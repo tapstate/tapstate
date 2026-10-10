@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.spi.store.ArtifactStore;
 
@@ -42,7 +44,17 @@ interface DagSource {
         NestCapacity capacity = capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
-                capacity, locations, Optional.empty(), fence -> dagFor(pipelineId, fence));
+                capacity, locations, Optional.empty(), fence -> plannedDagFor(pipelineId, fence),
+                sinkConnectors(pipelineId));
+    }
+
+    /**
+     * The connector each of the pipeline's sinks opens, by id, keyed by the sink's node. A sink opens its connector
+     * on whichever member runs it, so these are what every member a run takes part on has to be able to load. A
+     * source with no store-backed sinks opens none.
+     */
+    default Map<String, String> sinkConnectors(String pipelineId) {
+        return Map.of();
     }
 
     /**
@@ -67,6 +79,43 @@ interface DagSource {
      */
     default DAG dagFor(String pipelineId, ExecutionFence fence) {
         return dagFor(pipelineId);
+    }
+
+    /**
+     * The topology to run, held to {@code fence}'s run as {@link #dagFor(String, ExecutionFence)} is, together
+     * with how wide it was planned to run: the width each node was worked out to run at, the members that was
+     * worked out for, and the batch each node takes its input in.
+     *
+     * <p>Defaulted, for the stand-ins a lifecycle test drives, to a topology planned over nothing: every node
+     * runs as one processor for the cluster, and there is no plan to say so.
+     */
+    default PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
+        return new PlannedDag(dagFor(pipelineId, fence), ExecutionShape.totalOne(), List.of(), Map.of(), Map.of());
+    }
+
+    /**
+     * A topology and the plan it was drawn from: {@code shape} holds each node's width, worked out for
+     * {@code members} - by stable id - {@code batches} the batch each node takes its input in,
+     * {@code vertices} which of the topology's vertices run at each node's width, and {@code feeding} which
+     * vertices send their rows into each sink.
+     */
+    record PlannedDag(DAG dag, ExecutionShape shape, List<String> members, Map<String, BatchSpec> batches,
+            Map<String, List<String>> vertices, Map<String, List<String>> feeding) {
+
+        public PlannedDag {
+            Objects.requireNonNull(dag, "dag");
+            Objects.requireNonNull(shape, "shape");
+            members = List.copyOf(Objects.requireNonNull(members, "members"));
+            batches = Map.copyOf(Objects.requireNonNull(batches, "batches"));
+            vertices = Map.copyOf(Objects.requireNonNull(vertices, "vertices"));
+            feeding = Map.copyOf(Objects.requireNonNull(feeding, "feeding"));
+        }
+
+        /** A plan that says nothing of what feeds its sinks. */
+        PlannedDag(DAG dag, ExecutionShape shape, List<String> members, Map<String, BatchSpec> batches,
+                Map<String, List<String>> vertices) {
+            this(dag, shape, members, batches, vertices, Map.of());
+        }
     }
 
     /**
@@ -129,61 +178,103 @@ interface DagSource {
     }
 
     /**
-     * The validated, artifact-derived inputs available before placement is configured. DAG construction is
-     * deferred until after placement and pending teardown because it may inspect and record operator shape.
+     * The validated, artifact-derived inputs available before placement is configured. The run itself is worked
+     * out later, in two steps a start takes on either side of opening its capture: {@link #plan()} once placement
+     * and pending teardown are settled, because planning may inspect and record operator shape; the topology once
+     * the capture is open, because its source vertices read what the capture opens.
      */
     record StartPreparation(
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
             String cursorWriterToken,
-            Function<ExecutionFence, DAG> dagBuilder) {
-
-        StartPreparation(
-                NestCapacity capacity,
-                Set<OperatorStateLocation> stateLocations,
-                Optional<ArtifactStore> artifactSnapshot,
-                Function<ExecutionFence, DAG> dagBuilder) {
-            this(capacity, stateLocations, artifactSnapshot,
-                    java.util.UUID.randomUUID().toString(), dagBuilder);
-        }
+            Planner planner,
+            Map<String, String> sinkConnectors) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
             stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
             Objects.requireNonNull(cursorWriterToken, "cursorWriterToken");
+            Objects.requireNonNull(planner, "planner");
+            sinkConnectors = Map.copyOf(Objects.requireNonNull(sinkConnectors, "sinkConnectors"));
+        }
+
+        StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
+                Optional<ArtifactStore> artifactSnapshot, Planner planner, Map<String, String> sinkConnectors) {
+            this(capacity, stateLocations, artifactSnapshot, java.util.UUID.randomUUID().toString(),
+                    planner, sinkConnectors);
+        }
+
+        /** A preparation that builds an unplanned topology after capture opens. */
+        StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
+                Optional<ArtifactStore> artifactSnapshot, Function<ExecutionFence, DAG> dagBuilder) {
+            this(capacity, stateLocations, artifactSnapshot, java.util.UUID.randomUUID().toString(), dagBuilder);
+        }
+
+        StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
+                Optional<ArtifactStore> artifactSnapshot, String cursorWriterToken,
+                Function<ExecutionFence, DAG> dagBuilder) {
+            this(capacity, stateLocations, artifactSnapshot, cursorWriterToken,
+                    () -> fence -> new PlannedDag(dagBuilder.apply(fence), ExecutionShape.totalOne(),
+                            List.of(), Map.of(), Map.of()), Map.of());
             Objects.requireNonNull(dagBuilder, "dagBuilder");
         }
 
-        /**
-         * Builds the topology, with every external effect in it held to {@code fence}'s run. Taking the
-         * fence here rather than at preparation is what keeps the two in step: the run is fenced before
-         * the first side effect of a start, and the topology is built after placement and teardown, so
-         * the generation the build is held to is the one this member has just been granted.
-         *
-         * <p>A null fence is the single-member path, where there is one run of anything and so nothing
-         * for a second one to be held against. Deliberately the only way to get an unfenced topology
-         * from a preparation: a no-argument build would let a clustered start drop its fence without
-         * anything in the call saying so.
-         */
+        /** A preparation whose plan and topology are built together after capture opens. */
+        StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
+                Optional<ArtifactStore> artifactSnapshot, Function<ExecutionFence, PlannedDag> dagBuilder,
+                Map<String, String> sinkConnectors) {
+            this(capacity, stateLocations, artifactSnapshot, () -> dagBuilder, sinkConnectors);
+        }
+
+        /** Plans before capture opens, preserving the exact cursor token for the later reader. */
+        PlannedStart plan() {
+            return new PlannedStart(this, Objects.requireNonNull(planner.plan(), "planned topology"));
+        }
+
         StartPlan build(ExecutionFence fence) {
-            return new StartPlan(dagBuilder.apply(fence), capacity, stateLocations, artifactSnapshot);
+            return plan().build(fence);
+        }
+    }
+
+    /** Works out a run ahead of its capture, answering the builder of the run's topology. */
+    @FunctionalInterface
+    interface Planner {
+        Function<ExecutionFence, PlannedDag> plan();
+    }
+
+    /** A start whose run has been planned, and whose topology is built once its capture is open. */
+    record PlannedStart(StartPreparation preparation, Function<ExecutionFence, PlannedDag> dagBuilder) {
+
+        public PlannedStart {
+            Objects.requireNonNull(preparation, "preparation");
+            Objects.requireNonNull(dagBuilder, "dagBuilder");
+        }
+
+        StartPlan build(ExecutionFence fence) {
+            return new StartPlan(dagBuilder.apply(fence), preparation.capacity(), preparation.stateLocations(),
+                    preparation.artifactSnapshot());
         }
     }
 
     /** Every artifact-derived input to one start, resolved from one immutable snapshot. */
     record StartPlan(
-            DAG dag,
+            PlannedDag planned,
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot) {
 
         public StartPlan {
-            Objects.requireNonNull(dag, "dag");
+            Objects.requireNonNull(planned, "planned");
             Objects.requireNonNull(capacity, "capacity");
             stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
+        }
+
+        /** The topology to submit. */
+        DAG dag() {
+            return planned.dag();
         }
     }
 }

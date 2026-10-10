@@ -15,6 +15,7 @@ import io.tapstate.spi.store.SuccessorEnd;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Map;
@@ -81,6 +82,11 @@ public final class PipelineConverger {
     }
 
     public enum PendingAction { NONE, START, STOP }
+
+    /** Tells the rebuild admission which pipelines are still desired, so it forgets the rest. */
+    public void retain(Collection<String> pipelineIds) {
+        rebuilds.retain(pipelineIds);
+    }
 
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
     public ConvergeResult converge(String pipelineId) {

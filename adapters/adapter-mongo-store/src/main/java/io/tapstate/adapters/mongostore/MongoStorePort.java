@@ -132,6 +132,7 @@ public final class MongoStorePort implements StorePort {
      */
     public static final WriteConcern NEST_STATE_WRITE_CONCERN = WriteConcern.MAJORITY.withJournal(true);
 
+    private final MongoConnection connection;
     private final ArtifactStore artifacts;
     private final StateStore state;
     private final DesiredStore desired;
@@ -172,7 +173,7 @@ public final class MongoStorePort implements StorePort {
      */
     public MongoStorePort(
             MongoConnection connection, String operatorStateDatabase, Duration rateHistoryRetention) {
-        Objects.requireNonNull(connection, "connection");
+        this.connection = Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
         this.state = new MongoStateStore(connection.client(), SystemCollections.PIPELINE_STATE.on(database),
@@ -333,6 +334,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public ClusterMembershipStore clusterMembership() {
         return clusterMembership;
+    }
+
+    @Override
+    public int endTransactionsLeftOpenBy(String processId) {
+        return connection.endTransactionsLeftOpenBy(processId);
     }
 
     @Override

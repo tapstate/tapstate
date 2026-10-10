@@ -83,6 +83,17 @@ public final class JoinProcessor extends AbstractProcessor implements Staged, Dy
                 driver::lowestPendingOn);
     }
 
+    /**
+     * Like every other vertex that reaches the state layer, and for the same reason: every call into the
+     * join's state is a call into the cluster, and one the cluster refuses while a member joining catches up
+     * is waited out where it was made. A call that waits on a cooperative thread stops every other vertex
+     * sharing that thread rather than only this one.
+     */
+    @Override
+    public boolean isCooperative() {
+        return false;
+    }
+
     /** How many arrivals before the next settlement marker have already been taken into the state. */
     private int taken;
 

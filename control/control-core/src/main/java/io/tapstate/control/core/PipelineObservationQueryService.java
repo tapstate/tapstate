@@ -1,14 +1,18 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.ObservationStore;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * The pipeline observation read side: the three store-backed read faces — status / metrics / snapshot —
@@ -32,23 +36,64 @@ public final class PipelineObservationQueryService {
 
     private final ArtifactQueryService artifacts;
     private final Function<String, Optional<Observation>> observations;
+    private final ExecutionPlans plans;
+    private final Supplier<List<String>> members;
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations) {
-        this(artifacts, observations::read);
+        this(artifacts, observations::read, ExecutionPlans.NONE, List::of);
     }
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, CurrentObservationReader observations) {
-        this(artifacts, observations::read);
+        this(artifacts, observations::read, ExecutionPlans.NONE, List::of);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans) {
+        this(artifacts, observations::read, plans, List::of);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, CurrentObservationReader observations,
+            ExecutionPlans plans) {
+        this(artifacts, observations::read, plans, List::of);
+    }
+
+    /** Answers the current observation beside the plan and the members it was not worked out for. */
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations::read, plans, members);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, CurrentObservationReader observations,
+            ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations::read, plans, members);
     }
 
     private PipelineObservationQueryService(ArtifactQueryService artifacts,
-            Function<String, Optional<Observation>> observations) {
+            Function<String, Optional<Observation>> observations, ExecutionPlans plans,
+            Supplier<List<String>> members) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
+        this.plans = Objects.requireNonNull(plans, "plans");
+        this.members = Objects.requireNonNull(members, "members");
     }
 
-    /** The pipeline's lifecycle state, with the coded reason its run died when there is one. */
+    /**
+     * The pipeline's lifecycle state, with the coded reason its run died when there is one, the plan its current
+     * run was submitted on where one is recorded, and the members of the cluster that plan was not worked out for.
+     */
     public PipelineStatus status(String pipelineId) {
+        PipelineStatus status = lifecycleStatus(pipelineId);
+        ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+        return new PipelineStatus(status.pipelineId(), status.state(), status.failure(), status.observedAt(),
+                plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
+    }
+
+    /**
+     * The pipeline's status as {@link #status} answers it, without the plan: what a reader following the state
+     * as it changes asks for on every poll. The plan changes only when a new run is submitted, so reading it on
+     * every poll would be a read thrown away each time.
+     */
+    public PipelineStatus lifecycleStatus(String pipelineId) {
         Observation observation = require(pipelineId);
         return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
                 observation.observedAt());

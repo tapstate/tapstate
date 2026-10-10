@@ -5,6 +5,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.adapters.pdk.PdkExternalCallStats;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.StoredCountSampler;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -35,6 +36,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
+import java.util.List;
 import java.util.Optional;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -86,17 +88,54 @@ class DataPlaneActuationConfiguration {
     private static final Duration STORE_PROBE_TIMEOUT = Duration.ofSeconds(10);
 
     /**
+     * How long a start waits for every member to say whether it can load the pipeline's sink connectors. A member
+     * seeing an artifact for the first time downloads and stages it, so this allows for that; a member that has
+     * not answered by then refuses the start rather than holding the pass that is starting it.
+     */
+    private static final Duration CONNECTOR_READINESS_TIMEOUT = Duration.ofSeconds(60);
+
+    /**
      * The topology builder, with every source vertex it builds held to this member. A start runs its capture
      * here before it builds, so this member's hand-off is the one the sources have to drain; left to the
      * engine, a source lands on another member as often as not on a cluster and reads nothing, healthily.
      */
     @Bean
     DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester,
-            HazelcastInstance hazelcastMember, SnapshotBuffer snapshotBuffer) {
+            HazelcastInstance hazelcastMember, SnapshotBuffer snapshotBuffer,
+            ParallelismBudget parallelismBudget) {
         return new StoreBackedDagSource(storePort, nestSettings,
                 StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT),
                 SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()),
-                snapshotBuffer);
+                snapshotBuffer, () -> dataMembers(hazelcastMember), parallelismBudget);
+    }
+
+    /**
+     * The members a run submitted now would take part on, by stable id: every member that holds data, which in
+     * this product is every member - none joins as a lite member. A member that names no stable id is named by
+     * its engine identity instead.
+     */
+    private static List<String> dataMembers(HazelcastInstance member) {
+        return ClusterMembershipGate.dataMembers(member);
+    }
+
+    /** The plans of the runs the cluster is executing, written by whichever member submits each. */
+    @Bean
+    HazelcastExecutionPlans executionPlans(HazelcastInstance hazelcastMember) {
+        return new HazelcastExecutionPlans(hazelcastMember);
+    }
+
+    /**
+     * The limits a node's per-member width is held to. Every one is countable before anything is opened, so
+     * the same configuration is judged the same way on every connector version.
+     */
+    @Bean
+    ParallelismBudget parallelismBudget(
+            @Value("${tapstate.execution.max-local-parallelism:16}") int maxLocalParallelism,
+            @Value("${tapstate.execution.max-connector-instances-per-member:8}") int maxConnectorInstances,
+            @Value("${tapstate.execution.max-buffered-records-per-member:262144}") long maxBufferedRecords,
+            @Value("${tapstate.execution.max-blocking-processors-per-member:128}") int maxBlockingProcessors) {
+        return new ParallelismBudget(maxLocalParallelism, maxConnectorInstances, maxBufferedRecords,
+                maxBlockingProcessors);
     }
 
     @Bean
@@ -206,13 +245,15 @@ class DataPlaneActuationConfiguration {
     @Bean
     RebuildAdmission rebuildAdmission(
             ClusterProperties clusterProperties, HazelcastProperties hazelcastProperties,
-            PipelineActuationOwnership pipelineActuationOwnership) {
+            PipelineActuationOwnership pipelineActuationOwnership, Engine engine) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return RebuildAdmission.never();
         }
         return new ClusterRebuildAdmission(
-                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl(),
-                hazelcastProperties.getMaximumNoHeartbeat());
+                pipelineActuationOwnership,
+                pipelineId -> engine.failureOf(pipelineId)
+                        .map(ClusterRebuildAdmission::isMembershipChangedBeforeStart).orElse(false),
+                clusterProperties.getWorkloadClaimTtl(), hazelcastProperties.getMaximumNoHeartbeat());
     }
 
     /**
@@ -258,6 +299,20 @@ class DataPlaneActuationConfiguration {
                     Map.of("configured", configured, "stored", stored.clusterId()), null);
         }
         return stored.clusterId();
+    }
+
+    /**
+     * Keeps the actuation claims renewed apart from the convergence pass, which a single start can hold for
+     * longer than a lease. Nothing to renew on a single node.
+     */
+    @Bean(destroyMethod = "close")
+    ActuationClaimRenewer actuationClaimRenewer(
+            PipelineActuationOwnership pipelineActuationOwnership, ClusterProperties clusterProperties) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return ActuationClaimRenewer.inactive();
+        }
+        return new ActuationClaimRenewer(
+                pipelineActuationOwnership, clusterProperties.getWorkloadClaimRenewInterval());
     }
 
     @Bean
@@ -314,11 +369,12 @@ class DataPlaneActuationConfiguration {
             PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown,
             PipelineActuationOwnership pipelineActuationOwnership, StorePort storePort,
             ObservationScopeRegistry observationScopes, io.tapstate.runtime.scheduler.ObservationPublisher publisher,
-            LifecycleWorkDispatcher lifecycleWork) {
+            LifecycleWorkDispatcher lifecycleWork, HazelcastExecutionPlans executionPlans,
+            HazelcastInstance hazelcastMember, Clock clock) {
         return new MeasuredLifecycleActuator(new EngineLifecycleActuator(engine, dagSource,
-                pipelineCaptureCoordinator, nestStateTeardown,
-                pipelineActuationOwnership,
+                pipelineCaptureCoordinator, nestStateTeardown, pipelineActuationOwnership,
                 new io.tapstate.control.core.PipelineIncarnationService(storePort.artifacts()), observationScopes,
-                publisher, storePort.observations(), storePort.workloadClaims()), lifecycleWork);
+                publisher, storePort.observations(), storePort.workloadClaims(), executionPlans, clock,
+                new HazelcastConnectorReadiness(hazelcastMember, CONNECTOR_READINESS_TIMEOUT)), lifecycleWork);
     }
 }

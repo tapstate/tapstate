@@ -83,6 +83,8 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -337,7 +339,7 @@ class EngineLifecycleActuatorTest {
                                 assertThat(latest.readStored(PIPE).orElseThrow().observation().state())
                                         .isEqualTo(PipelineState.NEW);
                             }
-                            try { return actual.dagBuilder().apply(fence); }
+                            try { return actual.plan().build(fence).dag(); }
                             catch (TapstateException refusal) { buildRefusal.set(refusal); throw refusal; }
                         });
             }
@@ -1478,6 +1480,143 @@ class EngineLifecycleActuatorTest {
         assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
     }
 
+    /**
+     * A start on a member that still has a capture open for the pipeline, with no job carrying it, closes that
+     * capture before it opens one. The capture was left by a run that ended without a stop -- a job lost with a
+     * member, replaced by this member before it can see that job failed -- whose sources had begun taking the
+     * load it handed them. A source of the new run cannot vouch for a load another run began, so the table
+     * would never land in it; closed first, and keeping the pipeline's position, the capture opens a load for
+     * this run.
+     */
+    @Test
+    void aStartOverACaptureARunLeftOpenWithNoStopClosesItFirst() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        coordinator.capturing = true;
+        coordinator.jobTerminalProbe = () -> member.getJet().getJob(PIPE) == null;
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        LifecycleActuator actuator =
+                TestEngineLifecycleActuators.create(new Engine(member), dagSource, coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly(
+                "stopCapture:" + PIPE + "[keep][jobTerminal]", "startCapture:" + PIPE, "buildDag:" + PIPE);
+        assertThat(member.getJet().getJob(PIPE)).as("the run was submitted after the capture was opened again")
+                .isNotNull();
+    }
+
+    /**
+     * A start works its run out before it opens the capture: a start refused there - for a width it cannot honour
+     * - has opened no capture, so it has joined no mining chain and left no consumer on one to hold back the other
+     * pipelines reading the same tables.
+     */
+    @Test
+    void aStartRefusedWhileItsRunIsPlannedOpensNoCapture() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        dagSource.planning = () -> {
+            throw new TapstateException(ActuationError.NO_SAFE_PARALLELISM, Map.of(
+                    "pipeline", PIPE, "node", "w", "requested", 1000, "members", 1,
+                    "candidates", "1000 per member breaks max-local-parallelism"), null);
+        };
+        LifecycleActuator actuator =
+                TestEngineLifecycleActuators.create(new Engine(member), dagSource, coordinator, teardown());
+
+        assertThatThrownBy(() -> actuator.start(PIPE))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        refused -> assertThat(refused.code()).isEqualTo(ActuationError.NO_SAFE_PARALLELISM));
+
+        assertThat(events).as("nothing was opened for a start refused while its run was planned").isEmpty();
+        assertThat(member.getJet().getJob(PIPE)).isNull();
+    }
+
+    /**
+     * A start refused while its prerequisites are checked has taken no run of its own, so the claim still names the
+     * run before it. The member driving the pipeline is told, so the failure the refusal records is judged as that
+     * refusal - not by the earlier run, which after a member left would read as the departure ending it again.
+     */
+    @Test
+    void aStartRefusedBeforeItTakesARunIsJudgedAsThatRefusal() {
+        RecordingDagSource dagSource = new RecordingDagSource(new CopyOnWriteArrayList<>());
+        TapstateException refused = new TapstateException(ActuationError.SOURCE_TABLE_NOT_DISCOVERED,
+                Map.of("source", "orders_src", "table", "orders"), null);
+        dagSource.validation = () -> {
+            throw refused;
+        };
+        PipelineActuationOwnership ownership = clusteredOwnership();
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        assertThat(ownership.beginExecution(PIPE).allowed()).as("the run before this start").isTrue();
+        LifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member), dagSource,
+                new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>()), teardown(), ownership);
+
+        assertThatThrownBy(() -> actuator.start(PIPE)).isSameAs(refused);
+
+        assertThat(ownership.departure(PIPE, Duration.ofSeconds(90).toNanos()))
+                .isEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
+    /** A start refused once it took a run is that run's failure, judged like any other death of a run. */
+    @Test
+    void aStartRefusedOnceItTookARunIsJudgedByThatRun() {
+        RecordingDagSource dagSource = new RecordingDagSource(new CopyOnWriteArrayList<>());
+        dagSource.building = () -> {
+            throw new TapstateException(ActuationError.NO_SAFE_PARALLELISM, Map.of(
+                    "pipeline", PIPE, "node", "w", "requested", 1000, "members", 1,
+                    "candidates", "1000 per member breaks max-local-parallelism"), null);
+        };
+        PipelineActuationOwnership ownership = clusteredOwnership();
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        LifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member), dagSource,
+                new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>()), teardown(), ownership);
+
+        assertThatThrownBy(() -> actuator.start(PIPE)).isInstanceOf(TapstateException.class);
+
+        assertThat(ownership.heldExecutionGeneration(PIPE)).as("the start took a run first").isEqualTo(1);
+        assertThat(ownership.departure(PIPE, Duration.ofSeconds(90).toNanos()))
+                .isNotEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
+    /** A start that plans its run does so before it opens the capture its topology is then built over. */
+    @Test
+    void aStartPlansItsRunBeforeItOpensTheCapture() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        dagSource.planning = () -> events.add("planStart:" + PIPE);
+        LifecycleActuator actuator =
+                TestEngineLifecycleActuators.create(new Engine(member), dagSource, coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly("planStart:" + PIPE, "startCapture:" + PIPE, "buildDag:" + PIPE);
+    }
+
+    /**
+     * A second start while a job carries the pipeline leaves its open capture alone: the capture is that job's,
+     * and closing it would take the load from under a run that is reading it.
+     */
+    @Test
+    void aStartOverACaptureARunningJobReadsLeavesItOpen() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        LifecycleActuator actuator =
+                TestEngineLifecycleActuators.create(new Engine(member), dagSource, coordinator, teardown());
+        actuator.start(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        long existingJob = member.getJet().getJob(PIPE).getId();
+        coordinator.capturing = true;
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
+        assertThat(member.getJet().getJob(PIPE).getId()).isEqualTo(existingJob);
+        assertThat(coordinator.capturing).isTrue();
+        assertThat(coordinator.activeCapture).isTrue();
+    }
+
     @Test
     void aPreparedStartAbandonedByACasLossClosesCaptureBeforeAnyJobIsSubmitted() {
         List<String> events = new CopyOnWriteArrayList<>();
@@ -1668,6 +1807,82 @@ class EngineLifecycleActuatorTest {
         }
     }
 
+    /**
+     * A start holds the pass from the moment it takes its run's generation until it submits the job, and it
+     * can take longer than a lease: an overloaded host, a slow source, many tables. The claim behind the run
+     * is renewed throughout, so the run it submits is one its own members let write. Renewed only between
+     * passes, the claim ran out under the start, and the members refused the run it had just submitted.
+     */
+    @Test
+    void aStartThatOutlastsALeaseSubmitsARunItsOwnMembersAuthorize() {
+        InMemoryWorkloadClaimStore store = new InMemoryWorkloadClaimStore();
+        AtomicLong nanos = new AtomicLong();
+        PipelineActuationOwnership ownership = clusteredOwnership(store, nanos::get, "node-a");
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        // Inside the capture start, while the pass is held: only the renewer moves, as it does on its own thread.
+        coordinator.jobAbsentProbe = () -> {
+            for (int second = 0; second <= 30; second += 5) {
+                store.elapse(Duration.ofSeconds(5));
+                nanos.addAndGet(Duration.ofSeconds(5).toNanos());
+                ownership.renewDue();
+            }
+            return true;
+        };
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown(), ownership);
+        coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
+
+        actuator.start(PIPE);
+        try (ExecutionAuthorization guard =
+                     new ExecutionAuthorization("cluster-a", store, Duration.ofSeconds(10), nanos::get)) {
+            assertThat(member.getJet().getJob(PIPE)).as("the run was submitted").isNotNull();
+            assertThat(guard.authorized(dagSource.fences.get(0)))
+                    .as("and its members may write for it, more than a lease after its generation was taken")
+                    .isTrue();
+        } finally {
+            actuator.stop(PIPE, true);
+        }
+    }
+
+    /**
+     * A start whose claim was taken over while it ran submits nothing. Its members would refuse the run at its
+     * first write; submitted, the run dies as it starts, and the member now holding the pipeline reads that
+     * death as the pipeline's. The capture the start opened is closed again keeping the position, so the
+     * holder opens its own over it.
+     */
+    @Test
+    void aStartWhoseClaimIsTakenOverWhileItRunsSubmitsNothingAndClosesTheCaptureItOpened() {
+        InMemoryWorkloadClaimStore store = new InMemoryWorkloadClaimStore();
+        AtomicLong nanos = new AtomicLong();
+        PipelineActuationOwnership nodeA = clusteredOwnership(store, nanos::get, "node-a");
+        PipelineActuationOwnership nodeB = clusteredOwnership(store, nanos::get, "node-b");
+        assertThat(nodeA.permit(PIPE).granted()).isTrue();
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        // Nothing on this member renews for longer than a lease -- its store out of reach, or the process
+        // paused -- and another member takes the pipeline over in the meantime.
+        coordinator.jobAbsentProbe = () -> {
+            store.elapse(Duration.ofSeconds(31));
+            nanos.addAndGet(Duration.ofSeconds(31).toNanos());
+            assertThat(nodeB.permit(PIPE).granted()).as("another member took the pipeline over").isTrue();
+            return true;
+        };
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown(), nodeA);
+
+        actuator.start(PIPE);
+
+        assertThat(member.getJet().getJob(PIPE))
+                .as("no run was submitted over a claim this member no longer holds").isNull();
+        assertThat(events)
+                .as("and the capture it opened was closed again, keeping the pipeline's position")
+                .containsSubsequence("startCapture:" + PIPE, "stopCapture:" + PIPE + "[keep][jobLive]");
+    }
+
     @Test
     void reportsNoFailureWhenNeitherTheJobNorTheCaptureHasFailed() {
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
@@ -1838,15 +2053,21 @@ class EngineLifecycleActuatorTest {
      */
     /** A member that holds its cluster's pipelines, so a start of one is granted a run to be fenced to. */
     private PipelineActuationOwnership clusteredOwnership() {
+        return clusteredOwnership(new InMemoryWorkloadClaimStore(), () -> 0L, "node-a");
+    }
+
+    /** The same, as one of several members over {@code store}, on the monotonic clock {@code nanos}. */
+    private static PipelineActuationOwnership clusteredOwnership(
+            InMemoryWorkloadClaimStore store, LongSupplier nanos, String node) {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         ClusterMembershipGate gate = new ClusterMembershipGate(properties);
         gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
         gate.canCommit(Set.of("node-a", "node-b"));
-        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(new InMemoryWorkloadClaimStore(), gate);
+        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(store, gate);
         return new PipelineActuationOwnership(
-                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate, claims,
-                Duration.ofSeconds(30), Duration.ofSeconds(10), () -> 0L);
+                "cluster-a", new WorkloadOwner(node, "boot-" + node), gate, claims,
+                Duration.ofSeconds(30), Duration.ofSeconds(10), nanos);
     }
 
     private NestStateTeardown teardown() {
@@ -1912,9 +2133,15 @@ class EngineLifecycleActuatorTest {
         private final List<io.tapstate.core.logging.LogSink.Scope> activatedLogScopes = new CopyOnWriteArrayList<>();
         private java.util.function.BiConsumer<String, io.tapstate.core.logging.LogSink.Scope> activationProbe =
                 (pipelineId, scope) -> { };
+        private boolean capturing;
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
+        }
+
+        @Override
+        public boolean isCapturing(String pipelineId) {
+            return activeCapture || capturing;
         }
 
         @Override
@@ -1929,6 +2156,7 @@ class EngineLifecycleActuatorTest {
                 throw new SnapshotCapacityUnavailable();
             }
             activeCapture = true;
+            capturing = true;
             afterStart.run();
             if (interruptAfterStart) {
                 Thread.currentThread().interrupt();
@@ -1958,6 +2186,7 @@ class EngineLifecycleActuatorTest {
             events.add("stopCapture:" + pipelineId + (purgeState ? "[purge]" : "[keep]")
                     + (jobTerminalProbe.get() ? "[jobTerminal]" : "[jobLive]"));
             activeCapture = false;
+            capturing = false;
         }
 
         @Override
@@ -1986,6 +2215,9 @@ class EngineLifecycleActuatorTest {
         private ArtifactStore artifactSnapshot;
         private boolean interruptDuringBuild;
         private final List<String> preparedTokens = new CopyOnWriteArrayList<>();
+        /** Run as the start is planned, when set: what a store-backed source works out before the capture. */
+        private Runnable planning;
+        private Runnable building = () -> { };
 
         RecordingDagSource(List<String> events) {
             this.events = events;
@@ -1998,6 +2230,16 @@ class EngineLifecycleActuatorTest {
 
         @Override
         public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
+            if (planning != null) {
+                validateStart(pipelineId);
+                return new StartPreparation(
+                        capacityOf(pipelineId), stateLocations(pipelineId, defaultDatabase), Optional.empty(),
+                        () -> {
+                            planning.run();
+                            return fence -> plannedDagFor(pipelineId, fence);
+                        },
+                        Map.of());
+            }
             if (artifactSnapshot == null) {
                 StartPreparation prepared = DagSource.super.prepareStart(pipelineId, defaultDatabase);
                 preparedTokens.add(prepared.cursorWriterToken());
@@ -2021,6 +2263,7 @@ class EngineLifecycleActuatorTest {
         @Override
         public DAG dagFor(String pipelineId) {
             events.add("buildDag:" + pipelineId);
+            building.run();
             if (interruptDuringBuild) {
                 Thread.currentThread().interrupt();
             }

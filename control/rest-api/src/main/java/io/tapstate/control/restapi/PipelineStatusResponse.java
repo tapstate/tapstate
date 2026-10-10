@@ -9,6 +9,7 @@ import io.tapstate.messages.MessageCatalog;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -32,10 +33,14 @@ import java.util.TreeMap;
  * reaches a reader as an age before the present. Floored rather than dropped: the reading is still an age
  * and still says the observation is recent, and the direction is the safe one — a floor can only make a
  * reading look fresher, never stale, so nothing is ever reported as a stopped publisher by clock skew.
+ *
+ * <p>{@code plan} is the plan the pipeline's current run was submitted on, omitted when no run has one recorded;
+ * {@code awaitingRebalance} the members of the cluster that plan was not worked out for, omitted when there are
+ * none.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record PipelineStatusResponse(String pipelineId, PipelineState state, Failure failure, Instant observedAt,
-        Long observedAgeMillis) {
+        Long observedAgeMillis, ExecutionPlanResponse plan, List<String> awaitingRebalance) {
 
     /**
      * A coded failure as a client reads it: the canonical code string (the stable identity — the enum never
@@ -58,7 +63,9 @@ record PipelineStatusResponse(String pipelineId, PipelineState state, Failure fa
         return new PipelineStatusResponse(status.pipelineId(), status.state(),
                 failure(status.failure(), catalog), observedAt,
                 observedAt == null ? null
-                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()));
+                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
+                ExecutionPlanResponse.of(status.plan()),
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance());
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {

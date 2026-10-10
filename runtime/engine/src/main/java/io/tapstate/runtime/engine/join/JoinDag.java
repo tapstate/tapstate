@@ -4,7 +4,6 @@ import com.hazelcast.function.FunctionEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Processor;
-import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.metrics.Metric;
@@ -13,6 +12,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
+import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.runtime.engine.PassthroughProcessor;
 import io.tapstate.runtime.engine.StageWorkDag;
 import io.tapstate.runtime.engine.StageOutputPressureProcessor;
@@ -59,6 +59,8 @@ public final class JoinDag {
      * @param dimensionRowKeyColumns each dimension source's own key columns, which distinguish rows
      *                               that share the columns the join matches on
      * @param displaced      where a dimension row lost to a key another row already held is reported
+     * @param width          how wide the node runs - one processor for the cluster, or the same number on
+     *                       every member - which both of its vertices, and every edge into them, follow
      */
     public static Vertex attach(DAG dag, JoinPlan plan, String pipelineId, String nodeId,
             List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
@@ -66,7 +68,7 @@ public final class JoinDag {
             ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
             DimensionRowDisplacedAlert displaced) {
         return attach(dag, plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
-                sourceUpstream, nextOutbound, stores, displaced, null);
+                sourceUpstream, nextOutbound, stores, displaced, null, NodeWidth.totalOne(nodeId, null));
     }
 
     /** The same Join with per-source chain bounds that reach its projection and sink. */
@@ -75,6 +77,24 @@ public final class JoinDag {
             Function<String, List<Vertex>> sourceUpstream,
             ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
             DimensionRowDisplacedAlert displaced, JoinFrontier frontier) {
+        return attach(dag, plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
+                sourceUpstream, nextOutbound, stores, displaced, frontier, NodeWidth.totalOne(nodeId, null));
+    }
+
+    public static Vertex attach(DAG dag, JoinPlan plan, String pipelineId, String nodeId,
+            List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
+            Function<String, List<Vertex>> sourceUpstream,
+            ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
+            DimensionRowDisplacedAlert displaced, NodeWidth width) {
+        return attach(dag, plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
+                sourceUpstream, nextOutbound, stores, displaced, null, width);
+    }
+
+    public static Vertex attach(DAG dag, JoinPlan plan, String pipelineId, String nodeId,
+            List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
+            Function<String, List<Vertex>> sourceUpstream,
+            ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
+            DimensionRowDisplacedAlert displaced, JoinFrontier frontier, NodeWidth width) {
         Map<Integer, String> sourceByOrdinal = new LinkedHashMap<>();
         Map<String, List<String>> keyColumns = new LinkedHashMap<>();
         String factSource = plan.factSource().name();
@@ -97,11 +117,11 @@ public final class JoinDag {
         });
         List<String> allChains = chainsByOrdinal.values().stream().flatMap(List::stream).distinct().toList();
         ChainAxes axes = frontier == null ? null : frontier.axes();
-        Vertex vertex = dag.newVertex(nodeId, ProcessorMetaSupplier.of(new JoinVertexSupplier(
+        Vertex vertex = width.sized(dag.newVertex(nodeId, width.metaSupplier(nodeId, new JoinVertexSupplier(
                 plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
                 Map.copyOf(sourceByOrdinal), axes, Map.copyOf(chainsByOrdinal), allChains,
-                stores, displaced, false)));
-        StageWorkDag.measured(dag, vertex, Stage.JOIN);
+                stores, displaced, false), axes, chainsByOrdinal)));
+        StageWorkDag.measured(dag, vertex, Stage.JOIN, !width.isNative());
         sourceByOrdinal.forEach((edge, source) -> {
             List<Vertex> producers = sourceUpstream.apply(source);
             if (producers == null || producers.isEmpty()) {
@@ -109,17 +129,18 @@ public final class JoinDag {
             }
             Vertex producer = producers.size() == 1 ? producers.get(0)
                     : merged(dag, vertex, source, producers, nextOutbound, frontier);
-            dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(vertex, edge)
-                    .partitioned(keyOf(keyColumns.get(source))).distributed());
+            dag.edge(width.into(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(vertex, edge),
+                    nodeId, keyOf(keyColumns.get(source))));
         });
-        Vertex projection = dag.newVertex(nodeId + ":project", ProcessorMetaSupplier.of(new JoinVertexSupplier(
+        String projecting = nodeId + ":project";
+        Vertex projection = width.sized(dag.newVertex(projecting, width.metaSupplier(projecting, new JoinVertexSupplier(
                 plan, pipelineId, nodeId, factKeyColumns, Map.of(), Map.of(), axes,
                 Map.of(), allChains, stores,
-                displaced, true)));
-        StageWorkDag.measured(dag, projection, Stage.JOIN);
-        dag.edge(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection)
-                .partitioned(item -> item instanceof JoinUpdate update
-                        ? update.factKey() : SETTLEMENT_PARTITION).distributed());
+                displaced, true), axes, Map.of(0, allChains))));
+        StageWorkDag.measured(dag, projection, Stage.JOIN, !width.isNative());
+        dag.edge(width.into(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection), projecting,
+                (FunctionEx<Object, Object>) item -> item instanceof JoinUpdate update
+                        ? update.factKey() : SETTLEMENT_PARTITION));
         return projection;
     }
 

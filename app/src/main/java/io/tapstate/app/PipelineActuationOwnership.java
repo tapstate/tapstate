@@ -7,6 +7,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.spi.store.StopAuthority;
@@ -117,8 +118,19 @@ final class PipelineActuationOwnership {
          * revision moves forward the moment this member re-acquires under a changed cluster -- which is
          * exactly when the difference between what the run was planned over and what is here now becomes
          * the thing worth knowing.
+         *
+         * <p>Forgotten when this member takes the pipeline back carrying a run somebody else submitted in
+         * between: it describes only the run it was taken for.
          */
         private Set<String> runMembers;
+        /** The execution generation of the run {@link #runMembers} describes; zero while there is none. */
+        private long runExecutionGeneration;
+        /**
+         * The execution generation the claim carried when a start on this member was refused before it took
+         * a run of its own, or {@link #NEVER}. While the claim still carries it, what failed is that start,
+         * not the run the generation names.
+         */
+        private long startRefusedAtGeneration = NEVER;
         /**
          * The last moment any of those members was out of sight while this member looked, or
          * {@link #NEVER}. Remembered rather than recomputed, because a member that leaves and
@@ -252,7 +264,7 @@ final class PipelineActuationOwnership {
 
     /** Whether a run may be submitted, and its durable generation identity. */
     record Execution(boolean allowed, ExecutionFence fence, Set<String> executionNodeIds,
-            Optional<WorkloadClaim> admittedClaim) {
+            Optional<WorkloadClaim> admittedClaim, Long topologyRevision) {
 
         Execution {
             executionNodeIds = Set.copyOf(executionNodeIds);
@@ -266,10 +278,21 @@ final class PipelineActuationOwnership {
                         || !claim.key().resourceId().equals(fence.pipelineId())
                         || claim.claimGeneration() != fence.claimGeneration()
                         || claim.executionGeneration() != fence.executionGeneration()
-                        || !claim.executionNodeIds().equals(executionNodeIds)) {
+                        || !claim.executionNodeIds().equals(executionNodeIds)
+                        || !Objects.equals(topologyRevision, claim.topologyRevision())) {
                     throw new IllegalArgumentException("an admission receipt must match its factual execution fence");
                 }
             }
+        }
+
+        Execution(boolean allowed, ExecutionFence fence, Set<String> executionNodeIds,
+                Optional<WorkloadClaim> admittedClaim) {
+            this(allowed, fence, executionNodeIds, admittedClaim,
+                    admittedClaim.map(WorkloadClaim::topologyRevision).orElse(null));
+        }
+
+        Execution(boolean allowed, ExecutionFence fence, Long topologyRevision) {
+            this(allowed, fence, Set.of(), Optional.empty(), topologyRevision);
         }
 
         Execution(boolean allowed, ExecutionFence fence, Set<String> executionNodeIds) {
@@ -279,7 +302,7 @@ final class PipelineActuationOwnership {
         Execution(boolean allowed, ExecutionFence fence) { this(allowed, fence, Set.of()); }
 
         static Execution refused() {
-            return new Execution(false, null);
+            return new Execution(false, null, Set.of(), Optional.empty(), null);
         }
     }
 
@@ -294,6 +317,22 @@ final class PipelineActuationOwnership {
      * does. The caller submits nothing in that case: a run that cannot be fenced is a run nothing could
      * later stop from writing.
      */
+    /**
+     * Notes that a start of {@code pipelineId} on this member was refused before it took a run, by one of the
+     * checks a start makes ahead of everything a run opens. Until a run takes a generation of its own, the
+     * failure that refusal records is the refusal's, which no member leaving answers for.
+     */
+    void startRefusedBeforeItsRun(String pipelineId) {
+        Held state = held.get(Objects.requireNonNull(pipelineId, "pipelineId"));
+        if (state == null) { return; }
+        state.lock.lock();
+        try {
+            if (!closing && held.get(pipelineId) == state && state.claim != null) {
+                state.startRefusedAtGeneration = state.claim.executionGeneration();
+            }
+        } finally { state.lock.unlock(); }
+    }
+
     Execution beginExecution(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing) {
@@ -373,13 +412,14 @@ final class PipelineActuationOwnership {
             }
             state.claim = advanced;
             state.runMembers = Set.copyOf(advanced.executionNodeIds());
+            state.runExecutionGeneration = advanced.executionGeneration();
             state.failureObservedAtNanos = NEVER;
             state.visibilityRevisionAtDetectionWindow = NEVER;
             // Prove the returned lease again before native submission, including time spent preparing the DAG.
             state.contacted = true;
             state.nextContactNanos = nanoTime.getAsLong();
             return new Execution(true, new ExecutionFence(marker.pipelineId(), advanced.claimGeneration(),
-                    advanced.executionGeneration()), advanced.executionNodeIds());
+                    advanced.executionGeneration()), advanced.executionNodeIds(), Optional.of(advanced));
         } finally {
             state.lock.unlock();
         }
@@ -442,6 +482,7 @@ final class PipelineActuationOwnership {
         // eligibility gate above makes unreachable -- because an empty set would read as "planned over
         // nobody", and nobody can never go missing.
         state.runMembers = planned == null ? null : runMembers;
+        state.runExecutionGeneration = state.claim.executionGeneration();
         // The departure is deliberately not forgotten here. This run is planned over members that are
         // all present, so the comparison below will find nothing missing from it -- and the run is being
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
@@ -464,8 +505,43 @@ final class PipelineActuationOwnership {
     }
 
     /**
+     * Whether a failed run is one a departure answers for, and why not when it is not: a pipeline left
+     * failed has to say what kept it there, or it reads exactly like one nobody asked about.
+     */
+    enum Departure {
+        /** A member the run was planned over is gone, or went recently enough to answer for this death. */
+        A_MEMBER_LEFT(null),
+        /** Another holder submitted the run, and may have gone before it could say why the run ended. */
+        INHERITED(null),
+        ALONE("a single member cannot lose a member"),
+        SHUTTING_DOWN("this member is shutting down"),
+        NOT_DRIVING("this member does not hold the pipeline's actuation claim"),
+        NO_RUN("no run has been submitted under the pipeline's actuation claim"),
+        START_REFUSED("its last start was refused before it took a run, which no member leaving answers for"),
+        ITS_OWN_FAILURE("its run's failure was recorded as its own before any member it was planned over left"),
+        NOBODY_LEFT("every member its run was planned over is still in sight,"
+                + " and none left within the settling stretch");
+
+        private final String refusal;
+
+        Departure(String refusal) {
+            this.refusal = refusal;
+        }
+
+        /** Whether this answer lets the run be rebuilt. */
+        boolean admits() {
+            return refusal == null;
+        }
+
+        /** Why the run is not rebuilt, or null when it is. */
+        String refusal() {
+            return refusal;
+        }
+    }
+
+    /**
      * Whether a member the run this member last submitted for {@code pipelineId} was planned over is
-     * gone, or went within {@code settlingNanos} of now.
+     * gone, or went within {@code settlingNanos} of now - and when the answer is no, which no it is.
      *
      * <p><b>Why a stretch and not an instant.</b> A member going away does not end one run; it ends the
      * run it was carrying pieces of, and then goes on ending the ones submitted to replace it while the
@@ -500,40 +576,112 @@ final class PipelineActuationOwnership {
      * a later handover cannot make that earlier death recoverable. If a member was lost when failure
      * was recorded, that fact survives a takeover even if the member has returned. An inherited run
      * with no recorded failure is admitted: its driver may have gone away before it could record why
-     * the run ended.
+     * the run ended. That includes a run somebody else submitted while this member did not hold the
+     * pipeline, whatever this member once planned a run of its own over.
+     *
+     * <p>A start refused before it took a run is judged as that refusal. The claim still names the run
+     * before it, and judged by that run - inherited, or planned over a member that has gone - every
+     * refused start would read as the same death again and spend a rebuild meant for a departure.
      */
-    boolean aMemberLeftUnderTheRun(String pipelineId, long settlingNanos) {
+    Departure departure(String pipelineId, long settlingNanos) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (!fenced || closing) {
-            return false;
-        }
+        if (!fenced) { return Departure.ALONE; }
+        if (closing) { return Departure.SHUTTING_DOWN; }
         Held state = held.get(pipelineId);
-        if (state == null) { return false; }
+        if (state == null) { return Departure.NOT_DRIVING; }
         state.lock.lock();
         try {
-            if (closing || held.get(pipelineId) != state || state.claim == null || state.claim.executionGeneration() == 0) {
-                return false;
+            if (closing) { return Departure.SHUTTING_DOWN; }
+            if (held.get(pipelineId) != state || state.claim == null) { return Departure.NOT_DRIVING; }
+            if (state.claim.executionGeneration() == 0) { return Departure.NO_RUN; }
+            if (state.startRefusedAtGeneration == state.claim.executionGeneration()) {
+                return Departure.START_REFUSED;
             }
-            // A recorded execution verdict survives later ownership and membership changes.
+            // A recorded independent failure survives later membership and ownership changes.
             if (state.claim.contextExecutionGeneration() == state.claim.executionGeneration()
                     && state.claim.failureClaimGeneration() == state.claim.executionClaimGeneration()
-                    && !state.claim.failureAfterMemberLoss()) { return false; }
-            return memberLeftUnderHeldRun(state, settlingNanos);
+                    && !state.claim.failureAfterMemberLoss()) {
+                return Departure.ITS_OWN_FAILURE;
+            }
+            if (state.runMembers == null) {
+                state.lostAMemberAtNanos = nanoTime.getAsLong();
+                return Departure.INHERITED;
+            }
+            observeMembership(state);
+            if (state.lostAMemberAtNanos == NEVER
+                    || nanoTime.getAsLong() - (state.lostAMemberAtNanos + settlingNanos) >= 0) {
+                return Departure.NOBODY_LEFT;
+            }
+            return Departure.A_MEMBER_LEFT;
         } finally { state.lock.unlock(); }
     }
 
-    private boolean memberLeftUnderHeldRun(Held state, long settlingNanos) {
-        if (state.runMembers == null) {
-            // The submitting holder is gone and this member has no local run snapshot. Take the moment
-            // here so a replacement that fails while the handover settles can spend the remaining budget.
-            state.lostAMemberAtNanos = nanoTime.getAsLong();
+    /**
+     * Renews every claim this member holds whose renewal is due, whatever the convergence pass is doing.
+     * Called on a renewer of its own, so a start that holds the pass for longer than a lease -- an
+     * overloaded host, a slow source, many tables -- runs out no claim of this member, its own included.
+     * A claim the store will not renew is dropped here exactly as the pass would drop it, and the pass
+     * takes it from there.
+     */
+    void renewDue() {
+        if (!fenced || closing) { return; }
+        long now = nanoTime.getAsLong();
+        for (Map.Entry<String, Held> entry : held.entrySet()) {
+            Held state = entry.getValue();
+            if (!state.lock.tryLock()) { continue; }
+            try {
+                if (!closing && held.get(entry.getKey()) == state && state.claim != null
+                        && state.contacted && now - state.nextContactNanos >= 0) {
+                    renew(state, now);
+                }
+            } finally { state.lock.unlock(); }
+        }
+    }
+
+    /**
+     * Whether the run {@code fence} names is still this member's to submit, asked of the store right before
+     * submitting it. A start can outlast a lease, and the renewer that keeps the claim alive through it can
+     * still lose it -- the store out of reach, the process paused, another member taking the pipeline over.
+     * A run submitted over a claim this member no longer holds dies at its first write, and the member that
+     * holds the pipeline then reads that death as the pipeline's.
+     *
+     * <p>Read rather than renewed: what is asked is who holds the run's generations now, and a renewal is
+     * also refused for a claim granted under a topology revision a member joining has since moved, which
+     * the same owner takes again on its next pass under the same generations. True on a single node, where
+     * nothing is fenced.
+     */
+    boolean proveExecution(ExecutionFence fence) {
+        if (!fenced || fence == null) {
             return true;
         }
-        observeMembership(state);
-        if (state.lostAMemberAtNanos == NEVER) {
+        if (closing) {
             return false;
         }
-        return nanoTime.getAsLong() - (state.lostAMemberAtNanos + settlingNanos) < 0;
+        WorkloadClaimKey key =
+                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId());
+        Optional<WorkloadClaimReading> reading;
+        try {
+            reading = claims.read(key);
+        } catch (RuntimeException unreachable) {
+            return false;
+        }
+        // The claim generation alone says whose tenure it is: every change of holder takes the next one, a
+        // restarted member included, so a match on it is a match on this member.
+        return reading.filter(WorkloadClaimReading::leased)
+                .map(WorkloadClaimReading::claim)
+                .filter(claim -> claim.claimGeneration() == fence.claimGeneration()
+                        && claim.executionGeneration() == fence.executionGeneration())
+                .isPresent();
+    }
+
+    /** The execution generation the claim this member holds for {@code pipelineId} carries, or zero. */
+    long heldExecutionGeneration(String pipelineId) {
+        Held state = fenced ? held.get(pipelineId) : null;
+        if (state == null) { return 0; }
+        state.lock.lock();
+        try {
+            return held.get(pipelineId) != state || state.claim == null ? 0 : state.claim.executionGeneration();
+        } finally { state.lock.unlock(); }
     }
 
     /** Records FAILED once member loss is visible or a post-detection view confirms none. */
@@ -746,6 +894,13 @@ final class PipelineActuationOwnership {
         state.claim = attempt.get().claim();
         state.failureObservedAtNanos = NEVER;
         state.visibilityRevisionAtDetectionWindow = NEVER;
+        if (state.claim.executionGeneration() != state.runExecutionGeneration) {
+            // The run this claim carries is not the one this member last submitted: somebody else drove the
+            // pipeline while this member did not hold it, and replaced that run. What this member planned its
+            // own run over says nothing about the run it holds now -- a member that was not in sight when it
+            // planned would never be missed from it. Without it, this is the inherited run it is.
+            state.runMembers = null;
+        }
         return Permit.granted(state.claim);
     }
 }

@@ -9,6 +9,8 @@ import io.tapstate.control.core.PipelineExplanation.NextAction;
 import io.tapstate.control.core.PipelineExplanation.Pending;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
@@ -28,8 +30,12 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
-/** The fixed five-rule explain projection over one current observation. */
+/**
+ * The fixed five-rule explain projection over one current observation, answered beside the plan the pipeline's
+ * current run was submitted on where one is recorded.
+ */
 public final class PipelineExplainService {
 
     public static final Duration PUBLISHER_SILENCE = Duration.ofSeconds(30);
@@ -44,42 +50,78 @@ public final class PipelineExplainService {
     private final Clock clock;
     private final ExplanationMessages messages;
     private final Function<String, Optional<Pending>> pending;
+    private final ExecutionPlans plans;
+    private final Supplier<List<String>> members;
 
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages) {
-        this(artifacts, observations::read, clock, messages, id -> Optional.empty());
+        this(artifacts, observations::read, clock, messages, id -> Optional.empty(), ExecutionPlans.NONE, List::of);
     }
 
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages, Function<String, Optional<Pending>> pending) {
-        this(artifacts, observations::read, clock, messages, pending);
+        this(artifacts, observations::read, clock, messages, pending, ExecutionPlans.NONE, List::of);
     }
 
     public PipelineExplainService(ArtifactQueryService artifacts, CurrentObservationReader observations,
             Clock clock, ExplanationMessages messages) {
-        this(artifacts, observations::read, clock, messages, id -> Optional.empty());
+        this(artifacts, observations::read, clock, messages, id -> Optional.empty(), ExecutionPlans.NONE, List::of);
     }
 
     public PipelineExplainService(ArtifactQueryService artifacts, CurrentObservationReader observations,
             Clock clock, ExplanationMessages messages, Function<String, Optional<Pending>> pending) {
-        this(artifacts, observations::read, clock, messages, pending);
+        this(artifacts, observations::read, clock, messages, pending, ExecutionPlans.NONE, List::of);
+    }
+
+    public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
+            Clock clock, ExplanationMessages messages, ExecutionPlans plans) {
+        this(artifacts, observations::read, clock, messages, id -> Optional.empty(), plans, List::of);
+    }
+
+    public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
+            Clock clock, ExplanationMessages messages, ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations::read, clock, messages, id -> Optional.empty(), plans, members);
+    }
+
+    /** Keeps pending lifecycle evidence and current identity checks alongside the submitted execution plan. */
+    public PipelineExplainService(ArtifactQueryService artifacts, CurrentObservationReader observations,
+            Clock clock, ExplanationMessages messages, Function<String, Optional<Pending>> pending,
+            ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations::read, clock, messages, pending, plans, members);
+    }
+
+    public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
+            Clock clock, ExplanationMessages messages, Function<String, Optional<Pending>> pending,
+            ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations::read, clock, messages, pending, plans, members);
     }
 
     private PipelineExplainService(ArtifactQueryService artifacts,
             Function<String, Optional<Observation>> observations, Clock clock, ExplanationMessages messages,
-            Function<String, Optional<Pending>> pending) {
+            Function<String, Optional<Pending>> pending, ExecutionPlans plans, Supplier<List<String>> members) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.messages = Objects.requireNonNull(messages, "messages");
         this.pending = Objects.requireNonNull(pending, "pending");
+        this.plans = Objects.requireNonNull(plans, "plans");
+        this.members = Objects.requireNonNull(members, "members");
     }
 
-    /** Reads one observation once and applies the fixed first-match checklist without writing it back. */
+    /**
+     * Reads one observation once and applies the fixed first-match checklist without writing it back, answering
+     * beside it the plan the pipeline's current run was submitted on where one is recorded.
+     */
     public PipelineExplanation explain(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation observation = observations.apply(pipelineId).orElseThrow(() -> unobserved(pipelineId));
         Pending lifecyclePending = pending.apply(pipelineId).orElse(null);
+        ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+        return diagnose(pipelineId, observation, lifecyclePending)
+                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
+    }
+
+    private PipelineExplanation diagnose(String pipelineId, Observation observation, Pending lifecyclePending) {
         Time time = time(observation.observedAt());
         Facts facts = facts(observation);
 

@@ -9,7 +9,9 @@ import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
+import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.FromClause;
@@ -21,18 +23,23 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
-import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.DagBindings;
+import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
+import io.tapstate.runtime.engine.NodeVertices;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
+import io.tapstate.runtime.engine.SinkTarget;
 import io.tapstate.runtime.engine.ViewSinkWriters;
-import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStoresBinding;
+import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.nest.NestBinding;
 import io.tapstate.runtime.engine.nest.NestClock;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -46,29 +53,35 @@ import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.SinkWriter;
-import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
+import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.transform.TransformPort;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.Deque;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -105,6 +118,12 @@ final class StoreBackedDagSource implements DagSource {
     private final SourcePlacement sourcePlacement;
     private final String cursorWriterToken;
     private final SnapshotBuffer snapshotBuffer;
+    // The members a run built now takes part on, by stable id, read at the moment it is built: the widths of its
+    // nodes are worked out for exactly these, and the plan the run records names them.
+    private final Supplier<List<String>> members;
+    // The one member a source built without a cluster plans over: no cluster names it, so it is named here.
+    private static final String LOCAL_MEMBER = "local";
+    private final ParallelismBudget parallelismBudget;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -140,6 +159,25 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
+     * The assembled source for a cluster: as above, with each run's node widths worked out for the members
+     * {@code members} reports - by stable id - when the run is built, within {@code parallelismBudget}.
+     */
+    StoreBackedDagSource(
+            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
+            SourcePlacement sourcePlacement, Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement,
+                Objects.requireNonNull(storePort, "storePort").artifacts(), members, parallelismBudget);
+    }
+
+    StoreBackedDagSource(StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
+            SourcePlacement sourcePlacement, SnapshotBuffer snapshotBuffer, Supplier<List<String>> members,
+            ParallelismBudget parallelismBudget) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement,
+                storePort.artifacts(), null, Objects.requireNonNull(snapshotBuffer, "snapshotBuffer"),
+                members, parallelismBudget);
+    }
+
+    /**
      * The binder the product is assembled with, named rather than written inline at each construction.
      *
      * <p>It has to be this one and not a method reference to the factory. A method reference binds to the
@@ -169,7 +207,7 @@ final class StoreBackedDagSource implements DagSource {
         String cursorToken = java.util.UUID.randomUUID().toString();
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
-                snapshot, cursorToken, snapshotBuffer);
+                snapshot, cursorToken, snapshotBuffer, members, parallelismBudget);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
@@ -180,7 +218,33 @@ final class StoreBackedDagSource implements DagSource {
         boolean freshFullLoad = captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot), cursorToken,
-                fence -> captured.dagFor(pipelineId, fence, freshFullLoad));
+                () -> captured.plannedTopology(pipelineId, freshFullLoad), captured.sinkConnectors(pipelineId));
+    }
+
+    /**
+     * The connector each of the pipeline's sinks opens: each serve.sync element's target source's, and that of the
+     * managed store a view materializes into, keyed by the sink's node. A view whose store is not configured has
+     * none here; building its sink refuses it with the code that names the missing store.
+     */
+    @Override
+    public Map<String, String> sinkConnectors(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        Map<String, String> connectors = new TreeMap<>();
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            artifacts().get(ViewTargetResolver.resolve(view).sourceId())
+                    .filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast)
+                    .ifPresent(store -> connectors.put(PipelineDagBuilder.viewVertex(view), store.connector()));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (int index = 0; index < serve.sync().size(); index++) {
+                SyncElement element = serve.sync().get(index);
+                connectors.put(PipelineDagBuilder.serveVertex(element, index),
+                        StoredArtifacts.requireSource(artifacts(), element.source()).connector());
+            }
+        }
+        return connectors;
     }
 
     @Override
@@ -239,20 +303,32 @@ final class StoreBackedDagSource implements DagSource {
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement) {
         this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
-                Objects.requireNonNull(storePort, "storePort").artifacts());
+                Objects.requireNonNull(storePort, "storePort").artifacts(), () -> List.of(LOCAL_MEMBER),
+                ParallelismBudget.DEFAULTS);
     }
 
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
-            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore) {
+            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
+            Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
         this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
-                artifactStore, null, null);
+                artifactStore, null, null, members, parallelismBudget);
     }
 
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement,
             ArtifactStore artifactStore, String cursorWriterToken, SnapshotBuffer snapshotBuffer) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
+                artifactStore, cursorWriterToken, snapshotBuffer, () -> List.of(LOCAL_MEMBER),
+                ParallelismBudget.DEFAULTS);
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, SourcePlacement sourcePlacement,
+            ArtifactStore artifactStore, String cursorWriterToken, SnapshotBuffer snapshotBuffer,
+            Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -265,6 +341,8 @@ final class StoreBackedDagSource implements DagSource {
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
         this.cursorWriterToken = cursorWriterToken;
         this.snapshotBuffer = snapshotBuffer;
+        this.members = Objects.requireNonNull(members, "members");
+        this.parallelismBudget = Objects.requireNonNull(parallelismBudget, "parallelismBudget");
     }
 
     @Override
@@ -279,22 +357,50 @@ final class StoreBackedDagSource implements DagSource {
      */
     @Override
     public DAG dagFor(String pipelineId, ExecutionFence fence) {
-        PipelineResource pipeline = PipelineInlining.inline(
-                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
-        return dagFor(pipelineId, fence, pipeline, freshFullLoad(pipeline));
+        return plannedDagFor(pipelineId, fence).dag();
     }
 
-    private DAG dagFor(String pipelineId, ExecutionFence fence, boolean freshFullLoad) {
-        PipelineResource pipeline = PipelineInlining.inline(
-                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
-        return dagFor(pipelineId, fence, pipeline, freshFullLoad);
+    /**
+     * The topology, held to {@code fence}'s run, together with how wide it was planned to run: each node's width,
+     * worked out for the members taking part as the run is built, and the batch each node takes its input in.
+     */
+    @Override
+    public PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
+        return plannedTopology(pipelineId).apply(fence);
     }
 
-    private DAG dagFor(
-            String pipelineId, ExecutionFence fence, PipelineResource pipeline, boolean freshFullLoad) {
+    /**
+     * Works out {@code pipelineId}'s run as far as it can be without the run's capture - each step's recorded
+     * shape, the table every stream lands in, and how wide each node runs among the members taking part - and
+     * answers the builder of its topology, held to a fence's run. A start asks this before it opens its capture,
+     * so a start refused here, for a width it cannot honour or for anything else found on the way, has opened no
+     * connector and left the pipeline on no mining chain: a consumer left there would hold back every pipeline
+     * reading the same table from it. The topology itself waits for the capture, because its source vertices read
+     * the ring generation the capture opens and how far into each ring the pipeline is done.
+     */
+    Function<ExecutionFence, PlannedDag> plannedTopology(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return plannedTopology(pipelineId, pipeline, freshFullLoad(pipeline));
+    }
+
+    /**
+     * As above, for a start that has already worked out whether its pipeline loads from nothing. That answer
+     * belongs to the start before its capture registers a ring cursor and a snapshot seam, both of which a later
+     * read would take for progress.
+     */
+    Function<ExecutionFence, PlannedDag> plannedTopology(String pipelineId, boolean freshFullLoad) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return plannedTopology(pipelineId, pipeline, freshFullLoad);
+    }
+
+    private Function<ExecutionFence, PlannedDag> plannedTopology(
+            String pipelineId, PipelineResource pipeline, boolean freshFullLoad) {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+        refuseProgressNoSinkCanAnswerFor(pipelineId, pipeline, sourceVertices);
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
         // re-discovery change the shape of this run's input while the run is already using it.
@@ -364,16 +470,127 @@ final class StoreBackedDagSource implements DagSource {
                     bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
         }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
+        // A nest with nothing to assemble passes its root's rows on under their own streams, not under the nest's,
+        // so each stream they arrive on is landed where the nest's documents land: in its target, matched on its
+        // root's key, and routed among a sink's writers by those.
+        Map<String, Set<String>> passedOn =
+                passedOnStreams(pipeline, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
+        Set<String> serveLanding = landing(pipelineId, serveStreams, targets, passedOn);
+        Set<String> viewLanding = landing(pipelineId, viewStreams, viewTargets, passedOn);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         PipelineResource builtPipeline = new PipelineResource(
                 pipeline.id(), pipeline.metadata(),
                 pipeline.sources().stream().filter(ref -> sourceKeysById.containsKey(ref.id())).toList(),
                 pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental());
-        return PipelineDagBuilder.build(
-                builtPipeline,
-                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                        serveStreams, viewStreams, stepIds, frontier, compiledJoins, freshFullLoad, fence),
-                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier);
+        List<String> planned = List.copyOf(members.get());
+        ExecutionShape shape = ExecutionShapes.of(pipelineId, pipeline, planned.size(), parallelismBudget,
+                new ExecutionShapes.Graph(
+                        ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
+                        streamOfSourceVertex(sourceVertices),
+                        keyColumnsOf(bySourceTable),
+                        keyColumnsOf(assembled),
+                        PipelineDagBuilder.nestBlockingVertices(pipeline,
+                                nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
+                        sourceExecutions(sourceVertices)),
+                sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
+        return fence -> {
+            NodeVertices drawn = new NodeVertices();
+            DAG dag = PipelineDagBuilder.build(
+                    builtPipeline,
+                    bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
+                            serveLanding, viewLanding, stepIds, frontier, compiledJoins, freshFullLoad, fence),
+                    FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier,
+                    shape, drawn);
+            return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
+                    drawn.feedingByNode());
+        };
+    }
+
+    /**
+     * The batch each node takes its input in, by the node the run's shape names it: the batch written on it, or
+     * the default batch where none was. A source vertex takes its source's.
+     */
+    private Map<String, BatchSpec> nodeBatches(PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
+        Map<String, BatchSpec> batches = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> batches.put(key,
+                batchOrDefaults(StoredArtifacts.requireSource(artifacts(), vertex.sourceId()).execution())));
+        if (pipeline.transforms() != null) {
+            pipeline.transforms().forEach(step -> batches.put(step.id(), batchOrDefaults(step.execution())));
+        }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            batches.put(PipelineDagBuilder.viewVertex(view), batchOrDefaults(view.execution()));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (int index = 0; index < serve.sync().size(); index++) {
+                SyncElement element = serve.sync().get(index);
+                batches.put(PipelineDagBuilder.serveVertex(element, index), batchOrDefaults(element.execution()));
+            }
+        }
+        return batches;
+    }
+
+    private static BatchSpec batchOrDefaults(ExecutionSpec execution) {
+        return execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults();
+    }
+
+    /**
+     * Each sink the pipeline draws, with the table every stream reaching it lands in and that table's key - the
+     * tables its writers are handed. A view writes every stream into its one collection, keyed on the view's key;
+     * a {@code serve.sync} element writes each stream into the table its rename rules name, keyed as that
+     * table's model is.
+     */
+    private static List<ExecutionShapes.Sink> sinksOf(PipelineResource pipeline, Map<String, TargetTable> targets,
+            Set<String> serveStreams, Set<String> viewStreams, Map<String, String> sourceIdByTable) {
+        List<ExecutionShapes.Sink> sinks = new ArrayList<>();
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view);
+            Map<String, SinkTarget> lands = new LinkedHashMap<>();
+            viewStreams.forEach(stream ->
+                    lands.put(stream, new SinkTarget(target.collection(), List.of(target.primaryKey()))));
+            sinks.add(new ExecutionShapes.Sink(PipelineDagBuilder.viewVertex(view), view.execution(), lands));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (int index = 0; index < serve.sync().size(); index++) {
+                SyncElement element = serve.sync().get(index);
+                Map<String, SinkTarget> lands = new LinkedHashMap<>();
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable)
+                        .forEach((stream, table) ->
+                                lands.put(stream, new SinkTarget(table.name(), keyColumnsOf(table))));
+                sinks.add(new ExecutionShapes.Sink(
+                        PipelineDagBuilder.serveVertex(element, index), element.execution(), lands));
+            }
+        }
+        return sinks;
+    }
+
+    /** The execution block written on the source each source vertex reads, for the vertices whose source has one. */
+    private Map<String, ExecutionSpec> sourceExecutions(Map<String, SourceVertex> sourceVertices) {
+        Map<String, ExecutionSpec> executions = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> {
+            ExecutionSpec execution = StoredArtifacts.requireSource(artifacts(), vertex.sourceId()).execution();
+            if (execution != null) {
+                executions.put(key, execution);
+            }
+        });
+        return executions;
+    }
+
+    /** The stream each source vertex emits: the table it reads, which is what its rows name as their stream. */
+    private static Map<String, String> streamOfSourceVertex(Map<String, SourceVertex> sourceVertices) {
+        Map<String, String> streams = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> streams.put(key, vertex.table()));
+        return streams;
+    }
+
+    /** The key columns of each target model, in key order; empty for a model with no key. */
+    private static Map<String, List<String>> keyColumnsOf(Map<String, TargetTable> models) {
+        Map<String, List<String>> keys = new LinkedHashMap<>();
+        models.forEach((name, model) -> keys.put(name, model == null ? List.of() : keyColumnsOf(model)));
+        return keys;
+    }
+
+    private static List<String> keyColumnsOf(TargetTable model) {
+        return model.fields().stream().filter(TargetField::primaryKey).map(TargetField::name).toList();
     }
 
     /**
@@ -1307,14 +1524,23 @@ final class StoreBackedDagSource implements DagSource {
      * source the pipeline reads. The map is built here, on the assembly side; only serializable
      * coordinates ship.
      */
-    private SinkAckFactory sinkAckFactory(PipelineResource pipeline, String pipelineId) {
+    private SinkAckFactory sinkAckFactory(PipelineResource pipeline, String pipelineId, ExecutionFence fence) {
         // A snapshot-only read deliberately has no durable change-chain position. Its order exists for
         // stateful processing, not as a position a later tail can resume from, so settling it must not
         // manufacture a chain acknowledgement or ask for a cdc seam that cannot exist.
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             return SinkAckFactory.NONE;
         }
-        return new StoreBackedSinkAckFactory(progressByTable(pipeline), storePort.meta());
+        return new StoreBackedSinkAckFactory(progressByTable(pipeline), pipelineId, runIdOf(fence));
+    }
+
+    /**
+     * The name this run's writers report their progress under. A fenced run is named by its execution
+     * generation, which every submission moves; a single-member run has no generation and takes a name of
+     * its own, so no two starts ever share one and a writer of an earlier start lands nothing in a later one.
+     */
+    private static String runIdOf(ExecutionFence fence) {
+        return fence != null ? "g" + fence.executionGeneration() : "local-" + UUID.randomUUID();
     }
 
     /**
@@ -1641,10 +1867,7 @@ final class StoreBackedDagSource implements DagSource {
         // A unique current value says nothing about what the capture stream puts in an earlier image.
         // Guard only an accepted alternate identity: the discovered primary identity is the capture
         // contract already used throughout the pipeline, while an alternate has no such guarantee.
-        return alternateKey
-                ? () -> ViewSinkWriters.requireAlternateKeyInBeforeImage(
-                        writer.get(), viewId, viewKey)
-                : writer;
+        return alternateKey ? ViewSinkWriters.requiringAlternateKeyInBeforeImage(writer, viewId, viewKey) : writer;
     }
 
     /**
@@ -1797,6 +2020,81 @@ final class StoreBackedDagSource implements DagSource {
         return List.of();
     }
 
+    /**
+     * Refuses a run whose retained progress no one sink can answer for, before the run opens anything: the
+     * pipeline's retained state has to be cleared and its data loaded again, or a new starting point accepted on
+     * purpose. Where reading starts is not progress a sink made, so a ring cursor alone does not count.
+     *
+     * <p>Before each sink kept its own progress, a source node kept one confirmed position - moved by
+     * whichever of its sinks confirmed first - and one list of the loads its sinks had finished. Where more than
+     * one sink reads it, that position may be one only the fastest sink reached, and resuming from it would skip
+     * for good what a slower sink had not written; so such progress, with nothing kept per writer beside it, is
+     * refused. A source node only one sink reads is exempt, since whatever position it holds, that sink
+     * reached. Progress a pipeline kept under its own name, from before each of its source nodes had a record of
+     * its own, is the capture's to refuse as it registers the source, with the diagnostic for recovery it cannot
+     * prove.
+     */
+    private void refuseProgressNoSinkCanAnswerFor(
+            String pipelineId, PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Map<SourceNode, Integer> sinksBySource = new LinkedHashMap<>();
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()) {
+            Set<String> read = sourceIdsReaching(
+                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
+            int sinks = serve.sync().size();
+            sourceNodesOf(read, sourceVertices).forEach(node -> sinksBySource.merge(node, sinks, Integer::sum));
+        }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            Set<String> read = sourceIdsReaching(
+                    pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
+            sourceNodesOf(read, sourceVertices).forEach(node -> sinksBySource.merge(node, 1, Integer::sum));
+        }
+        sinksBySource.forEach((node, sinks) -> {
+            if (sinks > 1 && heldForEverySinkAtOnce(node.chain(), node.consumerId())) {
+                throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS, Map.of("pipeline", pipelineId),
+                        null);
+            }
+        });
+    }
+
+    /** Where one source node keeps its progress: the chain it reads, and the consumer naming it there. */
+    private record SourceNode(String chain, String consumerId) {
+        static SourceNode of(SourceVertex vertex) {
+            return new SourceNode(vertex.resolution().chainId().value(), vertex.consumerId());
+        }
+    }
+
+    /** The source nodes named in {@code sourceIds}, each once however many of its tables the pipeline reads. */
+    private static Set<SourceNode> sourceNodesOf(Set<String> sourceIds, Map<String, SourceVertex> sourceVertices) {
+        Set<SourceNode> nodes = new LinkedHashSet<>();
+        sourceVertices.values().forEach(vertex -> {
+            if (sourceIds.contains(vertex.sourceId())) {
+                nodes.add(SourceNode.of(vertex));
+            }
+        });
+        return nodes;
+    }
+
+    /**
+     * Whether {@code consumerId} holds progress on {@code chain} recorded once for all its sinks - a confirmed
+     * position, or a load marked finished - with no writer's own progress kept beside it. A position at the load's
+     * seam is not such progress: it sits beneath every change, so a run resuming from it reads them all again and
+     * skips nothing any sink held, which is also why a direct channel's capture may record one before any run of
+     * its sinks has begun.
+     */
+    private boolean heldForEverySinkAtOnce(String chain, String consumerId) {
+        boolean recordedForAll = storePort.meta().read(chain)
+                .flatMap(meta -> meta.consumerOffset(consumerId))
+                .map(consumer -> consumer.sinkAcked() != null
+                                && consumer.sinkAcked().order() != null
+                                && consumer.sinkAcked().order().seq() != SourceOrder.SNAPSHOT_SEQ
+                        || !consumer.snapshotCompletedTables().isEmpty())
+                .orElse(false);
+        return recordedForAll && storePort.meta().writerRun(chain, consumerId).isEmpty();
+    }
+
     /** The source artifacts whose rows can reach one terminal reference. */
     private static Set<String> sourceIdsReaching(
             PipelineResource pipeline,
@@ -1844,6 +2142,79 @@ final class StoreBackedDagSource implements DagSource {
                 }
             }
         }
+    }
+
+    /**
+     * Each nest step with nothing to assemble, with the streams its root's rows arrive on - which are the streams
+     * they leave it on, since such a nest passes each row on as it came.
+     */
+    private static Map<String, Set<String>> passedOnStreams(
+            PipelineResource pipeline,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds) {
+        Map<String, Set<String>> passedOn = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
+                    && (nest.root().embed() == null || nest.root().embed().isEmpty())
+                    && inline.from() instanceof FromClause.Aliases aliases
+                    && aliases.aliases().get(nest.root().from()) != null) {
+                passedOn.put(step.id(), streamsReaching(pipeline, aliases.aliases().get(nest.root().from()),
+                        sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
+            }
+        }
+        return passedOn;
+    }
+
+    /**
+     * The streams a sink's rows arrive on: {@code streams}, and for each nest among them that assembles nothing, the
+     * streams its rows are actually on - each landing in that nest's target in {@code targets}.
+     *
+     * <p>A sink names one target per stream. So a stream that reaches it both as such a nest's documents and another
+     * way - as itself, or as another such nest's documents - lands one way only, and only where the two land it in
+     * the same table on the same key; otherwise the rows of one way would be routed and matched on a key they were
+     * not given, and the start is refused here, before anything opens.
+     */
+    private static Set<String> landing(String pipelineId, Set<String> streams, Map<String, TargetTable> targets,
+            Map<String, Set<String>> passedOn) {
+        Set<String> landing = new LinkedHashSet<>(streams);
+        Map<String, String> landedBy = new LinkedHashMap<>();
+        for (String stream : streams) {
+            TargetTable target = targets.get(stream);
+            if (target == null || !passedOn.containsKey(stream)) {
+                continue;
+            }
+            Set<String> seen = new HashSet<>();
+            Deque<String> pending = new ArrayDeque<>(passedOn.get(stream));
+            while (!pending.isEmpty()) {
+                String arriving = pending.pop();
+                if (!seen.add(arriving)) {
+                    continue;
+                }
+                if (passedOn.containsKey(arriving)) {
+                    // One nest with nothing to assemble reading another: its rows are that one's rows.
+                    pending.addAll(passedOn.get(arriving));
+                    continue;
+                }
+                String other = streams.contains(arriving) ? arriving : landedBy.get(arriving);
+                if (other == null) {
+                    landing.add(arriving);
+                    landedBy.put(arriving, stream);
+                    targets.put(arriving, target);
+                } else if (!landsAlike(targets.get(arriving), target)) {
+                    throw new TapstateException(ActuationError.STREAM_LANDS_TWO_WAYS, Map.of(
+                            "pipeline", pipelineId, "stream", arriving, "nest", stream, "other", other), null);
+                }
+            }
+        }
+        return landing;
+    }
+
+    /** Whether two targets land a row alike: in the same table, matched on the same key. */
+    private static boolean landsAlike(TargetTable one, TargetTable other) {
+        return one != null && other != null && one.name().equals(other.name())
+                && keyColumnsOf(one).equals(keyColumnsOf(other));
     }
 
     /** The stream ids a terminal sink can receive: source tables, or a nest step's assembled stream id. */
@@ -2384,7 +2755,12 @@ final class StoreBackedDagSource implements DagSource {
                 doneThrough, sourceContextEpoch(chainId, vertex.consumerId(), vertex.table()),
                 CaptureRunUnit.readCursorPublisher(chainId, vertex.consumerId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
-                snapshotToken);
+                readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.sourceId())), snapshotToken);
+    }
+
+    /** The source reader's input batch, independently of connector fetch size. */
+    static int readBatchOf(SourceResource source) {
+        return batchOrDefaults(source.execution()).effectiveMaxRecords();
     }
 
     /**

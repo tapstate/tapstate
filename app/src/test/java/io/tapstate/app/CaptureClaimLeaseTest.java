@@ -66,6 +66,30 @@ class CaptureClaimLeaseTest {
     }
 
     /**
+     * A claim is renewed from the moment it is taken, before the capture it guards is open, so it can be lost
+     * before there is anything to stop. That loss is not dropped: binding the stop answers it at once, since
+     * the capture was opened over a claim somebody else may hold now.
+     */
+    @Test
+    void aClaimLostBeforeItsCaptureIsOpenStopsTheCaptureAsSoonAsItIsBound() {
+        RefusingRenewals raw = new RefusingRenewals();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate,
+                new ClusterWorkloadClaims(raw, gate), Duration.ofSeconds(30));
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), Duration.ofHours(1));
+
+        lease.renew();
+        AtomicBoolean lost = new AtomicBoolean();
+        lease.onLost(() -> lost.set(true));
+        lease.close();
+
+        assertThat(lost).as("the capture opened meanwhile is stopped once there is one to stop").isTrue();
+        assertThat(raw.releases).as("and a claim this member no longer owns is not released").isZero();
+    }
+
+    /**
      * A member joining the cluster moves the committed topology on and takes nothing from a capture already
      * being tailed, so its holder goes on holding it -- the lease is carried past the one it had when the
      * member joined, under the same owner and generation. Refusing the renewal instead stopped every tail

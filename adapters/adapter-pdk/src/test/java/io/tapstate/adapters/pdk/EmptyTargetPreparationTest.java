@@ -74,6 +74,51 @@ class EmptyTargetPreparationTest {
         }
     }
 
+    /**
+     * A run prepares each table once, and the writers opened for it afterwards - several of one sink - only
+     * write: none of them creates or clears a table again, however many open.
+     */
+    @Test
+    void aRunPreparesEachTableOnceAndTheWritersItOpensPrepareNothing(@TempDir Path dir) throws Exception {
+        Path trace = Files.createFile(dir.resolve("trace"));
+        var port = port(dir, trace, true, new State());
+        Map<String, TargetTable> targets = Map.of("source", TARGET);
+
+        port.prepare(config(OnFullLoad.CLEAR, true), targets);
+        try (var first = port.openPrepared(config(OnFullLoad.CLEAR, true), targets);
+                var second = port.openPrepared(config(OnFullLoad.CLEAR, true), targets)) {
+            assertThat(Files.readAllLines(trace)).containsExactly("create:target", "clear:target", "stop");
+        }
+        assertThat(Files.readAllLines(trace))
+                .containsExactly("create:target", "clear:target", "stop", "stop", "stop");
+    }
+
+    /** A writer of a table no run prepared is refused before it opens a connector at all. */
+    @Test
+    void aWriterOfATableNoRunPreparedIsRefusedBeforeItOpensAConnector(@TempDir Path dir) throws Exception {
+        Path trace = Files.createFile(dir.resolve("trace"));
+        var port = port(dir, trace, true, new State());
+
+        assertThatThrownBy(() -> port.openPrepared(config(OnFullLoad.CLEAR, true), Map.of("source", TARGET)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("target").hasMessageContaining("not prepared");
+        assertThat(Files.readAllLines(trace)).isEmpty();
+    }
+
+    /** Preparing that fails is coded as it was when a writer prepared, and leaves the connector stopped. */
+    @Test
+    void aRunsPreparationThatFailsIsCodedAndStopsTheConnector(@TempDir Path dir) throws Exception {
+        Path trace = Files.createFile(dir.resolve("trace"));
+        var port = port(dir, trace, true, new State());
+
+        assertThatThrownBy(() -> port.prepare(config(OnFullLoad.FAIL, true), Map.of("source", TARGET)))
+                .isInstanceOfSatisfying(TapstateException.class, e -> {
+                    assertThat(e.code()).isEqualTo(ConnectorError.WRITE_FAILED);
+                    assertThat(e.getMessage()).contains("not empty");
+                });
+        assertThat(Files.readAllLines(trace)).containsExactly("create:target", "count:target", "stop");
+    }
+
     private static SinkConfig config(OnFullLoad policy, boolean fullLoad) {
         return new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, TARGET, NODE, policy, fullLoad);
     }

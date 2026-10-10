@@ -53,17 +53,24 @@ final class RealProcessServer implements ServerHandle {
     private final Path output;
     private final Path stagingDirectory;
     private final List<String> launchCommand;
+    private final boolean ownsStagingDirectory;
 
     RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory) {
-        this(process, baseUrl, output, stagingDirectory, List.of());
+        this(process, baseUrl, output, stagingDirectory, List.of(), true);
     }
 
     RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory, List<String> launchCommand) {
+        this(process, baseUrl, output, stagingDirectory, launchCommand, true);
+    }
+
+    private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory,
+            List<String> launchCommand, boolean ownsStagingDirectory) {
         this.process = process;
         this.baseUrl = baseUrl;
         this.output = output;
         this.stagingDirectory = stagingDirectory;
         this.launchCommand = List.copyOf(launchCommand);
+        this.ownsStagingDirectory = ownsStagingDirectory;
     }
 
     /** Launches the deliverable and returns once its health probe answers. */
@@ -113,6 +120,20 @@ final class RealProcessServer implements ServerHandle {
     static RealProcessServer start(String storeUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
         return healthy(launching(storeUri, bootJar(), listenAddress, extraArguments));
+    }
+
+    /**
+     * The same, staging the connectors it resolves into {@code stagingDirectory} rather than a directory of this
+     * launch's own, which it then leaves where it is when it ends; null for a directory of the launch's own.
+     *
+     * <p>For a witness whose subject is a member that cannot stage what it is asked to load. A parameter rather than
+     * something a caller appends, for the reason the listen address is one: the standing setting would be joined
+     * with the caller's by a comma rather than replaced by it.
+     */
+    static RealProcessServer start(String storeUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return healthy(launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
+                List.of(), stagingDirectory, extraArguments));
     }
 
     /**
@@ -170,6 +191,12 @@ final class RealProcessServer implements ServerHandle {
         return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
     }
 
+    /** The same, staging into the directory a witness names, which the launch leaves where it is as it ends. */
+    static RealProcessServer launching(String storeUri, Path jar, Path stagingDirectory) {
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar, LOOPBACK, List.of(), stagingDirectory,
+                port -> List.of());
+    }
+
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar) {
         return launching(storeUri, operatorStateDatabase, jar, List.of());
     }
@@ -222,7 +249,7 @@ final class RealProcessServer implements ServerHandle {
 
     static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
-        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(), extraArguments);
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(), null, extraArguments);
     }
 
     /**
@@ -234,7 +261,7 @@ final class RealProcessServer implements ServerHandle {
      */
     static RealProcessServer startInJvm(String storeUri, List<String> jvmOptions) {
         return healthy(launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
-                jvmOptions, port -> List.of()));
+                jvmOptions, null, port -> List.of()));
     }
 
     /**
@@ -260,32 +287,41 @@ final class RealProcessServer implements ServerHandle {
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments, List<String> jvmArguments) {
-        return launching(storeUri, operatorStateDatabase, jar, listenAddress, jvmArguments, extraArguments);
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, jvmArguments, null, extraArguments);
     }
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, jvmOptions, null, extraArguments);
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Path stagingDirectory = ServerHandle.privateStagingDirectory();
+        boolean owned = stagingDirectory == null;
+        Path staging = owned ? ServerHandle.privateStagingDirectory() : stagingDirectory;
         Launched launched;
         try {
             launched = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                    workingDirectory, output, stagingDirectory, extraArguments.apply(port));
+                    workingDirectory, output, staging, extraArguments.apply(port));
         } catch (RuntimeException | Error failure) {
-            // No child was returned; these pre-launch artifacts have no live process using them.
-            try {
-                ServerHandle.discardStagingDirectory(stagingDirectory);
-            } catch (RuntimeException cleanup) {
-                failure.addSuppressed(cleanup);
+            // A caller's directory is never this launch's to discard, even if the child was not returned.
+            if (owned) {
+                try {
+                    ServerHandle.discardStagingDirectory(staging);
+                } catch (RuntimeException cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
             }
             throw failure;
         }
-        return new RealProcessServer(launched.process(), baseUrl, output, stagingDirectory, launched.command());
+        return new RealProcessServer(launched.process(), baseUrl, output, staging, launched.command(), owned);
     }
 
     /**
@@ -308,7 +344,7 @@ final class RealProcessServer implements ServerHandle {
             throw new AssertionError("interrupted while waiting for the killed server to go away", e);
         }
         // The harness's own leftovers, not the server's: a crash witness may never close what it killed.
-        ServerHandle.discardStagingDirectory(stagingDirectory);
+        discardOwnStagingDirectory();
     }
 
     @Override
@@ -323,6 +359,14 @@ final class RealProcessServer implements ServerHandle {
      */
     Path output() {
         return output;
+    }
+
+    /**
+     * The operating system's id for this process: what a connector running inside it names itself by, and so how
+     * a case finds the member carrying a write the connector reports.
+     */
+    long pid() {
+        return process.pid();
     }
 
     /** Where this launch staged its connectors, for a witness that the directory goes when the launch does. */
@@ -362,11 +406,6 @@ final class RealProcessServer implements ServerHandle {
         } catch (IOException unavailable) { throw new UncheckedIOException(unavailable); }
     }
 
-    /** The child JVM identity used by external benchmark resource sampling. */
-    long pid() {
-        return process.pid();
-    }
-
     /**
      * What it exited with, for a witness whose subject is the server declining to start.
      *
@@ -396,7 +435,11 @@ final class RealProcessServer implements ServerHandle {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
         }
-        if (!process.isAlive()) {
+        discardOwnStagingDirectory();
+    }
+
+    private void discardOwnStagingDirectory() {
+        if (ownsStagingDirectory && !process.isAlive()) {
             ServerHandle.discardStagingDirectory(stagingDirectory);
         }
     }
@@ -424,8 +467,9 @@ final class RealProcessServer implements ServerHandle {
                 "--tapstate.store.mongo.uri=" + storeUri,
                 "--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                 "--tapstate.store.mongo.server-selection-timeout=5s",
-                // A staging directory of this launch's own, for the same reason the other tier gets one:
-                // the cache is content-addressed and reused, so a shared one serves a stale connector.
+                // A staging directory of this launch's own unless a witness names one, for the same reason
+                // the other tier gets one: the cache is content-addressed and reused, so a shared one serves
+                // a stale connector.
                 "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                 "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         // After the standing ones, and additional to them rather than replacing any: a repeated option

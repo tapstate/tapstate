@@ -6,6 +6,7 @@ import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import io.tapstate.spi.sink.TargetTable;
 import java.util.Map;
@@ -23,6 +24,7 @@ public final class PdkSinkPort implements SinkPort {
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
     private final PdkExternalCallStats externalCalls;
+    private final SharedSinkConnectors sharing;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkSinkPort(ConnectorProvisioner provisioner) {
@@ -30,13 +32,27 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
-        this(provisioner, stateStore, PdkExternalCallStats.disabled());
+        this(provisioner, stateStore, null, PdkExternalCallStats.disabled());
     }
 
     public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
             PdkExternalCallStats externalCalls) {
+        this(provisioner, stateStore, null, externalCalls);
+    }
+
+    /**
+     * As above, sharing one connector among the writers of a sink where its artifact is certified for that, as
+     * {@code sharing} keeps them on this member; null opens one per writer whatever the artifact.
+     */
+    public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, SharedSinkConnectors sharing) {
+        this(provisioner, stateStore, sharing, PdkExternalCallStats.disabled());
+    }
+
+    public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
+            SharedSinkConnectors sharing, PdkExternalCallStats externalCalls) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
+        this.sharing = sharing;
         this.externalCalls = Objects.requireNonNull(externalCalls, "externalCalls");
     }
 
@@ -52,9 +68,116 @@ public final class PdkSinkPort implements SinkPort {
 
     /** Opens one member-side writer with the log owner captured when its DAG was built. */
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets, LogSink.Scope logScope) {
+        return open(config, provisioner.resolve(config.connectorId()), targets, false, logScope);
+    }
+
+    /**
+     * A writer for tables prepared before it opened, by {@link #prepare}: refused, before any connector is opened,
+     * unless each one was; then it only writes rows. Several writers of one sink open this way, and none of them
+     * clears a table another has started writing.
+     *
+     * <p>Each opens a connector of its own, unless the artifact is certified to be shared: then the writers of a
+     * sink on this member share one, started by the first of them and stopped by the last.
+     */
+    public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
+        return openPrepared(config, targets, null);
+    }
+
+    /** Opens a prepared writer with the execution owner captured by its factory. */
+    public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets, LogSink.Scope logScope) {
+        PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values());
+        ConnectorRef ref = provisioner.resolve(config.connectorId());
+        if (sharing == null || config.node() == null || !ref.shareSafe()) {
+            return open(config, ref, targets, true, logScope);
+        }
+        PdkConnector connector = sharing.acquire(config.node(), config.connectorId(), ref, logScope,
+                () -> started(config, ref, logScope));
+        Runnable letGo = () -> sharing.release(config.node(), config.connectorId(), ref, logScope);
+        try {
+            return writerOver(connector, config, targets, letGo);
+        } catch (Throwable t) {
+            // However the writer failed to open, it lets go of the hold it took: the last hold stops the connector.
+            letGo.run();
+            throw t;
+        }
+    }
+
+    /** A writer over {@code connector}, which the writers of its sink share; closing it runs {@code letGo}. */
+    private PdkSinkWriter writerOver(PdkConnector connector, SinkConfig config, Map<String, TargetTable> targets,
+            Runnable letGo) {
+        WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
+        try {
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true,
+                    letGo, externalCalls);
+            writer.prepareTargets();
+            return writer;
+        } catch (TapstateException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
+        }
+    }
+
+    /** A connector opened and started for the writers that will share it, stopped again if it fails to start. */
+    private PdkConnector started(SinkConfig config, ConnectorRef ref, LogSink.Scope logScope) {
+        PdkConnector connector = PdkConnector.open(
+                config.connectorId(), ref, config.settings(), config.node(), stateStore, logScope);
+        try {
+            connector.underLoader(() -> {
+                connector.connector().init(connector.context());
+                return null;
+            });
+            return connector;
+        } catch (Throwable t) {
+            connector.stopQuietly();
+            connector.close();
+            throw t instanceof TapstateException coded
+                    ? coded : PdkSinkWriter.writeFailed(connector.connectorId(), t);
+        }
+    }
+
+    /**
+     * Prepares each of {@code targets} for the writers that will write it - created where it is missing, cleared
+     * or checked as the full-load policy says, indexed - on a connector opened for that alone and closed again.
+     * A table prepared before, as its receipt says, is not cleared again. A failure is coded as a write failure,
+     * as it was when each writer prepared its own tables.
+     */
+    public void prepare(SinkConfig config, Map<String, TargetTable> targets) {
+        prepare(config, targets, null);
+    }
+
+    /** Prepares tables under the same frozen owner the execution's writers will carry. */
+    public void prepare(SinkConfig config, Map<String, TargetTable> targets, LogSink.Scope logScope) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
                 config.node(), stateStore, logScope);
+        try {
+            connector.underLoader(() -> {
+                connector.connector().init(connector.context());
+                PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
+                        connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
+                        config.node(), stateStore);
+                for (TargetTable target : targets.values()) {
+                    TapTable table = TargetTapTable.build(target);
+                    connector.resolveTargetTypes(table);
+                    preparation.prepare(target, table);
+                }
+                return null;
+            });
+        } catch (TapstateException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
+        } finally {
+            connector.stopQuietly();
+            connector.close();
+        }
+    }
+
+    private SinkWriter open(SinkConfig config, ConnectorRef ref, Map<String, TargetTable> targets,
+            boolean preparedAhead, LogSink.Scope logScope) {
+        PdkConnector connector = PdkConnector.open(config.connectorId(), ref, config.settings(), config.node(),
+                stateStore, logScope);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());
@@ -67,7 +190,8 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, externalCalls);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead,
+                    null, externalCalls);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {

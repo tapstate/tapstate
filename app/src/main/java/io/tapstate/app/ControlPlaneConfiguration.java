@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
@@ -17,6 +18,7 @@ import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
+import io.tapstate.control.core.ExecutionAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -126,6 +128,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.util.function.Consumer;
+import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Wires the control plane into the assembly root: the authentication ports over the store, the control-core
@@ -237,7 +241,24 @@ class ControlPlaneConfiguration {
                 new StoreBackedPipelineCaptures(storePort),
                 claims.getIfAvailable(),
                 storePort.desired(),
-                clusterProperties.getId());
+                clusterProperties.getId(),
+                executionPlans(engine));
+    }
+
+    /**
+     * Where a read face reads the plan of each pipeline's current run from: the cluster's own record of it,
+     * whichever member submitted the run, or nowhere on a server that is no cluster member.
+     */
+    private static ExecutionPlans executionPlans(HazelcastInstance engine) {
+        return engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine);
+    }
+
+    /**
+     * The members a run would take part on now, by stable id; none on a server that is no cluster member, and none
+     * while this member's engine cannot be asked.
+     */
+    private static Supplier<List<String>> dataMembers(HazelcastInstance engine) {
+        return engine == null ? List::of : () -> ClusterMembershipGate.dataMembersIfReadable(engine);
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----
@@ -347,10 +368,13 @@ class ControlPlaneConfiguration {
         // lands in a document store as a key that store reads as a path, so the ordinary read for it
         // answers nothing and no index can be declared over it. Nothing downstream of apply says this,
         // and the discovered model already holds the name, so this is the one moment it can be said.
+        // Last, how the batch asks its nodes to run where that will not happen as written: a
+        // pipeline-level parallelism or batch size nothing reads, and a source asking for parallel reads.
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
-                        new DocumentKeyAdvisories()),
+                        new DocumentKeyAdvisories(),
+                        new ExecutionAdvisories()),
                 derivation, livePipelines, DeploymentProfile.parse(deploymentProfile));
     }
 
@@ -672,8 +696,11 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
-            ArtifactQueryService artifactQueryService, CurrentObservationReader observations) {
-        return new PipelineObservationQueryService(artifactQueryService, observations);
+            ArtifactQueryService artifactQueryService, CurrentObservationReader observations,
+            ObjectProvider<HazelcastInstance> member) {
+        HazelcastInstance engine = member.getIfAvailable();
+        return new PipelineObservationQueryService(artifactQueryService, observations,
+                executionPlans(engine), dataMembers(engine));
     }
 
     @Bean
@@ -717,16 +744,19 @@ class ControlPlaneConfiguration {
     PipelineExplainService pipelineExplainService(
             ArtifactQueryService artifactQueryService, CurrentObservationReader observations, Clock clock,
             LifecyclePendingRegistry pending, StorePort storePort, ObjectProvider<ObservationScopeRegistry> scopes,
-            ClusterMembershipGate membership, ClusterProperties cluster, ClusterIdentityStore identities) {
+            ClusterMembershipGate membership, ClusterProperties cluster, ClusterIdentityStore identities,
+            ObjectProvider<HazelcastInstance> member) {
         String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
                 ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, identities) : cluster.getId();
         ObservationScopeRegistry local = scopes.getIfAvailable();
         LifecyclePendingProjection projection = local == null ? null
                 : new LifecyclePendingProjection(pending, storePort, local, membership, clusterId);
         ExplanationCatalog messages = ExplanationCatalog.bundled();
+        HazelcastInstance engine = member.getIfAvailable();
         return new PipelineExplainService(
                 artifactQueryService, observations, clock, messages::render,
-                projection == null ? pending::pending : projection::pending);
+                projection == null ? pending::pending : projection::pending,
+                executionPlans(engine), dataMembers(engine));
     }
 
     /**

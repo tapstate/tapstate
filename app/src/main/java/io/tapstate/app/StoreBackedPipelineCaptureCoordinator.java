@@ -115,6 +115,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private volatile long shutdownDeadline;
 
     /**
+     * The claims this member has taken on captures it has not opened yet, each renewed from the moment it
+     * was taken. Opening a capture can take longer than a lease, and a claim nothing renewed meanwhile has
+     * run out by the time its tail is open. Handed to the capture once it is open, or closed -- which lets
+     * the claim go -- when the start that took it does not get that far.
+     */
+
+    /**
      * The pipelines here reading a capture another member holds, by capture. Kept for the moment this
      * member takes such a capture over, by a start of its own or because nobody tails it any more: its
      * tail then runs for these pipelines as well, and has to outlast the last of them rather than the
@@ -1706,7 +1713,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // A table this run skipped may not have been published by its hand-off yet, because another
         // table is still being read. Its sink's durable completion mark already answers for it. The
         // measured count was saved before that sink could confirm the load; discovery's estimate is the
-        // fallback for an older completed record without one.
+        // fallback for an older completed record without one. Only the durable mark lands the table.
         SnapshotReading current = runSnapshotProgress(pipelineId);
         List<SnapshotOnChain> covered = snapshotTablesByPipeline.getOrDefault(pipelineId, List.of());
         if (covered.isEmpty()) {
@@ -1731,14 +1738,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 TableSnapshot reading = completed.get(key);
                 OptionalLong saved = SnapshotLoadCounts.read(storePort.keyedState(), source.consumerId(),
                         source.chainId().orElseThrow(), table);
-                Long rows = saved.isPresent() ? saved.getAsLong()
-                        : reading != null && reading.rowsDone() > 0L ? reading.rowsDone()
+                // Boxed in every arm: one unboxed arm types the whole choice as a primitive, and a load nothing
+                // counted anywhere would then throw here instead of reading as uncounted.
+                Long rows = saved.isPresent() ? Long.valueOf(saved.getAsLong())
+                        : reading != null && reading.rowsDone() > 0L ? Long.valueOf(reading.rowsDone())
                         : reading != null && reading.rowsTotal() != null ? reading.rowsTotal()
                         : load.estimatedRows(source.sourceId(), table);
-                if (rows == null) {
+                if (rows != null) {
+                    completed.put(key, new TableSnapshot(rows, rows, 100, true));
+                } else if (reading != null) {
+                    // Nothing counted the table, but this run read it through: its reading stands, now landed.
+                    completed.put(key, new TableSnapshot(
+                            reading.rowsDone(), reading.rowsTotal(), reading.donePct(), true));
+                } else {
                     continue;
                 }
-                completed.put(key, new TableSnapshot(rows, rows, 100));
                 changed = true;
             }
         }
@@ -2411,9 +2425,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 .findFirst();
     }
 
-    /** Whether this pipeline currently has a live capture -- a test-visible view of the retained handles. */
+    /** Whether this pipeline currently has a live capture. */
     boolean isActive(String pipelineId) {
         return runsByPipeline.containsKey(pipelineId);
+    }
+
+    @Override
+    public boolean isCapturing(String pipelineId) {
+        return isActive(pipelineId);
     }
 
     @Override

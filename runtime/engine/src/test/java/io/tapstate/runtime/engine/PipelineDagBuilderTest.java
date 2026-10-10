@@ -16,6 +16,11 @@ import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import com.hazelcast.jet.core.test.TestProcessorSupplierContext;
+import io.tapstate.core.lifecycle.NodeParallelism;
+import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.core.lifecycle.HoldsChangesForLoads;
+import io.tapstate.core.lifecycle.LoadLandings;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
@@ -81,6 +86,115 @@ class PipelineDagBuilderTest {
         assertThat(measured.complete()).isTrue();
         assertThat(outbox.queue(0)).containsExactly("source-row");
         measured.close();
+    }
+
+    @Test
+    void loadGateBindsBeforePressureAndRetriesEmitOneBusinessRow() throws Exception {
+        var landed = new java.util.concurrent.atomic.AtomicBoolean();
+        var sourceFactory = new GateAwareSourceFactory();
+        ProcessorMetaSupplier raw = ProcessorMetaSupplier.of(ProcessorSupplier.of(sourceFactory));
+        SinkAckFactory acks = new GateAckFactory(landed);
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of(SourceRef.bare("orders_src")), null, null,
+                serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")), null, null);
+        DagBindings bindings = new DagBindings(id -> raw,
+                step -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                syncElement -> stubWriter(), ref -> List.of("orders_src"));
+        String sink = "serve.sync_1";
+        ExecutionShape shape = new ExecutionShape(1, Map.of(sink, new NodeParallelism(sink, 2,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 1, 2, 2, List.of())),
+                Map.of(sink, Map.of("orders", List.of("id"))),
+                Map.of(sink, Map.of("orders", new SinkTarget("orders_dest", List.of("id")))));
+        DAG dag = PipelineDagBuilder.build(pipeline, bindings, acks,
+                new FrontierBinding(Map.of("orders_src", "orders")), shape);
+        assertThat(StageWorkDag.singleVertices(dag)).contains("orders_src").doesNotContain(sink);
+        Processor measured = openOneSource(dag.getVertex("orders_src").getMetaSupplier());
+        GateAwareSource source = sourceFactory.created;
+        assertThat(measured).isInstanceOf(StageOutputPressureProcessor.class);
+        assertThat(source.gateApplications).isEqualTo(1);
+        assertThat(source.awaited).containsExactly(new AwaitedLoad(sink, "orders", List.of(
+                SinkProcessor.writerId(sink, 0), SinkProcessor.writerId(sink, 1))));
+        TestOutbox outbox = new TestOutbox(1);
+        measured.init(outbox, new TestProcessorContext());
+        assertThat(measured.complete()).isFalse();
+        assertThat(outbox.queue(0)).isEmpty();
+        landed.set(true);
+        assertThat(outbox.offer("occupied")).isTrue();
+        assertThat(measured.complete()).isFalse();
+        assertThat(source.acceptedRows).isZero();
+        outbox.queue(0).clear();
+        assertThat(measured.complete()).isTrue();
+        assertThat(measured.complete()).isTrue();
+        assertThat(outbox.queue(0)).containsExactly("source-row");
+        assertThat(source.acceptedRows).isEqualTo(1);
+        measured.close();
+    }
+
+    @Test
+    void pressureOutsideTheRawHolderHidesItFromALaterLoadGate() throws Exception {
+        var sourceFactory = new GateAwareSourceFactory();
+        ProcessorMetaSupplier raw = ProcessorMetaSupplier.of(ProcessorSupplier.of(sourceFactory));
+        var gate = new LoadGate(SinkAckFactory.NONE, List.of(new AwaitedLoad(
+                "serve.sync_1", "orders", List.of(SinkProcessor.writerId("serve.sync_1", 0)))));
+        Processor wrong = openOneSource(gate.appliedTo(StageOutputPressureProcessor.wrap(raw)));
+        GateAwareSource source = sourceFactory.created;
+        assertThat(source.gateApplications).isZero();
+        TestOutbox outbox = new TestOutbox(1);
+        wrong.init(outbox, new TestProcessorContext());
+        assertThat(wrong.complete()).isTrue();
+        assertThat(outbox.queue(0)).containsExactly("source-row");
+        wrong.close();
+    }
+
+    private static Processor openOneSource(ProcessorMetaSupplier meta) throws Exception {
+        Address address = new Address("127.0.0.1", 5701);
+        ProcessorSupplier supplier = meta.get(List.of(address)).apply(address);
+        supplier.init(new TestProcessorSupplierContext());
+        return supplier.get(1).iterator().next();
+    }
+
+    private static final class GateAwareSourceFactory implements SupplierEx<Processor> {
+        private static final long serialVersionUID = 1L;
+        private transient GateAwareSource created;
+        @Override public Processor getEx() {
+            created = new GateAwareSource();
+            return created;
+        }
+    }
+
+    private static final class GateAckFactory implements SinkAckFactory {
+        private static final long serialVersionUID = 1L;
+        private final java.util.concurrent.atomic.AtomicBoolean landed;
+        private GateAckFactory(java.util.concurrent.atomic.AtomicBoolean landed) { this.landed = landed; }
+        @Override public SinkAck resolve(com.hazelcast.core.HazelcastInstance member) {
+            return SinkAckFactory.NONE.resolve(member);
+        }
+        @Override public LoadLandings loadLandings(com.hazelcast.core.HazelcastInstance member) {
+            return awaited -> landed.get() ? List.of() : awaited;
+        }
+    }
+
+    /** A source holding the same load-gate contract as an SRS source, without a dependency on that ring. */
+    private static final class GateAwareSource extends AbstractProcessor implements Staged, HoldsChangesForLoads {
+        private List<AwaitedLoad> awaited;
+        private LoadLandings landings;
+        private int gateApplications;
+        private int acceptedRows;
+        private boolean emitted;
+        @Override public Stage stage() { return Stage.SOURCE; }
+        @Override public void holdChangesUntil(List<AwaitedLoad> awaited, LoadLandings landings) {
+            this.awaited = List.copyOf(awaited);
+            this.landings = java.util.Objects.requireNonNull(landings);
+            gateApplications++;
+        }
+        @Override public boolean complete() {
+            if (emitted) { return true; }
+            if (awaited != null && !landings.stillLanding(awaited).isEmpty()) { return false; }
+            if (!tryEmit("source-row")) { return false; }
+            emitted = true;
+            acceptedRows++;
+            return true;
+        }
     }
 
     private static final class OutputSource extends AbstractProcessor implements Staged {
@@ -379,8 +493,122 @@ class PipelineDagBuilderTest {
     }
 
     /**
+     * A join its author wrote no width for runs as one processor for the whole cluster, as any step does: both of
+     * its vertices are pinned to one member, and every edge into them - from its sources, and from the join into
+     * its projection - is delivered there, since every other member runs only a stand-in that refuses input.
+     */
+    @Test
+    void a_join_run_as_one_processor_pins_both_its_vertices_and_sends_every_edge_into_them_there() {
+        DAG dag = PipelineDagBuilder.build(joinPipeline(null), joinBindings());
+
+        for (String vertex : List.of("j", "j:project")) {
+            assertThat(dag.getVertex(vertex).getLocalParallelism())
+                    .isEqualTo(com.hazelcast.jet.core.Vertex.LOCAL_PARALLELISM_USE_DEFAULT);
+            assertThat(dag.getVertex(vertex).getMetaSupplier().preferredLocalParallelism()).as(vertex).isEqualTo(1);
+            assertThat(dag.getInboundEdges(vertex)).isNotEmpty().allSatisfy(edge ->
+                    assertThat(edge.getPartitioner().getConstantPartitioningKey())
+                            .as("%s -> %s", edge.getSourceName(), vertex).isEqualTo(vertex));
+        }
+    }
+
+    /**
+     * A join run wide runs its width on every member in both of its vertices, each edge into them routed by the
+     * key of the state it is about to change; and where its author asked for batches, both take their input in
+     * them.
+     */
+    @Test
+    void a_wide_join_runs_its_width_in_both_vertices_and_takes_its_input_in_its_batches() {
+        ExecutionShape wide = new ExecutionShape(1, Map.of("j", new NodeParallelism("j", 3,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 1, 3, 3, List.of())), Map.of());
+
+        DAG dag = PipelineDagBuilder.build(joinPipeline(new io.tapstate.core.model.ExecutionSpec(3,
+                new io.tapstate.core.model.BatchSpec(8, null))), joinBindings(), null, null, wide);
+
+        for (String vertex : List.of("j", "j:project")) {
+            assertThat(dag.getVertex(vertex).getLocalParallelism()).as(vertex).isEqualTo(3);
+            assertThat(InputBatches.takesInputInBatches(dag.getVertex(vertex).getMetaSupplier()))
+                    .as(vertex).isTrue();
+            assertThat(dag.getInboundEdges(vertex)).isNotEmpty().allSatisfy(edge ->
+                    assertThat(edge.getPartitioner().getConstantPartitioningKey())
+                            .as("%s -> %s", edge.getSourceName(), vertex).isNull());
+        }
+    }
+
+    /**
+     * The drawing says which vertices run at each node's width: a source's own, both of a join's vertices, and a
+     * wide sink's router as well as the sink - where a sink's own vertex is all it draws when it runs as one.
+     */
+    @Test
+    void the_drawing_tells_which_vertices_run_at_each_nodes_width() {
+        Map<String, NodeParallelism> nodes = new java.util.LinkedHashMap<>();
+        nodes.put("j", new NodeParallelism("j", 3, NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE,
+                1, 3, 3, List.of()));
+        nodes.put("serve.sync_1", new NodeParallelism("serve.sync_1", 4, NodeParallelism.Origin.NODE_DEFAULT,
+                NodeParallelism.Scope.NATIVE, 1, 4, 4, List.of()));
+        ExecutionShape wide = new ExecutionShape(1, nodes, Map.of(),
+                Map.of("serve.sync_1", Map.of("j", new SinkTarget("orders", List.of("id")))));
+        NodeVertices drawn = new NodeVertices();
+        NodeVertices narrow = new NodeVertices();
+
+        PipelineDagBuilder.build(joinPipeline(null), joinBindings(), null, null, wide, drawn);
+        PipelineDagBuilder.build(joinPipeline(null), joinBindings(), null, null, ExecutionShape.totalOne(), narrow);
+
+        assertThat(drawn.byNode()).containsExactly(
+                Map.entry("orders_src", List.of("orders_src")),
+                Map.entry("customers_src", List.of("customers_src")),
+                Map.entry("j", List.of("j", "j:project")),
+                Map.entry("serve.sync_1", List.of("route.serve.sync_1", "serve.sync_1")));
+        assertThat(narrow.byNode()).containsEntry("serve.sync_1", List.of("serve.sync_1"));
+        // What feeds the sink is the vertex the join emits from, however wide the sink runs: the queues into
+        // the sink are counted from it.
+        assertThat(drawn.feedingByNode()).containsExactly(Map.entry("serve.sync_1", List.of("j:project")));
+        assertThat(narrow.feedingByNode()).containsExactly(Map.entry("serve.sync_1", List.of("j:project")));
+    }
+
+    /**
+     * A stateless step runs at its node's width in a vertex of its own, and the drawing says so under the step's
+     * id - so a reader matching a running vertex to the width its node was planned at finds an ordinary step as
+     * it finds a join, and never has to guess from the vertex's name.
+     */
+    @Test
+    void the_drawing_tells_that_a_steps_own_vertex_runs_at_its_width() {
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.bare("orders_src")),
+                List.of(filter("shape_orders", "row.id % 2 == 0", FromRef.literal("orders_src"))),
+                view("order_state", FromRef.literal("shape_orders")),
+                null, null, null);
+        NodeVertices drawn = new NodeVertices();
+
+        PipelineDagBuilder.build(pipeline, bindings(Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("shape_orders"), List.of("shape_orders"))),
+                null, null, ExecutionShape.totalOne(), drawn);
+
+        assertThat(drawn.byNode()).containsEntry("shape_orders", List.of("shape_orders"));
+    }
+
+    private static PipelineResource joinPipeline(io.tapstate.core.model.ExecutionSpec execution) {
+        return new PipelineResource(
+                "p", null,
+                List.of(SourceRef.bare("orders_src"), SourceRef.bare("customers_src")),
+                List.of(joinStep("j", FromRef.literal("orders_src"), FromRef.literal("customers_src"), execution)),
+                null,
+                serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
+                null, null);
+    }
+
+    private static DagBindings joinBindings() {
+        return bindings(Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("customers_src"), List.of("customers_src"),
+                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding());
+    }
+
+    /**
      * The positive control for the case below: with the binding supplied, the join is drawn rather than
-     * refused. Source changes keep their own ordinals, and final projection meets at the output key.
+     * refused. Source changes keep their own ordinals, and final projection - where the join runs on several
+     * processors - meets at the output key.
      */
     @Test
     void join_step_routes_final_projection_by_the_fact_key() {
@@ -391,14 +619,17 @@ class PipelineDagBuilderTest {
                 null,
                 serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
                 null, null);
+        ExecutionShape wide = new ExecutionShape(1, Map.of("j", new NodeParallelism("j", 4,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 1, 4, 4, List.of())), Map.of());
 
         DAG dag = PipelineDagBuilder.build(pipeline, bindings(Map.of(
                 FromRef.literal("orders_src"), List.of("orders_src"),
                 FromRef.literal("customers_src"), List.of("customers_src"),
                 FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()),
                 SinkAckFactory.NONE,
-                new FrontierBinding(Map.of("orders_src", "orders", "customers_src", "customers")));
+                new FrontierBinding(Map.of("orders_src", "orders", "customers_src", "customers")), wide);
 
+        assertThat(StageWorkDag.singleVertices(dag)).doesNotContain("j", "j:project");
         assertThat(vertexNames(dag))
                 .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1",
                         StateStoreCostMetricNames.VERTEX);
@@ -636,10 +867,15 @@ class PipelineDagBuilderTest {
 
     /** A join step reading two sources, under the alias names the plan below calls them by. */
     private static Step joinStep(String id, FromRef fact, FromRef dimension) {
+        return joinStep(id, fact, dimension, null);
+    }
+
+    private static Step joinStep(String id, FromRef fact, FromRef dimension,
+            io.tapstate.core.model.ExecutionSpec execution) {
         TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN,
                 "SELECT o.id FROM orders o JOIN customers c ON o.cust_id = c.id");
         return Step.inline(id, FromClause.aliases(new java.util.LinkedHashMap<>(
-                Map.of("o", fact, "c", dimension))), body, null);
+                Map.of("o", fact, "c", dimension))), body, execution, null);
     }
 
     /**

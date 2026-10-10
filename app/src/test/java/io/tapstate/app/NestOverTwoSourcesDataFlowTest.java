@@ -167,6 +167,33 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     /**
+     * A nest reading what a nest with nothing to assemble passed on takes those rows as it would take the root's
+     * own: each still sits where it sat on its own stream, which is what a nest orders every row it keeps by. Moved
+     * under the first nest's name on the way, a row would sit nowhere, and the second nest would fail the run on the
+     * first of them.
+     */
+    @Test
+    @DisplayName("a nest assembles the rows a nest with nothing to assemble passed on to it")
+    void aNestAssemblesWhatANestWithNothingToAssemblePassedOn() {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_AND_CDC, pipelineAfterAPassThrough());
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+
+        actuator.start(PIPELINE);
+        List<Map<String, Object>> documents;
+        try {
+            awaitAssembled("order-1");
+            documents = List.copyOf(CapturingSinkWriter.collected());
+        } finally {
+            stopQuietly(actuator);
+        }
+
+        Map<Object, Map<String, Object>> latest = latestPerRoot(documents);
+        assertThat(latest.keySet()).containsExactlyInAnyOrder(1L, 2L);
+        assertThat(elementsOf(latest.get(1L))).hasSize(3);
+        assertThat(elementsOf(latest.get(2L))).hasSize(1);
+    }
+
+    /**
      * Mutation evidence: forwarding the drain unchanged fails before the first document with "no order";
      * pinning every run to generation one lets the first half pass and makes the second await time out with
      * an empty sink. The snapshot-and-cdc sibling above stays green under both mutations.
@@ -342,12 +369,16 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     private InMemoryStorePort seedStore(ReadMode readMode) {
+        return seedStore(readMode, pipeline(readMode));
+    }
+
+    private InMemoryStorePort seedStore(ReadMode readMode, PipelineResource pipeline) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
 
-        artifacts.save(pipeline(readMode));
+        artifacts.save(pipeline);
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts, log);
         // Both models are discovered: the parent's resolves the target the sink writes, and each supplies
@@ -379,6 +410,28 @@ class NestOverTwoSourcesDataFlowTest {
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, readMode, "earliest"), null);
+    }
+
+    /**
+     * The same documents, assembled by a nest whose root reads a nest with nothing to assemble over the orders,
+     * rather than the orders themselves.
+     */
+    private static PipelineResource pipelineAfterAPassThrough() {
+        Step pass = Step.inline("pass", FromClause.aliases(Map.of("c", FromRef.literal(PARENT_TABLE))),
+                new TransformBody.Nest(null, null, new NestRoot("c", List.of("id"), null, null, List.of())), null);
+        Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
+                null, null, null);
+        Map<String, FromRef> aliases = new LinkedHashMap<>();
+        aliases.put("p", FromRef.literal("pass"));
+        aliases.put("i", FromRef.literal(CHILD_TABLE));
+        Step step = Step.inline(STEP, FromClause.aliases(aliases),
+                new TransformBody.Nest(null, null, new NestRoot("p", List.of("id"), null, null, List.of(item))), null);
+        return new PipelineResource(PIPELINE, null,
+                List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
+                List.of(pass, step), null,
+                new ServeBlock.Inline(null, FromRef.literal(STEP),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
     private static SourceResource source(String id, String table) {

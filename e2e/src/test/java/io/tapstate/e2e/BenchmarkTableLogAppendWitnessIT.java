@@ -10,9 +10,11 @@ import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.event.Op;
+import io.tapstate.runtime.srs.SrsWriterFrontier;
 import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsLogRecord;
+import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -34,6 +36,7 @@ class BenchmarkTableLogAppendWitnessIT {
         String database = "benchmark_table_ack_actual_store_witness";
         String chain = "exact-ack-chain";
         String consumer = SrsConsumerId.of("pipeline", "source").value();
+        String runId = "exact-ack-writer-run";
         String uri = SharedMongo.replicaSetUrl(database);
         try (var client = MongoClients.create(uri)) {
             var db = client.getDatabase(database); db.drop();
@@ -41,19 +44,32 @@ class BenchmarkTableLogAppendWitnessIT {
             var cursors = db.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS);
             var meta = new MongoSrsMetaStore(client, roots, cursors);
             meta.create(chain, null);
-            meta.configureSinkWriters(chain, consumer, Map.of("orders", List.of("first", "second")),
+            meta.beginWriterRun(chain, consumer, runId, Map.of("orders", List.of("first", "second")),
                     ConsumerProgressKind.SRS);
             Document lookup = new Document("miningChainId", chain).append("pipelineId", consumer);
             var binding = BenchmarkTableAckGate.bind(chain, "pipeline", "source", "orders", cursors.find(lookup).first());
             var marker = new BenchmarkTableTerminalObserver.Point("marker", "srs." + chain + ".orders", 7L, 41L, null);
             meta.advanceConsumerReadSeq(chain, consumer, "orders", 999L);
-            meta.advanceSinkWriterAcked(chain, consumer, "first", "orders", new ChainPosition(new SourceOrder(7L, 41L), null));
             assertThat(BenchmarkTableAckGate.covers(binding, marker, cursors.find(lookup).first())).isFalse();
-            meta.advanceSinkWriterAcked(chain, consumer, "second", "orders", new ChainPosition(new SourceOrder(7L, 40L), null));
+            reportAndLand(meta, chain, consumer, runId, "first", 41L);
             assertThat(BenchmarkTableAckGate.covers(binding, marker, cursors.find(lookup).first())).isFalse();
-            meta.advanceSinkWriterAcked(chain, consumer, "second", "orders", new ChainPosition(new SourceOrder(7L, 41L), null));
+            reportAndLand(meta, chain, consumer, runId, "second", 40L);
+            assertThat(BenchmarkTableAckGate.covers(binding, marker, cursors.find(lookup).first())).isFalse();
+            reportAndLand(meta, chain, consumer, runId, "second", 41L);
             assertThat(BenchmarkTableAckGate.covers(binding, marker, cursors.find(lookup).first())).isTrue();
         }
+    }
+
+    private static void reportAndLand(MongoSrsMetaStore meta, String chain, String consumer, String runId,
+            String writer, long sequence) {
+        var run = meta.advanceWriter(chain, consumer, runId, writer, "orders",
+                new WriterProgress(new SourceOrder(7L, sequence), null)).orElseThrow();
+        SrsWriterFrontier.landed(run, "orders").ifPresent(landed -> {
+            ChainPosition resumable = landed.resumableAt();
+            String token = resumable != null && resumable.order().equals(landed.durableThrough())
+                    ? resumable.token() : null;
+            meta.advanceTableConfirmed(chain, consumer, "orders", new ChainPosition(landed.durableThrough(), token));
+        });
     }
 
     @Test

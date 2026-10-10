@@ -139,7 +139,30 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
                 // is exactly the lowest of what its edges promised.
                 : () -> StageOutputPressureProcessor.wrap(new TransformProcessor(portFactory.get(),
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
+        // Its stand-ins on the other members pass its bounds on as it does; see TotalOne.
+        return TotalOne.passingBounds(ProcessorSupplier.of(supplier), vertexName, axes, chainsByOrdinal);
+    }
+
+    /**
+     * A meta-supplier for a vertex that runs the same number of processors on every member, rather than one
+     * for the whole cluster. Every edge into it must route by the key of the rows it carries, so that each
+     * row's changes meet on one processor and keep the order they were read in; the per-member count itself
+     * is set on the vertex, not here.
+     *
+     * <p>Each processor works out its own promise from what reached it, exactly as the single processor
+     * does, and the engine combines the promises of all of them for whatever reads this vertex. Held to
+     * {@code plannedMembers}: see {@link PlannedMembersGuard}.
+     */
+    public static ProcessorMetaSupplier nativeMetaSupplier(String vertexName,
+            SupplierEx<? extends TransformPort> portFactory,
+            ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal, int plannedMembers) {
+        Objects.requireNonNull(vertexName, "vertexName");
+        Objects.requireNonNull(portFactory, "portFactory");
+        SupplierEx<Processor> supplier = axes == null
+                ? () -> StageOutputPressureProcessor.wrap(new TransformProcessor(portFactory.get()))
+                : () -> StageOutputPressureProcessor.wrap(new TransformProcessor(portFactory.get(),
+                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
+        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(ProcessorSupplier.of(supplier)), plannedMembers);
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */

@@ -52,6 +52,9 @@ final class PdkSinkWriter implements SinkWriter {
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
     private final PdkExternalCallStats externalCalls;
+    // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
+    // by the writers of one sink - lets go of this writer's hold on it.
+    private final Runnable letGo;
     private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
     private boolean closed;
 
@@ -74,23 +77,50 @@ final class PdkSinkWriter implements SinkWriter {
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore) {
-        this(connector, write, config, targets, stateStore, PdkExternalCallStats.disabled());
+        this(connector, write, config, targets, stateStore, false, null, PdkExternalCallStats.disabled());
     }
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore, PdkExternalCallStats externalCalls) {
+        this(connector, write, config, targets, stateStore, false, null, externalCalls);
+    }
+
+    /** As above, and where {@code preparedAhead}, a writer of tables prepared already, which prepares nothing. */
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead) {
+        this(connector, write, config, targets, stateStore, preparedAhead, null, PdkExternalCallStats.disabled());
+    }
+
+    /**
+     * As above, over a connector other writers share, which closing this one lets go of through {@code letGo}
+     * rather than stopping; null for a connector of this writer's own.
+     */
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo) {
+        this(connector, write, config, targets, stateStore, preparedAhead, letGo, PdkExternalCallStats.disabled());
+    }
+
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo,
+            PdkExternalCallStats externalCalls) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
-                new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(), config.onFullLoad(),
-                        config.fullLoad(), config.node(), stateStore), externalCalls);
+                new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
+                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead), letGo,
+                externalCalls);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PdkTargetPreparation preparation) {
-        this(connector, write, mode, ddl, targets, preparation, PdkExternalCallStats.disabled());
+        this(connector, write, mode, ddl, targets, preparation, null, PdkExternalCallStats.disabled());
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
-            Map<String, TargetTable> targets, PdkTargetPreparation preparation, PdkExternalCallStats externalCalls) {
+            Map<String, TargetTable> targets, PdkTargetPreparation preparation, Runnable letGo,
+            PdkExternalCallStats externalCalls) {
+        this.letGo = letGo != null ? letGo : () -> {
+            connector.stopQuietly();
+            connector.close();
+        };
         this.connector = connector;
         this.write = write;
         this.mode = mode;
@@ -222,7 +252,6 @@ final class PdkSinkWriter implements SinkWriter {
             return;
         }
         closed = true;
-        connector.stopQuietly();
-        connector.close();
+        letGo.run();
     }
 }

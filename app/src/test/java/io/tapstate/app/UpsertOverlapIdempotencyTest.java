@@ -135,7 +135,9 @@ class UpsertOverlapIdempotencyTest {
 
         actuator.start(PIPELINE);
         try {
-            awaitKeyPresent("5");
+            // Every write landed, not only the last key's: the sink runs several writers, each landing its own
+            // keys, so one key having arrived says nothing of a key another writer holds.
+            awaitTotalAtLeast(6);
         } finally {
             actuator.stop(PIPELINE, true);
         }
@@ -216,11 +218,6 @@ class UpsertOverlapIdempotencyTest {
         DagSource dagSource = new StoreBackedDagSource(store, upsertSink);
         return TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
-    }
-
-    private void awaitKeyPresent(String key) {
-        awaitCondition(() -> UpsertSink.keys().contains(key),
-                () -> "timed out waiting for key " + key + " at the sink, have " + UpsertSink.keys());
     }
 
     private void awaitTotalAtLeast(int total) {

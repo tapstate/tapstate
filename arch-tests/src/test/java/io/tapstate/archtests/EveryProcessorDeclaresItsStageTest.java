@@ -34,14 +34,23 @@ import static org.assertj.core.api.Assertions.assertThat;
 class EveryProcessorDeclaresItsStageTest {
 
     /**
-     * The one vertex that runs no processing of its own. A union, and the merge that gives a nest one edge
-     * per stream, are topology: the vertex exists so ordinals downstream stay unique, and nothing is spent
-     * in it that a reader would want to see on its own.
+     * The vertices that run no processing of their own. A union, and the merge that gives a nest one edge
+     * per stream, are topology: the vertex exists so ordinals downstream stay unique. The router in front of
+     * a sink that runs several writers is topology too: all it does is pick which of two edges into those
+     * writers a row takes. Nothing is spent in either that a reader would want to see on its own, and a
+     * router timed under the sink's stage would fill it with units of next to nothing - the shape that hides
+     * a slow writer. The processor that takes a step's input in the batches its author asked for only decides
+     * when the processor it wraps is handed its rows; that one times its own stage, and timing the wrapper too
+     * would count the same work twice. And a vertex that runs one processor for the whole cluster keeps a stand-in
+     * on every other member that takes no rows and only passes the vertex's bounds on: the processor it stands in
+     * for times the stage, on the one member where the work is done.
      */
-    private static final String PASSTHROUGH = "io.tapstate.runtime.engine.PassthroughProcessor";
-    /** Installs metric handles once and completes; it neither drains nor produces business data. */
-    private static final String COST_SETUP = "io.tapstate.runtime.engine.StateStoreCostBridge";
-    private static final Set<String> UNSTAGED = Set.of(PASSTHROUGH, COST_SETUP);
+    private static final Set<String> UNSTAGED = Set.of(
+            "io.tapstate.runtime.engine.PassthroughProcessor",
+            "io.tapstate.runtime.engine.SinkRouter",
+            "io.tapstate.runtime.engine.InputBatches",
+            "io.tapstate.runtime.engine.TotalOne$BoundsStandIn",
+            "io.tapstate.runtime.engine.StateStoreCostBridge");
     /** Decorates the existing business family and inherits its timed callbacks. */
     private static final String OUTPUT_DECORATOR = "io.tapstate.runtime.engine.StageOutputPressureProcessor";
 
@@ -78,6 +87,11 @@ class EveryProcessorDeclaresItsStageTest {
                 .map(JavaClass::getName).toList())
                 .as("only the explicit topology and one-time measurement setup vertices are unstaged")
                 .containsExactlyInAnyOrderElementsOf(UNSTAGED);
+        for (String unstaged : UNSTAGED) {
+            assertThat(tapstateClasses.get(unstaged).isAssignableTo(Staged.class))
+                    .as("%s runs no independently timed business work", unstaged)
+                    .isFalse();
+        }
     }
 
     @Test

@@ -191,20 +191,6 @@ public interface SrsMetaStore {
     void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
 
     /**
-     * The store-fenced form of {@link #advanceSinkAcked(String, String, ChainPosition)}. The consumer must
-     * already be bound to {@code fence} by fenced writer-plan configuration; a stale or differently bound
-     * advance is ignored. Stores that cannot enforce that condition refuse the fenced operation rather than
-     * silently falling back to the unfenced contract.
-     */
-    default void advanceSinkAcked(
-            String miningChainId,
-            String pipelineId,
-            ChainPosition position,
-            WorkloadClaimFence fence) {
-        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
-    }
-
-    /**
      * Advances the sink-acked position as {@link #advanceSinkAcked(String, String, ChainPosition)} does, and
      * records with it where in {@code table}'s own change ring that change sat: the ring sequence the order
      * carries. A run that replaces this pipeline's run carries on from just past it, rather than from the
@@ -215,16 +201,30 @@ public interface SrsMetaStore {
      * has been confirmed; it cannot say where in any one ring that was, and positioning a table's ring by
      * another table's sequence would skip changes nobody confirmed. Only ever raised, never lowered.
      *
-     * <p>The default records the chain position alone, which leaves a replacing run starting at the head of
-     * each ring as runs always have: more replayed than needed, nothing missed.
+     * <p>A position no later than the last one recorded for {@code table} leaves the chain position where it
+     * is, and still raises the table's place in its ring: every writer of a sink reports on its own, so a
+     * report worked out before a later one can land after it, and written it would move the position back.
+     * Only the table's own last position is compared: each table's ring numbers its changes on its own, so
+     * one table's position says nothing about another's, and the last position recorded that moved its own
+     * table on stands. A snapshot row sits beneath every change of its generation and raises no ring place.
+     *
+     * <p>The default records the chain position alone, compared with nothing, which leaves a replacing run
+     * starting at the head of each ring as runs always have: more replayed than needed, nothing missed.
      */
     default void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
         advanceSinkAcked(miningChainId, pipelineId, position);
     }
 
-    /** The store-fenced form of the table-aware sink acknowledgement. */
-    default void advanceSinkAcked(
+    /**
+     * The store-fenced form of {@link #advanceSinkAcked(String, String, String, ChainPosition)}. The consumer
+     * must already be bound to {@code fence}'s run by {@link #beginWriterRun(String, String, String, Map,
+     * WorkloadClaimFence)}, and {@code fence} must still be the live claim, proved in the same store operation
+     * as the write: a stale or differently bound advance is ignored, and answers false. Stores that cannot
+     * enforce that condition refuse the fenced operation rather than silently falling back to the unfenced
+     * contract.
+     */
+    default boolean advanceSinkAcked(
             String miningChainId,
             String pipelineId,
             String table,
@@ -234,63 +234,124 @@ public interface SrsMetaStore {
     }
 
     /**
-     * Records the complete set of sink writers expected to receive each table on this mining chain.
-     * Writer-aware stores use this before acknowledgements begin so one writer cannot advance a
-     * pipeline-level position on behalf of another. A writer-aware store must refuse to expand retained
-     * aggregate progress into a plan naming multiple writers: an older record cannot prove which writer
-     * reached that position, so the pipeline has to clear its retained state and either run a full resync
-     * or explicitly accept a new incremental baseline. The default keeps older stores compatible with the
-     * single-writer contract.
+     * Starts {@code runId}'s writer accounting for {@code pipelineId} on the chain, replacing whatever run's
+     * accounting was there: each table maps to the writers its changes are expected to reach in this run.
+     *
+     * <p>Replacing rather than merging is what keeps a writer of the run being replaced from standing for a
+     * writer of this one: its progress is dropped with its run, and nothing it writes afterwards lands. What
+     * the replaced run proved has already been carried into the pipeline's own record as it was proved, so
+     * dropping the per-writer detail loses nothing a resume reads. A mutate on an unseeded chain is a caller
+     * ordering error.
      */
-    default void configureSinkWriters(
-            String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
-    }
-
-    /** Installs the writer plan and its source node's recovery coordinate system together. */
-    default void configureSinkWriters(String miningChainId, String consumerId,
-            Map<String, List<String>> writerIdsByTable, ConsumerProgressKind kind) {
-        configureSinkWriters(miningChainId, consumerId, writerIdsByTable);
-    }
-
-    /** The same plan and coordinate-system write under the source node's current execution fence. */
-    default void configureSinkWriters(String miningChainId, String consumerId,
-            Map<String, List<String>> writerIdsByTable, ConsumerProgressKind kind, WorkloadClaimFence fence) {
-        configureSinkWriters(miningChainId, consumerId, writerIdsByTable, fence);
+    default void beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
     }
 
     /**
-     * Records the writer plan and binds its later durable sink effects to {@code fence}. The binding and
-     * proof that the workload claim is still live are one store operation.
+     * Starts {@code runId}'s writer accounting as {@link #beginWriterRun(String, String, String, Map)} does, and
+     * records with it what the consumer's progress is measured against: {@code kind}, which says which of the
+     * positions its record holds a run replacing this one may resume from.
+     *
+     * <p>A consumer named for its source node, whose pipeline still holds progress recorded under the
+     * pipeline's own name on the chain, is refused: that progress cannot say which source node it was made
+     * for, so neither carrying it over nor dropping it is safe, and the pipeline's state has to be cleared.
+     * Read cursors and a snapshot seam are not progress any sink made, and do not count.
      */
-    default void configureSinkWriters(
-            String miningChainId,
-            String pipelineId,
-            Map<String, List<String>> writerIdsByTable,
+    default void beginWriterRun(String miningChainId, String consumerId, String runId,
+            Map<String, List<String>> expectedWritersByTable, ConsumerProgressKind kind) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /** The fenced form of {@link #beginWriterRun(String, String, String, Map, ConsumerProgressKind)}. */
+    default boolean beginWriterRun(String miningChainId, String consumerId, String runId,
+            Map<String, List<String>> expectedWritersByTable, ConsumerProgressKind kind, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
+    }
+
+    /**
+     * Records how far {@code consumerId} has durably landed {@code table}: the position every change of the
+     * table at or below which has landed - its order, and the token of the change there where it carried one -
+     * with the table's place in its own ring raised to the order's sequence. Only ever raised: a position no
+     * later than the one the table holds leaves it, as every writer reports on its own and an older answer can
+     * land after a newer one. The consumer's acked position is left as it is, since one table's progress says
+     * nothing about how far the source has been confirmed for the others.
+     */
+    default void advanceTableConfirmed(String miningChainId, String consumerId, String table,
+            ChainPosition confirmed) {
+        throw new UnsupportedOperationException("this store keeps no per-table confirmations");
+    }
+
+    /** The fenced form of {@link #advanceTableConfirmed}, under the same condition as the fenced advance. */
+    default boolean advanceTableConfirmed(String miningChainId, String consumerId, String table,
+            ChainPosition confirmed, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
+    }
+
+    /**
+     * Moves a direct channel's consumer on as far as its tables' confirmations now reach. Its tables share one
+     * source order, so the acked position - and the channel's checkpoint with it - moves as far as the source
+     * batches recorded for it ({@link #recordDirectBatch}) are complete: every table a batch carried a change of
+     * confirmed through that change, a table it carried none of holding nothing back. Where it has recorded no
+     * batch, the acked position moves to the lowest of its tables' confirmations, once every table of its run has
+     * one. Only ever raised. What it decides comes from what is stored alone, so settling twice, or late, settles
+     * the same.
+     */
+    default void settleDirectBatches(String miningChainId, String consumerId) {
+    }
+
+    /**
+     * Raises {@code consumerId}'s acked position to {@code position} where the one it holds is earlier, or where
+     * it holds none, and leaves it otherwise: every writer works the position out on its own, so an older
+     * answer can land after a newer one, and written as it came it would move the position back.
+     */
+    default void raiseSinkAcked(String miningChainId, String consumerId, ChainPosition position) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /** The fenced form of {@link #raiseSinkAcked}, under the same condition as the fenced advance. */
+    default boolean raiseSinkAcked(String miningChainId, String consumerId, ChainPosition position,
             WorkloadClaimFence fence) {
         throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 
     /**
-     * Records one writer's acknowledgement and derives the pipeline-level positions from the minimum of
-     * every writer configured for the table. The default preserves the former single-writer behaviour.
+     * Starts {@code runId}'s writer accounting as {@link #beginWriterRun(String, String, String, Map)} does, and
+     * binds every later durable sink effect of the pipeline on the chain to {@code fence}'s run. The binding and
+     * the proof that {@code fence} is still the live claim are one store operation, so a superseded run can
+     * neither start its accounting again nor take the binding back. False, with nothing written, where
+     * {@code fence} is not the live claim.
      */
-    default void advanceSinkWriterAcked(
-            String miningChainId,
-            String pipelineId,
-            String writerId,
-            String table,
-            ChainPosition position) {
-        advanceSinkAcked(miningChainId, pipelineId, table, position);
+    default boolean beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 
-    /** The store-fenced form of one writer's acknowledgement. */
-    default void advanceSinkWriterAcked(
-            String miningChainId,
-            String pipelineId,
-            String writerId,
-            String table,
-            ChainPosition position,
-            WorkloadClaimFence fence) {
+    /**
+     * Records how far {@code writerId} of {@code runId} has durably landed {@code table}'s changes, and answers
+     * the run's accounting as it stands after the write - or empty where {@code runId} is no longer the
+     * chain's current run for the pipeline, in which case nothing was written.
+     *
+     * <p>Each writer reports only its own progress and only ever forward, so the write is a plain replacement
+     * of that writer's entry; the store's part is refusing a run that has been replaced.
+     */
+    default Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /** The pipeline's current writer accounting on the chain, or empty where no run has begun one. */
+    default Optional<WriterRun> writerRun(String miningChainId, String pipelineId) {
+        return Optional.empty();
+    }
+
+    /**
+     * The store-fenced form of {@link #advanceWriter}: also empty, with nothing written, where {@code fence} is
+     * no longer the live claim or the pipeline is bound to another run, proved in the same store operation as
+     * the write.
+     */
+    default Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress, WorkloadClaimFence fence) {
         throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 
@@ -390,28 +451,9 @@ public interface SrsMetaStore {
      */
     void markSnapshotComplete(String miningChainId, String pipelineId, String table);
 
-    /** The store-fenced form of a snapshot-completion mark. */
-    default void markSnapshotComplete(
+    /** The store-fenced form of a snapshot-completion mark, under the same condition as the fenced advance. */
+    default boolean markSnapshotComplete(
             String miningChainId, String pipelineId, String table, WorkloadClaimFence fence) {
-        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
-    }
-
-    /**
-     * Marks one writer's copy of a table snapshot complete. Writer-aware stores expose the table as
-     * complete only after every configured writer has marked it; the default is the single-writer case.
-     */
-    default void markSinkWriterSnapshotComplete(
-            String miningChainId, String pipelineId, String writerId, String table) {
-        markSnapshotComplete(miningChainId, pipelineId, table);
-    }
-
-    /** The store-fenced form of one writer's snapshot-completion mark. */
-    default void markSinkWriterSnapshotComplete(
-            String miningChainId,
-            String pipelineId,
-            String writerId,
-            String table,
-            WorkloadClaimFence fence) {
         throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 

@@ -7,6 +7,9 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.Vertex;
+import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -26,14 +29,13 @@ import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -58,7 +60,27 @@ public final class PipelineDagBuilder {
      */
     static final String VIEW_VERTEX_PREFIX = "view.";
 
+    /**
+     * The name prefix of the router in front of a sink that runs on several processors, followed by that
+     * sink's own name. Deliberately neither of the two output prefixes: the router passes rows on and writes
+     * nothing, and a vertex named as an output would have every row it passes counted as delivered.
+     */
+    static final String ROUTE_VERTEX_PREFIX = "route.";
+
     private PipelineDagBuilder() {
+    }
+
+    /**
+     * The vertex a pipeline's view is drawn as - which is also the pipeline node a run works out its width
+     * under, so a shape naming this node is read by the sink it was worked out for.
+     */
+    public static String viewVertex(ViewBlock.Inline view) {
+        return VIEW_VERTEX_PREFIX + view.id();
+    }
+
+    /** The vertex the {@code index}th {@code serve.sync} element is drawn as, and the node its width is under. */
+    public static String serveVertex(SyncElement element, int index) {
+        return SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : index);
     }
 
     /**
@@ -116,6 +138,28 @@ public final class PipelineDagBuilder {
             }
         }
         return Map.copyOf(databases);
+    }
+
+    /**
+     * How many vertices each nest step draws that hold a thread of their own for the life of a run - every vertex
+     * that keeps state - by step id. Each of them runs as wide as its step does, so a member runs this many times
+     * the step's per-member width of such threads; a nest that assembles nothing draws none.
+     */
+    public static Map<String, Integer> nestBlockingVertices(PipelineResource pipeline,
+            Function<String, NestTable> tables) {
+        if (pipeline.transforms() == null) {
+            return Map.of();
+        }
+        Map<String, Integer> byStep = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Nest nest = nestOf(step);
+            if (nest != null) {
+                NestTopology topology = NestTopology.compile(pipeline.id(), step.id(), nest, tables);
+                byStep.put(step.id(), topology.isPassthrough() ? 0
+                        : topology.vertices().size() + topology.lookups().size());
+            }
+        }
+        return Map.copyOf(byStep);
     }
 
     /** Each nest step's resolved state database, used by the shape ledger beside that step's state. */
@@ -279,12 +323,38 @@ public final class PipelineDagBuilder {
      */
     public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
             FrontierBinding frontier) {
+        return build(pipeline, bindings, sinkAck, frontier, ExecutionShape.totalOne());
+    }
+
+    /**
+     * Builds the Jet DAG for a validated pipeline with each node as wide as {@code shape} says. A node the
+     * shape runs natively runs its per-member count on every member, and every edge into it routes by the key
+     * of the rows it carries; every other node is one processor for the whole cluster, reached over edges
+     * that deliver everything to it. The shape travels into each native node, which refuses an execution
+     * that starts on a member count other than the one its width was worked out for.
+     */
+    public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
+            FrontierBinding frontier, ExecutionShape shape) {
+        return build(pipeline, bindings, sinkAck, frontier, shape, new NodeVertices());
+    }
+
+    /**
+     * As above, telling {@code drawn} which vertices run at each node's width: a source's, a step's and a sink's
+     * own, a wide sink's router, and every vertex a nest or a join draws at its width - never one drawn to gather
+     * several producers into one, which runs as one processor whatever the node's width.
+     */
+    public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
+            FrontierBinding frontier, ExecutionShape shape, NodeVertices drawn) {
+        Objects.requireNonNull(shape, "shape");
         DAG dag = new StageWorkDag();
         Map<String, Vertex> byKey = new HashMap<>();
-        // Whether anything in this graph gathers several chains into one stream. It settles which shape of
-        // frontier the sinks are given, and it is a property of the graph rather than of what flows through
-        // it, so it is answered here and never re-judged while running.
-        boolean assembled = false;
+        // Whether anything in this graph gathers several chains into one stream, or splits one chain over
+        // several processors. It settles which shape of frontier the sinks are given, and it is a property of
+        // the graph rather than of what flows through it, so it is answered here and never re-judged while
+        // running. A chain split over several processors reaches whatever reads it over several queues that
+        // drain independently, so a later position can land before an earlier one - the same reading an
+        // assembly needs, and for the same reason.
+        boolean assembled = shape.anyNative();
         // Jet rejects two edges that share a source or destination ordinal, so every edge takes the
         // next free ordinal on each of its endpoints; a fan-in (union) and a fan-out (multi-sink)
         // then wire without collision.
@@ -300,8 +370,8 @@ public final class PipelineDagBuilder {
             }
             for (String sourceKey : sourceKeys) {
                 byKey.put(sourceKey, StageWorkDag.measured(dag,
-                        dag.newVertex(sourceKey, StageOutputPressureProcessor.wrap(
-                                bindings.sourceVertices().apply(sourceKey))), Stage.SOURCE, true));
+                        dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey)), Stage.SOURCE, true));
+                drawn.add(sourceKey, sourceKey);
                 // Per vertex rather than per source: a source reading several tables reads several chains,
                 // and a bound carrying one of their names for all of them would say how far one table had
                 // travelled about changes of a table nobody had read.
@@ -342,9 +412,15 @@ public final class PipelineDagBuilder {
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
-                                            aliasUpstream(inline.from(), alias, bindings)))));
+                                            aliasUpstream(inline.from(), alias, bindings))),
+                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn),
+                            // A nest that assembles nothing keeps no state to route by, so where it runs on
+                            // every member its rows go by their own key, as they would into any step.
+                            topology.isPassthrough() && shape.isNative(step.id())
+                                    ? RoutingKeys.forNode(step.id(), shape.inputKeysOf(step.id()))
+                                    : null));
                     if (chains != null) {
-                        chains.derived(step.id(), nestUpstream(inline.from(), bindings));
+                        chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
                     assembled = true;
                     continue;
@@ -366,78 +442,78 @@ public final class PipelineDagBuilder {
                             bindings.join().stores(), bindings.join().displaced(),
                             chains == null ? null : new JoinFrontier(axes,
                                     alias -> chains.perProducer(
-                                            aliasUpstream(inline.from(), alias, bindings)))));
+                                            aliasUpstream(inline.from(), alias, bindings))),
+                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn)));
                     if (chains != null) {
-                        chains.derived(step.id(), nestUpstream(inline.from(), bindings));
+                        chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
                     assembled = true;
                     continue;
                 }
                 List<String> upstream = resolveClause(step.from(), bindings);
                 Vertex vertex = transformVertex(dag, step, bindings, axes,
-                        chains == null ? null : chains.perOrdinal(upstream));
+                        chains == null ? null : chains.perOrdinal(upstream), shape);
                 byKey.put(step.id(), vertex);
+                drawn.add(step.id(), vertex.getName());
                 if (chains != null) {
                     chains.derived(step.id(), upstream);
                 }
-                connect(dag, verticesOf(upstream, byKey), vertex, outboundOrdinal, inboundOrdinal);
+                connect(dag, verticesOf(upstream, byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
             }
         }
 
-        if (pipeline.view() instanceof ViewBlock.Use) {
-            throw new IllegalArgumentException(
-                    "view block is a use-reference; resolve it to an inline view first");
-        }
-        // A view id names data, not a vertex that can be read from: the view compiles to a terminal
-        // sink, so a downstream reference to it resolves to whatever the view itself reads. Without
-        // this the parser's own default - serve.from = the view's id - resolves to no vertex at all.
-        Map<String, List<Vertex>> readsAs = new HashMap<>();
-
-        List<SinkPlan> sinkPlans = new ArrayList<>();
-        if (pipeline.view() instanceof ViewBlock.Inline view) {
-            // A declared view IS its own instruction to materialize: the pipeline needs no serve block
-            // to reach the state store, and the vertex is a terminal sink like any other.
-            List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
-            String viewName = VIEW_VERTEX_PREFIX + view.id();
-            sinkPlans.add(new SinkPlan(viewName, writerIdFor(viewName), bindings.viewSinks().apply(view), upstream,
-                    chainsOf(upstream, byKey, chains)));
-            readsAs.put(view.id(), upstream);
-        }
-
-        if (pipeline.serve() instanceof ServeBlock.Use) {
-            throw new IllegalArgumentException(
-                    "serve block is a use-reference; resolve it to an inline serve first");
-        }
-        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
-            List<Vertex> upstream = upstreamOf(serve.from(), byKey, bindings, readsAs);
-            List<SyncElement> sync = serve.sync();
-            for (int i = 0; i < sync.size(); i++) {
-                SyncElement element = sync.get(i);
-                String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
-                sinkPlans.add(new SinkPlan(name, writerIdFor(name), bindings.sinkWriters().apply(element), upstream,
-                        chainsOf(upstream, byKey, chains)));
+        // Every sink the graph draws, worked out before any is drawn. Which writers each chain reaches is only
+        // known once every sink is, and an execution has to have written that down before any of its writers
+        // can report.
+        List<SinkNode> sinks = sinkNodes(pipeline, bindings);
+        Map<String, List<String>> writersByChain = chains == null ? null : writersByChain(sinks, chains, shape);
+        boolean startsTheRun = sinkAck != null && writersByChain != null;
+        for (SinkNode sink : sinks) {
+            verticesOf(sink.upstream(), byKey).forEach(upstream -> drawn.feeds(sink.name(), upstream.getName()));
+            if (shape.isNative(sink.name())) {
+                drawNativeSink(dag, sink, sinkAck, axes, chains, shape, byKey, outboundOrdinal, inboundOrdinal,
+                        startsTheRun ? writersByChain : null);
+                drawn.add(sink.name(), ROUTE_VERTEX_PREFIX + sink.name());
+                drawn.add(sink.name(), sink.name());
+                startsTheRun = false;
+                continue;
             }
-        }
-
-        Map<String, List<String>> writerIdsByStream = new LinkedHashMap<>();
-        for (SinkPlan plan : sinkPlans) {
-            for (String stream : plan.streams()) {
-                writerIdsByStream.computeIfAbsent(stream, ignored -> new ArrayList<>()).add(plan.writerId());
+            // A chain reaching the sink over several paths arrives in whatever order they drain in, which is
+            // the reading an assembly needs, for the same reason.
+            boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
+            ProcessorMetaSupplier supplier = preparingTargets(sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
+                    assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()),
+                    sink.batch()), sink);
+            if (startsTheRun) {
+                supplier = WriterRunStart.of(supplier, sinkAck, writersByChain);
+                startsTheRun = false;
             }
-        }
-        writerIdsByStream.replaceAll((stream, writers) -> List.copyOf(writers));
-        Map<String, List<String>> writerPlan = Map.copyOf(writerIdsByStream);
-        if (sinkAck != null) {
-            sinkAck.prepareWriterPlan(writerPlan);
-        }
-        for (SinkPlan plan : sinkPlans) {
-            SinkAckFactory writerAck = sinkAck == null
-                    ? null
-                    : sinkAck.forWriter(plan.writerId(), plan.streams(), writerPlan);
-            Vertex vertex = dag.newVertex(plan.vertexName(),
-                    sinkVertex(plan.vertexName(), plan.writerFactory(), writerAck, axes, assembled));
+            Vertex vertex = dag.newVertex(sink.name(), supplier);
             StageWorkDag.measured(dag, vertex, Stage.SINK, true);
-            connect(dag, plan.upstream(), vertex, outboundOrdinal, inboundOrdinal);
+            drawn.add(sink.name(), sink.name());
+            connect(dag, verticesOf(sink.upstream(), byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
+        }
+
+        // Only once every sink is known: what a source's changes wait for depends on every sink its rows reach.
+        // Held against the durable record the acks write, so a graph whose sinks record nothing holds nothing.
+        if (sinkAck != null && chains != null) {
+            Map<String, List<AwaitedLoad>> gates = loadGates(sinks, chains, shape);
+            for (String sourceId : pipeline.sourceIds()) {
+                for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
+                    List<AwaitedLoad> awaited = gates.get(frontier.chainOf(sourceKey));
+                    if (awaited != null) {
+                        LoadGate gate = new LoadGate(sinkAck, awaited);
+                        byKey.get(sourceKey).updateMetaSupplier(gate::appliedTo);
+                    }
+                }
+            }
+        }
+
+        // Apply pressure decoration after load gates so those gates bind the actual source processors.
+        for (String sourceId : pipeline.sourceIds()) {
+            for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
+                byKey.get(sourceKey).updateMetaSupplier(StageOutputPressureProcessor::wrap);
+            }
         }
 
         if (!costNamespaces.isEmpty()) {
@@ -448,42 +524,195 @@ public final class PipelineDagBuilder {
         return dag;
     }
 
-    /** One terminal writer and the source streams the graph proves can reach it. */
-    private record SinkPlan(
-            String vertexName,
-            String writerId,
-            SupplierEx<? extends SinkWriter> writerFactory,
-            List<Vertex> upstream,
-            List<String> streams) {
+    /**
+     * For each chain whose changes have to wait before they leave its source, the loads they wait for.
+     *
+     * <p>A sink running several writers hands a keyed target table's load rows to whichever writer has room and
+     * every change to the writer its key belongs to, so a change reaching its writer could overtake a load row
+     * of the same key still being written by another, and the older value would land last. What a change of
+     * one table could overtake there is a load row of any table written into the same target table, since a
+     * row of either can carry the same key - so its changes wait for every one of those loads, landed at every
+     * writer of that sink.
+     *
+     * <p>Only rows a table's source read are handed out that way. A nest's documents and a join's widened rows
+     * are rows of their own, never load rows, and go to the writer their key belongs to like any change; a
+     * table reaching a sink only through one of them waits for nothing there. Neither does a table with no key,
+     * all of whose rows go to one writer in the order they were read, nor anything reaching a sink that runs
+     * one processor for the cluster.
+     */
+    private static Map<String, List<AwaitedLoad>> loadGates(List<SinkNode> sinks, PipelineChains chains,
+            ExecutionShape shape) {
+        Map<String, Set<AwaitedLoad>> byChain = new LinkedHashMap<>();
+        for (SinkNode sink : sinks) {
+            if (!shape.isNative(sink.name())) {
+                continue;
+            }
+            Map<String, SinkTarget> targets = shape.sinkTargetsOf(sink.name());
+            List<String> writers = writersOf(sink, shape);
+            // The tables whose own rows reach this sink, by the keyed target table each is written into.
+            Map<String, List<String>> loadsByTarget = new LinkedHashMap<>();
+            for (String chain : chains.unassembled(sink.upstream())) {
+                SinkTarget target = targets.get(chain);
+                if (target == null) {
+                    throw new IllegalStateException("sink '" + sink.name() + "' receives rows of '" + chain
+                            + "' but no target table was worked out for them");
+                }
+                if (target.keyed()) {
+                    loadsByTarget.computeIfAbsent(target.table(), table -> new ArrayList<>()).add(chain);
+                }
+            }
+            for (List<String> loads : loadsByTarget.values()) {
+                for (String chain : loads) {
+                    Set<AwaitedLoad> awaited = byChain.computeIfAbsent(chain, ignored -> new LinkedHashSet<>());
+                    for (String load : loads) {
+                        awaited.add(new AwaitedLoad(sink.name(), load, writers));
+                    }
+                }
+            }
+        }
+        Map<String, List<AwaitedLoad>> gates = new LinkedHashMap<>();
+        byChain.forEach((chain, awaited) -> gates.put(chain, List.copyOf(awaited)));
+        return gates;
+    }
+
+    /** One sink a graph draws: its vertex, the producers it reads, the writers it opens and the batch it forms. */
+    private record SinkNode(String name, List<String> upstream, SupplierEx<? extends SinkWriter> writers,
+            BatchSpec batch) {
     }
 
     /**
-     * A durable writer key from the terminal's stable identity. URL-safe Base64 preserves every byte
-     * while keeping author-chosen ids, including a leading {@code $}, inside one Mongo field name.
+     * Draws a sink that runs the same number of writers on every member, and the router in front of it.
+     *
+     * <p>The router takes the sink's rows over a distributed edge keyed by where each row lands - its target
+     * table and its key there - so every router instance hears every upstream processor's bounds, and one key's
+     * rows reach one instance in the order they were read. From the router a keyed table's snapshot rows go to
+     * whichever writer has room, and everything else to the writer its key belongs to, over the same key. Both
+     * vertices are as wide as the sink was worked out to be, and both refuse an execution on any other member
+     * count.
+     *
+     * <p>A writer takes rows from every router instance over both edges, so it goes by bounds, combined over
+     * the two edges - each of which carries every chain the sink receives.
      */
-    private static String writerIdFor(String sinkIdentity) {
-        String encoded = Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(sinkIdentity.getBytes(StandardCharsets.UTF_8));
-        return "sink-" + encoded;
+    private static void drawNativeSink(DAG dag, SinkNode sink, SinkAckFactory sinkAck, ChainAxes axes,
+            PipelineChains chains, ExecutionShape shape, Map<String, Vertex> byKey,
+            Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal,
+            Map<String, List<String>> startsTheRun) {
+        String name = sink.name();
+        Map<String, SinkTarget> targets = shape.sinkTargetsOf(name);
+        int local = shape.localOf(name);
+        com.hazelcast.function.FunctionEx<Object, Object> byTarget = RoutingKeys.forSink(name, targets);
+        Vertex router = dag.newVertex(ROUTE_VERTEX_PREFIX + name, SinkRouter.metaSupplier(targets, axes,
+                        chains == null ? null : chains.perOrdinal(sink.upstream()), shape.plannedMembers()))
+                .localParallelism(local);
+        for (Vertex upstream : verticesOf(sink.upstream(), byKey)) {
+            int from = outboundOrdinal.merge(upstream, 1, Integer::sum) - 1;
+            int to = inboundOrdinal.merge(router, 1, Integer::sum) - 1;
+            dag.edge(Edge.from(upstream, from).to(router, to).partitioned(byTarget).distributed());
+        }
+        List<String> carried = chains == null ? null : chains.union(sink.upstream());
+        SupplierEx<LevelBounds> edges = axes == null || carried == null
+                ? null
+                : () -> new LevelBounds(Map.of(SinkRouter.SPREAD, carried, SinkRouter.BY_KEY, carried), axes,
+                        LevelBounds.HOLDS_NOTHING);
+        ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
+                sinkAck, () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
+                shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis()),
+                sink);
+        if (startsTheRun != null) {
+            writers = WriterRunStart.of(writers, sinkAck, startsTheRun);
+        }
+        Vertex vertex = dag.newVertex(name, writers).localParallelism(local);
+        StageWorkDag.measured(dag, vertex, Stage.SINK, false);
+        dag.edge(Edge.from(router, SinkRouter.SPREAD).to(vertex, SinkRouter.SPREAD).distributed());
+        dag.edge(Edge.from(router, SinkRouter.BY_KEY).to(vertex, SinkRouter.BY_KEY)
+                .partitioned(byTarget).distributed());
     }
 
-    /** The source streams carried by {@code upstream}, or none when frontier binding is absent. */
-    private static List<String> chainsOf(
-            List<Vertex> upstream, Map<String, Vertex> byKey, PipelineChains chains) {
-        if (chains == null) {
-            return List.of();
+    /**
+     * {@code supplier}, preparing {@code sink}'s target tables as each execution starts, where its writers write
+     * only tables prepared for them: once for the sink, however many writers it runs.
+     */
+    private static ProcessorMetaSupplier preparingTargets(ProcessorMetaSupplier supplier, SinkNode sink) {
+        return sink.writers() instanceof PreparesTargets targets
+                ? TargetPreparationStart.of(supplier, targets)
+                : supplier;
+    }
+
+    /**
+     * The sinks a pipeline draws, in the order they are drawn: its view, then each {@code serve.sync} element.
+     *
+     * <p>A view id names data, not a vertex that can be read from: the view compiles to a terminal sink, so a
+     * later reference to it resolves to whatever the view itself reads. Without this the parser's own default
+     * - {@code serve.from} = the view's id - resolves to no vertex at all.
+     */
+    private static List<SinkNode> sinkNodes(PipelineResource pipeline, DagBindings bindings) {
+        if (pipeline.view() instanceof ViewBlock.Use) {
+            throw new IllegalArgumentException(
+                    "view block is a use-reference; resolve it to an inline view first");
         }
-        List<String> keys = new ArrayList<>();
-        for (Vertex vertex : upstream) {
-            String key = byKey.entrySet().stream()
-                    .filter(entry -> entry.getValue() == vertex)
-                    .map(Map.Entry::getKey)
-                    .findFirst()
-                    .orElseThrow(() -> new IllegalStateException(
-                            "upstream vertex '" + vertex.getName() + "' has no pipeline key"));
-            keys.add(key);
+        if (pipeline.serve() instanceof ServeBlock.Use) {
+            throw new IllegalArgumentException(
+                    "serve block is a use-reference; resolve it to an inline serve first");
         }
-        return chains.union(keys);
+        List<SinkNode> sinks = new ArrayList<>();
+        Map<String, List<String>> readsAs = new HashMap<>();
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            // A declared view IS its own instruction to materialize: the pipeline needs no serve block to reach
+            // the state store, and the vertex is a terminal sink like any other.
+            List<String> upstream = resolve(view.from(), bindings);
+            sinks.add(new SinkNode(viewVertex(view), upstream, bindings.viewSinks().apply(view),
+                    batchOf(view.execution())));
+            readsAs.put(view.id(), upstream);
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            List<String> upstream = upstreamOf(serve.from(), bindings, readsAs);
+            List<SyncElement> sync = serve.sync();
+            for (int i = 0; i < sync.size(); i++) {
+                SyncElement element = sync.get(i);
+                String name = serveVertex(element, i);
+                sinks.add(new SinkNode(name, upstream, bindings.sinkWriters().apply(element),
+                        batchOf(element.execution())));
+            }
+        }
+        return sinks;
+    }
+
+    /** The batch a node's execution block asks for, or the defaults where it asks for none. */
+    private static BatchSpec batchOf(ExecutionSpec execution) {
+        return execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults();
+    }
+
+    /**
+     * For each chain, every writer the graph routes that chain's changes to: {@linkplain #writersOf every writer}
+     * of each sink the chain reaches.
+     *
+     * <p>Taken from the graph rather than from what a running writer has seen, for the reason the levels
+     * above take their edges from it: at runtime a writer that has not reported yet and a writer that never
+     * will look exactly alike, and leaving the first out lets a faster writer stand for it.
+     */
+    private static Map<String, List<String>> writersByChain(List<SinkNode> sinks, PipelineChains chains,
+            ExecutionShape shape) {
+        Map<String, List<String>> byChain = new LinkedHashMap<>();
+        for (SinkNode sink : sinks) {
+            List<String> writers = writersOf(sink, shape);
+            for (String chain : chains.union(sink.upstream())) {
+                byChain.computeIfAbsent(chain, ignored -> new ArrayList<>()).addAll(writers);
+            }
+        }
+        return byChain;
+    }
+
+    /**
+     * Every writer {@code sink} runs: one, at index zero, for a sink running as one processor for the cluster,
+     * and as many as it runs across the cluster otherwise, by the index the engine gives each.
+     */
+    private static List<String> writersOf(SinkNode sink, ExecutionShape shape) {
+        int width = shape.isNative(sink.name()) ? shape.effectiveOf(sink.name()) : 1;
+        List<String> writers = new ArrayList<>(width);
+        for (int index = 0; index < width; index++) {
+            writers.add(SinkProcessor.writerId(sink.name(), index));
+        }
+        return writers;
     }
 
     /**
@@ -492,26 +721,38 @@ public final class PipelineDagBuilder {
      * one generic sink adapter, pinned to total parallelism one.
      *
      * <p>{@code assembled} picks the shape of frontier the ack-bearing sink runs. Where the graph gathers
-     * several chains into one stream, what arrives can no longer say by itself how far a chain has
-     * travelled, and the sink goes by the bound the engine combines across its input queues instead. Where
-     * it does not, the events of one chain arrive in their own order and the settled prefix is the whole
-     * answer; a bound reaching such a sink is discarded rather than acted on, because the source stamps
-     * bounds whatever the graph does with them.
+     * several chains into one stream, splits one over several processors, or brings one to the sink over
+     * several paths, what arrives can no longer say by itself how far a chain has travelled, and the sink
+     * goes by the bound combined across its input queues instead. Where it does none of these,
+     * the events of one chain arrive in their own order, so a later position settling closes every earlier
+     * one and a bound closes the last.
      *
      * <p>An assembling graph built without a chain numbering gets the same shape with nothing to attribute
      * a bound to, so its frontier stands still. That is the direction to fail in: reading a stream of
      * several chains as though it were one would ack positions whose changes are still in flight.
+     *
+     * <p>{@code chainsByOrdinal} names the chains each inbound edge carries, and where it is known the sink
+     * combines its bounds edge by edge rather than taking the engine's combination. The engine holds every
+     * chain down by every edge, so on a sink fed one table over one edge and another over a second, neither
+     * table's bound ever arrives: the other edge never speaks for it, and in a running pipeline no edge ever
+     * ends either.
      */
     private static ProcessorMetaSupplier sinkVertex(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory,
-            SinkAckFactory sinkAck, ChainAxes axes, boolean assembled) {
+            SinkAckFactory sinkAck, ChainAxes axes, boolean assembled, Map<Integer, List<String>> chainsByOrdinal,
+            BatchSpec batch) {
         if (sinkAck == null) {
-            return SinkProcessor.metaSupplier(vertexName, writerFactory);
+            return SinkProcessor.metaSupplier(vertexName, writerFactory, batch.effectiveMaxRecords(),
+                    batch.effectiveMaxWaitMillis());
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
                 : () -> new ContiguousPrefix(axes);
-        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier);
+        SupplierEx<LevelBounds> edges = axes == null || chainsByOrdinal == null
+                ? null
+                : () -> new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING);
+        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier, edges,
+                batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis());
     }
 
     /**
@@ -524,21 +765,44 @@ public final class PipelineDagBuilder {
      * this builder's scope and is refused.
      */
     private static Vertex transformVertex(DAG dag, Step step, DagBindings bindings, ChainAxes axes,
-            Map<Integer, List<String>> chainsByOrdinal) {
+            Map<Integer, List<String>> chainsByOrdinal, ExecutionShape shape) {
         if (!(step instanceof Step.Inline inline)) {
             throw new IllegalArgumentException(
                     "transform step '" + step.id() + "' is a use-reference; resolve it to an inline step first");
         }
         TransformBody body = inline.body();
+        boolean wide = shape.isNative(step.id());
+        BatchSpec batch = writtenBatch(step);
         if (body instanceof TransformBody.Union) {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all
             // for a chain only one of the merged streams carries, which is the whole shape a union is.
-            return dag.newVertex(step.id(),
-                    PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal));
+            ProcessorMetaSupplier merge = wide
+                    ? PassthroughProcessor.nativeMetaSupplier(step.id(), axes, chainsByOrdinal, shape.plannedMembers())
+                    : PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal);
+            return stepVertex(dag, step.id(), InputBatches.around(merge, batch), shape);
         }
-        return StageWorkDag.measured(dag, dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
-                bindings.transformPorts().apply(step), axes, chainsByOrdinal)), Stage.TRANSFORM, true);
+        var port = bindings.transformPorts().apply(step);
+        ProcessorMetaSupplier transform = wide
+                ? TransformProcessor.nativeMetaSupplier(step.id(), port, axes, chainsByOrdinal, shape.plannedMembers())
+                : TransformProcessor.metaSupplier(step.id(), port, axes, chainsByOrdinal);
+        return StageWorkDag.measured(dag,
+                stepVertex(dag, step.id(), InputBatches.around(transform, batch), shape),
+                Stage.TRANSFORM, !shape.isNative(step.id()));
+    }
+
+    /**
+     * The batch a step's author asked for, which its vertices then take their input in; null where none was, and
+     * the step takes its input as the engine delivers it.
+     */
+    private static BatchSpec writtenBatch(Step step) {
+        return step.execution() == null ? null : step.execution().batch();
+    }
+
+    /** A step's vertex, as many processors per member as its shape says where it runs natively. */
+    private static Vertex stepVertex(DAG dag, String name, ProcessorMetaSupplier supplier, ExecutionShape shape) {
+        Vertex vertex = dag.newVertex(name, supplier);
+        return shape.isNative(name) ? vertex.localParallelism(shape.localOf(name)) : vertex;
     }
 
     /**
@@ -592,38 +856,23 @@ public final class PipelineDagBuilder {
         return keys;
     }
 
-    /** The vertices a {@code from:} reference names, for a graph with no such names to stand in for. */
-    private static List<Vertex> upstreamOf(FromRef ref, Map<String, Vertex> byKey, DagBindings bindings) {
-        return upstreamOf(ref, byKey, bindings, Map.of());
-    }
-
     /**
-     * As above, but first honours the names that stand for data rather than for a vertex - today a
-     * declared view, which is a terminal sink and so cannot itself be read from. Reading such a name
-     * means reading what it reads, which is a fan-out from the shared upstream rather than a chain.
+     * The producer keys a serve flow reads, preserving every selected table in one sink path. A name that
+     * stands for data rather than for a vertex - today a declared view, which is a terminal sink and so cannot
+     * itself be read from - reads what it reads, which is a fan-out from the shared upstream rather than a
+     * chain.
      */
-    private static List<Vertex> upstreamOf(FromRef ref, Map<String, Vertex> byKey, DagBindings bindings,
-            Map<String, List<Vertex>> readsAs) {
-        if (ref instanceof FromRef.Literal literal) {
-            List<Vertex> aliased = readsAs.get(literal.ref());
-            if (aliased != null) {
-                return aliased;
-            }
+    private static List<String> upstreamOf(FromClause from, DagBindings bindings,
+            Map<String, List<String>> readsAs) {
+        if (!(from instanceof FromClause.Flow flow)) {
+            throw new IllegalArgumentException("serve.from must be a flow of references");
         }
-        return verticesOf(resolve(ref, bindings), byKey);
-    }
-
-    /** The vertices named by a serve flow, preserving every selected table in one sink path. */
-    private static List<Vertex> upstreamOf(FromClause from, Map<String, Vertex> byKey,
-            DagBindings bindings, Map<String, List<Vertex>> readsAs) {
-        if (from instanceof FromClause.Flow flow) {
-            List<Vertex> upstream = new ArrayList<>();
-            for (FromRef ref : flow.refs()) {
-                upstream.addAll(upstreamOf(ref, byKey, bindings, readsAs));
-            }
-            return upstream;
+        List<String> upstream = new ArrayList<>();
+        for (FromRef ref : flow.refs()) {
+            List<String> aliased = ref instanceof FromRef.Literal literal ? readsAs.get(literal.ref()) : null;
+            upstream.addAll(aliased != null ? aliased : resolve(ref, bindings));
         }
-        throw new IllegalArgumentException("serve.from must be a flow of references");
+        return upstream;
     }
 
     /** The vertices those producer keys name, refusing a key no vertex was built for. */
@@ -655,12 +904,21 @@ public final class PipelineDagBuilder {
      * place input can come from, so a mis-keyed edge and a correct one are the same graph.
      */
     private static void connect(DAG dag, List<Vertex> upstream, Vertex destination,
-            Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal) {
+            Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal, ExecutionShape shape) {
+        String node = destination.getName();
+        // A node running on every member takes each row where its key belongs, so that one row's changes
+        // are applied on one processor in the order they were read. The routing is worked out once per node
+        // rather than per edge: the key is a property of the rows, not of which upstream sent them.
+        com.hazelcast.function.FunctionEx<Object, Object> byKey = shape.isNative(node)
+                ? RoutingKeys.forNode(node, shape.inputKeysOf(node))
+                : null;
         for (Vertex source : upstream) {
             int from = outboundOrdinal.merge(source, 1, Integer::sum) - 1;
             int to = inboundOrdinal.merge(destination, 1, Integer::sum) - 1;
-            dag.edge(Edge.from(source, from).to(destination, to)
-                    .distributed().allToOne(destination.getName()));
+            Edge edge = Edge.from(source, from).to(destination, to);
+            dag.edge(byKey != null
+                    ? edge.partitioned(byKey).distributed()
+                    : edge.distributed().allToOne(node));
         }
     }
 }

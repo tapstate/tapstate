@@ -4,6 +4,8 @@
 # against this file. Adding a code = append it here in the same change set; renaming or
 # removing one = a breaking change to an external contract (review + major version).
 actuation.capture-shutdown-incomplete
+actuation.connector-differs-across-members
+actuation.connector-unavailable-on-member
 actuation.execution-generation-unavailable
 actuation.from-regex-empty
 actuation.from-regex-invalid
@@ -15,7 +17,9 @@ actuation.join-source-key-missing
 actuation.join-source-not-declared
 actuation.join-sql-invalid
 actuation.lifecycle-dispatcher-invalid-capacity
+actuation.no-safe-parallelism
 actuation.not-a-pipeline
+actuation.parallelism-needs-a-key
 actuation.pipeline-not-found
 actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
@@ -24,6 +28,7 @@ actuation.source-table-not-discovered
 actuation.source-table-regex-invalid
 actuation.source-table-selection-empty
 actuation.source-table-spec-unsupported
+actuation.stream-lands-two-ways
 actuation.unwind-parent-key-unresolved
 actuation.view-fed-by-many-tables
 actuation.view-key-missing
@@ -194,6 +199,8 @@ dsl.mode-required-for-read
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported
+dsl.setting-has-no-effect
+dsl.source-read-not-split
 dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
@@ -203,14 +210,18 @@ dsl.unwind-column-already-exists
 dsl.unwind-needs-an-element-key
 dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key
+engine.cluster-refused-the-state
 engine.execution-not-authorized
 engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed
 engine.job-still-ending
 engine.join-dimension-row-displaced
+engine.key-change-on-parallel-node
+engine.membership-changed-before-start
 engine.no-such-job
 engine.out-of-memory
+engine.routing-key-missing
 engine.view-key-missing-from-before-image
 io.document-too-large
 io.document-unreadable

@@ -873,6 +873,19 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 claim.get("leased") instanceof Boolean b ? b : null);
     }
 
+    /** A map of names to whole numbers as the server sent it, keeping only the entries that are both. */
+    private static Map<String, Long> longsByName(Object raw) {
+        Map<String, Long> out = new java.util.TreeMap<>();
+        if (raw instanceof Map<?, ?> map) {
+            map.forEach((name, value) -> {
+                if (name instanceof String key && value instanceof Number number) {
+                    out.put(key, number.longValue());
+                }
+            });
+        }
+        return out;
+    }
+
     private static RemoteVertex vertex(Map<?, ?> vertex) {
         List<RemoteProcessor> processors = new ArrayList<>();
         if (vertex.get("processors") instanceof List<?> list) {
@@ -880,8 +893,14 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 if (processor instanceof Map<?, ?> p) {
                     processors.add(new RemoteProcessor(
                             p.get("index") instanceof Number n ? n.intValue() : null,
+                            p.get("localIndex") instanceof Number n ? n.intValue() : null,
                             stringOrNull(p.get("memberUuid")),
-                            stringOrNull(p.get("nodeId"))));
+                            stringOrNull(p.get("nodeId")),
+                            p.get("backlog") instanceof Number n ? n.longValue() : null,
+                            longsByName(p.get("frontierGaps")),
+                            longsByName(p.get("frontierStalledMillis")),
+                            longsByName(p.get("queuedByStream")),
+                            longsByName(p.get("inFlightByTable"))));
                 }
             }
         }
@@ -1459,9 +1478,107 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (map.get("pending") != null && pending == null) {
             return null;
         }
+        ExplainOutcome.Plan plan = explanationPlan(map.get("plan"));
+        List<String> awaitingRebalance = map.get("awaitingRebalance") == null ? List.of()
+                : strings(map.get("awaitingRebalance"));
+        if (map.get("plan") != null && plan == null || awaitingRebalance == null) {
+            return null;
+        }
         return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
                 rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
-                evidence, cannotSay, next, pending);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance);
+    }
+
+    private static ExplainOutcome.Plan explanationPlan(Object raw) {
+        if (!(raw instanceof Map<?, ?> plan)
+                || !(plan.get("plannedAt") instanceof String plannedAt)
+                || !(plan.get("nodes") instanceof List<?> rawNodes)
+                || !absentOrNumber(plan.get("claimGeneration"))
+                || !absentOrNumber(plan.get("executionGeneration"))
+                || !absentOrNumber(plan.get("topologyRevision"))) {
+            return null;
+        }
+        List<String> members = strings(plan.get("members"));
+        ExplainOutcome.PlanReplaced replaces = explanationPlanReplaced(plan.get("replaces"));
+        if (members == null || plan.get("replaces") != null && replaces == null) {
+            return null;
+        }
+        List<ExplainOutcome.PlanNode> nodes = new ArrayList<>();
+        for (Object item : rawNodes) {
+            ExplainOutcome.PlanNode node = explanationPlanNode(item);
+            if (node == null) {
+                return null;
+            }
+            nodes.add(node);
+        }
+        return new ExplainOutcome.Plan(longOrNull(plan.get("claimGeneration")),
+                longOrNull(plan.get("executionGeneration")), longOrNull(plan.get("topologyRevision")),
+                members, nodes, plannedAt, replaces);
+    }
+
+    private static ExplainOutcome.PlanReplaced explanationPlanReplaced(Object raw) {
+        if (!(raw instanceof Map<?, ?> replaced)
+                || !(replaced.get("plannedAt") instanceof String plannedAt)
+                || !absentOrNumber(replaced.get("executionGeneration"))) {
+            return null;
+        }
+        List<String> members = strings(replaced.get("members"));
+        return members == null ? null
+                : new ExplainOutcome.PlanReplaced(longOrNull(replaced.get("executionGeneration")), members, plannedAt);
+    }
+
+    private static ExplainOutcome.PlanChange explanationPlanChange(Object raw) {
+        if (!(raw instanceof Map<?, ?> change) || !(change.get("previousEffective") instanceof Number previous)) {
+            return null;
+        }
+        List<String> causes = strings(change.get("causes"));
+        return causes == null ? null : new ExplainOutcome.PlanChange(previous.intValue(), causes);
+    }
+
+    private static ExplainOutcome.PlanNode explanationPlanNode(Object raw) {
+        if (!(raw instanceof Map<?, ?> node)
+                || !(node.get("node") instanceof String id)
+                || !(node.get("requested") instanceof Number requested)
+                || !(node.get("requestedOrigin") instanceof String origin)
+                || !(node.get("scope") instanceof String scope)
+                || !(node.get("memberCount") instanceof Number memberCount)
+                || !absentOrNumber(node.get("computedLocal"))
+                || !(node.get("effective") instanceof Number effective)
+                || !(node.get("batch") instanceof Map<?, ?> batch)
+                || !(batch.get("maxRecords") instanceof Number maxRecords)
+                || !(batch.get("maxWaitMillis") instanceof Number maxWaitMillis)) {
+            return null;
+        }
+        List<String> reasons = strings(node.get("reasons"));
+        ExplainOutcome.PlanResources resources = explanationPlanResources(node.get("resources"));
+        ExplainOutcome.PlanChange change = explanationPlanChange(node.get("change"));
+        if (reasons == null || node.get("resources") != null && resources == null
+                || node.get("change") != null && change == null) {
+            return null;
+        }
+        return new ExplainOutcome.PlanNode(id, requested.intValue(), origin, scope, memberCount.intValue(),
+                node.get("computedLocal") instanceof Number local ? local.intValue() : null, effective.intValue(),
+                reasons, maxRecords.intValue(), maxWaitMillis.longValue(), resources, change);
+    }
+
+    private static ExplainOutcome.PlanResources explanationPlanResources(Object raw) {
+        return raw instanceof Map<?, ?> resources
+                && resources.get("writers") instanceof Number writers
+                && resources.get("connectorMode") instanceof String mode
+                && resources.get("connectorInstances") instanceof Number instances
+                && resources.get("bufferedRecords") instanceof Number buffered
+                && resources.get("edgeQueueRecords") instanceof Number queued
+                ? new ExplainOutcome.PlanResources(writers.intValue(), mode, instances.intValue(),
+                        buffered.longValue(), queued.longValue())
+                : null;
+    }
+
+    private static boolean absentOrNumber(Object raw) {
+        return raw == null || raw instanceof Number;
+    }
+
+    private static Long longOrNull(Object raw) {
+        return raw instanceof Number number ? number.longValue() : null;
     }
 
     private static List<ExplainOutcome.Evidence> explanationEvidence(Object raw) {
@@ -1727,8 +1844,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     /**
      * The per-table progress decoded from a 200 body's {@code snapshot} object, or {@code null} unless the body
      * carries a string id and a snapshot object. A table needs a numeric {@code rowsDone}; {@code rowsTotal} and
-     * {@code donePct} are kept null when absent or null (unavailable), never faked. An empty object is a
-     * legitimate empty (outside a snapshot phase).
+     * {@code donePct} are kept null when absent or null (unavailable), never faked, and so is {@code landed}, which
+     * a server that predates it does not send. An empty object is a legitimate empty (outside a snapshot phase).
      */
     private static SnapshotOutcome.Found snapshotFound(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
@@ -1740,7 +1857,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         && t.get("rowsDone") instanceof Number rowsDone) {
                     Long rowsTotal = t.get("rowsTotal") instanceof Number n ? n.longValue() : null;
                     Integer donePct = t.get("donePct") instanceof Number n ? n.intValue() : null;
-                    tables.put(table, new RemoteTableSnapshot(rowsDone.longValue(), rowsTotal, donePct));
+                    Boolean landed = t.get("landed") instanceof Boolean said ? said : null;
+                    tables.put(table, new RemoteTableSnapshot(rowsDone.longValue(), rowsTotal, donePct, landed));
                 }
             }
             return new SnapshotOutcome.Found(id, tables);

@@ -67,6 +67,16 @@ public interface StorePort {
     }
 
     /**
+     * Ends every store transaction the process {@code processId} left open, and answers how many it ended: what
+     * a process that went away halfway through a write still holds at the store, let go as soon as whoever is
+     * left knows the process has gone rather than whenever the store gives up on it. A store that leaves no
+     * transaction open ends none.
+     */
+    default int endTransactionsLeftOpenBy(String processId) {
+        return 0;
+    }
+
+    /**
      * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
      * process that read them and a ring can be rebuilt where it left off.
      */

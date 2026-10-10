@@ -23,6 +23,7 @@ import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineEventStore;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.runtime.scheduler.RebuildAdmission;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -33,6 +34,8 @@ import java.time.Duration;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
@@ -1902,6 +1905,38 @@ class ConvergenceDriverTest {
         desired.save(new DesiredState("orders", RUNNING, "rev-1"));
         driver.reconcile();
         assertThat(observations.read("orders").orElseThrow().metrics()).isEmpty();
+    }
+
+    @Test
+    void aDeletedPipelinesRebuildBudgetGoesWithIt() {
+        // Through the pass that sees the delete, as with the counts above: the admission's own case calls its
+        // sweep directly, so a sweep that existed and was never called would pass it - and a pipeline created
+        // again under the id would start with what the deleted one had left.
+        List<List<String>> kept = new ArrayList<>();
+        RebuildAdmission admission = new RebuildAdmission() {
+            @Override
+            public boolean admits(String pipelineId) {
+                return false;
+            }
+
+            @Override
+            public void retain(Collection<String> pipelineIds) {
+                kept.add(List.copyOf(pipelineIds));
+            }
+        };
+        PipelineConverger converger = new PipelineConverger(
+                desired, state, new FailingActuator(), Clock.fixed(T0, ZoneOffset.UTC), admission);
+        ConvergenceDriver driver =
+                new ConvergenceDriver(converger, desired, new ObservationPublisher(state, observations));
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        driver.reconcile();
+
+        desired.remove("orders");
+        driver.reconcile();
+
+        assertThat(kept).as("every pass tells the admission which pipelines are left").hasSize(2);
+        assertThat(kept.get(0)).containsExactly("orders");
+        assertThat(kept.get(1)).as("and the pass after the delete leaves this one out").isEmpty();
     }
 
     @Test

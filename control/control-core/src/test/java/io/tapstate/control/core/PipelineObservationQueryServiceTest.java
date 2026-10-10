@@ -2,6 +2,8 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -17,7 +19,11 @@ import io.tapstate.spi.store.ExecutionGenerationStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -85,19 +91,38 @@ class PipelineObservationQueryServiceTest {
             @Override public void delete(String id) { throw new UnsupportedOperationException(); }
         };
         CurrentObservationReader current = new CurrentObservationReader(artifacts, generations, latest, "cluster-a");
+        Instant plannedAt = Instant.parse("2026-09-20T10:00:00Z");
+        ExecutionPlan plan = new ExecutionPlan("orders_sync", null, 42L, null, List.of("m1"),
+                List.of(), plannedAt);
+        ReadCountingPlans plans = new ReadCountingPlans(Map.of("orders_sync", plan));
         PipelineObservationQueryService service = new PipelineObservationQueryService(
-                new ArtifactQueryService(artifacts), current);
+                new ArtifactQueryService(artifacts), current, plans, () -> List.of("m1", "m2"));
+        PipelineExplanation.Pending pending = new PipelineExplanation.Pending(
+                PipelineExplanation.PendingReason.START_CAPACITY);
+        PipelineExplainService explain = new PipelineExplainService(new ArtifactQueryService(artifacts), current,
+                Clock.fixed(plannedAt, ZoneOffset.UTC), (key, args) -> key,
+                id -> Optional.of(pending), plans, () -> List.of("m1", "m2"));
 
         assertThat(service.findStatus("orders_sync")).isEmpty();
         assertThatThrownBy(() -> service.status("orders_sync"))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(MonitorError.NO_OBSERVATION));
+        assertThatThrownBy(() -> explain.explain("orders_sync"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(MonitorError.NO_OBSERVATION));
+        assertThat(plans.reads).isEmpty();
         stored.set(new ObservationStore.Stored(observed,
                 Optional.of(new ObservationStore.Scope("inc-old", 42))));
         assertThat(service.findStatus("orders_sync")).isEmpty();
         stored.set(new ObservationStore.Stored(observed,
                 Optional.of(new ObservationStore.Scope("inc-current", 42))));
         assertThat(service.status("orders_sync").state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(service.status("orders_sync").plan()).isEqualTo(plan);
+        assertThat(service.status("orders_sync").awaitingRebalance()).containsExactly("m2");
+        PipelineExplanation answer = explain.explain("orders_sync");
+        assertThat(answer.pending()).isEqualTo(pending);
+        assertThat(answer.plan()).isEqualTo(plan);
+        assertThat(answer.awaitingRebalance()).containsExactly("m2");
         stored.set(new ObservationStore.Stored(observed, Optional.empty()));
         assertThat(service.findStatus("orders_sync")).isEmpty();
         incarnation.set(Optional.empty());
@@ -248,6 +273,82 @@ class PipelineObservationQueryServiceTest {
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()));
 
         assertThat(service.status("orders_sync").failure()).isNull();
+    }
+
+    @Test
+    void statusCarriesThePlanThePipelinesCurrentRunWasSubmittedOn() {
+        ExecutionPlan plan = new ExecutionPlan("orders_sync", 3L, 7L, 11L, List.of("m1", "m2"),
+                List.of(new ExecutionPlan.Node("orders_sink", 4, "node-default", "native", 2, 2, 4, List.of(),
+                        1024, 0L, List.of("orders_sink"))),
+                Instant.parse("2026-09-26T10:00:00Z"));
+        ReadCountingPlans plans = new ReadCountingPlans(Map.of("orders_sync", plan));
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()), plans);
+
+        assertThat(service.status("orders_sync").plan()).isEqualTo(plan);
+        assertThat(plans.reads).containsExactly(List.of("orders_sync"));
+    }
+
+    @Test
+    void statusNamesTheMembersThatJoinedAfterTheRunWasPlanned() {
+        ExecutionPlan plan = new ExecutionPlan("orders_sync", 3L, 7L, 11L, List.of("m1", "m2"), List.of(),
+                Instant.parse("2026-09-26T10:00:00Z"));
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()),
+                new ReadCountingPlans(Map.of("orders_sync", plan)), () -> List.of("m1", "m2", "m3"));
+
+        // Awaiting a rebalance, not failed: the run keeps the members it was planned over, and a member that
+        // joined since is given no part of it until somebody asks for one.
+        assertThat(service.status("orders_sync").awaitingRebalance()).containsExactly("m3");
+    }
+
+    @Test
+    void statusOfAPipelineWhoseRunHasNoPlanRecordedCarriesNone() {
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()),
+                new ReadCountingPlans(Map.of()), () -> List.of("m1", "m2", "m3"));
+
+        assertThat(service.status("orders_sync").plan()).isNull();
+        assertThat(service.status("orders_sync").awaitingRebalance())
+                .as("with no plan there is nothing a member could be left out of")
+                .isEmpty();
+    }
+
+    @Test
+    void aReaderFollowingTheStateAsItChangesIsAnsweredWithoutThePlanBeingRead() {
+        ReadCountingPlans plans = new ReadCountingPlans(Map.of("orders_sync", new ExecutionPlan("orders_sync",
+                null, null, null, List.of("local"), List.of(), Instant.parse("2026-09-26T10:00:00Z"))));
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()), plans);
+
+        PipelineStatus polled = service.lifecycleStatus("orders_sync");
+        Optional<PipelineStatus> listed = service.findStatus("orders_sync");
+
+        // Both are read once per pipeline per poll or per page: a plan read there would be read and thrown away,
+        // since it changes only when a new run is submitted.
+        assertThat(polled.state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(polled.plan()).isNull();
+        assertThat(listed).get().extracting(PipelineStatus::plan).isNull();
+        assertThat(plans.reads).isEmpty();
+    }
+
+    /** Answers from a fixed set of plans, remembering every set of pipelines it was asked about. */
+    private static final class ReadCountingPlans implements ExecutionPlans {
+
+        private final Map<String, ExecutionPlan> plans;
+        private final List<List<String>> reads = new ArrayList<>();
+
+        ReadCountingPlans(Map<String, ExecutionPlan> plans) {
+            this.plans = plans;
+        }
+
+        @Override
+        public Map<String, ExecutionPlan> current(Collection<String> pipelineIds) {
+            reads.add(List.copyOf(pipelineIds));
+            Map<String, ExecutionPlan> found = new HashMap<>();
+            pipelineIds.forEach(id -> {
+                if (plans.containsKey(id)) {
+                    found.put(id, plans.get(id));
+                }
+            });
+            return found;
+        }
     }
 
     @Test

@@ -309,6 +309,15 @@ final class SchemaGenerator {
             entries.add(new Json.Entry("description", new Json.Str(desc)));
         }
         entries.addAll(type.entries());
+        if (doc != null && doc.min() != Long.MIN_VALUE) {
+            entries.add(new Json.Entry("minimum", new Json.Num(Long.toString(doc.min()))));
+        }
+        if (doc != null && doc.max() != Long.MAX_VALUE) {
+            entries.add(new Json.Entry("maximum", new Json.Num(Long.toString(doc.max()))));
+        }
+        if (doc != null && !doc.pattern().isEmpty()) {
+            entries.add(new Json.Entry("pattern", new Json.Str(doc.pattern())));
+        }
         if (doc != null && !doc.def().isEmpty()) {
             entries.add(new Json.Entry("default", defaultValue(component.getType(), doc.def())));
         }

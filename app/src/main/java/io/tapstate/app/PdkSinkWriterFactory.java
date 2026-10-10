@@ -6,8 +6,10 @@ import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkExternalCallStats;
 import io.tapstate.adapters.pdk.PdkSinkPort;
+import io.tapstate.adapters.pdk.SharedSinkConnectors;
 import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkConfig;
@@ -34,8 +36,13 @@ import java.util.Set;
  * <p>The provisioner is expected under {@link #CONNECTOR_PROVISIONER_USER_CONTEXT_KEY}; a member with none
  * bound is not sink-capable and the open fails rather than silently dropping writes. Binding the provisioner
  * into the member user context is the assembly root's job when it makes the member sink-capable.
+ *
+ * <p>The tables its writers write are prepared once for each execution, by {@link #prepareTargets} on the member
+ * coordinating it, before any writer opens; each writer then only checks they were. A sink running several
+ * writers would otherwise prepare each table once per writer, and a table cleared for a full load by one writer
+ * after another had started writing into it would lose the other's rows.
  */
-final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
+final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTargets {
 
     private static final long serialVersionUID = 1L;
 
@@ -55,6 +62,13 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
      */
     static final String CONNECTOR_STATE_STORE_USER_CONTEXT_KEY = "tapstate.pdk.connector-state-store";
     static final String CONNECTOR_CALL_STATS_USER_CONTEXT_KEY = "tapstate.pdk.connector-call-stats";
+
+    /**
+     * The member user-context key under which the member's table of shared sink connectors is bound: where an
+     * artifact is certified for it, the writers of one sink on the member share one connector through it. A
+     * member with none bound opens one connector per writer, whatever the artifact.
+     */
+    static final String SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY = "tapstate.pdk.shared-sink-connectors";
 
     private final String connectorId;
     private final Map<String, Object> settings;
@@ -119,14 +133,29 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     @Override
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
-        return new PdkSinkPort(provisioner(member), stateStore(member), externalCalls(member))
-                .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad),
-                        targets, logScope());
+        return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member), externalCalls(member))
+                .openPrepared(config(), targets, logScope());
     }
 
     private static PdkExternalCallStats externalCalls(HazelcastInstance member) {
         Object bound = member.getUserContext().get(CONNECTOR_CALL_STATS_USER_CONTEXT_KEY);
         return bound instanceof PdkExternalCallStats stats ? stats : PdkExternalCallStats.disabled();
+    }
+
+    /** The member's table of shared sink connectors, or null where none is bound. */
+    private static SharedSinkConnectors sharing(HazelcastInstance member) {
+        Object bound = member.getUserContext().get(SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY);
+        return bound instanceof SharedSinkConnectors sharing ? sharing : null;
+    }
+
+    @Override
+    public void prepareTargets(HazelcastInstance coordinator) {
+        new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), externalCalls(coordinator))
+                .prepare(config(), targets, logScope());
+    }
+
+    private SinkConfig config() {
+        return new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad);
     }
 
     /**

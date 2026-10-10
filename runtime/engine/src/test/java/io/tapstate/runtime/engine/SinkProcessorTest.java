@@ -48,6 +48,12 @@ class SinkProcessorTest {
                 .withOrder(new SourceOrder(1, Integer.parseInt(pos.replaceAll("\\D+", ""))));
     }
 
+    /** An event of the one stream an assembly writes, carrying source position {@code pos} on chain {@code chain}. */
+    private static Envelope assembled(String chain, String pos) {
+        return Envelope.insert(1L, "assembled", Map.of("id", pos), null).withPositions(Map.of(chain,
+                new ChainPosition(new SourceOrder(1, Integer.parseInt(pos.replaceAll("\\D+", ""))), pos)));
+    }
+
     /** A sink is terminal: it consumes every event and emits nothing, across all Jet run scenarios. */
     @Test
     void consumes_all_input_and_emits_nothing() {
@@ -95,9 +101,10 @@ class SinkProcessorTest {
         inbox.addAll(List.of(event(1), event(2), event(3), event(4), event(5)));
 
         processor.process(0, inbox);
-        // saturated at two in flight; the remaining three events stay in the inbox for backpressure.
+        // saturated at two in flight; one more event waits in the sink's own queue - one batch's worth -
+        // and the remaining two stay in the inbox for backpressure.
         assertThat(writer.issued()).isEqualTo(2);
-        assertThat(inbox).hasSize(3);
+        assertThat(inbox).hasSize(2);
         // two writes are still pending, so the processor must not report itself done: a premature
         // complete() would let Jet close the writer and abandon an unsettled write.
         assertThat(processor.complete()).isFalse();
@@ -105,7 +112,7 @@ class SinkProcessorTest {
         writer.completeOldest();
         processor.process(0, inbox);
         assertThat(writer.issued()).isEqualTo(3);
-        assertThat(inbox).hasSize(2);
+        assertThat(inbox).hasSize(1);
         assertThat(processor.complete()).isFalse();
 
         writer.completeAll();
@@ -122,10 +129,12 @@ class SinkProcessorTest {
         RecordingAck ack = new RecordingAck();
         RecordingSinkUseGauge use = new RecordingSinkUseGauge();
         AtomicLong nanos = new AtomicLong();
-        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(), 1, 2,
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 2,
                 FrontierGauge.none(), DeliveryGauge.none(), use, () -> 1_700_000_000_000L, nanos::get));
         TestInbox inbox = new TestInbox();
-        inbox.addAll(List.of(at("orders", "p1"), at("orders", "p2"), at("orders", "p3")));
+        // Two rows are in flight, two occupy the bounded queue, and the fifth is genuinely refused.
+        inbox.addAll(List.of(at("orders", "p1"), at("orders", "p2"), at("orders", "p3"),
+                at("orders", "p4"), at("orders", "p5")));
 
         processor.process(0, inbox);
         assertThat(writer.issued()).isEqualTo(1);
@@ -149,11 +158,31 @@ class SinkProcessorTest {
         assertThat(use.waitNanos).containsExactly(500_000_000L);
         assertThat(use.active).containsExactly(true, false);
 
+        assertThat(writer.issued()).isEqualTo(2);
+        assertThat(inbox).hasSize(1);
         processor.process(0, inbox);
-        assertThat(use.issued).containsExactly("1/2/2/1/1", "2/3/2/1/1");
+        assertThat(inbox).isEmpty();
+        assertThat(use.issued).containsExactly("1/2/2/1/1", "2/4/2/1/1");
+        // The bound covers all five rows but waits for both the in-flight and queued writes.
+        processor.tryProcessWatermark(boundAt("orders", 5));
+        assertThat(ack.calls).isEmpty();
+        nanos.addAndGet(10_000_000L);
         writer.completeOldest();
-        drain(processor);
+        nanos.addAndGet(90_000_000L);
+        processor.tryProcess();
         assertThat(ack.calls).containsExactly("orders=p2");
+        assertThat(use.issued).containsExactly("1/2/2/1/1", "2/4/2/1/1", "3/5/2/1/1");
+        assertThat(use.settled).containsExactly("100000000/0", "10000000/0");
+        assertThat(processor.complete()).isFalse();
+        nanos.addAndGet(10_000_000L);
+        writer.completeOldest();
+        nanos.addAndGet(390_000_000L);
+        processor.tryProcess();
+        assertThat(use.settled).containsExactly("100000000/0", "10000000/0", "10000000/0");
+        assertThat(use.waitNanos).containsExactly(500_000_000L);
+        assertThat(use.active).containsExactly(true, false);
+        drain(processor);
+        assertThat(ack.calls).containsExactly("orders=p2", "orders=p4", "orders=p5");
     }
 
     @Test
@@ -202,15 +231,16 @@ class SinkProcessorTest {
         inbox.addAll(List.of(event(1), event(2), event(3)));
 
         processor.process(0, inbox);
-        // exactly one write may be outstanding; the rest wait in the inbox, so a later same-key
-        // event can never reach the target before an earlier one it depends on.
+        // exactly one write may be outstanding; the rest wait - one batch's worth in the sink's own queue,
+        // the rest in the inbox - so a later same-key event can never reach the target before an earlier
+        // one it depends on.
         assertThat(writer.issued()).isEqualTo(1);
-        assertThat(inbox).hasSize(2);
+        assertThat(inbox).hasSize(1);
 
         writer.completeAll();
         processor.process(0, inbox);
         assertThat(writer.issued()).isEqualTo(2);
-        assertThat(inbox).hasSize(1);
+        assertThat(inbox).isEmpty();
 
         writer.completeAll();
         processor.process(0, inbox);
@@ -341,8 +371,10 @@ class SinkProcessorTest {
         SinkProcessor processor = init(new SinkProcessor(new RecordingWriter(), ack, new ContiguousPrefix(), 1, 3));
 
         TestInbox inbox = new TestInbox();
-        // one batch interleaves two chains; within it chain a's position is a2 (its max), chain b's is b1.
-        inbox.addAll(List.of(at("a", "a1"), at("b", "b1"), at("a", "a2"), at("a", "a3"), at("b", "b2")));
+        // one stream carries both chains - rows assembled from two sources - so one batch interleaves them;
+        // within it chain a's position is a2 (its max), chain b's is b1.
+        inbox.addAll(List.of(assembled("a", "a1"), assembled("b", "b1"), assembled("a", "a2"),
+                assembled("a", "a3"), assembled("b", "b2")));
         pump(processor, inbox);
 
         // batch [a1,b1,a2] opens a at a2 and b at b1; batch [a3,b2] closes both -> a=a2, b=b1 independently.
@@ -509,8 +541,8 @@ class SinkProcessorTest {
     void a_bound_held_for_one_chain_survives_a_bound_arriving_for_another() throws Exception {
         RecordingAck ack = new RecordingAck();
         ManualWriter writer = new ManualWriter();
-        // One write in flight, as an ack-bearing sink requires, and a batch that carries both chains: a
-        // pipeline reading two sources feeds one sink, and the batch it fills is whatever arrived.
+        // One write in flight, as an ack-bearing sink requires: a pipeline reading two sources feeds one sink,
+        // and the two streams' rows go as two writes, one after the other.
         SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 2));
 
         TestInbox inbox = new TestInbox();
@@ -519,9 +551,11 @@ class SinkProcessorTest {
         processor.tryProcessWatermark(boundAt("orders", 1));
         processor.tryProcessWatermark(boundAt("lines", 1));
 
-        // Neither yet: both writes are still in flight.
+        // Neither yet: one write is in flight and the other still queued.
         assertThat(ack.calls).isEmpty();
 
+        writer.completeAll();
+        processor.tryProcess();
         writer.completeAll();
         drain(processor);
 
