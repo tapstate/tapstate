@@ -13,8 +13,11 @@ final class BenchmarkTargetClock {
     static final int INTERIOR_SAMPLE_INTERVAL_MILLIS = 200;
     static final int MAX_INTERIOR_SAMPLE_GAP_MILLIS = 500;
     static final int MAX_INTERIOR_SAMPLES = 6_000;
+    // Operation dates and logical slots are sampled separately; their ordering does not identify a clock step.
+    static final String OPERATION_DATE_REFUSAL_SCOPE =
+            "; evidenceScope=OPERATION_DATE_ORDER_IN_LOGICAL_STREAM; clockCause=UNKNOWN";
 
-    /** Bounded native sample uncertainty cannot hide a cumulative interior clock rollback. */
+    /** Retains the fixed operation-date ordering tolerance without assigning the cause of a refusal. */
     static final class WallSamples {
         private Long highWater;
         boolean accept(Long current) {

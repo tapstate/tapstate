@@ -505,7 +505,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                             + "; namespace=" + namespace + "; target=" + targetId + "; phase=" + activePhase
                             + "; key=" + key + "; highWaterMillis=" + operationWalls.highWaterMillis()
                             + "; currentWallMillis=" + operationWall + "; clusterTime=" + change.getClusterTime()
-                            + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS);
+                            + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS
+                            + BenchmarkTargetClock.OPERATION_DATE_REFUSAL_SCOPE);
                     if (clockRejectionEvidence != null) {
                         recordRejectedClockEvent(clockRejectionEvidence, clockRecordingFailure,
                                 () -> clockEvent(change, key, startedReadNanos, observedAtNanos, null), original);

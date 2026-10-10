@@ -34,6 +34,29 @@ class BenchmarkTargetClockTest {
         assertThat(samples.accept(2_001L)).isTrue();
         assertThat(samples.accept(1_998L)).isFalse();
     }
+    @Test void qualifiedSerialClockReadsDoNotResolveConcurrentOperationDateOrdering() {
+        var clocks = java.util.List.of(reading("one", 1_000, 0, 2), reading("one", 1_200, 199, 202),
+                reading("one", 1_400, 399, 402));
+        assertThat(BenchmarkTargetClock.validateSeries(clocks))
+                .containsEntry("state", "QUALIFIED_SAMPLED_INTERIOR");
+        // An earlier date sampler may acquire a later logical slot after another operation.
+        // This synthetic ordering does not identify the cause of an actual server refusal.
+        var operationDatesInLogicalOrder = java.util.List.of(1_010L, 1_006L);
+        var dates = new BenchmarkTargetClock.WallSamples();
+        assertThat(dates.accept(operationDatesInLogicalOrder.getFirst())).isTrue();
+        assertThat(dates.accept(operationDatesInLogicalOrder.getLast())).isFalse();
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readServerOperations(operationDatesInLogicalOrder))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("beyond clock uncertainty")
+                .hasMessageContaining("uncertaintyMillis=2")
+                .hasMessageContaining("clockCause=UNKNOWN")
+                .hasMessageContaining("evidenceScope=OPERATION_DATE_ORDER_IN_LOGICAL_STREAM");
+    }
+    @Test void missingOperationDateCannotIdentifyAClockFailure() {
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readServerOperations(java.util.Arrays.asList(1_000L, null)))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("clockCause=UNKNOWN")
+                .hasMessageContaining("evidenceScope=OPERATION_DATE_ORDER_IN_LOGICAL_STREAM");
+    }
     private static BenchmarkTargetClock.Reading reading(String process, long wall, long start, long end) {
         return new BenchmarkTargetClock.Reading("owned:27017", process, wall, start*1_000_000, end*1_000_000, wall-1, wall+1);
     }

@@ -50,7 +50,9 @@ final class BenchmarkSteadyOutputWindow {
     }
 
     static Reading readServerOperations(List<Long> wallMillis) {
-        if (wallMillis.stream().anyMatch(java.util.Objects::isNull)) { throw new AssertionError("target operation timeline is unavailable"); }
+        if (wallMillis.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new AssertionError("target operation timeline is unavailable" + BenchmarkTargetClock.OPERATION_DATE_REFUSAL_SCOPE);
+        }
         validateWallSamples(wallMillis);
         // Logical oplog order is validated by the observer. Concurrent writes independently sample
         // server wall dates, so temporal bins use every original timestamp in chronological order.
@@ -116,7 +118,10 @@ final class BenchmarkSteadyOutputWindow {
             validateWallSamples(stream);
             long minimum = Long.MAX_VALUE, maximum = Long.MIN_VALUE;
             for (Long value : stream) {
-                if (value == null) { throw new AssertionError("target operation clock is missing before stream merge"); }
+                if (value == null) {
+                    throw new AssertionError("target operation clock is missing before stream merge"
+                            + BenchmarkTargetClock.OPERATION_DATE_REFUSAL_SCOPE);
+                }
                 minimum = Math.min(minimum, value); maximum = Math.max(maximum, value);
             }
             first = Math.max(first, minimum); last = Math.min(last, maximum);
@@ -131,7 +136,8 @@ final class BenchmarkSteadyOutputWindow {
             if (!samples.accept(current)) {
                 throw new AssertionError("target operation clock is missing or moved backward beyond clock uncertainty"
                         + "; highWaterMillis=" + samples.highWaterMillis() + "; currentWallMillis=" + current
-                        + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS);
+                        + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS
+                        + BenchmarkTargetClock.OPERATION_DATE_REFUSAL_SCOPE);
             }
         }
     }
