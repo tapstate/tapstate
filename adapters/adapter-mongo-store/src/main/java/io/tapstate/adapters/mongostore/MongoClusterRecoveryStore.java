@@ -377,7 +377,7 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
     public Result recordSubmission(ClusterRecoveryFence expected, WorkloadClaimFence pipelineClaim, String nativeJobId) {
         return write(expected, (session, context) -> {
             ClusterRecoveryItem item = context.item;
-            if (item.successor() == null || !item.successor().pipelineClaim().equals(pipelineClaim) || item.permit() == null
+            if (!item.hasAllocatedSuccessor() || !item.successor().pipelineClaim().sameAuthorityAs(pipelineClaim)
                     || item.successor().failureNote() != null) {
                 return result(ClusterRecoveryMutation.STALE_EXECUTION, item);
             }
@@ -396,22 +396,32 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
     @Override
     public Result recordStartup(ClusterRecoveryFence expected, WorkloadClaimFence pipelineClaim, ClusterRecoveryStartupReceipt receipt) {
         return write(expected, (session, context) -> {
-            if (!pipelineClaim.equals(receipt.pipelineClaim()) || capacity.workloadStore.conditionTouchClaim(session, pipelineClaim) == null) {
+            ClusterRecoverySuccessor successor = context.item.successor();
+            if (!context.item.hasAllocatedSuccessor() || !successor.pipelineClaim().sameAuthorityAs(pipelineClaim)
+                    || !originalOrCurrent(receipt.pipelineClaim(), successor.pipelineClaim(), pipelineClaim)) {
+                return result(ClusterRecoveryMutation.STALE_EXECUTION, context.item);
+            }
+            Document authority = capacity.workloadStore.conditionTouchClaim(session, pipelineClaim);
+            if (authority == null) {
                 return result(ClusterRecoveryMutation.STALE_PIPELINE_CLAIM, context.item);
             }
-            ClusterRecoveryMutation evidence = context.item.startupReceiptCheck(receipt);
+            if (!matchesContext(context.item, context.facts, authority)) {
+                return result(ClusterRecoveryMutation.STALE_EXECUTION, context.item);
+            }
+            ClusterRecoveryStartupReceipt originalReceipt = receiptWithClaim(receipt, successor.pipelineClaim());
+            ClusterRecoveryMutation evidence = context.item.startupReceiptCheck(originalReceipt);
             if (evidence != ClusterRecoveryMutation.APPLIED) {
                 return result(evidence, context.item);
             }
             ClusterRecoveryMutation liveExecution = startupExecutionCheck(context.item.successor(), context.facts.pipeline(),
-                    context.facts.actual(), receipt);
+                    context.facts.actual(), originalReceipt);
             if (liveExecution != ClusterRecoveryMutation.APPLIED) {
                 return result(liveExecution, context.item);
             }
-            if (!guardSources(session, context.item.successor(), receipt)) {
+            if (!guardSources(session, successor, originalReceipt, pipelineClaim)) {
                 return result(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT, context.item);
             }
-            return save(session, context.stored, context.item.initialized(receipt, context.facts.now()), null);
+            return save(session, context.stored, context.item.initialized(originalReceipt, context.facts.now()), null);
         });
     }
 
@@ -423,15 +433,19 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
                 return result(evidence, context.item);
             }
             ClusterRecoverySuccessor successor = context.item.successor();
+            WorkloadClaimFence current = WorkloadClaimFence.from(MongoWorkloadClaimStore.readDocument(context.facts.pipeline()));
+            if (!successor.pipelineClaim().sameAuthorityAs(current) || !matchesContext(context.item, context.facts, context.facts.pipeline())) {
+                return result(ClusterRecoveryMutation.STALE_EXECUTION, context.item);
+            }
             ClusterRecoveryMutation liveExecution = startupExecutionCheck(successor, context.facts.pipeline(),
                     context.facts.actual(), successor.startupReceipt());
             if (liveExecution != ClusterRecoveryMutation.APPLIED) {
                 return result(liveExecution, context.item);
             }
-            if (capacity.workloadStore.conditionTouchClaim(session, successor.pipelineClaim()) == null) {
+            if (capacity.workloadStore.conditionTouchClaim(session, current) == null) {
                 return result(ClusterRecoveryMutation.STALE_PIPELINE_CLAIM, context.item);
             }
-            if (!guardSources(session, successor, successor.startupReceipt())) {
+            if (!guardSources(session, successor, successor.startupReceipt(), current)) {
                 return result(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT, context.item);
             }
             ClusterCapacityReservation reservation = capacity.readReservation(session, context.item.permit().reservationId());
@@ -455,7 +469,8 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
                 ? ClusterRecoveryMutation.APPLIED : ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT;
     }
 
-    private boolean guardSources(ClientSession session, ClusterRecoverySuccessor successor, ClusterRecoveryStartupReceipt receipt) {
+    private boolean guardSources(ClientSession session, ClusterRecoverySuccessor successor, ClusterRecoveryStartupReceipt receipt,
+            WorkloadClaimFence current) {
         if (!successor.matchesStartup(receipt)) {
             return false;
         }
@@ -463,12 +478,51 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
             return false;
         }
         for (String source : successor.requiredSourceIds()) {
-            if (!meta.guardPreparedStartup(session, successor.pipelineClaim(), receipt.preparedWitnesses().get(source),
+            if (!meta.guardPreparedStartup(session, current, receipt.preparedWitnesses().get(source),
                     receipt.requestedPositions().get(source), successor.requiredSourceIds())) {
                 return false;
             }
         }
         return true;
+    }
+
+    private static boolean originalOrCurrent(WorkloadClaimFence observed, WorkloadClaimFence original, WorkloadClaimFence current) {
+        return original.equals(observed) || current.equals(observed);
+    }
+
+    private static ClusterRecoveryStartupReceipt receiptWithClaim(ClusterRecoveryStartupReceipt receipt, WorkloadClaimFence claim) {
+        return new ClusterRecoveryStartupReceipt(claim, receipt.nativeJobId(), receipt.nativeInitializedAt(), receipt.preparedWitnesses(),
+                receipt.requestedPositions(), receipt.acceptedPositions(), receipt.positionsAcceptedAt(), receipt.executionCompleted());
+    }
+
+    private static boolean matchesContext(ClusterRecoveryItem item, MongoClusterCapacityStore.Context facts, Document authority) {
+        ClusterRecoverySuccessor successor = item.successor();
+        return successor != null && MongoClusterCapacityStore.matchesExecutionContext(authority, successor.pipelineClaim(),
+                successor.profile(), item.event().key(), facts.intent().getString("revision"), successor.executionNodeIds());
+    }
+
+    /** An older allocation marker is repaired only from the reservation created by the real issuer. */
+    private ClusterRecoveryItem recordedAllocation(ClientSession session, ClusterRecoveryItem item, MongoClusterCapacityStore.Context facts) {
+        if (item.hasAllocatedSuccessor() || item.permit() == null || item.successor() == null
+                || item.permit().transferredExecutionGeneration() != 0 || item.successor().nativeJobId() != null
+                || !item.successor().sourceRequirementsRecorded()) {
+            return item;
+        }
+        ClusterCapacityReservation reservation = capacity.readReservation(session, item.permit().reservationId());
+        if (reservation == null || reservation.executionGeneration() == null
+                || reservation.executionGeneration() != item.successor().executionGeneration()
+                || !reservation.pipelineClaim().equals(item.successor().pipelineClaim())
+                || !reservation.profile().equals(item.successor().profile())
+                || !reservation.incarnationId().equals(item.event().key().incarnation())
+                || !reservation.intentFingerprint().equals(item.event().intentFingerprint())
+                || !reservation.demandByNode().equals(item.permit().demandByNode()) || reservation.nativeJobId() != null
+                || !matchesContext(item, facts, facts.pipeline())
+                || !Set.copyOf(((PipelineResource) MongoArtifactStore.toResource(facts.artifact())).sourceIds())
+                        .containsAll(item.successor().requiredSourceIds())
+                || !capacity.touchAllocation(session, reservation)) {
+            return item;
+        }
+        return item.allocationRecorded(reservation.executionGeneration(), facts.now());
     }
 
     private OriginalAuthority originalAuthority(ClientSession session, ClusterRecoveryItem item, MongoClusterCapacityStore.Context facts) {
@@ -541,14 +595,6 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
             if (!item.targetProfile().equals(expected.targetProfile())) {
                 return result(ClusterRecoveryMutation.STALE_PROFILE, item);
             }
-            if (item.successor() == null || item.permit() == null
-                    || !item.successor().pipelineClaim().equals(expected.pipelineClaim())
-                    || item.executionFrontier() != expected.pipelineClaim().executionGeneration()) {
-                return result(ClusterRecoveryMutation.STALE_EXECUTION, item);
-            }
-            if (capacity.workloadStore.conditionTouchClaim(session, expected.pipelineClaim()) == null) {
-                return result(ClusterRecoveryMutation.STALE_PIPELINE_CLAIM, item);
-            }
             var facts = capacity.guardFailureFact(session, expected.key(), expected.targetProfile(), expected.intentFingerprint());
             if (facts.outcome() != ClusterCapacityStore.Outcome.APPLIED) {
                 return result(mutation(facts.outcome()), item);
@@ -556,7 +602,16 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
             if (!List.of("RUNNING", "FAILED").contains(facts.actual().getString("stateJson"))) {
                 return result(ClusterRecoveryMutation.TERMINAL, item);
             }
-            if (ClusterRecoveryDocuments.number(facts.pipeline(), "executionGeneration") != item.executionFrontier()) {
+            item = recordedAllocation(session, item, facts);
+            if (!item.hasAllocatedSuccessor() || !item.successor().pipelineClaim().sameAuthorityAs(expected.pipelineClaim())
+                    || item.executionFrontier() != expected.pipelineClaim().executionGeneration()) {
+                return result(ClusterRecoveryMutation.STALE_EXECUTION, item);
+            }
+            Document authority = capacity.workloadStore.conditionTouchClaim(session, expected.pipelineClaim());
+            if (authority == null) {
+                return result(ClusterRecoveryMutation.STALE_PIPELINE_CLAIM, item);
+            }
+            if (!matchesContext(item, facts, authority)) {
                 return result(ClusterRecoveryMutation.STALE_EXECUTION, item);
             }
             if (item.successor().failureNote() != null) {
@@ -568,17 +623,22 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
                         && numberOrZero(facts.pipeline(), "failureClaimGeneration") == expected.pipelineClaim().claimGeneration();
             } else {
                 String source = sourceFailure.witness().sourceId();
-                qualified = meta != null && expected.pipelineClaim().equals(sourceFailure.pipelineClaim())
+                if (!originalOrCurrent(sourceFailure.pipelineClaim(), item.successor().pipelineClaim(), expected.pipelineClaim())) {
+                    return result(ClusterRecoveryMutation.STALE_EXECUTION, item);
+                }
+                var rebound = new CaptureStartupFailure(expected.pipelineClaim(), sourceFailure.witness(),
+                        sourceFailure.requestedPosition(), sourceFailure.preparedAt(), sourceFailure.readerState());
+                qualified = meta != null
                         && item.successor().sourceRequirementsRecorded() && item.successor().requiredSourceIds().contains(source)
                         && diagnostic.code().equals(sourceFailure.code()) && diagnostic.params().equals(sourceFailure.params())
                         && (sourceFailure.requestedPosition() == null ? !diagnostic.positions().containsKey(source)
                                 : sourceFailure.requestedPosition().equals(diagnostic.positions().get(source)))
-                        && meta.guardStartupFailure(session, sourceFailure, expected.pipelineClaim(), item.successor().requiredSourceIds());
+                        && meta.guardStartupFailure(session, rebound, expected.pipelineClaim(), item.successor().requiredSourceIds());
             }
             if (!qualified) {
                 return result(ClusterRecoveryMutation.STALE_EXECUTION, item);
             }
-            ClusterRecoveryFailureNote note = new ClusterRecoveryFailureNote(expected.pipelineClaim(), stage, diagnostic, facts.now());
+            ClusterRecoveryFailureNote note = new ClusterRecoveryFailureNote(item.successor().pipelineClaim(), stage, diagnostic, facts.now());
             return save(session, stored, item.failureNoted(note, facts.now()), null);
         });
     }
@@ -589,11 +649,11 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
         MongoClusterCapacityStore.positive(backoff);
         return write(expected, (session, context) -> {
             ClusterRecoveryItem item = context.item;
-            ClusterRecoveryFailureNote note = item.successor() == null ? null : item.successor().failureNote();
+            ClusterRecoveryFailureNote note = item.hasAllocatedSuccessor() ? item.successor().failureNote() : null;
             FailureStage effectiveStage = note == null ? stage : note.stage();
             ClusterRecoveryDiagnostic effectiveDiagnostic = note == null ? diagnostic : note.diagnostic();
             if ((effectiveStage == FailureStage.ALLOCATED_EXECUTION || effectiveStage == FailureStage.SOURCE_POSITION_REJECTION)
-                    && (item.successor() == null || !item.successor().pipelineClaim().equals(pipelineClaim))) {
+                    && (!item.hasAllocatedSuccessor() || !item.successor().pipelineClaim().sameAuthorityAs(pipelineClaim))) {
                 return result(ClusterRecoveryMutation.STALE_EXECUTION, item);
             }
             if (effectiveStage == FailureStage.SOURCE_POSITION_REJECTION
@@ -670,11 +730,11 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
             if (!releaseReservation(session, item, context.facts.now())) {
                 return result(ClusterRecoveryMutation.SUCCESSOR_STILL_AUTHORIZED, item);
             }
-            if (item.successor() != null && item.successor().failureNote() != null) {
+            if (item.hasAllocatedSuccessor() && item.successor().failureNote() != null) {
                 return save(session, context.stored, item.executionFailed(item.successor().failureNote().diagnostic(),
                         Duration.ofMillis(1), context.facts.now()), null);
             }
-            if (item.attempt() >= item.maxAttempts() && item.successor() != null) {
+            if (item.attempt() >= item.maxAttempts() && item.hasAllocatedSuccessor()) {
                 ClusterRecoveryDiagnostic cause = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
                         new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null),
                         item.event().resumePositions(), "Confirm the prior execution is stopped before starting the pipeline explicitly");
@@ -758,7 +818,7 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
             if (optimistic != ClusterRecoveryMutation.APPLIED) {
                 return result(optimistic, item);
             }
-            return operation.apply(session, new QueueContext(current, item, facts, recovery));
+            return operation.apply(session, new QueueContext(current, recordedAllocation(session, item, facts), facts, recovery));
         });
     }
 

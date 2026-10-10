@@ -173,6 +173,47 @@ class ClusterRecoveryRuntimeTest {
         verifyNoInteractions(workloads);
     }
 
+    @Test void startupEvidenceUsesTheRefreshedLivePipelineFence() {
+        finiteSuccessor();
+        WorkloadClaim refreshed = atTopology(claim(9), 8);
+        WorkloadClaimFence expected = WorkloadClaimFence.from(refreshed);
+        when(ownership.currentClaim("p")).thenReturn(Optional.of(refreshed));
+
+        assertThat(runtime.mayComplete("p")).isTrue();
+
+        verify(store.clusterRecovery()).recordSubmission(any(), eq(expected), eq("42"));
+        verify(captures).startupProofs("p", expected);
+        verify(captures).requiredSources("p", expected);
+        verify(store.clusterRecovery()).recordStartup(any(), eq(expected), argThat(receipt -> receipt.pipelineClaim().equals(expected)));
+    }
+
+    @Test void anExpiredPipelineClaimCannotSupplyStartupEvidence() {
+        finiteSuccessor();
+        when(store.workloadClaims().read(any())).thenReturn(Optional.of(new WorkloadClaimReading(claim(9), Duration.ZERO)));
+
+        assertThat(runtime.mayComplete("p")).isFalse();
+
+        verify(store.clusterRecovery(), never()).recordSubmission(any(), any(), anyString());
+        verify(store.clusterRecovery(), never()).recordStartup(any(), any(), any());
+        verify(store.clusterRecovery(), never()).complete(any());
+    }
+
+    @Test void aDifferentPipelineHolderCannotSupplyThePreviousHoldersStartupEvidence() {
+        finiteSuccessor();
+        WorkloadClaim previous = claim(9);
+        var next = new WorkloadClaim(previous.key(), new WorkloadOwner("b", "new-boot"), 2, previous.executionGeneration(), 8,
+                previous.leaseUntil(), previous.contextExecutionGeneration(), previous.executionClaimGeneration(), previous.executionNodeIds(),
+                0, false, previous.profileGeneration(), previous.executionProfile(), previous.executionTopologyRevision(),
+                previous.executionIncarnation(), previous.executionRevision(), previous.executionMembers());
+        when(store.workloadClaims().read(any())).thenReturn(Optional.of(new WorkloadClaimReading(next, Duration.ofSeconds(30))));
+
+        assertThat(runtime.mayComplete("p")).isFalse();
+
+        verify(store.clusterRecovery(), never()).recordSubmission(any(), any(), anyString());
+        verify(store.clusterRecovery(), never()).recordStartup(any(), any(), any());
+        verify(store.clusterRecovery(), never()).complete(any());
+    }
+
     @Test void aCompatibleMemberJoinDoesNotRetargetAProvenSuccessfulSuccessor() {
         var completion = finiteSuccessor();
         when(gate.committed()).thenReturn(new ClusterMembership("cluster", 8, NODES, 2));
@@ -184,7 +225,8 @@ class ClusterRecoveryRuntimeTest {
         when(states.read("p")).thenReturn(Optional.empty());
         var claimStore = mock(WorkloadClaimStore.class);
         when(store.workloadClaims()).thenReturn(claimStore);
-        when(claimStore.read(any())).thenReturn(Optional.empty());
+        when(claimStore.read(any())).thenAnswer(call -> ownership.currentClaim("p")
+                .map(claim -> new WorkloadClaimReading(claim, Duration.ofSeconds(30))));
         when(store.clusterRecovery().list("cluster", 0, 100)).thenReturn(List.of(completion.item()));
         when(store.clusterRecovery().retarget(any(), any(), anyLong())).thenReturn(new ClusterRecoveryStore.Result(
                 ClusterRecoveryMutation.STALE_ITEM, completion.item(), null));
@@ -279,6 +321,62 @@ class ClusterRecoveryRuntimeTest {
         verify(store.clusterRecovery(), never()).resumePermit(any(), anyString(), any());
     }
 
+    @Test void aNewUnallocatedPermitDoesNotConsumeThePreviousSuccessorsFailureNote() {
+        CompletionFixture recovery = finiteSuccessor();
+        var error = new TapstateException(EngineError.ROUTING_KEY_MISSING,
+                Map.of("node", "join", "stream", "s.orders", "columns", "id"), null);
+        var diagnostic = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                error, Map.of(), "Correct the missing routing key.");
+        var note = new ClusterRecoveryFailureNote(recovery.item().successor().pipelineClaim(),
+                ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, diagnostic, NOW);
+        ClusterRecoveryItem next = recovery.item().failureNoted(note, NOW)
+                .executionFailed(diagnostic, Duration.ofSeconds(1), NOW)
+                .permitted(new ClusterRecoveryPermit("next-reservation", WorkloadClaimFence.from(recovery.coordinator()),
+                        NOW.plusSeconds(1), NOW.plusSeconds(31), Map.of("a", demand, "b", demand, "c", demand), 0), NOW.plusSeconds(1));
+        recoveryPass(recovery.coordinator(), next);
+        when(store.clusterRecovery().releaseExpiredPermit(any())).thenReturn(
+                new ClusterRecoveryStore.Result(ClusterRecoveryMutation.WAITING_PERMIT, next, null));
+        when(store.clusterRecovery().resumePermit(any(), eq("next-reservation"), any())).thenReturn(
+                new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, next, null));
+
+        runtime.retain(List.of("p"));
+
+        verify(store.clusterRecovery(), never()).fail(any(), any(), any(), any(), any());
+        verify(store.clusterRecovery(), never()).complete(any());
+        verify(store.clusterRecovery(), never()).recordStartup(any(), any(), any());
+        verify(store.clusterRecovery()).resumePermit(any(), eq("next-reservation"), any());
+    }
+
+    @Test void aNewPermitAllocatesItsOwnExecutionRatherThanReusingItsHistoricalSuccessor() {
+        CompletionFixture recovery = finiteSuccessor();
+        var diagnostic = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                new TapstateException(EngineError.ROUTING_KEY_MISSING,
+                        Map.of("node", "join", "stream", "s.orders", "columns", "id"), null),
+                Map.of(), "Correct the missing routing key.");
+        ClusterRecoveryItem next = recovery.item().executionFailed(diagnostic, Duration.ofSeconds(1), NOW)
+                .permitted(new ClusterRecoveryPermit("next-reservation", WorkloadClaimFence.from(recovery.coordinator()),
+                        NOW.plusSeconds(1), NOW.plusSeconds(31), Map.of("a", demand, "b", demand, "c", demand), 0), NOW.plusSeconds(1));
+        WorkloadClaim previous = claim(9);
+        WorkloadClaim advanced = claim(10);
+        ClusterRecoveryItem issued = next.advanced(new ClusterRecoverySuccessor(WorkloadClaimFence.from(advanced), profile,
+                NODES, Set.of("s"), NOW.plusSeconds(1), null, null, Map.of(), null), NOW.plusSeconds(1));
+        when(store.clusterRecovery().read(any())).thenReturn(Optional.of(next));
+        when(store.clusterRecovery().advanceExecution(any(), eq(previous), eq(NODES), eq(Set.of("s"))))
+                .thenReturn(new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, issued, advanced));
+        when(ownership.beginExecution(eq("p"), any())).thenAnswer(call -> {
+            var issuer = call.<PipelineActuationOwnership.ExecutionAdvance>getArgument(1);
+            return issuer.advance(previous, 7, NODES).map(claim -> new PipelineActuationOwnership.Execution(true,
+                    new ExecutionFence("p", claim.claimGeneration(), claim.executionGeneration(), claim.profileGeneration()),
+                    claim.topologyRevision())).orElseGet(PipelineActuationOwnership.Execution::refused);
+        });
+        DagSource.PlannedStart planned = plan(List.of());
+
+        assertThat(runtime.prepare("p", planned, ownership)).isTrue();
+        assertThat(runtime.begin("p", planned, ownership).fence().executionGeneration()).isEqualTo(10);
+
+        verify(store.clusterRecovery()).advanceExecution(any(), eq(previous), eq(NODES), eq(Set.of("s")));
+    }
+
     @Test void aFailureFactRefusalKeepsTheStoppedExecutionAuthorityForARetry() {
         CompletionFixture recovery = finiteSuccessor();
         WorkloadClaim current = failed(claim(9));
@@ -350,7 +448,7 @@ class ClusterRecoveryRuntimeTest {
         Map<String, Object> params = code == io.tapstate.runtime.srs.CaptureError.START_FROM_OUTSIDE_WINDOW
                 ? Map.of("requested", "original-token", "earliest", "head\n" + "x".repeat(300), "retention", 2L)
                 : Map.of("connector", "fixture-source", "requested", "original-token", "pdkId", "fixture-source",
-                        "pdkCode", 10003, "serverCode", 286, "pdkArgs", List.of("retained point is outside the source log"));
+                        "pdkCode", "10003", "serverCode", "286", "pdkArgs", List.of("retained point is outside the source log"));
         String disposition = "Extend source retention before retrying the original point.";
         var fact = new CaptureStartupFailure(WorkloadClaimFence.from(current), witness, point, NOW,
                 new CaptureReadState(attempt, null, null, null, true, code.code(),
@@ -390,6 +488,50 @@ class ClusterRecoveryRuntimeTest {
                 && diagnostic.params().equals(failure.args())), eq(ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION), isNull());
     }
 
+    @Test void aCachedAllocatedCauseCannotClassifyAReacquiredClaimAtTheSameExecutionGeneration() {
+        var held = new java.util.concurrent.atomic.AtomicReference<>(claim(9));
+        when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
+        var failure = new TapstateException(EngineError.ROUTING_KEY_MISSING,
+                Map.of("node", "join", "stream", "s.orders", "columns", "id"), null);
+        runtime.failedAfterAllocation("p", new PipelineActuationOwnership.Execution(true, new ExecutionFence("p", 1, 9, 2), 7L), failure);
+        clearInvocations(ownership);
+        WorkloadClaim previous = held.get();
+        held.set(new WorkloadClaim(previous.key(), previous.owner(), 2, previous.executionGeneration(), 8,
+                previous.leaseUntil(), previous.contextExecutionGeneration(), previous.executionClaimGeneration(),
+                previous.executionNodeIds(), 0, false, previous.profileGeneration(), previous.executionProfile(),
+                previous.executionTopologyRevision(), previous.executionIncarnation(), previous.executionRevision(), previous.executionMembers()));
+
+        runtime.recordFailure("p");
+
+        verify(ownership, never()).recordClassifiedFailure(anyString(), anyBoolean());
+    }
+
+    @Test void aFailureNoteIsWrittenWithTheRefreshedLivePipelineFence() {
+        CompletionFixture recovery = finiteSuccessor();
+        WorkloadClaim refreshed = failed(atTopology(claim(9), 8));
+        WorkloadClaimFence expected = WorkloadClaimFence.from(refreshed);
+        when(ownership.currentClaim("p")).thenReturn(Optional.of(refreshed));
+        var failure = new TapstateException(EngineError.ROUTING_KEY_MISSING,
+                Map.of("node", "join", "stream", "s.orders", "columns", "id"), null);
+        when(engine.nativeRun("p")).thenReturn(Optional.of(new Engine.NativeRun("42", 1, 9, 2, JobStatus.FAILED, Optional.empty())));
+        when(engine.failureOf("p")).thenReturn(Optional.of(failure));
+        when(store.clusterRecovery().recordFailureNote(any(), any(), any(), isNull())).thenReturn(
+                new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, recovery.item(), null));
+
+        runtime.recordFailure("p");
+
+        verify(store.clusterRecovery()).recordFailureNote(argThat(fence -> fence.pipelineClaim().equals(expected)),
+                argThat(diagnostic -> diagnostic.code().equals(failure.code().code()) && diagnostic.params().equals(failure.args())),
+                eq(ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION), isNull());
+    }
+
+    private static WorkloadClaim atTopology(WorkloadClaim claim, long topology) {
+        return new WorkloadClaim(claim.key(), claim.owner(), claim.claimGeneration(), claim.executionGeneration(), topology,
+                claim.leaseUntil(), claim.contextExecutionGeneration(), claim.executionClaimGeneration(), claim.executionNodeIds(),
+                claim.failureClaimGeneration(), claim.failureAfterMemberLoss(), claim.profileGeneration(), claim.executionProfile(),
+                claim.executionTopologyRevision(), claim.executionIncarnation(), claim.executionRevision(), claim.executionMembers());
+    }
+
     private void recoveryPass(WorkloadClaim previousCoordinator, ClusterRecoveryItem item) {
         when(gate.committed()).thenReturn(new ClusterMembership("cluster", 7, NODES, 2));
         WorkloadClaim coordinator = new WorkloadClaim(previousCoordinator.key(), owner, 5, 0, 7,
@@ -407,6 +549,10 @@ class ClusterRecoveryRuntimeTest {
     private CompletionFixture successor(Set<String> sources) {
         WorkloadClaim successorClaim = claim(9);
         when(ownership.currentClaim("p")).thenReturn(Optional.of(successorClaim));
+        var claimStore = mock(WorkloadClaimStore.class);
+        when(store.workloadClaims()).thenReturn(claimStore);
+        when(claimStore.read(any())).thenAnswer(call -> ownership.currentClaim("p")
+                .map(claim -> new WorkloadClaimReading(claim, Duration.ofSeconds(30))));
         WorkloadClaim coordinator = new WorkloadClaim(new WorkloadClaimKey("cluster", WorkloadClaimType.CLUSTER_RECOVERY, "cluster"),
                 new WorkloadOwner("b", "boot-b"), 4, 0, 7, NOW.plusSeconds(30), 0, 0, Set.of(), 0, false, 2);
         DesiredState desired = store.desired().read("p").orElseThrow();
@@ -432,7 +578,11 @@ class ClusterRecoveryRuntimeTest {
                 .thenReturn(new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, submitted, null));
         var current = new java.util.concurrent.atomic.AtomicReference<>(submitted);
         when(store.clusterRecovery().recordStartup(any(), any(), any())).thenAnswer(call -> {
-            var initialized = current.get().initialized(call.getArgument(2), NOW);
+            ClusterRecoveryStartupReceipt supplied = call.getArgument(2);
+            var normalized = new ClusterRecoveryStartupReceipt(current.get().successor().pipelineClaim(), supplied.nativeJobId(),
+                    supplied.nativeInitializedAt(), supplied.preparedWitnesses(), supplied.requestedPositions(), supplied.acceptedPositions(),
+                    supplied.positionsAcceptedAt(), supplied.executionCompleted());
+            var initialized = current.get().initialized(normalized, NOW);
             current.set(initialized);
             return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, initialized, null);
         });

@@ -704,6 +704,31 @@ class ClusterRecoveryStoreIT {
     }
 
     @Test
+    void aPriorCompatibleRetargetKeepsTheVerifiedOriginalSuccessorCompletable() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("orders", true);
+            ClusterRecoveryItem item = fixture.permit(fixture.enqueue(pipeline).item(), DEMAND, LIMITS).item();
+            var allocated = fixture.advance(item, pipeline.claim);
+            item = fixture.submitted(allocated.item()).item();
+            fixture.running("orders");
+            var receipt = fixture.startupReceipt(item);
+            WorkloadClaim refreshed = fixture.compatibleAddition(allocated.advancedPipelineClaim(), TTL);
+            var retargeted = fixture.store.retarget(fixture.fence(item), fixture.profile, 3);
+            assertThat(retargeted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            var current = WorkloadClaimFence.from(refreshed);
+            var observed = fixture.store.recordStartup(fixture.fence(retargeted.item()), current, receiptFor(receipt, current));
+            assertThat(observed.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            var completed = fixture.store.complete(fixture.fence(observed.item()));
+            assertThat(completed.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(completed.item().targetTopologyRevision()).isEqualTo(3);
+            assertThat(completed.item().successor().pipelineClaim().topologyRevision()).isEqualTo(2);
+            assertThat(completed.item().successor().executionNodeIds()).containsExactlyInAnyOrder("a", "b");
+            assertThat(completed.item().successor().startupReceipt().pipelineClaim()).isEqualTo(item.successor().pipelineClaim());
+            assertThat(fixture.workloads.read(pipeline.claim.key()).orElseThrow().claim().executionGeneration()).isEqualTo(2);
+        }
+    }
+
+    @Test
     void aDifferentHolderOrGenerationCannotConsumeTheArchivedStartupOrFailure() {
         try (Fixture fixture = new Fixture()) {
             Pipeline pipeline = fixture.pipeline("orders", true);
@@ -754,6 +779,130 @@ class ClusterRecoveryStoreIT {
         }
     }
 
+    @Test
+    void aRefreshedTopologyCanSubmitTheAlreadyAllocatedExecution() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("orders", true);
+            ClusterRecoveryItem item = fixture.permit(fixture.enqueue(pipeline).item(), DEMAND, LIMITS).item();
+            var allocated = fixture.advance(item, pipeline.claim);
+            item = allocated.item();
+            WorkloadClaim refreshed = fixture.compatibleAddition(allocated.advancedPipelineClaim(), TTL);
+            var submitted = fixture.store.recordSubmission(fixture.fence(item), WorkloadClaimFence.from(refreshed), "job-2");
+            assertThat(submitted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(submitted.item().successor().pipelineClaim()).isEqualTo(item.successor().pipelineClaim());
+            var reservation = MongoClusterCapacityStore.reservation(
+                    fixture.occupancy.find(new Document("_id", item.permit().reservationId())).first());
+            assertThat(reservation.pipelineClaim()).isEqualTo(item.successor().pipelineClaim());
+            assertThat(reservation.nativeJobId()).isEqualTo("job-2");
+            assertThat(fixture.workloads.read(refreshed.key()).orElseThrow().claim().executionGeneration()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void aFailureObservedBeforeACompatibleJoinCanBeNotedWithTheCurrentAuthority() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("orders", true);
+            ClusterRecoveryItem item = fixture.permit(fixture.enqueue(pipeline).item(), DEMAND, LIMITS).item();
+            var allocated = fixture.advance(item, pipeline.claim);
+            item = fixture.submitted(allocated.item()).item();
+            fixture.running("orders");
+            var receipt = fixture.startupReceipt(item);
+            var reader = fixture.meta.captureReadState("capture-crm").orElseThrow();
+            assertThat(fixture.meta.recordCaptureReadFailure(reader.attempt(), IoError.SRS_PROGRESS_UNPROVEN.code(),
+                    Map.of("pipeline", "orders"), "manual-start-required")).isTrue();
+            var cached = fixture.meta.captureStartupFailure(item.successor().pipelineClaim(),
+                    receipt.preparedWitnesses().get("crm")).orElseThrow();
+            var diagnostic = new ClusterRecoveryDiagnostic(ClusterRecoveryDiagnostic.Reason.SOURCE_POSITION_REJECTED,
+                    cached.code(), cached.params(), Map.of("crm", cached.requestedPosition()), cached.disposition());
+            WorkloadClaim refreshed = fixture.compatibleAddition(allocated.advancedPipelineClaim(), TTL);
+            var recorded = fixture.store.recordFailureNote(fixture.pipelineFence(item, WorkloadClaimFence.from(refreshed)),
+                    diagnostic, ClusterRecoveryStore.FailureStage.SOURCE_POSITION_REJECTION, cached);
+            assertThat(recorded.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(recorded.item().successor().failureNote().pipelineClaim()).isEqualTo(cached.pipelineClaim());
+            assertThat(recorded.item().successor().failureNote().diagnostic()).isEqualTo(diagnostic);
+            assertThat(recorded.item().attempt()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void aFreshPermitUsesItsPreAllocationRefusalInsteadOfTheHistoricalFailureNote() {
+        try (Fixture fixture = new Fixture()) {
+            var retry = fixture.permitAfterNotedFailure();
+            ClusterRecoveryItem item = retry.item();
+            assertThat(item.successor().failureNote()).isNotNull();
+            assertThat(item.permit().transferredExecutionGeneration()).isZero();
+            assertThat(fixture.store.recordFailureNote(fixture.pipelineFence(item, WorkloadClaimFence.from(retry.claim())),
+                    item.successor().failureNote().diagnostic(), ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, null)
+                    .outcome()).isNotEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.store.recordStartup(fixture.fence(item), WorkloadClaimFence.from(retry.claim()),
+                    receiptFor(retry.receipt(), WorkloadClaimFence.from(retry.claim()))).outcome())
+                    .isNotEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.store.complete(fixture.fence(item)).outcome()).isNotEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.workloads.release(retry.claim())).isTrue();
+            fixture.awaitRetirement(retry.claim().key());
+            var diagnostic = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                    new io.tapstate.core.common.TapstateException(io.tapstate.core.lifecycle.LifecycleError.PIPELINE_NOT_RUNNABLE,
+                            Map.of("pipeline", "orders"), null), POSITIONS, "Correct the current compilation refusal");
+            var refused = fixture.store.fail(fixture.fence(item), WorkloadClaimFence.from(retry.claim()), diagnostic,
+                    ClusterRecoveryStore.FailureStage.BEFORE_EXECUTION_ADVANCE, Duration.ofMillis(1));
+            assertThat(refused.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(refused.item().diagnostic()).isEqualTo(diagnostic);
+            assertThat(refused.item().attempt()).isEqualTo(2);
+            assertThat(refused.item().status()).isEqualTo(ClusterRecoveryStatus.RETRY_BACKOFF);
+            assertThat(fixture.store.fail(fixture.fence(item), WorkloadClaimFence.from(retry.claim()), diagnostic,
+                    ClusterRecoveryStore.FailureStage.BEFORE_EXECUTION_ADVANCE, Duration.ofMillis(1)).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.STALE_ITEM);
+            assertThat(fixture.store.read(item.event().key()).orElseThrow().attempt()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void anExpiredFreshPermitDoesNotConsumeTheHistoricalExecutionFailureAgain() {
+        try (Fixture fixture = new Fixture()) {
+            var retry = fixture.permitAfterNotedFailure();
+            assertThat(fixture.workloads.release(retry.claim())).isTrue();
+            fixture.awaitRetirement(retry.claim().key());
+            var expired = fixture.store.releaseExpiredPermit(fixture.fence(retry.item()));
+            assertThat(expired.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(expired.item().status()).isEqualTo(ClusterRecoveryStatus.WAITING_PERMIT);
+            assertThat(expired.item().attempt()).isEqualTo(1);
+            assertThat(expired.item().permit()).isNull();
+            assertThat(expired.item().successor().failureNote()).isEqualTo(retry.item().successor().failureNote());
+            assertThat(fixture.workloads.read(retry.claim().key()).orElseThrow().claim().executionGeneration()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void anUnsubmittedAllocationCanReportFailureAndRepairOnlyItsExactOlderMarker() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("orders", true);
+            ClusterRecoveryItem item = fixture.permit(fixture.enqueue(pipeline).item(), DEMAND, LIMITS).item();
+            var allocated = fixture.advance(item, pipeline.claim);
+            item = allocated.item();
+            assertThat(fixture.workloads.recordExecutionFailure(allocated.advancedPipelineClaim(), false)).isPresent();
+            assertThat(fixture.queue.updateOne(new Document("_id", ClusterRecoveryDocuments.id(item.event().key())),
+                    new Document("$set", new Document("permit.transferredExecutionGeneration", 0L))).getMatchedCount()).isEqualTo(1);
+            var diagnostic = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                    new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null),
+                    POSITIONS, "Wait for the allocated execution authority to retire");
+            var noted = fixture.store.recordFailureNote(fixture.pipelineFence(item), diagnostic,
+                    ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, null);
+            assertThat(noted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(noted.item().permit().transferredExecutionGeneration()).isEqualTo(2);
+            assertThat(noted.item().successor().nativeJobId()).isNull();
+            assertThat(fixture.occupancy.find(new Document("_id", item.permit().reservationId())).first().get("nativeJobId")).isNull();
+            item = noted.item();
+            fixture.queue.updateOne(new Document("_id", ClusterRecoveryDocuments.id(item.event().key())),
+                    new Document("$set", new Document("permit.transferredExecutionGeneration", 0L)));
+            fixture.occupancy.updateOne(new Document("_id", item.permit().reservationId()),
+                    new Document("$set", new Document("executionGeneration", null)));
+            assertThat(fixture.store.recordFailureNote(fixture.pipelineFence(item), diagnostic,
+                    ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, null).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
+            assertThat(fixture.store.read(item.event().key()).orElseThrow().attempt()).isEqualTo(1);
+        }
+    }
+
     private static ClusterRecoveryStartupReceipt receiptFor(ClusterRecoveryStartupReceipt receipt, WorkloadClaimFence pipeline) {
         return new ClusterRecoveryStartupReceipt(pipeline, receipt.nativeJobId(), receipt.nativeInitializedAt(),
                 receipt.preparedWitnesses(), receipt.requestedPositions(), receipt.acceptedPositions(),
@@ -773,6 +922,7 @@ class ClusterRecoveryStoreIT {
     }
 
     private record Pipeline(ClusterRecoveryKey key, WorkloadClaim claim, ClusterRecoveryEvent event, String intentFingerprint) {}
+    private record RetryPermit(ClusterRecoveryItem item, WorkloadClaim claim, ClusterRecoveryStartupReceipt receipt) {}
 
     private static final class Fixture implements AutoCloseable {
         private final MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl());
@@ -946,6 +1096,34 @@ class ClusterRecoveryStoreIT {
                     new Document("$set", new Document("revision", 3L).append("activeNodeIds", List.of("a", "b", "c", "d"))));
             assertThat(committed.getModifiedCount()).isEqualTo(1);
             return workloads.acquire(pipeline.key(), pipeline.owner(), 3, ttl).claim();
+        }
+
+        private RetryPermit permitAfterNotedFailure() {
+            Pipeline pipeline = pipeline("orders", true, List.of(SourceRef.bare("crm")), true, nodeB.owner(), Duration.ofSeconds(8));
+            ClusterRecoveryItem item = permit(enqueue(pipeline).item(), DEMAND, LIMITS).item();
+            var allocated = advance(item, pipeline.claim());
+            item = submitted(allocated.item()).item();
+            running("orders");
+            ClusterRecoveryStartupReceipt receipt = startupReceipt(item);
+            assertThat(workloads.recordExecutionFailure(allocated.advancedPipelineClaim(), false)).isPresent();
+            var diagnostic = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                    new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null),
+                    POSITIONS, "Wait for the first execution authority to retire");
+            item = store.recordFailureNote(pipelineFence(item), diagnostic, ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, null).item();
+            var checkpoint = states.read("orders").orElseThrow();
+            assertThat(states.compareAndSwap("orders", checkpoint.epoch(), StateJson.of(PipelineState.FAILED), checkpoint.touchTime()))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+            assertThat(workloads.release(allocated.advancedPipelineClaim())).isTrue();
+            awaitRetirement(allocated.advancedPipelineClaim().key());
+            var failed = store.fail(fence(item), item.successor().pipelineClaim(), diagnostic,
+                    ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, Duration.ofMillis(1));
+            assertThat(failed.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            awaitEligibility(pipeline.key());
+            WorkloadClaim next = workloads.acquire(pipeline.claim().key(), nodeB.owner(), 2, Duration.ofSeconds(3)).claim();
+            var reserved = permit(failed.item(), DEMAND, LIMITS);
+            assertThat(reserved.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(reserved.item().attempt()).isEqualTo(1);
+            return new RetryPermit(reserved.item(), next, receipt);
         }
 
         private ClusterRecoveryStore.Result permit(ClusterRecoveryItem item, Map<String, ClusterCapacityDemand> demand, ClusterCapacityLimits limits) {

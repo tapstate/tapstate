@@ -46,7 +46,7 @@ final class RecoveryText {
             if (item.permit() != null) {
                 var permit = item.permit();
                 out.println("  permit     " + permit.reservationId() + "  deadline " + permit.deadline()
-                        + "  transferred execution " + known(permit.transferredExecutionGeneration()));
+                        + "  allocated execution " + known(permit.transferredExecutionGeneration()));
                 out.println("  demand     " + JsonOut.compact(RecoveryWire.tree(permit.demandByNode())));
             }
             if (item.successor() != null) {

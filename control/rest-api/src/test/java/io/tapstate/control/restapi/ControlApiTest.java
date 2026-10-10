@@ -774,6 +774,17 @@ class ControlApiTest {
     }
 
     @Test
+    void theClusterHttpSurfaceExposesOnlyItsTwoExistingGets() {
+        RequestMappingHandlerMapping mapping = context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
+        var routes = mapping.getHandlerMethods().keySet().stream()
+                .filter(route -> route.getPatternValues().stream().anyMatch(path -> path.startsWith("/api/cluster"))).toList();
+        assertThat(routes.stream().flatMap(route -> route.getPatternValues().stream()))
+                .containsExactlyInAnyOrder("/api/cluster/members", "/api/cluster/status");
+        assertThat(routes).allSatisfy(route -> assertThat(route.getMethodsCondition().getMethods())
+                .containsExactly(org.springframework.web.bind.annotation.RequestMethod.GET));
+    }
+
+    @Test
     void clusterMembersAlsoAnswersWhoOwnsEachPipelineAndWhereItsWorkIsRunning() {
         // Ownership and placement are one answer with the members, not a second read: the work is
         // reported against members, and a reader who had to take two readings to join them would be

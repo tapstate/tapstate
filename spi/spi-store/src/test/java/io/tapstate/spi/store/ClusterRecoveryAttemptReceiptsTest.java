@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ClusterRecoveryAttemptReceiptsTest {
     private static final Instant NOW = Instant.parse("2026-10-10T01:00:00Z");
@@ -184,6 +185,66 @@ class ClusterRecoveryAttemptReceiptsTest {
         assertThat(next.startupReceiptCheck(receipt(next, ORIGINAL))).isEqualTo(ClusterRecoveryMutation.APPLIED);
         assertThat(next.initialized(receipt(next, ORIGINAL), NOW.plusSeconds(1)).recovered(NOW.plusSeconds(1)).status())
                 .isEqualTo(ClusterRecoveryStatus.RECOVERED);
+    }
+
+    @Test
+    void allocatorBindingStillNeedsIndependentSubmissionAndStartupFacts() {
+        ClusterRecoveryItem allocated = ClusterRecoveryItem.enqueued(event(41, ORIGINAL_POSITIONS, PROFILE, 2), 1, NOW, 3)
+                .permitted(permit("first"), NOW).advanced(successor(42, Set.of("crm")), NOW);
+        assertThat(allocated.hasAllocatedSuccessor()).isTrue();
+        assertThat(allocated.permit().transferredExecutionGeneration()).isEqualTo(42);
+        assertThat(allocated.successor().nativeJobId()).isNull();
+        assertThat(allocated.completionCheck()).isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
+        var submitted = allocated.submitted("job-42", NOW);
+        assertThat(submitted.hasAllocatedSuccessor()).isTrue();
+        assertThat(submitted.attempt()).isEqualTo(1);
+        assertThat(submitted.completionCheck()).isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
+    }
+
+    @Test
+    void aNewPermitRetainsHistoryWithoutAcceptingItsExecutionFacts() {
+        ClusterRecoveryItem original = submitted(ORIGINAL_POSITIONS, Set.of("crm"), 42);
+        var oldCause = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null), ORIGINAL_POSITIONS, "Wait for retirement");
+        var note = new ClusterRecoveryFailureNote(original.successor().pipelineClaim(),
+                ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, oldCause, NOW);
+        var fresh = original.failureNoted(note, NOW).executionFailed(oldCause, Duration.ofSeconds(1), NOW)
+                .permitted(permit("second"), NOW.plusSeconds(1));
+        assertThat(fresh.successor().failureNote()).isEqualTo(note);
+        assertThat(fresh.hasAllocatedSuccessor()).isFalse();
+        assertThat(fresh.startupReceiptCheck(receipt(original, ORIGINAL))).isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
+        assertThat(fresh.completionCheck()).isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
+        assertThatThrownBy(() -> fresh.failureNoted(note, NOW.plusSeconds(1))).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> fresh.executionFailed(oldCause, Duration.ofSeconds(1), NOW.plusSeconds(1)))
+                .isInstanceOf(IllegalStateException.class);
+        var currentCause = ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                new TapstateException(LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", "orders"), null),
+                ORIGINAL_POSITIONS, "Correct the current compilation refusal");
+        var refused = fresh.refused(currentCause, Duration.ofSeconds(1), NOW.plusSeconds(1));
+        assertThat(refused.attempt()).isEqualTo(2);
+        assertThat(refused.diagnostic()).isEqualTo(currentCause);
+        assertThat(refused.successor().failureNote()).isEqualTo(note);
+    }
+
+    @Test
+    void aCompatibleTargetAdvanceKeepsTheOriginalSuccessfulExecutionAndSourceReceipt() {
+        var original = submitted(ORIGINAL_POSITIONS, Set.of("crm"), 42);
+        var retargeted = original.retargeted(PROFILE, 3, NOW);
+        var completed = retargeted.initialized(receipt(original, ORIGINAL), NOW).recovered(NOW);
+        assertThat(completed.targetTopologyRevision()).isEqualTo(3);
+        assertThat(completed.successor().pipelineClaim().topologyRevision()).isEqualTo(2);
+        assertThat(completed.successor().executionNodeIds()).isEqualTo(original.successor().executionNodeIds());
+        assertThat(completed.successor().startupReceipt()).isEqualTo(receipt(original, ORIGINAL));
+        assertThat(completed.attempt()).isEqualTo(1);
+    }
+
+    @Test
+    void aNewProfileCannotCompleteUsingAnOlderProfilesStartupProof() {
+        var original = submitted(ORIGINAL_POSITIONS, Set.of("crm"), 42);
+        var next = new ClusterExecutionProfile("east", 2, PROFILE.profile());
+        var incompatible = original.retargeted(next, 3, NOW).initialized(receipt(original, ORIGINAL), NOW);
+        assertThat(incompatible.completionCheck()).isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
+        assertThatThrownBy(() -> incompatible.recovered(NOW)).isInstanceOf(IllegalStateException.class);
     }
 
     private static ClusterRecoveryDiagnostic rejection() {

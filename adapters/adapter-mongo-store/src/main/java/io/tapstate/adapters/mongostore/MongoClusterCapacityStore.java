@@ -211,15 +211,19 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             return result(Outcome.STALE_EXECUTION, expected, null, List.of());
         }
         Document authority = workloadStore.conditionTouchClaim(session, pipelineClaim);
-        if (!expected.pipelineClaim().equals(pipelineClaim) || authority == null) {
+        if (!expected.pipelineClaim().sameAuthorityAs(pipelineClaim) || authority == null) {
             return result(Outcome.STALE_CLAIM, expected, null, List.of());
         }
         Context context = guard(session, key(expected), expected.profile(), expected.intentFingerprint(), true);
         if (context.outcome != Outcome.APPLIED) {
             return result(context.outcome, expected, null, List.of());
         }
+        if (!matchesExecutionContext(authority, expected.pipelineClaim(), expected.profile(), key(expected),
+                context.intent.getString("revision"), expected.demandByNode().keySet())) {
+            return result(Outcome.STALE_EXECUTION, expected, null, List.of());
+        }
         ClusterCapacityReservation submitted = new ClusterCapacityReservation(expected.reservationId(), expected.clusterId(),
-                expected.pipelineId(), expected.incarnationId(), expected.intentFingerprint(), expected.profile(), pipelineClaim,
+                expected.pipelineId(), expected.incarnationId(), expected.intentFingerprint(), expected.profile(), expected.pipelineClaim(),
                 expected.demandByNode(), expected.reservedAt(), expected.deadline(), expected.executionGeneration(), jobId);
         replace(session, current, submitted, authority.getDate("leaseUntil").toInstant());
         return result(Outcome.APPLIED, submitted, null, List.of());
@@ -334,7 +338,7 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             return true;
         }
         Document current = claims.find(session, new Document("_id", claimId(reservation.clusterId(), reservation.pipelineId()))).first();
-        Document live = WorkloadClaimDocuments.live(reservation.pipelineClaim());
+        Document live = WorkloadClaimDocuments.liveAuthority(reservation.pipelineClaim());
         live.put("$expr", new Document("$gt", List.of("$leaseUntil", Date.from(now))));
         if (current == null || claims.find(session, live).first() != null) {
             return false;
@@ -484,7 +488,7 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             return true;
         }
         Document current = claims.find(session, new Document("_id", claimId(reservation.clusterId(), reservation.pipelineId()))).first();
-        if (current == null || claims.find(session, WorkloadClaimDocuments.live(reservation.pipelineClaim())).first() != null) {
+        if (current == null || claims.find(session, WorkloadClaimDocuments.liveAuthority(reservation.pipelineClaim())).first() != null) {
             return false;
         }
         Date horizon = capacity.getDate("authorityUntil");
@@ -492,6 +496,19 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             return false;
         }
         return workloadStore.provesRetired(session, reservation.pipelineClaim());
+    }
+
+    /** Acquisition topology may change; the allocator's immutable execution context may not. */
+    static boolean matchesExecutionContext(Document document, WorkloadClaimFence original, ClusterExecutionProfile profile,
+            ClusterRecoveryKey key, String revision, Set<String> executionNodes) {
+        WorkloadClaim claim = MongoWorkloadClaimStore.readDocument(document);
+        return claim.key().equals(original.key()) && claim.executionGeneration() == original.executionGeneration()
+                && claim.contextExecutionGeneration() == original.executionGeneration()
+                && claim.executionClaimGeneration() == original.claimGeneration()
+                && Objects.equals(claim.executionTopologyRevision(), original.topologyRevision())
+                && profile.equals(claim.executionProfile()) && key.incarnation().equals(claim.executionIncarnation())
+                && Objects.equals(revision, claim.executionRevision()) && executionNodes.equals(claim.executionNodeIds())
+                && executionNodes.equals(claim.executionMembers().keySet());
     }
 
     Document exact(ClientSession session, ClusterCapacityReservation expected) {
@@ -502,6 +519,14 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
     ClusterCapacityReservation readReservation(ClientSession session, String id) {
         Document record = occupancy.find(session, new Document("_id", id)).first();
         return record == null ? null : reservation(record);
+    }
+
+    boolean touchAllocation(ClientSession session, ClusterCapacityReservation expected) {
+        Document current = exact(session, expected);
+        return current != null && occupancy.updateOne(session, new Document("_id", expected.reservationId())
+                .append("revision", current.get("revision")).append("executionGeneration", expected.executionGeneration())
+                .append("pipelineClaim", WorkloadClaimDocuments.stored(expected.pipelineClaim())),
+                new Document("$inc", new Document("revision", 1L))).getMatchedCount() == 1;
     }
 
     ClusterCapacityReservation bindRecoveryPipeline(ClientSession session, ClusterCapacityReservation expected,

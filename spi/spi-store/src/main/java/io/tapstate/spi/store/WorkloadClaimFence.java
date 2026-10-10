@@ -34,4 +34,11 @@ public record WorkloadClaimFence(
                 claim.key(), claim.owner(), claim.claimGeneration(),
                 claim.executionGeneration(), claim.topologyRevision(), claim.profileGeneration());
     }
+
+    /** Value identity only: acquisition topology can refresh without replacing this authority. */
+    public boolean sameAuthorityAs(WorkloadClaimFence other) {
+        return other != null && key.equals(other.key) && owner.equals(other.owner)
+                && claimGeneration == other.claimGeneration && executionGeneration == other.executionGeneration
+                && profileGeneration == other.profileGeneration;
+    }
 }

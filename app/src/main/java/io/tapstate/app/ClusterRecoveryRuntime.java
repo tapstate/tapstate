@@ -56,8 +56,12 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
 
     private record Allocation(DagSource.PlanningFacts facts, ClusterExecutionProfile profile,
             ClusterRecoveryKey key, ClusterCapacityReservation capacity, boolean recovery) { }
-    private record FailedExecution(long executionGeneration, ClusterRecoveryDiagnostic diagnostic,
-            CaptureStartupFailure sourceFailure, Throwable executionCause) { }
+    private record FailedExecution(long executionGeneration, WorkloadClaimFence authority, ClusterRecoveryDiagnostic diagnostic,
+            CaptureStartupFailure sourceFailure, Throwable executionCause) {
+        boolean belongsTo(WorkloadClaim claim) {
+            return claim != null && authority != null && authority.sameAuthorityAs(WorkloadClaimFence.from(claim));
+        }
+    }
 
     ClusterRecoveryRuntime(StorePort stores, DagSource dags, PipelineCaptureCoordinator captures, Engine engine,
             PipelineActuationOwnership actuation, ClusterWorkloadClaims claims, ClusterMembershipGate membership,
@@ -164,7 +168,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
             if (allocation.recovery()) {
                 ClusterRecoveryItem item = stores.clusterRecovery().read(allocation.key()).orElse(null);
                 if (item == null || item.permit() == null) { return Optional.empty(); }
-                if (item.successor() != null && item.successor().pipelineClaim().equals(WorkloadClaimFence.from(expected))
+                if (item.hasAllocatedSuccessor() && item.successor().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(expected))
                         && item.successor().submittedAt() == null) { return Optional.of(expected); }
                 var advanced = stores.clusterRecovery().advanceExecution(fence(item), expected, nodes,
                         allocation.facts().selectedSourceIds()).advancedPipelineClaim();
@@ -214,10 +218,9 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     @Override public void recordFailure(String pipelineId) {
         if (!active()) { return; }
         WorkloadClaim failedClaim = actuation.currentClaim(pipelineId).orElse(null);
-        long failedGeneration = failedClaim == null ? 0 : failedClaim.executionGeneration();
         Throwable failure = PipelineFailures.current(pipelineId, failedClaim, true, engine, captures).orElse(null);
         FailedExecution recorded = failures.get(pipelineId);
-        if (failure == null && recorded != null && recorded.executionGeneration() == failedGeneration) {
+        if (failure == null && recorded != null && recorded.belongsTo(failedClaim)) {
             failure = recorded.executionCause();
         }
         if (failure != null) {
@@ -241,7 +244,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 detectionWindow.toNanos());
         if (failure != null) {
             FailedExecution previous = failures.get(pipelineId);
-            if (previous == null || previous.executionGeneration() != failedGeneration) {
+            if (previous == null || !previous.belongsTo(failedClaim)) {
                 failures.put(pipelineId, failedExecution(pipelineId, failedClaim, failure));
             }
         }
@@ -249,7 +252,8 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         if (current != null && verdictRecorded(current)) {
             // A generic native result can disappear during cleanup. The durable FAILED verdict still
             // names that execution; the original diagnosis is preferred whenever it was observed.
-            failures.computeIfAbsent(pipelineId, ignored -> failedExecution(pipelineId, current, null));
+            failures.compute(pipelineId, (ignored, previous) -> previous != null && previous.belongsTo(current)
+                    ? previous : failedExecution(pipelineId, current, null));
             boolean noted = persistFailure(pipelineId, current);
             WorkloadClaim stopped = failedStops.get(pipelineId);
             if (noted && sameAuthority(stopped, current)) { retireStopped(pipelineId, stopped); }
@@ -265,13 +269,16 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         if (claim == null || !claim.owner().equals(owner) || claim.claimGeneration() != execution.fence().claimGeneration()
                 || claim.executionGeneration() != execution.fence().executionGeneration()
                 || claim.profileGeneration() != execution.fence().profileGeneration()) { return; }
-        failures.putIfAbsent(pipelineId, failedExecution(pipelineId, claim, failure));
+        failures.compute(pipelineId, (ignored, previous) -> previous != null && previous.belongsTo(claim)
+                ? previous : failedExecution(pipelineId, claim, failure));
         recordFailure(pipelineId);
     }
 
     @Override public void refused(String pipelineId, TapstateException failure) {
         if (!active()) { return; }
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
         failures.put(pipelineId, new FailedExecution(actuation.heldExecutionGeneration(pipelineId),
+                current == null ? null : WorkloadClaimFence.from(current),
                 ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.REBUILD_REFUSED,
                         failure, diagnosticPositions(pipelineId), "Correct the reported configuration or capacity; the source position has not been reset."), null, null));
     }
@@ -396,11 +403,16 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
             if (observeStartup(item, expected)) { return; }
             FailedExecution failure = failures.get(item.event().key().pipelineId());
             if (failure != null && failure.executionGeneration() == item.executionFrontier()) {
-                WorkloadClaimFence pipelineClaim = item.successor() == null ? null : item.successor().pipelineClaim();
+                boolean allocated = item.hasAllocatedSuccessor();
+                WorkloadClaimFence pipelineClaim = allocated ? item.successor().pipelineClaim() : null;
+                boolean currentFailure = allocated ? pipelineClaim.sameAuthorityAs(failure.authority())
+                        : failure.diagnostic().reason() == ClusterRecoveryDiagnostic.Reason.REBUILD_REFUSED
+                                && failure.belongsTo(actuation.currentClaim(item.event().key().pipelineId()).orElse(null));
+                if (!currentFailure) { return; }
                 stores.clusterRecovery().fail(expected, pipelineClaim, failure.diagnostic(),
                         failure.diagnostic().reason() == ClusterRecoveryDiagnostic.Reason.SOURCE_POSITION_REJECTED
                                 ? ClusterRecoveryStore.FailureStage.SOURCE_POSITION_REJECTION
-                                : item.successor() == null ? ClusterRecoveryStore.FailureStage.BEFORE_EXECUTION_ADVANCE
+                                : !allocated ? ClusterRecoveryStore.FailureStage.BEFORE_EXECUTION_ADVANCE
                                 : ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, properties.getWorkloadClaimTtl());
             }
             return;
@@ -421,20 +433,24 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     }
 
     private boolean observeStartup(ClusterRecoveryItem item, ClusterRecoveryFence expected) {
-        if (item.successor() == null || item.successor().failureNote() != null) { return false; }
+        if (!item.hasAllocatedSuccessor() || item.successor().failureNote() != null) { return false; }
         String pipeline = item.event().key().pipelineId();
         var successor = item.successor();
+        WorkloadClaimFence liveFence = stores.workloadClaims().read(successor.pipelineClaim().key())
+                .filter(WorkloadClaimReading::leased).map(WorkloadClaimReading::claim).map(WorkloadClaimFence::from)
+                .filter(successor.pipelineClaim()::sameAuthorityAs).orElse(null);
+        if (liveFence == null) { return false; }
         var nativeRun = engine.nativeRun(pipeline).filter(run -> run.executionGeneration() == successor.executionGeneration()
                 && run.claimGeneration() == successor.pipelineClaim().claimGeneration()
                 && run.profileGeneration() == successor.profile().generation()).orElse(null);
         if (nativeRun == null || (nativeRun.status() != JobStatus.RUNNING && nativeRun.status() != JobStatus.COMPLETED)) { return false; }
         if (item.successor().submittedAt() == null) {
-            var submitted = stores.clusterRecovery().recordSubmission(expected, item.successor().pipelineClaim(), nativeRun.nativeJobId());
+            var submitted = stores.clusterRecovery().recordSubmission(expected, liveFence, nativeRun.nativeJobId());
             if (submitted.outcome() != ClusterRecoveryMutation.APPLIED) { return false; }
             item = submitted.item(); expected = fence(item, expected.recoveryClaim());
         }
         if (!nativeRun.initialized()) { return false; }
-        var fence = item.successor().pipelineClaim();
+        var fence = liveFence;
         Map<String, CaptureStartupProof> proof = captures.startupProofs(pipeline, fence);
         if (!item.successor().sourceRequirementsRecorded()
                 || !proof.keySet().equals(item.successor().requiredSourceIds())
@@ -465,11 +481,12 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     }
 
     private boolean consumeFailure(ClusterRecoveryItem item, ClusterRecoveryFence expected) {
-        ClusterRecoveryFailureNote note = item.successor() == null ? null : item.successor().failureNote();
+        ClusterRecoveryFailureNote note = item.hasAllocatedSuccessor() ? item.successor().failureNote() : null;
         if (note == null) { return false; }
-        stores.clusterRecovery().fail(expected, note.pipelineClaim(), note.diagnostic(), note.stage(),
+        var result = stores.clusterRecovery().fail(expected, note.pipelineClaim(), note.diagnostic(), note.stage(),
                 properties.getWorkloadClaimTtl());
-        return true;
+        return result.outcome() == ClusterRecoveryMutation.APPLIED || result.outcome() == ClusterRecoveryMutation.TERMINAL
+                || result.outcome() == ClusterRecoveryMutation.SUCCESSOR_STILL_AUTHORIZED;
     }
 
     private FailedExecution failedExecution(String pipeline, WorkloadClaim claim, Throwable failure) {
@@ -498,7 +515,8 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         var diagnostic = new ClusterRecoveryDiagnostic(sourcePositionRejected(code)
                 ? ClusterRecoveryDiagnostic.Reason.SOURCE_POSITION_REJECTED : ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
                 code, params, positions, disposition);
-        return new FailedExecution(claim == null ? 0 : claim.executionGeneration(), diagnostic, source, failure);
+        return new FailedExecution(claim == null ? 0 : claim.executionGeneration(),
+                claim == null ? null : WorkloadClaimFence.from(claim), diagnostic, source, failure);
     }
 
     /** Report under PIPE authority before its retirement; a recovery coordinator is not required. */
@@ -506,11 +524,11 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         WorkloadClaimFence authority = WorkloadClaimFence.from(claim);
         ClusterRecoveryItem current = item(pipeline).orElse(null);
         for (int retry = 0; retry < 2; retry++) {
-            if (current == null || current.status().terminal() || current.permit() == null || current.successor() == null
-                    || !current.successor().pipelineClaim().equals(authority)) { return true; }
-            if (authority.equals(notedFailures.get(pipeline)) || current.successor().failureNote() != null) { return true; }
+            if (current == null || current.status().terminal() || !current.hasAllocatedSuccessor()
+                    || !current.successor().pipelineClaim().sameAuthorityAs(authority)) { return true; }
+            if (authority.sameAuthorityAs(notedFailures.get(pipeline)) || current.successor().failureNote() != null) { return true; }
             FailedExecution failure = failures.get(pipeline);
-            if (failure == null || failure.executionGeneration() != claim.executionGeneration()) { return false; }
+            if (failure == null || !failure.belongsTo(claim)) { return false; }
             var expected = new ClusterRecoveryPipelineFence(current.event().key(), current.itemRevision(),
                     current.event().intentFingerprint(), current.targetProfile(), authority);
             var result = stores.clusterRecovery().recordFailureNote(expected, failure.diagnostic(),
@@ -537,9 +555,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     }
 
     private static boolean sameAuthority(WorkloadClaim expected, WorkloadClaim actual) {
-        return expected != null && actual != null && expected.key().equals(actual.key()) && expected.owner().equals(actual.owner())
-                && expected.claimGeneration() == actual.claimGeneration() && expected.executionGeneration() == actual.executionGeneration()
-                && expected.profileGeneration() == actual.profileGeneration();
+        return expected != null && actual != null && WorkloadClaimFence.from(expected).sameAuthorityAs(WorkloadClaimFence.from(actual));
     }
 
     private static boolean ordinaryFailure(TapstateException coded) {

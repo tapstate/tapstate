@@ -474,7 +474,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     /** Generation mismatch retires store writes immediately; cached calls retire only after their promise. */
     boolean provesRetired(ClientSession session, WorkloadClaimFence expected) {
         Document filter = new Document("_id", id(expected.key()))
-                .append("$nor", List.of(WorkloadClaimDocuments.live(expected)))
+                .append("$nor", List.of(WorkloadClaimDocuments.liveAuthority(expected)))
                 .append("$expr", new Document("$lte", List.of(
                         new Document("$ifNull", List.of("$retiredAuthorizationUntil", new Date(Long.MAX_VALUE))), "$$NOW")));
         return collection.find(session, filter).first() != null;

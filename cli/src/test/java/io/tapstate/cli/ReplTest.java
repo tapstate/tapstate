@@ -5550,6 +5550,23 @@ class ReplTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"rebalance", "drain", "cordon", "uncordon", "restart", "rejoin"})
+    void noClusterMutationIsRegisteredInBeta(String verb) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        client.clusterCalls.clear();
+        client.clusterStatusCalls.clear();
+        client.lifecycleCalls.clear();
+
+        h.repl().dispatch("cluster " + verb);
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.clusterCalls).isEmpty();
+        assertThat(client.clusterStatusCalls).isEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"cluster", "cluster members", "cluster status"})
     void clusterReadsReuseTheVerifiedFailoverWithoutSendingTheBearerToAForeignSeed(String command) {
         URI original = URI.create("http://localhost:7900");

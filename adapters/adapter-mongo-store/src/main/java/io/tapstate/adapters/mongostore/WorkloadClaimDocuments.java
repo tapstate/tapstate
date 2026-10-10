@@ -32,6 +32,13 @@ final class WorkloadClaimDocuments {
         return filter;
     }
 
+    /** Retirement follows the authority tuple even when its acquisition topology has refreshed. */
+    static Document liveAuthority(WorkloadClaimFence fence) {
+        Document filter = live(fence);
+        filter.remove("topologyRevision");
+        return filter;
+    }
+
     /** The canonical persisted form of one workload claim fence. */
     static Document stored(WorkloadClaimFence fence) {
         Document stored = new Document("clusterId", fence.key().clusterId())

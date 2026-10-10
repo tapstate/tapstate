@@ -10,6 +10,7 @@ import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.control.core.ClusterRecoveryItemView;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ClusterRecoveryStatus;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
@@ -146,7 +147,8 @@ class AnExpiredSourcePositionNeverFallsForwardSilentlyIT {
                     change(sourceDb, EXPIRED_TABLE, "after-expiry-sentinel");
                     change(liveDb, LIVE_TABLE, "after-restart-sentinel");
                     ClusterRecoveryItemView failed = Await.answered("the expired queue item to be terminal", BOUND,
-                            () -> item(resumed, EXPIRED).filter(item -> "FAILED".equals(item.persistedStatus())));
+                            () -> item(resumed, EXPIRED)
+                                    .filter(item -> ClusterRecoveryStatus.REBUILD_FAILED.name().equals(item.persistedStatus())));
                     ClusterRecoveryItemView recovered = Await.answered("the following source to recover", BOUND,
                             () -> item(resumed, FOLLOWING).filter(item -> "RECOVERED".equals(item.persistedStatus())));
                     assertThat(failed.originalExecutionGeneration()).isEqualTo(originalGeneration);

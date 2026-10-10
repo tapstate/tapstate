@@ -53,7 +53,7 @@ public record ClusterRecoveryItem(
         }
         if (status == ClusterRecoveryStatus.RECOVERED && (!hasMatchingStartup(successor)
                 || !targetProfile.equals(successor.profile())
-                || targetTopologyRevision != successor.pipelineClaim().topologyRevision())) {
+                || targetTopologyRevision < successor.pipelineClaim().topologyRevision())) {
             throw new IllegalArgumentException("recovered item requires matching initialization and source acceptance");
         }
     }
@@ -74,6 +74,13 @@ public record ClusterRecoveryItem(
 
     public long executionFrontier() {
         return executionAliases.stream().mapToLong(Long::longValue).max().orElseThrow();
+    }
+
+    /** The reservation belongs to this allocated step, rather than to retained execution history. */
+    public boolean hasAllocatedSuccessor() {
+        return permit != null && successor != null && permit.transferredExecutionGeneration() > 0
+                && permit.transferredExecutionGeneration() == successor.executionGeneration()
+                && successor.executionGeneration() == executionFrontier();
     }
 
     /** Structural replacement eligibility; stores must still prove the candidate's current cause. */
@@ -172,13 +179,24 @@ public record ClusterRecoveryItem(
         Set<Long> aliases = new HashSet<>(executionAliases);
         aliases.add(nextSuccessor.executionGeneration());
         return copy(targetProfile, targetTopologyRevision, ClusterRecoveryStatus.REBUILDING, attempt + 1,
-                null, aliases, permit, nextSuccessor, diagnostic, storeTime);
+                null, aliases, permit.transferred(nextSuccessor.executionGeneration()), nextSuccessor, diagnostic, storeTime);
+    }
+
+    /** Store adapters call this only after verifying the exact older allocation reservation. */
+    public ClusterRecoveryItem allocationRecorded(long executionGeneration, Instant storeTime) {
+        requireActive();
+        if (permit == null || permit.transferredExecutionGeneration() != 0 || successor == null
+                || executionGeneration != successor.executionGeneration() || executionGeneration != executionFrontier()) {
+            throw new IllegalArgumentException("allocation proof must bind this permit to the recorded successor");
+        }
+        return copy(targetProfile, targetTopologyRevision, status, attempt, nextEligibleAt, executionAliases,
+                permit.transferred(executionGeneration), successor, diagnostic, storeTime);
     }
 
     /** Submission proof transfers reservation occupancy without opening another recovery slot. */
     public ClusterRecoveryItem submitted(String nativeJobId, Instant storeTime) {
         requireActive();
-        if (permit == null || successor == null || successor.submittedAt() != null || successor.failureNote() != null) {
+        if (!hasAllocatedSuccessor() || successor.submittedAt() != null || successor.failureNote() != null) {
             throw new IllegalStateException("submission requires an unsubmitted allocated successor");
         }
         ClusterRecoverySuccessor submitted = new ClusterRecoverySuccessor(successor.pipelineClaim(),
@@ -186,11 +204,11 @@ public record ClusterRecoveryItem(
                 successor.sourceRequirementsRecorded(), successor.allocatedAt(),
                 nativeJobId, storeTime, successor.requestedPositions(), null);
         return copy(targetProfile, targetTopologyRevision, status, attempt, null, executionAliases,
-                permit.transferred(successor.executionGeneration()), submitted, diagnostic, storeTime);
+                permit, submitted, diagnostic, storeTime);
     }
 
     public ClusterRecoveryMutation startupReceiptCheck(ClusterRecoveryStartupReceipt receipt) {
-        if (successor == null || !successor.pipelineClaim().equals(receipt.pipelineClaim())
+        if (!hasAllocatedSuccessor() || !successor.pipelineClaim().equals(receipt.pipelineClaim())
                 || !Objects.equals(successor.nativeJobId(), receipt.nativeJobId())) {
             return ClusterRecoveryMutation.STALE_EXECUTION;
         }
@@ -215,7 +233,7 @@ public record ClusterRecoveryItem(
     /** Reporting the first failure preserves all occupancy until the exact authority is retired. */
     public ClusterRecoveryItem failureNoted(ClusterRecoveryFailureNote note, Instant storeTime) {
         requireActive();
-        if (permit == null || successor == null || !successor.pipelineClaim().equals(note.pipelineClaim())) {
+        if (!hasAllocatedSuccessor() || !successor.pipelineClaim().equals(note.pipelineClaim())) {
             throw new IllegalArgumentException("failure fact must match an allocated permitted successor");
         }
         if (successor.failureNote() != null) {
@@ -233,10 +251,10 @@ public record ClusterRecoveryItem(
         if (status.terminal()) {
             return ClusterRecoveryMutation.TERMINAL;
         }
-        return status == ClusterRecoveryStatus.REBUILDING && permit != null
+        return status == ClusterRecoveryStatus.REBUILDING && hasAllocatedSuccessor()
                 && hasMatchingStartup(successor) && targetProfile.equals(successor.profile())
                 && permit.transferredExecutionGeneration() == successor.executionGeneration()
-                && targetTopologyRevision == successor.pipelineClaim().topologyRevision()
+                && targetTopologyRevision >= successor.pipelineClaim().topologyRevision()
                 ? ClusterRecoveryMutation.APPLIED : ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT;
     }
 
@@ -267,7 +285,7 @@ public record ClusterRecoveryItem(
     /** A previously allocated failed attempt is counted once; its generation remains visible. */
     public ClusterRecoveryItem executionFailed(ClusterRecoveryDiagnostic cause, Duration backoff, Instant storeTime) {
         requireActive();
-        if (successor == null) {
+        if (!hasAllocatedSuccessor()) {
             throw new IllegalStateException("execution failure requires an allocated successor");
         }
         return failed(successor.failureNote() == null ? cause : successor.failureNote().diagnostic(), attempt, backoff, storeTime);

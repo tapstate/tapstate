@@ -5,7 +5,10 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 
-/** One durable recovery slot and per-member budget reservation, with a store-clock deadline. */
+/**
+ * One durable recovery slot and per-member budget reservation, with a store-clock deadline.
+ * The transferred generation binds a real allocator result; native submission and startup remain separate receipts.
+ */
 public record ClusterRecoveryPermit(
         String reservationId, WorkloadClaimFence recoveryClaim, Instant reservedAt, Instant deadline,
         Map<String, ClusterCapacityDemand> demandByNode, long transferredExecutionGeneration) {
