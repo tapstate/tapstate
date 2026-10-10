@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
@@ -8,9 +9,21 @@ import org.bson.Document;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * Reads instance-wide Mongo command counters around one measured fork window. The process under test
@@ -55,18 +68,54 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
     }
 
     private final MongoClient client;
+    private final Supplier<Snapshot> source;
+    private final Supplier<Snapshot> checkpointSource;
+    private final LongSupplier nanoTime;
+    private final ConnectionString connection;
     private Snapshot beginning;
     private long startedAtNanos;
     private boolean finished;
     private boolean closed;
+    private boolean checkpointRequested;
+    private ExecutorService checkpointWorker;
+    private CheckpointWaiter checkpointWaiter = Future::get;
+    private volatile CheckpointRead retainedCheckpointRead;
+    private volatile Checkpoint completedCheckpoint;
 
-    private BenchmarkMongoCommandSampler(MongoClient client) {
+    private BenchmarkMongoCommandSampler(MongoClient client, ConnectionString connection) {
         this.client = client;
+        this.connection = connection;
+        source = this::read;
+        checkpointSource = this::readCheckpoint;
+        nanoTime = io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime;
+    }
+
+    private BenchmarkMongoCommandSampler(Supplier<Snapshot> source, LongSupplier nanoTime) {
+        client = null;
+        connection = null;
+        this.source = Objects.requireNonNull(source, "command source");
+        checkpointSource = source;
+        this.nanoTime = Objects.requireNonNull(nanoTime, "command clock");
+    }
+
+    static BenchmarkMongoCommandSampler from(Supplier<Snapshot> source, LongSupplier nanoTime) {
+        return new BenchmarkMongoCommandSampler(source, nanoTime);
+    }
+
+    @FunctionalInterface interface CheckpointWaiter {
+        Checkpoint await(Future<Checkpoint> read, long timeout, TimeUnit unit)
+                throws InterruptedException, ExecutionException, TimeoutException;
+    }
+
+    static BenchmarkMongoCommandSampler fromWithCheckpointWaiter(Supplier<Snapshot> source, LongSupplier nanoTime,
+            CheckpointWaiter waiter) {
+        var sampler = from(source, nanoTime); sampler.checkpointWaiter = Objects.requireNonNull(waiter); return sampler;
     }
 
     static BenchmarkMongoCommandSampler open(String mongoUri) {
         Objects.requireNonNull(mongoUri, "Mongo URI");
-        return new BenchmarkMongoCommandSampler(MongoClients.create(new ConnectionString(mongoUri)));
+        ConnectionString connection = new ConnectionString(mongoUri);
+        return new BenchmarkMongoCommandSampler(MongoClients.create(connection), connection);
     }
 
     /** Read the baseline after all fork setup and before issuing measured source SQL. */
@@ -74,8 +123,8 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
         if (beginning != null || finished || closed) {
             throw new IllegalStateException("Mongo command sampler can start only once");
         }
-        beginning = read();
-        startedAtNanos = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+        beginning = source.get();
+        startedAtNanos = nanoTime.getAsLong();
     }
 
     /** Read the end counter after target ACK and its change-stream barrier. */
@@ -83,17 +132,124 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
         if (beginning == null || finished || closed) {
             throw new IllegalStateException("Mongo command sampler has no open measured window");
         }
-        long endedAtNanos = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+        long endedAtNanos = nanoTime.getAsLong();
         long elapsedNanos = endedAtNanos - startedAtNanos;
         if (elapsedNanos < 0) {
             throw new AssertionError("Mongo command sample clock moved backward");
         }
         finished = true;
-        Snapshot end = read();
+        Snapshot end = source.get();
         return difference(beginning, end, elapsedNanos / 1_000_000);
     }
 
+    /** This calibration read retains the original baseline and leaves the later full finish open. */
+    Checkpoint checkpoint() {
+        var result = new CompletableFuture<Checkpoint>();
+        synchronized (this) {
+            if (beginning == null || finished || closed || checkpointRequested) {
+                throw checkpointFailure(CheckpointReason.STATE, new IllegalStateException("Mongo checkpoint needs one open unused calibration window"));
+            }
+            checkpointRequested = true;
+            checkpointWorker = Executors.newSingleThreadExecutor(Thread.ofPlatform().daemon()
+                    .name("benchmark-command-checkpoint").factory());
+            Snapshot baseline = beginning; long baselineAt = startedAtNanos;
+            try {
+                checkpointWorker.execute(() -> {
+                    try { result.complete(readCheckpoint(baseline, baselineAt)); }
+                    catch (Throwable unavailable) { result.completeExceptionally(unavailable); }
+                    finally { checkpointWorker.shutdown(); }
+                });
+            } catch (RuntimeException scheduling) { throw checkpointFailure(CheckpointReason.SCHEDULING_FAILURE, scheduling); }
+        }
+        // No sampler monitor is held while an external read or the bounded owner wait is active.
+        try { return checkpointWaiter.await(result, 5, TimeUnit.SECONDS); }
+        catch (TimeoutException timeout) { throw checkpointFailure(CheckpointReason.WAIT_TIMEOUT, timeout); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt(); throw checkpointFailure(CheckpointReason.WAIT_INTERRUPTED, interrupted);
+        } catch (ExecutionException failed) {
+            if (failed.getCause() instanceof CheckpointFailure diagnosed) { throw diagnosed; }
+            throw checkpointFailure(CheckpointReason.READ_FAILURE, failed.getCause());
+        }
+    }
+
+    private Checkpoint readCheckpoint(Snapshot baseline, long baselineAt) {
+        long began = nanoTime.getAsLong();
+        retainedCheckpointRead = new CheckpointRead(began, OptionalLong.empty(), Optional.empty(), "NONE");
+        Snapshot actual = null; Throwable primary = null;
+        try { actual = checkpointSource.get(); }
+        catch (Throwable unavailable) { primary = unavailable; }
+        long ended;
+        try { ended = nanoTime.getAsLong(); }
+        catch (Throwable unavailable) {
+            retainedCheckpointRead = new CheckpointRead(began, OptionalLong.empty(), Optional.ofNullable(actual), unavailable.getClass().getName());
+            if (primary != null) { primary.addSuppressed(unavailable); } else { primary = unavailable; }
+            throw checkpointFailure(CheckpointReason.READ_FAILURE, primary);
+        }
+        retainedCheckpointRead = new CheckpointRead(began, OptionalLong.of(ended), Optional.ofNullable(actual),
+                primary == null ? "NONE" : primary.getClass().getName());
+        if (primary != null) { throw checkpointFailure(CheckpointReason.READ_FAILURE, primary); }
+        try {
+            if (Math.subtractExact(ended, began) < 0 || Math.subtractExact(began, baselineAt) < 0) {
+                throw new AssertionError("Mongo checkpoint clock moved backward");
+            }
+            Checkpoint checkpoint = new Checkpoint(difference(baseline, actual, Math.subtractExact(began, baselineAt) / 1_000_000), began, ended);
+            completedCheckpoint = checkpoint; return checkpoint;
+        } catch (Throwable invalid) { throw checkpointFailure(CheckpointReason.INVALID_COUNTERS, invalid); }
+    }
+
+    record Checkpoint(Summary summary, long startedAtNanos, long completedAtNanos) { }
+    record CheckpointRead(long startedAtNanos, OptionalLong completedAtNanos, Optional<Snapshot> snapshot, String failureType) { }
+    enum CheckpointReason { STATE, WAIT_TIMEOUT, WAIT_INTERRUPTED, READ_FAILURE, INVALID_COUNTERS, SCHEDULING_FAILURE }
+    Optional<Checkpoint> checkpointEvidence() { return Optional.ofNullable(completedCheckpoint); }
+    Optional<CheckpointRead> checkpointReadEvidence() { return Optional.ofNullable(retainedCheckpointRead); }
+
+    private CheckpointFailure checkpointFailure(CheckpointReason reason, Throwable cause) {
+        return new CheckpointFailure(reason, checkpointReadEvidence(), checkpointEvidence(), cause);
+    }
+
+    static final class CheckpointFailure extends AssertionError {
+        private final CheckpointReason reason;
+        private final Optional<CheckpointRead> read;
+        private final Optional<Checkpoint> checkpoint;
+        CheckpointFailure(CheckpointReason reason, Optional<CheckpointRead> read, Optional<Checkpoint> checkpoint, Throwable cause) {
+            super("Mongo command checkpoint was refused: " + reason, cause);
+            this.reason = reason; this.read = read; this.checkpoint = checkpoint;
+        }
+        CheckpointReason reason() { return reason; }
+        Optional<CheckpointRead> readEvidence() { return read; }
+        Optional<Checkpoint> checkpointEvidence() { return checkpoint; }
+        Map<String, Object> retainedEvidence() {
+            var result = new LinkedHashMap<String, Object>(); result.put("state", "UNKNOWN"); result.put("reason", reason.name());
+            result.put("actualReadAvailable", read.isPresent()); result.put("completedCheckpointAvailable", checkpoint.isPresent());
+            read.ifPresent(actual -> {
+                var evidence = new LinkedHashMap<String, Object>(); evidence.put("startedAtNanos", actual.startedAtNanos());
+                evidence.put("state", actual.completedAtNanos().isPresent() ? "COMPLETED_READ_FACTS" : "PENDING_READ");
+                actual.completedAtNanos().ifPresent(value -> evidence.put("completedAtNanos", value));
+                actual.snapshot().ifPresent(value -> evidence.put("snapshot", Map.of("host", value.host(), "pid", value.pid(),
+                        "uptimeMillis", value.uptimeMillis(), "commandTotals", value.commandTotals())));
+                evidence.put("failureType", actual.failureType()); result.put("actualRead", Map.copyOf(evidence));
+            });
+            checkpoint.ifPresent(actual -> result.put("completedCheckpoint", Map.of("startedAtNanos", actual.startedAtNanos(),
+                    "completedAtNanos", actual.completedAtNanos(), "byCommand", actual.summary().byCommand(),
+                    "elapsedMillis", actual.summary().elapsedMillis())));
+            BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> result.put(flag, false));
+            return Map.copyOf(result);
+        }
+    }
+
     private Snapshot read() {
+        return read(client);
+    }
+
+    /** Only this optional client has local read limits; the normal start/finish client is unchanged. */
+    private Snapshot readCheckpoint() {
+        MongoClientSettings settings = MongoClientSettings.builder().applyConnectionString(connection)
+                .applyToSocketSettings(socket -> socket.connectTimeout(5, TimeUnit.SECONDS).readTimeout(5, TimeUnit.SECONDS))
+                .applyToClusterSettings(cluster -> cluster.serverSelectionTimeout(5, TimeUnit.SECONDS)).build();
+        try (MongoClient owned = MongoClients.create(settings)) { return read(owned); }
+    }
+
+    private static Snapshot read(MongoClient client) {
         try {
             Document status = client.getDatabase("admin").runCommand(new Document("serverStatus", 1));
             return parse(status);
@@ -191,7 +347,8 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
     public synchronized void close() {
         if (!closed) {
             closed = true;
-            client.close();
+            if (checkpointWorker != null) { checkpointWorker.shutdownNow(); }
+            if (client != null) { client.close(); }
         }
     }
 }

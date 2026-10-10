@@ -7,10 +7,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -32,6 +36,9 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     private volatile PublishedDiagnostics published;
     private Throwable failure;
     private volatile Throwable finalSampleFailure;
+    private volatile Checkpoint completedCheckpoint;
+    private boolean checkpointRequested;
+    private CheckpointWaiter checkpointWaiter = Future::get;
     private ScheduledFuture<?> periodicSamples;
     private boolean started;
     private boolean finished;
@@ -120,6 +127,70 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     interface TerminationWaiter {
         boolean await(ScheduledExecutorService worker, long timeout, TimeUnit unit) throws InterruptedException;
     }
+
+    @FunctionalInterface
+    interface CheckpointWaiter {
+        Checkpoint await(Future<Checkpoint> read, long timeout, TimeUnit unit)
+                throws InterruptedException, ExecutionException, TimeoutException;
+    }
+
+    static BenchmarkResourceSampler fromWithCheckpointWaiter(Supplier<BenchmarkProcessProbe.Snapshot> source,
+            Duration interval, LongSupplier nanoTime, CheckpointWaiter waiter) {
+        BenchmarkResourceSampler sampler = from(source, interval, nanoTime);
+        sampler.checkpointWaiter = Objects.requireNonNull(waiter, "checkpoint waiter");
+        return sampler;
+    }
+
+    /** A calibration read follows active periodic work without closing or resetting the full window. */
+    Checkpoint checkpoint() {
+        var result = new CompletableFuture<Checkpoint>();
+        synchronized (lifecycle) {
+            if (!started || finished || checkpointRequested) {
+                throw finishFailure(FailureStage.CHECKPOINT, FailureReason.NO_OPEN_CHECKPOINT,
+                        new IllegalStateException("resource checkpoint needs one open unused calibration window"));
+            }
+            checkpointRequested = true;
+            try {
+                worker.execute(() -> {
+                    try {
+                        record(false, true);
+                        throwCompilationInvariant(); throwThreadPointInvariant();
+                        if (failure != null) {
+                            var last = published.completed().retainedAttempts().getLast();
+                            throw finishFailure(FailureStage.CHECKPOINT, last.outcome() == Outcome.UNAVAILABLE
+                                    ? FailureReason.READ_UNAVAILABLE : FailureReason.READ_ERROR, failure);
+                        }
+                        var trace = published.completed(); var actual = trace.retainedAttempts().getLast();
+                        Summary summary;
+                        try { summary = resources.summary(Optional.of(trace)); }
+                        catch (Throwable invalid) { throw finishFailure(FailureStage.CHECKPOINT, FailureReason.INVALID_SUMMARY, invalid); }
+                        Checkpoint checkpoint = new Checkpoint(summary, actual.index(), actual.startedAtNanos(), actual.completedAtNanos());
+                        completedCheckpoint = checkpoint; result.complete(checkpoint);
+                    } catch (Throwable unavailable) { result.completeExceptionally(unavailable); }
+                });
+            } catch (RuntimeException scheduling) {
+                throw finishFailure(FailureStage.CHECKPOINT, FailureReason.CHECKPOINT_ERROR, scheduling);
+            }
+        }
+        try { return checkpointWaiter.await(result, 5, TimeUnit.SECONDS); }
+        catch (TimeoutException timeout) { throw finishFailure(FailureStage.CHECKPOINT, FailureReason.CHECKPOINT_TIMEOUT, timeout); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw finishFailure(FailureStage.CHECKPOINT, FailureReason.CHECKPOINT_INTERRUPTED, interrupted);
+        } catch (ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof SamplingFailure diagnosed) { throw diagnosed; }
+            if (cause == compilationInvariantFailure || cause == threadPointInvariantFailure) {
+                if (cause instanceof Error error) { throw error; }
+                if (cause instanceof RuntimeException invariant) { throw invariant; }
+            }
+            throw finishFailure(FailureStage.CHECKPOINT, FailureReason.CHECKPOINT_ERROR, cause);
+        }
+    }
+
+    Optional<Checkpoint> checkpointEvidence() { return Optional.ofNullable(completedCheckpoint); }
+
+    record Checkpoint(Summary summary, long attemptIndex, long startedAtNanos, long completedAtNanos) { }
 
     void start() {
         synchronized (lifecycle) {
@@ -269,13 +340,17 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         record(false);
     }
 
-    private synchronized void record(boolean finalRead) {
+    private void record(boolean finalRead) {
+        record(finalRead, false);
+    }
+
+    private synchronized void record(boolean finalRead, boolean checkpointRead) {
         if (failure != null) {
             return;
         }
         long startedAt = nanoTime.getAsLong();
         published = new PublishedDiagnostics(published.completed(),
-                Optional.of(new PendingRead(published.completed().attemptCount() + 1, startedAt, finalRead)));
+                Optional.of(new PendingRead(published.completed().attemptCount() + 1, startedAt, finalRead, checkpointRead)));
         BenchmarkProcessProbe.Snapshot sample = null;
         Outcome outcome = Outcome.SUCCESS;
         Throwable unavailable = null;
@@ -391,7 +466,9 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     }
 
     /** An unfinished read has a start but no invented completion, duration or failure outcome. */
-    record PendingRead(long index, long startedAtNanos, boolean finalRead) { }
+    record PendingRead(long index, long startedAtNanos, boolean finalRead, boolean checkpointRead) {
+        PendingRead(long index, long startedAtNanos, boolean finalRead) { this(index, startedAtNanos, finalRead, false); }
+    }
 
     private record PublishedDiagnostics(SamplingDiagnostics completed, Optional<PendingRead> pending) { }
 
@@ -475,7 +552,8 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         SHUTDOWN,
         FINAL_SAMPLE,
         READ,
-        SUMMARY
+        SUMMARY,
+        CHECKPOINT
     }
 
     enum FailureReason {
@@ -486,7 +564,11 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         FINAL_SAMPLE_ERROR,
         READ_UNAVAILABLE,
         READ_ERROR,
-        INVALID_SUMMARY
+        INVALID_SUMMARY,
+        NO_OPEN_CHECKPOINT,
+        CHECKPOINT_TIMEOUT,
+        CHECKPOINT_INTERRUPTED,
+        CHECKPOINT_ERROR
     }
 
     /** Window failures keep their stage separate from the count of completed reads that failed. */

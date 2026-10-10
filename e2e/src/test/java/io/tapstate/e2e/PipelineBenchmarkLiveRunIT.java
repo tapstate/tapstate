@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY) != null) {
+            throw new AssertionError("return collector calibration cannot establish a live performance gate");
+        }
         if (Boolean.getBoolean(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY)) {
             throw new AssertionError("common native counter diagnostics cannot establish a live performance gate");
         }
@@ -575,9 +578,9 @@ class PipelineBenchmarkLiveRunIT {
                         .orElseGet(() -> object("state", "NOT_RECORDED")));
     }
 
-    private static Map<String, Object> samplingEvidence(BenchmarkResourceSampler.SamplingDiagnostics diagnostics,
-                                                       BenchmarkForkEnvironment.ClockAnchor anchor) {
-        return object("state", diagnostics.state(), "attemptCount", diagnostics.attemptCount(),
+    static Map<String, Object> samplingEvidence(BenchmarkResourceSampler.SamplingDiagnostics diagnostics,
+                                              BenchmarkForkEnvironment.ClockAnchor anchor) {
+        return java.util.Collections.unmodifiableMap(object("state", diagnostics.state(), "attemptCount", diagnostics.attemptCount(),
                 "failureCount", diagnostics.failureCount(),
                 "totalDurationNanos", diagnostics.totalDurationNanos(),
                 "maxDurationNanos", diagnostics.maxDurationNanos(),
@@ -585,16 +588,19 @@ class PipelineBenchmarkLiveRunIT {
                 diagnostics.state().equals("COHORT_INTERVAL") ? "COHORT_INTERVAL" : "FIRST_AND_LAST",
                 "retainedAttemptLimit", diagnostics.retainedAttemptLimit(),
                 "omittedAttempts", diagnostics.omittedAttempts(),
-                "attempts", diagnostics.retainedAttempts().stream().map(attempt -> object(
-                        "index", attempt.index(), "startedAtNanos", attempt.startedAtNanos(),
-                        "completedAtNanos", attempt.completedAtNanos(),
-                        "durationNanos", attempt.durationNanos(), "outcome", attempt.outcome().name(),
-                        "failureType", attempt.failureType(),
-                        "startedAtUtcEarliest", anchor.earliestUtc(attempt.startedAtNanos()).toString(),
-                        "startedAtUtcLatest", anchor.latestUtc(attempt.startedAtNanos()).toString(),
-                        "completedAtUtcEarliest", anchor.earliestUtc(attempt.completedAtNanos()).toString(),
-                        "completedAtUtcLatest", anchor.latestUtc(attempt.completedAtNanos()).toString(),
-                        "reading", readingEvidence(attempt.reading()))).toList());
+                "attempts", diagnostics.retainedAttempts().stream().map(attempt -> {
+                    var facts = object("index", attempt.index(), "startedAtNanos", attempt.startedAtNanos(),
+                            "completedAtNanos", attempt.completedAtNanos(), "durationNanos", attempt.durationNanos(),
+                            "outcome", attempt.outcome().name(), "failureType", attempt.failureType(),
+                            "reading", java.util.Collections.unmodifiableMap(readingEvidence(attempt.reading())));
+                    if (anchor != null) {
+                        facts.put("startedAtUtcEarliest", anchor.earliestUtc(attempt.startedAtNanos()).toString());
+                        facts.put("startedAtUtcLatest", anchor.latestUtc(attempt.startedAtNanos()).toString());
+                        facts.put("completedAtUtcEarliest", anchor.earliestUtc(attempt.completedAtNanos()).toString());
+                        facts.put("completedAtUtcLatest", anchor.latestUtc(attempt.completedAtNanos()).toString());
+                    }
+                    return java.util.Collections.unmodifiableMap(facts);
+                }).toList()));
     }
 
     private static Map<String, Object> readingEvidence(BenchmarkProcessProbe.Snapshot reading) {

@@ -87,6 +87,14 @@ final class BenchmarkNativeReturnClock implements BenchmarkReturnPointClock {
         return result;
     }
 
+    static Map<String, Object> supportedRootSnapshot(Map<String, Object> parsed) {
+        BenchmarkNativeClockEvidence.requireMatchingNative(parsed, parsed);
+        require(parsed.get("before") instanceof Map<?, ?>, "actual root snapshot is missing");
+        @SuppressWarnings("unchecked") Map<String, Object> snapshot = (Map<String, Object>) parsed.get("before");
+        supported(snapshot);
+        return snapshot;
+    }
+
     /** Different binaries or counter routes require fresh validation; hashes are not accuracy proofs. */
     private static void supported(Map<String, Object> snapshot) {
         require(JNI_SHA256.equals(snapshot.get("loadedJniSha256")) && CLASS_HASHES.equals(snapshot.get("classHashes")),
