@@ -798,6 +798,14 @@ final class ControlPlane {
         return asObject(map);
     }
 
+    /** The quoted authoritative version exposed by the typed Source HTTP read. */
+    String sourceEtag(String sourceId) {
+        HttpResponse<String> response = send(authedGet("/api/sources/" + urlSegment(sourceId)));
+        expect(response, 200, "read the source version " + sourceId);
+        return response.headers().firstValue("ETag")
+                .orElseThrow(() -> new AssertionError("the Source read returned no ETag"));
+    }
+
     /**
      * The content hash of the stored artifact {@code id}, failing when the server holds none.
      *

@@ -1,6 +1,17 @@
 package io.tapstate.e2e;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringStore;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.testsupport.DockerGate;
+import org.bson.Document;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -28,9 +39,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>The refusal is asserted on the stored bytes as well as the code, and that is the discriminating
  * assertion rather than a second opinion on the same fact. An implementation that writes first and
  * compares afterwards answers the very same code on the very same call - it just answers it over a store
- * it has already overwritten, which is the one outcome a precondition exists to make impossible. Reading
- * the canonical form either side of the refused call is the only thing that separates the two, so the
- * bytes are captured before it rather than reconstructed from the document the test sent.
+ * it has already overwritten, which is the one outcome a precondition exists to make impossible. Public
+ * Source reads omit config, so the harness also compares the complete raw encrypted document across the
+ * refusal. Successful writes are checked against their decrypted fake config and logical content hash;
+ * no production API is allowed to expose that config.
  *
  * <p>The third apply then succeeds against the hash the store actually holds. Without it, "refuses a
  * stale hash" is indistinguishable from "refuses every hash", and the case would pass against a product
@@ -53,43 +65,53 @@ class ArtifactApplyIfMatchIT {
     @EnumSource(Tiers.class)
     void aStaleVersionIsRefusedWithoutWritingAndTheCurrentOneIsAccepted(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri("apply_if_match", tier))) {
+        String uri = storeUri("apply_if_match", tier);
+        try (MongoClient raw = MongoClients.create(uri); ServerHandle server = tier.launch(uri)) {
+            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
             ControlPlane control = connected(server, directory);
 
             control.apply(Map.of("src_file.tap.yml", sourceYaml("first")));
+            assertStoredSource(database, control, "first");
             String hashOfTheFirstVersion = control.contentHash(SOURCE_ID);
 
             // A second author replaces it. The hash the first author is holding now describes a version the
             // store no longer has, which is the whole situation the precondition exists to notice.
             control.applyExpecting("src_file.tap.yml", sourceYaml("second"), hashOfTheFirstVersion);
+            Document storedBeforeTheRefusal = assertStoredSource(database, control, "second");
             String hashOfTheSecondVersion = control.contentHash(SOURCE_ID);
             assertThat(hashOfTheSecondVersion)
                     .as("replacing the document changes the version it is addressed by")
                     .isNotEqualTo(hashOfTheFirstVersion);
 
-            String storedBeforeTheRefusal = control.artifact(SOURCE_ID).orElseThrow().canonicalForm();
+            String publicBeforeTheRefusal = control.artifact(SOURCE_ID).orElseThrow().canonicalForm();
 
             ControlPlane.Refusal refusal =
                     control.applyExpectingRefusal("src_file.tap.yml", sourceYaml("third"), hashOfTheFirstVersion);
 
+            assertThat(refusal.status()).isEqualTo(412);
             assertThat(refusal.code())
                     .as("the code refusing an edit written against a version the store no longer holds")
                     .isEqualTo(VERSION_CONFLICT);
             assertThat(refusal.params())
                     .as("the refusal names which resource it is about, so a batch tells the author where to look")
                     .containsEntry("id", SOURCE_ID);
-            assertThat(control.artifact(SOURCE_ID).orElseThrow().canonicalForm())
+            assertThat(assertStoredSource(database, control, "second"))
                     .as("the stored bytes across a refused apply - a product that writes first and compares "
                             + "afterwards answers the same code over a store it has already overwritten")
                     .isEqualTo(storedBeforeTheRefusal);
+            assertThat(control.contentHash(SOURCE_ID)).isEqualTo(hashOfTheSecondVersion);
+            assertThat(control.artifact(SOURCE_ID).orElseThrow().canonicalForm()).isEqualTo(publicBeforeTheRefusal);
 
             // Against the version the store actually holds, the same edit goes through. Without this the case
             // would pass against a product that refuses every precondition it is handed.
             control.applyExpecting("src_file.tap.yml", sourceYaml("third"), hashOfTheSecondVersion);
-            assertThat(control.artifact(SOURCE_ID).orElseThrow().canonicalForm())
+            assertThat(assertStoredSource(database, control, "third"))
                     .as("the edit lands once it names the version it was written against")
-                    .isNotEqualTo(storedBeforeTheRefusal)
-                    .contains("third");
+                    .isNotEqualTo(storedBeforeTheRefusal);
+            assertThat(control.contentHash(SOURCE_ID)).isNotEqualTo(hashOfTheSecondVersion);
+            assertThat(control.artifact(SOURCE_ID).orElseThrow().canonicalForm())
+                    .as("config-only edits do not change the public Source display projection")
+                    .isEqualTo(publicBeforeTheRefusal);
         }
     }
 
@@ -97,20 +119,24 @@ class ArtifactApplyIfMatchIT {
     @EnumSource(Tiers.class)
     void anApplyThatClaimsNoVersionOverwritesWhateverIsStored(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri("apply_no_if_match", tier))) {
+        String uri = storeUri("apply_no_if_match", tier);
+        try (MongoClient raw = MongoClients.create(uri); ServerHandle server = tier.launch(uri)) {
+            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
             ControlPlane control = connected(server, directory);
 
             control.apply(Map.of("src_file.tap.yml", sourceYaml("first")));
+            assertStoredSource(database, control, "first");
             // Replaced behind the caller's back. An apply carrying a precondition would be refused from here
             // on; one carrying none is entitled to overwrite, and that entitlement is what callers written
             // before the field existed are standing on.
             control.apply(Map.of("src_file.tap.yml", sourceYaml("second")));
+            Document second = assertStoredSource(database, control, "second");
 
             control.apply(Map.of("src_file.tap.yml", sourceYaml("third")));
 
-            assertThat(control.artifact(SOURCE_ID).orElseThrow().canonicalForm())
+            assertThat(assertStoredSource(database, control, "third"))
                     .as("an apply that never claimed a version is never refused by one")
-                    .contains("third");
+                    .isNotEqualTo(second);
         }
     }
 
@@ -124,6 +150,29 @@ class ArtifactApplyIfMatchIT {
 
     private static String storeUri(String name, Tiers tier) {
         return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
+    }
+
+    /** Reads only this fixture's metadata; public HTTP must withhold even its non-secret fake config. */
+    private static Document assertStoredSource(MongoDatabase database, ControlPlane control, String marker) {
+        Document stored = SystemCollections.ARTIFACTS.on(database).find(new Document("_id", SOURCE_ID)).first();
+        assertThat(stored).isNotNull();
+        String envelope = stored.get("body", Document.class).getString("config");
+        assertThat(envelope).startsWith("tscfg:1:");
+        assertThat(stored.toJson()).doesNotContain("/tmp/first", "/tmp/second", "/tmp/third");
+        SourceResource expected = (SourceResource) new DslParser().parse(sourceYaml(marker));
+        var cipher = new SourceConfigKeyringStore(database).loadExistingCipher();
+        assertThat(JsonReader.parse(cipher.decrypt(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, envelope)))
+                .as("the accepted HTTP write stores the complete config the runtime reconstructs")
+                .isEqualTo(expected.config());
+        String expectedHash = CanonicalHash.of(expected);
+        assertThat(stored.getString("contentHash")).isEqualTo(expectedHash);
+        assertThat(control.sourceEtag(SOURCE_ID)).isEqualTo("\"" + expectedHash + "\"");
+        ControlPlane.StoredArtifact projection = control.artifact(SOURCE_ID).orElseThrow();
+        assertThat(projection.contentHash()).isEqualTo(expectedHash);
+        assertThat(projection.canonicalForm())
+                .contains("id: " + SOURCE_ID, "connector: " + E2eConnectorJar.CONNECTOR_ID)
+                .doesNotContain("config:", "tscfg:", "/tmp/first", "/tmp/second", "/tmp/third");
+        return stored;
     }
 
     /**
