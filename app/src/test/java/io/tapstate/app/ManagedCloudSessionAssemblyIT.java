@@ -33,7 +33,6 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.HttpHeaders;
@@ -583,7 +582,6 @@ class ManagedCloudSessionAssemblyIT {
         }
     }
 
-    @Configuration(proxyBeanMethods = false)
     static class PreviewProbeAssembly {
         @Bean
         PipelinePreviewProbe pipelinePreviewProbe() {
