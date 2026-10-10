@@ -7,10 +7,12 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.testsupport.RequiresDocker;
 import java.time.Duration;
 import java.util.List;
@@ -26,7 +28,7 @@ import org.testcontainers.utility.DockerImageName;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** All durable sink effects obey both the live claim and the consumer's configured run identity. */
+/** Every durable sink effect obeys both the live claim and the run the pipeline's cursor is bound to. */
 @RequiresDocker
 class MongoSinkAcknowledgementFenceIT {
 
@@ -41,50 +43,63 @@ class MongoSinkAcknowledgementFenceIT {
             new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     @Test
-    void theCurrentRunCanAdvanceDirectAcknowledgementsAndCompleteSnapshots() {
+    void theCurrentRunCanAdvanceItsWritersAndThePipelinesRecord() {
         withStore(fixture -> {
             var store = fixture.store();
             var fence = fixture.fence();
-            store.configureSinkWriters(CHAIN, PIPELINE, PLAN, fence);
-            store.advanceSinkAcked(CHAIN, PIPELINE, position(1), fence);
-            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow().sinkAcked())
-                    .isEqualTo(position(1));
-            store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(4), fence);
-            store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(2), fence);
+            assertThat(store.beginWriterRun(CHAIN, PIPELINE, fixture.runId(), PLAN, fence)).isTrue();
+
+            assertThat(store.advanceWriter(CHAIN, PIPELINE, fixture.runId(), WRITER, TABLE, progress(3), fence))
+                    .hasValueSatisfying(run -> assertThat(run.progressFor(TABLE)).containsEntry(WRITER, progress(3)));
+            assertThat(store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(4), fence)).isTrue();
+            assertThat(store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(2), fence)).isTrue();
+            assertThat(ackedBy(store)).isEqualTo(position(4));
             assertThat(store.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 4L);
-            store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(-1), fence);
-            assertThat(store.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 4L);
-            store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence);
-            store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence);
-            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE))
-                    .containsExactly(TABLE);
+            assertThat(store.advanceTableConfirmed(
+                    CHAIN, PIPELINE, TABLE, new ChainPosition(new SourceOrder(1, 6), null), fence)).isTrue();
+            assertThat(store.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 6L);
+            assertThat(store.raiseSinkAcked(CHAIN, PIPELINE, position(7), fence)).isTrue();
+            assertThat(store.raiseSinkAcked(CHAIN, PIPELINE, position(5), fence)).isTrue();
+            assertThat(ackedBy(store)).isEqualTo(position(7));
+            assertThat(store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence)).isTrue();
+            assertThat(store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE)).containsExactly(TABLE);
         });
     }
 
+    /**
+     * A member joining has the holder take the same claim again, with the same generations, under the new
+     * topology. The run it carries goes on, so its fenced effects land, and the binding records the claim as it
+     * now stands.
+     */
     @Test
-    void writerSnapshotCompletionRequiresEveryConfiguredWriter() {
+    void theSameRunGoesOnAfterItsHolderTakesTheClaimAgainUnderANewTopology() {
         withStore(fixture -> {
             var store = fixture.store();
-            var fence = fixture.fence();
-            store.configureSinkWriters(CHAIN, PIPELINE, Map.of(TABLE, List.of(WRITER, "writer-2")), fence);
-            store.advanceSinkWriterAcked(CHAIN, PIPELINE, WRITER, TABLE, position(2), fence);
-            store.markSinkWriterSnapshotComplete(CHAIN, PIPELINE, WRITER, TABLE, fence);
-            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE)).isEmpty();
-            store.advanceSinkWriterAcked(CHAIN, PIPELINE, "writer-2", TABLE, position(1), fence);
-            store.markSinkWriterSnapshotComplete(CHAIN, PIPELINE, "writer-2", TABLE, fence);
-            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE)).containsExactly(TABLE);
-            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow().sinkAcked())
-                    .isEqualTo(position(1));
-            assertThat(store.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 1L);
+            assertThat(store.beginWriterRun(CHAIN, PIPELINE, fixture.runId(), PLAN, fixture.fence())).isTrue();
+            WorkloadClaim again = fixture.claims().acquire(fixture.fence().key(), fixture.fence().owner(), 2,
+                    Duration.ofMinutes(1)).claim();
+            WorkloadClaimFence retaken = WorkloadClaimFence.from(again);
+            assertThat(retaken.executionGeneration()).isEqualTo(fixture.fence().executionGeneration());
+
+            assertThat(store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(5), retaken)).isTrue();
+
+            assertThat(ackedBy(store)).isEqualTo(position(5));
+            assertThat(fixture.consumer().get(MongoSrsMetaStore.SINK_ACK_FENCE, Document.class))
+                    .containsEntry("topologyRevision", 2L);
+            assertThat(store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(6), fixture.fence()))
+                    .as("the claim as it stood before is no longer the live one")
+                    .isFalse();
         });
     }
 
     @Test
     void aLiveClaimWithoutAMatchingConsumerBindingCannotChangeAnySinkProgress() {
         withStore(fixture -> {
-            fixture.store().configureSinkWriters(CHAIN, PIPELINE, PLAN);
+            fixture.store().beginWriterRun(CHAIN, PIPELINE, fixture.runId(), PLAN);
             assertEffectsLeaveConsumerUnchanged(fixture);
-            fixture.store().configureSinkWriters(CHAIN, PIPELINE, PLAN, fixture.fence());
+            assertThat(fixture.store().beginWriterRun(CHAIN, PIPELINE, fixture.runId(), PLAN, fixture.fence()))
+                    .isTrue();
             Document otherRun = WorkloadClaimDocuments.stored(fixture.fence());
             otherRun.put("executionGeneration", fixture.fence().executionGeneration() + 1);
             fixture.consumers().updateOne(new Document("pipelineId", PIPELINE),
@@ -96,12 +111,17 @@ class MongoSinkAcknowledgementFenceIT {
     @Test
     void aSupersededClaimCannotRebindOrAdvanceTheConsumer() {
         withStore(fixture -> {
-            fixture.store().configureSinkWriters(CHAIN, PIPELINE, PLAN, fixture.fence());
+            assertThat(fixture.store().beginWriterRun(CHAIN, PIPELINE, fixture.runId(), PLAN, fixture.fence()))
+                    .isTrue();
             var current = fixture.claims().read(fixture.fence().key()).orElseThrow().claim();
             var next = fixture.claims().advanceExecution(current, 1, Set.of("node-a")).orElseThrow();
-            fixture.store().configureSinkWriters(CHAIN, PIPELINE, PLAN, WorkloadClaimFence.from(next));
+            assertThat(fixture.store().beginWriterRun(CHAIN, PIPELINE, "g" + next.executionGeneration(), PLAN,
+                    WorkloadClaimFence.from(next))).isTrue();
             Document before = fixture.consumer();
-            fixture.store().configureSinkWriters(CHAIN, PIPELINE, PLAN, fixture.fence());
+
+            assertThat(fixture.store().beginWriterRun(CHAIN, PIPELINE, fixture.runId(), PLAN, fixture.fence()))
+                    .as("a superseded run cannot take its binding back")
+                    .isFalse();
             assertThat(fixture.consumer()).isEqualTo(before);
             assertEffectsLeaveConsumerUnchanged(fixture);
         });
@@ -110,7 +130,8 @@ class MongoSinkAcknowledgementFenceIT {
     @Test
     void aDamagedConsumerFenceIsReportedAndNeverReplacedByAnAcknowledgement() {
         withStore(fixture -> {
-            fixture.store().configureSinkWriters(CHAIN, PIPELINE, PLAN, fixture.fence());
+            assertThat(fixture.store().beginWriterRun(CHAIN, PIPELINE, fixture.runId(), PLAN, fixture.fence()))
+                    .isTrue();
             fixture.consumers().updateOne(new Document("pipelineId", PIPELINE),
                     new Document("$set", new Document(MongoSrsMetaStore.SINK_ACK_FENCE, "damaged")));
             Document before = fixture.consumer();
@@ -149,15 +170,23 @@ class MongoSinkAcknowledgementFenceIT {
         var store = fixture.store();
         var fence = fixture.fence();
         return List.of(
-                () -> store.advanceSinkAcked(CHAIN, PIPELINE, position(9), fence),
+                () -> store.advanceWriter(CHAIN, PIPELINE, fixture.runId(), WRITER, TABLE, progress(9), fence),
                 () -> store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(9), fence),
-                () -> store.advanceSinkWriterAcked(CHAIN, PIPELINE, WRITER, TABLE, position(9), fence),
-                () -> store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence),
-                () -> store.markSinkWriterSnapshotComplete(CHAIN, PIPELINE, WRITER, TABLE, fence));
+                () -> store.advanceTableConfirmed(CHAIN, PIPELINE, TABLE, position(9), fence),
+                () -> store.raiseSinkAcked(CHAIN, PIPELINE, position(9), fence),
+                () -> store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence));
     }
 
     private static ChainPosition position(long seq) {
         return new ChainPosition(new SourceOrder(1, seq), "w" + seq);
+    }
+
+    private static WriterProgress progress(long seq) {
+        return new WriterProgress(new SourceOrder(1, seq), position(seq));
+    }
+
+    private static ChainPosition ackedBy(MongoSrsMetaStore store) {
+        return store.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow().sinkAcked();
     }
 
     private static void withStore(Consumer<Fixture> test) {
@@ -173,7 +202,8 @@ class MongoSinkAcknowledgementFenceIT {
                     Duration.ofMinutes(1)).claim();
             var run = claims.advanceExecution(claim, 1, Set.of("node-a")).orElseThrow();
             try {
-                test.accept(new Fixture(store, consumers, claims, WorkloadClaimFence.from(run)));
+                test.accept(new Fixture(store, consumers, claims, WorkloadClaimFence.from(run),
+                        "g" + run.executionGeneration()));
             } finally {
                 database.drop();
             }
@@ -181,7 +211,7 @@ class MongoSinkAcknowledgementFenceIT {
     }
 
     private record Fixture(MongoSrsMetaStore store, MongoCollection<Document> consumers,
-                           MongoWorkloadClaimStore claims, WorkloadClaimFence fence) {
+                           MongoWorkloadClaimStore claims, WorkloadClaimFence fence, String runId) {
         Document consumer() {
             return consumers.find(new Document("pipelineId", PIPELINE)).first();
         }

@@ -11,6 +11,7 @@ import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaModifier;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
+import io.tapstate.runtime.engine.ProtectedMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -322,8 +323,12 @@ class NestStateMapGatesTest {
         }
     }
 
+    /**
+     * A call on a state map, made on the map itself or on the view of it that waits out the cluster refusing
+     * an operation. The view reaches the same map one operation at a time, so it answers to every ban here.
+     */
     private static boolean onMap(JavaAccess<?> access) {
-        return targets(access, IMap.class);
+        return targets(access, IMap.class) || targets(access, ProtectedMap.class);
     }
 
     private static boolean targets(JavaAccess<?> access, Class<?> owner) {
