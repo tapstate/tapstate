@@ -11,6 +11,7 @@ import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.changestream.FullDocument;
 import com.mongodb.client.model.changestream.OperationType;
 import org.bson.Document;
+import io.tapstate.core.common.JsonWriter;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -23,6 +24,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * Reads physical target changes outside the product and timestamps their delivery on this JVM's
@@ -40,6 +42,7 @@ import java.util.function.Function;
  * Unregistered or duplicate target writes remain failures.
  */
 final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
+    static final String CLOCK_REJECTION_EVIDENCE_PROPERTY = "tapstate.e2e.benchmark.operation-clock-rejection-evidence";
 
     private static final String BARRIER_COLLECTION = "_benchmark_delivery_barriers";
     private static final Duration CURSOR_MAX_AWAIT = Duration.ofMillis(100);
@@ -98,6 +101,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private final OperationOrder operationOrder = new OperationOrder();
     private final BenchmarkTargetClock.WallSamples operationWalls = new BenchmarkTargetClock.WallSamples();
     private final BenchmarkWitnessReadGate readGate;
+    private BenchmarkOperationClockEvidence clockRejectionEvidence;
+    private Throwable clockRecordingFailure;
 
     static final class OperationOrder {
         private org.bson.BsonTimestamp previous;
@@ -166,7 +171,14 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         readGate.releaseAfterOwnAck(acknowledgedAtNanos);
     }
 
-    Map<String, Object> readScheduleEvidence() { return readGate.evidence(); }
+    Map<String, Object> readScheduleEvidence() {
+        synchronized (lock) {
+            if (clockRejectionEvidence == null) { return readGate.evidence(); }
+            var out = new java.util.LinkedHashMap<>(readGate.evidence());
+            out.put("operationClockRefusalEvidence", clockRejectionEvidence.evidence());
+            return java.util.Collections.unmodifiableMap(out);
+        }
+    }
     boolean readDeferred() { return readGate.deferred(); }
 
     /** Register before the corresponding source SQL begins, using its captured monotonic start time. */
@@ -221,6 +233,12 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             requireOpenAndReady();
             if (activePhase == null) {
                 activePhase = phaseId;
+                clockRejectionEvidence = null;
+                clockRecordingFailure = null;
+                if (measured && Boolean.getBoolean(CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
+                    clockRejectionEvidence = new BenchmarkOperationClockEvidence(
+                            databaseName + "." + targetCollection, targetId, phaseId);
+                }
             } else if (!activePhase.equals(phaseId)) {
                 throw new IllegalStateException("target changes for " + activePhase + " are not checkpointed");
             }
@@ -352,7 +370,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 ChangeStreamDocument<Document> change = cursor.tryNext();
                 long completed = System.nanoTime();
                 if (change != null) {
-                    accept(change, completed);
+                    accept(change, started, completed);
                 }
                 long accepted = System.nanoTime();
                 previousIterationEnded = accepted;
@@ -391,7 +409,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         }
     }
 
-    private void accept(ChangeStreamDocument<Document> change, long observedAtNanos) {
+    private void accept(ChangeStreamDocument<Document> change, long startedReadNanos, long observedAtNanos) {
         MongoNamespace namespace = change.getNamespace();
         if (namespace == null || !databaseName.equals(namespace.getDatabaseName())) {
             return;
@@ -478,11 +496,23 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                             + "; observedAtNanos=" + observedAtNanos, null); return;
                 }
                 if (!operationWalls.accept(operationWall)) {
-                    fail("target operation clock is missing or moved backward beyond clock uncertainty"
+                    AssertionError original = new AssertionError("target operation clock is missing or moved backward beyond clock uncertainty"
                             + "; namespace=" + namespace + "; target=" + targetId + "; phase=" + activePhase
                             + "; key=" + key + "; highWaterMillis=" + operationWalls.highWaterMillis()
                             + "; currentWallMillis=" + operationWall + "; clusterTime=" + change.getClusterTime()
-                            + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS, null); return;
+                            + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS);
+                    if (clockRejectionEvidence != null) {
+                        recordRejectedClockEvent(clockRejectionEvidence, clockRecordingFailure,
+                                () -> clockEvent(change, key, startedReadNanos, observedAtNanos, null), original);
+                        try { System.out.println("benchmark-operation-clock-refusal=" + JsonWriter.write(clockRejectionEvidence.evidence())); }
+                        catch (RuntimeException | Error recording) { if (recording != original) { original.addSuppressed(recording); } }
+                    }
+                    if (failure == null) { failure = original; lock.notifyAll(); }
+                    return;
+                }
+                if (clockRejectionEvidence != null && clockRecordingFailure == null) {
+                    clockRecordingFailure = recordAcceptedClockEvent(clockRejectionEvidence,
+                            () -> clockEvent(change, key, startedReadNanos, observedAtNanos, System.nanoTime()));
                 }
                 deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration, operationWall));
             }
@@ -491,6 +521,49 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             phaseObserved = Math.addExact(phaseObserved, 1);
             lock.notifyAll();
         }
+    }
+
+    static Throwable recordAcceptedClockEvent(BenchmarkOperationClockEvidence recorder,
+            Supplier<Map<String, Object>> event) {
+        try { recorder.accepted(event.get()); return null; }
+        catch (RuntimeException | Error recording) {
+            try { recorder.recordingFailed(recording); }
+            catch (RuntimeException | Error freezing) { if (freezing != recording) { recording.addSuppressed(freezing); } }
+            return recording;
+        }
+    }
+
+    static void recordRejectedClockEvent(BenchmarkOperationClockEvidence recorder, Throwable priorRecordingFailure,
+            Supplier<Map<String, Object>> event, AssertionError original) {
+        if (priorRecordingFailure != null && priorRecordingFailure != original) {
+            original.addSuppressed(priorRecordingFailure);
+        }
+        try {
+            if (priorRecordingFailure == null) { recorder.rejected(event.get(), original.getMessage()); }
+            else { recorder.authoritativeRejectionAfterRecordingFailure(original.getMessage()); }
+        } catch (RuntimeException | Error recording) {
+            if (recording != original) { original.addSuppressed(recording); }
+            try {
+                recorder.recordingFailed(recording);
+                recorder.authoritativeRejectionAfterRecordingFailure(original.getMessage());
+            } catch (RuntimeException | Error freezing) { if (freezing != original) { original.addSuppressed(freezing); } }
+        }
+    }
+
+    /** Decoded native event metadata only; no document payload or additional target read. */
+    private Map<String, Object> clockEvent(ChangeStreamDocument<Document> change, String key,
+            long startedReadNanos, long observedNanos, Long acceptedNanos) {
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("namespace", change.getNamespace().getFullName()); out.put("targetId", targetId);
+        out.put("phaseId", activePhase); out.put("key", key); out.put("operationType", change.getOperationTypeString());
+        var timestamp = change.getClusterTime();
+        out.put("clusterTime", timestamp == null ? Map.of("status", "MISSING")
+                : Map.of("seconds", Integer.toUnsignedLong(timestamp.getTime()), "increment", Integer.toUnsignedLong(timestamp.getInc())));
+        out.put("wallTime", change.getWallTime() == null ? Map.of("status", "MISSING") : change.getWallTime().getValue());
+        out.put("resumeToken", change.getResumeToken() == null ? Map.of("status", "MISSING") : change.getResumeToken().toJson());
+        out.put("startedReadNanos", startedReadNanos); out.put("completedReadNanos", observedNanos);
+        out.put("observedNanos", observedNanos); out.put("acceptedNanos", acceptedNanos);
+        return java.util.Collections.unmodifiableMap(out);
     }
 
     private boolean acceptOptional(String key, Kind actual) {

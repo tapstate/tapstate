@@ -265,6 +265,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         void requireSteadyStateWindow() {
             if (!workload.pilotProfile()) { throw new AssertionError("steady output requires the predeclared load profile"); }
             for (var phase : phases) {
+                if (Boolean.TRUE.equals(phase.targetClockEvidence().get("operationClockRefusalEvidenceEnabled"))
+                        || clockRefusalEvidenceRecorded(phase.targetClockEvidence().get("targetWitnessReadReceipts"))) {
+                    throw new AssertionError("clock refusal evidence cannot establish a live performance gate");
+                }
                 if (Boolean.TRUE.equals(phase.targetClockEvidence().get("targetWitnessDeferred"))) {
                     throw new AssertionError("deferred target witness cannot establish a live performance gate");
                 }
@@ -277,6 +281,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 BenchmarkSteadyOutputWindow.requireSteady(timeline.operationWindow());
             }
         }
+    }
+
+    private static boolean clockRefusalEvidenceRecorded(Object receipts) {
+        return receipts instanceof List<?> items && items.stream().anyMatch(item -> item instanceof Map<?, ?> receipt
+                && receipt.get("readSchedule") instanceof Map<?, ?> schedule
+                && schedule.containsKey("operationClockRefusalEvidence"));
     }
 
     private record PhaseWindow(MeasuredPhase measurement, List<Long> deliveryDurations,
@@ -670,7 +680,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         targets.releaseAfterOwnMeasuredAck(completedAckAt);
         var targetStreams = targets.checkpointStreams(phase);
         clockProof.put("targetWitnessDeferred", deferredWitness);
-        clockProof.put("targetWitnessReadReceipts", targets.readSchedules());
+        var readReceipts = targets.readSchedules();
+        clockProof.put("targetWitnessReadReceipts", readReceipts);
+        if (clockRefusalEvidenceRecorded(readReceipts)) {
+            clockProof.put("operationClockRefusalEvidenceEnabled", true);
+        }
         Map<String, Object> targetClockEvidence = Map.copyOf(clockProof);
         List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targetStreams.values().stream().flatMap(List::stream).toList();
         if (deliveries.size() != phase.expectedLogicalOutputChanges()) {

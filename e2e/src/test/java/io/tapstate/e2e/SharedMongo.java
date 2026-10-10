@@ -10,6 +10,9 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Optional;
+import java.util.Map;
+import org.bson.Document;
+import io.tapstate.core.common.JsonReader;
 
 /**
  * One replica set for every specification in the JVM.
@@ -91,5 +94,32 @@ final class SharedMongo {
         BigDecimal budget = new BigDecimal(configured);
         if (budget.signum() <= 0) { throw new IllegalArgumentException("the shared Mongo cache budget must be positive"); }
         return cacheBudget = Optional.of(budget.stripTrailingZeros());
+    }
+
+    /** Exact owned fixture identity, read only during diagnostic setup. */
+    static synchronized Map<String, Object> diagnosticIdentity() {
+        if (container == null) { return Map.of("status", "UNKNOWN", "reason", "OWNED_MONGO_NOT_STARTED"); }
+        long before = System.nanoTime();
+        try (MongoClient client = MongoClients.create(container.getReplicaSetUrl())) {
+            Document build = client.getDatabase("admin").runCommand(new Document("buildInfo", 1).append("maxTimeMS", 2000));
+            Document fcv = client.getDatabase("admin").runCommand(new Document("getParameter", 1)
+                    .append("featureCompatibilityVersion", 1).append("maxTimeMS", 2000));
+            String version = build.getString("version"), gitVersion = build.getString("gitVersion");
+            String canonical = fcv.toJson();
+            var info = container.getContainerInfo();
+            if (version == null || gitVersion == null || version.length() > 4096 || gitVersion.length() > 4096
+                    || canonical.length() > 65536 || info.getImageId() == null || container.getContainerId() == null) {
+                return Map.of("status", "UNKNOWN", "reason", "OWNED_MONGO_IDENTITY_INCOMPLETE");
+            }
+            return Map.of("status", "COMPLETE", "scope", "OWNED_FIXTURE_PRE_PIPELINE_CONFIGURATION",
+                    "containerId", container.getContainerId(), "imageId", info.getImageId(),
+                    "imageTag", container.getDockerImageName(), "version", version, "gitVersion", gitVersion,
+                    "featureCompatibilityVersion", JsonReader.parse(canonical), "startedAtNanos", before,
+                    "completedAtNanos", System.nanoTime());
+        } catch (RuntimeException | AssertionError unavailable) {
+            return Map.of("status", "UNKNOWN", "reason", "OWNED_MONGO_IDENTITY_READ_FAILED",
+                    "failureType", unavailable.getClass().getName(), "startedAtNanos", before,
+                    "completedAtNanos", System.nanoTime());
+        }
     }
 }

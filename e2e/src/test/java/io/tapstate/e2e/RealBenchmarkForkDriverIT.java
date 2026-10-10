@@ -56,6 +56,17 @@ class RealBenchmarkForkDriverIT {
                 System.getProperty(ARM_PROPERTY, "A"));
         var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
         Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)
+                && (!"stateless".equals(workloadId) || arm != PipelineBenchmarkComparison.Arm.B
+                || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
+                || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
+                || List.of("tapstate.e2e.benchmark.load-diagnostics", "tapstate.e2e.benchmark.compilation-diagnostics",
+                        "tapstate.e2e.benchmark.thread-point-diagnostics", "tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics",
+                        BenchmarkDualGcDiagnostics.ENABLED_PROPERTY, BenchmarkWitnessReadGate.PROPERTY,
+                        "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
+                        "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean))) {
+            throw new AssertionError("clock refusal evidence requires one original plain stateless B diagnostic");
+        }
         if (Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY) && (!"copy".equals(workloadId)
                 || arm != PipelineBenchmarkComparison.Arm.B
                 || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null

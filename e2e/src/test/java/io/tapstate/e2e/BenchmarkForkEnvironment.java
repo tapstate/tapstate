@@ -222,6 +222,13 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             // The view database is product-wide on this replica set. Forks run serially, and the
             // preceding application process is closed before these shared collections are dropped.
             workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri);
+            if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
+                Map<String, Object> identity = SharedMongo.diagnosticIdentity();
+                System.out.println("benchmark-owned-mongo-clock-fixture=" + JsonWriter.write(identity));
+                if (!"COMPLETE".equals(identity.get("status"))) {
+                    throw new AssertionError("clock rejection evidence requires an actual owned Mongo build identity");
+                }
+            }
             boot = Objects.requireNonNull(launcher.launch(storeUri, operatorDatabase, applicationJar));
             RealProcessServer server = boot.server();
             OwnedBoot ownedBoot = boot;

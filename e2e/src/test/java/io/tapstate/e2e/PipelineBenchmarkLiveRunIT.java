@@ -40,6 +40,9 @@ class PipelineBenchmarkLiveRunIT {
         if (Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY)) {
             throw new AssertionError("deferred target witness cannot establish a live performance gate");
         }
+        if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
+            throw new AssertionError("clock refusal evidence cannot establish a live performance gate");
+        }
         boolean requested = List.of(BASELINE, CANDIDATE, OUTPUT, GATE, TARGET, PRIMARY).stream()
                 .anyMatch(property -> System.getProperty(property) != null);
         Assumptions.assumeTrue(requested,
