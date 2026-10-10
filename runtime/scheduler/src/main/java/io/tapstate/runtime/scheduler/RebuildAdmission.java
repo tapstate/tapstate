@@ -24,8 +24,20 @@ public interface RebuildAdmission {
     /** Whether this pipeline's failed run may be replaced now. Called only while it is failed. */
     boolean admits(String pipelineId);
 
+    /**
+     * Whether an already RUNNING checkpoint whose job disappeared may be actuated now. A durable
+     * cluster queue overrides this with the same admission used for failed executions. The default
+     * preserves the standalone restart path for an assembly with no cluster recovery queue.
+     */
+    default boolean admitsMissingJob(String pipelineId) {
+        return true;
+    }
+
     /** Records failure context after the checkpoint first enters FAILED. */
     default void recordFailure(String pipelineId) {}
+
+    /** Called after failure cleanup has stopped the old job, before its authority can be retired. */
+    default void afterFailedStop(String pipelineId) {}
 
     /**
      * Forgets whatever is kept for pipelines outside {@code pipelineIds}, which are the pipelines still

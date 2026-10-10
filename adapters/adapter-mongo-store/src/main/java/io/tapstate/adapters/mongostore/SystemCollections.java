@@ -160,7 +160,19 @@ public enum SystemCollections {
     OPERATOR_STATE(MongoStorePort.OPERATOR_STATE, Database.NEST, MongoKeyedStateStore.class,
             Strategy.NEST_EXCLUDED, 0),
     NEST_DEAD_LETTERS(MongoStorePort.NEST_DEAD_LETTERS, Database.NEST, MongoNestDeadLetterStore.class,
-            Strategy.NEST_EXCLUDED, 0);
+            Strategy.NEST_EXCLUDED, 0),
+
+    CLUSTER_EXECUTION_PROFILES(MongoStorePort.CLUSTER_EXECUTION_PROFILES, Database.STORE,
+            MongoClusterProfileStore.class, Strategy.MIGRATED, 12),
+    CLUSTER_NODE_REGISTRY(MongoStorePort.CLUSTER_NODE_REGISTRY, Database.STORE,
+            MongoClusterProfileStore.class, Strategy.MIGRATED, 12,
+            new IndexSpec(List.of("clusterId"), false)),
+    CLUSTER_CAPACITY_OCCUPANCY(MongoStorePort.CLUSTER_CAPACITY_OCCUPANCY, Database.STORE,
+            MongoClusterCapacityStore.class, Strategy.MIGRATED, 12,
+            new IndexSpec(List.of("clusterId", "pipelineId", "incarnationId", "intentFingerprint"), false)),
+    CLUSTER_RECOVERY_QUEUE(MongoStorePort.CLUSTER_RECOVERY_QUEUE, Database.STORE,
+            MongoClusterRecoveryStore.class, Strategy.MIGRATED, 12,
+            new IndexSpec(List.of("clusterId", "enqueueSequence"), false));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

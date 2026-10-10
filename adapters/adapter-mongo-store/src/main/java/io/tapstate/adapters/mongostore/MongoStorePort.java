@@ -7,6 +7,9 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.ClusterMembershipStore;
+import io.tapstate.spi.store.ClusterProfileStore;
+import io.tapstate.spi.store.ClusterCapacityStore;
+import io.tapstate.spi.store.ClusterRecoveryStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
@@ -63,6 +66,12 @@ public final class MongoStorePort implements StorePort {
     public static final String WORKLOAD_CLAIMS = "workload_claims";
     /** The last majority-committed ACTIVE node set per cluster. */
     public static final String CLUSTER_MEMBERSHIP = "cluster_membership";
+    /** Immutable profile generations and their conservative authorization horizons. */
+    public static final String CLUSTER_EXECUTION_PROFILES = "cluster_execution_profiles";
+    /** Stable node identity and boot-scoped runtime join evidence. */
+    public static final String CLUSTER_NODE_REGISTRY = "cluster_node_registry";
+    public static final String CLUSTER_CAPACITY_OCCUPANCY = "cluster_capacity_occupancy";
+    public static final String CLUSTER_RECOVERY_QUEUE = "cluster_recovery_queue";
     /** One document per movement sample, left to expire by the server; the one series among these. */
     public static final String PIPELINE_RATE_HISTORY = "pipeline_rate_history";
     /** The collection holding one editor-only canvas layout per pipeline. */
@@ -139,6 +148,9 @@ public final class MongoStorePort implements StorePort {
     private final PipelineLayoutStore layouts;
     private final PipelineDraftStore drafts;
     private final WorkloadClaimStore workloadClaims;
+    private final ClusterProfileStore clusterProfiles;
+    private final ClusterCapacityStore clusterCapacity;
+    private final ClusterRecoveryStore clusterRecovery;
     private final ClusterMembershipStore clusterMembership;
     private final SrsMetaStore meta;
     private final SrsLogStore srsLog;
@@ -163,6 +175,11 @@ public final class MongoStorePort implements StorePort {
      */
     public MongoStorePort(
             MongoConnection connection, String operatorStateDatabase, Duration rateHistoryRetention) {
+        this(connection, operatorStateDatabase, rateHistoryRetention, false);
+    }
+
+    public MongoStorePort(MongoConnection connection, String operatorStateDatabase,
+            Duration rateHistoryRetention, boolean clusteredClaims) {
         this.connection = Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
@@ -179,9 +196,24 @@ public final class MongoStorePort implements StorePort {
         this.rateHistory = new MongoRateHistoryStore(
                 database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
-        this.workloadClaims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
+        MongoClusterProfileStore profiles = new MongoClusterProfileStore(connection.client(),
+                SystemCollections.CLUSTER_EXECUTION_PROFILES.on(database),
+                SystemCollections.WORKLOAD_CLAIMS.on(database), SystemCollections.CLUSTER_NODE_REGISTRY.on(database));
+        this.clusterProfiles = profiles;
+        MongoWorkloadClaimStore leases = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database),
+                clusteredClaims ? profiles : null);
+        this.workloadClaims = leases;
+        MongoClusterCapacityStore capacity = new MongoClusterCapacityStore(profiles, leases,
+                SystemCollections.CLUSTER_CAPACITY_OCCUPANCY.on(database),
+                SystemCollections.WORKLOAD_CLAIMS.on(database), SystemCollections.CLUSTER_EXECUTION_PROFILES.on(database),
+                SystemCollections.CLUSTER_MEMBERSHIP.on(database), SystemCollections.CLUSTER_NODE_REGISTRY.on(database),
+                SystemCollections.PIPELINE_DESIRED.on(database), SystemCollections.PIPELINE_STATE.on(database),
+                SystemCollections.ARTIFACTS.on(database));
+        this.clusterCapacity = capacity;
+        this.clusterRecovery = new MongoClusterRecoveryStore(SystemCollections.CLUSTER_RECOVERY_QUEUE.on(database), capacity);
         this.clusterMembership =
-                new MongoClusterMembershipStore(SystemCollections.CLUSTER_MEMBERSHIP.on(database));
+                new MongoClusterMembershipStore(SystemCollections.CLUSTER_MEMBERSHIP.on(database),
+                        clusteredClaims ? profiles : null);
         this.meta = new MongoSrsMetaStore(connection.client(),
                 SystemCollections.SRS_META.on(database), SystemCollections.SRS_CONSUMER_OFFSETS.on(database));
         this.srsLog = new MongoSrsLogStore(
@@ -216,6 +248,21 @@ public final class MongoStorePort implements StorePort {
             throw invalidOperatorStateDatabase(null);
         }
         return name;
+    }
+
+    @Override
+    public ClusterProfileStore clusterProfiles() {
+        return clusterProfiles;
+    }
+
+    @Override
+    public ClusterCapacityStore clusterCapacity() {
+        return clusterCapacity;
+    }
+
+    @Override
+    public ClusterRecoveryStore clusterRecovery() {
+        return clusterRecovery;
     }
 
     private static TapstateException invalidOperatorStateDatabase(Throwable cause) {

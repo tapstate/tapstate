@@ -13,11 +13,12 @@ import java.util.Objects;
  * same owner, which is not a change of ownership but is certainly a different run. A member holding a
  * job from the previous run therefore reads the same claim generation and a stale execution generation,
  * which is exactly the case that a claim generation alone could not tell apart from being current.
+ * The profile generation binds both to one compatible cluster session generation.
  *
  * <p>{@link Serializable} because it travels on the DAG to whichever members run the sink vertices, the
  * same way the coordinates behind a sink writer and a durable ack do.
  */
-record ExecutionFence(String pipelineId, long claimGeneration, long executionGeneration)
+record ExecutionFence(String pipelineId, long claimGeneration, long executionGeneration, long profileGeneration)
         implements Serializable {
 
     ExecutionFence {
@@ -25,8 +26,12 @@ record ExecutionFence(String pipelineId, long claimGeneration, long executionGen
         if (pipelineId.isBlank()) {
             throw new IllegalArgumentException("pipelineId must not be blank");
         }
-        if (claimGeneration < 1 || executionGeneration < 1) {
+        if (claimGeneration < 1 || executionGeneration < 1 || profileGeneration < 0) {
             throw new IllegalArgumentException("a fenced run carries both of its generations");
         }
+    }
+
+    ExecutionFence(String pipelineId, long claimGeneration, long executionGeneration) {
+        this(pipelineId, claimGeneration, executionGeneration, 0);
     }
 }

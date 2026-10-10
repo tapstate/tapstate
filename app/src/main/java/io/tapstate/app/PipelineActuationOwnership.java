@@ -235,6 +235,16 @@ final class PipelineActuationOwnership {
     }
 
     synchronized Execution beginExecution(String pipelineId) {
+        return beginExecution(pipelineId, claims == null ? null : claims::advanceExecution);
+    }
+
+    @FunctionalInterface
+    interface ExecutionAdvance {
+        Optional<WorkloadClaim> advance(WorkloadClaim expected, long topologyRevision, Set<String> members);
+    }
+
+    /** Reuses the real issuer through a transaction which also records capacity or recovery receipts. */
+    synchronized Execution beginExecution(String pipelineId, ExecutionAdvance advance) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing) {
             return Execution.refused();
@@ -252,7 +262,8 @@ final class PipelineActuationOwnership {
         try {
             // At the claim's own topology revision, which is the committed one: a revision change refuses
             // the renew above, so a claim still held is a claim granted under the current topology.
-            advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision(), runMembers);
+            advanced = Objects.requireNonNull(advance, "advance")
+                    .advance(state.claim, state.claim.topologyRevision(), runMembers);
         } catch (RuntimeException unreachable) {
             advanced = Optional.empty();
         }
@@ -273,7 +284,8 @@ final class PipelineActuationOwnership {
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
         // the moment here would make the very next death of this run read as the pipeline's own.
         return new Execution(true, new ExecutionFence(
-                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()),
+                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration(),
+                state.claim.profileGeneration()),
                 state.claim.topologyRevision());
     }
 
@@ -446,8 +458,34 @@ final class PipelineActuationOwnership {
         return reading.filter(WorkloadClaimReading::leased)
                 .map(WorkloadClaimReading::claim)
                 .filter(claim -> claim.claimGeneration() == fence.claimGeneration()
-                        && claim.executionGeneration() == fence.executionGeneration())
+                        && claim.executionGeneration() == fence.executionGeneration()
+                        && claim.profileGeneration() == fence.profileGeneration())
                 .isPresent();
+    }
+
+    /** A captured local claim is an expectation only; the store still validates every transaction. */
+    synchronized Optional<WorkloadClaim> currentClaim(String pipelineId) {
+        Held current = held.get(pipelineId);
+        return current == null ? Optional.empty() : Optional.ofNullable(current.claim);
+    }
+
+    /** Retires only the stopped execution captured before cleanup, never a subsequently admitted run. */
+    synchronized boolean retireStoppedExecution(WorkloadClaim expected) {
+        if (!fenced || expected == null) {
+            return true;
+        }
+        Held current = held.get(expected.key().resourceId());
+        if (current == null || current.claim == null
+                || current.claim.claimGeneration() != expected.claimGeneration()
+                || current.claim.executionGeneration() != expected.executionGeneration()
+                || current.claim.profileGeneration() != expected.profileGeneration()) {
+            return false;
+        }
+        boolean released = claims.release(expected);
+        if (released) {
+            current.claim = null;
+        }
+        return released;
     }
 
     /** The execution generation the claim this member holds for {@code pipelineId} carries, or zero. */

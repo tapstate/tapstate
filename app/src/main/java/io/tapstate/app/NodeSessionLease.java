@@ -56,6 +56,17 @@ final class NodeSessionLease implements AutoCloseable {
         return new NodeSessionLease();
     }
 
+    /** This boot's last proven profile/session and its conservative local authorization bound. */
+    record Proof(WorkloadClaim claim, long deadlineNanos, boolean live) { }
+
+    Proof proof() {
+        if (current == null) {
+            return null;
+        }
+        long deadline = provenUntil;
+        return new Proof(current.get(), deadline, !closed.get() && System.nanoTime() - deadline < 0);
+    }
+
     /**
      * Keeps {@code initial} live from now on. {@code askedAt} is when, on the monotonic clock, the
      * acquisition that produced it was asked for -- no later -- which is where its lease is timed from.

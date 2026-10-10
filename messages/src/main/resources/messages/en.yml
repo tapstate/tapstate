@@ -426,6 +426,9 @@ dsl.undefined-variable:
 dsl.malformed-interpolation:
   message: "Reference '{ref}' is not a form the grammar defines."
   solution: "A reference names a variable, as in ${var:NAME:default} for one with a fallback; a lone dollar sign is ordinary text."
+lifecycle.cluster-capacity-refused:
+  message: "Node {node} cannot reserve {requested} {resource}: {occupied} already occupied, ceiling {limit}."
+  solution: "Wait for a pending rebuild or execution to release its resources, reduce the pipeline's computed demand, or configure a verified larger capacity ceiling."
 lifecycle.illegal-transition:
   message: "Cannot {verb} a pipeline in state {from}."
   solution: "Only certain actions are valid from each state; check the pipeline's current state first."
@@ -669,6 +672,9 @@ engine.cluster-refused-the-state:
 engine.membership-changed-before-start:
   message: "Pipeline {pipeline} was planned for {planned} members but started on {actual}; it was stopped before any processor ran."
   solution: "Nothing to do: the next start works the plan out again for the members present then."
+engine.execution-cohort-changed-before-start:
+  message: "Pipeline {pipeline} could not start because its execution cohort changed ({reason}); planned {planned}, observed {actual}. This execution was refused before its processors ran."
+  solution: "Check that all data members have the same admitted profile and valid node sessions. Retry only after the live identities and committed membership agree."
 engine.job-failed:
   message: "Pipeline {pipeline} stopped because its job failed: {cause}."
   solution: "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."
@@ -985,3 +991,22 @@ cli.auth-issuer-mismatch:
 actuation.unwind-parent-key-unresolved:
   message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
   solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
+
+boot.execution-profile-incompatible:
+  message: "Execution profile {proposed} is incompatible with active profile {active}."
+  solution: "Use identical product/runtime, heap, thread and capacity settings, or stop all members for a cold profile upgrade."
+boot.execution-profile-invalid:
+  message: "The execution profile cannot be constructed: {detail}."
+  solution: "Supply valid heap and capacity settings and a build with substituted runtime/PDK metadata."
+boot.profile-authorization-pending:
+  message: "The prior profile generation still has an outstanding authorization deadline."
+  solution: "Wait until its promised node-session horizon expires before starting the next profile generation."
+boot.profile-session-lost:
+  message: "The node session could not prove its profile while the member was joining."
+  solution: "Restore the coordination store and retry after the previous session expires."
+boot.legacy-cluster-active:
+  message: "Legacy cluster workload leases are still active."
+  solution: "Stop all legacy processes and wait for node and business leases and local authorization deadlines before the cold upgrade."
+migration.cold-upgrade-required:
+  message: "Live legacy workload leases prevent installing the execution-profile protocol."
+  solution: "Stop every legacy process, wait for its node/business leases and local authorization deadlines, then start the upgrade again."

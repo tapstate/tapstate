@@ -1,0 +1,168 @@
+{
+  "clusterId": "01J5AUTHFIXTURE",
+  "topologyRevision": 4,
+  "members": [
+    {
+      "nodeId": "node-a",
+      "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000a",
+      "bootId": "boot-a1",
+      "hzAddress": "[127.0.0.1]:5701",
+      "controlUrl": "https://node-a.example:8443",
+      "state": "ACTIVE",
+      "profileGeneration": 2,
+      "profileHash": "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e",
+      "sessionBootId": "boot-a1",
+      "sessionLeaseUntil": "2026-09-19T08:30:21Z",
+      "sessionLeaseRemainingMillis": 21000,
+      "sessionLeased": true,
+      "joined": true,
+      "joinedAt": "2026-09-19T08:29:00Z",
+      "live": true,
+      "joinedMemberUuid": "8b0a1e6e-0000-4000-8000-00000000000a",
+      "joinedMemberAddress": "[127.0.0.1]:5701"
+    },
+    {
+      "nodeId": "node-b",
+      "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000b",
+      "bootId": "boot-b1",
+      "hzAddress": "[127.0.0.1]:5702",
+      "controlUrl": "https://node-b.example:8443",
+      "state": "ACTIVE",
+      "profileGeneration": 2,
+      "profileHash": "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e",
+      "sessionBootId": "boot-b1",
+      "sessionLeaseUntil": "2026-09-19T08:30:28Z",
+      "sessionLeaseRemainingMillis": 28000,
+      "sessionLeased": true,
+      "joined": true,
+      "joinedAt": "2026-09-19T08:29:00Z",
+      "live": true,
+      "joinedMemberUuid": "8b0a1e6e-0000-4000-8000-00000000000b",
+      "joinedMemberAddress": "[127.0.0.1]:5702"
+    },
+    {
+      "nodeId": "node-c",
+      "memberUuid": "uuid-c",
+      "bootId": "boot-c1",
+      "hzAddress": "[127.0.0.1]:5703",
+      "controlUrl": "https://node-c.example:8443",
+      "state": "LOST",
+      "profileGeneration": 2,
+      "profileHash": "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e",
+      "sessionBootId": "boot-c1",
+      "sessionLeaseUntil": "2026-09-19T08:29:53Z",
+      "sessionLeaseRemainingMillis": -7000,
+      "sessionLeased": false,
+      "joined": true,
+      "joinedAt": "2026-09-19T08:29:00Z",
+      "live": false,
+      "joinedMemberUuid": "uuid-c",
+      "joinedMemberAddress": "[127.0.0.1]:5703"
+    },
+    {
+      "nodeId": "node-d",
+      "memberUuid": null,
+      "bootId": "boot-d1",
+      "hzAddress": null,
+      "controlUrl": "https://node-d.example:8443",
+      "state": "JOINING",
+      "profileGeneration": 2,
+      "profileHash": "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e",
+      "sessionBootId": "boot-d1",
+      "sessionLeaseUntil": "2026-09-19T08:30:15Z",
+      "sessionLeaseRemainingMillis": 15000,
+      "sessionLeased": true,
+      "joined": false,
+      "joinedAt": null,
+      "live": false,
+      "joinedMemberUuid": null,
+      "joinedMemberAddress": null
+    }
+  ],
+  "pipelines": [
+    {
+      "pipelineId": "orders",
+      "controllerClaim": {
+        "resourceId": "orders",
+        "ownerNodeId": "node-b",
+        "ownerBootId": "boot-b1",
+        "claimGeneration": 3,
+        "executionGeneration": 7,
+        "topologyRevision": 4,
+        "leased": true
+      },
+      "captureClaims": [
+        {
+          "resourceId": "capture-f00d",
+          "ownerNodeId": "node-a",
+          "ownerBootId": "boot-a1",
+          "claimGeneration": 1,
+          "executionGeneration": 1,
+          "topologyRevision": 4,
+          "leased": true
+        }
+      ],
+      "measuredAt": "2026-09-19T08:30:00Z",
+      "measuredFrom": [
+        "8b0a1e6e-0000-4000-8000-00000000000a",
+        "8b0a1e6e-0000-4000-8000-00000000000b"
+      ],
+      "awaitingRebalance": [],
+      "vertices": [
+        {
+          "name": "source",
+          "requested": null,
+          "effective": 1,
+          "computedLocal": null,
+          "executionId": "1002-8287-ca81-0001",
+          "processors": [
+            {
+              "index": 0,
+              "localIndex": 0,
+              "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000b",
+              "nodeId": "node-b",
+              "backlog": null,
+              "frontierGaps": {},
+              "frontierStalledMillis": {},
+              "queuedByStream": {},
+              "inFlightByTable": {}
+            }
+          ]
+        },
+        {
+          "name": "serve-orders",
+          "requested": null,
+          "effective": 2,
+          "computedLocal": null,
+          "executionId": "1002-8287-ca81-0001",
+          "processors": [
+            {
+              "index": 0,
+              "localIndex": 0,
+              "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000b",
+              "nodeId": "node-b",
+              "backlog": null,
+              "frontierGaps": {},
+              "frontierStalledMillis": {},
+              "queuedByStream": {},
+              "inFlightByTable": {}
+            },
+            {
+              "index": 1,
+              "localIndex": 0,
+              "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000a",
+              "nodeId": "node-a",
+              "backlog": null,
+              "frontierGaps": {},
+              "frontierStalledMillis": {},
+              "queuedByStream": {},
+              "inFlightByTable": {}
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "profileGeneration": 2,
+  "profileHash": "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e"
+}

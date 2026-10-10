@@ -271,6 +271,12 @@
     <resources>
       <resource>
         <directory>src/main/resources</directory>
+        <excludes><exclude>tapstate-execution-abi.properties</exclude></excludes>
+      </resource>
+      <resource>
+        <directory>src/main/resources</directory>
+        <includes><include>tapstate-execution-abi.properties</include></includes>
+        <filtering>true</filtering>
       </resource>
       <resource>
         <directory>${project.build.directory}/generated-resources/tapstate-web</directory>

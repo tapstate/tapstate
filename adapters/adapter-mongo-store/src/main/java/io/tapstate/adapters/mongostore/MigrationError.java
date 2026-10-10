@@ -44,7 +44,10 @@ public enum MigrationError implements TapstateErrorCode {
      * underneath. The recorded version stays at the changeset before this one, so a start that gets
      * past the cause resumes from here rather than from the beginning.
      */
-    CHANGESET_FAILED("migration.changeset-failed", Set.of("changeset", "cause"));
+    CHANGESET_FAILED("migration.changeset-failed", Set.of("changeset", "cause")),
+
+    /** The profile protocol requires a cold upgrade after every legacy workload lease expires. */
+    COLD_UPGRADE_REQUIRED("migration.cold-upgrade-required", Set.of());
 
     private final String code;
     private final Set<String> placeholders;

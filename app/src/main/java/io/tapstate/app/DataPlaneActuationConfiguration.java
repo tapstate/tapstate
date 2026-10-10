@@ -167,13 +167,14 @@ class DataPlaneActuationConfiguration {
     ExecutionAuthorization executionAuthorization(
             HazelcastInstance hazelcastMember,
             ClusterProperties clusterProperties,
-            WorkloadClaimStore workloadClaimStore) {
+            WorkloadClaimStore workloadClaimStore,
+            NodeSessionLease nodeSessionLease) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return ExecutionAuthorization.unfenced();
         }
         ExecutionAuthorization authorization = new ExecutionAuthorization(
                 clusterProperties.getId(), workloadClaimStore,
-                clusterProperties.getWorkloadClaimRenewInterval());
+                clusterProperties.getWorkloadClaimRenewInterval(), nodeSessionLease);
         hazelcastMember.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         return authorization;
     }

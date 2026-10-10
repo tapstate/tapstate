@@ -105,19 +105,14 @@
          home of the version -> API-level mapping the compatibility check reads (the level table lands
          with the resolver). The contract (tapdata-api) and its error-code libraries carry a different
          base version, so both are set. -->
-    <pdk-api.version>2.0.8-SNAPSHOT</pdk-api.version>
     <!-- The compatible entity companion adds the DDL warning event used by Oracle sources. -->
-    <pdk-entity.version>2.0.9-SNAPSHOT</pdk-entity.version>
-    <pdk-errorcode.version>2.8-SNAPSHOT</pdk-errorcode.version>
     <!-- The PDK runtime (pdk-runner): a connector base class bootstraps TapRuntime through the host
          loader at construction, so the assembly root carries this on its runtime classpath. A separate
          line from the API contract above (the runner tracks the 2.x line, the contract the 2.0.x line). -->
-    <pdk-runner.version>2.8-SNAPSHOT</pdk-runner.version>
     <!-- The PDK's shared utility library (tapdata-common): connectors declare it `provided` and expect
          the host to have it, so a host that does not is one where those connectors link at load and
          fail part-way through a read. Same 2.x line as the runner, and it has to be one line: both sit
          under io.tapdata, which the connector loader delegates to the host wholesale. -->
-    <pdk-common.version>2.8-SNAPSHOT</pdk-common.version>
     <!-- Testcontainers: brings up a throwaway Mongo replica-set in tests so the storage CAS
          contract is witnessed against a real Mongo, not only the pure in-memory contract. Test scope
          only, in adapter-mongo-store. -->

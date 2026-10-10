@@ -47,13 +47,18 @@ boot.cluster-profile-invalid
 boot.control-advertise-url-invalid
 boot.coordination-store-required
 boot.discovery-config-invalid
+boot.execution-profile-incompatible
+boot.execution-profile-invalid
 boot.hazelcast-unavailable
 boot.heartbeat-config-invalid
+boot.legacy-cluster-active
 boot.member-bind-address-invalid
 boot.node-id-in-use
 boot.node-id-required
 boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
+boot.profile-authorization-pending
+boot.profile-session-lost
 boot.workload-claim-renew-interval-invalid
 boot.workload-claim-ttl-invalid
 capture.claim-lost
@@ -203,6 +208,7 @@ dsl.unwind-needs-an-element-key
 dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key
 engine.cluster-refused-the-state
+engine.execution-cohort-changed-before-start
 engine.execution-not-authorized
 engine.frontier-order-not-encodable
 engine.frontier-pinned
@@ -224,6 +230,7 @@ io.srs-progress-unproven
 io.store-unauthorized
 io.store-unavailable
 io.workload-claim-fenced
+lifecycle.cluster-capacity-refused
 lifecycle.illegal-transition
 lifecycle.incompatible-revision
 lifecycle.pipeline-not-runnable
@@ -234,6 +241,7 @@ mcp.environment-missing
 mcp.invalid-server-response
 mcp.server-rejected
 migration.changeset-failed
+migration.cold-upgrade-required
 migration.data-newer-than-binary
 migration.lock-timeout
 monitor.cursor-expired

@@ -64,7 +64,12 @@ enum BootError implements TapstateErrorCode {
     COORDINATION_STORE_REQUIRED("boot.coordination-store-required", Set.of()),
 
     /** Another live boot already holds this stable node id. */
-    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId"));
+    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId")),
+    EXECUTION_PROFILE_INCOMPATIBLE("boot.execution-profile-incompatible", Set.of("proposed", "active")),
+    EXECUTION_PROFILE_INVALID("boot.execution-profile-invalid", Set.of("detail")),
+    PROFILE_AUTHORIZATION_PENDING("boot.profile-authorization-pending", Set.of()),
+    PROFILE_SESSION_LOST("boot.profile-session-lost", Set.of()),
+    LEGACY_CLUSTER_ACTIVE("boot.legacy-cluster-active", Set.of());
 
     private final String code;
     private final Set<String> placeholders;

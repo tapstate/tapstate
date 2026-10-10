@@ -138,6 +138,10 @@ public enum EngineError implements TapstateErrorCode {
     MEMBERSHIP_CHANGED_BEFORE_START("engine.membership-changed-before-start",
             Set.of("pipeline", "planned", "actual")),
 
+    /** A same-sized cohort can still have different node, boot, runtime, profile, or execution-address identities. */
+    EXECUTION_COHORT_CHANGED_BEFORE_START("engine.execution-cohort-changed-before-start",
+            Set.of("pipeline", "reason", "planned", "actual")),
+
     /**
      * The cluster refused operations on a pipeline's operator state for the whole stretch a run waits such a
      * refusal out. A member that has just joined takes over parts of that state before every member's

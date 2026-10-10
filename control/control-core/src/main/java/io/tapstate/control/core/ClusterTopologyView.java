@@ -16,17 +16,25 @@ import java.util.Objects;
  *                          when nothing is committed -- a single-node build, or a cluster whose
  *                          coordination store has not answered yet. Null is "cannot say", and a reader
  *                          must not print it as zero
- * @param members           every member the answering node sees, ordered by stable id
+ * @param members           live members and registered nodes, ordered by stable id
  * @param pipelines         every pipeline the cluster has been asked to run, ordered by id
  */
 public record ClusterTopologyView(
         String clusterId,
         Long topologyRevision,
         List<ClusterMemberView> members,
-        List<ClusterPipelineView> pipelines) {
+        List<ClusterPipelineView> pipelines,
+        Long profileGeneration,
+        String profileHash) {
 
     public ClusterTopologyView {
         members = List.copyOf(Objects.requireNonNull(members, "members"));
         pipelines = List.copyOf(Objects.requireNonNull(pipelines, "pipelines"));
+    }
+
+    /** A topology whose execution profile has not been read. */
+    public ClusterTopologyView(String clusterId, Long topologyRevision, List<ClusterMemberView> members,
+            List<ClusterPipelineView> pipelines) {
+        this(clusterId, topologyRevision, members, pipelines, null, null);
     }
 }

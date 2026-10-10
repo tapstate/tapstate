@@ -24,6 +24,42 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 class ClusterMemberPreflightTest {
 
     @Test
+    void profileAwarePreflightRefusesEveryTypedOutcomeBeforeCreatingAMember() {
+        var proposed = new io.tapstate.spi.store.ExecutionProfile(1, java.util.Map.of("build", "one"));
+        var active = new io.tapstate.spi.store.ClusterExecutionProfile("cluster-a", 7,
+                new io.tapstate.spi.store.ExecutionProfile(1, java.util.Map.of("build", "two")));
+        var expected = java.util.Map.of(
+                io.tapstate.spi.store.ClusterNodeReservation.Outcome.NODE_IN_USE, BootError.NODE_ID_IN_USE,
+                io.tapstate.spi.store.ClusterNodeReservation.Outcome.INCOMPATIBLE, BootError.EXECUTION_PROFILE_INCOMPATIBLE,
+                io.tapstate.spi.store.ClusterNodeReservation.Outcome.LEGACY_LEASES_ACTIVE, BootError.LEGACY_CLUSTER_ACTIVE,
+                io.tapstate.spi.store.ClusterNodeReservation.Outcome.AUTHORIZATION_HORIZON_ACTIVE,
+                BootError.PROFILE_AUTHORIZATION_PENDING);
+        expected.forEach((outcome, code) -> {
+            var profiles = profilesReturning(new io.tapstate.spi.store.ClusterNodeReservation(outcome, null, active));
+            var cluster = cluster("cluster-a", "node-a");
+            var identity = ClusterMemberPreflight.validate(clusteredHazelcast(), cluster, control("https://node-a:8080"));
+            assertThat(catchThrowable(() -> ClusterMemberPreflight.reserve(identity, cluster,
+                    new MemoryIdentityStore(), profiles, proposed, "boot-a")))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(code));
+        });
+    }
+
+    private static io.tapstate.spi.store.ClusterProfileStore profilesReturning(
+            io.tapstate.spi.store.ClusterNodeReservation outcome) {
+        return new io.tapstate.spi.store.ClusterProfileStore() {
+            public io.tapstate.spi.store.ClusterNodeReservation reserve(String clusterId, WorkloadOwner owner,
+                    java.net.URI url, io.tapstate.spi.store.ExecutionProfile proposed, Duration ttl) { return outcome; }
+            public Optional<io.tapstate.spi.store.ClusterExecutionProfile> profile(String clusterId) {
+                return Optional.of(outcome.profile());
+            }
+            public List<io.tapstate.spi.store.ClusterNodeReading> nodes(String clusterId) { return List.of(); }
+            public boolean markJoined(WorkloadClaim session, String uuid, String address) {
+                throw new AssertionError("a refused candidate must not produce a member");
+            }
+        };
+    }
+
+    @Test
     void twoBootsWithTheSameStableNodeIdCannotBothPassPreflight() {
         ClusterProperties cluster = cluster("cluster-a", "node-a");
         ClusterMemberPreflight.Identity identity = ClusterMemberPreflight.validate(

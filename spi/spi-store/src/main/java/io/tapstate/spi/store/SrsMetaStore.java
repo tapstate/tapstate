@@ -25,6 +25,31 @@ import java.util.Optional;
  */
 public interface SrsMetaStore {
 
+    default CaptureResumeWitness resumeWitness(String sourceId, String connectorId, String chain,
+            String consumerId, io.tapstate.core.model.ReadMode mode, boolean shared, List<String> tables) {
+        return CaptureResumeWitness.from(sourceId, connectorId, chain, consumerId, mode, shared, tables, read(chain));
+    }
+
+    /** Records the exact pre-open facts under the pipeline's real successor claim, never a read-time UUID. */
+    default boolean prepareCaptureResume(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requestedPosition) {
+        return false;
+    }
+
+    default Optional<CaptureReadAttempt> beginCaptureReadAttempt(String chain, long epoch, List<String> tables,
+            CaptureReadAttempt.Kind kind, String requestedToken, java.time.Instant requestedInstant,
+            WorkloadClaimFence captureClaim) {
+        return Optional.empty();
+    }
+
+    default boolean recordCaptureAnchor(CaptureReadAttempt attempt, String anchor) { return false; }
+    default boolean recordCaptureFirstDelivery(CaptureReadAttempt attempt) { return false; }
+    default boolean recordCaptureReadFailure(CaptureReadAttempt attempt, String code) { return false; }
+    default Optional<CaptureReadState> captureReadState(String chain) { return Optional.empty(); }
+
+    /** A snapshot-only read proves its own different mode, without inventing a CDC position. */
+    default boolean recordSnapshotStartup(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness) { return false; }
+
     /** Records a requested table union for one physical capture without broadening any consumer. */
     default void requestCaptureTables(String miningChainId, List<String> tables) {
     }

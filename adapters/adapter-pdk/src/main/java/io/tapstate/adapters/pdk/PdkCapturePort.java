@@ -73,7 +73,18 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private static final Logger LOG = LoggerFactory.getLogger(PdkCapturePort.class);
 
-    private static final int BATCH_SIZE = 1000;
+    /** Maximum rows in one Tapstate-owned decoded delivery or copied snapshot read-ahead chunk. */
+    public static final int MAX_DELIVERY_CHUNK_RECORDS = 1000;
+
+    private static final int BATCH_SIZE = MAX_DELIVERY_CHUNK_RECORDS;
+
+    /**
+     * Snapshot records retained by this bridge: queued chunks, one producer waiting to enqueue, one raw
+     * chunk being decoded, and its decoded rows. Connector-owned input allocation is outside this bound.
+     */
+    public static long snapshotBufferedRecordsUpperBound() {
+        return Math.multiplyExact((long) PdkCaptureBatch.READ_AHEAD + 3, MAX_DELIVERY_CHUNK_RECORDS);
+    }
     private static final int SAMPLE_SIZE = 10;
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
     private static final long CDC_SHUTDOWN_GRACE_MILLIS = 5000;
@@ -410,6 +421,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         private final Set<Thread> active = new HashSet<>();
         private volatile boolean closed;
 
+        void requireOpen() {
+            if (closed) {
+                throw new CancellationException("the change capture was closed");
+            }
+        }
+
         synchronized boolean cancel() {
             if (closed) {
                 return false;
@@ -740,9 +757,14 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             if (events.isEmpty()) {
                 return;
             }
-            // A copy: the list is the connector's, and is decoded only once somebody takes it.
-            List<TapEvent> handed = new ArrayList<>(events);
-            reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+            // A connector may ignore its requested batch size. Copy only a bounded chunk while waiting
+            // for read-ahead room, and decode it on the taker's thread as before.
+            for (int first = 0; first < events.size();) {
+                int end = first + Math.min(MAX_DELIVERY_CHUNK_RECORDS, events.size() - first);
+                List<TapEvent> handed = new ArrayList<>(events.subList(first, end));
+                reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+                first = end;
+            }
         });
     }
 
@@ -892,7 +914,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                     // and outside the delivery a close cancels, so a close wakes the hand-over and never the
                     // source's own call.
                     acknowledgements.applyIfDue();
-                    delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                    delivery.accept(() -> handOver(connector, declared, listener, events, offset, delivery));
                 });
                 Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
                         connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
@@ -934,24 +956,28 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * Hands one delivery to {@code listener}: its changes, decoded, with the offset the source named for it.
      *
      * <p>A change stream also carries control events (heartbeats and the like) that signal the tail is alive but
-     * carry no row; they are not decodable changes, so they are skipped. The batch goes over whole, with the one
-     * offset the source named for it. The offset means the source had read to here once this entire batch was
-     * handed over, so it belongs to the batch and not to any change inside it; and the batch itself is worth
-     * keeping, because everything downstream that costs per act rather than per change -- writing the changes
-     * down above all -- costs one act per batch only while the batch still exists.
+     * carry no row; they are not decodable changes, so they are skipped. A batch fitting the delivery bound
+     * goes over whole; an oversized callback goes over in bounded chunks. Its one offset belongs only to
+     * the final chunk, because it covers every change in the original callback, not an earlier prefix.
      */
     private static void handOver(PdkConnector connector, Map<String, Map<String, String>> declared,
-            CaptureListener listener, List<TapEvent> events, Object offset) {
-        List<TapEvent> changes = new ArrayList<>(events.size());
+            CaptureListener listener, List<TapEvent> events, Object offset, CdcDelivery delivery) {
+        List<Envelope> decoded = new ArrayList<>(Math.min(MAX_DELIVERY_CHUNK_RECORDS, events.size()));
         for (TapEvent event : events) {
-            if (!(event instanceof ControlEvent)) {
-                changes.add(event);
+            delivery.requireOpen();
+            if (event instanceof ControlEvent) {
+                continue;
             }
+            if (decoded.size() == MAX_DELIVERY_CHUNK_RECORDS) {
+                listener.onBatch(decoded, Optional.empty());
+                delivery.requireOpen();
+                decoded = new ArrayList<>(MAX_DELIVERY_CHUNK_RECORDS);
+            }
+            decoded.add(TapEventCodec.decodeChange(event, connector.codecs(), declaredTypes(declared, event)));
         }
-        List<Envelope> decoded = new ArrayList<>(changes.size());
-        for (TapEvent change : changes) {
-            decoded.add(TapEventCodec.decodeChange(change, connector.codecs(), declaredTypes(declared, change)));
-        }
+        delivery.requireOpen();
+        // The source's position covers its whole callback, so only its final chunk may carry it. An
+        // empty heartbeat still reaches the listener with the source position it reports.
         listener.onBatch(decoded, position(connector, offset));
     }
 

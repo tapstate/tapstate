@@ -769,8 +769,17 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public ClusterMembersOutcome clusterMembers(URI baseUrl, String credential) {
+        return clusterTopology(baseUrl, credential, "/api/cluster/members");
+    }
+
+    @Override
+    public ClusterMembersOutcome clusterStatus(URI baseUrl, String credential) {
+        return clusterTopology(baseUrl, credential, "/api/cluster/status");
+    }
+
+    private ClusterMembersOutcome clusterTopology(URI baseUrl, String credential, String path) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/cluster/members", credential).GET().build();
+            HttpRequest request = authed(baseUrl, path, credential).GET().build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -792,9 +801,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         List<RemotePipeline> pipelines = new ArrayList<>();
         String clusterId = null;
         Long revision = null;
+        Long profileGeneration = null;
+        String profileHash = null;
         if (JsonReader.parse(body) instanceof Map<?, ?> map) {
             clusterId = stringOrNull(map.get("clusterId"));
             revision = map.get("topologyRevision") instanceof Number n ? n.longValue() : null;
+            profileGeneration = map.get("profileGeneration") instanceof Number n ? n.longValue() : null;
+            profileHash = stringOrNull(map.get("profileHash"));
             if (map.get("members") instanceof List<?> list) {
                 for (Object o : list) {
                     if (o instanceof Map<?, ?> m) {
@@ -804,13 +817,25 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                                 stringOrNull(m.get("bootId")),
                                 stringOrNull(m.get("hzAddress")),
                                 stringOrNull(m.get("controlUrl")),
-                                stringOrNull(m.get("state"))));
+                                stringOrNull(m.get("state")),
+                                m.get("profileGeneration") instanceof Number n ? n.longValue() : null,
+                                stringOrNull(m.get("profileHash")),
+                                stringOrNull(m.get("sessionBootId")),
+                                stringOrNull(m.get("sessionLeaseUntil")),
+                                m.get("sessionLeaseRemainingMillis") instanceof Number n ? n.longValue() : null,
+                                m.get("sessionLeased") instanceof Boolean b ? b : null,
+                                m.get("joined") instanceof Boolean b ? b : null,
+                                stringOrNull(m.get("joinedAt")),
+                                m.get("live") instanceof Boolean b ? b : null,
+                                stringOrNull(m.get("joinedMemberUuid")),
+                                stringOrNull(m.get("joinedMemberAddress"))));
                     }
                 }
             }
             pipelines.addAll(pipelines(map));
         }
-        return new ClusterMembersOutcome.Listed(clusterId, revision, members, pipelines);
+        return new ClusterMembersOutcome.Listed(
+                clusterId, revision, members, pipelines, profileGeneration, profileHash);
     }
 
     /** The pipeline half of a topology body; a field the server did not send stays null. */

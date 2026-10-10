@@ -39,10 +39,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>A load is declared before the job that takes it is submitted, ended once its last row has been
  * appended, and read by the vertex through {@link #snapshotState}: a declared load that has not been handed
  * over in full holds the vertex off the shared ring, because a change read from the ring ahead of a
- * snapshot row of the same key would be overwritten by the older value. Only snapshot rows appended while
- * the load is declared and not ended wait for room; a change appended after it ended does not, and neither
- * does anything appended under a coordinate nobody declared, which is the hand-off exactly as it was before
- * loads were declared.
+ * snapshot row of the same key would be overwritten by the older value. The capacity remains in force
+ * after the load and for direct changes with no load declaration. Load completion tracks its own rows,
+ * separately from the changes waiting behind them.
  *
  * <p>It is plain member-local state, never a distributed structure: there is one embedded member per
  * process, and the capture side that writes and the source vertex that reads both run in that one process.
@@ -67,7 +66,7 @@ public final class SnapshotBuffer {
     public static final String USER_CONTEXT_KEY = "tapstate.srs.snapshot-buffer";
 
     /**
-     * How many rows of one declared load may wait in one pipeline's hand-off for one ring before the reader
+     * How many rows may wait in one pipeline's hand-off for one ring before the reader
      * appending them waits for room. A few batches of a source read: enough that the vertex never runs dry
      * while the reader fetches the next batch, and small enough that a server holds the same few megabytes
      * per table whatever the table's size.
@@ -108,7 +107,13 @@ public final class SnapshotBuffer {
      * load, and nothing a previous run of the pipeline handed over belongs to it.
      */
     public void declareSnapshot(String pipelineId, String ringName) {
-        handoffs.put(new BufferKey(pipelineId, ringName), new Handoff());
+        BufferKey key = new BufferKey(pipelineId, ringName);
+        handoffs.compute(key, (coordinate, previous) -> {
+            if (previous != null) {
+                previous.release();
+            }
+            return new Handoff(true, queued(coordinate));
+        });
     }
 
     /**
@@ -135,19 +140,15 @@ public final class SnapshotBuffer {
     /**
      * Appends one row to a pipeline's buffer for {@code ringName}, preserving append order.
      *
-     * <p>A row of a declared load that has not ended waits while {@link #capacity} of its rows are already
-     * waiting here. The wait ends when the vertex takes some, and gives up with a
+     * <p>A row waits while {@link #capacity} rows are already waiting here. The wait ends when the vertex
+     * takes some, and gives up with a
      * {@link CancellationException} when the pipeline's hand-offs are released or the waiting thread is
-     * interrupted -- both mean the load is being abandoned, and the row is not appended.
+     * interrupted -- both mean the hand-off is being abandoned, and the row is not appended.
      */
     public void append(String pipelineId, String ringName, Envelope row) {
         Objects.requireNonNull(row, "row");
         BufferKey key = new BufferKey(pipelineId, ringName);
-        Handoff handoff = handoffs.get(key);
-        if (handoff == null) {
-            queueOf(key).add(row);
-            return;
-        }
+        Handoff handoff = handoffs.computeIfAbsent(key, coordinate -> new Handoff(false, queued(coordinate)));
         handoff.append(() -> queueOf(key).add(row), capacity);
     }
 
@@ -199,6 +200,11 @@ public final class SnapshotBuffer {
         return byConsumerRing.computeIfAbsent(key, ignored -> new LinkedBlockingQueue<>());
     }
 
+    private int queued(BufferKey key) {
+        Queue<Envelope> queue = byConsumerRing.get(key);
+        return queue == null ? 0 : queue.size();
+    }
+
     /**
      * Where one declared load stands.
      *
@@ -216,29 +222,38 @@ public final class SnapshotBuffer {
     }
 
     /**
-     * One declared load: how many of its rows are waiting, and whether it has ended, been started on or been
-     * released. The rows themselves wait in the coordinate's queue, ahead of anything appended after the
-     * load ended, so the load's rows are always the first ones a drain takes.
+     * One bounded channel and its optional load. Total occupancy bounds every append; the load's own
+     * pending rows separately determine whether it was begun or handed over. Those rows precede changes
+     * appended after the load ended, so a drain takes the load's rows first.
      */
     private static final class Handoff {
 
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition room = lock.newCondition();
+        private final boolean declared;
         private int waiting;
+        private int queued;
         private boolean ended;
         private boolean begun;
         private boolean released;
 
+        Handoff(boolean declared, int queued) {
+            this.declared = declared;
+            this.ended = !declared;
+            this.queued = queued;
+        }
+
         void append(Runnable enqueue, int capacity) {
             lock.lock();
             try {
-                while (!ended && !released && waiting >= capacity) {
+                while (!released && queued >= capacity) {
                     room.await();
                 }
                 if (released) {
                     throw new CancellationException("the pipeline's hand-off was released while its load ran");
                 }
                 enqueue.run();
+                queued++;
                 if (!ended) {
                     waiting++;
                 }
@@ -262,8 +277,9 @@ public final class SnapshotBuffer {
                 if (waiting > 0) {
                     begun = true;
                     waiting -= Math.min(rows, waiting);
-                    room.signalAll();
                 }
+                queued -= Math.min(rows, queued);
+                room.signalAll();
             } finally {
                 lock.unlock();
             }
@@ -292,7 +308,7 @@ public final class SnapshotBuffer {
         SnapshotState state() {
             lock.lock();
             try {
-                return new SnapshotState(true, begun, ended && waiting == 0);
+                return declared ? new SnapshotState(true, begun, ended && waiting == 0) : SnapshotState.UNDECLARED;
             } finally {
                 lock.unlock();
             }

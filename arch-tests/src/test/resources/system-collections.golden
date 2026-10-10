@@ -26,3 +26,7 @@ pipeline_rate_history | store | MongoRateHistoryStore | migrated | 9 | observedA
 srs_consumer_offsets | store | MongoSrsMetaStore | migrated | 10 | miningChainId, pipelineId
 operator_state | nest | MongoKeyedStateStore | nest-excluded | 0 | -
 nest_dead_letters | nest | MongoNestDeadLetterStore | nest-excluded | 0 | -
+cluster_execution_profiles | store | MongoClusterProfileStore | migrated | 12 | -
+cluster_node_registry | store | MongoClusterProfileStore | migrated | 12 | clusterId
+cluster_capacity_occupancy | store | MongoClusterCapacityStore | migrated | 12 | clusterId+pipelineId+incarnationId+intentFingerprint
+cluster_recovery_queue | store | MongoClusterRecoveryStore | migrated | 12 | clusterId+enqueueSequence

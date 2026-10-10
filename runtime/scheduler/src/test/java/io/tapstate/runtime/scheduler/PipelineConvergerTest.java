@@ -759,6 +759,37 @@ class PipelineConvergerTest {
         converger.converge("p1");
     }
 
+    @Test
+    void aMissingJobWaitsForTheSameRecoveryPermitBeforeStartingAgain() {
+        converge(RUNNING);
+        actuator.carryingNothing();
+        actuator.reset();
+        long epoch = state.read("p1").orElseThrow().epoch();
+        AtomicBoolean permit = new AtomicBoolean();
+        RebuildAdmission admission = new RebuildAdmission() {
+            @Override
+            public boolean admits(String pipelineId) {
+                return permit.get();
+            }
+
+            @Override
+            public boolean admitsMissingJob(String pipelineId) {
+                return permit.get();
+            }
+        };
+        PipelineConverger queued = new PipelineConverger(desired, state, actuator,
+                Clock.fixed(T0, ZoneOffset.UTC), admission);
+
+        queued.converge("p1");
+        assertThat(actuator.calls()).isEmpty();
+        assertThat(state.read("p1").orElseThrow().epoch()).isEqualTo(epoch);
+        permit.set(true);
+        queued.converge("p1");
+        assertThat(actuator.calls()).containsExactly("start:p1");
+        queued.converge("p1");
+        assertThat(actuator.calls()).containsExactly("start:p1");
+    }
+
     private void convergeStopping(boolean purgeState) {
         desired.save(new DesiredState("p1", STOPPED, REV, purgeState));
         converger.converge("p1");

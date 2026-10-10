@@ -31,4 +31,10 @@ class ClusterController {
     ClusterTopologyView members() {
         return topology.topology();
     }
+
+    @Verb("cluster.status")
+    @GetMapping("/cluster/status")
+    ClusterTopologyView status() {
+        return topology.topology();
+    }
 }

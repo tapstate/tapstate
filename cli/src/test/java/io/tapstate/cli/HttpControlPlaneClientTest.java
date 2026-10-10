@@ -124,6 +124,49 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void bothClusterReadsDecodeTheSharedProfileAndSessionWireWithoutInventingUnknowns() throws Exception {
+        String body;
+        try (var golden = getClass().getResourceAsStream("/golden/cluster/topology-profile.golden.json")) {
+            assertThat(golden).isNotNull();
+            body = new String(golden.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        String hash = "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e";
+        for (String path : List.of("/api/cluster/members", "/api/cluster/status")) {
+            HttpServer server = serverReplying(path, 200, body);
+            try {
+                HttpControlPlaneClient client = new HttpControlPlaneClient();
+                ClusterMembersOutcome result = path.endsWith("status")
+                        ? client.clusterStatus(baseOf(server), "token") : client.clusterMembers(baseOf(server), "token");
+                assertThat(result).isInstanceOf(ClusterMembersOutcome.Listed.class);
+                ClusterMembersOutcome.Listed listed = (ClusterMembersOutcome.Listed) result;
+                assertThat(listed.profileGeneration()).isEqualTo(2L);
+                assertThat(listed.profileHash()).isEqualTo(hash);
+                assertThat(listed.members()).containsExactly(
+                        new RemoteClusterMember("node-a", "8b0a1e6e-0000-4000-8000-00000000000a", "boot-a1",
+                                "[127.0.0.1]:5701", "https://node-a.example:8443", "ACTIVE", 2L, hash,
+                                "boot-a1", "2026-09-19T08:30:21Z", 21_000L, true, true, "2026-09-19T08:29:00Z", true,
+                                "8b0a1e6e-0000-4000-8000-00000000000a", "[127.0.0.1]:5701"),
+                        new RemoteClusterMember("node-b", "8b0a1e6e-0000-4000-8000-00000000000b", "boot-b1",
+                                "[127.0.0.1]:5702", "https://node-b.example:8443", "ACTIVE", 2L, hash,
+                                "boot-b1", "2026-09-19T08:30:28Z", 28_000L, true, true, "2026-09-19T08:29:00Z", true,
+                                "8b0a1e6e-0000-4000-8000-00000000000b", "[127.0.0.1]:5702"),
+                        new RemoteClusterMember("node-c", "uuid-c", "boot-c1", "[127.0.0.1]:5703",
+                                "https://node-c.example:8443", "LOST", 2L, hash, "boot-c1",
+                                "2026-09-19T08:29:53Z", -7_000L, false, true, "2026-09-19T08:29:00Z", false,
+                                "uuid-c", "[127.0.0.1]:5703"),
+                        new RemoteClusterMember("node-d", null, "boot-d1", null, "https://node-d.example:8443",
+                                "JOINING", 2L, hash, "boot-d1", "2026-09-19T08:30:15Z", 15_000L,
+                                true, false, null, false, null, null));
+                assertThat(listed.pipelines().getFirst().vertices()).extracting(RemoteVertex::effective)
+                        .containsExactly(1, 2);
+                assertThat(listed.pipelines().getFirst().awaitingRebalance()).isEmpty();
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
     void healthyWhenHealthzReturns200() throws Exception {
         HttpServer server = serverReplying(200, "ok");
         try {

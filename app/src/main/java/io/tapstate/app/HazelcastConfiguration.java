@@ -42,6 +42,7 @@ import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import io.tapstate.spi.store.ClusterProfileStore;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
@@ -70,7 +71,7 @@ import java.util.regex.Pattern;
  */
 @Configuration
 @EnableConfigurationProperties({HazelcastProperties.class, ControlEndpointProperties.class})
-@Import(ClusterMembershipConfiguration.class)
+@Import({ClusterMembershipConfiguration.class, ExecutionProfileConfiguration.class})
 class HazelcastConfiguration {
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
@@ -101,19 +102,26 @@ class HazelcastConfiguration {
             @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
-            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts) {
+            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts,
+            ObjectProvider<ClusterProfileStore> clusterProfiles, ExecutionProfileFactory profileFactory) {
         ClusterMemberPreflight.Identity identity =
                 ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
         long sessionAskedAt = System.nanoTime();
+        io.tapstate.spi.store.ExecutionProfile proposed = identity == null ? null : profileFactory.create();
         if (identity != null) {
             identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
-                    clusterIdentities.getIfAvailable(), claimStore, bootId.value());
+                    clusterIdentities.getIfAvailable(), clusterProfiles.getIfAvailable(), proposed, bootId.value());
+            membershipGate.bindProfile(identity.nodeSession().profileGeneration(), proposed.hash());
         }
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         if (identity != null) {
             identify(config, identity);
+            config.getMemberAttributeConfig()
+                    .setAttribute(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE,
+                            Long.toString(identity.nodeSession().profileGeneration()))
+                    .setAttribute(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE, proposed.hash());
             configureClusterProtection(config, membershipGate);
         }
         HazelcastInstance member;
@@ -126,6 +134,25 @@ class HazelcastConfiguration {
             throw startupFailure;
         }
         if (identity != null) {
+            try {
+                var local = member.getCluster().getLocalMember();
+                ClusterProfileStore profiles = clusterProfiles.getIfAvailable();
+                if (profiles == null || !profiles.markJoined(identity.nodeSession(),
+                        local.getUuid().toString(), local.getAddress().toString())) {
+                    throw new io.tapstate.core.common.TapstateException(BootError.PROFILE_SESSION_LOST,
+                            java.util.Map.of(), null);
+                }
+            } catch (RuntimeException unprovedJoin) {
+                try {
+                    member.shutdown();
+                    if (claimStore != null) {
+                        claimStore.release(identity.nodeSession());
+                    }
+                } catch (RuntimeException cleanup) {
+                    unprovedJoin.addSuppressed(cleanup);
+                }
+                throw unprovedJoin;
+            }
             // What the rings and maps of this member will answer when work reaches them. Asked rather
             // than assumed, because the library caches its answer and recomputes it on its own schedule:
             // admitting work this member's data plane is still refusing produces a run that reaches
@@ -137,6 +164,9 @@ class HazelcastConfiguration {
             member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
             member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
             member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
+            member.getUserContext().put(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE,
+                    identity.nodeSession().profileGeneration());
+            member.getUserContext().put(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE, proposed.hash());
             member.getUserContext().put(
                     io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
                     ClusterMembershipGate.PROTECTION_NAME);
@@ -274,7 +304,8 @@ class HazelcastConfiguration {
             throw new IllegalStateException("cluster member started without its membership store");
         }
         return new ClusterMembershipController(clusterProperties.getId(), member, store, membershipGate,
-                clusterProperties.getMembershipReconcileInterval());
+                clusterProperties.getMembershipReconcileInterval(),
+                (io.tapstate.spi.store.WorkloadClaim) member.getUserContext().get(NODE_SESSION_CONTEXT_KEY));
     }
 
     /** Test seam retaining the single-member call shape that predates cluster identity configuration. */
@@ -285,7 +316,7 @@ class HazelcastConfiguration {
         return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
                 srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
                 nestDeadLetterStore, null, srsLogStore, emptyProvider(), emptyProvider(),
-                new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(), emptyProvider());
+                new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(), emptyProvider(), emptyProvider(), null);
     }
 
     private static <T> ObjectProvider<T> emptyProvider() {

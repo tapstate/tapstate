@@ -20,10 +20,14 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     static final String NODE_ID_ATTRIBUTE = "tapstate.node-id";
     static final String BOOT_ID_ATTRIBUTE = "tapstate.boot-id";
     static final String CONTROL_URL_ATTRIBUTE = "tapstate.control-url";
+    static final String PROFILE_GENERATION_ATTRIBUTE = "tapstate.profile-generation";
+    static final String PROFILE_HASH_ATTRIBUTE = "tapstate.profile-hash";
 
     private final ClusterProperties.Profile profile;
     private final int bootstrapMinMembers;
     private final AtomicReference<ClusterMembership> committed = new AtomicReference<>();
+    private volatile long profileGeneration;
+    private volatile String profileHash;
     private final AtomicReference<VisibleSnapshot> visible =
             new AtomicReference<>(new VisibleSnapshot(0, Set.of()));
 
@@ -125,7 +129,40 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     }
 
     void install(ClusterMembership membership) {
-        committed.set(membership);
+        committed.set(profileGeneration == 0 || membership.profileGeneration() == profileGeneration
+                ? membership : null);
+    }
+
+    void bindProfile(long generation, String hash) {
+        if (generation < 1 || hash == null || hash.isBlank()) {
+            throw new IllegalArgumentException("an execution profile requires its actual generation and hash");
+        }
+        profileGeneration = generation;
+        profileHash = hash;
+        committed.set(null);
+    }
+
+    /** A new job cannot select a member subset when an uncommitted or incompatible member is live. */
+    boolean submissionEligible(Collection<Member> members) {
+        if (profile == ClusterProperties.Profile.SINGLE) {
+            return true;
+        }
+        ClusterMembership current = committed.get();
+        if (!businessEligible() || current == null) {
+            return false;
+        }
+        for (Member member : members) {
+            if (member.isLiteMember()) {
+                return false;
+            }
+            if (!current.activeNodeIds().contains(stableIdOf(member))
+                    || (profileGeneration > 0 && (!Long.toString(profileGeneration).equals(
+                            member.getAttribute(PROFILE_GENERATION_ATTRIBUTE))
+                            || !profileHash.equals(member.getAttribute(PROFILE_HASH_ATTRIBUTE))))) {
+                return false;
+            }
+        }
+        return !members.isEmpty();
     }
 
     void failClosed() {

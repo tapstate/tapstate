@@ -2,12 +2,15 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
+import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
+import com.mongodb.WriteConcern;
+import com.mongodb.TransactionOptions;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
-import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
@@ -15,6 +18,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactIdentity;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactWrite;
@@ -27,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * The MongoDB artifact truth layer: stores each applied resource as one document keyed by the
@@ -50,13 +55,17 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
+    private static final TransactionOptions DURABLE_WRITE = TransactionOptions.builder()
+            .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
 
     private final MongoClient client;
     private final MongoCollection<Document> collection;
 
     public MongoArtifactStore(MongoClient client, MongoCollection<Document> collection) {
         this.client = Objects.requireNonNull(client, "client");
-        this.collection = Objects.requireNonNull(collection, "collection");
+        this.collection = Objects.requireNonNull(collection, "collection")
+                .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.MAJORITY)
+                .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
     }
 
     @Override
@@ -64,7 +73,7 @@ public final class MongoArtifactStore implements ArtifactStore {
         Objects.requireNonNull(artifact, "artifact");
         return StoreIo.call(() -> {
             try {
-                collection.insertOne(toDocument(artifact));
+                collection.insertOne(createdDocument(artifact));
                 return ArtifactMutation.CREATED;
             } catch (MongoException e) {
                 if (ErrorCategory.fromErrorCode(e.getCode()) == ErrorCategory.DUPLICATE_KEY) {
@@ -85,7 +94,11 @@ public final class MongoArtifactStore implements ArtifactStore {
         }
         return StoreIo.call(() -> {
             Document filter = new Document("_id", id).append("contentHash", expectedContentHash);
-            if (collection.replaceOne(filter, toDocument(replacement)).getMatchedCount() == 1) {
+            Document stored = collection.find(new Document("_id", id)).first();
+            if (stored != null) {
+                filter.append("incarnation", identityOf(stored).incarnation());
+            }
+            if (collection.updateOne(filter, replacementPipeline(replacement)).getMatchedCount() == 1) {
                 return ArtifactMutation.REPLACED;
             }
             return collection.find(new Document("_id", id)).first() == null
@@ -140,7 +153,7 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private ArtifactBatchWrite writeTransactionally(List<ArtifactWrite> writes) {
         try (ClientSession session = client.startSession()) {
-            session.startTransaction();
+            session.startTransaction(DURABLE_WRITE);
             try {
                 for (ArtifactWrite write : writes) {
                     String stale = firstStalePrecondition(session, write.readPreconditions());
@@ -174,8 +187,7 @@ public final class MongoArtifactStore implements ArtifactStore {
             case CREATE_ONLY -> insertOnly(session, write);
             case REPLACE_ONLY -> replaceOnly(session, write);
             case UPSERT -> {
-                collection.replaceOne(session, new Document("_id", write.resource().id()), toDocument(write.resource()),
-                        new ReplaceOptions().upsert(true));
+                upsert(session, write.resource());
                 yield ArtifactBatchWrite.applied();
             }
         };
@@ -183,7 +195,7 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private ArtifactBatchWrite insertOnly(ClientSession session, ArtifactWrite write) {
         try {
-            collection.insertOne(session, toDocument(write.resource()));
+            collection.insertOne(session, createdDocument(write.resource()));
             return ArtifactBatchWrite.applied();
         } catch (MongoException error) {
             if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
@@ -196,7 +208,11 @@ public final class MongoArtifactStore implements ArtifactStore {
     private ArtifactBatchWrite replaceOnly(ClientSession session, ArtifactWrite write) {
         Document filter = new Document("_id", write.resource().id())
                 .append("contentHash", write.expectedContentHash());
-        if (collection.replaceOne(session, filter, toDocument(write.resource())).getMatchedCount() == 1) {
+        Document current = collection.find(session, new Document("_id", write.resource().id())).first();
+        if (current != null) {
+            filter.append("incarnation", identityOf(current).incarnation());
+        }
+        if (collection.updateOne(session, filter, replacementPipeline(write.resource())).getMatchedCount() == 1) {
             return ArtifactBatchWrite.applied();
         }
         return collection.find(session, new Document("_id", write.resource().id())).first() == null
@@ -231,7 +247,7 @@ public final class MongoArtifactStore implements ArtifactStore {
         List<String> conflicted = new ArrayList<>(1);
         StoreIo.run(() -> {
             try (ClientSession session = client.startSession()) {
-                session.startTransaction();
+                session.startTransaction(DURABLE_WRITE);
                 try {
                     String stale = firstStalePrecondition(session, expectedContentHashes);
                     if (stale != null) {
@@ -240,8 +256,7 @@ public final class MongoArtifactStore implements ArtifactStore {
                         return;
                     }
                     for (Resource artifact : artifacts) {
-                        collection.replaceOne(session, new Document("_id", artifact.id()), toDocument(artifact),
-                                new ReplaceOptions().upsert(true));
+                        upsert(session, artifact);
                     }
                 } catch (RuntimeException e) {
                     // A write failed before commit: roll the whole batch back and surface the write failure
@@ -289,6 +304,50 @@ public final class MongoArtifactStore implements ArtifactStore {
         Objects.requireNonNull(id, "id");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", id)).first());
         return document == null ? Optional.empty() : Optional.of(toResource(document));
+    }
+
+    @Override
+    public Optional<ArtifactIdentity> identity(String id) {
+        Objects.requireNonNull(id, "id");
+        Document stored = StoreIo.call(() -> collection.find(new Document("_id", id))
+                .projection(new Document("incarnation", 1).append("contentHash", 1)).first());
+        return Optional.ofNullable(stored).map(MongoArtifactStore::identityOf);
+    }
+
+    static ArtifactIdentity identityOf(Document stored) {
+        String id = String.valueOf(stored.get("_id"));
+        String incarnation = text(stored, "incarnation");
+        String hash = text(stored, "contentHash");
+        if (incarnation == null || incarnation.isBlank() || hash == null || hash.isBlank()) {
+            throw unreadable(id, incarnation == null || incarnation.isBlank() ? "incarnation" : "contentHash", null);
+        }
+        return new ArtifactIdentity(id, incarnation, hash);
+    }
+
+    private static Document createdDocument(Resource artifact) {
+        return toDocument(artifact).append("incarnation", UUID.randomUUID().toString());
+    }
+
+    /** Replacement preserves the durable incarnation in the same write as the canonical body. */
+    static List<Document> replacementPipeline(Resource artifact) {
+        Document next = toDocument(artifact);
+        next.remove("_id");
+        Document fields = new Document();
+        next.forEach((key, value) -> fields.put(key, new Document("$literal", value)));
+        return List.of(new Document("$set", fields));
+    }
+
+    private void upsert(ClientSession session, Resource artifact) {
+        Document existing = collection.find(session, new Document("_id", artifact.id())).first();
+        if (existing == null) {
+            collection.insertOne(session, createdDocument(artifact));
+        } else {
+            Document exact = new Document("_id", artifact.id())
+                    .append("incarnation", identityOf(existing).incarnation());
+            if (collection.updateOne(session, exact, replacementPipeline(artifact)).getMatchedCount() != 1) {
+                throw new IllegalStateException("an artifact changed inside its write transaction");
+            }
+        }
     }
 
     @Override

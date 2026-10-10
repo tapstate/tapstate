@@ -24,6 +24,28 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  */
 class MongoArtifactStoreTest {
 
+    @Test
+    void durableIdentityReadsTheStoredIncarnationAndRefusesAbsence() {
+        Document stored = new Document("_id", "orders").append("incarnation", "incarnation-one")
+                .append("contentHash", "hash-one");
+        assertThat(MongoArtifactStore.identityOf(stored).incarnation()).isEqualTo("incarnation-one");
+        assertThat(MongoArtifactStore.identityOf(stored)).isEqualTo(MongoArtifactStore.identityOf(stored));
+        stored.remove("incarnation");
+        assertThat(catchThrowable(() -> MongoArtifactStore.identityOf(stored)))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    assertThat(error.args()).containsEntry("field", "incarnation");
+                });
+    }
+
+    @Test
+    void canonicalReplacementDoesNotOverwritePrivateIncarnation() {
+        Resource resource = PARSER.parse(SOURCE);
+        Document set = MongoArtifactStore.replacementPipeline(resource).getFirst().get("$set", Document.class);
+        assertThat(set).doesNotContainKeys("incarnation", "_id");
+        assertThat(set.get("body", Document.class)).containsKey("$literal");
+    }
+
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
 

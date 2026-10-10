@@ -9,6 +9,7 @@ import io.tapstate.control.core.ClusterVertexView;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.ApplyResult;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -721,7 +722,39 @@ class ControlApiTest {
                         tuple("node-a", "8b0a1e6e-0000-4000-8000-00000000000a", "boot-a1",
                                 "[127.0.0.1]:5701", "https://node-a.example:8443"),
                         tuple("node-b", "8b0a1e6e-0000-4000-8000-00000000000b", "boot-b1",
-                                "[127.0.0.1]:5702", "https://node-b.example:8443"));
+                                "[127.0.0.1]:5702", "https://node-b.example:8443"),
+                        tuple("node-c", "uuid-c", "boot-c1", "[127.0.0.1]:5703", "https://node-c.example:8443"),
+                        tuple("node-d", null, "boot-d1", null, "https://node-d.example:8443"));
+    }
+
+    @Test
+    void clusterStatusAndMembersCarryTheSameProfileAndHonestSessionProjection() throws Exception {
+        ClusterTopologyView status = client().get().uri("/api/cluster/status")
+                .retrieve().body(ClusterTopologyView.class);
+        ClusterTopologyView members = client().get().uri("/api/cluster/members")
+                .retrieve().body(ClusterTopologyView.class);
+
+        assertThat(status).isEqualTo(members);
+        assertThat(status.profileGeneration()).isEqualTo(2L);
+        assertThat(status.profileHash()).isEqualTo(ClusterTopologyTestConfiguration.PROFILE.profile().hash());
+        assertThat(status.members()).extracting(member -> member.state().name(),
+                ClusterMemberView::live, ClusterMemberView::sessionLeased, ClusterMemberView::joined,
+                ClusterMemberView::sessionLeaseRemainingMillis)
+                .containsExactly(tuple("ACTIVE", true, true, true, 21_000L),
+                        tuple("ACTIVE", true, true, true, 28_000L),
+                        tuple("LOST", false, false, true, -7_000L),
+                        tuple("JOINING", false, true, false, 15_000L));
+        assertThat(status.pipelines().getFirst().vertices()).extracting(ClusterVertexView::effective)
+                .containsExactly(1, 2);
+        String body = client().get().uri("/api/cluster/status").retrieve().body(String.class);
+        assertThat(body).contains("\"profileGeneration\":2", "\"sessionLeaseRemainingMillis\":-7000",
+                "\"sessionBootId\":\"boot-c1\"", "\"joinedAt\":\"2026-09-19T08:29:00Z\"")
+                .doesNotContain("heartbeat", "activeConnections");
+        try (var golden = ControlApiTest.class.getResourceAsStream("/golden/cluster/topology-profile.golden.json")) {
+            assertThat(golden).isNotNull();
+            assertThat(JsonReader.parse(body)).isEqualTo(JsonReader.parse(
+                    new String(golden.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)));
+        }
     }
 
     @Test
@@ -837,7 +870,7 @@ class ControlApiTest {
                 .contains("artifact.apply", "artifact.get", "artifact.list", "connection.test",
                         "connection.test-result", "connection.discover-schema", "connection.schema",
                         "source.draft",
-                        "cluster.members");
+                        "cluster.members", "cluster.status");
     }
 
     private static String describe(HandlerMethod handler) {

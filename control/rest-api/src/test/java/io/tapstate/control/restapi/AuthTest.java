@@ -655,14 +655,16 @@ class AuthTest {
         // Now that the verb answers with the cluster rather than a stub, this case is the one that says
         // the answer is still only for somebody who authenticated — an anonymous caller is turned away at
         // the interceptor, and never reaches the handler at all.
-        HttpStatusCode anonymous = client().get().uri("/api/cluster/members")
-                .exchange((request, response) -> response.getStatusCode());
-        assertThat(anonymous).isEqualTo(HttpStatus.UNAUTHORIZED);
+        for (String path : List.of("/api/cluster/members", "/api/cluster/status")) {
+            HttpStatusCode anonymous = client().get().uri(path)
+                    .exchange((request, response) -> response.getStatusCode());
+            assertThat(anonymous).as(path).isEqualTo(HttpStatus.UNAUTHORIZED);
 
-        HttpStatusCode authenticated = client().get().uri("/api/cluster/members")
-                .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .exchange((request, response) -> response.getStatusCode());
-        assertThat(authenticated).isEqualTo(HttpStatus.OK);
+            HttpStatusCode authenticated = client().get().uri(path)
+                    .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                    .exchange((request, response) -> response.getStatusCode());
+            assertThat(authenticated).as(path).isEqualTo(HttpStatus.OK);
+        }
     }
 
     // ---- the unauthenticated surface is a closed allow-list (root-exit convergence) ----

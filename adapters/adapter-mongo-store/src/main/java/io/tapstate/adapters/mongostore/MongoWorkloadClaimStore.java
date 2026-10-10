@@ -6,15 +6,19 @@ import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.core.common.TapstateException;
 import org.bson.Document;
 
 import java.time.Duration;
@@ -34,18 +38,27 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     private static final int DUPLICATE_KEY = 11000;
     private static final String LEASE_REMAINING = "leaseRemainingMillis";
     private final MongoCollection<Document> collection;
+    private final MongoClusterProfileStore profiles;
 
     public MongoWorkloadClaimStore(MongoCollection<Document> collection) {
+        this(collection, null);
+    }
+
+    public MongoWorkloadClaimStore(MongoCollection<Document> collection, MongoClusterProfileStore profiles) {
         this.collection = Objects.requireNonNull(collection, "collection")
                 .withReadPreference(ReadPreference.primary())
                 .withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+        this.profiles = profiles;
     }
 
     @Override
     public WorkloadClaimAttempt acquire(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         validate(key, owner, topologyRevision, ttl);
+        if (profiles != null) {
+            return acquireProfiled(key, owner, topologyRevision, ttl);
+        }
         Document id = id(key);
         Document eligible = new Document("$and", List.of(
                 new Document("_id", id),
@@ -81,6 +94,24 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         Objects.requireNonNull(expected, "expected");
         positive(ttl);
+        if (profiles != null) {
+            return profiledWrite(expected, session -> {
+                Document node = expected.key().type() == WorkloadClaimType.NODE_SESSION ? null
+                        : profiles.guard(session, expected.key().clusterId(), expected.owner(), expected.profileGeneration());
+                if (expected.key().type() != WorkloadClaimType.NODE_SESSION && node == null) {
+                    return null;
+                }
+                Document lease = new Document("$set", new Document("leaseUntil", node == null
+                        ? leaseUntil(ttl) : clampedLease(ttl, node.getDate("leaseUntil"))));
+                Document renewed = collection.findOneAndUpdate(session, liveExpected(expected, expected.topologyRevision()),
+                        List.of(lease), new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+                if (renewed != null && expected.key().type() == WorkloadClaimType.NODE_SESSION) {
+                    profiles.extendHorizon(session, expected.key().clusterId(), expected.profileGeneration(),
+                            renewed.getDate("leaseUntil"));
+                }
+                return renewed;
+            });
+        }
         Document filter = liveExpected(expected, expected.topologyRevision());
         Document lease = new Document("$set", new Document("leaseUntil", leaseUntil(ttl)));
         Document renewed = findOneAndUpdate(filter, List.of(lease), false);
@@ -91,7 +122,24 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     public boolean release(WorkloadClaim expected) {
         Objects.requireNonNull(expected, "expected");
         Document filter = expected(expected);
-        Document expired = new Document("$set", new Document("leaseUntil", "$$NOW"));
+        Document expired = new Document("$set", new Document("leaseUntil", "$$NOW")
+                .append("retiredAuthorizationUntil", retiredDeadline()));
+        if (profiles != null) {
+            return profiledWrite(expected, session -> {
+                Document released = collection.findOneAndUpdate(session, filter,
+                        List.of(expired), new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+                if (released != null && expected.key().type() == WorkloadClaimType.NODE_SESSION) {
+                    // Early session release must revoke every shorter business lease in the same commit.
+                    Document owned = new Document("clusterId", expected.key().clusterId())
+                            .append("ownerNodeId", expected.owner().nodeId())
+                            .append("ownerBootId", expected.owner().bootId())
+                            .append("profileGeneration", expected.profileGeneration())
+                            .append("resourceType", new Document("$ne", WorkloadClaimType.NODE_SESSION.name()));
+                    collection.updateMany(session, owned, List.of(expired));
+                }
+                return released;
+            }).isPresent();
+        }
         return findOneAndUpdate(filter, List.of(expired), false) != null;
     }
 
@@ -103,16 +151,66 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         if (topologyRevision < 0) {
             throw new IllegalArgumentException("topologyRevision must not be negative");
         }
+        if (profiles != null) {
+            return profiles.transaction(session -> advanceExecution(session, expected, topologyRevision, executionNodeIds));
+        }
+        Document advanced = findOneAndUpdate(liveExpected(expected, topologyRevision),
+                executionAdvance(executionNodeIds), false);
+        return Optional.ofNullable(advanced).map(MongoWorkloadClaimStore::read);
+    }
+
+    /** Shares the real issuer with a transaction that persists the corresponding successor receipt. */
+    Optional<WorkloadClaim> advanceExecution(ClientSession session, WorkloadClaim expected,
+            long topologyRevision, Set<String> executionNodeIds) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(executionNodeIds, "executionNodeIds");
+        if (profiles == null || expected.profileGeneration() < 1
+                || topologyRevision < 1
+                || profiles.guard(session, expected.key().clusterId(), expected.owner(), expected.profileGeneration()) == null) {
+            return Optional.empty();
+        }
+        Document snapshot = profiles.executionProfileSnapshot(session, expected.key().clusterId(), expected.profileGeneration());
+        if (snapshot == null) {
+            throw new IllegalStateException("the guarded execution profile disappeared inside its transaction");
+        }
+        List<Document> update = executionAdvance(executionNodeIds, snapshot);
+        update.getFirst().get("$set", Document.class).append("executionTopologyRevision", topologyRevision);
+        Document advanced = collection.findOneAndUpdate(session, liveExpected(expected, topologyRevision), update,
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+        return Optional.ofNullable(advanced).map(MongoWorkloadClaimStore::read);
+    }
+
+    /** A real conditional claim write makes a fenced queue transition conflict with an owner takeover. */
+    Document conditionTouchClaim(ClientSession session, WorkloadClaimFence expected) {
+        if (profiles == null || expected.profileGeneration() < 1
+                || profiles.guard(session, expected.key().clusterId(), expected.owner(), expected.profileGeneration()) == null) {
+            return null;
+        }
+        return collection.findOneAndUpdate(session, WorkloadClaimDocuments.live(expected),
+                new Document("$inc", new Document("queueFenceSerial", 1L)),
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+    }
+
+    private static List<Document> executionAdvance(Set<String> executionNodeIds) {
+        return executionAdvance(executionNodeIds, null);
+    }
+
+    private static List<Document> executionAdvance(Set<String> executionNodeIds, Document executionProfile) {
         Document nextGeneration = new Document("$add", List.of(
                 new Document("$ifNull", List.of("$executionGeneration", 0L)), 1L));
         Document next = new Document("$set", new Document("executionGeneration", nextGeneration)
                 .append("contextExecutionGeneration", nextGeneration)
                 .append("executionClaimGeneration", "$claimGeneration")
-                .append("executionNodeIds", executionNodeIds.stream().sorted().toList())
+                .append("executionNodeIds", new Document("$literal", executionNodeIds.stream().sorted().toList()))
+                .append("executionIncarnation", null).append("executionRevision", null)
                 .append("failureClaimGeneration", 0L)
-                .append("failureAfterMemberLoss", false));
-        Document advanced = findOneAndUpdate(liveExpected(expected, topologyRevision), List.of(next), false);
-        return Optional.ofNullable(advanced).map(MongoWorkloadClaimStore::read);
+                .append("failureAfterMemberLoss", false)
+                .append("retiredAuthorizationUntil", retiredDeadline()));
+        if (executionProfile != null) {
+            next.get("$set", Document.class).append("executionProfile", new Document("$literal", executionProfile))
+                    .append("executionProfileVersion", 1);
+        }
+        return List.of(next);
     }
 
     @Override
@@ -128,6 +226,10 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 "$contextExecutionGeneration", "$executionGeneration")));
         Document filter = new Document("$and", List.of(
                 liveExpected(expected, expected.topologyRevision()), sameExecution));
+        if (profiles != null) {
+            return profiledWrite(expected, session -> collection.findOneAndUpdate(session, filter,
+                    List.of(next), new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
+        }
         Document recorded = findOneAndUpdate(filter, List.of(next), false);
         return Optional.ofNullable(recorded).map(MongoWorkloadClaimStore::read);
     }
@@ -191,22 +293,23 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     private static List<Document> acquirePipeline(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         Document sameOwner = new Document("$and", List.of(
-                new Document("$eq", List.of("$ownerNodeId", owner.nodeId())),
-                new Document("$eq", List.of("$ownerBootId", owner.bootId()))));
+                new Document("$eq", List.of("$ownerNodeId", new Document("$literal", owner.nodeId()))),
+                new Document("$eq", List.of("$ownerBootId", new Document("$literal", owner.bootId())))));
         Document generation = new Document("$cond", List.of(
                 sameOwner,
                 new Document("$ifNull", List.of("$claimGeneration", 1L)),
                 new Document("$add", List.of(
                         new Document("$ifNull", List.of("$claimGeneration", 0L)), 1L))));
-        Document fields = new Document("clusterId", key.clusterId())
+        Document fields = new Document("clusterId", new Document("$literal", key.clusterId()))
                 .append("resourceType", key.type().name())
-                .append("resourceId", key.resourceId())
-                .append("ownerNodeId", owner.nodeId())
-                .append("ownerBootId", owner.bootId())
+                .append("resourceId", new Document("$literal", key.resourceId()))
+                .append("ownerNodeId", new Document("$literal", owner.nodeId()))
+                .append("ownerBootId", new Document("$literal", owner.bootId()))
                 .append("claimGeneration", generation)
                 .append("executionGeneration",
                         new Document("$ifNull", List.of("$executionGeneration", 0L)))
                 .append("topologyRevision", topologyRevision)
+                .append("retiredAuthorizationUntil", retiredDeadline())
                 .append("leaseUntil", leaseUntil(ttl));
         return List.of(new Document("$set", fields));
     }
@@ -219,11 +322,18 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private static Document expected(WorkloadClaim expected) {
-        return new Document("_id", id(expected.key()))
+        Document filter = new Document("_id", id(expected.key()))
                 .append("ownerNodeId", expected.owner().nodeId())
                 .append("ownerBootId", expected.owner().bootId())
                 .append("claimGeneration", expected.claimGeneration())
                 .append("executionGeneration", expected.executionGeneration());
+        if (expected.profileGeneration() > 0) {
+            filter.append("profileGeneration", expected.profileGeneration());
+        } else {
+            filter.append("$or", List.of(new Document("profileGeneration", 0L),
+                    new Document("profileGeneration", new Document("$exists", false))));
+        }
+        return filter;
     }
 
     private static Document ownerFilter(WorkloadOwner owner) {
@@ -242,7 +352,24 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 .append("amount", ttl.toMillis()));
     }
 
-    private static WorkloadClaim read(Document document) {
+    static WorkloadClaim readDocument(Document document) {
+        if (document.containsKey("executionProfileVersion")
+                && (!(document.get("executionProfileVersion") instanceof Number version) || version.longValue() != 1)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(document.get("_id")), "field", "executionProfileVersion"), null);
+        }
+        if (!document.containsKey("executionProfileVersion") && document.get("executionProfile") != null) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(document.get("_id")), "field", "executionProfileVersion"), null);
+        }
+        if (numberOrZero(document, "executionProfileVersion") > 0
+                && (document.get("executionProfile", Document.class) == null
+                        || !(document.get("executionTopologyRevision") instanceof Number))) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(document.get("_id")), "field",
+                            document.get("executionProfile", Document.class) == null ? "executionProfile"
+                                    : "executionTopologyRevision"), null);
+        }
         return new WorkloadClaim(
                 new WorkloadClaimKey(
                         document.getString("clusterId"),
@@ -257,7 +384,79 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 numberOrZero(document, "executionClaimGeneration"),
                 Set.copyOf(document.getList("executionNodeIds", String.class, List.of())),
                 numberOrZero(document, "failureClaimGeneration"),
-                Boolean.TRUE.equals(document.getBoolean("failureAfterMemberLoss")));
+                Boolean.TRUE.equals(document.getBoolean("failureAfterMemberLoss")),
+                numberOrZero(document, "profileGeneration"),
+                MongoClusterProfileStore.executionProfile(document.get("executionProfile", Document.class)),
+                document.get("executionTopologyRevision") instanceof Number revision ? revision.longValue() : null,
+                document.getString("executionIncarnation"), document.getString("executionRevision"));
+    }
+
+    private static WorkloadClaim read(Document document) {
+        return readDocument(document);
+    }
+
+    private WorkloadClaimAttempt acquireProfiled(WorkloadClaimKey key, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        if (key.type() == WorkloadClaimType.NODE_SESSION) {
+            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        }
+        return profiles.transaction(session -> {
+            Document node = profiles.owningSession(session, key.clusterId(), owner);
+            if (node == null) {
+                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            }
+            Document current = collection.aggregate(session, List.of(
+                    new Document("$match", new Document("_id", id(key))), leaseRemaining())).first();
+            if (current != null && number(current, LEASE_REMAINING) > 0
+                    && (!owner.nodeId().equals(current.getString("ownerNodeId"))
+                            || !owner.bootId().equals(current.getString("ownerBootId")))) {
+                return WorkloadClaimAttempt.refused(read(current));
+            }
+            List<Document> updates = acquirePipeline(key, owner, topologyRevision, ttl);
+            Document fields = updates.getFirst().get("$set", Document.class);
+            fields.append("profileGeneration", number(node, "profileGeneration"))
+                    .append("leaseUntil", clampedLease(ttl, node.getDate("leaseUntil")));
+            if (current != null && number(current, LEASE_REMAINING) <= 0) {
+                fields.append("claimGeneration", Math.addExact(number(current, "claimGeneration"), 1L));
+            }
+            Document acquired = collection.findOneAndUpdate(session, new Document("_id", id(key)), updates,
+                    new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
+            return WorkloadClaimAttempt.acquired(read(acquired));
+        });
+    }
+
+    private Optional<WorkloadClaim> profiledWrite(WorkloadClaim expected,
+            java.util.function.Function<ClientSession, Document> operation) {
+        if (expected.profileGeneration() < 1) {
+            return Optional.empty();
+        }
+        return profiles.transaction(session -> {
+            boolean permitted = expected.key().type() == WorkloadClaimType.NODE_SESSION
+                    ? profiles.profileGuard(session, expected.key().clusterId(), expected.profileGeneration())
+                    : profiles.guard(session, expected.key().clusterId(), expected.owner(), expected.profileGeneration()) != null;
+            return permitted ? Optional.ofNullable(operation.apply(session)).map(MongoWorkloadClaimStore::read)
+                    : Optional.empty();
+        });
+    }
+
+    static Document clampedLease(Duration ttl, Date nodeDeadline) {
+        Objects.requireNonNull(nodeDeadline, "nodeDeadline");
+        return new Document("$min", List.of(leaseUntil(ttl), nodeDeadline));
+    }
+
+    private static Document retiredDeadline() {
+        return new Document("$max", List.of(
+                new Document("$ifNull", List.of("$retiredAuthorizationUntil", new Date(0))),
+                new Document("$ifNull", List.of("$leaseUntil", "$$NOW"))));
+    }
+
+    /** Generation mismatch retires store writes immediately; cached calls retire only after their promise. */
+    boolean provesRetired(ClientSession session, WorkloadClaimFence expected) {
+        Document filter = new Document("_id", id(expected.key()))
+                .append("$nor", List.of(WorkloadClaimDocuments.live(expected)))
+                .append("$expr", new Document("$lte", List.of(
+                        new Document("$ifNull", List.of("$retiredAuthorizationUntil", new Date(Long.MAX_VALUE))), "$$NOW")));
+        return collection.find(session, filter).first() != null;
     }
 
     private static WorkloadClaimReading reading(Document document) {

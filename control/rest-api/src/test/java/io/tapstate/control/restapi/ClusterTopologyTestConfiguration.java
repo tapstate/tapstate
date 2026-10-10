@@ -11,6 +11,14 @@ import io.tapstate.control.core.LivePipelineVertex;
 import io.tapstate.control.core.PipelineCaptures;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.ClusterMembershipStore;
+import io.tapstate.spi.store.ClusterExecutionProfile;
+import io.tapstate.spi.store.ClusterNodeReading;
+import io.tapstate.spi.store.ClusterNodeRegistration;
+import io.tapstate.spi.store.ClusterNodeReservation;
+import io.tapstate.spi.store.ClusterProfileStore;
+import io.tapstate.spi.store.ExecutionProfile;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -26,9 +34,12 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.net.URI;
+import java.util.Map;
 
 /**
- * A two-member cluster carrying one pipeline, for the HTTP contract cases. The engine is faked because
+ * Two live members, a departed node, and a reserved boot carrying one pipeline, for HTTP contract cases.
+ * The engine is faked because
  * what these cases are about is the wire: which fields cross it, and who is allowed to ask. Whether the
  * engine's own member list and its runs are read correctly is a question for the layer that reads them,
  * over real members.
@@ -49,11 +60,73 @@ class ClusterTopologyTestConfiguration {
             "[127.0.0.1]:5702", "https://node-b.example:8443");
 
     static final Instant MEASURED_AT = Instant.parse("2026-09-19T08:30:00Z");
+    static final ClusterExecutionProfile PROFILE = new ClusterExecutionProfile(
+            CLUSTER, 2, new ExecutionProfile(1, Map.of("build", "fixture")));
+    static final LiveClusterMember DEPARTED = new LiveClusterMember(
+            "node-c", "uuid-c", "boot-c1", "[127.0.0.1]:5703", "https://node-c.example:8443");
+    static final LiveClusterMember RESERVED = new LiveClusterMember(
+            "node-d", null, "boot-d1", null, "https://node-d.example:8443");
 
     @Bean
     ClusterTopologyService clusterTopologyService() {
         LiveClusterMembers members = () -> List.of(SECOND, FIRST);
-        return new ClusterTopologyService(members, null, pipelines(), CLUSTER);
+        return new ClusterTopologyService(members, membership(), pipelines(), CLUSTER, profiles());
+    }
+
+    private static ClusterMembershipStore membership() {
+        return new ClusterMembershipStore() {
+            @Override
+            public Optional<ClusterMembership> read(String clusterId) {
+                return Optional.of(new ClusterMembership(CLUSTER, 4, Set.of("node-a", "node-b", "node-c")));
+            }
+
+            @Override
+            public ClusterMembership createIfAbsent(String clusterId, Set<String> activeNodeIds) {
+                throw new UnsupportedOperationException("a read face commits nothing");
+            }
+
+            @Override
+            public Optional<ClusterMembership> compareAndSet(
+                    String clusterId, long expectedRevision, Set<String> activeNodeIds) {
+                throw new UnsupportedOperationException("a read face commits nothing");
+            }
+        };
+    }
+
+    private static ClusterProfileStore profiles() {
+        return new ClusterProfileStore() {
+            @Override
+            public ClusterNodeReservation reserve(String clusterId, WorkloadOwner owner, URI controlUrl,
+                    ExecutionProfile proposed, Duration ttl) {
+                throw new UnsupportedOperationException("a read face reserves nothing");
+            }
+
+            @Override
+            public Optional<ClusterExecutionProfile> profile(String clusterId) {
+                return Optional.of(PROFILE);
+            }
+
+            @Override
+            public List<ClusterNodeReading> nodes(String clusterId) {
+                return List.of(node(FIRST, true, 21), node(SECOND, true, 28),
+                        node(DEPARTED, true, -7), node(RESERVED, false, 15));
+            }
+
+            @Override
+            public boolean markJoined(WorkloadClaim expectedSession, String memberUuid, String memberAddress) {
+                throw new UnsupportedOperationException("a read face records nothing");
+            }
+        };
+    }
+
+    private static ClusterNodeReading node(LiveClusterMember member, boolean joined, long remainingSeconds) {
+        WorkloadClaim session = new WorkloadClaim(
+                new WorkloadClaimKey(CLUSTER, WorkloadClaimType.NODE_SESSION, member.nodeId()),
+                new WorkloadOwner(member.nodeId(), member.bootId()), 1, 0, 0,
+                MEASURED_AT.plusSeconds(remainingSeconds), 0, 0, Set.of(), 0, false, PROFILE.generation());
+        return new ClusterNodeReading(new ClusterNodeRegistration(session, PROFILE, URI.create(member.controlUrl()),
+                joined, joined ? member.memberUuid() : null, joined ? member.hzAddress() : null,
+                joined ? MEASURED_AT.minusSeconds(60) : null), Duration.ofSeconds(remainingSeconds));
     }
 
     private static ClusterPipelineTopologyService pipelines() {

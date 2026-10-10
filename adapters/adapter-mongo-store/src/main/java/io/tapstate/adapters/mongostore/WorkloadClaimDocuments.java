@@ -16,18 +16,25 @@ final class WorkloadClaimDocuments {
         Document id = new Document("clusterId", fence.key().clusterId())
                 .append("resourceType", fence.key().type().name())
                 .append("resourceId", fence.key().resourceId());
-        return new Document("_id", id)
+        Document filter = new Document("_id", id)
                 .append("ownerNodeId", fence.owner().nodeId())
                 .append("ownerBootId", fence.owner().bootId())
                 .append("claimGeneration", fence.claimGeneration())
                 .append("executionGeneration", fence.executionGeneration())
                 .append("topologyRevision", fence.topologyRevision())
                 .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+        if (fence.profileGeneration() > 0) {
+            filter.append("profileGeneration", fence.profileGeneration());
+        } else {
+            filter.append("$or", List.of(new Document("profileGeneration", 0L),
+                    new Document("profileGeneration", new Document("$exists", false))));
+        }
+        return filter;
     }
 
     /** The canonical persisted form of one workload claim fence. */
     static Document stored(WorkloadClaimFence fence) {
-        return new Document("clusterId", fence.key().clusterId())
+        Document stored = new Document("clusterId", fence.key().clusterId())
                 .append("resourceType", fence.key().type().name())
                 .append("resourceId", fence.key().resourceId())
                 .append("ownerNodeId", fence.owner().nodeId())
@@ -35,5 +42,9 @@ final class WorkloadClaimDocuments {
                 .append("claimGeneration", fence.claimGeneration())
                 .append("executionGeneration", fence.executionGeneration())
                 .append("topologyRevision", fence.topologyRevision());
+        if (fence.profileGeneration() > 0) {
+            stored.append("profileGeneration", fence.profileGeneration());
+        }
+        return stored;
     }
 }

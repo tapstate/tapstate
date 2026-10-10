@@ -168,6 +168,11 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     ClusterMembersOutcome clusterMembers(URI baseUrl, String credential);
 
+    /** Reads the same cluster projection through its status endpoint. */
+    default ClusterMembersOutcome clusterStatus(URI baseUrl, String credential) {
+        return clusterMembers(baseUrl, credential);
+    }
+
     /**
      * Lists the collections a declared source's own database holds, via
      * {@code GET {baseUrl}/api/sources/{sourceId}/collections}, authenticated by the bearer

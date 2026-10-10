@@ -348,7 +348,8 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 new WorkloadOwner(fence.getString("ownerNodeId"), fence.getString("ownerBootId")),
                 number(fence, "claimGeneration"),
                 number(fence, "executionGeneration"),
-                number(fence, "topologyRevision"));
+                number(fence, "topologyRevision"),
+                fence.get("profileGeneration") instanceof Number profile ? profile.longValue() : 0L);
     }
 
     private static long number(Document document, String field) {

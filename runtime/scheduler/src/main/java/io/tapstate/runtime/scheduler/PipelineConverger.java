@@ -139,6 +139,9 @@ public final class PipelineConverger {
         // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
         // rather than "this process did not start it", so the next tick actuates nothing.
         if (!actuator.isCarryingAJob(pipelineId)) {
+            if (!rebuilds.admitsMissingJob(pipelineId)) {
+                return ConvergeResult.converged(current);
+            }
             try {
                 actuator.start(pipelineId);
             } catch (TapstateException refused) {
@@ -221,6 +224,9 @@ public final class PipelineConverger {
                 // fenced write lands the intent durably before the job side is driven to match it.
                 try {
                     actuate(pipelineId, from, target, purgeState, rebuild);
+                    if (target == PipelineState.FAILED) {
+                        rebuilds.afterFailedStop(pipelineId);
+                    }
                 } catch (TapstateException refused) {
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,
                     // because to everyone reading the product they are the same event: the pipeline is not

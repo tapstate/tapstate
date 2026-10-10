@@ -17,5 +17,11 @@ public enum ClusterMemberState {
      * change in membership is a round trip on its own cadence -- and worth naming, because a node that
      * stays here is a node whose commit is not happening.
      */
-    JOINING
+    JOINING,
+
+    /** Previously admitted, but its current boot is absent or cannot prove a live session. */
+    LOST,
+
+    /** Live runtime identity conflicts with its admitted node session or current execution profile. */
+    INCOMPATIBLE
 }

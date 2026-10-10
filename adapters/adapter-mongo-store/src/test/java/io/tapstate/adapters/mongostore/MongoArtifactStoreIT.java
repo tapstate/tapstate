@@ -50,6 +50,68 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class MongoArtifactStoreIT {
 
+    @Test
+    void editsAndAtomicBatchesPreserveIncarnationButIdenticalRecreationChangesIt() {
+        withStore((store, collection) -> {
+            Resource one = PARSER.parse(ORDERS);
+            Resource changed = PARSER.parse(ORDERS.replace("localhost", "db.internal"));
+            assertThat(store.create(one)).isEqualTo(ArtifactMutation.CREATED);
+            String first = store.identity(one.id()).orElseThrow().incarnation();
+            assertThat(store.replace(one.id(), CanonicalHash.of(one), changed)).isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(store.identity(one.id()).orElseThrow().incarnation()).isEqualTo(first);
+            store.saveAll(List.of(one, PARSER.parse(ORDERS_SYNC)));
+            assertThat(store.identity(one.id()).orElseThrow().incarnation()).isEqualTo(first);
+            store.writeAll(List.of(ArtifactWrite.upsert(changed), ArtifactWrite.upsert(PARSER.parse(ORDERS_SYNC))));
+            assertThat(store.identity(one.id()).orElseThrow().incarnation()).isEqualTo(first);
+            assertThat(store.delete(one.id(), CanonicalHash.of(changed))).isEqualTo(ArtifactMutation.DELETED);
+            assertThat(store.create(changed)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(store.identity(one.id()).orElseThrow().incarnation()).isNotEqualTo(first);
+            assertThat(store.identity(one.id()).orElseThrow().contentHash()).isEqualTo(CanonicalHash.of(changed));
+        });
+    }
+
+    @Test
+    void aReplacementAlreadyReadBeforeDeleteCannotOverwriteTheRecreatedIncarnation() throws Exception {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
+                var worker = Executors.newSingleThreadExecutor()) {
+            var collection = client.getDatabase("artifact_incarnation_race").getCollection("artifacts");
+            collection.drop();
+            Resource one = PARSER.parse(ORDERS);
+            Resource stale = PARSER.parse(ORDERS.replace("localhost", "stale.internal"));
+            MongoArtifactStore store = new MongoArtifactStore(client, collection);
+            store.create(one);
+            String initial = store.identity(one.id()).orElseThrow().incarnation();
+            CountDownLatch readComplete = new CountDownLatch(1);
+            CountDownLatch recreated = new CountDownLatch(1);
+            @SuppressWarnings("unchecked")
+            MongoCollection<Document> delayed = (MongoCollection<Document>) java.lang.reflect.Proxy.newProxyInstance(
+                    MongoCollection.class.getClassLoader(), new Class<?>[] {MongoCollection.class},
+                    (proxy, method, args) -> {
+                        if (method.getName().startsWith("with")) {
+                            return proxy;
+                        }
+                        if (method.getName().equals("updateOne")) {
+                            readComplete.countDown();
+                            assertThat(recreated.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                        }
+                        try {
+                            return method.invoke(collection, args);
+                        } catch (java.lang.reflect.InvocationTargetException failure) {
+                            throw failure.getCause();
+                        }
+                    });
+            Future<ArtifactMutation> replacement = worker.submit(() -> new MongoArtifactStore(client, delayed)
+                    .replace(one.id(), CanonicalHash.of(one), stale));
+            assertThat(readComplete.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            store.delete(one.id(), CanonicalHash.of(one));
+            store.create(one);
+            recreated.countDown();
+            assertThat(replacement.get(30, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+            assertThat(store.identity(one.id()).orElseThrow().incarnation()).isNotEqualTo(initial);
+            assertThat(store.get(one.id())).contains(one);
+        }
+    }
+
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();

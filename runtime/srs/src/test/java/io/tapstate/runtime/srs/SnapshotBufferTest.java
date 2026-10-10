@@ -21,6 +21,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * The member-local snapshot buffer: the seam that carries a source's bounded snapshot rows from the capture
@@ -249,42 +251,54 @@ class SnapshotBufferTest {
         }
     }
 
-    /**
-     * A change a ring-less tail hands over behind the load is not part of the load and never waits: the
-     * load's one row is still waiting here, and at a capacity of one a row of the load would.
-     */
+    /** Direct changes remain bounded after the load, while retaining the load's separate completion facts. */
     @Test
-    void whatIsAppendedAfterTheLoadEndedNeverWaits() {
+    void whatIsAppendedAfterTheLoadEndedStillWaitsForCapacity() throws Exception {
         SnapshotBuffer buffer = new SnapshotBuffer(1);
         String ring = "srs.chain.after";
         buffer.declareSnapshot(PIPELINE, ring);
         buffer.append(PIPELINE, ring, row("orders", 1));
         buffer.endSnapshot(PIPELINE, ring);
 
-        buffer.append(PIPELINE, ring, row("orders", 2));
-        buffer.append(PIPELINE, ring, row("orders", 3));
-
-        assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L, 3L);
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            Future<?> second = capture.submit(() -> buffer.append(PIPELINE, ring, row("orders", 2)));
+            assertThatThrownBy(() -> second.get(300, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L);
+            second.get(10, TimeUnit.SECONDS);
+            assertThat(buffer.snapshotState(PIPELINE, ring))
+                    .isEqualTo(new SnapshotBuffer.SnapshotState(true, true, true));
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(2L);
+        }
     }
 
     @Test
-    void aCoordinateNobodyDeclaredIsNotHeldToTheCapacity() {
+    void anUndeclaredDirectChannelIsBoundedWithoutPretendingItHasALoad() throws Exception {
         SnapshotBuffer buffer = new SnapshotBuffer(1);
         String ring = "srs.chain.undeclared";
         buffer.append(PIPELINE, ring, row("orders", 1));
-        buffer.append(PIPELINE, ring, row("orders", 2));
-
-        assertThat(buffer.drain(PIPELINE, ring)).hasSize(2);
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            Future<?> second = capture.submit(() -> buffer.append(PIPELINE, ring, row("orders", 2)));
+            assertThatThrownBy(() -> second.get(300, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L);
+            second.get(10, TimeUnit.SECONDS);
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(2L);
+        }
         assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
     }
 
     /** A stop has to be able to end a load whose reader is parked waiting for a vertex that is gone. */
-    @Test
-    void releasingThePipelineAbandonsALoadWaitingForRoom() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"snapshot", "after-load", "direct"})
+    void releasingThePipelineAbandonsAnyChannelWaitingForRoom(String phase) throws Exception {
         SnapshotBuffer buffer = new SnapshotBuffer(1);
         String ring = "srs.chain.released";
-        buffer.declareSnapshot(PIPELINE, ring);
+        if (!phase.equals("direct")) {
+            buffer.declareSnapshot(PIPELINE, ring);
+        }
         buffer.append(PIPELINE, ring, row("orders", 1));
+        if (phase.equals("after-load")) {
+            buffer.endSnapshot(PIPELINE, ring);
+        }
 
         try (var capture = Executors.newSingleThreadExecutor()) {
             Future<?> waiting = capture.submit(() -> buffer.append(PIPELINE, ring, row("orders", 2)));
@@ -298,6 +312,23 @@ class SnapshotBufferTest {
         }
         assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
         assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
+    }
+
+    @Test
+    void endingALoadDoesNotLetABlockedAppendExceedTheCapacity() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        String ring = "srs.chain.end-while-full";
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, row("orders", 1));
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            Future<?> second = capture.submit(() -> buffer.append(PIPELINE, ring, row("orders", 2)));
+            assertThatThrownBy(() -> second.get(200, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            buffer.endSnapshot(PIPELINE, ring);
+            assertThatThrownBy(() -> second.get(200, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L);
+            second.get(10, TimeUnit.SECONDS);
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(2L);
+        }
     }
 
     @Test

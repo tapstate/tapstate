@@ -2849,7 +2849,7 @@ final class Repl {
     }
 
     /**
-     * {@code cluster [-o text|json|yaml]} — lists the cluster's members: each one's stable node id, the
+     * {@code cluster [members|status] [-o text|json|yaml]} — lists the cluster's members: each one's stable node id, the
      * runtime identity of this boot of it, where members reach it, where a client reaches its control
      * face, and what it is to the cluster. Takes no operand; an unknown option is a benign usage line; a
      * coded refusal renders its code and message.
@@ -2858,12 +2858,19 @@ final class Repl {
      * change what is printed — the point of asking a cluster rather than a node.
      */
     private int clusterOnline(List<String> words) {
-        OutputFormat format = parseFormatOnly("cluster", words);
+        boolean status = words.size() > 1 && words.get(1).equals("status");
+        boolean explicit = status || (words.size() > 1 && words.get(1).equals("members"));
+        List<String> options = new ArrayList<>(words);
+        if (explicit) {
+            options.remove(1);
+        }
+        OutputFormat format = parseFormatOnly(explicit ? "cluster " + words.get(1) : "cluster", options);
         if (format == null) {
             return Cli.EXIT_USAGE;
         }
         ClusterMembersOutcome outcome = withFailover(
-                () -> controlPlane.clusterMembers(session.landingNode(), session.credential()),
+                () -> status ? controlPlane.clusterStatus(session.landingNode(), session.credential())
+                        : controlPlane.clusterMembers(session.landingNode(), session.credential()),
                 o -> o instanceof ClusterMembersOutcome.Unreachable);
         return switch (outcome) {
             case ClusterMembersOutcome.Listed listed -> {
@@ -2880,16 +2887,25 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         switch (format) {
             case TEXT -> {
+                StringBuilder identity = new StringBuilder();
+                appendFact(identity, "cluster", listed.clusterId());
+                appendFact(identity, "topology", listed.topologyRevision());
+                printFacts(out, identity);
+                StringBuilder profile = new StringBuilder();
+                appendFact(profile, "profile", listed.profileGeneration());
+                appendFact(profile, "hash", listed.profileHash());
+                printFacts(out, profile);
                 if (listed.members().isEmpty()) {
                     out.println("no members");
                 } else {
                     for (RemoteClusterMember member : listed.members()) {
                         out.println(memberHeadline(member));
+                        renderMemberFacts(out, member, listed.profileHash());
                     }
                 }
                 for (RemotePipeline pipeline : listed.pipelines()) {
                     out.println();
-                    out.println(pipelineHeadline(pipeline, listed.members().size()));
+                    out.println(pipelineHeadline(pipeline, participatingLiveMembers(pipeline, listed.members())));
                     for (RemoteVertex vertex : pipeline.vertices()) {
                         out.println("  " + cell(vertex.name()) + "  " + where(vertex) + backlogOf(vertex));
                     }
@@ -2906,6 +2922,68 @@ final class Repl {
         return cell(member.nodeId()) + "  " + cell(member.state()) + "  " + cell(member.controlUrl());
     }
 
+    private static void renderMemberFacts(PrintWriter out, RemoteClusterMember member, String clusterProfileHash) {
+        StringBuilder runtime = new StringBuilder();
+        appendFact(runtime, "boot", member.bootId());
+        appendFact(runtime, "member", member.memberUuid());
+        appendFact(runtime, "address", member.hzAddress());
+        appendFact(runtime, "live", member.live());
+        printFacts(out, runtime);
+        StringBuilder profile = new StringBuilder();
+        appendFact(profile, "profile", member.profileGeneration());
+        if (!Objects.equals(member.profileHash(), clusterProfileHash)) {
+            appendFact(profile, "hash", member.profileHash());
+        }
+        printFacts(out, profile);
+        StringBuilder session = new StringBuilder();
+        appendFact(session, "session boot", member.sessionBootId());
+        appendFact(session, "leased", member.sessionLeased());
+        appendFact(session, "remaining ms", member.sessionLeaseRemainingMillis());
+        appendFact(session, "until", member.sessionLeaseUntil());
+        printFacts(out, session);
+        StringBuilder join = new StringBuilder();
+        appendFact(join, "join observed", member.joined());
+        appendFact(join, "at", member.joinedAt());
+        if (!Objects.equals(member.memberUuid(), member.joinedMemberUuid())) {
+            appendFact(join, "joined member", member.joinedMemberUuid());
+        }
+        if (!Objects.equals(member.hzAddress(), member.joinedMemberAddress())) {
+            appendFact(join, "joined address", member.joinedMemberAddress());
+        }
+        printFacts(out, join);
+    }
+
+    private static void appendFact(StringBuilder line, String label, Object value) {
+        if (value != null) {
+            line.append("  ").append(label).append(' ').append(value);
+        }
+    }
+
+    private static void printFacts(PrintWriter out, StringBuilder line) {
+        if (!line.isEmpty()) {
+            out.println(line);
+        }
+    }
+
+    /** Expected measurement sources use only supplied live identities and the run's participation exclusions. */
+    private static java.util.Set<String> participatingLiveMembers(
+            RemotePipeline pipeline, List<RemoteClusterMember> members) {
+        java.util.Set<String> participating = new java.util.HashSet<>();
+        for (RemoteClusterMember member : members) {
+            if (Boolean.FALSE.equals(member.live())
+                    || (member.nodeId() != null && pipeline.awaitingRebalance().contains(member.nodeId()))
+                    || "LOST".equals(member.state()) || "INCOMPATIBLE".equals(member.state())
+                    || "JOINING".equals(member.state())) {
+                continue;
+            }
+            if (member.live() == null || member.memberUuid() == null || !"ACTIVE".equals(member.state())) {
+                return null;
+            }
+            participating.add(member.memberUuid());
+        }
+        return participating;
+    }
+
     /** The topology as an ordered tree for the machine surfaces, omitting what the server did not say. */
     private static Map<String, Object> clusterMap(ClusterMembersOutcome.Listed listed) {
         List<Object> rows = new ArrayList<>();
@@ -2917,6 +2995,17 @@ final class Repl {
             putIfPresent(row, "hzAddress", member.hzAddress());
             putIfPresent(row, "controlUrl", member.controlUrl());
             putIfPresent(row, "state", member.state());
+            putIfPresent(row, "profileGeneration", member.profileGeneration());
+            putIfPresent(row, "profileHash", member.profileHash());
+            putIfPresent(row, "sessionBootId", member.sessionBootId());
+            putIfPresent(row, "sessionLeaseUntil", member.sessionLeaseUntil());
+            putIfPresent(row, "sessionLeaseRemainingMillis", member.sessionLeaseRemainingMillis());
+            putIfPresent(row, "sessionLeased", member.sessionLeased());
+            putIfPresent(row, "joined", member.joined());
+            putIfPresent(row, "joinedAt", member.joinedAt());
+            putIfPresent(row, "live", member.live());
+            putIfPresent(row, "joinedMemberUuid", member.joinedMemberUuid());
+            putIfPresent(row, "joinedMemberAddress", member.joinedMemberAddress());
             rows.add(row);
         }
         List<Object> pipelines = new ArrayList<>();
@@ -2925,6 +3014,8 @@ final class Repl {
         }
         Map<String, Object> map = new LinkedHashMap<>();
         putIfPresent(map, "clusterId", listed.clusterId());
+        putIfPresent(map, "profileGeneration", listed.profileGeneration());
+        putIfPresent(map, "profileHash", listed.profileHash());
         // Absent rather than zero: nothing committed is not a cluster at revision zero.
         if (listed.topologyRevision() != null) {
             map.put("topologyRevision", listed.topologyRevision());
@@ -2938,12 +3029,11 @@ final class Repl {
      * The human line for one pipeline: who owns it, at which generations, and whether the placement
      * below it is the whole picture.
      *
-     * <p>The count of members the readings came from is printed only when it is short of the cluster,
-     * because that is the one case where the vertex lines below mean less than they appear to: for the
-     * first seconds of a run the engine has reported from some members and not others, and a narrower
-     * answer then is being assembled rather than being true.
+     * <p>Measurement coverage is compared by engine identity with the supplied live participants, not
+     * with registry history or newly joined members awaiting rebalance. Unknown membership proof leaves
+     * coverage unknown; a departed member's reading cannot stand in for a live member that did not report.
      */
-    private static String pipelineHeadline(RemotePipeline pipeline, int members) {
+    private static String pipelineHeadline(RemotePipeline pipeline, java.util.Set<String> members) {
         StringBuilder line = new StringBuilder(cell(pipeline.pipelineId()));
         RemoteClaim claim = pipeline.controllerClaim();
         if (claim == null) {
@@ -2965,9 +3055,15 @@ final class Repl {
         }
         if (pipeline.vertices().isEmpty()) {
             line.append("  (not running)");
-        } else if (pipeline.measuredFrom().size() < members) {
+        } else if (members == null) {
             line.append("  (measured from ").append(pipeline.measuredFrom().size())
-                    .append(" of ").append(members).append(" members)");
+                    .append(" members; membership coverage unknown)");
+        } else if (members.isEmpty()) {
+            line.append("  (no live participating members)");
+        } else if (!pipeline.measuredFrom().containsAll(members)) {
+            long measured = members.stream().filter(pipeline.measuredFrom()::contains).count();
+            line.append("  (measured from ").append(measured)
+                    .append(" of ").append(members.size()).append(" members)");
         }
         return line.toString();
     }

@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ClusterMembershipStore;
+import io.tapstate.spi.store.WorkloadClaim;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,6 +31,7 @@ final class ClusterMembershipController implements AutoCloseable {
     private final HazelcastInstance member;
     private final ClusterMembershipStore store;
     private final ClusterMembershipGate gate;
+    private final WorkloadClaim nodeSession;
     private final ScheduledExecutorService reconciler;
     private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -39,10 +41,16 @@ final class ClusterMembershipController implements AutoCloseable {
             ClusterMembershipStore store,
             ClusterMembershipGate gate,
             Duration interval) {
+        this(clusterId, member, store, gate, interval, null);
+    }
+
+    ClusterMembershipController(String clusterId, HazelcastInstance member, ClusterMembershipStore store,
+            ClusterMembershipGate gate, Duration interval, WorkloadClaim nodeSession) {
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.member = Objects.requireNonNull(member, "member");
         this.store = Objects.requireNonNull(store, "store");
         this.gate = Objects.requireNonNull(gate, "gate");
+        this.nodeSession = nodeSession;
         Objects.requireNonNull(interval, "interval");
         this.reconciler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "tapstate-cluster-membership-reconciler");
@@ -57,6 +65,7 @@ final class ClusterMembershipController implements AutoCloseable {
         this.member = null;
         this.store = null;
         this.gate = null;
+        this.nodeSession = null;
         this.reconciler = null;
         this.closed.set(true);
     }
@@ -72,6 +81,10 @@ final class ClusterMembershipController implements AutoCloseable {
         try {
             Set<String> visible = ClusterMembershipGate.nodeIds(member.getCluster().getMembers());
             Optional<ClusterMembership> stored = store.read(clusterId);
+            if (nodeSession != null && nodeSession.profileGeneration() > 0) {
+                reconcileProfile(visible, stored);
+                return;
+            }
             if (stored.isEmpty()) {
                 if (gate.canCommit(visible)) {
                     gate.install(store.createIfAbsent(clusterId, visible));
@@ -93,6 +106,31 @@ final class ClusterMembershipController implements AutoCloseable {
         } catch (RuntimeException unavailable) {
             gate.failClosed();
             LOG.warn("Could not refresh committed cluster membership; business work remains fail-closed", unavailable);
+        }
+    }
+
+    private void reconcileProfile(Set<String> visible, Optional<ClusterMembership> stored) {
+        long generation = nodeSession.profileGeneration();
+        if (stored.isEmpty() || stored.get().profileGeneration() < generation) {
+            gate.failClosed();
+            if (gate.canCommit(visible)) {
+                Optional<ClusterMembership> initialized = store.initializeProfile(nodeSession,
+                        stored.map(ClusterMembership::revision).orElse(0L), visible);
+                initialized.ifPresentOrElse(gate::install, gate::failClosed);
+            }
+            return;
+        }
+        ClusterMembership current = stored.get();
+        if (current.profileGeneration() != generation) {
+            gate.failClosed();
+            return;
+        }
+        gate.install(current);
+        if (joinsOnly(current.activeNodeIds(), visible) && gate.canCommit(visible)) {
+            store.compareAndSetProfile(nodeSession, current.revision(), visible)
+                    .ifPresentOrElse(gate::install, gate::failClosed);
+        } else {
+            gate.canCommit(visible);
         }
     }
 
