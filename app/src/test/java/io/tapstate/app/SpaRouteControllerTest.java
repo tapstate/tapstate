@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
@@ -15,10 +16,10 @@ class SpaRouteControllerTest {
 
     @Test
     void browserEntryPointsAndClientDeepRoutesForwardToThePackagedIndex() throws Exception {
-        mvc.perform(get("/"))
+        mvc.perform(get("/").accept(MediaType.TEXT_HTML))
                 .andExpect(status().isOk())
                 .andExpect(forwardedUrl("/index.html"));
-        mvc.perform(get("/pipelines/example/edit/logs"))
+        mvc.perform(get("/pipelines/example/edit/logs").accept(MediaType.TEXT_HTML))
                 .andExpect(status().isOk())
                 .andExpect(forwardedUrl("/index.html"));
     }
