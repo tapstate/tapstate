@@ -79,11 +79,16 @@ final class AtlasRuntime implements AutoCloseable {
     }
 
     ServerHandle launch(Tiers tier) {
+        return launch(tier, List.of());
+    }
+
+    ServerHandle launch(Tiers tier, List<String> additionalArguments) {
         List<String> arguments = new ArrayList<>(List.of(
                 "--spring.config.location=optional:classpath:/application.properties",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--logging.level.root=ERROR", "--logging.level.io.tapstate.app.Bootstrap=INFO",
                 "--SDK_STATUS_SENDER_ENABLED=false"));
+        arguments.addAll(additionalArguments);
         if (mode == Mode.CLOUD) {
             arguments.addAll(List.of("--tapstate.cloud.base-url=" + issuer,
                     "--tapstate.cloud.token=" + TOKEN, "--tapstate.cloud.atlas-uri=" + storeUri,
