@@ -89,8 +89,12 @@ class SourceConfigEncryptionIT {
             // Internal storage is intentional: this also covers contracts that are not registered.
             // Source admission and PDK delivery are witnessed separately by the shared HTTP suite.
             expected.values().forEach(store::save);
-            // The startup-owned views Source must use the same storage and read boundary.
-            expected.put("views", store.get("views").orElseThrow());
+            if (cloud) {
+                assertThat(store.get("views")).isEmpty();
+            } else {
+                // The on-prem startup-owned views Source shares the full encryption/read boundary.
+                expected.put("views", store.get("views").orElseThrow());
+            }
             credential = verify(context, cloud, uri, database, expected, null);
             try (var raw = MongoClients.create(uri)) {
                 originalKeyring = SystemCollections.SYSTEM_META.on(raw.getDatabase(database))
@@ -99,6 +103,7 @@ class SourceConfigEncryptionIT {
             }
         }
         try (var restarted = start(cloud, database, uri)) {
+            if (cloud) assertThat(restarted.getBean(ArtifactStore.class).get("views")).isEmpty();
             verify(restarted, cloud, uri, database, expected, credential);
             try (var raw = MongoClients.create(uri)) {
                 assertThat(SystemCollections.SYSTEM_META.on(raw.getDatabase(database))
