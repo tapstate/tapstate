@@ -66,6 +66,44 @@ class BenchmarkWriteReturnReaderTest {
         }
     }
 
+    @Test void terminal_totals_are_actual_typed_reads_with_the_same_owned_identity() {
+        var values = summary(3L, 0L, 6L, 0L, 826L);
+        var result = summaryReader(values).summary();
+        assertThat(result).isEqualTo(new BenchmarkWriteReturnReader.Summary("measured",
+                "RECORDED_SCOPE_UNQUALIFIED", 3, 0, 6, 0, 826));
+    }
+
+    @Test void terminal_summary_cannot_hide_missing_counters_foreign_owner_or_overflow() {
+        var missing = summary(3L, 0L, 6L, 0L, 826L); missing.remove(0);
+        var foreign = summary(3L, 0L, 6L, 0L, 826L); foreign.set(0, new Attribute("Pid", 18L));
+        var duplicate = summary(3L, 0L, 6L, 0L, 826L); duplicate.add(new Attribute("State", "IDLE"));
+        for (var values : List.of(missing, foreign, duplicate, summary(3L, 4L, 6L, 0L, 826L),
+                summary(3L, 0L, -1L, 0L, 826L), summary(3L, 0L, 6L, 0L, 2_097_153L),
+                summary(3, 0L, 6L, 0L, 826L))) {
+            assertThatThrownBy(() -> summaryReader(values).summary()).isInstanceOf(AssertionError.class);
+        }
+    }
+
+    private static AttributeList summary(Object calls, Object failed, Object records, Object open, Object bytes) {
+        var values = new AttributeList();
+        values.add(new Attribute("Pid", 17L)); values.add(new Attribute("JvmStartTimeMillis", 1_000L));
+        values.add(new Attribute("Window", "measured")); values.add(new Attribute("State", "RECORDED_SCOPE_UNQUALIFIED"));
+        values.add(new Attribute("CompletedCalls", calls)); values.add(new Attribute("FailedCalls", failed));
+        values.add(new Attribute("ReportedRecords", records)); values.add(new Attribute("OpenCalls", open));
+        values.add(new Attribute("RetainedBytes", bytes)); return values;
+    }
+    private static BenchmarkWriteReturnReader summaryReader(AttributeList values) {
+        var connection = (MBeanServerConnection) Proxy.newProxyInstance(
+                BenchmarkWriteReturnReaderTest.class.getClassLoader(), new Class<?>[]{MBeanServerConnection.class},
+                (proxy, method, arguments) -> {
+                    if (method.getName().equals("getAttributes")) {
+                        return ((String[]) arguments[1]).length == 3 ? attributes(17L, 1_000L, -50L) : values;
+                    }
+                    throw new AssertionError("unexpected management operation: " + method.getName());
+                });
+        return new BenchmarkWriteReturnReader(OWNER, connection, () -> true, new AtomicLong()::incrementAndGet);
+    }
+
     private static AttributeList attributes(Object pid, Object start, Object point) {
         var attributes = new AttributeList();
         attributes.add(new Attribute("Pid", pid)); attributes.add(new Attribute("JvmStartTimeMillis", start));

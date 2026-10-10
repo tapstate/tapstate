@@ -29,10 +29,10 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     static final String OBJECT_NAME = "io.tapstate.benchmark:type=WriteReturn";
     static final int MAX_FRAME_BYTES = 64 * 1024;
     static final int MAX_LEDGER_BYTES = 2 * 1024 * 1024;
-    static final int MAX_RECORDS = 131_072;
     static final int MAX_BATCH_RECORDS = 512;
     static final int MAX_CALL_RECORDS = 1024;
     static final int MAX_FRAMES = 512;
+    static final int MAX_RECORDS = MAX_FRAMES * MAX_BATCH_RECORDS;
     static final int MAX_OPEN_CALLS = 128;
     private static PdkWriteReturnProbe installed;
 

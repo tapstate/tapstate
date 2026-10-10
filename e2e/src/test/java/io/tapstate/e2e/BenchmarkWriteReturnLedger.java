@@ -22,7 +22,7 @@ final class BenchmarkWriteReturnLedger {
     private static final int MAX_FRAMES = 512;
     private static final int MAX_BATCH_ROWS = 512;
     private static final int MAX_NATIVE_ROWS = 1024;
-    private static final int MAX_RECORDS = 131_072;
+    private static final int MAX_RECORDS = MAX_FRAMES * MAX_BATCH_ROWS;
     private static final int MAX_WRITERS = 128;
 
     private BenchmarkWriteReturnLedger() { }

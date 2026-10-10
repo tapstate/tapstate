@@ -283,6 +283,28 @@ class PdkWriteReturnProbeTest {
                 .containsExactlyElementsOf(java.util.stream.IntStream.range(0, 1024).boxed().toList());
     }
 
+    @Test
+    void stateful_row_volume_fits_without_confusing_rows_with_a_byte_limit() throws Exception {
+        var probe = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet);
+        var writer = probe.writer("writer"); probe.start("measured");
+        for (int first = 0; first < 192_000; first += 1024) {
+            var rows = java.util.stream.IntStream.range(first, Math.min(first + 1024, 192_000))
+                    .mapToObj(PdkWriteReturnProbeTest::event).toList();
+            var call = writer.begin("source", table(), rows);
+            call.callback(new WriteListResult<>((long) rows.size(), 0L, 0L)); call.returned(null);
+        }
+        assertThat(probe.getState()).isEqualTo("RECORDED_SCOPE_UNQUALIFIED");
+        assertThat(probe.getReportedRecords()).isEqualTo(192_000);
+        assertThat(probe.getRetainedBytes()).isLessThanOrEqualTo(2 * 1024 * 1024);
+        int cursor = 0, records = 0;
+        while (true) {
+            var page = decode(probe.read(cursor));
+            if (page.next() == cursor) { break; }
+            records += page.frames().stream().mapToInt(frame -> frame.keys().size()).sum(); cursor = page.next();
+        }
+        assertThat(records).isEqualTo(192_000);
+    }
+
     private static PdkWriteReturnProbe errorReceipt(String identity, List<TapRecordEvent> rows, Throwable type, int errors) {
         var probe = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet);
         var writer = probe.writer(identity); probe.start("measured");

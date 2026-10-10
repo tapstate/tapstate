@@ -56,6 +56,42 @@ final class BenchmarkWriteReturnReader {
     boolean start(String window) { return control("start", new Object[]{window}, new String[]{String.class.getName()}); }
     boolean stop() { return control("stop", new Object[0], new String[0]); }
 
+    record Summary(String window, String state, long completedCalls, long failedCalls,
+                   long reportedRecords, long openCalls, long retainedBytes) { }
+
+    /** Terminal totals are actual probe reads; caller closure still requires stop and full page coverage. */
+    Summary summary() {
+        clockSample(0);
+        String[] names = {"Pid", "JvmStartTimeMillis", "Window", "State", "CompletedCalls", "FailedCalls",
+                "ReportedRecords", "OpenCalls", "RetainedBytes"};
+        try {
+            var attributes = connection.getAttributes(name, names);
+            requireAlive();
+            Map<String, Object> values = new HashMap<>();
+            for (Object entry : attributes) {
+                if (!(entry instanceof Attribute attribute) || values.containsKey(attribute.getName())) {
+                    throw new AssertionError("return summary attributes are malformed or duplicate");
+                }
+                values.put(attribute.getName(), attribute.getValue());
+            }
+            if (!values.keySet().equals(java.util.Set.of(names))) { throw new AssertionError("return summary is incomplete"); }
+            var actual = new BenchmarkCausalClock.Identity(number(values, "Pid"), number(values, "JvmStartTimeMillis"));
+            if (!identity.equals(actual)) { throw new AssertionError("return summary has another owned runtime identity"); }
+            for (String field : java.util.List.of("CompletedCalls", "FailedCalls", "ReportedRecords", "OpenCalls", "RetainedBytes")) {
+                if (number(values, field) < 0) { throw new AssertionError("return summary counter is negative"); }
+            }
+            String window = boundedText(values, "Window", 512), state = boundedText(values, "State", 128);
+            long completed = number(values, "CompletedCalls"), failures = number(values, "FailedCalls");
+            if (failures > completed || number(values, "RetainedBytes") > 2L * 1024 * 1024) {
+                throw new AssertionError("return summary counters contradict their bounded domain");
+            }
+            return new Summary(window, state, completed, failures, number(values, "ReportedRecords"),
+                    number(values, "OpenCalls"), number(values, "RetainedBytes"));
+        } catch (java.io.IOException | javax.management.JMException unavailable) {
+            throw new AssertionError("owned return probe summary is unavailable", unavailable);
+        }
+    }
+
     byte[] page(long completionCursor) {
         clockSample(0);
         try {
@@ -88,5 +124,12 @@ final class BenchmarkWriteReturnReader {
     private static long number(Map<String, Object> values, String field) {
         if (!(values.get(field) instanceof Long value)) { throw new AssertionError("return clock counter is not an exact long"); }
         return value;
+    }
+    private static String boundedText(Map<String, Object> values, String field, int maximum) {
+        if (!(values.get(field) instanceof String text) || text.length() > maximum
+                || text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > maximum) {
+            throw new AssertionError("return summary text is missing or exceeds its bound");
+        }
+        return text;
     }
 }
