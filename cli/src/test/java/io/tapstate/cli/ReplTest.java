@@ -161,6 +161,7 @@ class ReplTest {
         final List<String> events = new ArrayList<>();
         final List<URI> probed = new ArrayList<>();
         final List<URI> discovered = new ArrayList<>();
+        final Map<URI, DiscoveryOutcome> discoveryOutcomes = new HashMap<>();
         /** What the server answers when asked its version; null is a server that does not say. */
         String serverVersion;
         /** The grammars it accepts and the schema version of its store; null in either is a server
@@ -321,8 +322,9 @@ class ReplTest {
             events.add("discover " + baseUrl);
             discovered.add(baseUrl);
             return healthy.contains(baseUrl)
-                    ? new DiscoveryOutcome.Discovered("urn:tapstate:cluster:test-cluster", "test-cluster",
-                            "tapstate/v1", List.of("password", "machine_token"))
+                    ? discoveryOutcomes.getOrDefault(baseUrl, new DiscoveryOutcome.Discovered(
+                            "urn:tapstate:cluster:test-cluster", "test-cluster",
+                            "tapstate/v1", List.of("password", "machine_token")))
                     : new DiscoveryOutcome.Unreachable();
         }
 
@@ -1517,6 +1519,86 @@ class ReplTest {
     }
 
     // --- failover: re-land across the member set on a lost landing node --------------------------
+
+    @ParameterizedTest
+    @CsvSource({
+            "ls,false", "ls,true",
+            "status pl1 --watch,false", "status pl1 --watch,true",
+            "logs pl1 --follow,false", "logs pl1 --follow,true"
+    })
+    void aPreviouslyUnreachableForeignSeedIsSkippedForReadsAndStreams(
+            String command, boolean machineBearer) {
+        URI original = URI.create("http://localhost:7900");
+        URI foreign = URI.create("http://localhost:7901");
+        URI replacement = URI.create("http://localhost:7902");
+        FakeControlPlane client = new FakeControlPlane(original);
+        Harness h = authenticatedFailoverHarness(client, List.of(original, foreign, replacement), machineBearer);
+        assertThat(client.discovered).contains(foreign, replacement);
+        client.discoveryOutcomes.put(foreign, new DiscoveryOutcome.Discovered(
+                "urn:tapstate:cluster:another-cluster", "another-cluster", "tapstate/v1",
+                List.of("password", "machine_token")));
+        client.setHealthy(foreign, replacement);
+        client.watchStates = List.of("RUNNING");
+        client.followBatches = List.of(List.of(new RemoteLogLine(1_700_000_000_000L, "INFO", "submitted job")));
+        client.streamEndings.clear();
+        client.streamEndings.addAll(List.of(
+                FakeControlPlane.StreamEnding.DROPPED, FakeControlPlane.StreamEnding.STOPPED));
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command);
+
+        List<String> calls = switch (command) {
+            case "ls" -> client.listCalls;
+            case "status pl1 --watch" -> client.watchCalls;
+            case "logs pl1 --follow" -> client.followCalls;
+            default -> throw new IllegalStateException("unexpected command " + command);
+        };
+        assertThat(calls).hasSize(2).noneMatch(call -> call.contains("@" + foreign));
+        assertThat(calls.getLast()).contains("@" + replacement);
+        assertThat(h.repl().session().landingNode()).isEqualTo(replacement);
+        assertThat(h.repl().session().credential()).isEqualTo("cluster-bearer");
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.sink().toString().substring(mark)).contains("cli.auth-issuer-mismatch");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failoverRefusesAForeignSeedWhenNoVerifiedMemberRemains(boolean machineBearer) {
+        URI original = URI.create("http://localhost:7900");
+        URI foreign = URI.create("http://localhost:7901");
+        FakeControlPlane client = new FakeControlPlane(original);
+        Harness h = authenticatedFailoverHarness(client, List.of(original, foreign), machineBearer);
+        client.discoveryOutcomes.put(foreign, new DiscoveryOutcome.Discovered(
+                "urn:tapstate:cluster:another-cluster", "another-cluster", "tapstate/v1",
+                List.of("password", "machine_token")));
+        client.setHealthy(foreign);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("ls");
+
+        assertThat(client.listCalls).containsExactly("cluster-bearer@" + original + "?null");
+        assertThat(h.repl().session().isConnected()).isFalse();
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString().substring(mark)).contains("cli.auth-issuer-mismatch");
+    }
+
+    private static Harness authenticatedFailoverHarness(
+            FakeControlPlane client, List<URI> seeds, boolean machineBearer) {
+        client.loginOutcome = new LoginOutcome.Success("cluster-bearer");
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        h.repl().dispatch("connect " + String.join(",", seeds.stream().map(URI::toString).toList()));
+        if (machineBearer) {
+            h.repl().installMachineToken("cluster-bearer");
+            h.repl().dispatch("ls");
+        } else {
+            h.repl().dispatch("login alice");
+        }
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().session().credential()).isEqualTo("cluster-bearer");
+        client.listCalls.clear();
+        return h;
+    }
 
     @Test
     void failoverRelandsOnAnotherHealthyMemberKeepingTheCredential() {

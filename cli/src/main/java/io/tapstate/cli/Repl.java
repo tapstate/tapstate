@@ -229,6 +229,9 @@ final class Repl {
     /** The connection state, carried across read-loop iterations (offline until {@code connect}). */
     private final Session session = new Session();
 
+    /** The verified issuer of this connection, retained across endpoint moves and credential renewal. */
+    private String boundIssuer;
+
     /** The launch-scoped machine bearer, retained only in this process until logout or exit. */
     private String machineToken;
 
@@ -5395,6 +5398,7 @@ final class Repl {
                 // server that does not answer is reported as not answering rather than as agreeing.
                 String serverVersion = controlPlane.serverVersion(seed);
                 session.connect(seeds, seed, serverVersion);
+                boundIssuer = null;
                 confirm("connected to " + hostPort(seed) + " (" + session.versions() + ")");
                 if (serverVersion != null && !serverVersion.equals(Cli.VERSION_NUMBER)) {
                     renderWarning(CliError.VERSION_MISMATCH.code(),
@@ -5451,6 +5455,7 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         if (session.isConnected()) {
             session.disconnect();
+            boundIssuer = null;
             out.println("disconnected");
         } else {
             out.println("not connected");
@@ -5587,6 +5592,7 @@ final class Repl {
      * better informed and is not a step it depends on.
      */
     private void adoptAdvertisedMembers(String issuer) {
+        boundIssuer = issuer;
         // Once per connection. A cached session is re-activated before every API call, so asking here
         // each time would put a second round trip in front of every command this CLI runs.
         if (session.membersDiscovered()
@@ -5629,6 +5635,10 @@ final class Repl {
      * session returns to offline; an offline session is a no-op. This is the seam a connected verb
      * invokes on a request failure — L1's single-node member set exercises the same path (it is not
      * omitted for one node). Returns whether a landing node was kept.
+     *
+     * <p>A candidate can have been unreachable during initial discovery, or its address can have been
+     * reassigned since. Health proves neither identity, so a connection whose issuer is known verifies
+     * it again anonymously before moving the credential to any candidate.
      */
     boolean failover() {
         if (!session.isConnected()) {
@@ -5636,6 +5646,14 @@ final class Repl {
         }
         for (URI member : session.members()) {
             if (controlPlane.isHealthy(member)) {
+                if (boundIssuer != null) {
+                    try {
+                        new IssuerBinding(controlPlane).verify(List.of(member), boundIssuer);
+                    } catch (io.tapstate.core.common.TapstateException refusal) {
+                        printDiagnostic(commandLine.getErr(), refusal.code(), refusal.args());
+                        continue;
+                    }
+                }
                 session.reland(member);
                 PrintWriter out = commandLine.getOut();
                 out.println("reconnected to " + hostPort(member));
