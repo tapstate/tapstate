@@ -202,7 +202,7 @@ final class PreviewSampleCache {
     /** Reuses the platform's typed Envelope serializer so cache hits preserve connector value types. */
     public static final class EntrySerializer implements StreamSerializer<Entry> {
 
-        public static final int TYPE_ID = 10003;
+        public static final int TYPE_ID = 10005;
 
         @Override
         public int getTypeId() {
