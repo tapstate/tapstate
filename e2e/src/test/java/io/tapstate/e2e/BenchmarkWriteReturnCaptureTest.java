@@ -23,6 +23,8 @@ class BenchmarkWriteReturnCaptureTest {
             assertThatThrownBy(() -> result.pagesBase64().clear()).isInstanceOf(UnsupportedOperationException.class);
             assertThat(access.starts).hasValue(1); assertThat(access.stops).hasValue(1);
             assertThat(access.firstBeforeStart).isTrue(); assertThat(access.finalAfterStop).isTrue();
+            assertThat(access.costStageReads).hasValue(0);
+            assertThat(result.costStages()).isEmpty();
             var compatible = new BenchmarkWriteReturnCapture.Result(result.calls(), result.samples(), result.summary(), result.pagesBase64());
             assertThat(compatible.clockMode()).isEqualTo(BenchmarkReturnClockSampler.Mode.PERIODIC);
             assertThat(compatible.calls()).isEqualTo(result.calls());
@@ -53,6 +55,7 @@ class BenchmarkWriteReturnCaptureTest {
             assertThat(sampling.containsKey("fixedDelayNanos")).isFalse();
             assertThat(sampling.get("mode")).isEqualTo("FIRST_FINAL_CONTROL");
             assertThat(sampling.get("periodicPollingEnabled")).isEqualTo(false);
+            assertThat(access.costStageReads).hasValue(0);
         }
         assertThat(access.clockReads).hasValue(2);
         assertThat(access.stops).hasValue(1);
@@ -138,6 +141,9 @@ class BenchmarkWriteReturnCaptureTest {
     private static final class Fake implements BenchmarkWriteReturnCapture.Access {
         final AtomicInteger starts = new AtomicInteger(), stops = new AtomicInteger();
         final AtomicInteger clockReads = new AtomicInteger();
+        final AtomicInteger pageReads = new AtomicInteger(), costStageReads = new AtomicInteger();
+        java.util.Map<String, Object> costStages = java.util.Map.of("state", "RECORDED", "samplingCostQualified", false);
+        BenchmarkWriteReturnReader.CostStagesRefusal costStageRefusal;
         boolean acceptStart = true, acceptStop = true, foreignSummary, extraCount, wrongBytes, throwStop, failedSummary;
         boolean changeFinalIdentity, throwFinalClock;
         volatile boolean firstBeforeStart, finalAfterStop;
@@ -166,7 +172,60 @@ class BenchmarkWriteReturnCaptureTest {
                     extraCount ? 2 : 1, failedSummary ? 1 : 0, extraCount ? 2 : 1, 0,
                     wrongBytes ? 0 : page.length - 32 - "measured".length() - "RECORDED_SCOPE_UNQUALIFIED".length());
         }
-        public byte[] page(long cursor) { return page; }
+        public byte[] page(long cursor) { pageReads.incrementAndGet(); return page; }
+        public java.util.Map<String, Object> costStages(long epoch, String window, long completedCalls) {
+            costStageReads.incrementAndGet();
+            if (stops.get() != 1 || pageReads.get() != 2 || epoch != 1 || !"measured".equals(window) || completedCalls != 1) {
+                throw new AssertionError("cost-stage read must follow successful stop and complete receipt assembly");
+            }
+            if (costStageRefusal != null) { throw costStageRefusal; }
+            return costStages;
+        }
+    }
+
+    @Test void stage_summaries_are_read_once_after_complete_receipts_and_unknown_stays_explicit() throws Exception {
+        for (String state : java.util.List.of("RECORDED", "UNKNOWN")) {
+            var access = new Fake();
+            access.costStages = java.util.Map.of("state", state, "samplingCostQualified", false);
+            try (var capture = BenchmarkWriteReturnCapture.open(access, "measured",
+                    BenchmarkReturnClockSampler.Mode.PERIODIC, true)) {
+                var result = capture.finish();
+                assertThat(result.costStages()).isEqualTo(access.costStages);
+                assertThat(capture.retainedEvidence().get("costStages")).isEqualTo(access.costStages);
+                assertThat(access.costStageReads).hasValue(1);
+                assertThatThrownBy(() -> result.costStages().put("state", "changed"))
+                        .isInstanceOf(UnsupportedOperationException.class);
+            }
+            assertThat(access.costStageReads).hasValue(1);
+        }
+    }
+
+    @Test void refused_receipts_and_other_clock_controls_never_read_cost_stages() throws Exception {
+        var access = new Fake(); access.wrongBytes = true;
+        try (var capture = BenchmarkWriteReturnCapture.open(access, "measured",
+                BenchmarkReturnClockSampler.Mode.PERIODIC, true)) {
+            assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("retained-byte");
+            assertThat(access.costStageReads).hasValue(0);
+        }
+        assertThatThrownBy(() -> BenchmarkWriteReturnCapture.open(access, "measured",
+                BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL, true))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("unchanged periodic");
+        assertThat(access.costStageReads).hasValue(0);
+    }
+
+    @Test void a_cost_stage_read_refusal_retains_its_raw_facts_without_repeating_the_read_or_stop() throws Exception {
+        var access = new Fake();
+        var retained = java.util.Map.<String, Object>of("state", "UNKNOWN", "raw", "malformed",
+                "samplingCostQualified", false);
+        var refusal = new BenchmarkWriteReturnReader.CostStagesRefusal(new AssertionError("controlled shape refusal"), retained);
+        access.costStageRefusal = refusal;
+        try (var capture = BenchmarkWriteReturnCapture.open(access, "measured",
+                BenchmarkReturnClockSampler.Mode.PERIODIC, true)) {
+            assertThatThrownBy(capture::finish).isSameAs(refusal);
+            assertThat(capture.retainedEvidence()).containsEntry("completed", false).containsEntry("costStages", retained);
+            assertThat((java.util.List<?>) capture.retainedEvidence().get("retainedPagesBase64")).hasSize(1);
+        }
+        assertThat(access.costStageReads).hasValue(1); assertThat(access.stops).hasValue(1);
     }
 
     @Test void a_retained_byte_total_cannot_hide_missing_or_replaced_page_contents() throws Exception {

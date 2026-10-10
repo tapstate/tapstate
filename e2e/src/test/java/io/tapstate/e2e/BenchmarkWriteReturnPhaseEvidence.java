@@ -100,6 +100,7 @@ final class BenchmarkWriteReturnPhaseEvidence {
         evidence.put("formalCommonActiveWindowQualified", false);
         evidence.put("performanceAcceptanceEligible", false);
         evidence.put("returnCaptureDelayQualified", false); evidence.put("samplingCostQualified", false);
+        if (!capture.costStages().isEmpty()) { evidence.put("producerCostStages", capture.costStages()); }
         return Map.copyOf(evidence);
     }
 

@@ -29,6 +29,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     static final String WRITE_RETURN_DIAGNOSTICS_PROPERTY = "tapstate.e2e.benchmark.write-return-diagnostics";
     static final String WRITE_RETURN_CLOCK_CONTROL_PROPERTY = "tapstate.e2e.benchmark.write-return-clock-control";
     static final String WRITE_RETURN_METHOD_CONTROL_PROPERTY = "tapstate.e2e.benchmark.write-return-method-control";
+    static final String WRITE_RETURN_COST_STAGES_PROPERTY = "tapstate.e2e.benchmark.write-return-cost-stages";
 
     /** Local observation intervals distinguish data arrival from subsequent proof reads. */
     record ConfirmationTiming(long sourceMarkerWaitStartedAtNanos, long sourceMarkerWaitCompletedAtNanos,
@@ -336,6 +337,23 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return diagnostics && !methodControl;
     }
 
+    static boolean writeReturnCostStages(String value, boolean diagnostics, boolean pilot,
+            BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) {
+        if (value == null || "false".equals(value)) { return false; }
+        if (!"true".equals(value)) { throw new AssertionError("return cost stages must be true or false"); }
+        if (!diagnostics || !pilot || clockMode != BenchmarkReturnClockSampler.Mode.PERIODIC || conflictingDiagnostics) {
+            throw new AssertionError("return cost stages require one original plain stateless B diagnostic pilot without other controls");
+        }
+        return true;
+    }
+
+    static List<String> returnJvmArguments(boolean methodControl, boolean costStages) {
+        if (methodControl && costStages) { throw new AssertionError("disabled producer cannot collect cost stages"); }
+        return costStages ? List.of("-Dtapstate.benchmark.write-return=true",
+                "-Dtapstate.benchmark.write-return-cost-stages=true")
+                : List.of("-Dtapstate.benchmark.write-return=" + !methodControl);
+    }
+
     static boolean admitWriteReturnMethodProtocol(String value, boolean diagnostics, boolean pilot,
             BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) {
         if (value == null) { return false; }
@@ -353,6 +371,17 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         Objects.requireNonNull(arm, "arm");
         var clockMode = writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile());
+        writeReturnCostStages(System.getProperty(WRITE_RETURN_COST_STAGES_PROPERTY),
+                Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(), clockMode,
+                !"stateless".equals(workload.id()) || arm != PipelineBenchmarkComparison.Arm.B
+                        || System.getProperty(WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null
+                        || List.of("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics",
+                                "tapstate.e2e.benchmark.compilation-diagnostics", "tapstate.e2e.benchmark.thread-point-diagnostics",
+                                "tapstate.e2e.benchmark.load-diagnostics", BenchmarkDualGcDiagnostics.ENABLED_PROPERTY,
+                                BenchmarkWitnessReadGate.PROPERTY, BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY,
+                                BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
+                                "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
+                                "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean));
         admitWriteReturnMethodProtocol(System.getProperty(WRITE_RETURN_METHOD_CONTROL_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(), clockMode,
                 !"stateless".equals(workload.id()) || arm != PipelineBenchmarkComparison.Arm.B
@@ -642,7 +671,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), methodControl)
                         ? BenchmarkWriteReturnCapture.open(resourceSampler.writeReturnReader(),
                                 workload.id() + "/" + phase.id(), writeReturnClockMode(
-                                        System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY), true, workload.pilotProfile())) : null) {
+                                        System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY), true, workload.pilotProfile()),
+                                Boolean.getBoolean(WRITE_RETURN_COST_STAGES_PROPERTY)) : null) {
                     try {
                         issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
                             for (BenchmarkExpectedChanges.TargetPlan plan : plans) {

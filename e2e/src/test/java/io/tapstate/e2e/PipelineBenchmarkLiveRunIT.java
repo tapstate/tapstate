@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_COST_STAGES_PROPERTY)) {
+            throw new AssertionError("producer cost-stage diagnostics cannot establish a live performance gate");
+        }
         if (Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY)) {
             throw new AssertionError("return method cost control cannot establish a live performance gate");
         }

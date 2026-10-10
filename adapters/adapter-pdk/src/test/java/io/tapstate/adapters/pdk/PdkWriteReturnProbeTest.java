@@ -568,6 +568,171 @@ class PdkWriteReturnProbeTest {
         assertThat(probe.getCompletedCalls()).isZero();
     }
 
+    @Test
+    void default_cost_stages_add_no_clock_reads_and_keep_the_original_V3_bytes() throws Exception {
+        AtomicLong one = new AtomicLong(), two = new AtomicLong();
+        var original = new PdkWriteReturnProbe(one::incrementAndGet);
+        var explicitOff = new PdkWriteReturnProbe(two::incrementAndGet, false);
+        for (var probe : List.of(original, explicitOff)) {
+            var writer = probe.writer("writer"); probe.start("measured");
+            var call = writer.begin("source", table(), List.of(event(1)));
+            call.callback(new WriteListResult<>(1L, 0L, 0L)); call.callbackExited(); call.returned(null);
+            assertThat(cost(probe)).containsEntry("enabled", false).containsEntry("state", "DISABLED");
+        }
+        assertThat(one).hasValue(3); assertThat(two).hasValue(3);
+        assertThat(original.read(0)).isEqualTo(explicitOff.read(0));
+        String producer = System.getProperty(PROPERTY), stages = System.getProperty(PdkWriteReturnProbe.COST_STAGES_PROPERTY);
+        try {
+            System.clearProperty(PROPERTY); System.setProperty(PdkWriteReturnProbe.COST_STAGES_PROPERTY, "true");
+            assertThat(PdkWriteReturnProbe.forWriter(null)).isNull();
+        } finally {
+            restoreProperty(PROPERTY, producer); restoreProperty(PdkWriteReturnProbe.COST_STAGES_PROPERTY, stages);
+        }
+    }
+
+    @Test
+    void cost_stages_count_a_native_multipart_call_once_and_keep_the_six_elapsed_scopes() throws Exception {
+        var probe = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet, true);
+        var writer = probe.writer("writer", PdkMongoWriteScope.disabled()); probe.start("measured");
+        var rows = java.util.stream.IntStream.range(0, 1024).mapToObj(PdkWriteReturnProbeTest::event).toList();
+        var call = writer.begin("source", table(), rows);
+        call.callback(new WriteListResult<>(1024L, 0L, 0L)); call.callbackExited(); call.returned(null);
+        assertThat(probe.stop()).isTrue();
+        var summary = cost(probe);
+        assertThat(summary).containsEntry("state", "RECORDED").containsEntry("timeScope", "ELAPSED_NOT_CPU")
+                .containsEntry("performanceAcceptanceEligible", false).containsEntry("samplingCostQualified", false)
+                .containsEntry("costAcceptanceEligible", false).containsEntry("causalOverheadQualified", false);
+        assertThat(number(summary, "fullCallCount")).isEqualTo(1);
+        assertThat(number(summary, "completeTimedCalls")).isEqualTo(1);
+        assertThat(stageMap(summary)).containsOnlyKeys("BEGIN_LOCK_WAIT", "IDENTITY_ENCODING", "SCOPE_BEFORE",
+                "SCOPE_AFTER", "COMPLETE_LOCK_WAIT", "RECEIPT_ENCODING_PUBLICATION");
+        for (var value : stageMap(summary).values()) {
+            var stage = (Map<?, ?>) value;
+            assertThat(number(stage, "count")).isEqualTo(1);
+            assertThat(number(stage, "sumNanos")).isEqualTo(1);
+            assertThat(number(stage, "maxNanos")).isEqualTo(1);
+        }
+        assertThat(decode(probe.read(0)).frames()).hasSize(2);
+        assertThat(probe.getCostStages().getBytes(StandardCharsets.US_ASCII).length).isLessThanOrEqualTo(8192);
+    }
+
+    @Test
+    void both_producer_lock_waits_are_measured_before_monitor_acquisition_without_moving_return_stamps() throws Exception {
+        for (boolean completion : List.of(false, true)) {
+            AtomicLong clock = new AtomicLong(); AtomicLong reads = new AtomicLong();
+            CountDownLatch outside = new CountDownLatch(1), ready = new CountDownLatch(1), permit = new CountDownLatch(1);
+            var probe = new PdkWriteReturnProbe(() -> {
+                long value = clock.get(); if (reads.incrementAndGet() == 1) { outside.countDown(); } return value;
+            }, true);
+            var writer = probe.writer("writer", PdkMongoWriteScope.disabled()); probe.start("measured");
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread worker = new Thread(() -> {
+                try {
+                    var call = writer.begin("source", table(), List.of(event(1)));
+                    call.callback(new WriteListResult<>(1L, 0L, 0L)); call.callbackExited(); call.observeReturn();
+                    if (completion) { ready.countDown(); assertThat(permit.await(2, TimeUnit.SECONDS)).isTrue(); }
+                    call.completed(null);
+                } catch (Throwable problem) { failure.set(problem); }
+            }, "owned-cost-stage-control");
+            worker.setDaemon(true);
+            try {
+                if (completion) {
+                    worker.start(); assertThat(ready.await(2, TimeUnit.SECONDS)).isTrue();
+                    synchronized (probe) { permit.countDown(); awaitBlocked(worker); clock.set(50); }
+                } else {
+                    synchronized (probe) {
+                        worker.start(); assertThat(outside.await(2, TimeUnit.SECONDS)).isTrue(); awaitBlocked(worker); clock.set(50);
+                    }
+                }
+                worker.join(3000); assertThat(worker.isAlive()).isFalse(); assertThat(failure.get()).isNull();
+                var summary = cost(probe); assertThat(summary).containsEntry("state", "RECORDED");
+                var selected = (Map<?, ?>) stageMap(summary).get(completion ? "COMPLETE_LOCK_WAIT" : "BEGIN_LOCK_WAIT");
+                assertThat(number(selected, "sumNanos")).isEqualTo(50);
+                var frame = decode(probe.read(0)).frames().getFirst();
+                assertThat(frame.observed()).isEqualTo(completion ? 0 : 50);
+            } finally { permit.countDown(); worker.join(3000); }
+        }
+    }
+
+    @Test
+    void failed_duplicate_and_stale_completions_do_not_recount_or_contaminate_the_next_cost_window() {
+        var probe = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet, true);
+        var writer = probe.writer("writer", PdkMongoWriteScope.disabled()); probe.start("old");
+        var old = writer.begin("source", table(), List.of(event(1)));
+        old.callback(new WriteListResult<>(1L, 0L, 0L)); old.callbackExited(); old.returned(new IllegalStateException("controlled failure"));
+        assertThat(cost(probe)).containsEntry("state", "UNKNOWN").containsEntry("reason", "FAILED_CALL");
+        String failed = probe.getCostStages(); old.completed(null); assertThat(probe.getCostStages()).isEqualTo(failed);
+        assertThat(probe.getFailedCalls()).isEqualTo(1); assertThat(probe.stop()).isTrue(); assertThat(probe.start("next")).isTrue();
+        var current = writer.begin("source", table(), List.of(event(2)));
+        current.callback(new WriteListResult<>(1L, 0L, 0L)); current.callbackExited(); current.returned(null);
+        String next = probe.getCostStages(); old.completed(null); assertThat(probe.getCostStages()).isEqualTo(next);
+        var beforeDuplicate = cost(probe); assertThat(beforeDuplicate).containsEntry("state", "RECORDED");
+        current.completed(null);
+        var duplicate = cost(probe);
+        assertThat(duplicate).containsEntry("state", "UNKNOWN").containsEntry("reason", "RETURN_RECEIPT_UNQUALIFIED");
+        assertThat(number(duplicate, "fullCallCount")).isEqualTo(1);
+        assertThat(number(duplicate, "completeTimedCalls")).isEqualTo(1);
+        assertThat(stageMap(duplicate)).isEqualTo(stageMap(beforeDuplicate));
+    }
+
+    @Test
+    void aggregate_overflow_refuses_the_entire_call_without_partially_updating_other_stages() throws Exception {
+        var probe = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet, true);
+        var writer = probe.writer("writer", PdkMongoWriteScope.disabled()); probe.start("measured");
+        var first = writer.begin("source", table(), List.of(event(1)));
+        first.callback(new WriteListResult<>(1L, 0L, 0L)); first.callbackExited(); first.returned(null);
+        var field = PdkWriteReturnProbe.class.getDeclaredField("costStages"); field.setAccessible(true);
+        var aggregate = field.get(probe);
+        var sumsField = aggregate.getClass().getDeclaredField("sums"); sumsField.setAccessible(true);
+        ((long[]) sumsField.get(aggregate))[5] = Long.MAX_VALUE;
+        var before = cost(probe);
+        var second = writer.begin("source", table(), List.of(event(2)));
+        second.callback(new WriteListResult<>(1L, 0L, 0L)); second.callbackExited(); second.returned(null);
+        var after = cost(probe);
+        assertThat(after).containsEntry("state", "UNKNOWN").containsEntry("reason", "STAGE_SUM_OVERFLOW");
+        assertThat(number(after, "fullCallCount")).isEqualTo(2);
+        assertThat(number(after, "completeTimedCalls")).isEqualTo(1);
+        assertThat(stageMap(after)).isEqualTo(stageMap(before));
+        assertThat(probe.getCompletedCalls()).isEqualTo(2); assertThat(probe.getReportedRecords()).isEqualTo(2);
+    }
+
+    @Test
+    void missing_negative_and_overflowing_cost_stages_stay_UNKNOWN_without_changing_receipts() {
+        var missing = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet, true);
+        var writer = missing.writer("writer"); missing.start("measured");
+        var call = writer.begin("source", table(), List.of(event(1)));
+        call.callback(new WriteListResult<>(1L, 0L, 0L)); call.callbackExited(); call.returned(null);
+        assertThat(cost(missing)).containsEntry("state", "UNKNOWN").containsEntry("reason", "STAGES_MISSING");
+        assertThat(missing.getReportedRecords()).isEqualTo(1);
+        for (boolean overflow : List.of(false, true)) {
+            AtomicLong reads = new AtomicLong();
+            var probe = new PdkWriteReturnProbe(() -> reads.incrementAndGet() == 1
+                    ? (overflow ? Long.MIN_VALUE : 100) : (overflow ? Long.MAX_VALUE : 99), true);
+            var scoped = probe.writer("writer", PdkMongoWriteScope.disabled()); probe.start("measured");
+            var recorded = scoped.begin("source", table(), List.of(event(1)));
+            recorded.callback(new WriteListResult<>(1L, 0L, 0L)); recorded.callbackExited(); recorded.returned(null);
+            assertThat(cost(probe)).containsEntry("state", "UNKNOWN").containsEntry("reason", "CLOCK_ORDER_OR_OVERFLOW");
+            assertThat(probe.getCompletedCalls()).isEqualTo(1); assertThat(probe.getReportedRecords()).isEqualTo(1);
+        }
+    }
+
+    private static void awaitBlocked(Thread worker) {
+        long began = System.nanoTime();
+        while (worker.isAlive() && worker.getState() != Thread.State.BLOCKED
+                && System.nanoTime() - began < TimeUnit.SECONDS.toNanos(2)) { Thread.yield(); }
+        assertThat(worker.getState()).isEqualTo(Thread.State.BLOCKED);
+    }
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> cost(PdkWriteReturnProbe probe) {
+        return (Map<String, Object>) io.tapstate.core.common.JsonReader.parse(probe.getCostStages());
+    }
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> stageMap(Map<String, Object> summary) { return (Map<String, Object>) summary.get("stages"); }
+    private static long number(Map<?, ?> values, String key) { return ((Number) values.get(key)).longValue(); }
+    private static void restoreProperty(String name, String value) {
+        if (value == null) { System.clearProperty(name); } else { System.setProperty(name, value); }
+    }
+
     private static TapTable table() {
         return new TapTable("target").add(new TapField("id", "int").primaryKeyPos(1));
     }

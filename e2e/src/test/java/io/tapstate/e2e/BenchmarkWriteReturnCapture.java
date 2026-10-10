@@ -12,29 +12,41 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         boolean stop();
         BenchmarkWriteReturnReader.Summary summary();
         byte[] page(long cursor);
+        default Map<String, Object> costStages(long epoch, String window, long completedCalls) {
+            throw new AssertionError("cost-stage diagnostic access is unavailable");
+        }
     }
 
     record Result(List<BenchmarkWriteReturnAssembly.FullCall> calls,
                   List<BenchmarkCausalClock.Sample> samples, BenchmarkWriteReturnReader.Summary summary,
-                  List<String> pagesBase64, BenchmarkReturnClockSampler.Mode clockMode) {
+                  List<String> pagesBase64, BenchmarkReturnClockSampler.Mode clockMode,
+                  Map<String, Object> costStages) {
         Result {
             calls = List.copyOf(calls); samples = List.copyOf(samples); pagesBase64 = List.copyOf(pagesBase64);
             java.util.Objects.requireNonNull(clockMode);
+            costStages = Map.copyOf(costStages);
+        }
+        Result(List<BenchmarkWriteReturnAssembly.FullCall> calls, List<BenchmarkCausalClock.Sample> samples,
+                BenchmarkWriteReturnReader.Summary summary, List<String> pagesBase64,
+                BenchmarkReturnClockSampler.Mode clockMode) {
+            this(calls, samples, summary, pagesBase64, clockMode, Map.of());
         }
         Result(List<BenchmarkWriteReturnAssembly.FullCall> calls, List<BenchmarkCausalClock.Sample> samples,
                 BenchmarkWriteReturnReader.Summary summary, List<String> pagesBase64) {
-            this(calls, samples, summary, pagesBase64, BenchmarkReturnClockSampler.Mode.PERIODIC);
+            this(calls, samples, summary, pagesBase64, BenchmarkReturnClockSampler.Mode.PERIODIC, Map.of());
         }
     }
 
     private final Access access;
     private final String window;
     private final BenchmarkReturnClockSampler sampler;
+    private final boolean costStageDiagnostics;
     private boolean captureStarted;
     private boolean completed;
     private boolean closed;
     private long epoch;
     private BenchmarkWriteReturnReader.Summary terminalSummary;
+    private Map<String, Object> terminalCostStages = Map.of();
     private final List<String> retainedPages = new ArrayList<>();
     private long retainedPageBytes;
 
@@ -44,13 +56,21 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
 
     static BenchmarkWriteReturnCapture open(BenchmarkWriteReturnReader reader, String window,
             BenchmarkReturnClockSampler.Mode mode) {
+        return open(reader, window, mode, false);
+    }
+
+    static BenchmarkWriteReturnCapture open(BenchmarkWriteReturnReader reader, String window,
+            BenchmarkReturnClockSampler.Mode mode, boolean costStageDiagnostics) {
         return open(new Access() {
             public BenchmarkCausalClock.Sample clock(long sequence) { return reader.clockSample(sequence); }
             public boolean start(String value) { return reader.start(value); }
             public boolean stop() { return reader.stop(); }
             public BenchmarkWriteReturnReader.Summary summary() { return reader.summary(); }
             public byte[] page(long cursor) { return reader.page(cursor); }
-        }, window, mode);
+            public Map<String, Object> costStages(long epoch, String value, long completedCalls) {
+                return reader.costStages(epoch, value, completedCalls);
+            }
+        }, window, mode, costStageDiagnostics);
     }
 
     static BenchmarkWriteReturnCapture open(Access access, String window) {
@@ -58,7 +78,12 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     }
 
     static BenchmarkWriteReturnCapture open(Access access, String window, BenchmarkReturnClockSampler.Mode mode) {
-        var capture = new BenchmarkWriteReturnCapture(access, window, mode);
+        return open(access, window, mode, false);
+    }
+
+    static BenchmarkWriteReturnCapture open(Access access, String window,
+            BenchmarkReturnClockSampler.Mode mode, boolean costStageDiagnostics) {
+        var capture = new BenchmarkWriteReturnCapture(access, window, mode, costStageDiagnostics);
         try {
             capture.sampler.start();
             if (!access.start(window)) { throw new AssertionError("owned return capture start was refused"); }
@@ -75,12 +100,17 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         }
     }
 
-    private BenchmarkWriteReturnCapture(Access access, String window, BenchmarkReturnClockSampler.Mode mode) {
+    private BenchmarkWriteReturnCapture(Access access, String window, BenchmarkReturnClockSampler.Mode mode,
+            boolean costStageDiagnostics) {
         this.access = java.util.Objects.requireNonNull(access);
         if (window == null || window.isBlank() || window.length() > 512) {
             throw new AssertionError("owned return capture window is invalid");
         }
         this.window = window;
+        if (costStageDiagnostics && mode != BenchmarkReturnClockSampler.Mode.PERIODIC) {
+            throw new AssertionError("cost-stage diagnostics require the unchanged periodic return capture");
+        }
+        this.costStageDiagnostics = costStageDiagnostics;
         sampler = new BenchmarkReturnClockSampler(access::clock, mode);
     }
 
@@ -130,13 +160,20 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
             clock.map(samples.getFirst().identity(), call.lastCallbackExitNanos());
             clock.map(samples.getFirst().identity(), call.observedNanos());
         }
+        if (costStageDiagnostics) {
+            try { terminalCostStages = access.costStages(epoch, window, summary.completedCalls()); }
+            catch (BenchmarkWriteReturnReader.CostStagesRefusal refusal) {
+                terminalCostStages = refusal.retainedEvidence();
+                throw refusal;
+            }
+        }
         completed = true;
-        return new Result(calls, samples, summary, retainedPages, sampler.mode());
+        return new Result(calls, samples, summary, retainedPages, sampler.mode(), terminalCostStages);
     }
 
     /** Keeps already obtained facts after refusal without retrying a remote read or stop. */
     Map<String, Object> retainedEvidence() {
-        return Map.of("window", window, "epoch", epoch, "completed", completed,
+        Map<String, Object> evidence = Map.of("window", window, "epoch", epoch, "completed", completed,
                 "sampler", sampler.evidence(), "samples", sampler.readings().stream().map(sample -> Map.of(
                         "sequence", sample.sequence(), "pid", sample.identity().pid(),
                         "jvmStartTimeMillis", sample.identity().jvmStartTimeMillis(),
@@ -149,6 +186,10 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
                         "reportedRecords", terminalSummary.reportedRecords(), "failedCalls", terminalSummary.failedCalls(),
                         "retainedBytes", terminalSummary.retainedBytes()),
                 "retainedPagesBase64", List.copyOf(retainedPages), "performanceAcceptanceEligible", false);
+        if (!costStageDiagnostics) { return evidence; }
+        var withStages = new java.util.LinkedHashMap<String, Object>(evidence);
+        withStages.put("costStages", terminalCostStages);
+        return Map.copyOf(withStages);
     }
 
     @Override public void close() {

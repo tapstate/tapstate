@@ -17,6 +17,82 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class BenchmarkWriteReturnReaderTest {
     private static final BenchmarkCausalClock.Identity OWNER = new BenchmarkCausalClock.Identity(17, 1_000);
     private static final String RETURN_FLAG = "-Dtapstate.benchmark.write-return=";
+    private static final String COST_FLAG = "-Dtapstate.benchmark.write-return-cost-stages=";
+
+    @Test void cost_stages_use_one_optional_getter_between_owned_runtime_reads_without_probe_clock_or_controls() {
+        var fixture = costFixture();
+        var evidence = fixture.reader().costStages(4, "measured", 2);
+        assertThat(evidence).containsEntry("state", "RECORDED").containsEntry("raw", fixture.costResponse)
+                .containsEntry("matchedRuntimeFlag", RETURN_FLAG + "true").containsEntry("matchedCostStagesFlag", COST_FLAG + "true")
+                .containsEntry("performanceAcceptanceEligible", false).containsEntry("samplingCostQualified", false)
+                .containsEntry("costAcceptanceEligible", false).containsEntry("formalPerformance", false)
+                .containsEntry("causalOverheadQualified", false);
+        assertThat(evidence.get("costStagesRead")).isEqualTo(Map.of("startedAtNanos", 103L, "completedAtNanos", 104L));
+        assertThat(fixture.operations).containsExactly("runtime", "cost", "runtime");
+        assertThat(io.tapstate.core.common.JsonWriter.write(evidence)).doesNotContain("controlled_runtime_secret", "InputArguments");
+        assertThatThrownBy(() -> evidence.put("state", "changed")).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test void malformed_oversized_and_foreign_cost_reads_carry_bounded_refusal_facts_without_retry() {
+        for (Object response : List.of("{}", "x".repeat(8193), 42L,
+                BenchmarkWriteReturnCostStagesTest.raw().replace("\"pid\":17", "\"pid\":18"))) {
+            var fixture = costFixture(); fixture.costResponse = response;
+            var failure = costRefusal(fixture);
+            var retained = failure.retainedEvidence();
+            assertThat(retained).containsEntry("state", "UNKNOWN").containsEntry("performanceAcceptanceEligible", false)
+                    .containsEntry("samplingCostQualified", false).containsEntry("causalOverheadQualified", false);
+            assertThat(retained).containsKeys("beforeRuntimeRead", "costStagesRead", "afterRuntimeRead");
+            if (response instanceof String text && text.length() <= 8192) { assertThat(retained).containsEntry("raw", text); }
+            else { assertThat(retained).doesNotContainKey("raw"); }
+            assertThat(fixture.operations).containsExactly("runtime", "cost", "runtime");
+            assertThatThrownBy(() -> retained.clear()).isInstanceOf(UnsupportedOperationException.class);
+        }
+    }
+
+    @Test void cost_runtime_io_exit_reuse_or_argument_changes_preserve_obtained_raw_and_identity_facts() {
+        var foreign = costFixture();
+        foreign.after = runtimeAttributes(18L, 1_000L, costArguments());
+        var refused = costRefusal(foreign).retainedEvidence();
+        assertThat(refused).containsEntry("raw", foreign.costResponse);
+        assertThat(((Map<?, ?>) refused.get("afterRuntimeRead")).get("actualPid")).isEqualTo(18L);
+        var changed = costFixture(); changed.after = runtimeAttributes(17L, 1_000L,
+                new String[]{RETURN_FLAG + "true", COST_FLAG + "true", "-Xmx64m"});
+        assertThat(costRefusal(changed).retainedEvidence()).containsEntry("raw", changed.costResponse);
+        for (String operation : List.of("runtime", "cost")) {
+            var fixture = costFixture(); fixture.failingOperation = operation;
+            assertThat(costRefusal(fixture)).hasCause(fixture.readFailure);
+            assertThat(fixture.operations.stream().filter("cost"::equals).count()).isLessThanOrEqualTo(1);
+        }
+        var dead = costFixture(); dead.alive = () -> false;
+        assertThat(costRefusal(dead).retainedEvidence()).containsEntry("rawAvailable", false);
+        assertThat(dead.operations).isEmpty();
+        var exits = costFixture(); var checks = new AtomicLong(); exits.alive = () -> checks.incrementAndGet() <= 3;
+        assertThat(costRefusal(exits).retainedEvidence()).containsEntry("raw", exits.costResponse);
+    }
+
+    @Test void cost_getter_requires_unique_explicit_true_flags_for_both_independent_properties() {
+        for (String[] arguments : List.of(new String[]{RETURN_FLAG + "true"},
+                new String[]{RETURN_FLAG + "false", COST_FLAG + "true"},
+                new String[]{RETURN_FLAG + "true", COST_FLAG + "false"},
+                new String[]{RETURN_FLAG + "true", COST_FLAG + "true", COST_FLAG + "true"},
+                new String[]{RETURN_FLAG + "true", RETURN_FLAG + "true", COST_FLAG + "true"})) {
+            var fixture = costFixture(); fixture.before = runtimeAttributes(17L, 1_000L, arguments);
+            assertThat(costRefusal(fixture).retainedEvidence()).containsEntry("rawAvailable", false);
+            assertThat(fixture.operations).containsExactly("runtime");
+        }
+    }
+
+    @Test void unknown_cost_stage_state_is_retained_without_transport_turning_it_into_recorded() {
+        var fixture = costFixture(); fixture.costResponse = BenchmarkWriteReturnCostStagesTest.raw()
+                .replace("\"state\":\"RECORDED\"", "\"state\":\"UNKNOWN\"")
+                .replace("\"reason\":\"NONE\"", "\"reason\":\"CLOCK_UNAVAILABLE\"")
+                .replace("\"completeTimedCalls\":2", "\"completeTimedCalls\":0")
+                .replace("\"count\":2", "\"count\":0").replace("\"sumNanos\":30", "\"sumNanos\":0")
+                .replace("\"maxNanos\":20", "\"maxNanos\":0");
+        assertThat(fixture.reader().costStages(4, "measured", 2)).containsEntry("state", "UNKNOWN")
+                .containsEntry("reason", "CLOCK_UNAVAILABLE").containsEntry("completeTimedCalls", 0L)
+                .containsEntry("raw", fixture.costResponse).containsEntry("costAcceptanceEligible", false);
+    }
 
     @Test void registration_proofs_use_only_owned_runtime_attributes_and_actual_bean_presence() {
         for (boolean enabled : new boolean[]{true, false}) {
@@ -211,6 +287,20 @@ class BenchmarkWriteReturnReaderTest {
         attributes.add(new Attribute("InputArguments", arguments)); return attributes;
     }
 
+    private static String[] costArguments() {
+        return new String[]{RETURN_FLAG + "true", COST_FLAG + "true", "-Dpassword=controlled_runtime_secret"};
+    }
+    private static RegistrationFixture costFixture() {
+        var fixture = new RegistrationFixture(true);
+        fixture.before = runtimeAttributes(17L, 1_000L, costArguments()); fixture.after = fixture.before;
+        fixture.costResponse = BenchmarkWriteReturnCostStagesTest.raw(); return fixture;
+    }
+    private static BenchmarkWriteReturnReader.CostStagesRefusal costRefusal(RegistrationFixture fixture) {
+        try { fixture.reader().costStages(4, "measured", 2); }
+        catch (BenchmarkWriteReturnReader.CostStagesRefusal refusal) { return refusal; }
+        throw new AssertionError("controlled cost read unexpectedly succeeded");
+    }
+
     private static final class RegistrationFixture {
         AttributeList before, after;
         boolean registered;
@@ -218,6 +308,7 @@ class BenchmarkWriteReturnReaderTest {
         final List<String> operations = new ArrayList<>();
         final java.io.IOException readFailure = new java.io.IOException("controlled registration read failure");
         String failingOperation;
+        Object costResponse;
         RegistrationFixture(boolean enabled) {
             before = runtimeAttributes(17L, 1_000L, new String[]{RETURN_FLAG + enabled, "-Dpassword=controlled_runtime_secret"});
             after = before; registered = enabled;
@@ -241,6 +332,13 @@ class BenchmarkWriteReturnReaderTest {
                             operations.add("registered");
                             if ("registered".equals(failingOperation)) { throw readFailure; }
                             return registered;
+                        }
+                        if (method.getName().equals("getAttribute")) {
+                            assertThat(arguments[0].toString()).isEqualTo("io.tapstate.benchmark:type=WriteReturn");
+                            assertThat(arguments[1]).isEqualTo("CostStages");
+                            operations.add("cost");
+                            if ("cost".equals(failingOperation)) { throw readFailure; }
+                            return costResponse;
                         }
                         throw new AssertionError("registration proof called a probe getter or control");
                     });

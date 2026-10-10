@@ -12,6 +12,7 @@ public interface PdkWriteReturnProbeMBean {
     long getReportedRecords();
     long getOpenCalls();
     long getRetainedBytes();
+    String getCostStages();
     boolean start(String window);
     boolean stop();
     byte[] read(long completionCursor);

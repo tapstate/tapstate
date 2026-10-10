@@ -27,6 +27,7 @@ import java.util.function.LongSupplier;
  */
 public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     static final String PROPERTY = "tapstate.benchmark.write-return";
+    static final String COST_STAGES_PROPERTY = "tapstate.benchmark.write-return-cost-stages";
     static final String OBJECT_NAME = "io.tapstate.benchmark:type=WriteReturn";
     static final int MAX_FRAME_BYTES = 64 * 1024;
     static final int MAX_LEDGER_BYTES = 2 * 1024 * 1024;
@@ -38,6 +39,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     private static PdkWriteReturnProbe installed;
 
     private final LongSupplier clock;
+    private final CostStages costStages;
     private final List<Frame> frames = new ArrayList<>();
     private final long pid = ProcessHandle.current().pid();
     private final long startMillis = ManagementFactory.getRuntimeMXBean().getStartTime();
@@ -50,16 +52,21 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     private int retainedRecords;
     private int writerSequence;
     private long epoch;
-    private boolean active;
+    private volatile boolean active;
     private String window = "";
     private String state = "IDLE";
 
-    PdkWriteReturnProbe(LongSupplier clock) { this.clock = java.util.Objects.requireNonNull(clock); }
+    PdkWriteReturnProbe(LongSupplier clock) { this(clock, false); }
+
+    PdkWriteReturnProbe(LongSupplier clock, boolean costStagesEnabled) {
+        this.clock = java.util.Objects.requireNonNull(clock);
+        costStages = costStagesEnabled ? new CostStages() : null;
+    }
 
     static synchronized Writer forWriter(PdkConnector connector) {
         if (!Boolean.getBoolean(PROPERTY)) { return null; }
         if (installed == null) {
-            PdkWriteReturnProbe probe = new PdkWriteReturnProbe(System::nanoTime);
+            PdkWriteReturnProbe probe = new PdkWriteReturnProbe(System::nanoTime, Boolean.getBoolean(COST_STAGES_PROPERTY));
             try {
                 ManagementFactory.getPlatformMBeanServer().registerMBean(probe, new ObjectName(OBJECT_NAME));
             } catch (javax.management.JMException | SecurityException unavailable) {
@@ -75,7 +82,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         return writer(identity, null);
     }
 
-    private synchronized Writer writer(String identity, PdkMongoWriteScope scope) {
+    synchronized Writer writer(String identity, PdkMongoWriteScope scope) {
         if (writerSequence >= MAX_OPEN_CALLS) {
             unknown("WRITER_ROSTER_OVERFLOW");
             return new Writer(this, -1, identity, scope);
@@ -92,25 +99,45 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
             this.probe = probe; this.id = id; this.identity = identity; this.scope = scope;
         }
         Ticket begin(String stream, TapTable table, List<TapRecordEvent> rows) {
-            Ticket ticket = probe.begin(id, identity, stream, table, rows);
+            boolean requested = probe.costStages != null && probe.active;
+            long timingEpoch = requested ? probe.epoch : 0;
+            long outside = 0;
+            boolean outsideObserved = false;
+            if (requested) {
+                try { outside = probe.clock.getAsLong(); outsideObserved = true; }
+                catch (RuntimeException unavailable) { /* The original write remains independent of timing reads. */ }
+            }
+            Ticket ticket = probe.begin(id, identity, stream, table, rows, requested, timingEpoch, outside, outsideObserved);
             if (ticket != null && scope != null) {
-                ticket.scope = scope; ticket.scopeCall = scope.beforeWrite();
+                ticket.scope = scope;
+                if (ticket.cost == null) { ticket.scopeCall = scope.beforeWrite(); }
+                else {
+                    long began = probe.costTime(ticket.cost);
+                    try { ticket.scopeCall = scope.beforeWrite(); }
+                    finally { ticket.cost.elapsed(2, began, probe.costTime(ticket.cost)); }
+                }
             }
             return ticket;
         }
     }
 
     private synchronized Ticket begin(int writer, String identity, String stream,
-                                      TapTable table, List<TapRecordEvent> rows) {
+                                      TapTable table, List<TapRecordEvent> rows, boolean timingRequested,
+                                      long timingEpoch, long outside, boolean outsideObserved) {
         if (!active) { return null; }
         long began = clock.getAsLong();
         openCalls++;
         Ticket ticket = new Ticket(this, epoch, ++sequence, writer, began);
-        if (writer < 1 || openCalls > MAX_OPEN_CALLS || rows.isEmpty() || rows.size() > MAX_CALL_RECORDS) {
-            unknown("CALL_OR_BATCH_BOUND");
-            return ticket;
+        if (timingRequested && costStages != null && openCalls <= MAX_OPEN_CALLS) {
+            ticket.cost = new CostCall();
+            if (!outsideObserved) { ticket.cost.fail("CLOCK_UNAVAILABLE"); }
+            if (timingEpoch != epoch) { ticket.cost.fail("TIMING_EPOCH_CHANGED"); }
+            ticket.cost.elapsed(0, outside, began);
         }
         try {
+            if (writer < 1 || openCalls > MAX_OPEN_CALLS || rows.isEmpty() || rows.size() > MAX_CALL_RECORDS) {
+                unknown("CALL_OR_BATCH_BOUND"); return ticket;
+            }
             ticket.rowOrdinals = new java.util.IdentityHashMap<>();
             for (int i = 0; i < rows.size(); i++) {
                 if (ticket.rowOrdinals.put(rows.get(i), i) != null) { unknown("DUPLICATE_RECORD_OBJECT"); }
@@ -162,6 +189,8 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
             ticket.rows = rows.size(); ticket.identityChunks = List.copyOf(chunks);
         } catch (IOException | RuntimeException unsupported) {
             unknown("RECORD_IDENTITY_UNAVAILABLE");
+        } finally {
+            if (ticket.cost != null) { ticket.cost.elapsed(1, began, costTime(ticket.cost)); }
         }
         return ticket;
     }
@@ -193,6 +222,8 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         private PdkMongoWriteScope scope;
         private PdkMongoWriteScope.Call scopeCall;
         private String scopeEvidence = "UNKNOWN";
+        private CostCall cost;
+        private boolean receiptAdmitted;
 
         private Ticket(PdkWriteReturnProbe probe, long epoch, long sequence, int writer, long began) {
             this.probe = probe; this.epoch = epoch; this.sequence = sequence; this.writer = writer; this.began = began;
@@ -200,7 +231,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         }
         void callback(WriteListResult<TapRecordEvent> result) {
             synchronized (probe) {
-                if (returnStarted || finished || epoch != probe.epoch) { probe.unknown("LATE_CALLBACK"); return; }
+                if (returnStarted || finished || epoch != probe.epoch) { probe.unknown("LATE_CALLBACK", epoch == probe.epoch); return; }
                 if (Thread.currentThread().getId() != beginThreadId) { probe.unknown("CALLBACK_THREAD_MISMATCH"); return; }
                 try {
                     callbacks = Math.incrementExact(callbacks);
@@ -231,11 +262,11 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
             long observed;
             try { observed = probe.clock.getAsLong(); }
             catch (RuntimeException unavailable) {
-                synchronized (probe) { probe.unknown("CALLBACK_EXIT_UNAVAILABLE"); }
+                synchronized (probe) { probe.unknown("CALLBACK_EXIT_UNAVAILABLE", epoch == probe.epoch); }
                 return;
             }
             synchronized (probe) {
-                if (returnStarted || finished || epoch != probe.epoch) { probe.unknown("LATE_CALLBACK_EXIT"); return; }
+                if (returnStarted || finished || epoch != probe.epoch) { probe.unknown("LATE_CALLBACK_EXIT", epoch == probe.epoch); return; }
                 if (Thread.currentThread().getId() != beginThreadId) {
                     probe.unknown("CALLBACK_EXIT_THREAD_MISMATCH"); return;
                 }
@@ -260,19 +291,35 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         }
         void completed(Throwable failure) {
             if (!returnObserved) {
-                synchronized (probe) { probe.unknown("RETURN_OBSERVATION_MISSING"); }
+                synchronized (probe) { probe.unknown("RETURN_OBSERVATION_MISSING", epoch == probe.epoch); }
             }
-            if (scope != null) { scopeEvidence = scope.afterWrite(scopeCall); }
+            if (scope != null) {
+                if (cost == null) { scopeEvidence = scope.afterWrite(scopeCall); }
+                else {
+                    long began = probe.costTime(cost);
+                    try { scopeEvidence = scope.afterWrite(scopeCall); }
+                    finally { cost.elapsed(3, began, probe.costTime(cost)); }
+                }
+            }
+            if (cost != null) { cost.completeOutside = probe.costTime(cost); cost.completionRequested = true; }
             probe.complete(this, returnObservation, failure);
         }
     }
 
     private synchronized void complete(Ticket ticket, long observed, Throwable failure) {
-        if (ticket.finished) { unknown("DUPLICATE_COMPLETION"); return; }
+        if (ticket.finished) { unknown("DUPLICATE_COMPLETION", ticket.epoch == epoch); return; }
+        boolean recordCost = costStages != null && ticket.epoch == epoch;
+        if (recordCost && failure != null) { costStages.fail("FAILED_CALL"); }
+        long acquired = recordCost && ticket.cost != null ? costTime(ticket.cost) : 0;
+        if (recordCost && ticket.cost != null) {
+            if (!ticket.cost.completionRequested) { ticket.cost.fail("STAGES_MISSING"); }
+            ticket.cost.elapsed(4, ticket.cost.completeOutside, acquired);
+        }
+        try {
         ticket.finished = true;
         ticket.rowOrdinals = null;
         openCalls--;
-        if (ticket.epoch != epoch || observed < ticket.began) { unknown("CALL_IDENTITY_OR_CLOCK_ORDER"); return; }
+        if (ticket.epoch != epoch || observed < ticket.began) { unknown("CALL_IDENTITY_OR_CLOCK_ORDER", ticket.epoch == epoch); return; }
         completedCalls++;
         if (failure != null) { failedCalls++; }
         long count;
@@ -312,6 +359,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
             }
             for (byte[] payload : payloads) { frames.add(new Frame(ticket.sequence, payload)); }
             retainedBytes += bytesTotal; retainedRecords += ticket.rows;
+            ticket.receiptAdmitted = true;
             if (failure != null || ticket.errors != 0 || ticket.callbacks == 0 || count != ticket.rows) {
                 unknown("FAILED_PARTIAL_OR_MISSING_CALLBACK");
             } else if (!ticket.lastCallbackExitObserved || ticket.callbackExits != ticket.callbacks) {
@@ -322,9 +370,80 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
                 unknown("RETURN_THREAD_MISMATCH");
             }
         } catch (IOException | RuntimeException unavailable) { unknown("RECEIPT_UNAVAILABLE"); }
+        } finally {
+            if (recordCost) {
+                if (ticket.cost != null) { ticket.cost.elapsed(5, acquired, costTime(ticket.cost)); }
+                costStages.record(ticket, failure);
+            }
+        }
     }
 
-    private void unknown(String reason) { if (!state.startsWith("UNKNOWN:")) { state = "UNKNOWN:" + reason; } }
+    private long costTime(CostCall call) {
+        try { return clock.getAsLong(); }
+        catch (RuntimeException unavailable) { call.fail("CLOCK_UNAVAILABLE"); return 0; }
+    }
+
+    private static final class CostCall {
+        final long[] elapsed = new long[6];
+        int present;
+        String reason;
+        long completeOutside;
+        boolean completionRequested;
+        void fail(String next) { if (reason == null) { reason = next; } }
+        void elapsed(int stage, long before, long after) {
+            try {
+                long duration = Math.subtractExact(after, before);
+                if (duration < 0) { fail("CLOCK_ORDER_OR_OVERFLOW"); return; }
+                elapsed[stage] = duration; present |= 1 << stage;
+            } catch (ArithmeticException overflow) { fail("CLOCK_ORDER_OR_OVERFLOW"); }
+        }
+    }
+
+    private static final class CostStages {
+        final long[] counts = new long[6], sums = new long[6], maxima = new long[6];
+        long fullCalls, completeCalls;
+        String reason;
+        void fail(String next) { if (reason == null) { reason = next; } }
+        void reset() {
+            java.util.Arrays.fill(counts, 0); java.util.Arrays.fill(sums, 0); java.util.Arrays.fill(maxima, 0);
+            fullCalls = completeCalls = 0; reason = null;
+        }
+        void record(Ticket ticket, Throwable failure) {
+            try { fullCalls = Math.incrementExact(fullCalls); }
+            catch (ArithmeticException overflow) { fail("CALL_COUNT_OVERFLOW"); return; }
+            if (fullCalls > MAX_FRAMES) { fail("CALL_CAPACITY_EXCEEDED"); return; }
+            if (failure != null) { fail("FAILED_CALL"); }
+            if (!ticket.receiptAdmitted || !ticket.returnObserved || !ticket.returnOnBeginThread
+                    || ticket.callbacks == 0 || ticket.callbackExits != ticket.callbacks || !ticket.lastCallbackExitObserved
+                    || ticket.lastCallbackExit < ticket.began || ticket.lastCallbackExit > ticket.returnObservation || ticket.errors != 0) {
+                fail("RETURN_RECEIPT_UNQUALIFIED");
+            }
+            try {
+                if (Math.addExact(Math.addExact(ticket.inserted, ticket.modified), ticket.removed) != ticket.rows) {
+                    fail("RETURN_RECEIPT_UNQUALIFIED");
+                }
+            } catch (ArithmeticException overflow) { fail("RETURN_RECEIPT_UNQUALIFIED"); }
+            CostCall call = ticket.cost;
+            if (call != null && call.reason != null) { fail(call.reason); return; }
+            if (call == null || call.present != 63) { fail("STAGES_MISSING"); return; }
+            if (ticket.scopeEvidence.equals("UNKNOWN") || ticket.scopeEvidence.startsWith("state=UNKNOWN;")) {
+                fail("RETURN_RECEIPT_UNQUALIFIED");
+            }
+            try {
+                for (int i = 0; i < 6; i++) { Math.addExact(sums[i], call.elapsed[i]); Math.incrementExact(counts[i]); }
+                for (int i = 0; i < 6; i++) {
+                    sums[i] += call.elapsed[i]; counts[i]++; maxima[i] = Math.max(maxima[i], call.elapsed[i]);
+                }
+                completeCalls++;
+            } catch (ArithmeticException overflow) { fail("STAGE_SUM_OVERFLOW"); }
+        }
+    }
+
+    private void unknown(String reason) { unknown(reason, true); }
+    private void unknown(String reason, boolean currentCostWindow) {
+        if (!state.startsWith("UNKNOWN:")) { state = "UNKNOWN:" + reason; }
+        if (currentCostWindow && costStages != null) { costStages.fail("RETURN_RECEIPT_UNQUALIFIED"); }
+    }
 
     private static void text(DataOutputStream out, String value, int max) throws IOException {
         if (value == null) { throw new IllegalArgumentException("missing receipt identity"); }
@@ -345,6 +464,33 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     @Override public synchronized long getOpenCalls() { return openCalls; }
     @Override public synchronized long getRetainedBytes() { return retainedBytes; }
 
+    @Override public synchronized String getCostStages() {
+        var text = new StringBuilder(2048);
+        text.append("{\"schemaVersion\":1,\"enabled\":").append(costStages != null)
+                .append(",\"pid\":").append(pid).append(",\"jvmStartTimeMillis\":").append(startMillis)
+                .append(",\"epoch\":").append(epoch).append(",\"windowBase64\":\"")
+                .append(java.util.Base64.getEncoder().encodeToString(window.getBytes(StandardCharsets.UTF_8)))
+                .append("\",\"fullCallCount\":").append(costStages == null ? completedCalls : costStages.fullCalls)
+                .append(",\"completeTimedCalls\":").append(costStages == null ? 0 : costStages.completeCalls)
+                .append(",\"state\":\"").append(costStages == null ? "DISABLED" : costStages.reason == null ? "RECORDED" : "UNKNOWN")
+                .append("\",\"reason\":\"").append(costStages == null ? "DEFAULT_DISABLED" : costStages.reason == null ? "NONE" : costStages.reason)
+                .append("\",\"timeUnit\":\"ns\",\"timeScope\":\"ELAPSED_NOT_CPU\",\"performanceAcceptanceEligible\":false,\"samplingCostQualified\":false,\"costAcceptanceEligible\":false,\"formalPerformance\":false,\"causalOverheadQualified\":false,\"stages\":{");
+        if (costStages != null) {
+            for (int i = 0; i < 6; i++) {
+                if (i != 0) { text.append(','); }
+                String name = switch (i) {
+                    case 0 -> "BEGIN_LOCK_WAIT"; case 1 -> "IDENTITY_ENCODING"; case 2 -> "SCOPE_BEFORE";
+                    case 3 -> "SCOPE_AFTER"; case 4 -> "COMPLETE_LOCK_WAIT"; default -> "RECEIPT_ENCODING_PUBLICATION";
+                };
+                text.append('"').append(name).append("\":{\"count\":").append(costStages.counts[i])
+                        .append(",\"sumNanos\":").append(costStages.sums[i]).append(",\"maxNanos\":").append(costStages.maxima[i]).append('}');
+            }
+        }
+        text.append("}}");
+        if (text.length() > 8192) { throw new AssertionError("bounded cost-stage summary exceeds its fixed transport limit"); }
+        return text.toString();
+    }
+
     @Override public synchronized boolean start(String nextWindow) {
         if (active || openCalls != 0 || nextWindow == null || nextWindow.isBlank()
                 || nextWindow.length() > 512 || nextWindow.getBytes(StandardCharsets.UTF_8).length > 512) {
@@ -352,6 +498,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         }
         epoch++; sequence = completedCalls = failedCalls = reportedRecords = 0;
         frames.clear(); retainedBytes = retainedRecords = 0;
+        if (costStages != null) { costStages.reset(); }
         window = nextWindow; state = "RECORDED_SCOPE_UNQUALIFIED"; active = true;
         return true;
     }

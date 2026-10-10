@@ -85,6 +85,12 @@ class RealBenchmarkForkDriverIT {
                 conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
                         || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                         || forkOutput == null);
+        boolean costStages = RealBenchmarkForkDriver.writeReturnCostStages(
+                System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_COST_STAGES_PROPERTY), writeReturnDiagnostics,
+                Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
+                conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
+                        || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
+                        || forkOutput == null || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
         if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
                 || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
                 || conflictingReturnDiagnostics)) {
@@ -169,7 +175,7 @@ class RealBenchmarkForkDriverIT {
                     : writeReturnDiagnostics
                     ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
                             RealProcessServer.start(store, operator, jar, "127.0.0.1",
-                                    port -> List.of(), List.of("-Dtapstate.benchmark.write-return=" + !methodControl)), null))
+                                    port -> List.of(), RealBenchmarkForkDriver.returnJvmArguments(methodControl, costStages)), null))
                     : dualGc != null
                     ? new RealBenchmarkForkDriver(dualGc::start)
                     : jvmDiagnostics ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
@@ -245,6 +251,10 @@ class RealBenchmarkForkDriverIT {
                         } else {
                             assertThat(capture).containsEntry("clockSamplingMode", returnClockMode.name());
                         }
+                        if (costStages) {
+                            assertThat(((Map<?, ?>) capture.get("producerCostStages")).get("state"))
+                                    .isEqualTo("RECORDED");
+                        } else { assertThat(capture).doesNotContainKey("producerCostStages"); }
                         if (!methodControl && returnClockMode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) {
                             assertThat((List<?>) capture.get("clockSamples")).hasSize(2);
                             assertThat((Map<?, ?>) capture.get("p99LatencyNanos")).isEqualTo(Map.of(
@@ -325,6 +335,7 @@ class RealBenchmarkForkDriverIT {
                     output.put("writeReturnMethodControl", methodControl);
                     output.put("writeReturnClockSamplingMode", returnClockMode.name());
                     output.put("writeReturnPerformanceAcceptanceEligible", false);
+                    if (costStages) { output.put("writeReturnCostStages", true); }
                     output.put("retainedLegacyMeasurementEndpoint", "OPERATION_DATE_AND_OBSERVER_DIAGNOSTICS");
                 }
                 if (threadPointDiagnostics) {
