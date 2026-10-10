@@ -294,11 +294,12 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
 
     private static List<Document> acquirePipeline(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
-        Document sameOwner = new Document("$and", List.of(
+        Document sameLease = new Document("$and", List.of(
                 new Document("$eq", List.of("$ownerNodeId", new Document("$literal", owner.nodeId()))),
-                new Document("$eq", List.of("$ownerBootId", new Document("$literal", owner.bootId())))));
+                new Document("$eq", List.of("$ownerBootId", new Document("$literal", owner.bootId()))),
+                new Document("$gt", List.of("$leaseUntil", "$$NOW"))));
         Document generation = new Document("$cond", List.of(
-                sameOwner,
+                sameLease,
                 new Document("$ifNull", List.of("$claimGeneration", 1L)),
                 new Document("$add", List.of(
                         new Document("$ifNull", List.of("$claimGeneration", 0L)), 1L))));

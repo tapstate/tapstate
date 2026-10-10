@@ -33,6 +33,7 @@ import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.NativeExecutionStartup;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRun;
@@ -598,6 +599,59 @@ class EngineLifecycleActuatorTest {
     }
 
     @Test
+    void anAcceptedStampedStartStillSubmitsAfterItsStopRetiresTheOwningClaim() {
+        ResumeCohortRun run = new ResumeCohortRun(ResumeCohortRun.ORIGINAL);
+        WorkloadClaim original = run.held.get();
+        var selected = ResumeCohortRun.ORIGINAL.keySet().stream().collect(java.util.stream.Collectors.toMap(
+                node -> node, node -> new ClusterCapacityDemand(0, 0, 1, 0, 0, 0)));
+        ClusterCapacityReservation previous = run.reservation(9L, original, selected);
+        ClusterCapacityReservation submitted = new ClusterCapacityReservation(previous.reservationId(), previous.clusterId(),
+                previous.pipelineId(), previous.incarnationId(), previous.intentFingerprint(), previous.profile(), previous.pipelineClaim(),
+                previous.demandByNode(), previous.reservedAt(), previous.deadline(), previous.executionGeneration(), "held-native-job");
+        when(run.capacity.submittedExecution(any())).thenReturn(Optional.of(new ClusterCapacityStore.SubmittedExecution(submitted, true)));
+        run.pending.set(null);
+        InMemoryStateStore checkpoints = new InMemoryStateStore();
+        checkpoints.create(PIPE, "STOPPED", ResumeCohortRun.NOW);
+        DesiredState start = new DesiredState(PIPE, PipelineState.RUNNING, "a".repeat(64), false, null, true, 0L);
+        when(run.desired.read(PIPE)).thenReturn(Optional.of(start));
+        when(run.state.read(PIPE)).thenAnswer(call -> checkpoints.read(PIPE));
+        when(run.state.compareAndSwap(eq(PIPE), anyLong(), anyString(), any())).thenAnswer(call ->
+                checkpoints.compareAndSwap(PIPE, call.getArgument(1), call.getArgument(2), call.getArgument(3)));
+        when(run.engine.awaitTerminal(eq(PIPE), any())).thenReturn(true);
+        when(run.engine.hasLiveJob(PIPE)).thenAnswer(call -> run.engine.nativeRun(PIPE)
+                .filter(nativeRun -> nativeRun.status() == JobStatus.RUNNING).isPresent());
+        doAnswer(call -> {
+            run.events.add("cancelJob");
+            when(run.engine.nativeRun(PIPE)).thenReturn(Optional.empty());
+            return null;
+        }).when(run.engine).cancel(PIPE);
+        when(run.capacity.reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any())).thenAnswer(call -> {
+            run.events.add("reserveCapacity");
+            ClusterCapacityReservation reserved = run.reservation(null, call.getArgument(0), call.getArgument(4));
+            run.allocated.set(reserved);
+            return ResumeCohortRun.result(reserved, null);
+        });
+        when(run.capacity.recordExecutionSources(any(), any(), anySet())).thenAnswer(call ->
+                ResumeCohortRun.result(call.getArgument(0), null));
+        PipelineConverger converger = new PipelineConverger(run.desired, run.state, run.actuator,
+                Clock.fixed(ResumeCohortRun.NOW, java.time.ZoneOffset.UTC), run.admission);
+
+        converger.converge(PIPE);
+        assertThat(checkpoints.read(PIPE).orElseThrow().stateJson()).isEqualTo("RUNNING");
+        assertThat(checkpoints.read(PIPE).orElseThrow().epoch()).isEqualTo(1);
+        run.ownership.permit(PIPE);
+        converger.converge(PIPE);
+
+        verify(run.engine).submitFenced(eq(PIPE), any(), anyMap(), any(), eq(2L), eq(10L), eq(2L));
+        verify(run.capacity, times(1)).advanceExecution(any(), any(), eq(ResumeCohortRun.ORIGINAL.keySet()));
+        assertThat(run.events).containsSubsequence("cancelJob", "stopCapture[keep]", "retireExecution",
+                "acquireClaim", "reserveCapacity", "advanceExecution", "submitJob", "recordSubmission");
+        converger.converge(PIPE);
+        verify(run.engine, times(1)).submitFenced(eq(PIPE), any(), anyMap(), any(), anyLong(), anyLong(), anyLong());
+        verify(run.recovery, never()).enqueue(any(), any());
+    }
+
+    @Test
     void aSettledLoadOnTheExactSameCohortResumesItsHeldJob() {
         ResumeCohortRun run = new ResumeCohortRun(ResumeCohortRun.ORIGINAL);
 
@@ -879,6 +933,8 @@ class EngineLifecycleActuatorTest {
         private final PipelineActuationOwnership ownership = mock(PipelineActuationOwnership.class);
         private final PipelineCaptureCoordinator captures = mock(PipelineCaptureCoordinator.class);
         private final StateStore state = mock(StateStore.class);
+        private final DesiredStore desired = mock(DesiredStore.class);
+        private final ClusterRecoveryRuntime admission;
         private final WorkloadOwner owner = new WorkloadOwner("node-a", "boot-node-a");
         private final ClusterExecutionProfile profile = new ClusterExecutionProfile("cluster-a", 2,
                 new ExecutionProfile(1, Map.of("runtime", "test")));
@@ -897,7 +953,6 @@ class EngineLifecycleActuatorTest {
             var stores = mock(StorePort.class);
             var profiles = mock(ClusterProfileStore.class);
             var artifacts = mock(ArtifactStore.class);
-            var desired = mock(DesiredStore.class);
             when(stores.clusterCapacity()).thenReturn(capacity);
             when(stores.clusterProfiles()).thenReturn(profiles);
             when(stores.clusterRecovery()).thenReturn(recovery);
@@ -912,7 +967,7 @@ class EngineLifecycleActuatorTest {
             pending.set(new PendingPipelineResume(21, DesiredStateFingerprint.of(desired.read(PIPE).orElseThrow()),
                     held.get(), "held-native-job", "held-native-execution"));
             when(state.read(PIPE)).thenReturn(Optional.of(new CheckpointDoc(PIPE, "RUNNING", 21, NOW)));
-            when(state.pendingResume(PIPE)).thenAnswer(call -> Optional.of(pending.get()));
+            when(state.pendingResume(PIPE)).thenAnswer(call -> Optional.ofNullable(pending.get()));
 
             var nativeMember = mock(HazelcastInstance.class);
             var cluster = mock(Cluster.class);
@@ -953,6 +1008,7 @@ class EngineLifecycleActuatorTest {
                     "held-native-job", 1, 9, 2, JobStatus.SUSPENDED, Optional.of(new NativeExecutionStartup.Evidence(
                             1, 9, 2, "held-native-job", "held-native-execution", Set.of("read"),
                             Map.of("read", ORIGINAL.size()), initialized)))));
+            when(ownership.isFenced()).thenReturn(true);
             when(ownership.currentClaim(PIPE)).thenAnswer(call -> Optional.ofNullable(held.get()));
             when(ownership.mayStart(PIPE)).thenAnswer(call -> held.get() != null);
             when(ownership.proveExecution(any())).thenReturn(true);
@@ -1064,7 +1120,7 @@ class EngineLifecycleActuatorTest {
             ClusterProperties properties = new ClusterProperties();
             properties.setId("cluster-a");
             properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
-            var admission = new ClusterRecoveryRuntime(stores, dags, captures, engine, ownership,
+            admission = new ClusterRecoveryRuntime(stores, dags, captures, engine, ownership,
                     mock(ClusterWorkloadClaims.class), gate, nativeMember, properties,
                     new ClusterCapacityProperties().limits(), "default", Duration.ofSeconds(30));
             actuator = new EngineLifecycleActuator(engine, dags, captures, teardown, ownership,
@@ -1108,7 +1164,8 @@ class EngineLifecycleActuatorTest {
         }
 
         private ClusterCapacityReservation reservation(Long execution, WorkloadClaim claim, Map<String, ClusterCapacityDemand> demand) {
-            return new ClusterCapacityReservation("reserved", "cluster-a", PIPE, "inc", pending.get().intentFingerprint(), profile,
+            return new ClusterCapacityReservation("reserved", "cluster-a", PIPE, "inc", pending.get() == null ? DesiredStateFingerprint.of(desired.read(PIPE).orElseThrow())
+                    : pending.get().intentFingerprint(), profile,
                     WorkloadClaimFence.from(claim), demand, NOW, NOW.plusSeconds(30), execution, null);
         }
 

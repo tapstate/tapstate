@@ -123,6 +123,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         Set<String> sharedConnectors;
         try {
             engine.refuseIfLost(pipelineId);
+            // A preceding stop can retire this member's control claim. Re-entry uses the same
+            // qualified ownership port; a cooldown or another holder leaves the accepted start pending.
+            if (actuation.isFenced() && actuation.currentClaim(pipelineId).isEmpty()
+                    && !actuation.permit(pipelineId).granted()) { return; }
             prepared = dagSource.prepareStart(pipelineId, stateTeardown.defaultDatabase());
             // Every member the run would take part on loads the connectors its sinks open, asked before the run
             // is fenced or anything is opened: a member that finds out only as its sink opens fails a run that

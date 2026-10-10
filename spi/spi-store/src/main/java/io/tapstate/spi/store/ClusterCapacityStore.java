@@ -29,6 +29,11 @@ public interface ClusterCapacityStore {
         return new Result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
     }
 
+    /** Reads the unique submitted receipt for the complete current execution without authorizing another run. */
+    default Optional<SubmittedExecution> submittedExecution(WorkloadClaim expected) {
+        return Optional.empty();
+    }
+
     /** Read-only restoration of the reservation linked to the exact accepted request and state epoch. */
     default Optional<ClusterCapacityReservation> resumeReservation(PendingPipelineResume pendingResume) {
         return Optional.empty();
@@ -76,6 +81,16 @@ public interface ClusterCapacityStore {
     /** The profile and demand from one read-only snapshot; unknown demand remains a coded refusal. */
     default Optional<Snapshot> readOccupied(String clusterId) {
         return Optional.empty();
+    }
+
+    record SubmittedExecution(ClusterCapacityReservation reservation, boolean authorityRetired) {
+        public SubmittedExecution {
+            Objects.requireNonNull(reservation, "reservation");
+            if (reservation.executionGeneration() == null || reservation.executionGeneration() < 1
+                    || reservation.nativeJobId() == null || reservation.nativeJobId().isBlank()) {
+                throw new IllegalArgumentException("submitted execution requires its existing native receipt");
+            }
+        }
     }
 
     record Snapshot(ClusterExecutionProfile profile, Map<String, ClusterCapacityDemand> occupiedByNode) {

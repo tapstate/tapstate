@@ -115,6 +115,79 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
     }
 
     @Override
+    public java.util.Optional<SubmittedExecution> submittedExecution(WorkloadClaim expected) {
+        Objects.requireNonNull(expected, "expected");
+        if (!completeSubmittedContext(expected)) {
+            return java.util.Optional.empty();
+        }
+        return profileStore.transaction(session -> {
+            Document profileDocument = profiles.aggregate(session, List.of(
+                    new Document("$match", new Document("_id", expected.key().clusterId())),
+                    new Document("$set", new Document("capacityReadTime", "$$NOW")))).first();
+            if (profileDocument == null) {
+                return java.util.Optional.empty();
+            }
+            ClusterExecutionProfile profile = MongoClusterProfileStore.profile(profileDocument);
+            if (profile.generation() != expected.profileGeneration() || !profile.equals(expected.executionProfile())) {
+                return java.util.Optional.empty();
+            }
+            Instant now = profileDocument.getDate("capacityReadTime").toInstant();
+            Document live = WorkloadClaimDocuments.liveAuthority(WorkloadClaimFence.from(expected));
+            live.put("$expr", new Document("$gt", List.of("$leaseUntil", Date.from(now))));
+            Document currentDocument = claims.find(session, live).first();
+            if (currentDocument == null) {
+                return java.util.Optional.empty();
+            }
+            WorkloadClaim current = MongoWorkloadClaimStore.readDocument(currentDocument);
+            if (!completeSubmittedContext(current) || !PendingPipelineResume.sameExecutionContext(expected, current)
+                    || currentDocument.getDate("retiredAuthorizationUntil") == null) {
+                return java.util.Optional.empty();
+            }
+            Document identity = new Document("clusterId", current.key().clusterId())
+                    .append("pipelineId", current.key().resourceId()).append("incarnationId", current.executionIncarnation())
+                    .append("executionGeneration", current.executionGeneration())
+                    .append("pipelineClaim.claimGeneration", current.executionClaimGeneration())
+                    .append("pipelineClaim.executionGeneration", current.executionGeneration())
+                    .append("pipelineClaim.profileGeneration", current.profileGeneration())
+                    .append("nativeJobId", new Document("$ne", null));
+            List<Document> rows = occupancy.find(session, identity).limit(2).into(new ArrayList<>());
+            if (rows.size() != 1) {
+                return java.util.Optional.empty();
+            }
+            Document row = rows.getFirst();
+            if (!(row.get("nativeJobId") instanceof String nativeJobId) || nativeJobId.isBlank()) {
+                return java.util.Optional.empty();
+            }
+            ClusterCapacityReservation receipt = reservation(row);
+            WorkloadClaimFence authority = receipt.pipelineClaim();
+            ClusterExecutionMember originalOwner = current.executionMembers().get(authority.owner().nodeId());
+            if (originalOwner == null || !originalOwner.bootId().equals(authority.owner().bootId())) {
+                return java.util.Optional.empty();
+            }
+            // Acquisition topology can refresh without changing the retained execution context.
+            WorkloadClaimFence original = new WorkloadClaimFence(authority.key(), authority.owner(), authority.claimGeneration(),
+                    authority.executionGeneration(), current.executionTopologyRevision(), authority.profileGeneration());
+            if (!matchesExecutionContext(currentDocument, original, receipt.profile(), key(receipt),
+                    current.executionRevision(), receipt.demandByNode().keySet()) || row.getDate("authorityUntil") == null) {
+                return java.util.Optional.empty();
+            }
+            boolean retired = !receipt.deadline().isAfter(now) && fencedAt(session, row, now);
+            return java.util.Optional.of(new SubmittedExecution(receipt, retired));
+        });
+    }
+
+    private static boolean completeSubmittedContext(WorkloadClaim claim) {
+        return claim.key().type() == WorkloadClaimType.PIPELINE_ACTUATION && claim.profileGeneration() > 0
+                && claim.executionGeneration() > 0 && claim.contextExecutionGeneration() == claim.executionGeneration()
+                && claim.executionClaimGeneration() > 0 && claim.executionProfile() != null
+                && claim.executionProfile().generation() == claim.profileGeneration()
+                && claim.executionTopologyRevision() != null && claim.executionIncarnation() != null
+                && !claim.executionIncarnation().isBlank() && claim.executionRevision() != null
+                && !claim.executionRevision().isBlank() && !claim.executionNodeIds().isEmpty()
+                && claim.executionMembers().keySet().equals(claim.executionNodeIds());
+    }
+
+    @Override
     public java.util.Optional<ClusterCapacityReservation> resumeReservation(PendingPipelineResume expected) {
         Objects.requireNonNull(expected, "expected");
         return profileStore.transaction(session -> {

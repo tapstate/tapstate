@@ -48,6 +48,27 @@ class PipelineConvergerTest {
             new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
 
     @Test
+    void aCodedMissingJobAdmissionRefusalBecomesTheObservablePipelineFailure() {
+        actuator.carryingNothing();
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        state.create("p1", StateJson.of(RUNNING), T0);
+        TapstateException refused = new TapstateException(LifecycleError.CLUSTER_CAPACITY_UNPROVEN,
+                Map.of("pipeline", "p1", "reason", "submitted execution history is unknown"), null);
+        RebuildAdmission admission = new RebuildAdmission() {
+            @Override public boolean admits(String pipelineId) { return false; }
+            @Override public boolean admitsMissingJob(String pipelineId) { throw refused; }
+        };
+        PipelineConverger guarded = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC), admission);
+
+        ConvergeResult result = guarded.converge("p1");
+
+        assertThat(result.failure()).contains(refused);
+        assertThat(result.checkpoint().orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+        assertThat(state.read("p1").orElseThrow().epoch()).isEqualTo(1);
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    @Test
     @DisplayName("with no desired intent there is nothing to converge and no checkpoint is written")
     void noDesiredIsANoOp() {
         ConvergeResult result = converger.converge("p1");

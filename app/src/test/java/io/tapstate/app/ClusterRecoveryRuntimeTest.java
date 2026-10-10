@@ -107,6 +107,68 @@ class ClusterRecoveryRuntimeTest {
         });
     }
 
+    @Test void anAcceptedStampedStartWaitsForItsActualPriorAuthorityRetirement() {
+        SubmittedStart start = stampedStart(false, false);
+        assertThat(runtime.admitsMissingJob("p")).isFalse();
+        assertThat(runtime.prepare("p", plan(List.of()), ownership)).isFalse();
+        verify(capacity, never()).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+
+        when(capacity.submittedExecution(start.current())).thenReturn(Optional.of(
+                new ClusterCapacityStore.SubmittedExecution(start.previous(), true)));
+        assertThat(runtime.admitsMissingJob("p")).isTrue();
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+    }
+
+    @Test void theSameSubmittedStartCannotBypassAutomaticRecoveryForAnotherMissingJob() {
+        stampedStart(true, true);
+        assertThat(runtime.admitsMissingJob("p")).isFalse();
+        assertThat(runtime.prepare("p", plan(List.of()), ownership)).isFalse();
+        verify(capacity, never()).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+    }
+
+    @Test void aSupersedingStateEpochCannotContinueTheOldStampedStart() {
+        stampedStart(true, false);
+        when(store.state().read("p")).thenReturn(Optional.of(new io.tapstate.core.lifecycle.CheckpointDoc("p", "RUNNING", 3, NOW)));
+        assertThat(runtime.admitsMissingJob("p")).isFalse();
+        verify(capacity, never()).submittedExecution(any());
+        verify(capacity, never()).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+    }
+
+    @Test void anUnknownSubmittedHistoryRefusesTheAcceptedStartBeforeAnotherAllocation() {
+        stampedStart(true, false);
+        when(capacity.submittedExecution(any())).thenReturn(Optional.empty());
+        assertThatThrownBy(() -> runtime.admitsMissingJob("p")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(LifecycleError.CLUSTER_CAPACITY_UNPROVEN));
+        verify(capacity, never()).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+    }
+
+    @Test void aStampedStartCannotBorrowAnotherArtifactIncarnationsSubmission() {
+        stampedStart(true, false);
+        when(store.artifacts().identity("p")).thenReturn(Optional.of(new ArtifactIdentity("p", "inc-next", "a".repeat(64))));
+        assertThatThrownBy(() -> runtime.admitsMissingJob("p")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(LifecycleError.CLUSTER_CAPACITY_UNPROVEN));
+        verify(capacity, never()).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+    }
+
+    private SubmittedStart stampedStart(boolean retired, boolean sameIntent) {
+        WorkloadClaim current = allocatedClaim(1, ORIGINAL_MEMBERS);
+        DesiredState intent = new DesiredState("p", PipelineState.RUNNING, "a".repeat(64), false, null, true, 0L);
+        when(store.desired().read("p")).thenReturn(Optional.of(intent));
+        when(store.state().read("p")).thenReturn(Optional.of(new io.tapstate.core.lifecycle.CheckpointDoc("p", "RUNNING", 1, NOW)));
+        when(ownership.currentClaim("p")).thenReturn(Optional.of(current));
+        String fingerprint = io.tapstate.core.lifecycle.DesiredStateFingerprint.of(sameIntent ? intent
+                : new DesiredState("p", PipelineState.RUNNING, "a".repeat(64)));
+        ClusterCapacityReservation previous = new ClusterCapacityReservation("previous", "cluster", "p", "inc", fingerprint,
+                profile, WorkloadClaimFence.from(current), NODES.stream().collect(java.util.stream.Collectors.toMap(
+                        node -> node, node -> demand)), NOW.minusSeconds(60), NOW.minusSeconds(1), 1L, "prior-native-job");
+        when(capacity.submittedExecution(current)).thenReturn(Optional.of(new ClusterCapacityStore.SubmittedExecution(previous, retired)));
+        return new SubmittedStart(current, previous);
+    }
+
+    private record SubmittedStart(WorkloadClaim current, ClusterCapacityReservation previous) {}
+
     @Test void unknownOwnedResourceDemandNeverReservesOrAllocates() {
         DagSource.PlannedStart planned = plan(List.of("script output has no proven bound"));
         assertThatThrownBy(() -> runtime.prepare("p", planned, ownership)).isInstanceOfSatisfying(TapstateException.class,

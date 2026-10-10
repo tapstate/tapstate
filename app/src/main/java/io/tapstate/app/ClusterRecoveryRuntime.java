@@ -110,7 +110,36 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 && local.capacity().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current))) {
             return true;
         }
-        return permitted(pipelineId);
+        if (permitted(pipelineId)) { return true; }
+        return acceptedStartPending(pipelineId, current).orElse(false);
+    }
+
+    /** An accepted ordinary START is owed only until its exact intent has actually submitted. */
+    private Optional<Boolean> acceptedStartPending(String pipelineId, WorkloadClaim current) {
+        DesiredState intent = stores.desired().read(pipelineId).orElse(null);
+        var checkpoint = stores.state().read(pipelineId).orElse(null);
+        if (intent == null || intent.targetState() != PipelineState.RUNNING || !intent.reassemble()
+                || intent.rebuiltAtStateEpoch() == null || intent.rebuiltAtStateEpoch() == Long.MAX_VALUE
+                || checkpoint == null || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING
+                || checkpoint.epoch() != intent.rebuiltAtStateEpoch() + 1 || current.executionGeneration() == 0) {
+            return Optional.empty();
+        }
+        if (!membership.businessEligible() || !actuation.mayStart(pipelineId)) { return Optional.of(false); }
+        // A new profile belongs to the existing cold-recovery path, with its own queue provenance.
+        if (current.executionProfile() != null && current.executionProfile().generation() != current.profileGeneration()) {
+            return Optional.empty();
+        }
+        var recorded = stores.clusterCapacity().submittedExecution(current);
+        if (recorded.isEmpty()) {
+            throw unproven(pipelineId, "the accepted start has no unique submitted execution history");
+        }
+        var prior = recorded.orElseThrow();
+        ArtifactIdentity artifact = stores.artifacts().identity(pipelineId).orElse(null);
+        if (artifact == null || !artifact.incarnation().equals(prior.reservation().incarnationId())) {
+            throw unproven(pipelineId, "the accepted start differs from its retained artifact incarnation");
+        }
+        return Optional.of(!prior.reservation().intentFingerprint().equals(DesiredStateFingerprint.of(intent))
+                && prior.authorityRetired());
     }
 
     private boolean permitted(String pipelineId) {
@@ -167,6 +196,8 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
             allocations.put(pipelineId, new Allocation(facts, profile, key, null, true));
             return true;
         }
+        if (resume == null && !pendingCapacity && !pendingRecovery
+                && acceptedStartPending(pipelineId, current).filter(ready -> !ready).isPresent()) { return false; }
         ClusterCapacityStore.Result reserved = resume == null
                 ? stores.clusterCapacity().reserve(current, profile, artifact.incarnation(),
                         DesiredStateFingerprint.of(intent), facts.perMemberUpperBounds(), limits, properties.getWorkloadClaimTtl())

@@ -183,10 +183,10 @@ public final class PipelineConverger {
         // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
         // rather than "this process did not start it", so the next tick actuates nothing.
         if (!actuator.isCarryingAJob(pipelineId)) {
-            if (!rebuilds.admitsMissingJob(pipelineId)) {
-                return ConvergeResult.converged(current);
-            }
             try {
+                if (!rebuilds.admitsMissingJob(pipelineId)) {
+                    return ConvergeResult.converged(current);
+                }
                 actuator.start(pipelineId);
             } catch (TapstateException refused) {
                 // Same refusal, third road. This one is the worst of the three to let escape: the

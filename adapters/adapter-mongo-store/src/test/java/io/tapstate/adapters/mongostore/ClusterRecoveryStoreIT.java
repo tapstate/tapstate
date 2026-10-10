@@ -966,6 +966,155 @@ class ClusterRecoveryStoreIT {
     }
 
     @Test
+    void submittedExecutionReadPreservesHistoricalAndCurrentFingerprintsWithoutMutatingFacts() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("read-history", true, Duration.ofSeconds(3), true);
+            Map<String, List<Document>> before = fixture.storedFacts();
+            var historical = fixture.capacity.submittedExecution(restart.controller()).orElseThrow();
+            assertThat(historical.reservation()).isEqualTo(restart.historicalReceipt());
+            assertThat(historical.authorityRetired()).isTrue();
+            assertThat(historical.reservation().intentFingerprint()).isEqualTo(restart.pipeline().intentFingerprint());
+            String accepted = DesiredStateFingerprint.of(restart.accepted());
+            assertThat(historical.reservation().intentFingerprint()).isNotEqualTo(accepted);
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+
+            WorkloadClaim renewed = fixture.workloads.renew(restart.controller(), Duration.ofSeconds(5)).orElseThrow();
+            before = fixture.storedFacts();
+            assertThat(fixture.capacity.submittedExecution(renewed)).contains(historical);
+            assertThat(fixture.capacity.submittedExecution(restart.controller())).contains(historical);
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+            var reserved = fixture.capacity.reserve(renewed, fixture.profile, restart.pipeline().key().incarnation(),
+                    accepted, DEMAND, LIMITS, PERMIT_TTL);
+            var advanced = fixture.capacity.advanceExecution(reserved.reservation(), renewed, LIVE);
+            assertThat(advanced.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            var submitted = fixture.capacity.submitted(advanced.reservation(), WorkloadClaimFence.from(advanced.advancedPipelineClaim()),
+                    "read-current-job");
+            assertThat(submitted.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            before = fixture.storedFacts();
+            var current = fixture.capacity.submittedExecution(advanced.advancedPipelineClaim()).orElseThrow();
+            assertThat(current.reservation()).isEqualTo(submitted.reservation());
+            assertThat(current.reservation().intentFingerprint()).isEqualTo(accepted);
+            assertThat(current.authorityRetired()).isFalse();
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+
+            WorkloadClaim inherited = fixture.retireAndAcquire(advanced.advancedPipelineClaim(), fixture.nodeB.owner(), TTL);
+            before = fixture.storedFacts();
+            var retiredCurrent = fixture.capacity.submittedExecution(inherited).orElseThrow();
+            assertThat(retiredCurrent.reservation()).isEqualTo(submitted.reservation());
+            assertThat(retiredCurrent.authorityRetired()).isTrue();
+            assertThat(retiredCurrent.reservation().intentFingerprint()).isEqualTo(accepted);
+            assertThat(fixture.workloads.read(inherited.key()).orElseThrow().claim().executionGeneration()).isEqualTo(2);
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+        }
+    }
+
+    @Test
+    void submittedExecutionReadWaitsForTheActualOriginalCachedPromiseAndDeadline() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("read-waiting", true, Duration.ofSeconds(3), false);
+            Map<String, List<Document>> before = fixture.storedFacts();
+            var waiting = fixture.capacity.submittedExecution(restart.controller()).orElseThrow();
+            assertThat(waiting.reservation()).isEqualTo(restart.historicalReceipt());
+            assertThat(waiting.authorityRetired()).isFalse();
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+
+            fixture.awaitRetirement(restart.controller().key());
+            before = fixture.storedFacts();
+            var retired = fixture.capacity.submittedExecution(restart.controller()).orElseThrow();
+            assertThat(retired.reservation()).isEqualTo(waiting.reservation());
+            assertThat(retired.authorityRetired()).isTrue();
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+        }
+    }
+
+    @Test
+    void submittedExecutionReadCannotInferAMissingUnsubmittedOrAmbiguousReceipt() {
+        for (String missing : List.of("missing", "unsubmitted", "ambiguous", "blank")) {
+            try (Fixture fixture = new Fixture()) {
+                OrdinaryRestart restart = fixture.ordinaryRestart("read-missing", !missing.equals("unsubmitted"),
+                        Duration.ofSeconds(3), true);
+                if (missing.equals("missing")) {
+                    fixture.occupancy.deleteOne(new Document("_id", restart.historicalReceipt().reservationId()));
+                } else if (missing.equals("ambiguous")) {
+                    Document original = fixture.occupancy.find(new Document("_id", restart.historicalReceipt().reservationId())).first();
+                    // A duplicated stored receipt is corruption, never evidence of another successful submission.
+                    fixture.occupancy.insertOne(new Document(original).append("_id", UUID.randomUUID().toString()));
+                } else if (missing.equals("blank")) {
+                    fixture.occupancy.updateOne(new Document("_id", restart.historicalReceipt().reservationId()),
+                            new Document("$set", new Document("nativeJobId", " \t ")));
+                }
+                Map<String, List<Document>> before = fixture.storedFacts();
+                assertThat(fixture.capacity.submittedExecution(restart.controller())).as(missing).isEmpty();
+                assertThat(fixture.storedFacts()).isEqualTo(before);
+            }
+        }
+    }
+
+    @Test
+    void submittedExecutionReadRejectsIncompleteAndMismatchedImmutableContexts() {
+        for (String field : List.of("executionIncarnation", "executionProfile", "executionClaimGeneration", "executionMembers", "executionRevision",
+                "receiptOwnerNode", "receiptOwnerBoot")) {
+            try (Fixture fixture = new Fixture()) {
+                OrdinaryRestart restart = fixture.ordinaryRestart("read-context", true, Duration.ofSeconds(3), true);
+                Object incompatible = switch (field) {
+                    case "executionIncarnation" -> "not-the-submitted-incarnation";
+                    case "executionProfile" -> {
+                        ExecutionProfile other = new ExecutionProfile(1, Map.of("build", "other", "threads", "4"));
+                        Document original = fixture.claims.find(new Document("_id", MongoClusterCapacityStore.claimId("east", "read-context")))
+                                .first().get("executionProfile", Document.class);
+                        yield new Document(original).append("formatVersion", other.formatVersion())
+                                .append("attributes", new Document(other.attributes())).append("hash", other.hash());
+                    }
+                    case "executionMembers" -> List.of();
+                    case "executionRevision" -> null;
+                    case "receiptOwnerNode" -> "not-an-execution-member";
+                    case "receiptOwnerBoot" -> "not-the-execution-boot";
+                    default -> restart.controller().claimGeneration();
+                };
+                if (field.startsWith("receiptOwner")) {
+                    String identity = field.equals("receiptOwnerNode") ? "ownerNodeId" : "ownerBootId";
+                    fixture.occupancy.updateOne(new Document("_id", restart.historicalReceipt().reservationId()),
+                            new Document("$set", new Document("pipelineClaim." + identity, incompatible)));
+                } else {
+                    fixture.claims.updateOne(new Document("_id", MongoClusterCapacityStore.claimId("east", "read-context")),
+                            new Document("$set", new Document(field, incompatible)));
+                }
+                WorkloadClaim current = fixture.workloads.read(restart.controller().key()).orElseThrow().claim();
+                Map<String, List<Document>> before = fixture.storedFacts();
+                assertThat(fixture.capacity.submittedExecution(current)).as(field).isEmpty();
+                assertThat(fixture.capacity.submittedExecution(restart.controller())).as("stale " + field).isEmpty();
+                assertThat(fixture.storedFacts()).isEqualTo(before);
+            }
+        }
+    }
+
+    @Test
+    void submittedExecutionReadUsesImmutableTopologyAcrossLiveAcquisitionRefresh() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("read-refreshed", true, Duration.ofSeconds(3), true);
+            WorkloadClaim shortLease = fixture.workloads.renew(restart.controller(), Duration.ofSeconds(3)).orElseThrow();
+            fixture.memberDocuments.updateOne(new Document("_id", "east"), new Document("$set", new Document("revision", 3L)));
+            WorkloadClaim refreshed = fixture.workloads.acquire(shortLease.key(), shortLease.owner(), 3, TTL).claim();
+            assertThat(refreshed.claimGeneration()).isEqualTo(restart.controller().claimGeneration());
+            assertThat(refreshed.topologyRevision()).isEqualTo(3);
+            assertThat(refreshed.executionTopologyRevision()).isEqualTo(2);
+            Map<String, List<Document>> before = fixture.storedFacts();
+            var reading = fixture.capacity.submittedExecution(refreshed).orElseThrow();
+            assertThat(reading.reservation()).isEqualTo(restart.historicalReceipt());
+            assertThat(reading.authorityRetired()).isFalse();
+            assertThat(fixture.capacity.submittedExecution(restart.controller())).contains(reading);
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+            fixture.awaitRetirement(refreshed.key());
+            before = fixture.storedFacts();
+            var retired = fixture.capacity.submittedExecution(refreshed).orElseThrow();
+            assertThat(retired.reservation()).isEqualTo(reading.reservation());
+            assertThat(retired.authorityRetired()).isTrue();
+            assertThat(fixture.capacity.submittedExecution(restart.controller())).contains(retired);
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+        }
+    }
+
+    @Test
     void retiredCapacityReadOmitsDemandWithoutDeletingItsStoredRow() {
         try (Fixture fixture = new Fixture()) {
             PipelineResource resource = new PipelineResource("retired", null, List.of(SourceRef.bare("crm")),
@@ -1661,7 +1810,10 @@ class ClusterRecoveryStoreIT {
             return Map.of("queue", queue.find().into(new ArrayList<>()),
                     "profiles", profileDocuments.find().into(new ArrayList<>()),
                     "claims", claims.find().into(new ArrayList<>()),
-                    "capacity", occupancy.find().into(new ArrayList<>()));
+                    "capacity", occupancy.find().into(new ArrayList<>()),
+                    "state", stateDocuments.find().into(new ArrayList<>()),
+                    "desired", desiredDocuments.find().into(new ArrayList<>()),
+                    "artifacts", artifactDocuments.find().into(new ArrayList<>()));
         }
 
         private Resume resumePipeline(String id, Duration ttl) {
