@@ -215,7 +215,7 @@ public final class PipelineDraftService {
             return new PublishResult(PipelineDraftMutation.ARTIFACT_CONFLICT, null, null);
         }
         PipelineResource candidate = compile(pipelineId, draft);
-        ApplyPlan plan = validation == null ? null : validation.planDraftPublication(candidate);
+        ApplyPlan plan = validation == null ? null : validation.planDraftPublication(updatedBy, candidate);
         PipelineResource artifact = plan == null ? candidate
                 : (PipelineResource) plan.artifacts().getFirst().resource();
         String artifactHash = CanonicalHash.of(artifact);

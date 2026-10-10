@@ -553,6 +553,12 @@ public final class ApplyService {
         return plan;
     }
 
+    /** Prepares a publication with the verified publisher's server-managed resource attribution. */
+    public ApplyPlan planDraftPublication(String principal, Resource resource) {
+        Objects.requireNonNull(principal, "principal");
+        return attributed(principal, planDraftPublication(resource));
+    }
+
     /** Re-derives the published pipeline's schema after the artifact transaction has committed. */
     public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
