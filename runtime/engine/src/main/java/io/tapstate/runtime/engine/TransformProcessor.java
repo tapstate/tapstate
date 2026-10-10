@@ -43,6 +43,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
     }
 
     private final FlatMapper<Envelope, Object> flatMapper;
+    private final TransformPort port;
     private final LevelBounds bounds;
     // Times each row through the port, which is this stage's unit of work. Counts for nobody until init
     // says whether there is a job to report into.
@@ -63,7 +64,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
      * still rather than one that runs ahead.
      */
     public TransformProcessor(TransformPort port, LevelBounds bounds) {
-        Objects.requireNonNull(port, "port");
+        this.port = Objects.requireNonNull(port, "port");
         this.bounds = bounds;
         // A port is a pure function over rows and knows nothing about where its input sat, so what the
         // event covered is stamped back onto everything it produced. The whole of it travels, not the
@@ -100,6 +101,11 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         this.pipelineId = context.jobConfig().getName();
         HazelcastInstance instance = context.hazelcastInstance();
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
+    }
+
+    @Override
+    public void close() {
+        port.close();
     }
 
     /**

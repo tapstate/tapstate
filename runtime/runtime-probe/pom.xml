@@ -12,7 +12,7 @@
 
   <artifactId>runtime-probe</artifactId>
   <name>Tapstate :: Runtime :: Connection Probe</name>
-  <description>The synchronous control-to-runtime seam (the probe whitelist, a closed set of two): the connection-probe and schema-discovery-probe interfaces plus the runtime-side delegates that drive the connector-plane tester and discoverer ports. Carries no third-party so control-core stays clean when it holds this narrow reference.</description>
+  <description>The synchronous control-to-runtime seam: the closed probe whitelist and runtime-side delegates for connector operations and finite Pipeline preview. Carries no third-party so control-core stays clean when it holds this narrow reference.</description>
 
   <dependencies>
     <dependency>

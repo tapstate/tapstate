@@ -352,7 +352,7 @@ public final class CanonicalWriter {
             b.put(e.getKey(), switch (e.getValue()) {
                 case FieldRule.Rename r -> scalar("$" + r.sourceField());
                 case FieldRule.Drop ignored -> scalar(Boolean.FALSE);
-                case FieldRule.Literal l -> scalar(l.value());
+                case FieldRule.Literal l -> fromValue(l.value());
                 case FieldRule.Computed c -> new Node.ScalarN("=" + c.celExpr(), Node.Style.EXPRESSION);
             });
         }

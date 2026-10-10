@@ -191,6 +191,24 @@ public final class PipelineDraftService {
         return validateAndPrepare(pipelineId, candidate);
     }
 
+    /** Compiles an editor candidate in memory without saving a draft revision. */
+    public PipelineResource previewCandidate(String pipelineId, PipelineDraft candidate) {
+        Objects.requireNonNull(candidate, "candidate");
+        PipelineDraft current = store.get(Objects.requireNonNull(pipelineId, "pipelineId"))
+                .orElseThrow(() -> new TapstateException(
+                        PipelineDraftError.NOT_FOUND, java.util.Map.of("id", pipelineId), null));
+        if (!pipelineId.equals(candidate.pipelineId()) || current.mode() != candidate.mode()) {
+            throw new TapstateException(PipelineDraftError.MODE_CONFLICT,
+                    java.util.Map.of("id", pipelineId), null);
+        }
+        PipelineDraft transientDraft = new PipelineDraft(pipelineId, current.schemaVersion(),
+                current.revision(), current.mode(), candidate.name(), candidate.description(),
+                candidate.graph(), candidate.wizard(), current.baseArtifactHash(),
+                current.publishedDraftRevision(), current.publishedArtifactHash(), current.createdAt(),
+                current.updatedAt(), current.updatedBy());
+        return validateAndPrepare(pipelineId, compile(pipelineId, transientDraft));
+    }
+
     /**
      * Compiles and hands one conditional publication to the store. The store owns the transaction that
      * advances the Artifact and the draft markers; this service never performs a split write.

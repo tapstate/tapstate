@@ -116,6 +116,15 @@ class ApiExceptionHandlerTest {
     }
 
     @Test
+    void anOverloadedPreviewAnswersServiceUnavailable() {
+        ResponseEntity<ApiError> response = handler.handle(
+                new TapstateException(ControlError.PREVIEW_OVERLOADED, Map.of(), null));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getBody().code()).isEqualTo("control.preview-overloaded");
+    }
+
+    @Test
     void aMissingOrRejectedCredentialIsUnauthorized() {
         // Both the interceptor's "no valid credential" and the login flow's own rejection map to 401.
         assertThat(handler.handle(new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null)).getStatusCode())

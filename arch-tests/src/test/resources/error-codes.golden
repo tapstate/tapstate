@@ -18,6 +18,7 @@ actuation.no-safe-parallelism
 actuation.not-a-pipeline
 actuation.parallelism-needs-a-key
 actuation.pipeline-not-found
+actuation.preview-refused
 actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
 actuation.source-table-ambiguous
@@ -173,6 +174,7 @@ control.bootstrap-forbidden
 control.cloud-auth-unavailable
 control.forbidden
 control.malformed-request
+control.preview-overloaded
 control.schema-derivation-incomplete
 control.source-config-reveal-unavailable
 control.state-database-unavailable
