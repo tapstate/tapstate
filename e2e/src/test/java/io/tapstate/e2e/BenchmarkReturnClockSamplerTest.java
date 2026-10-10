@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongFunction;
@@ -31,6 +32,7 @@ class BenchmarkReturnClockSamplerTest {
         assertThat(threads.getFirst().isDaemon()).isTrue();
         assertThat(result).containsExactly(sample(0), sample(1));
         assertThat(sampler.evidence()).containsEntry("firstRecorded", true).containsEntry("finalRecorded", true)
+                .containsEntry("mode", "PERIODIC").containsEntry("periodicPollingEnabled", true)
                 .containsEntry("workerExited", true).containsEntry("performanceAcceptanceEligible", false)
                 .containsEntry("samplingCostQualified", false);
         assertThatThrownBy(result::clear).isInstanceOf(UnsupportedOperationException.class);
@@ -44,10 +46,45 @@ class BenchmarkReturnClockSamplerTest {
         var sampler = new BenchmarkReturnClockSampler(BenchmarkReturnClockSamplerTest::sample);
         assertThat(BenchmarkReturnClockSampler.SAMPLE_DELAY).isEqualTo(Duration.ofMillis(50));
         assertThat(sampler.evidence()).containsEntry("fixedDelayNanos", 50_000_000L)
+                .containsEntry("mode", "PERIODIC").containsEntry("periodicPollingEnabled", true)
                 .containsEntry("performanceAcceptanceEligible", false);
         sampler.close();
         assertThat(sampler.readings()).isEmpty();
         assertThatThrownBy(sampler::start).isInstanceOf(AssertionError.class);
+    }
+
+    @Test void the_first_final_control_waits_without_periodic_reads_then_retains_two_actual_serial_points() {
+        AtomicBoolean stopped = new AtomicBoolean();
+        AtomicInteger calls = new AtomicInteger();
+        List<Thread> readers = new ArrayList<>();
+        var sampler = new BenchmarkReturnClockSampler(sequence -> {
+            calls.incrementAndGet(); readers.add(Thread.currentThread());
+            if (sequence != 0) { assertThat(stopped.get()).isTrue(); }
+            return sample(sequence);
+        }, BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL, Duration.ZERO);
+        try {
+            sampler.start(); awaitWaiting(readers.getFirst());
+            assertThat(calls).hasValue(1);
+            assertThat(sampler.readings()).containsExactly(sample(0));
+            assertThat(sampler.evidence()).containsEntry("mode", "FIRST_FINAL_CONTROL")
+                    .containsEntry("periodicPollingEnabled", false).doesNotContainKey("fixedDelayNanos");
+            stopped.set(true);
+            var result = sampler.finishAfterSuccessfulStop();
+            assertThat(result).containsExactly(sample(0), sample(1));
+            assertThat(readers).hasSize(2);
+            assertThat(readers.getFirst()).isSameAs(readers.getLast());
+            assertThat(readers.getFirst().isDaemon()).isTrue();
+            assertThat(sampler.evidence()).containsEntry("finalRecorded", true)
+                    .containsEntry("workerExited", true).containsEntry("samplingCostQualified", false)
+                    .containsEntry("performanceAcceptanceEligible", false);
+            sampler.close();
+            assertThatThrownBy(sampler::finishAfterSuccessfulStop).isInstanceOf(AssertionError.class);
+            assertThat(calls).hasValue(2);
+            assertThatThrownBy(result::clear).isInstanceOf(UnsupportedOperationException.class);
+        } finally {
+            if (sampler.evidence().get("finalRecorded").equals(true)) { sampler.close(); }
+            else { assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class); }
+        }
     }
 
     @Test void equal_counter_resolution_is_retained_but_foreign_identity_and_backward_values_are_refused() {
@@ -66,12 +103,14 @@ class BenchmarkReturnClockSamplerTest {
                         sequence == 0 ? 110 : 120, sequence * 1000),
                 sequence -> sequence == 0 ? sample(0) : sample(0),
                 sequence -> sequence == 0 ? sample(0) : null);
-        for (var reader : malformed) {
-            var sampler = new BenchmarkReturnClockSampler(reader, CONTROL_DELAY); sampler.start();
-            assertThatThrownBy(sampler::finishAfterSuccessfulStop)
-                    .isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
-            assertThat(sampler.evidence()).containsEntry("state", "UNKNOWN");
-            assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class);
+        for (var mode : BenchmarkReturnClockSampler.Mode.values()) {
+            for (var reader : malformed) {
+                var sampler = new BenchmarkReturnClockSampler(reader, mode, CONTROL_DELAY); sampler.start();
+                assertThatThrownBy(sampler::finishAfterSuccessfulStop)
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+                assertThat(sampler.evidence()).containsEntry("state", "UNKNOWN");
+                assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class);
+            }
         }
     }
 
@@ -95,14 +134,31 @@ class BenchmarkReturnClockSamplerTest {
     }
 
     @Test void reader_exceptions_are_not_retried_or_promoted_to_zero_readings() {
+        for (var mode : BenchmarkReturnClockSampler.Mode.values()) {
+            AtomicInteger calls = new AtomicInteger();
+            var sampler = new BenchmarkReturnClockSampler(sequence -> {
+                calls.incrementAndGet(); throw new IllegalStateException("controlled unavailable getter");
+            }, mode, CONTROL_DELAY);
+            assertThatThrownBy(sampler::start).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+            assertThat(sampler.readings()).isEmpty(); assertThat(calls).hasValue(1);
+            assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class);
+            assertThat(calls).hasValue(1);
+        }
+    }
+
+    @Test void a_control_final_reader_failure_does_not_retry_or_promote_the_first_point() {
         AtomicInteger calls = new AtomicInteger();
         var sampler = new BenchmarkReturnClockSampler(sequence -> {
-            calls.incrementAndGet(); throw new IllegalStateException("controlled unavailable getter");
-        }, CONTROL_DELAY);
-        assertThatThrownBy(sampler::start).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
-        assertThat(sampler.readings()).isEmpty(); assertThat(calls).hasValue(1);
+            calls.incrementAndGet();
+            if (sequence == 1) { throw new IllegalStateException("controlled final getter failure"); }
+            return sample(sequence);
+        }, BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL);
+        sampler.start();
+        assertThatThrownBy(sampler::finishAfterSuccessfulStop).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+        assertThat(sampler.readings()).containsExactly(sample(0));
+        assertThat(sampler.evidence()).containsEntry("finalRecorded", false).containsEntry("state", "UNKNOWN");
         assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class);
-        assertThat(calls).hasValue(1);
+        assertThat(calls).hasValue(2);
     }
 
     @Test void capacity_exhaustion_refuses_final_coverage_without_a_five_hundred_thirteenth_read() throws Exception {
@@ -167,12 +223,54 @@ class BenchmarkReturnClockSamplerTest {
     }
 
     @Test void plain_close_after_the_first_point_cannot_masquerade_as_a_successful_final_sample() {
-        AtomicInteger calls = new AtomicInteger();
-        var sampler = new BenchmarkReturnClockSampler(sequence -> { calls.incrementAndGet(); return sample(sequence); }, CONTROL_DELAY);
-        sampler.start();
-        assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
-        assertThat(calls).hasValue(1);
-        assertThat(sampler.evidence()).containsEntry("finalRecorded", false).containsEntry("workerExited", true);
+        for (var mode : BenchmarkReturnClockSampler.Mode.values()) {
+            AtomicInteger calls = new AtomicInteger();
+            var sampler = new BenchmarkReturnClockSampler(sequence -> {
+                calls.incrementAndGet(); return sample(sequence);
+            }, mode, CONTROL_DELAY);
+            sampler.start();
+            assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+            assertThat(calls).hasValue(1);
+            assertThat(sampler.evidence()).containsEntry("finalRecorded", false).containsEntry("workerExited", true);
+        }
+    }
+
+    @Test void an_in_flight_control_final_read_can_be_aborted_without_later_requests() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        AtomicInteger calls = new AtomicInteger(); AtomicReference<Thread> worker = new AtomicReference<>();
+        var sampler = new BenchmarkReturnClockSampler(sequence -> {
+            calls.incrementAndGet(); worker.set(Thread.currentThread());
+            if (sequence == 1) {
+                entered.countDown();
+                try { release.await(); } catch (InterruptedException interrupted) { throw new IllegalStateException(interrupted); }
+            }
+            return sample(sequence);
+        }, BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL);
+        var finisher = Executors.newSingleThreadExecutor();
+        try {
+            sampler.start();
+            var refusal = finisher.submit(() -> {
+                assertThatThrownBy(sampler::finishAfterSuccessfulStop).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+            });
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(calls).hasValue(2);
+            assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+            refusal.get(3, TimeUnit.SECONDS);
+            assertThat(worker.get().isDaemon()).isTrue();
+            assertThat(sampler.readings()).containsExactly(sample(0));
+            assertThat(sampler.evidence()).containsEntry("finalRecorded", false).containsEntry("workerExited", true);
+            assertThat(calls).hasValue(2);
+        } finally {
+            release.countDown(); finisher.shutdownNow();
+            assertThat(finisher.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    private static void awaitWaiting(Thread worker) {
+        long began = System.nanoTime();
+        while (worker.isAlive() && worker.getState() != Thread.State.WAITING
+                && System.nanoTime() - began < TimeUnit.SECONDS.toNanos(2)) { Thread.yield(); }
+        assertThat(worker.getState()).as("the control must await stop without a periodic timer").isEqualTo(Thread.State.WAITING);
     }
 
     private static BenchmarkCausalClock.Sample sample(long sequence) {

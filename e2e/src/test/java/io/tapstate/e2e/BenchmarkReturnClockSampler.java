@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -9,12 +10,15 @@ import java.util.function.LongFunction;
 
 /** Serial owned reads; actual brackets never imply equal clock origins, continuous drift or qualified cost. */
 final class BenchmarkReturnClockSampler implements AutoCloseable {
+    enum Mode { PERIODIC, FIRST_FINAL_CONTROL }
+
     static final Duration SAMPLE_DELAY = Duration.ofMillis(50);
     static final int MAX_SAMPLES = 512;
     private static final long OWNER_WAIT_NANOS = Duration.ofSeconds(2).toNanos();
 
     private final Object lock = new Object();
     private final LongFunction<BenchmarkCausalClock.Sample> reader;
+    private final Mode mode;
     private final long delayNanos;
     private final List<BenchmarkCausalClock.Sample> readings = new ArrayList<>();
     private Thread worker;
@@ -30,12 +34,22 @@ final class BenchmarkReturnClockSampler implements AutoCloseable {
     private Throwable failure;
 
     BenchmarkReturnClockSampler(LongFunction<BenchmarkCausalClock.Sample> reader) {
-        this(reader, SAMPLE_DELAY);
+        this(reader, Mode.PERIODIC, SAMPLE_DELAY);
+    }
+
+    BenchmarkReturnClockSampler(LongFunction<BenchmarkCausalClock.Sample> reader, Mode mode) {
+        this(reader, mode, SAMPLE_DELAY);
     }
 
     /** Cadence injection is confined to controls; actual callers use the fixed-delay constructor. */
     BenchmarkReturnClockSampler(LongFunction<BenchmarkCausalClock.Sample> reader, Duration testDelay) {
+        this(reader, Mode.PERIODIC, testDelay);
+    }
+
+    /** A test delay never enables periodic requests in the explicit first/final control. */
+    BenchmarkReturnClockSampler(LongFunction<BenchmarkCausalClock.Sample> reader, Mode mode, Duration testDelay) {
         this.reader = java.util.Objects.requireNonNull(reader);
+        this.mode = java.util.Objects.requireNonNull(mode);
         java.util.Objects.requireNonNull(testDelay);
         if (testDelay.isNegative()) { throw new AssertionError("return clock delay is invalid"); }
         try { delayNanos = testDelay.toNanos(); }
@@ -73,13 +87,21 @@ final class BenchmarkReturnClockSampler implements AutoCloseable {
         synchronized (lock) { return List.copyOf(readings); }
     }
 
+    Mode mode() { return mode; }
+
     Map<String, Object> evidence() {
         synchronized (lock) {
-            return Map.of("state", unknownReason == null ? "RECORDED" : "UNKNOWN",
-                    "reason", unknownReason == null ? "BOUNDED_REQUEST_SAMPLES_ONLY" : unknownReason,
-                    "fixedDelayNanos", delayNanos, "samples", readings.size(), "firstRecorded", firstRecorded,
-                    "finalRecorded", finalRecorded, "workerExited", workerExited,
-                    "performanceAcceptanceEligible", false, "samplingCostQualified", false);
+            var evidence = new LinkedHashMap<String, Object>();
+            evidence.put("state", unknownReason == null ? "RECORDED" : "UNKNOWN");
+            evidence.put("reason", unknownReason == null ? (mode == Mode.PERIODIC
+                    ? "BOUNDED_REQUEST_SAMPLES_ONLY" : "FIRST_AND_FINAL_ACTUAL_REQUEST_SAMPLES_ONLY") : unknownReason);
+            evidence.put("mode", mode.name());
+            evidence.put("periodicPollingEnabled", mode == Mode.PERIODIC);
+            if (mode == Mode.PERIODIC) { evidence.put("fixedDelayNanos", delayNanos); }
+            evidence.put("samples", readings.size()); evidence.put("firstRecorded", firstRecorded);
+            evidence.put("finalRecorded", finalRecorded); evidence.put("workerExited", workerExited);
+            evidence.put("performanceAcceptanceEligible", false); evidence.put("samplingCostQualified", false);
+            return Map.copyOf(evidence);
         }
     }
 
@@ -90,11 +112,15 @@ final class BenchmarkReturnClockSampler implements AutoCloseable {
             while (true) {
                 boolean finalRead;
                 synchronized (lock) {
-                    long waitingSince = System.nanoTime();
-                    while (!abort && !finishRequested) {
-                        long remaining = delayNanos - (System.nanoTime() - waitingSince);
-                        if (remaining <= 0) { break; }
-                        TimeUnit.NANOSECONDS.timedWait(lock, remaining);
+                    if (mode == Mode.FIRST_FINAL_CONTROL) {
+                        while (!abort && !finishRequested) { lock.wait(); }
+                    } else {
+                        long waitingSince = System.nanoTime();
+                        while (!abort && !finishRequested) {
+                            long remaining = delayNanos - (System.nanoTime() - waitingSince);
+                            if (remaining <= 0) { break; }
+                            TimeUnit.NANOSECONDS.timedWait(lock, remaining);
+                        }
                     }
                     if (abort) { return; }
                     finalRead = finishRequested;

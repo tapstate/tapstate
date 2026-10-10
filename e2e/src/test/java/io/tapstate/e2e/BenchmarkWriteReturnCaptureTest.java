@@ -12,7 +12,9 @@ class BenchmarkWriteReturnCaptureTest {
     @Test void first_and_last_actual_getters_enclose_the_complete_owned_capture() throws Exception {
         var access = new Fake();
         try (var capture = BenchmarkWriteReturnCapture.open(access, "measured")) {
+            assertThat(capture.clockMode()).isEqualTo(BenchmarkReturnClockSampler.Mode.PERIODIC);
             var result = capture.finish();
+            assertThat(result.clockMode()).isEqualTo(BenchmarkReturnClockSampler.Mode.PERIODIC);
             assertThat(result.calls()).hasSize(1);
             assertThat(result.calls().getFirst().lastCallbackExitNanos()).isEqualTo(1550);
             assertThat(result.calls().getFirst().rows().getFirst().keys()).containsExactly(1);
@@ -21,23 +23,60 @@ class BenchmarkWriteReturnCaptureTest {
             assertThatThrownBy(() -> result.pagesBase64().clear()).isInstanceOf(UnsupportedOperationException.class);
             assertThat(access.starts).hasValue(1); assertThat(access.stops).hasValue(1);
             assertThat(access.firstBeforeStart).isTrue(); assertThat(access.finalAfterStop).isTrue();
+            var compatible = new BenchmarkWriteReturnCapture.Result(result.calls(), result.samples(), result.summary(), result.pagesBase64());
+            assertThat(compatible.clockMode()).isEqualTo(BenchmarkReturnClockSampler.Mode.PERIODIC);
+            assertThat(compatible.calls()).isEqualTo(result.calls());
+            assertThat(compatible.samples()).isEqualTo(result.samples());
         }
         assertThat(access.stops).hasValue(1);
     }
 
+    @Test void the_first_final_control_preserves_complete_receipts_and_explicit_sampler_mode() throws Exception {
+        var access = new Fake();
+        try (var capture = BenchmarkWriteReturnCapture.open(access, "measured",
+                BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL)) {
+            assertThat(capture.clockMode()).isEqualTo(BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL);
+            assertThat(access.clockReads).hasValue(1);
+            var result = capture.finish();
+            assertThat(result.clockMode()).isEqualTo(BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL);
+            assertThat(result.samples()).extracting(BenchmarkCausalClock.Sample::sequence).containsExactly(0L, 1L);
+            assertThat(result.calls()).hasSize(1);
+            assertThat(result.calls().getFirst().lastCallbackExitNanos()).isEqualTo(1550);
+            assertThat(result.calls().getFirst().rows().getFirst().keys()).containsExactly(1);
+            assertThat(result.pagesBase64()).containsExactly(java.util.Base64.getEncoder().encodeToString(access.page));
+            assertThat(access.clockReads).hasValue(2);
+            assertThat(access.starts).hasValue(1); assertThat(access.stops).hasValue(1);
+            assertThat(access.firstBeforeStart).isTrue(); assertThat(access.finalAfterStop).isTrue();
+            var evidence = capture.retainedEvidence();
+            assertThat(evidence).containsEntry("completed", true).containsEntry("performanceAcceptanceEligible", false);
+            var sampling = (java.util.Map<?, ?>) evidence.get("sampler");
+            assertThat(sampling.containsKey("fixedDelayNanos")).isFalse();
+            assertThat(sampling.get("mode")).isEqualTo("FIRST_FINAL_CONTROL");
+            assertThat(sampling.get("periodicPollingEnabled")).isEqualTo(false);
+        }
+        assertThat(access.clockReads).hasValue(2);
+        assertThat(access.stops).hasValue(1);
+    }
+
     @Test void a_refused_start_never_stops_someone_elses_capture() throws Exception {
-        var access = new Fake(); access.acceptStart = false;
-        assertThatThrownBy(() -> BenchmarkWriteReturnCapture.open(access, "measured"))
-                .isInstanceOf(AssertionError.class).hasMessageContaining("start was refused");
-        assertThat(access.stops).hasValue(0);
+        for (var mode : BenchmarkReturnClockSampler.Mode.values()) {
+            var access = new Fake(); access.acceptStart = false;
+            assertThatThrownBy(() -> BenchmarkWriteReturnCapture.open(access, "measured", mode))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("start was refused");
+            assertThat(access.stops).hasValue(0);
+            if (mode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) { assertThat(access.clockReads).hasValue(1); }
+        }
     }
 
     @Test void an_open_call_at_stop_never_obtains_a_final_coverage_result() throws Exception {
-        var access = new Fake(); access.acceptStop = false;
-        var capture = BenchmarkWriteReturnCapture.open(access, "measured");
-        assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("incomplete call");
-        assertThatThrownBy(capture::close).isInstanceOf(AssertionError.class);
-        assertThat(access.stops).hasValue(1);
+        for (var mode : BenchmarkReturnClockSampler.Mode.values()) {
+            var access = new Fake(); access.acceptStop = false;
+            var capture = BenchmarkWriteReturnCapture.open(access, "measured", mode);
+            assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("incomplete call");
+            assertThatThrownBy(capture::close).isInstanceOf(AssertionError.class);
+            assertThat(access.stops).hasValue(1);
+            if (mode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) { assertThat(access.clockReads).hasValue(1); }
+        }
     }
 
     @Test void a_lost_stop_reply_cannot_stop_a_later_window_during_cleanup() throws Exception {
@@ -68,23 +107,51 @@ class BenchmarkWriteReturnCaptureTest {
     }
 
     @Test void normal_close_before_finish_is_an_abort_not_a_qualified_window() throws Exception {
-        var access = new Fake();
-        var capture = BenchmarkWriteReturnCapture.open(access, "measured");
-        assertThatThrownBy(capture::close).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
-        assertThat(access.stops).hasValue(1);
-        assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("not active");
+        for (var mode : BenchmarkReturnClockSampler.Mode.values()) {
+            var access = new Fake();
+            var capture = BenchmarkWriteReturnCapture.open(access, "measured", mode);
+            assertThatThrownBy(capture::close).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+            assertThat(access.stops).hasValue(1);
+            assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("not active");
+            if (mode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) { assertThat(access.clockReads).hasValue(1); }
+        }
+    }
+
+    @Test void final_control_identity_or_reader_failure_cannot_create_a_result_or_repeat_stop() throws Exception {
+        for (boolean changedIdentity : new boolean[]{false, true}) {
+            var access = new Fake();
+            access.changeFinalIdentity = changedIdentity; access.throwFinalClock = !changedIdentity;
+            var capture = BenchmarkWriteReturnCapture.open(access, "measured", BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL);
+            try {
+                assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN");
+                assertThat(capture.retainedEvidence()).containsEntry("completed", false);
+                var evidence = (java.util.Map<?, ?>) capture.retainedEvidence().get("sampler");
+                assertThat(evidence.get("state")).isEqualTo("UNKNOWN");
+                assertThat(evidence.get("finalRecorded")).isEqualTo(false);
+                assertThat(access.clockReads).hasValue(2);
+            } finally { assertThatThrownBy(capture::close).isInstanceOf(AssertionError.class).hasMessageContaining("UNKNOWN"); }
+            assertThat(access.clockReads).hasValue(2);
+            assertThat(access.stops).hasValue(1);
+        }
     }
 
     private static final class Fake implements BenchmarkWriteReturnCapture.Access {
         final AtomicInteger starts = new AtomicInteger(), stops = new AtomicInteger();
+        final AtomicInteger clockReads = new AtomicInteger();
         boolean acceptStart = true, acceptStop = true, foreignSummary, extraCount, wrongBytes, throwStop, failedSummary;
+        boolean changeFinalIdentity, throwFinalClock;
         volatile boolean firstBeforeStart, finalAfterStop;
         final byte[] page;
         Fake() throws Exception { page = BenchmarkWriteReturnCaptureTest.page(); }
         public BenchmarkCausalClock.Sample clock(long sequence) {
+            clockReads.incrementAndGet();
             if (sequence == 0) { firstBeforeStart = starts.get() == 0; }
-            if (stops.get() > 0) { finalAfterStop = true; }
-            return new BenchmarkCausalClock.Sample(sequence, new BenchmarkCausalClock.Identity(17, 1000),
+            if (stops.get() > 0) {
+                finalAfterStop = true;
+                if (throwFinalClock) { throw new IllegalStateException("controlled final getter failure"); }
+            }
+            return new BenchmarkCausalClock.Sample(sequence, new BenchmarkCausalClock.Identity(17,
+                    changeFinalIdentity && stops.get() > 0 ? 1001 : 1000),
                     sequence * 10_000, sequence * 10_000 + 10, sequence == 0 ? 1000 : 1_000_000 + sequence);
         }
         public boolean start(String window) { starts.incrementAndGet(); return acceptStart; }

@@ -70,6 +70,42 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
     }
 
     @Test
+    void firstFinalClockControlRetainsCompleteEvidenceButCannotProduceReturnPerformanceMetrics() throws Exception {
+        Fixture fixture = fixture(BenchmarkWorkloadDefinitions.steadyPilot("copy"), false);
+        var original = fixture.result();
+        var last = original.samples().getLast();
+        var samples = List.of(original.samples().getFirst(), new BenchmarkCausalClock.Sample(1, last.identity(),
+                last.driverBeforeNanos(), last.driverAfterNanos(), last.ownedNanos()));
+        var control = new BenchmarkWriteReturnCapture.Result(original.calls(), samples, original.summary(),
+                original.pagesBase64(), BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL);
+        var evidence = record(fixture, control);
+        assertThat(evidence).containsEntry("state", "RECORDED_CLOCK_COST_CONTROL")
+                .containsEntry("clockSamplingMode", "FIRST_FINAL_CONTROL")
+                .containsEntry("fullRows", 96_000).containsEntry("fixedCohortRows", 48_000L)
+                .containsEntry("performanceAcceptanceEligible", false).containsEntry("samplingCostQualified", false);
+        assertThat(evidence.get("pagesBase64")).isEqualTo(original.pagesBase64());
+        assertThat((List<?>) evidence.get("sourceBatches")).hasSize(960);
+        assertThat((List<?>) evidence.get("clockSamples")).hasSize(2);
+        for (String key : List.of("p99LatencyNanos", "throughput", "completionSpanNanos")) {
+            assertThat((Map<?, ?>) evidence.get(key)).isEqualTo(Map.of(
+                    "state", "UNAVAILABLE", "reason", "FIRST_FINAL_CLOCK_COST_CONTROL"));
+        }
+        assertThatThrownBy(() -> BenchmarkWriteReturnPhaseEvidence.record(fixture.workload(), fixture.phase(),
+                fixture.batches().subList(1, fixture.batches().size()), control))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("source batch roster");
+        reject(fixture, new BenchmarkWriteReturnCapture.Result(original.calls(), samples, original.summary(), List.of(),
+                BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL), "raw page roster");
+    }
+
+    @Test
+    void aClockControlCannotRelabelAPeriodicSampleRosterAsTwoBoundaryReads() throws Exception {
+        Fixture fixture = fixture(BenchmarkWorkloadDefinitions.byId("copy"), false);
+        var original = fixture.result();
+        reject(fixture, new BenchmarkWriteReturnCapture.Result(original.calls(), original.samples(), original.summary(),
+                original.pagesBase64(), BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL), "exactly two actual samples");
+    }
+
+    @Test
     void missingPagesForeignWindowAndContradictoryCountsAreRejected() throws Exception {
         Fixture fixture = fixture(BenchmarkWorkloadDefinitions.byId("copy"), false);
         var result = fixture.result();

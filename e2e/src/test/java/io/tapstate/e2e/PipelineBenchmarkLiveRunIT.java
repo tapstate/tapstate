@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_CLOCK_CONTROL_PROPERTY)) {
+            throw new AssertionError("return clock cost control cannot establish a live performance gate");
+        }
         if (Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY)) {
             throw new AssertionError("deferred target witness cannot establish a live performance gate");
         }

@@ -16,9 +16,14 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
 
     record Result(List<BenchmarkWriteReturnAssembly.FullCall> calls,
                   List<BenchmarkCausalClock.Sample> samples, BenchmarkWriteReturnReader.Summary summary,
-                  List<String> pagesBase64) {
+                  List<String> pagesBase64, BenchmarkReturnClockSampler.Mode clockMode) {
         Result {
             calls = List.copyOf(calls); samples = List.copyOf(samples); pagesBase64 = List.copyOf(pagesBase64);
+            java.util.Objects.requireNonNull(clockMode);
+        }
+        Result(List<BenchmarkWriteReturnAssembly.FullCall> calls, List<BenchmarkCausalClock.Sample> samples,
+                BenchmarkWriteReturnReader.Summary summary, List<String> pagesBase64) {
+            this(calls, samples, summary, pagesBase64, BenchmarkReturnClockSampler.Mode.PERIODIC);
         }
     }
 
@@ -34,17 +39,26 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     private long retainedPageBytes;
 
     static BenchmarkWriteReturnCapture open(BenchmarkWriteReturnReader reader, String window) {
+        return open(reader, window, BenchmarkReturnClockSampler.Mode.PERIODIC);
+    }
+
+    static BenchmarkWriteReturnCapture open(BenchmarkWriteReturnReader reader, String window,
+            BenchmarkReturnClockSampler.Mode mode) {
         return open(new Access() {
             public BenchmarkCausalClock.Sample clock(long sequence) { return reader.clockSample(sequence); }
             public boolean start(String value) { return reader.start(value); }
             public boolean stop() { return reader.stop(); }
             public BenchmarkWriteReturnReader.Summary summary() { return reader.summary(); }
             public byte[] page(long cursor) { return reader.page(cursor); }
-        }, window);
+        }, window, mode);
     }
 
     static BenchmarkWriteReturnCapture open(Access access, String window) {
-        var capture = new BenchmarkWriteReturnCapture(access, window);
+        return open(access, window, BenchmarkReturnClockSampler.Mode.PERIODIC);
+    }
+
+    static BenchmarkWriteReturnCapture open(Access access, String window, BenchmarkReturnClockSampler.Mode mode) {
+        var capture = new BenchmarkWriteReturnCapture(access, window, mode);
         try {
             capture.sampler.start();
             if (!access.start(window)) { throw new AssertionError("owned return capture start was refused"); }
@@ -61,14 +75,16 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         }
     }
 
-    private BenchmarkWriteReturnCapture(Access access, String window) {
+    private BenchmarkWriteReturnCapture(Access access, String window, BenchmarkReturnClockSampler.Mode mode) {
         this.access = java.util.Objects.requireNonNull(access);
         if (window == null || window.isBlank() || window.length() > 512) {
             throw new AssertionError("owned return capture window is invalid");
         }
         this.window = window;
-        sampler = new BenchmarkReturnClockSampler(access::clock);
+        sampler = new BenchmarkReturnClockSampler(access::clock, mode);
     }
+
+    BenchmarkReturnClockSampler.Mode clockMode() { return sampler.mode(); }
 
     Result finish() {
         if (!captureStarted || closed || completed) { throw new AssertionError("owned return capture is not active"); }
@@ -115,7 +131,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
             clock.map(samples.getFirst().identity(), call.observedNanos());
         }
         completed = true;
-        return new Result(calls, samples, summary, retainedPages);
+        return new Result(calls, samples, summary, retainedPages, sampler.mode());
     }
 
     /** Keeps already obtained facts after refusal without retrying a remote read or stop. */

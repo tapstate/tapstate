@@ -42,28 +42,37 @@ final class BenchmarkWriteReturnPhaseEvidence {
             clock.map(owner, call.lastCallbackExitNanos());
             clock.map(owner, call.observedNanos());
         }
-        var deliveries = BenchmarkReturnTimeBounds.map(rows, owner, clock);
-        require(deliveries.size() == cohort, "return bounds do not cover the complete fixed cohort");
-        Map<String, Object> p99 = deliveries.size() < 10_000
-                ? unavailable("INSUFFICIENT_COMPLETE_DELIVERIES_FOR_P99")
-                : interval(BenchmarkReturnTimeBounds.p99(deliveries.stream()
-                        .map(BenchmarkReturnTimeBounds.Delivery::latency).toList()));
-        Map<String, Object> span = unavailable("INSUFFICIENT_COMPLETE_DELIVERIES_FOR_SPAN");
-        Map<String, Object> throughput = unavailable("INSUFFICIENT_COMPLETE_DELIVERIES_FOR_SPAN");
-        if (deliveries.size() >= 2) {
-            var bounds = BenchmarkReturnTimeBounds.span(deliveries.stream()
-                    .map(BenchmarkReturnTimeBounds.Delivery::literalReturn).toList());
-            span = interval(bounds);
-            if (bounds.lowerNanos() > 0) {
-                var rate = BenchmarkReturnTimeBounds.throughput(cohort, bounds);
-                throughput = Map.of("state", "RECORDED_INTERVAL", "lowerRecordsPerSecond", rate.lowerRecordsPerSecond(),
-                        "upperRecordsPerSecond", rate.upperRecordsPerSecond());
-            } else {
-                throughput = unavailable("NONPOSITIVE_COMPLETION_SPAN_LOWER_BOUND");
+        boolean clockControl = capture.clockMode() == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL;
+        Map<String, Object> p99 = unavailable("FIRST_FINAL_CLOCK_COST_CONTROL");
+        Map<String, Object> span = p99;
+        Map<String, Object> throughput = p99;
+        if (clockControl) {
+            require(capture.samples().size() == 2, "first/final control must retain exactly two actual samples");
+        } else {
+            var deliveries = BenchmarkReturnTimeBounds.map(rows, owner, clock);
+            require(deliveries.size() == cohort, "return bounds do not cover the complete fixed cohort");
+            p99 = deliveries.size() < 10_000
+                    ? unavailable("INSUFFICIENT_COMPLETE_DELIVERIES_FOR_P99")
+                    : interval(BenchmarkReturnTimeBounds.p99(deliveries.stream()
+                            .map(BenchmarkReturnTimeBounds.Delivery::latency).toList()));
+            span = unavailable("INSUFFICIENT_COMPLETE_DELIVERIES_FOR_SPAN");
+            throughput = unavailable("INSUFFICIENT_COMPLETE_DELIVERIES_FOR_SPAN");
+            if (deliveries.size() >= 2) {
+                var bounds = BenchmarkReturnTimeBounds.span(deliveries.stream()
+                        .map(BenchmarkReturnTimeBounds.Delivery::literalReturn).toList());
+                span = interval(bounds);
+                if (bounds.lowerNanos() > 0) {
+                    var rate = BenchmarkReturnTimeBounds.throughput(cohort, bounds);
+                    throughput = Map.of("state", "RECORDED_INTERVAL", "lowerRecordsPerSecond", rate.lowerRecordsPerSecond(),
+                            "upperRecordsPerSecond", rate.upperRecordsPerSecond());
+                } else {
+                    throughput = unavailable("NONPOSITIVE_COMPLETION_SPAN_LOWER_BOUND");
+                }
             }
         }
         Map<String, Object> evidence = new LinkedHashMap<>();
-        evidence.put("state", "RECORDED_CAUSAL_RETURN_BOUNDS");
+        evidence.put("state", clockControl ? "RECORDED_CLOCK_COST_CONTROL" : "RECORDED_CAUSAL_RETURN_BOUNDS");
+        evidence.put("clockSamplingMode", capture.clockMode().name());
         evidence.put("workload", workload.id()); evidence.put("phase", phase.id());
         evidence.put("endpoint", "ordinary nontransactional acknowledged writeRecord successful return");
         evidence.put("timestampMeaning", "first owned nanoTime observation after a full table call returns");

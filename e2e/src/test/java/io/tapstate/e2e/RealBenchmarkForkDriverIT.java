@@ -57,6 +57,9 @@ class RealBenchmarkForkDriverIT {
         var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
         Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
         boolean writeReturnDiagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY);
+        var returnClockMode = RealBenchmarkForkDriver.writeReturnClockMode(
+                System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
+                writeReturnDiagnostics, Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"));
         if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
                 || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
                 || List.of("tapstate.e2e.benchmark.load-diagnostics", "tapstate.e2e.benchmark.compilation-diagnostics",
@@ -207,7 +210,13 @@ class RealBenchmarkForkDriverIT {
                         Map<String, Object> capture = (Map<String, Object>) phase.targetClockEvidence()
                                 .get("writeReturnDiagnostics");
                         assertThat(capture).containsEntry("performanceAcceptanceEligible", false)
-                                .containsEntry("samplingCostQualified", false);
+                                .containsEntry("samplingCostQualified", false)
+                                .containsEntry("clockSamplingMode", returnClockMode.name());
+                        if (returnClockMode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) {
+                            assertThat((List<?>) capture.get("clockSamples")).hasSize(2);
+                            assertThat((Map<?, ?>) capture.get("p99LatencyNanos")).isEqualTo(Map.of(
+                                    "state", "UNAVAILABLE", "reason", "FIRST_FINAL_CLOCK_COST_CONTROL"));
+                        }
                     });
                 }
                 long sourceChanges = evidence.phases().stream()
@@ -280,6 +289,7 @@ class RealBenchmarkForkDriverIT {
                 }
                 if (writeReturnDiagnostics) {
                     output.put("writeReturnDiagnostics", true);
+                    output.put("writeReturnClockSamplingMode", returnClockMode.name());
                     output.put("writeReturnPerformanceAcceptanceEligible", false);
                     output.put("retainedLegacyMeasurementEndpoint", "OPERATION_DATE_AND_OBSERVER_DIAGNOSTICS");
                 }

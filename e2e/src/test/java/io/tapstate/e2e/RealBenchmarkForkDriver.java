@@ -27,6 +27,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static final Duration COUNTER_POLL = Duration.ofMillis(100);
     private static final Duration PRE_WINDOW_QUIET = Duration.ofSeconds(3);
     static final String WRITE_RETURN_DIAGNOSTICS_PROPERTY = "tapstate.e2e.benchmark.write-return-diagnostics";
+    static final String WRITE_RETURN_CLOCK_CONTROL_PROPERTY = "tapstate.e2e.benchmark.write-return-clock-control";
 
     /** Local observation intervals distinguish data arrival from subsequent proof reads. */
     record ConfirmationTiming(long sourceMarkerWaitStartedAtNanos, long sourceMarkerWaitCompletedAtNanos,
@@ -309,11 +310,22 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return List.copyOf(evidence);
     }
 
+    static BenchmarkReturnClockSampler.Mode writeReturnClockMode(String value, boolean diagnostics, boolean pilot) {
+        if (value == null || "false".equals(value)) { return BenchmarkReturnClockSampler.Mode.PERIODIC; }
+        if (!"true".equals(value)) { throw new AssertionError("return clock control must be true or false"); }
+        if (!diagnostics || !pilot) {
+            throw new AssertionError("return clock cost control requires the original return diagnostic pilot");
+        }
+        return BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL;
+    }
+
     @Override
     public PipelineBenchmarkHarness.ForkResult run(BenchmarkWorkloadDefinitions.Workload workload,
             PipelineBenchmarkComparison.Arm arm, int armFork, Path applicationJar) throws Exception {
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(arm, "arm");
+        writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
+                Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile());
         if (armFork < 1 || applicationJar == null) {
             throw new IllegalArgumentException("a positive fork number and application JAR are required");
         }
@@ -576,7 +588,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 commandSampler.start();
                 try (BenchmarkWriteReturnCapture returnCapture = Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY)
                         ? BenchmarkWriteReturnCapture.open(resourceSampler.writeReturnReader(),
-                                workload.id() + "/" + phase.id()) : null) {
+                                workload.id() + "/" + phase.id(), writeReturnClockMode(
+                                        System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY), true, workload.pilotProfile())) : null) {
                     try {
                         issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
                             for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
@@ -711,13 +724,26 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             try {
                 Map<String, Object> returnEvidence = new LinkedHashMap<>(BenchmarkWriteReturnPhaseEvidence.record(
                         workload, phase, issued.batches(), writeReturns));
-                var associations = BenchmarkWriteReturnExpectations.associate(
-                        workload, phase, issued.batches(), writeReturns.calls());
-                var owner = writeReturns.samples().getFirst().identity();
-                var causalClock = new BenchmarkCausalClock(owner, writeReturns.samples());
-                var mappedReturns = BenchmarkReturnTimeBounds.map(associations, owner, causalClock);
-                returnEvidence.put("resourceBounds", BenchmarkReturnResourceBounds.evidence(resources, mappedReturns));
-                returnEvidence.put("commonWindowCertificate", BenchmarkReturnCommonWindow.evidence(mappedReturns));
+                if (writeReturns.clockMode() == BenchmarkReturnClockSampler.Mode.PERIODIC) {
+                    var associations = BenchmarkWriteReturnExpectations.associate(
+                            workload, phase, issued.batches(), writeReturns.calls());
+                    var owner = writeReturns.samples().getFirst().identity();
+                    var causalClock = new BenchmarkCausalClock(owner, writeReturns.samples());
+                    var mappedReturns = BenchmarkReturnTimeBounds.map(associations, owner, causalClock);
+                    returnEvidence.put("resourceBounds", BenchmarkReturnResourceBounds.evidence(resources, mappedReturns));
+                    returnEvidence.put("commonWindowCertificate", BenchmarkReturnCommonWindow.evidence(mappedReturns));
+                } else {
+                    var unavailable = Map.of("state", "UNAVAILABLE", "reason", "FIRST_FINAL_CLOCK_COST_CONTROL",
+                            "samplingCostQualified", false, "performanceAcceptanceEligible", false);
+                    returnEvidence.put("resourceBounds", unavailable);
+                    returnEvidence.put("commonWindowCertificate", unavailable);
+                }
+                long fullFirstIssued = issued.batches().getFirst().issuedAtNanos();
+                returnEvidence.put("driverPhaseDrain", Map.of("state", "RECORDED_DIAGNOSTIC",
+                        "firstSourceIssuedAtNanos", fullFirstIssued, "tableAckObservedAtNanos", completedAckAt,
+                        "durationNanos", Math.subtractExact(completedAckAt, fullFirstIssued),
+                        "scope", "FULL_SOURCE_FIRST_ISSUE_TO_OWN_TABLE_ACK_OBSERVATION",
+                        "performanceAcceptanceEligible", false, "samplingCostQualified", false));
                 returnEvidence.put("resourceReceiptScope", "FULL_PHASE_RETAINED_THROUGH_CAPTURE_CLOSE");
                 clockProof.put("writeReturnDiagnostics", Map.copyOf(returnEvidence));
                 System.out.println("benchmark-write-return-phase-evidence=" + JsonWriter.write(returnEvidence));
