@@ -57,6 +57,60 @@ class CloudSdkLiveContractTest {
     private static final String TOKEN = "shared-static-token-sentinel";
     private static final String KID = "test-key-one";
 
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1})
+    void overlappingJwksKeysVerifyCallbacksWithoutAcceptingUnknownKeysOrAlteredSignedFields(int signingKey)
+            throws Exception {
+        List<KeyPair> publishedKeys = List.of(rsaKeyPair(), rsaKeyPair());
+        KeyPair unknownKey = rsaKeyPair();
+        AtomicInteger jwksRequests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/api/jwks.json", exchange -> {
+            jwksRequests.incrementAndGet();
+            respond(exchange, Map.of("keys", List.of(
+                    jwk(publishedKeys.get(0), KID),
+                    jwk(publishedKeys.get(1), "active-key"))));
+        });
+        server.start();
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            CloudProperties properties = new CloudProperties();
+            properties.setBaseUrl(baseUrl);
+            properties.setToken(TOKEN);
+            properties.setAtlasUri("mongodb://user:secret@atlas.example/cluster_meta");
+            properties.setClusterId(CLUSTER);
+            CloudSdkBridge bridge = new CloudSdkBridge(CloudRuntimeSettings.resolve(properties));
+            CloudSessionIdentity deployment = new CloudSessionIdentity(
+                    baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER);
+            assertThat(bridge.validate(jwt(publishedKeys.get(0), baseUrl), deployment, REQUEST_AUDIENCE)).isPresent();
+            String timestamp = Long.toString(Instant.now().toEpochMilli());
+            String nonce = "overlap-callback-nonce";
+            String jti = "overlap-jti";
+            String canonical = "POST|" + timestamp + "|" + nonce + "|" + jti;
+            String signature = sign(publishedKeys.get(signingKey), canonical);
+
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti, signature)).isTrue();
+            assertThat(jwksRequests.get()).isPositive();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti, sign(unknownKey, canonical))).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "GET", timestamp, nonce, jti, signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp + "1", nonce, jti, signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce + "-altered", jti, signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti + "-altered", signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, "other-cluster",
+                    "POST", timestamp, nonce, jti, signature)).isFalse();
+            assertThat(bridge.verify("https://other-issuer.example", CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti, signature)).isFalse();
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void jwtVerificationRejectionsKeepAnInternalClassificationWithoutLoggingTheJwt() throws Exception {
         KeyPair keyPair = rsaKeyPair();
@@ -350,14 +404,18 @@ class CloudSdkLiveContractTest {
     }
 
     private static Map<String, Object> jwks(KeyPair keyPair) {
+        return Map.of("keys", List.of(jwk(keyPair, KID)));
+    }
+
+    private static Map<String, Object> jwk(KeyPair keyPair, String keyId) {
         RSAPublicKey key = (RSAPublicKey) keyPair.getPublic();
-        return Map.of("keys", List.of(Map.of(
+        return Map.of(
                 "kty", "RSA",
-                "kid", KID,
+                "kid", keyId,
                 "use", "sig",
                 "alg", "RS256",
                 "n", base64(unsigned(key.getModulus().toByteArray())),
-                "e", base64(unsigned(key.getPublicExponent().toByteArray())))));
+                "e", base64(unsigned(key.getPublicExponent().toByteArray())));
     }
 
     private static String sign(KeyPair keyPair, String canonical) throws Exception {
