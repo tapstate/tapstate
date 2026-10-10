@@ -1402,6 +1402,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1429,6 +1430,7 @@ jobs:
         env:
           CLOUD_GHCR_USERNAME: ${{ vars.CLOUD_GHCR_USERNAME }}
           CLOUD_GHCR_TOKEN: ${{ secrets.CLOUD_GHCR_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           bash deploy/cloud/ghcr-publish.sh publish
           --archive "$RUNNER_TEMP/cloud-image/cloud-image.tar"

@@ -164,6 +164,9 @@ fi
 has   "Cloud GHCR waits until satellite publication is complete" cloud-ghcr 'needs:.*satellites'
 has   "Cloud GHCR consumes the checked sealed archive" cloud-ghcr 'name: cloud-image-sealed'
 has   "Cloud GHCR uses the production environment" cloud-ghcr 'environment: cloud-ghcr-release'
+has   "Cloud publication grants the existing workflow token package write access" cloud-ghcr 'packages: write'
+has   "Cloud publication supplies the existing workflow token fallback" cloud-ghcr 'GITHUB_TOKEN:.*github[.]token'
+
 has   "Cloud GHCR uses the checked digest publisher" cloud-ghcr 'ghcr-publish[.]sh publish'
 has   "Cloud and OP use the same release version" cloud-ghcr 'needs[.]version[.]outputs[.]version'
 has   "Cloud GHCR publishes the verified archive digest" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]digest'
