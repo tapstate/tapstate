@@ -1,6 +1,6 @@
 # Upstream specification drift, daily, without building a single connector jar.
 #
-# The connector catalog is generated from an upstream repository nobody here controls. It drifts in
+# The connector catalog is generated from upstream repositories nobody here controls. It drifts in
 # two ways that cost two orders of magnitude apart: a specification file changes - field names,
 # labels, defaults - or a connector's capabilities change, which can only be found by building the
 # connector and loading it. This lane covers the cheap half and nothing else. The expensive half is
@@ -112,10 +112,23 @@ jobs:
           git -C upstream rev-parse HEAD > upstream-sha.txt
           echo "upstream is at $(cat upstream-sha.txt)"
 
+      - name: Read the enterprise upstream metadata
+        uses: actions/checkout@v4
+        with:
+          repository: tapdata/tapdata-connectors-enterprise
+          token: ${{ secrets.ENTERPRISE_CONNECTORS_READ_TOKEN }}
+          path: upstream-enterprise
+          fetch-depth: 1
+          sparse-checkout: /pom.xml
+          sparse-checkout-cone-mode: false
+
       - name: List the upstream paths
         # ls-tree, not a checkout: the trees came with the partial clone, so this reads every path in
         # the repository and fetches no file contents at all.
-        run: git -C upstream ls-tree -r --name-only HEAD > upstream-paths.txt
+        run: |
+          git -C upstream ls-tree -r --name-only HEAD > upstream-paths.txt
+          git -C upstream-enterprise ls-tree -r --name-only HEAD > enterprise-paths.txt
+          git -C upstream-enterprise rev-parse HEAD > enterprise-sha.txt
 
       - name: Work out which files to fetch
         run: |
@@ -124,20 +137,25 @@ jobs:
             -Dsurefire.failIfNoSpecifiedTests=false \
             -Dapi.version=1.44 \
             -Dtapstate.catalog.upstream-paths="$PWD/upstream-paths.txt" \
-            -Dtapstate.catalog.fetch-list="$PWD/fetch-list.txt"
+            -Dtapstate.catalog.fetch-list="$PWD/fetch-list.txt" \
+            -Dtapstate.catalog.upstream-paths.enterprise="$PWD/enterprise-paths.txt" \
+            -Dtapstate.catalog.fetch-list.enterprise="$PWD/enterprise-fetch-list.txt"
           # That test skips when its properties are absent, and a skipped test is not a failure -
           # Maven would exit 0 having enumerated nothing, and the scan below would find no drift and
           # report a clean upstream. So the output is checked rather than the exit code.
-          if [ ! -s fetch-list.txt ]; then
+          if [ ! -s fetch-list.txt ] || [ ! -s enterprise-fetch-list.txt ]; then
             echo "the enumeration produced no paths - it did not run" >&2
             exit 1
           fi
           echo "fetching $(wc -l < fetch-list.txt) specification files"
+          echo "fetching $(wc -l < enterprise-fetch-list.txt) enterprise specification files"
 
       - name: Fetch them, in one request
         run: |
           git -C upstream sparse-checkout set --no-cone --stdin < fetch-list.txt
           git -C upstream checkout
+          git -C upstream-enterprise sparse-checkout set --no-cone --stdin < enterprise-fetch-list.txt
+          git -C upstream-enterprise checkout
 
       - name: Is the drift pull request already open
         id: existing
@@ -184,6 +202,8 @@ jobs:
             -Dapi.version=1.44 \
             -Dtapstate.catalog.fetched="$PWD/upstream" \
             -Dtapstate.catalog.fetch-list="$PWD/fetch-list.txt" \
+            -Dtapstate.catalog.fetched.enterprise="$PWD/upstream-enterprise" \
+            -Dtapstate.catalog.fetch-list.enterprise="$PWD/enterprise-fetch-list.txt" \
             -Dtapstate.catalog.catalog-age-days="${AGE_OVERRIDE:-$(.github/scripts/catalog-age-days.sh)}" \
             -Dtapstate.catalog.drift-pr-open="${{ steps.existing.outputs.open }}" \
             -Dtapstate.catalog.drift-report="$PWD/drift-report.txt"
@@ -192,12 +212,15 @@ jobs:
             exit 1
           fi
           cat drift-report.txt
-          cat drift-report.txt >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=$(cat upstream-sha.txt)" >> "$GITHUB_OUTPUT"
+          {
+            cat drift-report.txt
+            echo "upstream_sha=$(cat upstream-sha.txt)"
+            echo "enterprise_sha=$(cat enterprise-sha.txt)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Rebuild the catalog from the fetched specifications
         if: steps.drift.outputs.decision == 'OPEN'
-        # A full clone, deliberately. Regenerating walks the connector sources to find each one's
+        # Full checkouts, deliberately. Regenerating walks the connector sources to find each one's
         # annotation, so a checkout holding only specification files resolves no Java connector and
         # every one of them empties out of the catalog - silently, since an emptied entry and an
         # ordinary edit are the same shape in a diff. That failure has been seen here once already,
@@ -206,10 +229,12 @@ jobs:
         # runs on the rare day something actually moved.
         #
         # --spec-only reuses the checked-in capability bitmap, so no connector jar is built here.
+        # Keep the exact revisions scanned, and visit both repositories so enterprise changes reach
+        # the refresh rather than being preserved as unrelated rows.
         run: |
-          rm -rf upstream
-          git clone --depth 1 "$UPSTREAM" upstream
-          scripts/refresh-catalog.sh --connectors upstream --spec-only
+          git -C upstream sparse-checkout disable
+          git -C upstream-enterprise sparse-checkout disable
+          scripts/refresh-catalog.sh --connectors upstream --connectors upstream-enterprise --spec-only
 
       - name: Open the pull request
         # A pull request run is here to exercise the lane, not to act on what it finds, so by default
@@ -249,6 +274,8 @@ jobs:
           # pull request itself.
           body: |
             Regenerated from upstream `${{ env.UPSTREAM }}` at `${{ steps.drift.outputs.upstream_sha }}`.
+            Enterprise specifications are from `tapdata/tapdata-connectors-enterprise` at
+            `${{ steps.drift.outputs.enterprise_sha }}`.
 
             - specifications that changed: ${{ steps.drift.outputs.changed }}
             - rows whose specification is no longer at the path they record: ${{ steps.drift.outputs.vanished }}
@@ -282,7 +309,9 @@ jobs:
 
                 git clone --filter=blob:none ${{ env.UPSTREAM }} upstream
                 git -C upstream checkout ${{ steps.drift.outputs.upstream_sha }}
-                scripts/refresh-catalog.sh --connectors upstream --spec-only
+                git clone https://github.com/tapdata/tapdata-connectors-enterprise.git upstream-enterprise
+                git -C upstream-enterprise checkout ${{ steps.drift.outputs.enterprise_sha }}
+                scripts/refresh-catalog.sh --connectors upstream --connectors upstream-enterprise --spec-only
                 git diff --exit-code
 
             A clean tree means what is checked in here is exactly what that upstream revision
