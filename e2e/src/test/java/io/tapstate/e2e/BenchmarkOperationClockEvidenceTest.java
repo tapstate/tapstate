@@ -15,6 +15,7 @@ class BenchmarkOperationClockEvidenceTest {
     void formalEntryRejectsClockDiagnosticsBeforeAssumptionsFilesOrServices() {
         Map<String, String> prior = new LinkedHashMap<>();
         for (String property : List.of(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY,
+                BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
                 BenchmarkWitnessReadGate.PROPERTY, "tapstate.e2e.benchmark.compilation-diagnostics",
                 "tapstate.e2e.benchmark.thread-point-diagnostics", "tapstate.e2e.benchmark.baseline-jar",
                 "tapstate.e2e.benchmark.candidate-jar", "tapstate.e2e.benchmark.output",
@@ -22,17 +23,54 @@ class BenchmarkOperationClockEvidenceTest {
             prior.put(property, System.getProperty(property));
             System.clearProperty(property);
         }
-        System.setProperty(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY, "true");
         try {
-            assertThatThrownBy(() -> new PipelineBenchmarkLiveRunIT()
-                    .interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate())
-                    .isInstanceOf(AssertionError.class).hasMessageContaining("clock refusal evidence");
+            for (String enabled : List.of(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY,
+                    BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY)) {
+                System.setProperty(enabled, "true");
+                assertThatThrownBy(() -> new PipelineBenchmarkLiveRunIT()
+                        .interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate())
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("clock refusal evidence");
+                System.clearProperty(enabled);
+            }
         } finally {
             prior.forEach((property, value) -> {
                 if (value == null) { System.clearProperty(property); }
                 else { System.setProperty(property, value); }
             });
         }
+    }
+
+    @Test
+    void nativeEvidenceWithoutDecodedClockModeRefusesBeforeFilesOrServices() {
+        Map<String, String> prior = new LinkedHashMap<>();
+        Map<String, String> requested = Map.of(
+                BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY, "true",
+                BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY, "false",
+                "tapstate.e2e.benchmark-smoke.jar", "unused.jar",
+                "tapstate.e2e.benchmark-smoke.arm", "B",
+                "tapstate.e2e.benchmark-smoke.capture-mode", "PLAIN");
+        requested.forEach((property, value) -> prior.put(property, System.setProperty(property, value)));
+        String output = "tapstate.e2e.benchmark-smoke.fork-output";
+        prior.put(output, System.getProperty(output)); System.clearProperty(output);
+        try {
+            assertThatThrownBy(() -> new RealBenchmarkForkDriverIT().statelessForkUsesPgoutputAndItsOwnTerminalPosition())
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("requires decoded clock refusal evidence");
+        } finally {
+            prior.forEach((property, value) -> {
+                if (value == null) { System.clearProperty(property); } else { System.setProperty(property, value); }
+            });
+        }
+    }
+
+    @Test
+    void actualDocumentKeysRemainLiteralOrExplicitlyMissing() {
+        var recorder = recorder(); var supplied = event("human key is independent", 30L, true);
+        String literal = "{\"_id\": {\"$numberLong\": \"1\"}}";
+        supplied.put("documentKey", literal); recorder.accepted(supplied);
+        assertThat(metadata(recorder.evidence(), "previousAccepted")).containsEntry("documentKey", literal);
+        var missing = event("another human key", 31L, true); missing.put("documentKey", MISSING);
+        recorder.accepted(missing);
+        assertThat(metadata(recorder.evidence(), "previousAccepted")).containsEntry("documentKey", MISSING);
     }
 
     @Test

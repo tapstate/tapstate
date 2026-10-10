@@ -14,7 +14,7 @@ final class BenchmarkOperationClockEvidence {
     static final long MAX_RECORD_BYTES = 65536, MAX_EVIDENCE_BYTES = 2L * 1024 * 1024;
     private static final Set<String> REQUIRED = Set.of("namespace", "targetId", "phaseId", "key", "operationType",
             "clusterTime", "wallTime", "startedReadNanos", "completedReadNanos", "observedNanos", "acceptedNanos");
-    private static final Set<String> OPTIONAL = Set.of("resumeToken", "transaction", "session");
+    private static final Set<String> OPTIONAL = Set.of("resumeToken", "documentKey", "transaction", "session");
     private record Event(long ordinal, boolean accepted, Map<String, Object> metadata) {
         Map<String, Object> evidence() { return Map.of("eventOrdinal", ordinal, "accepted", accepted, "metadata", metadata); }
     }
@@ -144,6 +144,7 @@ final class BenchmarkOperationClockEvidence {
         }
         if (accepted) { ordered(raw.get("observedNanos"), raw.get("acceptedNanos"), "accept timestamp precedes observation or overflowed"); }
         if (raw.containsKey("resumeToken")) { require(missing(raw.get("resumeToken")) || raw.get("resumeToken") instanceof String token && !token.isBlank(), "resume token must be actual textual BSON or explicit missing"); }
+        if (raw.containsKey("documentKey")) { require(missing(raw.get("documentKey")) || raw.get("documentKey") instanceof String key && !key.isBlank(), "document key must be actual textual BSON or explicit missing"); }
         for (String key : List.of("transaction", "session")) { if (raw.containsKey(key)) { require(raw.get(key) != null && !missing(raw.get(key)), "optional transaction or session must actually be present"); } }
         return freezeMap(raw, 0);
     }

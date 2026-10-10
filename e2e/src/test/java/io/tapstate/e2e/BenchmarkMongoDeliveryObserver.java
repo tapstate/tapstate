@@ -43,6 +43,7 @@ import java.util.function.Supplier;
  */
 final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     static final String CLOCK_REJECTION_EVIDENCE_PROPERTY = "tapstate.e2e.benchmark.operation-clock-rejection-evidence";
+    static final String NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY = "tapstate.e2e.benchmark.native-operation-wall-evidence";
 
     private static final String BARRIER_COLLECTION = "_benchmark_delivery_barriers";
     private static final Duration CURSOR_MAX_AWAIT = Duration.ofMillis(100);
@@ -103,6 +104,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private final BenchmarkWitnessReadGate readGate;
     private BenchmarkOperationClockEvidence clockRejectionEvidence;
     private Throwable clockRecordingFailure;
+    private boolean nativeOperationWallEvidenceRequested;
 
     static final class OperationOrder {
         private org.bson.BsonTimestamp previous;
@@ -176,6 +178,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             if (clockRejectionEvidence == null) { return readGate.evidence(); }
             var out = new java.util.LinkedHashMap<>(readGate.evidence());
             out.put("operationClockRefusalEvidence", clockRejectionEvidence.evidence());
+            if (nativeOperationWallEvidenceRequested) { out.put("nativeOperationWallEvidenceRequested", true); }
             return java.util.Collections.unmodifiableMap(out);
         }
     }
@@ -235,9 +238,11 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 activePhase = phaseId;
                 clockRejectionEvidence = null;
                 clockRecordingFailure = null;
+                nativeOperationWallEvidenceRequested = false;
                 if (measured && Boolean.getBoolean(CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
                     clockRejectionEvidence = new BenchmarkOperationClockEvidence(
                             databaseName + "." + targetCollection, targetId, phaseId);
+                    nativeOperationWallEvidenceRequested = Boolean.getBoolean(NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY);
                 }
             } else if (!activePhase.equals(phaseId)) {
                 throw new IllegalStateException("target changes for " + activePhase + " are not checkpointed");
@@ -561,6 +566,11 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 : Map.of("seconds", Integer.toUnsignedLong(timestamp.getTime()), "increment", Integer.toUnsignedLong(timestamp.getInc())));
         out.put("wallTime", change.getWallTime() == null ? Map.of("status", "MISSING") : change.getWallTime().getValue());
         out.put("resumeToken", change.getResumeToken() == null ? Map.of("status", "MISSING") : change.getResumeToken().toJson());
+        if (nativeOperationWallEvidenceRequested) {
+            out.put("documentKey", change.getDocumentKey() == null ? Map.of("status", "MISSING")
+                    : change.getDocumentKey().toJson(org.bson.json.JsonWriterSettings.builder()
+                            .outputMode(org.bson.json.JsonMode.EXTENDED).build()));
+        }
         out.put("startedReadNanos", startedReadNanos); out.put("completedReadNanos", observedNanos);
         out.put("observedNanos", observedNanos); out.put("acceptedNanos", acceptedNanos);
         return java.util.Collections.unmodifiableMap(out);
@@ -597,6 +607,39 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         }
     }
 
+    /** No native metadata query runs until the original reader has stopped with a clock refusal. */
+    private void retainNativeOperationWalls(boolean readerStopped) {
+        Map<String, Object> snapshot;
+        AssertionError original;
+        synchronized (lock) {
+            if (!nativeOperationWallEvidenceRequested) { return; }
+            snapshot = clockRejectionEvidence == null ? null : clockRejectionEvidence.evidence();
+            original = failure;
+        }
+        try {
+            Map<String, Object> evidence;
+            if (!readerStopped || snapshot == null || original == null || !"REJECTED".equals(snapshot.get("state"))) {
+                evidence = Map.of("state", "UNKNOWN", "reason", "NO_COMPLETE_STOPPED_READER_CLOCK_REFUSAL",
+                        "lookupAttempts", 0, "rootCause", "UNKNOWN", "performanceAcceptanceEligible", false);
+            } else {
+                evidence = BenchmarkNativeOperationWallEvidence.lookup(snapshot,
+                        new BenchmarkNativeOperationWallLookup(client, databaseName + "." + targetCollection),
+                        System::nanoTime, original);
+            }
+            System.out.println("benchmark-native-operation-wall=" + JsonWriter.write(evidence));
+        } catch (RuntimeException | Error recording) {
+            if (original != null && recording != original) { original.addSuppressed(recording); }
+            try {
+                System.out.println("benchmark-native-operation-wall=" + JsonWriter.write(Map.of(
+                        "state", "UNKNOWN", "reason", "NATIVE_METADATA_RETENTION_FAILED",
+                        "failureType", recording.getClass().getSimpleName(), "rootCause", "UNKNOWN",
+                        "performanceAcceptanceEligible", false)));
+            } catch (RuntimeException | Error printing) {
+                if (original != null && printing != original) { original.addSuppressed(printing); }
+            }
+        }
+    }
+
     @Override
     public void close() {
         synchronized (lock) {
@@ -610,12 +653,14 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         try {
             cursor.close();
         } finally {
+            boolean readerStopped = false;
             try {
-                reader.join(Duration.ofSeconds(2));
+                readerStopped = reader.join(Duration.ofSeconds(2));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } finally {
                 try {
+                    retainNativeOperationWalls(readerStopped);
                     if (pendingBarrierId != null) {
                         client.getDatabase(databaseName).getCollection(BARRIER_COLLECTION)
                                 .deleteOne(Filters.eq("_id", pendingBarrierId));
