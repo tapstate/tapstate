@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineStatus;
+import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
@@ -34,8 +35,9 @@ import java.util.TreeMap;
  * reading look fresher, never stale, so nothing is ever reported as a stopped publisher by clock skew.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-record PipelineStatusResponse(String pipelineId, PipelineState state, Failure failure, Instant observedAt,
-        Long observedAgeMillis) {
+record PipelineStatusResponse(String pipelineId, PipelineCatalogItem.DisplayState state, Failure failure,
+        Instant observedAt, Long observedAgeMillis, PipelineState desiredState, PipelineState observedState,
+        boolean hasArtifact) {
 
     /**
      * A coded failure as a client reads it: the canonical code string (the stable identity — the enum never
@@ -55,10 +57,21 @@ record PipelineStatusResponse(String pipelineId, PipelineState state, Failure fa
      */
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
         Instant observedAt = status.observedAt();
-        return new PipelineStatusResponse(status.pipelineId(), status.state(),
+        return new PipelineStatusResponse(status.pipelineId(),
+                PipelineCatalogItem.DisplayState.valueOf(status.state().name()),
                 failure(status.failure(), catalog), observedAt,
                 observedAt == null ? null
-                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()));
+                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
+                null, status.state(), true);
+    }
+
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
+        PipelineCatalogItem.Status status = item.status();
+        Instant observedAt = status.observedAt();
+        return new PipelineStatusResponse(item.id(), status.state(), failure(status.failure(), catalog),
+                observedAt, observedAt == null ? null
+                        : Math.max(0, Duration.between(observedAt, Clock.systemUTC().instant()).toMillis()),
+                status.desiredState(), status.observedState(), item.hasArtifact());
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {
