@@ -94,6 +94,8 @@ final class ControlPlane {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
     private String credential;
+    private int healthAttempts;
+    private volatile String healthObservation = "no completed health request";
 
     ControlPlane(URI baseUrl) {
         this.baseUrl = baseUrl;
@@ -101,13 +103,31 @@ final class ControlPlane {
 
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
+        int attempt = ++healthAttempts;
+        long started = System.nanoTime();
         try {
             HttpResponse<String> response = send(get("/healthz"));
+            String body = response.body();
+            String excerpt = body.length() <= 128 ? body : body.substring(0, 128);
+            healthObservation = "attempt " + attempt + " at " + response.uri() + " after "
+                    + Duration.ofNanos(System.nanoTime() - started) + ": HTTP " + response.statusCode()
+                    + ", bodyLength=" + body.length() + ", body=" + TYPED_JSON.valueToTree(excerpt);
             return response.statusCode() == 200 && "ok".equals(response.body());
         } catch (UncheckedIOException e) {
+            List<String> causes = new ArrayList<>();
+            for (Throwable cause = e; cause != null && causes.size() < 5; cause = cause.getCause()) {
+                String message = String.valueOf(cause.getMessage());
+                if (message.length() > 128) { message = message.substring(0, 128); }
+                causes.add(cause.getClass().getName() + ": " + TYPED_JSON.valueToTree(message));
+            }
+            healthObservation = "attempt " + attempt + " at " + baseUrl.resolve("/healthz") + " after "
+                    + Duration.ofNanos(System.nanoTime() - started) + ": " + String.join(" <- ", causes);
             return false;
         }
     }
+
+    /** The last completed existing probe, without making another request or changing readiness. */
+    String healthObservation() { return healthObservation; }
 
     /**
      * The version the running server says it is, read the way a client reads it: unauthenticated,

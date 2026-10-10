@@ -375,7 +375,8 @@ final class PartitionableCluster implements AutoCloseable {
                                 + " before health at " + server.baseUrl() + "; output:\n" + server.tail());
                     }
                     return plane.healthy();
-                }, () -> "member " + nodeId + " has not answered health; output:\n" + server.tail());
+                }, () -> "member " + nodeId + " pid=" + server.pid() + " alive=" + server.isAlive()
+                        + " has not answered health; " + plane.healthObservation() + "; output:\n" + server.tail());
     }
 
     private static void closeAfterFailure(Iterable<? extends AutoCloseable> owned, Throwable failure) {
