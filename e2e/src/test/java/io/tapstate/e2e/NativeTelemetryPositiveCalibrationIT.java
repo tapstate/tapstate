@@ -142,7 +142,8 @@ class NativeTelemetryPositiveCalibrationIT {
                             && flag(observed, "OFFER", "accepted", receipt)
                             && flag(observed, "VISIBLE", "included", receipt)
                             && matchingProduced(observed, body, receipt)
-                            && positiveScrape(body, pipeline)) { break; }
+                            && positiveScrape(body, pipeline)
+                            && boundary.decodedAndAuthorityBound()) { break; }
                     java.util.concurrent.TimeUnit.MILLISECONDS.sleep(250);
                 }
                 assertThat(boundary).isNotNull();
@@ -157,7 +158,8 @@ class NativeTelemetryPositiveCalibrationIT {
                 assertThat(matchingProduced(observed, body, receipt))
                         .as("the same real included point is visible in the fresh scrape").isTrue();
                 assertThat(positiveScrape(body, pipeline)).isTrue();
-                assertThat(boundary.decodedAndAuthorityBound()).isTrue();
+                assertThat(boundary.decodedAndAuthorityBound())
+                        .as("the positive evidence is complete only after its native invocations drain").isTrue();
                 var logRead = new java.util.LinkedHashMap<>(assertScopedLogRead(observed, http, fork.control(), observer.server().baseUrl(), receipt));
                 logRead.put("nativeLogEvidence", callerResolver.evidence(observed.stream()
                         .filter(record -> "LOG".equals(record.get("target"))).toList()));
