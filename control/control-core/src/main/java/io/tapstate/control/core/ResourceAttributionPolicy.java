@@ -123,14 +123,14 @@ public final class ResourceAttributionPolicy {
         return switch (resource) {
             case SourceResource source -> new SourceResource(
                     source.id(), metadata, source.connector(), source.config(), source.mode(), source.tables(),
-                    source.srs(), source.experimental());
+                    source.srs(), source.execution(), source.experimental());
             case PipelineResource pipeline -> new PipelineResource(
                     pipeline.id(), metadata, pipeline.sources(), pipeline.transforms(), pipeline.view(),
                     pipeline.serve(), pipeline.settings(), pipeline.experimental());
             case TransformResource transform -> new TransformResource(
                     transform.id(), metadata, transform.body(), transform.experimental());
             case ViewResource view -> new ViewResource(
-                    view.id(), metadata, view.primaryKey(), view.storage(), view.experimental());
+                    view.id(), metadata, view.primaryKey(), view.storage(), view.execution(), view.experimental());
             case ServeResource serve -> new ServeResource(
                     serve.id(), metadata, serve.sync(), serve.query(), serve.push(), serve.experimental());
         };

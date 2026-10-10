@@ -48,6 +48,19 @@ class RealProcessServerStagingTest {
         assertThat(staging).as("the staging directory of a killed launch").doesNotExist();
     }
 
+    @Test
+    void aStagingDirectoryAWitnessNamedStaysWhenTheLaunchEnds(@TempDir Path scratch) throws IOException {
+        // The witness made it and may still read it; clearing it is the witness's own business.
+        Path named = Files.createDirectory(scratch.resolve("named-staging"));
+        RealProcessServer closed = RealProcessServer.launching(UNUSED_STORE, notAJar(scratch), named);
+        closed.close();
+        RealProcessServer killed = RealProcessServer.launching(UNUSED_STORE, notAJar(scratch), named);
+        killed.kill();
+
+        assertThat(closed.stagingDirectory()).isEqualTo(named);
+        assertThat(named).as("a staging directory the witness named").isDirectory();
+    }
+
     private static Path notAJar(Path scratch) throws IOException {
         return Files.writeString(scratch.resolve("not-a.jar"), "");
     }

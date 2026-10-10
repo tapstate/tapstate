@@ -15,6 +15,10 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.core.lifecycle.ParallelismBudget;
+import io.tapstate.runtime.srs.SourcePlacement;
+import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.core.model.BatchSpec;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -149,6 +153,57 @@ class ValidatedPipelineBuildsTest {
         // assembly root supplies no nest binding, which is exactly what it had until now.
         assertThat(vertexNames(dag)).contains("orders_src", "items_src", "serve.sync_1");
         assertThat(vertexNames(dag)).anyMatch(name -> name.startsWith("nest:"));
+    }
+
+    /**
+     * The threads a nest's vertices hold count against what a member may run of them, counted from the tree the
+     * nest compiles to: here one vertex, so two wide it holds two threads - past a member allowed one, and within
+     * one allowed two.
+     */
+    @Test
+    void aWideNestIsRefusedWhereItsVerticesWouldHoldMoreThreadsThanAMemberMay() {
+        InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, NEST_PIPELINE.replace(
+                "    type: nest\n", "    type: nest\n    execution: { parallelism: 2 }\n"));
+        discovered(store, "items_src", "order_items", List.of("id"));
+
+        assertThatThrownBy(() -> sourceAllowing(store, 1).dagFor("nested"))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ActuationError.NO_SAFE_PARALLELISM);
+                    assertThat(refused.args()).containsEntry("node", "doc").containsEntry("candidates",
+                            "2 per member breaks " + ParallelismBudget.MAX_BLOCKING_PROCESSORS_PER_MEMBER);
+                });
+        assertThat(sourceAllowing(store, 2).dagFor("nested")).isNotNull();
+    }
+
+    /**
+     * A run is planned over the members read as it is built - the plan names them, and every node's width was
+     * worked out for exactly that many - and carries the batch each node takes its input in: the one written on
+     * it, or the default where none was.
+     */
+    @Test
+    void aRunIsPlannedOverTheMembersItWasBuiltForWithEveryNodesBatch() {
+        InMemoryStorePort store = validated(SOURCE, TARGET, PIPELINE.replace(
+                "sync: [ { id: sync_1, source: orders_dest } ]",
+                "sync: [ { id: sync_1, source: orders_dest, "
+                        + "execution: { batch: { max_records: 64, max_wait: 20ms } } } ]"));
+        discovered(store, "orders_src", "orders", List.of("id"));
+
+        DagSource.PlannedDag planned = sourceAllowing(store, 128).plannedDagFor("p", null);
+
+        assertThat(planned.members()).containsExactly("member-1");
+        assertThat(planned.shape().plannedMembers()).isEqualTo(planned.members().size());
+        assertThat(planned.shape().nodes()).containsKeys("orders_src", "keep_even", "serve.sync_1");
+        assertThat(planned.batches()).containsOnlyKeys("orders_src", "keep_even", "serve.sync_1");
+        assertThat(planned.batches().get("serve.sync_1").effectiveMaxRecords()).isEqualTo(64);
+        assertThat(planned.batches().get("serve.sync_1").effectiveMaxWaitMillis()).isEqualTo(20L);
+        assertThat(planned.batches().get("keep_even").effectiveMaxRecords())
+                .isEqualTo(BatchSpec.DEFAULT_MAX_RECORDS);
+    }
+
+    /** The assembled source on one member, allowed {@code threads} threads for vertices that hold one each. */
+    private static StoreBackedDagSource sourceAllowing(InMemoryStorePort store, int threads) {
+        return new StoreBackedDagSource(store, NestSettings.defaults(), StoreReachability.assumingReachable(),
+                SourcePlacement.anyMember(), () -> List.of("member-1"), new ParallelismBudget(16, 8, 262144, threads));
     }
 
     @Test
@@ -338,6 +393,38 @@ class ValidatedPipelineBuildsTest {
 
         DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("p");
 
+        // A sink its author wrote no width for runs four writers, and reads a keyed table through a router.
+        assertThat(vertexNames(dag))
+                .containsExactlyInAnyOrder("orders_src", "keep_even", "route.serve.sync_1", "serve.sync_1");
+        assertThat(dag.getVertex("serve.sync_1").getLocalParallelism()).isEqualTo(4);
+    }
+
+    /** A source asked to be read by four processors is still read by one: its reader stays pinned to one. */
+    @Test
+    void aSourceAskedForMoreThanOneReaderIsStillReadByOne() {
+        InMemoryStorePort store = validated(SOURCE.replace("tables: [ orders ]\n",
+                "tables: [ orders ]\nexecution: { parallelism: 4 }\n"), TARGET, PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"));
+
+        DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("p");
+
+        assertThat(dag.getVertex("orders_src").getMetaSupplier().preferredLocalParallelism())
+                .as("one reader for the whole cluster").isEqualTo(1);
+    }
+
+    /**
+     * A sync element whose author asked for one writer runs as one writer for the whole cluster, with nothing
+     * in front of it to route by - the width written in the element, carried from the text to the graph.
+     */
+    @Test
+    void aSyncElementAskingForOneWriterRunsItWithNoRouter() {
+        InMemoryStorePort store = validated(SOURCE, TARGET, PIPELINE.replace(
+                "sync: [ { id: sync_1, source: orders_dest } ]",
+                "sync: [ { id: sync_1, source: orders_dest, execution: { parallelism: 1 } } ]"));
+        discovered(store, "orders_src", "orders", List.of("id"));
+
+        DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("p");
+
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "keep_even", "serve.sync_1");
     }
 
@@ -352,7 +439,7 @@ class ValidatedPipelineBuildsTest {
 
         DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("direct");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "serve.sync_1");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.serve.sync_1", "serve.sync_1");
     }
 
     // ---- fixtures ----------------------------------------------------------------------

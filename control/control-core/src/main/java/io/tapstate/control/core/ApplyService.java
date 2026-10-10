@@ -106,7 +106,7 @@ public final class ApplyService {
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
     private static final Set<String> SOURCE_PATCH_FIELDS = Set.of(
-            "metadata", "config", "mode", "tables", "srs", "experimental");
+            "metadata", "config", "mode", "tables", "srs", "execution", "experimental");
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
@@ -234,6 +234,7 @@ public final class ApplyService {
                 fields.contains("mode") ? submitted.mode() : existing.mode(),
                 fields.contains("tables") ? submitted.tables() : existing.tables(),
                 fields.contains("srs") ? submitted.srs() : existing.srs(),
+                fields.contains("execution") ? submitted.execution() : existing.execution(),
                 fields.contains("experimental") ? submitted.experimental() : existing.experimental());
         return new MergedSource(merged, storedHash(existing));
     }

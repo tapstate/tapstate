@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -50,9 +51,11 @@ final class TwoMemberCluster implements AutoCloseable {
     private final String bindAddress;
     private final String seeds;
     private final Duration nodeSessionTtl;
+    private final Map<String, Path> stagingByNode;
 
     private TwoMemberCluster(RealProcessServer first, RealProcessServer second, String storeUri,
-            String clusterId, String bindAddress, String seeds, Duration nodeSessionTtl) {
+            String clusterId, String bindAddress, String seeds, Duration nodeSessionTtl,
+            Map<String, Path> stagingByNode) {
         this.first = first;
         this.second = second;
         this.a = new ControlPlane(first.baseUrl());
@@ -62,6 +65,7 @@ final class TwoMemberCluster implements AutoCloseable {
         this.bindAddress = bindAddress;
         this.seeds = seeds;
         this.nodeSessionTtl = nodeSessionTtl;
+        this.stagingByNode = Map.copyOf(stagingByNode);
     }
 
     /**
@@ -85,12 +89,12 @@ final class TwoMemberCluster implements AutoCloseable {
      * @param nodeSessionTtl the lease each member's node session is taken under, or null for the default
      */
     static TwoMemberCluster start(String storeUri, String name, Duration nodeSessionTtl) {
-        return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, false, false);
+        return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, false, false, Map.of());
     }
 
     /** Starts both JVMs before waiting, so first-boot coordination executes concurrently. */
     static TwoMemberCluster startConcurrently(String storeUri, String name, Duration nodeSessionTtl) {
-        return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, true, false);
+        return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, true, false, Map.of());
     }
 
     /** Restarts the entire stopped cluster with its original durable identity and existing administrator. */
@@ -98,11 +102,23 @@ final class TwoMemberCluster implements AutoCloseable {
         if (first.isAlive() || second.isAlive()) {
             throw new IllegalStateException("both original processes must stop before a cluster restart");
         }
-        return start(storeUri, clusterId, nodeSessionTtl, true, true);
+        return start(storeUri, clusterId, nodeSessionTtl, true, true, stagingByNode);
+    }
+
+    /**
+     * The same, with the member carrying {@code nodeId} staging the connectors it resolves into
+     * {@code stagingDirectory}.
+     *
+     * <p>For a case whose subject is one member that cannot stage what a pipeline needs while the other can. Every
+     * other launch stages into a directory of its own, and this is the one place a case says where instead.
+     */
+    static TwoMemberCluster startStaging(String storeUri, String name, String nodeId, Path stagingDirectory) {
+        return start(storeUri, name + "-" + UUID.randomUUID(), null, false, false,
+                Map.of(requireKnown(nodeId), stagingDirectory));
     }
 
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
-            boolean concurrent, boolean existingAdministrator) {
+            boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode) {
         String bindAddress = RoutableAddress.ofThisMachine();
         int memberPortA = RealProcessServer.reservePort();
         int memberPortB = RealProcessServer.reservePort();
@@ -114,13 +130,13 @@ final class TwoMemberCluster implements AutoCloseable {
             java.util.function.IntFunction<List<String>> firstArguments = httpPort -> arguments(
                     clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
             first = concurrent
-                    ? RealProcessServer.launching(storeUri, "0.0.0.0", firstArguments)
-                    : RealProcessServer.start(storeUri, "0.0.0.0", firstArguments);
+                    ? RealProcessServer.launching(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments)
+                    : RealProcessServer.start(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments);
             java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
                     clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
             second = concurrent
-                    ? RealProcessServer.launching(storeUri, "0.0.0.0", secondArguments)
-                    : RealProcessServer.start(storeUri, "0.0.0.0", secondArguments);
+                    ? RealProcessServer.launching(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments)
+                    : RealProcessServer.start(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments);
         } catch (RuntimeException | Error failure) {
             if (first != null) {
                 first.close();
@@ -131,7 +147,7 @@ final class TwoMemberCluster implements AutoCloseable {
             RealProcessServer.releasePort(memberPortB);
         }
         TwoMemberCluster cluster = new TwoMemberCluster(
-                first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl);
+                first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl, stagingByNode);
         try {
             if (concurrent) {
                 first.awaitReady();
@@ -174,6 +190,11 @@ final class TwoMemberCluster implements AutoCloseable {
         return NODE_A.equals(requireKnown(nodeId)) ? first : second;
     }
 
+    /** The staging directory a witness named for the member, or null for one the member's launch makes and clears. */
+    private static Path staging(String nodeId, Map<String, Path> stagingByNode) {
+        return stagingByNode.get(nodeId);
+    }
+
     private static String requireKnown(String nodeId) {
         if (!NODE_A.equals(nodeId) && !NODE_B.equals(nodeId)) {
             throw new AssertionError("this cluster carries " + NODE_A + " and " + NODE_B
@@ -197,7 +218,7 @@ final class TwoMemberCluster implements AutoCloseable {
      */
     RealProcessServer launching(String nodeId) {
         int memberPort = RealProcessServer.reservePort();
-        return RealProcessServer.launching(storeUri, "0.0.0.0",
+        return RealProcessServer.launching(storeUri, "0.0.0.0", staging(nodeId, stagingByNode),
                 httpPort -> arguments(
                         clusterId, nodeId, memberPort, seeds, httpPort, bindAddress, nodeSessionTtl));
     }

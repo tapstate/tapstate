@@ -17,18 +17,21 @@ import io.tapstate.spi.store.IoError;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
@@ -50,6 +53,9 @@ public final class MongoConnection implements AutoCloseable {
 
     /** The database used when the connection URI names none. */
     private static final String DEFAULT_DATABASE = "tapstate";
+
+    /** The longest application name the driver sends, in UTF-8 bytes. */
+    private static final int MAX_APPLICATION_NAME_BYTES = 128;
 
     private final MongoConnectionSettings settings;
     private MongoClient client;
@@ -288,7 +294,88 @@ public final class MongoConnection implements AutoCloseable {
         if (useTls && settings.tlsCaFile() != null) {
             builder.applyToSslSettings(b -> b.context(buildSslContext(settings.tlsCaFile())));
         }
+        // Named for this start of the process, so that once it has gone - killed halfway through a write, say -
+        // whoever is left can find the transactions it left open and end them; see endTransactionsLeftOpenBy.
+        if (settings.processId() != null) {
+            builder.applicationName(applicationName(connectionString.getApplicationName(), settings.processId()));
+        }
         return builder.build();
+    }
+
+    /**
+     * The part of a client's application name that says which process it belongs to. It ends the name, and
+     * is what {@link #endTransactionsLeftOpenBy} looks for.
+     */
+    public static String processTag(String processId) {
+        return "tapstate/" + Objects.requireNonNull(processId, "processId");
+    }
+
+    /**
+     * The application name of a client of the process {@code processId}: the name the URI gives, when it gives
+     * one, then the process's tag, within the length the driver sends. The tag goes last and whole, so it is the
+     * name the URI gives that is cut short when there is not room for both.
+     */
+    static String applicationName(String given, String processId) {
+        String tag = processTag(processId);
+        if (given == null || given.isEmpty()) {
+            return tag;
+        }
+        String kept = withinBytes(given, MAX_APPLICATION_NAME_BYTES - tag.getBytes(StandardCharsets.UTF_8).length - 1);
+        return kept.isEmpty() ? tag : kept + " " + tag;
+    }
+
+    /** The longest start of {@code text} that is at most {@code bytes} long in UTF-8, cut between characters. */
+    private static String withinBytes(String text, int bytes) {
+        int used = 0;
+        int end = 0;
+        while (end < text.length()) {
+            int codePoint = text.codePointAt(end);
+            int size = new String(Character.toChars(codePoint)).getBytes(StandardCharsets.UTF_8).length;
+            if (used + size > bytes) {
+                break;
+            }
+            used += size;
+            end += Character.charCount(codePoint);
+        }
+        return text.substring(0, end);
+    }
+
+    /**
+     * Ends every transaction a client of the process {@code processId} left open at the store, and answers how
+     * many it ended.
+     *
+     * <p>What a transaction has written stays held until it ends, and one whose process stopped halfway through
+     * it - killed, or cut off - ends only when the store gives up on it, a minute later by default. Until then
+     * every other write to what it touched waits, or retries, behind it: the progress a sink reports, a
+     * capture's claim being renewed or taken over, a change being appended to the durable log. A process that
+     * has gone cannot end it, so whoever is left does, as soon as it knows the process has gone. The store lists
+     * the transactions sitting open for each client, by the name the client connected under, and this ends
+     * those of that process's clients. What they wrote is thrown away, which is all that could have become of
+     * it: nobody is left to commit it.
+     *
+     * <p>Only this user's own sessions are listed and ended, which asks for no privilege beyond connecting, and
+     * every process of a deployment connects to its store as the same user.
+     */
+    public int endTransactionsLeftOpenBy(String processId) {
+        Objects.requireNonNull(processId, "processId");
+        MongoDatabase admin = client().getDatabase("admin");
+        Document leftOpen = new Document("appName",
+                        new Document("$regex", "(^| )" + Pattern.quote(processTag(processId)) + "$"))
+                .append("transaction", new Document("$exists", true));
+        List<Document> sessions = new ArrayList<>();
+        StoreIo.run(() -> admin.aggregate(List.of(
+                        new Document("$currentOp", new Document("allUsers", false).append("idleSessions", true)),
+                        new Document("$match", leftOpen)))
+                .forEach(operation -> {
+                    if (operation.get("lsid") instanceof Document session && session.get("id") != null) {
+                        sessions.add(new Document("id", session.get("id")));
+                    }
+                }));
+        if (sessions.isEmpty()) {
+            return 0;
+        }
+        StoreIo.run(() -> admin.runCommand(new Document("killSessions", sessions)));
+        return sessions.size();
     }
 
     /**

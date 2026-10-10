@@ -11,6 +11,8 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 
@@ -198,6 +200,48 @@ class MongoConnectionTest {
                 .as("only the self-signed CA is trusted").hasSize(1);
         assertThat(x509.getAcceptedIssuers()[0].getSubjectX500Principal().getName())
                 .contains("CN=localhost");
+    }
+
+    @Test
+    void aClientIsNamedForTheStartOfTheProcessItBelongsTo() {
+        String uri = "mongodb://localhost:27017/tapstate";
+
+        assertThat(clientSettingsFor(uri, "boot-1").getApplicationName())
+                .as("so that once the process has gone, whoever is left can find what its client left open by name")
+                .isEqualTo(MongoConnection.processTag("boot-1"));
+        assertThat(clientSettingsFor(uri).getApplicationName())
+                .as("and a connection made for no process anybody will clean up after is named for none")
+                .isNull();
+    }
+
+    @Test
+    void aNameTheUriGivesIsKeptInFrontOfTheProcessesTag() {
+        String uri = "mongodb://localhost:27017/tapstate?appName=ops-dashboard";
+
+        assertThat(clientSettingsFor(uri, "boot-1").getApplicationName())
+                .isEqualTo("ops-dashboard " + MongoConnection.processTag("boot-1"));
+    }
+
+    @Test
+    void aNameTheUriGivesIsCutBetweenCharactersSoTheTagStillFitsWhole() {
+        // As long as a name may be, in characters that take two bytes each: the tag cannot fit beside it whole, so
+        // the name is what gives way, and never in the middle of a character.
+        String given = "\u00e9".repeat(64);
+        String uri = "mongodb://localhost:27017/tapstate?appName=" + URLEncoder.encode(given, StandardCharsets.UTF_8);
+
+        String name = clientSettingsFor(uri, "boot-1").getApplicationName();
+
+        assertThat(name).endsWith(" " + MongoConnection.processTag("boot-1"));
+        assertThat(name.getBytes(StandardCharsets.UTF_8).length)
+                .as("within what the driver sends")
+                .isLessThanOrEqualTo(128);
+        assertThat(name.substring(0, name.indexOf(' '))).matches("\u00e9+");
+    }
+
+    private static MongoClientSettings clientSettingsFor(String uri, String processId) {
+        MongoConnectionSettings settings =
+                new MongoConnectionSettings(uri, null, Duration.ofMillis(300), processId);
+        return new MongoConnection(settings).buildClientSettings(new ConnectionString(uri));
     }
 
     private static MongoClientSettings clientSettingsFor(String uri) {

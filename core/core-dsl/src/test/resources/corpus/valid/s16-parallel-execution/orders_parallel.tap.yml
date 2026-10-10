@@ -1,0 +1,26 @@
+# Every kind of node carries the same execution block. A written value equal to its default
+# (parallelism 1 on a transform) stays written.
+version: tapstate/v1
+kind: pipeline
+id: orders_parallel
+source: src_orders
+transforms:
+  - id: shipped
+    type: filter
+    from: [orders]
+    expr: "after.status == 'SHIPPED'"
+    execution: { parallelism: 8 }
+  - id: masked
+    use: mask_notes
+    from: [shipped]
+    execution:
+      parallelism: 1
+      batch: { max_wait: 50ms }
+view: v_orders
+serve:
+  from: masked
+  sync:
+    - id: wh
+      source: tgt_wh
+      execution:
+        batch: { max_records: 2048, max_wait: 1s }

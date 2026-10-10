@@ -68,6 +68,11 @@ import java.util.stream.Stream;
  */
 final class Repl {
 
+    private static final String LOGIN_VERB = "login";
+    private static final String REASON_PARAM = "reason";
+    private static final String SEEDS_PARAM = "seeds";
+    private static final String SERVER_PARAM = "server";
+
     /**
      * Printed under a non-empty metrics read. The metric names are not a compatibility promise in this
      * preview: they may be renamed as the metric model settles, and the read face is where a user decides
@@ -94,7 +99,7 @@ final class Repl {
 
     /** REPL-only words handled here rather than by the command table; completed alongside the verbs. */
     static final List<String> BUILTINS =
-            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", "login", "logout", ":ctx");
+            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", LOGIN_VERB, "logout", ":ctx");
 
     /**
      * Registry verbs a connected session routes to the server instead of the offline command table. The
@@ -592,7 +597,7 @@ final class Repl {
             lastExitCode = disconnect();
             return true;
         }
-        if (words.get(0).equals("login")) {
+        if (words.get(0).equals(LOGIN_VERB)) {
             lastExitCode = login(words);
             return true;
         }
@@ -714,11 +719,11 @@ final class Repl {
                 namedContext = named;
                 return Cli.EXIT_OK;
             }
-            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED,
+            printDiagnostic(commandLine.getErr(), CliError.CONTEXT_REQUIRED,
                     Map.of("verb", "auth"));
             return Cli.EXIT_VERB_UNAVAILABLE;
         } catch (io.tapstate.core.common.TapstateException error) {
-            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            printDiagnostic(commandLine.getErr(), error.code(), error.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -737,7 +742,7 @@ final class Repl {
         try {
             Optional<ResolvedContext> resolution = contextResolver.resolve(connect, explicitContext, workspace);
             if (resolution.isEmpty()) {
-                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
+                printDiagnostic(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
                 return Cli.EXIT_VERB_UNAVAILABLE;
             }
             ResolvedContext target = resolution.orElseThrow();
@@ -753,7 +758,7 @@ final class Repl {
             }
             return connected;
         } catch (io.tapstate.core.common.TapstateException error) {
-            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            printDiagnostic(commandLine.getErr(), error.code(), error.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -785,8 +790,7 @@ final class Repl {
         }
         PrintWriter err = commandLine.getErr();
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
- Map.of("verb", words.get(0)), session.versions());
+            printDiagnostic(err, CliError.NOT_AUTHENTICATED, Map.of("verb", words.get(0)));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         // `test` and its read-back `test-result` return a structured report that is worth machine-reading, so
@@ -913,7 +917,7 @@ final class Repl {
             });
             return Cli.EXIT_OK;
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
+            printDiagnostic(commandLine.getErr(), failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -939,7 +943,7 @@ final class Repl {
             adoptAdvertisedMembers(verified.issuer());
             return Cli.EXIT_OK;
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
+            printDiagnostic(commandLine.getErr(), failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -1168,8 +1172,7 @@ final class Repl {
             }
         }
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED,
- Map.of("verb", verb), session.versions());
+            printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", verb));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         int prepared = prepareCredential();
@@ -1177,8 +1180,7 @@ final class Repl {
             return prepared;
         }
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
- Map.of("verb", verb), session.versions());
+            printDiagnostic(err, CliError.NOT_AUTHENTICATED, Map.of("verb", verb));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         return switch (call) {
@@ -1203,8 +1205,7 @@ final class Repl {
     private int watchLive(DataBrowserCall.Live live) {
         PrintWriter out = commandLine.getOut();
         if (!terminal.getAsBoolean()) {
-            Diagnostics.printText(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL,
- Map.of(), session.versions());
+            printDiagnostic(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL, Map.of());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         String namespace = live.sourceId() + "." + live.collection();
@@ -1609,7 +1610,7 @@ final class Repl {
         Prompter asking = terminal.getAsBoolean() ? prompter() : null;
         if (asking == null) {
             PrintWriter err = commandLine.getErr();
-            Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
+            printDiagnostic(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
             err.flush();
             return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
         }
@@ -2162,7 +2163,7 @@ final class Repl {
                 if (residue != null) {
                     err.println("  left behind, clear by hand: " + renderReferrers(residue));
                 }
-                if ("pipeline-live".equals(String.valueOf(rejected.params().get("reason")))) {
+                if ("pipeline-live".equals(String.valueOf(rejected.params().get(REASON_PARAM)))) {
                     // Nothing was cleared here on purpose, and clearing it by hand while the job runs
                     // would discard the fencing epoch that keeps it from colliding with a later
                     // pipeline under the same id. Stopping comes first.
@@ -2848,7 +2849,7 @@ final class Repl {
     private int renderDownloadFailure(String connector, Exception failure, OutputFormat format) {
         String reason = failure.getMessage() == null || failure.getMessage().isBlank()
                 ? failure.getClass().getSimpleName() : failure.getMessage();
-        Map<String, Object> params = Map.of("connector", connector, "reason", reason);
+        Map<String, Object> params = Map.of("connector", connector, REASON_PARAM, reason);
         MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(CliError.CONNECTOR_DOWNLOAD_FAILED, params);
         if (format == OutputFormat.TEXT) {
             return renderRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), params);
@@ -2915,7 +2916,7 @@ final class Repl {
                     out.println();
                     out.println(pipelineHeadline(pipeline, listed.members().size()));
                     for (RemoteVertex vertex : pipeline.vertices()) {
-                        out.println("  " + cell(vertex.name()) + "  " + where(vertex));
+                        out.println("  " + cell(vertex.name()) + "  " + where(vertex) + backlogOf(vertex));
                     }
                 }
             }
@@ -2996,6 +2997,18 @@ final class Repl {
         return line.toString();
     }
 
+    /**
+     * The rows queued into one vertex's processors between them, where any are: what a vertex that has fallen
+     * behind shows first. Nothing is printed where none are queued or nothing was read, so a line that says
+     * nothing about a backlog is a vertex keeping up or one not yet measured, as the headline's measured-from
+     * count says.
+     */
+    private static String backlogOf(RemoteVertex vertex) {
+        long queued = vertex.processors().stream()
+                .map(RemoteProcessor::backlog).filter(java.util.Objects::nonNull).mapToLong(Long::longValue).sum();
+        return queued > 0 ? "  backlog " + queued : "";
+    }
+
     /** Where one vertex's work is, by the node names a reader can act on; the count when it has none. */
     private static String where(RemoteVertex vertex) {
         List<String> nodes = new ArrayList<>();
@@ -3037,8 +3050,22 @@ final class Repl {
             for (RemoteProcessor processor : vertex.processors()) {
                 Map<String, Object> one = new LinkedHashMap<>();
                 putIfPresent(one, "index", processor.index());
+                putIfPresent(one, "localIndex", processor.localIndex());
                 putIfPresent(one, "memberUuid", processor.memberUuid());
                 putIfPresent(one, "nodeId", processor.nodeId());
+                putIfPresent(one, "backlog", processor.backlog());
+                if (!processor.frontierGaps().isEmpty()) {
+                    one.put("frontierGaps", new java.util.TreeMap<>(processor.frontierGaps()));
+                }
+                if (!processor.frontierStalledMillis().isEmpty()) {
+                    one.put("frontierStalledMillis", new java.util.TreeMap<>(processor.frontierStalledMillis()));
+                }
+                if (!processor.queuedByStream().isEmpty()) {
+                    one.put("queuedByStream", new java.util.TreeMap<>(processor.queuedByStream()));
+                }
+                if (!processor.inFlightByTable().isEmpty()) {
+                    one.put("inFlightByTable", new java.util.TreeMap<>(processor.inFlightByTable()));
+                }
                 processors.add(one);
             }
             entry.put("processors", processors);
@@ -3397,7 +3424,7 @@ final class Repl {
             entry.put("name", check.name());
             entry.put("status", check.status());
             putIfPresent(entry, "message", check.message());
-            putIfPresent(entry, "reason", check.reason());
+            putIfPresent(entry, REASON_PARAM, check.reason());
             putIfPresent(entry, "solution", check.solution());
             putIfPresent(entry, "connectorErrorCode", check.connectorErrorCode());
             checks.add(entry);
@@ -3731,7 +3758,7 @@ final class Repl {
     }
 
     private int renderMalformedRequest(String reason) {
-        Map<String, Object> args = Map.of("reason", reason);
+        Map<String, Object> args = Map.of(REASON_PARAM, reason);
         String message = MessageCatalog.bundled().render("control.malformed-request", args).message();
         return renderRejection("control.malformed-request", message, args);
     }
@@ -3871,9 +3898,9 @@ final class Repl {
 
     /**
      * {@code snapshot <pipeline-id>} — reads the pipeline's per-table initial-load progress and prints one
-     * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)} line per table in name order (a table with no total
-     * shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there is
-     * none. A coded refusal renders its code and message.
+     * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)  landed|landing} line per table in name order (a table with
+     * no total shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there
+     * is none. A coded refusal renders its code and message.
      */
     private int snapshotOnline(List<String> words) {
         String id = readTargetId(words);
@@ -4237,13 +4264,18 @@ final class Repl {
 
     /**
      * One table's snapshot progress: {@code rowsDone/rowsTotal (donePct%)} when the total is known, or
-     * {@code rowsDone/?} when it is unavailable — honest partial data, never faked as a percentage.
+     * {@code rowsDone/?} when it is unavailable — honest partial data, never faked as a percentage. Then
+     * {@code landed} once the target has durably confirmed the whole load, or {@code landing} while it has not;
+     * neither from a server that does not say.
      */
     private static String renderProgress(RemoteTableSnapshot progress) {
-        if (progress.rowsTotal() != null && progress.donePct() != null) {
-            return progress.rowsDone() + "/" + progress.rowsTotal() + " (" + progress.donePct() + "%)";
+        String counted = progress.rowsTotal() != null && progress.donePct() != null
+                ? progress.rowsDone() + "/" + progress.rowsTotal() + " (" + progress.donePct() + "%)"
+                : progress.rowsDone() + "/?";
+        if (progress.landed() == null) {
+            return counted;
         }
-        return progress.rowsDone() + "/?";
+        return counted + (progress.landed() ? "  landed" : "  landing");
     }
 
     /**
@@ -4350,7 +4382,7 @@ final class Repl {
         boolean connectedHere = false;
         if (options.server() != null || !session.isConnected()) {
             if (contextResolver == null) {
-                Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", "up"), session.versions());
+                printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", "up"));
                 return Cli.EXIT_VERB_UNAVAILABLE;
             }
             // The workspace's first up is where the server question is asked - and the only place. All
@@ -4374,7 +4406,7 @@ final class Repl {
             return prepared;
         }
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", "up"), session.versions());
+            printDiagnostic(err, CliError.NOT_AUTHENTICATED, Map.of("verb", "up"));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         return new UpRun(workspace, options.format(), connectedHere).run();
@@ -4418,7 +4450,7 @@ final class Repl {
             return reportBindFailure(options.format(), workspace, refused.code(), refused.args());
         } catch (java.io.IOException unreadable) {
             return reportBindFailure(options.format(), workspace, CliError.WORKSPACE_UNREADABLE,
-                    Map.of("path", workspace.toString(), "reason", String.valueOf(unreadable.getMessage())));
+                    Map.of("path", workspace.toString(), REASON_PARAM, String.valueOf(unreadable.getMessage())));
         }
     }
 
@@ -4570,7 +4602,7 @@ final class Repl {
             }
             if (!connectedHere && !landingAnswers()) {
                 return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
-                        Map.of("seeds", hostPort(session.landingNode())));
+                        Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
             }
             Set<String> local = sources().stream().map(UpDraft::id).collect(Collectors.toSet());
             for (UpDraft pipeline : pipelines()) {
@@ -4656,7 +4688,7 @@ final class Repl {
                 }
                 case ConnectionTestOutcome.TimedOut ignored -> {
                     return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CliError.REQUEST_TIMED_OUT,
-                            Map.of("server", hostPort(session.landingNode())));
+                            Map.of(SERVER_PARAM, hostPort(session.landingNode())));
                 }
                 case ConnectionTestOutcome.Unreachable ignored -> {
                     return unreachable(UpCmd.STAGE_PREFLIGHT, source.id());
@@ -4676,7 +4708,7 @@ final class Repl {
             } catch (IOException e) {
                 String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
                 return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_UNREADABLE,
-                        Map.of("path", workspace.toString(), "reason", reason));
+                        Map.of("path", workspace.toString(), REASON_PARAM, reason));
             } catch (DslException e) {
                 return failure(UpCmd.STAGE_PREFLIGHT, e.source(), e.code(), e.args());
             }
@@ -4798,7 +4830,7 @@ final class Repl {
                     }
                     case ConnectionDiscoverSchemaOutcome.TimedOut ignored -> {
                         return failure(UpCmd.STAGE_DISCOVER, id, CliError.REQUEST_TIMED_OUT,
-                                Map.of("server", hostPort(session.landingNode())));
+                                Map.of(SERVER_PARAM, hostPort(session.landingNode())));
                     }
                     case ConnectionDiscoverSchemaOutcome.Unreachable ignored -> {
                         return unreachable(UpCmd.STAGE_DISCOVER, id);
@@ -4872,7 +4904,7 @@ final class Repl {
 
         /** A stage that could not reach the server, after failover had its say. */
         private int unreachable(String stage, String on) {
-            return failure(stage, on, CliError.CONNECT_FAILED, Map.of("seeds", hostPort(session.landingNode())));
+            return failure(stage, on, CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
         }
 
         /** A stage failed on a code raised on this side, rendered from the catalog. */
@@ -5145,6 +5177,71 @@ final class Repl {
             out.println("  pending    " + answer.pending().reason());
         }
         answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
+        if (answer.plan() != null) {
+            renderPlan(out, answer.plan());
+        }
+        if (!answer.awaitingRebalance().isEmpty()) {
+            out.println("  awaiting   " + String.join(", ", answer.awaitingRebalance())
+                    + " -- joined after this run was planned; given no part of it until a rebalance");
+        }
+    }
+
+    /**
+     * How wide the pipeline's current run was planned to run, node by node, and why, as the server sent it: the
+     * run the plan belongs to, then per node the width it runs at and how that is spread, the target it was given
+     * and where that came from, why the width is not the target where it is not, and the batch it takes its
+     * input in. Nothing is worked out here; a generation the run does not have is left out rather than shown as 0.
+     */
+    private static void renderPlan(PrintWriter out, ExplainOutcome.Plan plan) {
+        List<String> run = new ArrayList<>();
+        if (plan.executionGeneration() != null) {
+            run.add("execution " + plan.executionGeneration());
+        }
+        if (plan.claimGeneration() != null) {
+            run.add("claim " + plan.claimGeneration());
+        }
+        if (plan.topologyRevision() != null) {
+            run.add("topology " + plan.topologyRevision());
+        }
+        out.println("  planned    " + plan.plannedAt() + " on " + String.join(", ", plan.members())
+                + (run.isEmpty() ? "" : " (" + String.join(", ", run) + ")"));
+        if (plan.replaces() != null) {
+            out.println("  replaced   " + (plan.replaces().executionGeneration() == null ? "the run"
+                    : "execution " + plan.replaces().executionGeneration()) + " planned " + plan.replaces().plannedAt()
+                    + " on " + String.join(", ", plan.replaces().members()));
+        }
+        plan.nodes().forEach(node -> {
+            out.println("  width      " + node.node() + "  " + width(node));
+            if (node.resources() != null) {
+                out.println("  resources  " + node.node() + "  " + resources(node.resources()));
+            }
+        });
+    }
+
+    private static String resources(ExplainOutcome.PlanResources resources) {
+        return resources.writers() + (resources.writers() == 1 ? " writer, " : " writers, ")
+                + resources.connectorInstances() + " " + resources.connectorMode()
+                + (resources.connectorInstances() == 1 ? " connector" : " connectors")
+                + "; at most " + resources.bufferedRecords() + " records buffered and "
+                + resources.edgeQueueRecords() + " queued";
+    }
+
+    private static String width(ExplainOutcome.PlanNode node) {
+        String spread = node.computedLocal() == null
+                ? "one processor for the cluster"
+                : node.computedLocal() + " per member on " + node.memberCount()
+                        + (node.memberCount() == 1 ? " member" : " members");
+        return node.effective() + " in all (" + spread + "), requested " + node.requested()
+                + " (" + node.requestedOrigin() + ")"
+                + (node.reasons().isEmpty() ? "" : " -- " + String.join(", ", node.reasons()))
+                + "; batch " + node.maxRecords() + " records, " + node.maxWaitMillis() + "ms wait"
+                + (node.change() == null ? "" : "; " + changed(node.change()));
+    }
+
+    /** How a node's width moved from the run before, and what moved it where the server could say. */
+    private static String changed(ExplainOutcome.PlanChange change) {
+        return "was " + change.previousEffective()
+                + (change.causes().isEmpty() ? "" : " (" + String.join(", ", change.causes()) + ")");
     }
 
     private static String evidenceValue(Object value) {
@@ -5285,9 +5382,14 @@ final class Repl {
         if (!session.isConnected()) {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
-        Diagnostics.printText(commandLine.getErr(), CliError.REQUEST_TIMED_OUT,
-                Map.of("server", hostPort(session.landingNode())), session.versions());
+        printDiagnostic(commandLine.getErr(), CliError.REQUEST_TIMED_OUT,
+                Map.of(SERVER_PARAM, hostPort(session.landingNode())));
         return Cli.EXIT_DIAGNOSTIC;
+    }
+
+    /** Renders every coded session diagnostic with the versions of its current connection. */
+    private void printDiagnostic(PrintWriter err, TapstateErrorCode code, Map<String, Object> args) {
+        Diagnostics.printText(err, code, args, session.versions());
     }
 
     /**
@@ -5324,7 +5426,7 @@ final class Repl {
                 confirm("connected to " + hostPort(seed) + " (" + session.versions() + ")");
                 if (serverVersion != null && !serverVersion.equals(Cli.VERSION_NUMBER)) {
                     renderWarning(CliError.VERSION_MISMATCH.code(),
-                            Map.of("cli", Cli.VERSION_NUMBER, "server", serverVersion));
+                            Map.of("cli", Cli.VERSION_NUMBER, SERVER_PARAM, serverVersion));
                 }
                 return Cli.EXIT_OK;
             }
@@ -5402,8 +5504,7 @@ final class Repl {
             return machineTokenUsage("login cannot be combined with --token");
         }
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED,
- Map.of("verb", "login"), session.versions());
+            printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", LOGIN_VERB));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (words.size() < 2 || words.get(1).isBlank()) {
@@ -5427,7 +5528,7 @@ final class Repl {
         try {
             verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
         return switch (verified.withCredential(password.get(),
@@ -5467,18 +5568,18 @@ final class Repl {
                     yield Cli.EXIT_OK;
                 }
                 case AuthService.LoginResult.Rejected rejected -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGIN_REJECTED,
+                    printDiagnostic(err, CliError.AUTH_LOGIN_REJECTED,
                             Map.of("code", rejected.code(), "principal", rejected.principal()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
                 case AuthService.LoginResult.Unreachable ignored -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGIN_UNREACHABLE,
+                    printDiagnostic(err, CliError.AUTH_LOGIN_UNREACHABLE,
                             Map.of("context", namedContext.name()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
             };
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -5607,14 +5708,14 @@ final class Repl {
             return machineTokenAuth(words);
         }
         if (namedContext == null || authService == null) {
-            Diagnostics.printText(err, CliError.CONTEXT_REQUIRED, Map.of("verb", "auth"));
+            printDiagnostic(err, CliError.CONTEXT_REQUIRED, Map.of("verb", "auth"));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (words.size() < 2) {
             return authUsage("missing action");
         }
         return switch (words.get(1)) {
-            case "login" -> authLogin(words);
+            case LOGIN_VERB -> authLogin(words);
             case "status" -> words.size() == 2 ? authStatus() : authUsage("status takes no arguments");
             case "logout" -> authLogoutWords(words);
             default -> authUsage("unknown action '" + words.get(1) + "'");
@@ -5668,7 +5769,7 @@ final class Repl {
                 commandLine.getOut().flush();
                 yield Cli.EXIT_OK;
             }
-            case "login" -> machineTokenUsage("auth login cannot be combined with --token");
+            case LOGIN_VERB -> machineTokenUsage("auth login cannot be combined with --token");
             default -> authUsage("unknown action '" + words.get(1) + "'");
         };
     }
@@ -5704,7 +5805,7 @@ final class Repl {
                 }
             };
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -5742,36 +5843,36 @@ final class Repl {
                     yield Cli.EXIT_OK;
                 }
                 case AuthService.LogoutResult.Rejected rejected -> {
-                    Diagnostics.printText(err, CliError.AUTH_SESSION_REJECTED,
+                    printDiagnostic(err, CliError.AUTH_SESSION_REJECTED,
                             Map.of("code", rejected.code(), "principal", rejected.principal()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
                 case AuthService.LogoutResult.Unreachable ignored -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGOUT_UNREACHABLE,
+                    printDiagnostic(err, CliError.AUTH_LOGOUT_UNREACHABLE,
                             Map.of("context", namedContext.name()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
                 case AuthService.LogoutResult.CacheChanged ignored -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGOUT_CACHE_CHANGED,
+                    printDiagnostic(err, CliError.AUTH_LOGOUT_CACHE_CHANGED,
                             Map.of("context", namedContext.name()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
             };
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
 
     private int authUsage(String reason) {
-        Diagnostics.printText(commandLine.getErr(), CliError.AUTH_USAGE, Map.of("reason", reason));
+        printDiagnostic(commandLine.getErr(), CliError.AUTH_USAGE, Map.of(REASON_PARAM, reason));
         return Cli.EXIT_USAGE;
     }
 
     private int context() {
         if (contextManager == null) {
-            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_USAGE,
-                    Map.of("reason", "context manager is unavailable in this session"));
+            printDiagnostic(commandLine.getErr(), CliError.CONTEXT_USAGE,
+                    Map.of(REASON_PARAM, "context manager is unavailable in this session"));
             return Cli.EXIT_USAGE;
         }
         return new ContextConsole(contextManager, prompter, workdir,
@@ -5781,8 +5882,7 @@ final class Repl {
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */
     private void reportConnectFailed(List<URI> seeds) {
         String display = seeds.stream().map(URI::toString).collect(Collectors.joining(", "));
-        Diagnostics.printText(commandLine.getErr(), CliError.CONNECT_FAILED,
- Map.of("seeds", display), session.versions());
+        printDiagnostic(commandLine.getErr(), CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, display));
     }
 
     /**
