@@ -23,6 +23,8 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -33,6 +35,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
@@ -236,6 +239,119 @@ class ManagedCloudSessionAssemblyIT {
                 ports.assertOnlyTwoLogins();
             }
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"dag", "wizard"})
+    void draftPublicationPersistsTheVerifiedCreatorThroughHttpAndMongo(String mode) {
+        String database = "managed_draft_users_" + Long.toUnsignedString(System.nanoTime(), 16);
+        String uri = MONGO.getReplicaSetUrl(database);
+        TwoUserPorts ports = new TwoUserPorts();
+        try (var raw = MongoClients.create(uri); var context = startTwoUsers(uri, ports)) {
+            RestClient client = client(context);
+            MongoDatabase stored = raw.getDatabase(database);
+            String ownerCookie = exchange(client, ports.userA);
+            String editorCookie = exchange(client, ports.userB);
+            apply(client, origin(context), ownerCookie, source(ports.userA));
+            apply(client, origin(context), editorCookie, source(ports.userB));
+            String id = "draft_orders_" + mode;
+            Map<String, Object> draft = publicationDraft(id, mode, ports, "Initial draft", null);
+            writeDraft(client, origin(context), ownerCookie, id, 0, draft);
+
+            Map<?, ?> preview = client.post().uri("/api/pipelines/" + id + "/draft:preview")
+                    .header(HttpHeaders.COOKIE, ownerCookie).header(HttpHeaders.ORIGIN, origin(context))
+                    .contentType(MediaType.APPLICATION_JSON).body(Map.of("revision", 1))
+                    .retrieve().body(Map.class);
+            assertThat(preview).isNotNull();
+            assertThat(preview.get("dsl")).isInstanceOf(String.class);
+            assertThat((String) preview.get("dsl")).isNotBlank().doesNotContain("user_id:", "cloud: true");
+            assertThat(SystemCollections.ARTIFACTS.on(stored).find(new Document("_id", id)).first()).isNull();
+
+            String firstHash = publishDraft(client, origin(context), ownerCookie, id, 1, null);
+            attributed(context, client, stored, ownerCookie, id, ports.userA.userId());
+            assertPublicationMarkers(stored, id, 1, firstHash, ports.userA.userId());
+
+            Map<String, Object> edit = publicationDraft(id, mode, ports, "Edited by the second user", firstHash);
+            writeDraft(client, origin(context), editorCookie, id, 1, edit);
+            String editedHash = publishDraft(client, origin(context), editorCookie, id, 2, firstHash);
+            assertThat(editedHash).isNotEqualTo(firstHash);
+            attributed(context, client, stored, editorCookie, id, ports.userA.userId());
+            assertThat(context.getBean(ArtifactStore.class).get(id).orElseThrow().metadata().description())
+                    .isEqualTo("Edited by the second user");
+            assertPublicationMarkers(stored, id, 2, editedHash, ports.userB.userId());
+
+            assertThat(publishDraft(client, origin(context), ownerCookie, id, 2, editedHash)).isEqualTo(editedHash);
+            attributed(context, client, stored, ownerCookie, id, ports.userA.userId());
+            assertPublicationMarkers(stored, id, 2, editedHash, ports.userA.userId());
+            ports.assertOnlyTwoLogins();
+        }
+    }
+
+    private static Map<String, Object> publicationDraft(String id, String mode, TwoUserPorts ports,
+            String description, String baseHash) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("pipelineId", id);
+        body.put("mode", mode);
+        body.put("name", id);
+        body.put("description", description);
+        body.put("baseArtifactHash", baseHash);
+        body.put("updatedBy", "untrusted-draft-actor");
+        if (mode.equals("dag")) {
+            body.put("graph", Map.of("nodes", List.of(
+                            Map.of("id", "input", "type", "source", "sourceId", ports.userA.sourceId(),
+                                    "table", "orders", "config", Map.of(), "metadata", Map.of()),
+                            Map.of("id", "output", "type", "target", "sourceId", ports.userB.sourceId(),
+                                    "table", "orders", "config", Map.of("writeMode", "append"), "metadata", Map.of())),
+                    "edges", List.of(Map.of("id", "input-output", "source", "input", "target", "output")),
+                    "viewport", Map.of("x", 0, "y", 0, "zoom", 1)));
+        } else {
+            body.put("wizard", Map.of(
+                    "root", Map.of("id", "root", "sourceId", ports.userA.sourceId(), "table", "orders",
+                            "key", List.of(), "preTransforms", List.of()),
+                    "related", List.of(), "transforms", List.of(),
+                    "output", Map.of("kind", "source", "config", Map.of(
+                            "sourceId", ports.userB.sourceId(), "table", "orders", "writeMode", "append"))));
+        }
+        return body;
+    }
+
+    private static void writeDraft(RestClient client, String origin, String cookie, String id,
+            long revision, Map<String, Object> body) {
+        var request = client.method(revision == 0 ? HttpMethod.POST : HttpMethod.PUT)
+                .uri("/api/pipelines/" + id + "/draft").header(HttpHeaders.COOKIE, cookie)
+                .header(HttpHeaders.ORIGIN, origin).contentType(MediaType.APPLICATION_JSON);
+        if (revision != 0) request.header(HttpHeaders.IF_MATCH, "\"" + revision + "\"");
+        request.body(body).exchange((sent, response) -> {
+            assertThat(response.getStatusCode().value()).isEqualTo(revision == 0 ? 201 : 200);
+            return null;
+        });
+    }
+
+    private static String publishDraft(RestClient client, String origin, String cookie, String id,
+            long revision, String artifactHash) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("revision", revision);
+        body.put("artifactHash", artifactHash);
+        Map<?, ?> result = client.post().uri("/api/pipelines/" + id + "/draft:publish")
+                .header(HttpHeaders.COOKIE, cookie).header(HttpHeaders.ORIGIN, origin)
+                .contentType(MediaType.APPLICATION_JSON).body(body).exchange((sent, response) -> {
+                    assertThat(response.getStatusCode().value()).isEqualTo(200);
+                    return response.bodyTo(Map.class);
+                });
+        assertThat(result).isNotNull();
+        assertThat(result.get("published")).isEqualTo(true);
+        assertThat(result.get("artifactHash")).isInstanceOf(String.class);
+        return (String) result.get("artifactHash");
+    }
+
+    private static void assertPublicationMarkers(MongoDatabase stored, String id, long revision,
+            String hash, String publisher) {
+        Document draft = SystemCollections.PIPELINE_DRAFTS.on(stored).find(new Document("_id", id)).first();
+        assertThat(draft).isNotNull().containsEntry("baseArtifactHash", hash)
+                .containsEntry("publishedArtifactHash", hash).containsEntry("publishedDraftRevision", revision)
+                .containsEntry("updatedBy", publisher);
+        Document artifact = SystemCollections.ARTIFACTS.on(stored).find(new Document("_id", id)).first();
+        assertThat(artifact).isNotNull().containsEntry("contentHash", hash);
     }
 
     private ConfigurableApplicationContext startTwoUsers(String uri, TwoUserPorts ports) {
