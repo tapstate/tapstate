@@ -297,6 +297,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                BenchmarkResourceSampler.Summary resources,
                                BenchmarkMongoCommandSampler.Summary mongoCommands) {}
 
+    private record ValidatedTargetClocks(List<BenchmarkTargetClock.Reading> after, Map<String, Object> outer) {}
+
     private final List<Evidence> evidence = new ArrayList<>();
     private final BenchmarkForkEnvironment.BootLauncher launcher;
 
@@ -705,19 +707,34 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     "queryIntervalMillis", 200, "samples", nativeQueues.samples(), "performanceAcceptanceEligible", false,
                     "samplingScope", "READ_ONLY_NATIVE_JOB_METRICS_WITH_DECLARED_COLLECTION_CADENCE")));
         }
-        List<BenchmarkTargetClock.Reading> targetClocksAfter = targetClockBefore == null ? List.of()
-                : targetClockUris.stream().map(BenchmarkTargetClock::read).toList();
-        if (!targetClocksAfter.isEmpty()) {
-            BenchmarkTargetClock.requireSharedClock(targetClocksAfter);
-            for (int i=0;i<targetClocksBefore.size();i++) { BenchmarkTargetClock.validate(targetClocksBefore.get(i), targetClocksAfter.get(i)); }
-        }
-        BenchmarkTargetClock.Reading targetClockAfter = targetClocksAfter.isEmpty() ? null : targetClocksAfter.getFirst();
-        if (!interiorClockReadings.isEmpty()) {
-            BenchmarkTargetClock.validate(interiorClockReadings.getLast(), targetClockAfter);
-        }
-        Map<String, Object> outerClockEvidence = targetClockBefore == null
-                ? Map.of("state", "UNQUALIFIED", "reason", "MULTI_TARGET_CLOCKS_NOT_YET_CALIBRATED")
-                : BenchmarkTargetClock.validate(targetClockBefore, targetClockAfter);
+        Map<String, Object> capturedForClockFailure = retainedReturnEvidence;
+        Map<String, Object> sourceForClockFailure = retainedSourceIssue;
+        List<BenchmarkTargetClock.Reading> interiorForClockCheck = interiorClockReadings;
+        ValidatedTargetClocks checkedClocks = BenchmarkReturnFailureRetention.run(() -> {
+            List<BenchmarkTargetClock.Reading> after = targetClockBefore == null ? List.of()
+                    : targetClockUris.stream().map(BenchmarkTargetClock::read).toList();
+            if (!after.isEmpty()) {
+                BenchmarkTargetClock.requireSharedClock(after);
+                for (int i = 0; i < targetClocksBefore.size(); i++) {
+                    BenchmarkTargetClock.validate(targetClocksBefore.get(i), after.get(i));
+                }
+            }
+            BenchmarkTargetClock.Reading firstAfter = after.isEmpty() ? null : after.getFirst();
+            if (!interiorForClockCheck.isEmpty()) {
+                BenchmarkTargetClock.validate(interiorForClockCheck.getLast(), firstAfter);
+            }
+            Map<String, Object> outer = targetClockBefore == null
+                    ? Map.of("state", "UNQUALIFIED", "reason", "MULTI_TARGET_CLOCKS_NOT_YET_CALIBRATED")
+                    : BenchmarkTargetClock.validate(targetClockBefore, firstAfter);
+            return new ValidatedTargetClocks(after, outer);
+        }, () -> capturedForClockFailure.isEmpty() ? Map.of() : Map.of(
+                "state", "UNKNOWN", "capture", capturedForClockFailure, "sourceIssue", sourceForClockFailure,
+                "resources", PipelineBenchmarkLiveRunIT.resourceEvidence(resources, issued.clockAnchor()),
+                "reason", "POST_CAPTURE_TARGET_CLOCK_REFUSAL", "performanceAcceptanceEligible", false,
+                "samplingCostQualified", false), failureEvidence -> System.out.println(
+                        "benchmark-write-return-post-capture-refusal=" + JsonWriter.write(failureEvidence)));
+        List<BenchmarkTargetClock.Reading> targetClocksAfter = checkedClocks.after();
+        Map<String, Object> outerClockEvidence = checkedClocks.outer();
         var clockProof = new LinkedHashMap<String, Object>(outerClockEvidence);
         if (counterBefore != null) { clockProof.put("nativeCounterBaselineBefore", counterBefore.evidence()); }
         if (writeReturns != null) {
