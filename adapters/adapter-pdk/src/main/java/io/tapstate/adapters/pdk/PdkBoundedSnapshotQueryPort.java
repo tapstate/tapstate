@@ -2,7 +2,6 @@ package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
-import io.tapstate.core.event.EventJsonValues;
 import io.tapstate.spi.capture.BoundedSnapshotQueryPort;
 import io.tapstate.spi.capture.BoundedQueryCancellation;
 import io.tapstate.spi.capture.BoundedSnapshotQueryRequest;
@@ -280,7 +279,8 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                     TapEvent event = TapInsertRecordEvent.create().table(table.getId()).after(copy);
                     Envelope envelope = TapEventCodec.decodeSnapshotRow(event, connector.codecs(), declaredTypes(table));
                     long remainingBytes = request.maxBytes() - bytesUsed[0];
-                    long rowBytes = EventJsonValues.encodedSize(envelope.after(), remainingBytes);
+                    // Byte accounting renders PDK temporal values without changing the typed row.
+                    long rowBytes = PdkPreviewJsonValues.encodedSize(envelope.after(), remainingBytes);
                     if (rowBytes > remainingBytes) {
                         reported.compareAndSet(null, new TapstateException(ConnectorError.READ_FAILED,
                                 Map.of("connector", connector.connectorId(),
