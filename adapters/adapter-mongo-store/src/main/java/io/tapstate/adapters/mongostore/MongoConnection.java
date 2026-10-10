@@ -97,8 +97,9 @@ public final class MongoConnection implements AutoCloseable {
             if (!MongoDatabaseNames.isValid(database)) {
                 throw new IllegalArgumentException("a deployment database name is invalid");
             }
-            String id = UUID.randomUUID().toString();
-            var collection = client().getDatabase(database).getCollection("tapstate_access_probe_" + id.replace("-", ""));
+            UUID probeId = UUID.randomUUID();
+            String id = probeId.toString();
+            var collection = SystemCollections.accessProbeOn(client().getDatabase(database), probeId);
             try (var session = client().startSession()) {
                 session.startTransaction(TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true))
