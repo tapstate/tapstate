@@ -85,6 +85,7 @@ class NativeJoinedTakeoverLogIT {
         Map<String, NativeTelemetryIdentityJdiSession> sessions = new LinkedHashMap<>();
         Map<String, Integer> ports = new LinkedHashMap<>();
         Map<String, List<Map<String, Object>>> records = new LinkedHashMap<>();
+        var callerResolver = new NativeLogCallerEvidence.Resolver(NativeLogCallerEvidence.Compatibility.ALLOW_LEGACY_RECORD_LOCAL);
         Map<String, NativeTelemetryIdentityJdiSession.Boundary> last = new LinkedHashMap<>();
         TwoMemberCluster cluster = null;
         Throwable primary = null;
@@ -254,7 +255,7 @@ class NativeJoinedTakeoverLogIT {
                 throw new AssertionError("UNSELECTED: both actual owners are on one member; this does not select a remote JoinedCapture");
             }
             Await.until("the joined consumer snapshot is physically written", remaining(deadline), () -> {
-                capture(sessions, records, last, report, "joined-before-stop");
+                capture(sessions, records, last, callerResolver, report, "joined-before-stop");
                 return qTarget.getCollection(TABLE).countDocuments() == 3 && snapshotDone(database, chainId, Q);
             }, () -> "survivor target rows=" + qTarget.getCollection(TABLE).countDocuments());
             assertThat(tuple(live(claims, cKey).orElseThrow())).isEqualTo(tuple(holder));
@@ -270,7 +271,7 @@ class NativeJoinedTakeoverLogIT {
             sessions.values().forEach(session -> session.recordAuthority(authority));
             var owner = sessions.get(q.owner().nodeId());
             var submitted = Await.answered("the actual surviving admitted native Job", remaining(deadline), () -> {
-                capture(sessions, records, last, report, "joined-job-before-stop");
+                capture(sessions, records, last, callerResolver, report, "joined-job-before-stop");
                 return owner.claimedSubmission(authority);
             });
             assertThat(withoutLease(submitted.claim())).isEqualTo(tuple(q));
@@ -278,7 +279,7 @@ class NativeJoinedTakeoverLogIT {
             assertBoot(claims, clusterId, q); assertBoot(claims, clusterId, holder);
             try (var sql = sqlConnection.createStatement()) { sql.execute("INSERT INTO " + TABLE + " VALUES (4,400,'native-4')"); }
             Await.until("real CDC reaches both live consumers before releasing the holder", remaining(deadline), () -> {
-                capture(sessions, records, last, report, "joined-both-targets");
+                capture(sessions, records, last, callerResolver, report, "joined-both-targets");
                 return pTarget.getCollection(TABLE).countDocuments() == 4 && qTarget.getCollection(TABLE).countDocuments() == 4;
             }, () -> "target rows: holder=" + pTarget.getCollection(TABLE).countDocuments()
                     + ", survivor=" + qTarget.getCollection(TABLE).countDocuments());
@@ -293,8 +294,8 @@ class NativeJoinedTakeoverLogIT {
             Map<String, Object> intent = new Document(database.getCollection(MongoStorePort.PIPELINE_DESIRED)
                     .find(new Document("_id", Q)).first());
             Map<String, Boolean> preNegative = new LinkedHashMap<>();
-            for (String node : sessions.keySet()) { preNegative.put(node, logSubset(last.get(node), authority, records.get(node))); }
-            assertThat(records.values().stream().flatMap(List::stream).noneMatch(record -> sourceLog(record, authority))).isTrue();
+            for (String node : sessions.keySet()) { preNegative.put(node, logSubset(last.get(node), authority, records.get(node), callerResolver)); }
+            assertThat(records.values().stream().flatMap(List::stream).noneMatch(record -> sourceLog(record, authority, callerResolver))).isTrue();
             assertThat(records.values().stream().flatMap(List::stream)
                     .noneMatch(record -> "JOINED_TAKEOVER".equals(record.get("target")))).isTrue();
             report.addFork(Map.of("action", "actual-remote-joined-before-holder-stop", "holder", tuple(holder),
@@ -304,12 +305,12 @@ class NativeJoinedTakeoverLogIT {
             ControlPlane holderControl = holder.owner().nodeId().equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
             holderControl.stop(P, false);
             WorkloadClaim successor = Await.answered("the joined member actually acquires the physical capture", remaining(deadline), () -> {
-                capture(sessions, records, last, report, "joined-takeover");
+                capture(sessions, records, last, callerResolver, report, "joined-takeover");
                 return live(claims, cKey).filter(value -> value.owner().equals(q.owner())
                         && value.claimGeneration() > holder.claimGeneration());
             });
             var receipt = Await.answered("the actual caller-qualified joined reader and returned tail", remaining(deadline), () -> {
-                capture(sessions, records, last, report, "joined-cold-receipt");
+                capture(sessions, records, last, callerResolver, report, "joined-cold-receipt");
                 return records.get(q.owner().nodeId()).stream().filter(record -> "JOINED_TAKEOVER".equals(record.get("target"))
                         && Boolean.TRUE.equals(record.get("normalReturn")) && !record.containsKey("decoderStatus")
                         && Boolean.TRUE.equals(record.get("callerStable")) && authority.scope().equals(record.get("scope"))
@@ -333,7 +334,7 @@ class NativeJoinedTakeoverLogIT {
             ControlPlane survivorControl = q.owner().nodeId().equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
             var positive = Await.answered("takeover source log, actual row and current SDK scrape", remaining(deadline), () -> {
                 try {
-                    capture(sessions, records, last, report, "joined-positive");
+                    capture(sessions, records, last, callerResolver, report, "joined-positive");
                     String body = http.send(java.net.http.HttpRequest.newBuilder(scrape).timeout(remaining(deadline)).GET().build(),
                             java.net.http.HttpResponse.BodyHandlers.ofString()).body();
                     var publicValue = latest.readStored(Q).filter(value -> value.scope().filter(scope::equals).isPresent()
@@ -342,7 +343,7 @@ class NativeJoinedTakeoverLogIT {
                             && recordsOut(value.observation()).filter(count -> count > recordsOut(baseline.observation()).orElseThrow()).isPresent());
                     var observed = records.get(q.owner().nodeId());
                     boolean ready = qTarget.getCollection(TABLE).countDocuments() == 5 && publicValue.isPresent()
-                            && observed.stream().anyMatch(record -> sourceLog(record, authority))
+                            && observed.stream().anyMatch(record -> sourceLog(record, authority, callerResolver))
                             && flag(observed, "OFFER", "accepted", authority) && flag(observed, "VISIBLE", "included", authority)
                             && observed.stream().anyMatch(record -> producedOutAtLeast(record, 5))
                             && positiveScrape(body, Q) && scrapeOutAtLeast(body, 5)
@@ -356,17 +357,18 @@ class NativeJoinedTakeoverLogIT {
             requireSameSurvivor(database, claims, qKey, q, latest, scope, intent, owner, authority, submitted);
             assertThat(tuple(live(claims, cKey).orElseThrow())).isEqualTo(tuple(successor));
             List<Map<String, Object>> sourceLogs = records.get(q.owner().nodeId()).stream()
-                    .filter(record -> sourceLog(record, authority)).toList();
-            report.addFork(NativeTelemetryPositiveCalibrationIT.assertScopedLogRead(sourceLogs, http, survivorControl,
+                    .filter(record -> sourceLog(record, authority, callerResolver)).toList();
+            var sourceRead = new LinkedHashMap<>(NativeTelemetryPositiveCalibrationIT.assertScopedLogRead(sourceLogs, http, survivorControl,
                     owner.server().baseUrl(), authority));
+            sourceRead.put("nativeLogEvidence", callerResolver.evidence(sourceLogs)); report.addFork(sourceRead);
             String oldMember = holder.owner().nodeId();
-            boolean postNegative = logSubset(last.get(oldMember), authority, records.get(oldMember))
-                    && records.get(oldMember).stream().noneMatch(record -> sourceLog(record, authority));
+            boolean postNegative = logSubset(last.get(oldMember), authority, records.get(oldMember), callerResolver)
+                    && records.get(oldMember).stream().noneMatch(record -> sourceLog(record, authority, callerResolver));
             report.addFork(Map.of("action", "paired-source-log-positive-and-narrow-negative", "positiveNode", q.owner().nodeId(),
                     "negativeNode", oldMember, "negativeSubsetQualified", postNegative, "positiveBodySha256", digest(positive.getBytes(StandardCharsets.UTF_8))));
             assertThat(preNegative.values()).containsOnly(true);
             assertThat(postNegative).as("only the bound, drained LOG family can qualify the nonemitting source subset").isTrue();
-            capture(sessions, records, last, report, "joined-before-owned-Q-stop");
+            capture(sessions, records, last, callerResolver, report, "joined-before-owned-Q-stop");
             long beforeQStopOrder = last.get(q.owner().nodeId()).events();
             report.addFork(Map.of("action", "actual-running-Q-through-row5-before-owned-cleanup", "claim", tuple(q),
                     "scope", authority.scope(), "submittedJobHistory", submitted.job().job(),
@@ -375,14 +377,14 @@ class NativeJoinedTakeoverLogIT {
             survivorControl.stop(Q, false);
             var currentJob = Await.answered("a fresh actual Q Job lookup during its owned normal-stop cleanup", remaining(deadline),
                     () -> {
-                        capture(sessions, records, last, report, "joined-current-job-at-Q-stop");
+                        capture(sessions, records, last, callerResolver, report, "joined-current-job-at-Q-stop");
                         return records.get(q.owner().nodeId()).stream().filter(record -> currentJobAfter(record,
                                 authority, submitted.job().job(), Math.max(takeoverReturned, beforeQStopOrder))).findFirst();
                     });
             report.addFork(Map.of("action", "actual-current-native-job-after-pre-Q-stop-cutoff", "receipt", currentJob,
                     "preQStopEventOrder", beforeQStopOrder));
             Await.until("Q's owned stop is actually published for the same execution", remaining(deadline), () -> {
-                capture(sessions, records, last, report, "joined-Q-stopped");
+                capture(sessions, records, last, callerResolver, report, "joined-Q-stopped");
                 return latest.readStored(Q).filter(value -> value.scope().filter(scope::equals).isPresent()
                         && value.observation().state() == PipelineState.STOPPED).isPresent();
             }, () -> "the same Q execution has no final STOPPED publication yet");
@@ -391,13 +393,14 @@ class NativeJoinedTakeoverLogIT {
             assertThat(last.get(q.owner().nodeId()).decodedAndAuthorityBound()).isTrue();
             for (var entry : sessions.entrySet()) {
                 var terminal = entry.getValue().shutdownAndFinish(); report.addFork(terminal.evidence());
-                records.get(entry.getKey()).addAll(terminal.records()); requireBudget(records.get(entry.getKey()));
+                callerResolver.register(terminal.callerSymbols());
+                records.get(entry.getKey()).addAll(terminal.records()); requireBudget(records.get(entry.getKey()), callerResolver);
                 assertThat(terminal.invocationDrainComplete()).isTrue();
                 assertThat(terminal.ownedVmDeath()).isTrue(); assertThat(terminal.ownedVmDisconnected()).isTrue();
-                assertThat(retainedLogDecoded(terminal, records.get(entry.getKey())))
+                assertThat(retainedLogDecoded(terminal, records.get(entry.getKey()), callerResolver))
                         .as("all retained LOG receipts remain decoded after final drain").isTrue();
                 if (entry.getKey().equals(oldMember)) {
-                    assertThat(records.get(entry.getKey()).stream().noneMatch(record -> sourceLog(record, authority)))
+                    assertThat(records.get(entry.getKey()).stream().noneMatch(record -> sourceLog(record, authority, callerResolver)))
                             .as("late old-holder Q source logs remain part of the narrow negative").isTrue();
                 }
             }
@@ -413,6 +416,7 @@ class NativeJoinedTakeoverLogIT {
                     "unverified", List.of("OLD_HOLDER_P_NATIVE_JOB_AND_LOG", "UNAVAILABLE_NONEMITTING_OBSERVER_FAMILIES",
                             "OS_KILL_MEMBER_LOSS", "FULL_T3_T4_MATRIX", "FORMAL_PERFORMANCE")));
         } catch (Exception | Error failure) {
+            sessions.forEach((node, session) -> NativeTelemetryPositiveCalibrationIT.recordFailureEvidence(report, session, node, failure));
             primary = failure;
             try { report.fail(failure); } catch (RuntimeException reporting) { if (reporting != failure) { failure.addSuppressed(reporting); } }
             throw failure;
@@ -533,14 +537,15 @@ class NativeJoinedTakeoverLogIT {
         return Optional.of(count);
     }
 
-    private static boolean sourceLog(Map<String, Object> record, NativeTelemetryIdentityJdiSession.AuthorityReceipt authority) {
+    private static boolean sourceLog(Map<String, Object> record, NativeTelemetryIdentityJdiSession.AuthorityReceipt authority,
+            NativeLogCallerEvidence.Resolver callerResolver) {
         return "LOG".equals(record.get("target")) && authority.scope().equals(record.get("scope"))
-                && Boolean.TRUE.equals(record.get("normalReturn")) && !record.containsKey("decoderStatus") && streamCaller(record);
+                && Boolean.TRUE.equals(record.get("normalReturn")) && !record.containsKey("decoderStatus") && streamCaller(record, callerResolver);
     }
 
-    private static boolean streamCaller(Map<String, Object> record) {
-        if (!(record.get("callers") instanceof List<?> encoded) || encoded.size() != 2
-                || !(encoded.get(0) instanceof List<?> names) || !(encoded.get(1) instanceof List<?> rows) || rows.size() % 9 != 0) { return false; }
+    private static boolean streamCaller(Map<String, Object> record, NativeLogCallerEvidence.Resolver callerResolver) {
+        List<Object> encoded = callerResolver.decode(record.get("callers"));
+        List<?> names = (List<?>) encoded.getFirst(), rows = (List<?>) encoded.get(1);
         for (int at = 0; at < rows.size(); at += 9) {
             if ("io.tapstate.adapters.pdk.PdkCapturePort".equals(name(names, rows.get(at)))
                     && "streamLoop".equals(name(names, rows.get(at + 1)))
@@ -554,7 +559,8 @@ class NativeJoinedTakeoverLogIT {
     }
 
     private static boolean logSubset(NativeTelemetryIdentityJdiSession.Boundary boundary,
-            NativeTelemetryIdentityJdiSession.AuthorityReceipt authority, List<Map<String, Object>> records) {
+            NativeTelemetryIdentityJdiSession.AuthorityReceipt authority, List<Map<String, Object>> records,
+            NativeLogCallerEvidence.Resolver callerResolver) {
         if (boundary == null || boundary.ownedVmDeath() || boundary.ownedVmDisconnected() || !boundary.queueDrained()
                 || !boundary.bindings().containsKey(NativeTelemetryIdentityJdiSession.Target.LOG)
                 || boundary.authorityReceipts().stream().noneMatch(value -> value.scope().equals(authority.scope()))) { return false; }
@@ -563,18 +569,18 @@ class NativeJoinedTakeoverLogIT {
                 && counts.entries() == counts.normalReturns() + counts.exceptionalExits()
                 && boundary.unverified().stream().noneMatch(value -> value.contains(":LOG:") || value.equals("LIVE_BINDING_UNAVAILABLE:LOG"))
                 && records.stream().noneMatch(record -> "LOG".equals(record.get("target"))
-                        && (record.containsKey("decoderStatus") || streamCaller(record) && record.get("scope") == null));
+                        && (record.containsKey("decoderStatus") || streamCaller(record, callerResolver) && record.get("scope") == null));
     }
 
     private static boolean retainedLogDecoded(NativeTelemetryIdentityJdiSession.Boundary boundary,
-            List<Map<String, Object>> records) {
+            List<Map<String, Object>> records, NativeLogCallerEvidence.Resolver callerResolver) {
         var counts = boundary.counts().get(NativeTelemetryIdentityJdiSession.Target.LOG);
         return boundary.bindings().containsKey(NativeTelemetryIdentityJdiSession.Target.LOG) && counts != null
                 && logFamilyReady(boundary)
                 && counts.inFlight() == 0 && counts.entries() == counts.normalReturns() + counts.exceptionalExits()
                 && boundary.unverified().stream().noneMatch(value -> value.contains(":LOG:") || value.equals("LIVE_BINDING_UNAVAILABLE:LOG"))
                 && records.stream().noneMatch(record -> "LOG".equals(record.get("target"))
-                        && (record.containsKey("decoderStatus") || streamCaller(record) && record.get("scope") == null));
+                        && (record.containsKey("decoderStatus") || streamCaller(record, callerResolver) && record.get("scope") == null));
     }
 
     private static boolean logFamilyReady(NativeTelemetryIdentityJdiSession.Boundary boundary) {
@@ -605,21 +611,22 @@ class NativeJoinedTakeoverLogIT {
 
     private static void capture(Map<String, NativeTelemetryIdentityJdiSession> sessions,
             Map<String, List<Map<String, Object>>> records, Map<String, NativeTelemetryIdentityJdiSession.Boundary> last,
-            BenchmarkLiveReport report, String phase) {
+            NativeLogCallerEvidence.Resolver callerResolver, BenchmarkLiveReport report, String phase) {
         try {
             for (var entry : sessions.entrySet()) {
                 var boundary = entry.getValue().boundary(phase); last.put(entry.getKey(), boundary);
                 report.addFork(Map.of("observedNodeId", entry.getKey(), "boundary", boundary.evidence()));
-                records.get(entry.getKey()).addAll(boundary.records()); requireBudget(records.get(entry.getKey()));
+                callerResolver.register(boundary.callerSymbols());
+                records.get(entry.getKey()).addAll(boundary.records()); requireBudget(records.get(entry.getKey()), callerResolver);
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt(); throw new AssertionError("the bounded native evidence read was interrupted", interrupted);
         } catch (Exception failure) { throw new AssertionError("the bounded native evidence read failed", failure); }
     }
 
-    private static void requireBudget(List<Map<String, Object>> records) {
+    private static void requireBudget(List<Map<String, Object>> records, NativeLogCallerEvidence.Resolver callerResolver) {
         assertThat(records.size()).isLessThanOrEqualTo(MAX_RECORDS);
-        assertThat(JsonWriter.write(records).getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(MAX_BYTES);
+        assertThat(JsonWriter.write(callerResolver.evidence(records)).getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(MAX_BYTES);
     }
 
     private static void requireRows(MongoDatabase target, int expected) {
@@ -684,6 +691,7 @@ class NativeJoinedTakeoverLogIT {
             assertThat(bytes.length).isLessThanOrEqualTo(MAX_BYTES);
             result.put(parked + "ExecutingClassSha256", digest(bytes));
         }
+        result.putAll(NativeTelemetryPositiveCalibrationIT.callerEvidenceHashes(root, MAX_BYTES));
         return Map.copyOf(result);
     }
 

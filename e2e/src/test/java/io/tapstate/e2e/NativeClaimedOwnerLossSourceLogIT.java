@@ -95,6 +95,7 @@ class NativeClaimedOwnerLossSourceLogIT {
         Map<String, Object> settings = SharedMySql.settings(name + "_source");
         Map<String, NativeTelemetryIdentityJdiSession> sessions = new LinkedHashMap<>();
         Map<String, List<Map<String, Object>>> records = new LinkedHashMap<>();
+        var callerResolver = new NativeLogCallerEvidence.Resolver(NativeLogCallerEvidence.Compatibility.ALLOW_LEGACY_RECORD_LOCAL);
         Map<String, Integer> scrapePorts = new LinkedHashMap<>();
         TwoMemberCluster cluster = null;
         Throwable primary = null;
@@ -183,13 +184,13 @@ class NativeClaimedOwnerLossSourceLogIT {
             ControlPlane ownerControl = ownerNode.equals(TwoMemberCluster.NODE_A) ? owned.first() : owned.second();
             ControlPlane survivorControl = owned.memberOtherThan(ownerNode);
             Await.until("the actual shared snapshot reaches Mongo", left(deadline), () -> {
-                capture(owner, ownerNode, records, report, "owner-loss-warm-snapshot");
+                capture(owner, ownerNode, records, callerResolver, report, "owner-loss-warm-snapshot");
                 return target.getCollection(TABLE).countDocuments() == 3 && current(latest, beforeReceipt).isPresent();
             }, () -> "targetRows=" + target.getCollection(TABLE).countDocuments());
             assertRows(target, 3);
             try (var sql = sqlConnection.createStatement()) { sql.execute("INSERT INTO " + TABLE + " VALUES (4,400,'owner-4')"); }
             Await.until("actual pre-kill CDC row4 and durable source root", left(deadline), () -> {
-                capture(owner, ownerNode, records, report, "owner-loss-warm-cdc");
+                capture(owner, ownerNode, records, callerResolver, report, "owner-loss-warm-cdc");
                 return target.getCollection(TABLE).countDocuments() == 4 && durableRoot(db, shared, null).isPresent();
             }, () -> "targetRows=" + target.getCollection(TABLE).countDocuments());
             assertRows(target, 4);
@@ -197,18 +198,18 @@ class NativeClaimedOwnerLossSourceLogIT {
             assertThat(warm.capture().owner()).as("this actual fixture kills the pipeline and shared CAPTURE common owner")
                     .isEqualTo(warm.pipeline().owner());
             Bridge warmBridge = Await.answered("the real warm returned admission and submitted Job lookup", left(deadline), () -> {
-                capture(owner, ownerNode, records, report, "owner-loss-warm-native-bridge");
+                capture(owner, ownerNode, records, callerResolver, report, "owner-loss-warm-native-bridge");
                 return bridgeIfPresent(owner, beforeReceipt, records.get(ownerNode), -1);
             });
             assertThat(warmBridge.submission().members()).containsExactlyInAnyOrder(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
             assertThat(withoutLease(warmBridge.submission().claim())).isEqualTo(tuple(warm.pipeline()));
             HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
             URI warmScrape = URI.create("http://127.0.0.1:" + scrapePorts.get(ownerNode) + "/metrics");
-            Positive warmPositive = positive(owner, ownerNode, beforeReceipt, records, report, http, warmScrape, -1, deadline);
+            Positive warmPositive = positive(owner, ownerNode, beforeReceipt, records, callerResolver, report, http, warmScrape, -1, deadline);
             List<Map<String, Object>> warmSourceLogs = records.get(ownerNode).stream()
-                    .filter(record -> sourceLog(record, beforeReceipt)).toList();
+                    .filter(record -> sourceLog(record, beforeReceipt, callerResolver)).toList();
             assertThat(warmSourceLogs).as("a true native source stream caller must precede the fault").isNotEmpty();
-            report.addFork(scopedSourceLogRead(warmSourceLogs, http, ownerControl, owner.server().baseUrl(), beforeReceipt, deadline));
+            report.addFork(scopedSourceLogRead(warmSourceLogs, callerResolver, http, ownerControl, owner.server().baseUrl(), beforeReceipt, deadline));
             assertThat(current(latest, beforeReceipt).orElseThrow().observation().facts().stream()
                     .filter(fact -> "tapstate.pipeline.records".equals(fact.name())).flatMap(fact -> fact.points().stream())
                     .anyMatch(point -> "out".equals(point.attributes().get("direction")) && point.value() != null && point.value() > 0))
@@ -216,7 +217,7 @@ class NativeClaimedOwnerLossSourceLogIT {
             assertThat(warmPositive.boundary().decodedAndAuthorityBound()).isTrue();
             ready(db, claims, pipelineKey, shared, warm.pipeline(), beforeReceipt, boots, ownerControl);
             assertThat(artifact(db)).isEqualTo(artifactBefore);
-            var cutoff = capture(survivor, survivorNode, records, report, "owner-loss-survivor-before-fault");
+            var cutoff = capture(survivor, survivorNode, records, callerResolver, report, "owner-loss-survivor-before-fault");
             long cutoffEvent = cutoff.events();
             report.addFork(Map.of("action", "actual-warm-common-owner-before-kill", "pipelineClaim", tuple(warm.pipeline()),
                     "captureClaim", tuple(warm.capture()), "captureEpoch", warm.epoch(), "chain", shared.chain(),
@@ -230,7 +231,7 @@ class NativeClaimedOwnerLossSourceLogIT {
             assertThat(owner.server().isAlive()).isFalse();
             var crashed = owner.finishOwnedCrash();
             report.addFork(crashed.evidence());
-            if (crashed.observed() != null) { append(ownerNode, crashed.observed(), records); }
+            if (crashed.observed() != null) { append(ownerNode, crashed.observed(), records, callerResolver); }
             assertThat(crashed.ownedPid()).isEqualTo(killedPid);
             assertThat(crashed.ownedFaultObserved()).isTrue(); assertThat(crashed.artifactUnchanged()).isTrue();
             assertThat(crashed.pumpStopped()).isTrue(); assertThat(crashed.evidenceFailure()).isNull();
@@ -258,7 +259,7 @@ class NativeClaimedOwnerLossSourceLogIT {
                     actualFailed[0] = failed != null;
                     if (failed != null) { failedReceipt.set(Map.of("kind", "ACTUAL_RETAINED_STATE_CHANGE", "row", failed.toJson())); }
                 }
-                capture(survivor, survivorNode, records, report, "owner-loss-recovery-admission");
+                capture(survivor, survivorNode, records, callerResolver, report, "owner-loss-recovery-admission");
                 return !actualFailed[0] ? Optional.empty() : claims.read(pipelineKey)
                         .filter(value -> value.leased() && value.claim().executionGeneration() > warm.pipeline().executionGeneration()
                                 && value.claim().owner().nodeId().equals(survivorNode)).map(value -> value.claim());
@@ -269,7 +270,7 @@ class NativeClaimedOwnerLossSourceLogIT {
             NativeTelemetryIdentityJdiSession.AuthorityReceipt afterReceipt = authority(db, next, artifactBefore);
             survivor.recordAuthority(afterReceipt);
             Bridge recovered = Await.answered("actual fresh admission then submit then fresh Job entry and return", left(deadline), () -> {
-                capture(survivor, survivorNode, records, report, "owner-loss-fresh-job");
+                capture(survivor, survivorNode, records, callerResolver, report, "owner-loss-fresh-job");
                 return bridgeIfPresent(survivor, afterReceipt, records.get(survivorNode), cutoffEvent);
             });
             assertThat(recovered.submission().job().job().get("jobId")).isNotEqualTo(warmBridge.submission().job().job().get("jobId"));
@@ -292,24 +293,24 @@ class NativeClaimedOwnerLossSourceLogIT {
                     "admissionMode", recovered.replacement() == null ? "ORDINARY" : "REPLACEMENT"));
             try (var sql = sqlConnection.createStatement()) { sql.execute("INSERT INTO " + TABLE + " VALUES (5,500,'owner-5')"); }
             Await.until("row5 reaches the actual new shared source execution", left(deadline), () -> {
-                capture(survivor, survivorNode, records, report, "owner-loss-new-cdc");
+                capture(survivor, survivorNode, records, callerResolver, report, "owner-loss-new-cdc");
                 return target.getCollection(TABLE).countDocuments() == 5 && durableRoot(db, shared, warm.epoch()).isPresent();
             }, () -> "targetRows=" + target.getCollection(TABLE).countDocuments());
             assertRows(target, 5);
             URI newScrape = URI.create("http://127.0.0.1:" + scrapePorts.get(survivorNode) + "/metrics");
-            Positive recoveredPositive = positive(survivor, survivorNode, afterReceipt, records, report, http,
+            Positive recoveredPositive = positive(survivor, survivorNode, afterReceipt, records, callerResolver, report, http,
                     newScrape, recovered.submitReturn(), deadline);
             List<Map<String, Object>> recoveredLogs = records.get(survivorNode).stream()
-                    .filter(record -> sourceLog(record, afterReceipt) && order(record, "entryOrder") > recovered.submitReturn()).toList();
+                    .filter(record -> sourceLog(record, afterReceipt, callerResolver) && order(record, "entryOrder") > recovered.submitReturn()).toList();
             assertThat(recoveredLogs).isNotEmpty();
-            report.addFork(scopedSourceLogRead(recoveredLogs, http, survivorControl, survivor.server().baseUrl(), afterReceipt, deadline));
+            report.addFork(scopedSourceLogRead(recoveredLogs, callerResolver, http, survivorControl, survivor.server().baseUrl(), afterReceipt, deadline));
             ready(db, claims, pipelineKey, shared, next, afterReceipt, boots, survivorControl);
             assertThat(artifact(db)).isEqualTo(artifactBefore);
             assertThat(recoveredPositive.boundary().decodedAndAuthorityBound()).isTrue();
             survivorControl.stop(Q, false);
             Await.until("the actual recovered pipeline stops", left(deadline), () -> states.read(Q)
                     .filter(cp -> StateJson.parse(cp.stateJson()) == PipelineState.STOPPED).isPresent(), () -> "state=" + states.read(Q));
-            var terminal = survivor.shutdownAndFinish(); append(survivorNode, terminal, records); report.addFork(terminal.evidence());
+            var terminal = survivor.shutdownAndFinish(); append(survivorNode, terminal, records, callerResolver); report.addFork(terminal.evidence());
             assertThat(terminal.invocationDrainComplete()).isTrue(); assertThat(terminal.ownedVmDeath()).isTrue();
             assertThat(terminal.ownedVmDisconnected()).isTrue(); assertThat(terminal.decodedAndAuthorityBound()).isTrue();
             assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
@@ -319,6 +320,7 @@ class NativeClaimedOwnerLossSourceLogIT {
                     "oldHeapCleanup", "UNKNOWN", "oldCrashDrain", "INCOMPLETE",
                     "unverified", List.of("OLD_CALLBACK_ZERO_WINDOWS", "UNKNOWN_BASELINE_MATRIX", "REPLACEMENT_CRASH_CUTS", "FORMAL_PERFORMANCE")));
         } catch (Exception | Error failure) {
+            sessions.forEach((node, session) -> NativeTelemetryPositiveCalibrationIT.recordFailureEvidence(report, session, node, failure));
             primary = failure; try { report.fail(failure); } catch (RuntimeException recording) { failure.addSuppressed(recording); }
             throw failure;
         } finally {
@@ -403,18 +405,21 @@ class NativeClaimedOwnerLossSourceLogIT {
         return Map.copyOf(out);
     }
     private static NativeTelemetryIdentityJdiSession.Boundary capture(NativeTelemetryIdentityJdiSession observer, String node,
-            Map<String, List<Map<String, Object>>> records, BenchmarkLiveReport report, String phase) {
+            Map<String, List<Map<String, Object>>> records, NativeLogCallerEvidence.Resolver callerResolver,
+            BenchmarkLiveReport report, String phase) {
         try {
-            var value = observer.boundary(phase); append(node, value, records);
+            var value = observer.boundary(phase); append(node, value, records, callerResolver);
             Map<String, Object> evidence = new LinkedHashMap<>(value.evidence()); evidence.put("observedNodeId", node);
             report.addFork(evidence); return value;
         } catch (InterruptedException problem) { Thread.currentThread().interrupt(); throw new AssertionError("native capture interrupted", problem); }
         catch (Exception problem) { throw new AssertionError("native capture failed", problem); }
     }
-    private static void append(String node, NativeTelemetryIdentityJdiSession.Boundary boundary, Map<String, List<Map<String, Object>>> records) {
+    private static void append(String node, NativeTelemetryIdentityJdiSession.Boundary boundary,
+            Map<String, List<Map<String, Object>>> records, NativeLogCallerEvidence.Resolver callerResolver) {
+        callerResolver.register(boundary.callerSymbols());
         records.get(node).addAll(boundary.records());
         assertThat(records.get(node).size()).as("all actual retained records on %s", node).isLessThanOrEqualTo(MAX_RECORDS);
-        assertThat(JsonWriter.write(records.get(node)).getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(MAX_BYTES);
+        assertThat(JsonWriter.write(callerResolver.evidence(records.get(node))).getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(MAX_BYTES);
     }
     private static Optional<Bridge> bridgeIfPresent(NativeTelemetryIdentityJdiSession observer,
             NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt, List<Map<String, Object>> records, long cutoff) {
@@ -448,13 +453,13 @@ class NativeClaimedOwnerLossSourceLogIT {
             List<Map<String, Object>> records, long cutoff) { return bridgeIfPresent(observer, receipt, records, cutoff).orElseThrow(); }
     private static Positive positive(NativeTelemetryIdentityJdiSession observer, String node,
             NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt, Map<String, List<Map<String, Object>>> records,
-            BenchmarkLiveReport report, HttpClient http, URI scrape, long cutoff, long deadline) {
+            NativeLogCallerEvidence.Resolver callerResolver, BenchmarkLiveReport report, HttpClient http, URI scrape, long cutoff, long deadline) {
         return Await.answered("actual scoped source stream log and matching offer/visible/produce/fresh scrape", left(deadline), () -> {
             try {
                 String body = NativeTelemetryPositiveCalibrationIT.scrape(http, scrape, deadline);
-                var boundary = capture(observer, node, records, report, "owner-loss-positive");
+                var boundary = capture(observer, node, records, callerResolver, report, "owner-loss-positive");
                 var fresh = records.get(node).stream().filter(record -> order(record, "entryOrder") > cutoff).toList();
-                boolean source = fresh.stream().anyMatch(record -> sourceLog(record, receipt));
+                boolean source = fresh.stream().anyMatch(record -> sourceLog(record, receipt, callerResolver));
                 boolean accepted = flag(fresh, "OFFER", "accepted", receipt);
                 boolean visible = flag(fresh, "VISIBLE", "included", receipt);
                 boolean produced = matchingProduced(fresh, body, receipt);
@@ -468,7 +473,8 @@ class NativeClaimedOwnerLossSourceLogIT {
             catch (Exception problem) { throw new AssertionError("positive native read failed", problem); }
         });
     }
-    private static Map<String, Object> scopedSourceLogRead(List<Map<String, Object>> observed, HttpClient http,
+    private static Map<String, Object> scopedSourceLogRead(List<Map<String, Object>> observed, NativeLogCallerEvidence.Resolver callerResolver,
+            HttpClient http,
             ControlPlane control, URI base, NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt, long deadline) throws Exception {
         Duration remaining = left(deadline);
         var reply = http.send(HttpRequest.newBuilder(base.resolve("/api/pipelines/" + Q + "/logs?scope=current"))
@@ -479,21 +485,23 @@ class NativeClaimedOwnerLossSourceLogIT {
         Object parsed = JsonReader.parse(reply.body()); assertThat(parsed).isInstanceOf(Map.class);
         Object lines = ((Map<?, ?>) parsed).get("lines"); assertThat(lines).isInstanceOf(List.class);
         assertThat(((List<?>) lines).stream().filter(Map.class::isInstance).map(Map.class::cast).anyMatch(line ->
-                observed.stream().anyMatch(record -> sourceLog(record, receipt)
+                observed.stream().anyMatch(record -> sourceLog(record, receipt, callerResolver)
                         && line.get("timestampMillis") instanceof Number time && record.get("timestampMillis") instanceof Number captured
                         && time.longValue() == captured.longValue() && line.get("level").equals(record.get("level"))
                         && line.get("message").equals(record.get("message")))))
                 .as("the current node-local endpoint serves the actual source stream scoped line").isTrue();
         left(deadline);
         return Map.of("action", "actual-source-current-http-log", "scope", receipt.scope(), "body", reply.body(),
-                "bodySha256", digest(reply.body().getBytes(StandardCharsets.UTF_8)));
+                "bodySha256", digest(reply.body().getBytes(StandardCharsets.UTF_8)),
+                "nativeLogEvidence", callerResolver.evidence(observed));
     }
     private static boolean good(Map<String, Object> record) { return Boolean.TRUE.equals(record.get("normalReturn")) && !record.containsKey("decoderStatus"); }
     private static long order(Map<String, Object> record, String key) { return record.get(key) instanceof Number value ? value.longValue() : -1; }
-    private static boolean sourceLog(Map<String, Object> record, NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt) {
-        if (!good(record) || !"LOG".equals(record.get("target")) || !receipt.scope().equals(record.get("scope"))
-                || !(record.get("callers") instanceof List<?> encoded) || encoded.size() != 2
-                || !(encoded.getFirst() instanceof List<?> strings) || !(encoded.get(1) instanceof List<?> callers) || callers.size() % 9 != 0) { return false; }
+    private static boolean sourceLog(Map<String, Object> record, NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt,
+            NativeLogCallerEvidence.Resolver callerResolver) {
+        if (!good(record) || !"LOG".equals(record.get("target")) || !receipt.scope().equals(record.get("scope"))) { return false; }
+        List<Object> encoded = callerResolver.decode(record.get("callers"));
+        List<?> strings = (List<?>) encoded.getFirst(), callers = (List<?>) encoded.get(1);
         for (int at = 0; at < callers.size(); at += 9) {
             if ("io.tapstate.adapters.pdk.PdkCapturePort".equals(decoded(strings, callers.get(at)))
                     && "streamLoop".equals(decoded(strings, callers.get(at + 1)))
@@ -554,6 +562,7 @@ class NativeClaimedOwnerLossSourceLogIT {
                 }
             }
         }
+        out.putAll(NativeTelemetryPositiveCalibrationIT.callerEvidenceHashes(root, MAX_BYTES));
         return Map.copyOf(out);
     }
     private static Map<String, String> resources(Map<String, Object> settings, String target) {

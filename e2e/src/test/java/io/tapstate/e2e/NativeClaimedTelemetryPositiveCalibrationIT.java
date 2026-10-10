@@ -168,6 +168,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         String operatorDatabase = namespace + "_operator";
         Map<String, Object> settings = SharedMySql.settings(namespace + "_source");
         Map<String, NativeTelemetryIdentityJdiSession> sessions = new LinkedHashMap<>();
+        var callerResolver = new NativeLogCallerEvidence.Resolver(NativeLogCallerEvidence.Compatibility.ALLOW_LEGACY_RECORD_LOCAL);
         Map<String, Integer> scrapePorts = new LinkedHashMap<>();
         TwoMemberCluster cluster = null;
         Throwable primary = null;
@@ -274,7 +275,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             DirectFixture directFixture = cdcOnly ? freshDirectFixture(mongo, database) : null;
             cluster.first().lifecycle(PIPELINE, LifecycleVerb.START);
             DirectReady directReady = cdcOnly ? awaitDirectReady(database, claims, key, memberBoots, directFixture,
-                    sessions, records, report, setupDeadline) : null;
+                    sessions, records, callerResolver, report, setupDeadline) : null;
             try (var target = MongoClients.create(targetUri)) {
                 MongoDatabase targetDatabase = target.getDatabase(new ConnectionString(targetUri).getDatabase());
                 if (cdcOnly) {
@@ -290,7 +291,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     Await.until("only the actual post-anchor CDC row reaches Mongo", remaining(setupDeadline),
                             () -> {
                                 requireDirectReadyStable(database, claims, key, memberBoots, directReady);
-                                captureContinueBoundaries(sessions, records, report, "claimed-independent-cdc-only-delivery");
+                                captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-independent-cdc-only-delivery");
                                 return targetDatabase.getCollection(TABLE).countDocuments() == 1;
                             }, () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
                     List<Document> rows = targetDatabase.getCollection(TABLE).find().limit(2).into(new ArrayList<>());
@@ -302,7 +303,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 } else if (continuing) {
                     Await.until("real claimed partial snapshot has known counters and histogram", remaining(setupDeadline),
                             () -> {
-                                captureContinueBoundaries(sessions, records, report, "claimed-partial-snapshot");
+                                captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-partial-snapshot");
                                 long rows = targetDatabase.getCollection(TABLE).countDocuments();
                                 return rows > 0 && rows < SNAPSHOT_ROWS && latest.readStored(PIPELINE)
                                         .filter(value -> value.scope().isPresent()
@@ -313,7 +314,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 } else {
                     Await.until("the real claimed snapshot reaches Mongo", remaining(setupDeadline),
                             () -> {
-                                if (replacement) { captureContinueBoundaries(sessions, records, report, "claimed-reset-initial-snapshot"); }
+                                if (replacement) { captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-reset-initial-snapshot"); }
                                 return targetDatabase.getCollection(TABLE).countDocuments() == 3;
                             },
                             () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
@@ -323,7 +324,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     }
                     Await.until("a real source CDC insert reaches Mongo", remaining(setupDeadline),
                             () -> {
-                                if (replacement) { captureContinueBoundaries(sessions, records, report, "claimed-reset-initial-CDC"); }
+                                if (replacement) { captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-reset-initial-CDC"); }
                                 return targetDatabase.getCollection(TABLE).countDocuments() == 4;
                             },
                             () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
@@ -366,12 +367,12 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                             ? cluster.first() : cluster.second();
                     historyEvents.capture("claimed-gen1-before-pause", first, firstOwnerControl,
                             sessions.get(firstClaim.owner().nodeId()).server().baseUrl(), true, setupDeadline);
-                    captureContinueBoundaries(sessions, records, report, "claimed-gen1-history-events");
+                    captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-gen1-history-events");
                     cluster.first().lifecycle(PIPELINE, LifecycleVerb.PAUSE);
                     TwoMemberCluster owned = cluster;
                     Await.until("actual claimed execution is paused while its snapshot remains unfinished", remaining(setupDeadline),
                             () -> {
-                                captureContinueBoundaries(sessions, records, report, "claimed-partial-paused");
+                                captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-partial-paused");
                                 return actual.read(PIPELINE).filter(checkpoint -> StateJson.parse(checkpoint.stateJson()) == PipelineState.PAUSED).isPresent()
                                         && owned.first().state(PIPELINE).filter(PipelineState.PAUSED::equals).isPresent();
                             }, () -> "actual=" + actual.read(PIPELINE));
@@ -391,17 +392,17 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     pausedFacts = paused.observation().facts();
                     historyEvents.capture("claimed-gen1-paused", paused, firstOwnerControl,
                             sessions.get(firstClaim.owner().nodeId()).server().baseUrl(), false, setupDeadline);
-                    captureContinueBoundaries(sessions, records, report, "claimed-paused-history-events");
+                    captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-paused-history-events");
                     nativeDeadline = System.nanoTime() + WAIT.toNanos();
                     cluster.first().lifecycle(PIPELINE, LifecycleVerb.RESUME);
                 } else {
-                    captureContinueBoundaries(sessions, records, report, "claimed-reset-before-STOP");
+                    captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-reset-before-STOP");
                     cluster.first().stop(PIPELINE, !firstCurrentWindow);
                     if (firstCurrentWindow) {
                         nativeDeadline = System.nanoTime() + WAIT.toNanos();
                         windowAdmission = claimedFirstCurrentWindow(sessions, report, database, latest, claims, key,
                                 cluster, firstReceipt, nativeDeadline);
-                        captureContinueBoundaries(sessions, records, report, "claimed-window-released-before-CDC");
+                        captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-window-released-before-CDC");
                         try (var sql = source.createStatement()) {
                             sql.execute("INSERT INTO " + TABLE + " (id,amount,payload) VALUES (5,500,'native-5')");
                         }
@@ -412,7 +413,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             long deadline = nativeDeadline;
             var current = Await.answered("a real scoped positive claimed observation", remaining(deadline),
                     () -> {
-                        if (replacement) { captureContinueBoundaries(sessions, records, report, "claimed-current-admission"); }
+                        if (replacement) { captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-current-admission"); }
                         return latest.readStored(PIPELINE).filter(value -> value.scope().isPresent()
                             && value.observation().state() == PipelineState.RUNNING
                             && (!replacement || value.scope().orElseThrow().executionGeneration() == 2L)
@@ -534,7 +535,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 var originalScope = priorScope;
                 var carrier = Await.answered("actual known CONTINUE carrier for the admitted old scope and token", remaining(deadline),
                         () -> {
-                            captureContinueBoundaries(sessions, records, report, "claimed-continued-carrier");
+                            captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-continued-carrier");
                             return latest.readContinuation(PIPELINE).filter(value -> value.receipt().knownBaseline()
                                 && proof.reservation().get("token").equals(value.continuation().token())
                                 && value.continuation().sourceScope().equals(originalScope)
@@ -578,7 +579,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                                 Map<String, Object> evidence = new LinkedHashMap<>(captured.evidence());
                                 evidence.put("observedNodeId", entry.getKey());
                                 report.addFork(evidence);
+                                callerResolver.register(captured.callerSymbols());
                                 records.get(entry.getKey()).addAll(captured.records());
+                                callerResolver.evidence(records.get(entry.getKey()));
                                 if (has(records.get(entry.getKey()), "LOG", receipt)) {
                                     assertThat(captured.bindings())
                                             .as("the actual log member has the validated native log method")
@@ -600,7 +603,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                                 predicates.put("nativeSourceStreamCaller", (requiredSourceNode == null ? submission.members().stream()
                                         : java.util.stream.Stream.of(requiredSourceNode))
                                         .anyMatch(node -> records.get(node).stream()
-                                                .anyMatch(record -> isSourceStreamLog(record, receipt))));
+                                                .anyMatch(record -> isSourceStreamLog(record, receipt, callerResolver))));
                             }
                             predicates.put("acceptedOffer", flag(observed, "OFFER", "accepted", receipt));
                             predicates.put("visible", flag(observed, "VISIBLE", "included", receipt));
@@ -651,7 +654,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     .as("a genuine scoped log on an actual admitted member is required; quiet is unverified").isTrue();
             if (!replacement) {
                 boolean sourceDrive = records.values().stream().flatMap(List::stream)
-                        .anyMatch(record -> isSourceStreamLog(record, receipt));
+                        .anyMatch(record -> isSourceStreamLog(record, receipt, callerResolver));
                 report.addFork(Map.of("action", "actual-warm-source-log-caller-qualification",
                         "scope", receipt.scope(), "sourceStreamCallerVerified", sourceDrive));
                 assertThat(sourceDrive)
@@ -671,7 +674,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 var bindEvents = new java.util.concurrent.atomic.AtomicReference<List<Document>>(List.of());
                 Await.until("actual claimed replacement bind state and execution events are readable", remaining(deadline),
                         () -> {
-                            captureContinueBoundaries(sessions, records, report, "claimed-gen2-bind-events");
+                            captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-gen2-bind-events");
                             List<Document> emitted = database.getCollection(MongoStorePort.PIPELINE_EVENTS)
                                     .find(new Document("pipelineId", PIPELINE)
                                             .append("pipelineIncarnationId", scope.pipelineIncarnationId())
@@ -694,9 +697,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 historyEvents.capture("claimed-gen2-continued", current, emittingControl, owner.server().baseUrl(), true, deadline);
                 report.addFork(Map.of("action", "actual-claimed-gen2-bind-events", "scope", receipt.scope(),
                         "events", bindEvents.get().stream().map(Document::toJson).toList()));
-                captureContinueBoundaries(sessions, records, report, "claimed-gen2-history-events");
+                captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-gen2-history-events");
                 verifyContinuedSnapshotAndCdc(source, targetUri, database, latest, actual, scope, matchedJob, frozenFloor,
-                        sessions, records, report, emittingNode, cluster.first());
+                        sessions, records, callerResolver, report, emittingNode, cluster.first());
             }
             WorkloadClaim after = claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim();
             assertThat(claimTuple(after)).isEqualTo(withoutLease(submission.claim()));
@@ -709,21 +712,24 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             Map<String, Object> logEvidence = new LinkedHashMap<>(NativeTelemetryPositiveCalibrationIT.assertScopedLogRead(
                     records.get(logNode), http, logControl, sessions.get(logNode).server().baseUrl(), receipt));
             logEvidence.put("observedNodeId", logNode);
+            logEvidence.put("nativeLogEvidence", callerResolver.evidence(records.get(logNode).stream()
+                    .filter(record -> "LOG".equals(record.get("target"))).toList()));
             logEvidence.put("nodeSessionOwner", memberEvidence(afterBoots).get(logNode));
             report.addFork(logEvidence);
             if (!replacement) {
                 String sourceNode = (requiredSourceNode == null ? submission.members().stream()
                         : java.util.stream.Stream.of(requiredSourceNode))
-                        .filter(node -> records.get(node).stream().anyMatch(record -> isSourceStreamLog(record, receipt)))
+                        .filter(node -> records.get(node).stream().anyMatch(record -> isSourceStreamLog(record, receipt, callerResolver)))
                         .findFirst().orElseThrow(() -> new AssertionError("the admitted source log member is absent"));
                 List<Map<String, Object>> sourceLogs = records.get(sourceNode).stream()
-                        .filter(record -> isSourceStreamLog(record, receipt)).toList();
+                        .filter(record -> isSourceStreamLog(record, receipt, callerResolver)).toList();
                 ControlPlane sourceControl = sourceNode.equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
                 Map<String, Object> sourceRead = new LinkedHashMap<>(NativeTelemetryPositiveCalibrationIT.assertScopedLogRead(
                         sourceLogs, http, sourceControl, sessions.get(sourceNode).server().baseUrl(), receipt));
                 sourceRead.put("action", "actual-current-native-source-log-response");
                 sourceRead.put("observedNodeId", sourceNode);
                 sourceRead.put("sourceCallerVerified", true);
+                sourceRead.put("nativeLogEvidence", callerResolver.evidence(sourceLogs));
                 report.addFork(sourceRead);
             }
             if (directReady != null) { requireDirectReadyStable(database, claims, key, memberBoots, directReady); }
@@ -749,8 +755,10 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 Map<String, Object> evidence = new LinkedHashMap<>(terminal.evidence());
                 evidence.put("observedNodeId", node);
                 report.addFork(evidence);
+                callerResolver.register(terminal.callerSymbols());
                 if (replacement) {
                     records.get(node).addAll(terminal.records());
+                    callerResolver.evidence(records.get(node));
                     assertThat(records.get(node).size()).as("all retained native records, including close").isLessThanOrEqualTo(MAX_RECORDS);
                 }
                 assertThat(terminal.invocationDrainComplete()).isTrue();
@@ -780,6 +788,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                             "NONEMITTING_MEMBER_NEGATIVE_CALIBRATION", "FORMAL_PERFORMANCE_ACCEPTANCE")));
         } catch (Exception | Error failure) {
             primary = failure;
+            sessions.forEach((node, session) -> NativeTelemetryPositiveCalibrationIT.recordFailureEvidence(report, session, node, failure));
             try { report.fail(failure); } catch (RuntimeException reporting) { failure.addSuppressed(reporting); }
             throw failure;
         } finally {
@@ -887,12 +896,11 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             Map<String, Object> raw, List<MetricFact> rawFacts) { }
 
     private static boolean isSourceStreamLog(Map<String, Object> record,
-            NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt) {
+            NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt, NativeLogCallerEvidence.Resolver callerResolver) {
         if (!"LOG".equals(record.get("target")) || !receipt.scope().equals(record.get("scope"))
-                || !Boolean.TRUE.equals(record.get("normalReturn")) || record.containsKey("decoderStatus")
-                || !(record.get("callers") instanceof List<?> encoded) || encoded.size() != 2
-                || !(encoded.get(0) instanceof List<?> strings)
-                || !(encoded.get(1) instanceof List<?> callers) || callers.size() % 9 != 0) { return false; }
+                || !Boolean.TRUE.equals(record.get("normalReturn")) || record.containsKey("decoderStatus")) { return false; }
+        List<Object> encoded = callerResolver.decode(record.get("callers"));
+        List<?> strings = (List<?>) encoded.getFirst(), callers = (List<?>) encoded.get(1);
         for (int offset = 0; offset < callers.size(); offset += 9) {
             if ("io.tapstate.adapters.pdk.PdkCapturePort".equals(callerString(strings, callers.get(offset)))
                     && "streamLoop".equals(callerString(strings, callers.get(offset + 1)))
@@ -909,14 +917,17 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     }
 
     private static void captureContinueBoundaries(Map<String, NativeTelemetryIdentityJdiSession> sessions,
-            Map<String, List<Map<String, Object>>> records, BenchmarkLiveReport report, String phase) {
+            Map<String, List<Map<String, Object>>> records, NativeLogCallerEvidence.Resolver callerResolver,
+            BenchmarkLiveReport report, String phase) {
         try {
             for (var session : sessions.entrySet()) {
                 var boundary = session.getValue().boundary(phase);
                 Map<String, Object> evidence = new LinkedHashMap<>(boundary.evidence());
                 evidence.put("observedNodeId", session.getKey());
                 report.addFork(evidence);
+                callerResolver.register(boundary.callerSymbols());
                 records.get(session.getKey()).addAll(boundary.records());
+                callerResolver.evidence(records.get(session.getKey()));
                 assertThat(records.get(session.getKey()).size()).as("all retained CONTINUE native records on %s", session.getKey())
                         .isLessThanOrEqualTo(MAX_RECORDS);
             }
@@ -1101,13 +1112,14 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     private static void verifyContinuedSnapshotAndCdc(java.sql.Connection source, String targetUri, MongoDatabase database,
             MongoObservationStore latest, MongoStateStore actual, ObservationStore.Scope scope, Map<String, Object> job,
             ObservationContinuation floor, Map<String, NativeTelemetryIdentityJdiSession> sessions,
-            Map<String, List<Map<String, Object>>> records, BenchmarkLiveReport report, String emittingNode, ControlPlane control) throws Exception {
+            Map<String, List<Map<String, Object>>> records, NativeLogCallerEvidence.Resolver callerResolver,
+            BenchmarkLiveReport report, String emittingNode, ControlPlane control) throws Exception {
         long deadline = System.nanoTime() + DELIVERY_WAIT.toNanos();
         try (var target = MongoClients.create(targetUri)) {
             MongoDatabase targetDatabase = target.getDatabase(new ConnectionString(targetUri).getDatabase());
             Await.until("the real claimed continued snapshot finishes its physical delivery and durable ACK", remaining(deadline),
                     () -> {
-                        captureContinueBoundaries(sessions, records, report, "claimed-continued-delivery");
+                        captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-continued-delivery");
                         assertThat(actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
                                 .filter(PipelineState.FAILED::equals))
                                 .as("an actual source or sink failure remains visible").isEmpty();
@@ -1122,7 +1134,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             }
             Await.until("actual claimed resumed CDC update, delete and insert reach Mongo", remaining(deadline),
                     () -> {
-                        captureContinueBoundaries(sessions, records, report, "claimed-continued-cdc");
+                        captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-continued-cdc");
                         Document updated = targetDatabase.getCollection(TABLE).find(new Document("id", 7L)).first();
                         Document inserted = targetDatabase.getCollection(TABLE).find(new Document("id", SNAPSHOT_ROWS + 1L)).first();
                         return targetDatabase.getCollection(TABLE).countDocuments() == SNAPSHOT_ROWS
@@ -1136,7 +1148,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             Instant targetConfirmed = Instant.now();
             var quiet = Await.answered("a matched actual raw frame after all physical CDC delivery", remaining(deadline),
                     () -> {
-                        captureContinueBoundaries(sessions, records, report, "claimed-continued-final-raw");
+                        captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-continued-final-raw");
                         return matchedContinuation(latest, records.get(emittingNode), scope, job, floor, targetConfirmed)
                                 .map(value -> { assertCumulativeExactly(value, floor); return value; })
                                 .filter(value -> finalNativeDelivery(value.rawFacts()));
@@ -1144,7 +1156,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             assertCumulativeExactly(quiet, floor);
             var repeated = Await.answered("a later unchanged native frame keeps the floor added only once", remaining(deadline),
                     () -> {
-                        captureContinueBoundaries(sessions, records, report, "claimed-continued-repeat-raw");
+                        captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-continued-repeat-raw");
                         return matchedContinuation(latest, records.get(emittingNode), scope, job, floor,
                                 quiet.publicValue().observation().observedAt())
                                 .map(value -> { assertCumulativeExactly(value, floor); return value; })
@@ -1386,7 +1398,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     private static DirectReady awaitDirectReady(MongoDatabase database, MongoWorkloadClaimStore claims,
             WorkloadClaimKey key, Map<String, WorkloadClaim> memberBoots, DirectFixture fixture,
             Map<String, NativeTelemetryIdentityJdiSession> sessions, Map<String, List<Map<String, Object>>> records,
-            BenchmarkLiveReport report, long deadline) throws Exception {
+            NativeLogCallerEvidence.Resolver callerResolver, BenchmarkLiveReport report, long deadline) throws Exception {
         WorkloadClaim pipeline = Await.answered("the actual positive leased CDC-only pipeline admission", remaining(deadline),
                 () -> claims.read(key).filter(reading -> reading.leased() && reading.claim().executionGeneration() > 0)
                         .map(reading -> reading.claim()));
@@ -1403,7 +1415,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         for (var session : sessions.values()) { session.recordAuthority(receipt); }
         var submitted = Await.answered("the genuine CDC-only admission and native Job before input", remaining(deadline),
                 () -> {
-                    captureContinueBoundaries(sessions, records, report, "claimed-independent-cdc-only-job");
+                    captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-independent-cdc-only-job");
                     return sessions.get(pipeline.owner().nodeId()).claimedSubmission(receipt);
                 });
         assertThat(withoutLease(submitted.claim())).isEqualTo(claimTuple(pipeline));
@@ -1423,7 +1435,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         assertThat(memberBoots.get(capture.owner().nodeId()).owner()).isEqualTo(capture.owner());
         DirectReady ready = Await.answered("the fresh actual onStart anchor is durable in its direct epoch", remaining(deadline),
                 () -> {
-                    captureContinueBoundaries(sessions, records, report, "claimed-independent-cdc-only-anchor");
+                    captureContinueBoundaries(sessions, records, callerResolver, report, "claimed-independent-cdc-only-anchor");
                     Document cursor = database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
                             .find(directConsumerKey(fixture.chainId(), fixture.consumerId())).first();
                     Document root = database.getCollection(MongoStorePort.SRS_META)
@@ -1551,6 +1563,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 result.put(nested + "ExecutingClassSha256", digest(bytes));
             }
         }
+        result.putAll(NativeTelemetryPositiveCalibrationIT.callerEvidenceHashes(root, MAX_BYTES));
         return Map.copyOf(result);
     }
 

@@ -56,7 +56,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     record Boundary(String phase, long sequence, String jarSha256, String pipelineId,
             Map<Target, Binding> bindings, Map<Target, Counts> counts, List<Map<String, Object>> records,
             List<AuthorityReceipt> authorityReceipts, Set<String> unverified, Set<String> decodedLayouts,
-            Map<String, Object> logFamilyCalibration,
+            Map<String, Object> logFamilyCalibration, NativeLogCallerEvidence.Table callerSymbols,
+            List<Map<String, Object>> unpairedCalls, long evidenceBytes,
             String vmVersion, long events, long handlingNanos, int openCalls, boolean queueDrained,
             boolean ownedVmDeath, boolean ownedVmDisconnected, BindingProfile bindingProfile,
             Set<Target> deferredUnpreparedBindings, boolean replacementObservationEnabled,
@@ -66,6 +67,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             authorityReceipts = List.copyOf(authorityReceipts); unverified = Set.copyOf(unverified);
             decodedLayouts = Set.copyOf(decodedLayouts);
             logFamilyCalibration = Map.copyOf(logFamilyCalibration);
+            Objects.requireNonNull(callerSymbols); unpairedCalls = List.copyOf(unpairedCalls);
             Objects.requireNonNull(bindingProfile);
             deferredUnpreparedBindings = Set.copyOf(deferredUnpreparedBindings);
         }
@@ -101,6 +103,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             out.put("deferredUnpreparedBindings", deferredUnpreparedBindings.stream().map(Enum::name).sorted().toList());
             out.put("decodedLayouts", decodedLayouts.stream().sorted().toList());
             out.put("logFamilyCalibration", logFamilyCalibration);
+            out.put("callerSymbols", callerSymbols.evidence()); out.put("unpairedCalls", unpairedCalls);
+            out.put("evidenceBytes", evidenceBytes);
             out.put("vmVersion", vmVersion); out.put("events", events); out.put("handlingNanos", handlingNanos);
             out.put("openCalls", openCalls); out.put("queueDrained", queueDrained);
             out.put("ownedVmDeath", ownedVmDeath); out.put("ownedVmDisconnected", ownedVmDisconnected);
@@ -133,7 +137,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             out.put("cleanupForcedKill", cleanupForcedKill); out.put("artifactUnchanged", artifactUnchanged);
             out.put("pumpStopped", pumpStopped); out.put("normalDrain", false); out.put("decodedComplete", false);
             out.put("oldHeapCleanup", "UNKNOWN");
-            out.put("observed", observed == null ? null : observed.evidence()); out.put("unpairedCalls", unpairedCalls);
+            Map<String, Object> observedEvidence = observed == null ? null : new LinkedHashMap<>(observed.evidence());
+            // The top-level crash field owns these rows; export them once with the observed dictionary.
+            if (observedEvidence != null && unpairedCalls != null) { observedEvidence.remove("unpairedCalls"); }
+            out.put("observed", observedEvidence); out.put("unpairedCalls", unpairedCalls);
             out.put("evidenceStatus", evidenceFailure == null && observed != null ? "RETAINED_INCOMPLETE" : "UNKNOWN");
             out.put("evidenceFailure", evidenceFailure); out.put("observerFailure", observerFailure);
             out.put("cleanupFailure", cleanupFailure); out.put("passiveObserver", true);
@@ -251,6 +258,9 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private final Map<Long, ClaimedSubmission> claimedSubmissions = new LinkedHashMap<>();
     private final Map<Long, ClaimedReplacement> claimedReplacements = new LinkedHashMap<>();
     private final List<Map<String, Object>> records = new ArrayList<>();
+    private final NativeLogCallerEvidence.Phase callerEvidence = new NativeLogCallerEvidence.Phase(UUID.randomUUID().toString());
+    private Map<String, Object> captureFailureEvidence = Map.of();
+    private Map<String, Object> rejectedRecord = Map.of();
     private final List<AuthorityReceipt> authorities = new ArrayList<>();
     private final Set<String> unverified = new LinkedHashSet<>(), layouts = new LinkedHashSet<>();
     private final Set<String> validatedTypes = new HashSet<>();
@@ -262,7 +272,6 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private volatile boolean running = true;
     private boolean closing, closed, vmDeath, disconnected;
     private long loaderId = -1, events, sequence, calls, handlingNanos;
-    private long phaseBytes;
     private Boundary terminal;
     private UnqualifiedEntry lastUnqualifiedEntry;
     private boolean logFamilyCalibrationStarted;
@@ -830,8 +839,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                         handle(next);
                     }
                     synchronized (lock) {
-                        check(); request.complete(snapshot(requestedPhase, true, requestedBindingProfile));
-                        records.clear(); phaseBytes = 0; command = null;
+                        check();
+                        Boundary completed = snapshot(requestedPhase, true, requestedBindingProfile);
+                        callerEvidence.reset(); records.clear(); command = null;
+                        request.complete(completed);
                     }
                 }
             }
@@ -1408,7 +1419,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         out.put("receiver", call.receiver.uniqueID()); out.put("normalReturn", true);
         if (call.logCalibration) { out.put("calibrationComplete", !out.containsKey("decoderStatus")); }
         AdmissionReturnPark selected = selectAdmissionReturnPark(call, out, event, eventSet);
-        addRecord(out);
+        addRecord(out, call.logCalibration ? out : logFamilyCalibration);
         if (call.logCalibration) {
             logFamilyCalibration = Collections.unmodifiableMap(new LinkedHashMap<>(out));
         } else { totals.get(call.spec.target()).normal++; }
@@ -2271,21 +2282,26 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         record.put("decoderTarget", target.name());
         record.put("decoderReasons", List.copyOf(failures));
     }
-    private void addRecord(Map<String, Object> record) {
+    private void addRecord(Map<String, Object> record, Map<String, Object> calibration) {
         if (records.size() >= MAX_RECORDS) { throw invalid("phase record budget exceeded"); }
         long bytes = evidenceBytes(record, 0);
         long recordLimit = Target.PRODUCE.name().equals(record.get("target"))
                 ? MAX_PRODUCE_RECORD_BYTES : MAX_RECORD_BYTES;
-        if (bytes > recordLimit || phaseBytes + bytes > MAX_PHASE_BYTES) {
-            throw invalid("phase or record byte budget exceeded: target=" + record.get("target")
-                    + ", recordBytes=" + bytes + ", maxRecordBytes=" + recordLimit
-                    + ", phaseBytes=" + phaseBytes + ", maxPhaseBytes=" + MAX_PHASE_BYTES
-                    + ", retainedRecords=" + records.size()
-                    + ", callerBytes=" + evidenceBytes(record.get("callers"), 0)
-                    + ", messageBytes=" + evidenceBytes(record.get("message"), 0));
+        try {
+            if (bytes > recordLimit) { throw invalid("expanded record byte budget exceeded"); }
+            // A normal return is no longer unpaired; all other entries still consume the same phase budget.
+            List<Map<String, Object>> open = retainedOpenCalls((Long) record.get("invocation"));
+            records.add(callerEvidence.retain(record, open, calibration));
+        } catch (AssertionError problem) {
+            if (rejectedRecord.isEmpty()) {
+                rejectedRecord = Map.of("target", Objects.toString(record.get("target")), "recordBytes", bytes,
+                        "maxRecordBytes", recordLimit, "retainedRecords", records.size(),
+                        "callerBytes", evidenceBytes(record.get("callers"), 0),
+                        "messageBytes", evidenceBytes(record.get("message"), 0),
+                        "reason", Objects.toString(problem.getMessage()));
+            }
+            throw problem;
         }
-        phaseBytes += bytes;
-        records.add(Collections.unmodifiableMap(new LinkedHashMap<>(record)));
     }
     private Boundary snapshot(String phase, boolean drained) throws Exception {
         return snapshot(phase, drained, BindingProfile.FULL);
@@ -2332,12 +2348,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
         if (authorities.isEmpty()) { missing.add("AUTHORITY_RECEIPTS_UNVERIFIED"); }
         for (Map<String, Object> record : records) { qualifyScopes(record, missing, 0); }
-        if (!logFamilyCalibration.isEmpty()
-                && evidenceBytes(Map.of("records", records, "logFamilyCalibration", logFamilyCalibration), 0) > MAX_PHASE_BYTES) {
-            throw invalid("log calibration and retained records exceed the existing phase budget");
-        }
-        return new Boundary(phase, ++sequence, sha, pipeline, bindings, counts, records, authorities,
-                missing, layouts, logFamilyCalibration, vmVersion, events, handlingNanos,
+        NativeLogCallerEvidence.Snapshot evidence = callerEvidence.snapshot(retainedOpenCalls(), logFamilyCalibration);
+        return new Boundary(phase, ++sequence, sha, pipeline, bindings, counts, evidence.records(), authorities,
+                missing, layouts, evidence.calibration(), evidence.table(), evidence.unpairedCalls(), evidence.logicalBytes(),
+                vmVersion, events, handlingNanos,
                 threads.values().stream().mapToInt(state -> state.calls.size()).sum(), drained, vmDeath, disconnected, profile,
                 deferSubmit ? Set.of(Target.SUBMIT) : Set.of(),
                 replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
@@ -2390,10 +2404,62 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         CompletableFuture<Boundary> waiting = command;
         if (waiting != null) { waiting.completeExceptionally(error); }
         synchronized (lock) {
+            try { captureFailureEvidence = incompleteEvidence(error); }
+            catch (Throwable retentionFailure) {
+                append(error, retentionFailure);
+                captureFailureEvidence = Map.of("status", "INCOMPLETE", "evidenceStatus", "UNKNOWN",
+                        "evidenceFailure", problemText(retentionFailure), "performanceAcceptanceEligible", false);
+            }
             if (admissionReturnPark != null) { admissionReturnPark.entered.completeExceptionally(error); }
         }
         detach(error);
     }
+    /** A failed capture retains bounded local evidence, never a qualified boundary or a target read. */
+    Map<String, Object> failureEvidence() {
+        synchronized (lock) {
+            return captureFailureEvidence.isEmpty() ? incompleteEvidence(failure.get()) : captureFailureEvidence;
+        }
+    }
+
+    private Map<String, Object> incompleteEvidence(Throwable firstFailure) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", "INCOMPLETE"); out.put("phase", requestedPhase);
+        out.put("jarSha256", sha); out.put("pipelineId", pipeline); out.put("events", events);
+        out.put("firstFailure", problemText(firstFailure)); out.put("rejectedRecord", rejectedRecord);
+        out.put("unverified", List.copyOf(unverified)); out.put("normalDrain", false);
+        out.put("performanceAcceptanceEligible", false);
+        Map<String, Object> counted = new LinkedHashMap<>();
+        List<String> mismatches = new ArrayList<>();
+        for (var entry : totals.entrySet()) {
+            Totals total = entry.getValue();
+            long open = threads.values().stream().flatMap(state -> state.calls.stream())
+                    .filter(call -> call.qualified && call.spec.target() == entry.getKey()).count();
+            counted.put(entry.getKey().name(), Map.of("entries", total.entries, "normalReturns", total.normal,
+                    "exceptionalExits", total.exceptional, "inFlight", open));
+            if (total.entries != total.normal + total.exceptional + open) { mismatches.add(entry.getKey().name()); }
+        }
+        out.put("counts", counted); out.put("callAccountingMismatches", List.copyOf(mismatches));
+        out.put("openCallCount", threads.values().stream().mapToInt(state -> state.calls.size()).sum());
+        NativeLogCallerEvidence.Snapshot evidence;
+        try {
+            evidence = callerEvidence.snapshot(retainedOpenCalls(), logFamilyCalibration);
+            out.put("unpairedEvidenceStatus", "RETAINED_INCOMPLETE");
+        } catch (Throwable incomplete) {
+            out.put("unpairedEvidenceStatus", "UNKNOWN"); out.put("evidenceFailure", problemText(incomplete));
+            if (firstFailure != null && firstFailure != incomplete) { firstFailure.addSuppressed(incomplete); }
+            // Atomic retention guarantees that the completed record/table envelope still fits.
+            try { evidence = callerEvidence.snapshot(); }
+            catch (Throwable unavailable) {
+                out.put("evidenceStatus", "UNKNOWN"); out.put("retainedEnvelopeFailure", problemText(unavailable));
+                if (firstFailure != null && firstFailure != unavailable) { firstFailure.addSuppressed(unavailable); }
+                return Collections.unmodifiableMap(out);
+            }
+        }
+        out.put("retained", evidence.evidence()); out.put("evidenceBytes", evidence.logicalBytes());
+        out.put("evidenceStatus", "RETAINED_INCOMPLETE");
+        return Collections.unmodifiableMap(out);
+    }
+
     private Throwable detach(Throwable primary) {
         try { releaseAdmissionReturnPark(admissionReturnPark, "DETACH"); }
         catch (Throwable problem) { primary = append(primary, problem); }
@@ -2433,10 +2499,11 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     }
 
     /** No live target reads: preserve actual counters and entries even when SIGKILL interrupts decoding. */
-    private Boundary crashSnapshot() {
+    private Boundary crashSnapshot(NativeLogCallerEvidence.Snapshot evidence, String evidenceGap) {
         Map<Target, Counts> counts = new EnumMap<>(Target.class);
         Set<String> missing = new LinkedHashSet<>(unverified);
         missing.add("OWNED_CRASH_INCOMPLETE"); missing.add("LIVE_PROVENANCE_AT_CRASH_UNKNOWN");
+        if (evidenceGap != null) { missing.add("UNPAIRED_CALL_EVIDENCE_UNAVAILABLE:" + evidenceGap); }
         if (crashReadInterruption != null) { missing.add("DISCONNECT_INTERRUPTED_OBSERVATION:" + crashReadInterruption); }
         for (var target : totals.entrySet()) {
             if (!bindings.containsKey(target.getKey())) { missing.add("LIVE_BINDING_UNAVAILABLE:" + target.getKey()); }
@@ -2450,24 +2517,25 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
         if (authorities.isEmpty()) { missing.add("AUTHORITY_RECEIPTS_UNVERIFIED"); }
         for (Map<String, Object> record : records) { qualifyScopes(record, missing, 0); }
-        return new Boundary("owned-crash", ++sequence, sha, pipeline, bindings, counts, records, authorities,
-                missing, layouts, logFamilyCalibration, vmVersion, events, handlingNanos,
+        return new Boundary("owned-crash", ++sequence, sha, pipeline, bindings, counts, evidence.records(), authorities,
+                missing, layouts, evidence.calibration(), evidence.table(), evidence.unpairedCalls(), evidence.logicalBytes(),
+                vmVersion, events, handlingNanos,
                 threads.values().stream().mapToInt(state -> state.calls.size()).sum(), false, vmDeath, disconnected, BindingProfile.FULL,
                 Set.of(), replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
     }
 
-    private List<Map<String, Object>> crashOpenCalls() {
+    private List<Map<String, Object>> retainedOpenCalls() { return retainedOpenCalls(null); }
+
+    private List<Map<String, Object>> retainedOpenCalls(Long returnedInvocation) {
         List<Map<String, Object>> open = new ArrayList<>();
         for (var thread : threads.entrySet()) {
             for (Call call : thread.getValue().calls) {
+                if (Objects.equals(returnedInvocation, call.id)) { continue; }
+                if (open.size() >= MAX_OPEN_CALLS) { throw invalid("phase open-call budget exceeded"); }
                 open.add(Map.of("thread", thread.getKey(), "invocation", call.id, "target", call.spec.target().name(),
                         "depth", call.depth, "qualifiedAtEntry", call.qualified, "escapingObserved", call.escaping,
                         "returnRequestCreated", call.exit != null, "entry", call.entry, "logCalibration", call.logCalibration));
             }
-        }
-        if (open.size() > MAX_OPEN_CALLS) { throw invalid("crash open-call budget exceeded"); }
-        if (evidenceBytes(Map.of("records", records, "unpairedCalls", open, "logFamilyCalibration", logFamilyCalibration), 0) > MAX_PHASE_BYTES) {
-            throw invalid("crash retained evidence exceeds the existing phase byte budget");
         }
         return List.copyOf(open);
     }
@@ -2516,8 +2584,15 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                         cleanup = append(cleanup, invalid("owned event pump did not stop"));
                         evidenceProblem = append(evidenceProblem, invalid("crash evidence is not stable while the pump is alive"));
                     } else {
-                        try { observed = crashSnapshot(); open = crashOpenCalls(); }
-                        catch (Exception | Error problem) { evidenceProblem = append(evidenceProblem, problem); }
+                        try {
+                            var evidence = callerEvidence.snapshot(retainedOpenCalls(), logFamilyCalibration);
+                            observed = crashSnapshot(evidence, null); open = evidence.unpairedCalls();
+                        }
+                        catch (Exception | Error problem) {
+                            evidenceProblem = append(evidenceProblem, problem);
+                            try { observed = crashSnapshot(callerEvidence.snapshot(), problemText(problem)); }
+                            catch (Exception | Error unavailable) { evidenceProblem = append(evidenceProblem, unavailable); }
+                        }
                     }
                     crashTerminal = new OwnedCrash(crashOwnedPid, crashMarkedAtEvent, deadBeforeCleanup,
                             !server.isAlive(), crashDisconnectBeforeDispose, crashDisconnectReceipt,

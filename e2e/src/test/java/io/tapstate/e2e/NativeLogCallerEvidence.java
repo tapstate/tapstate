@@ -76,12 +76,16 @@ final class NativeLogCallerEvidence {
         }
         private String id() { return owner + "#" + sequence; }
 
-        Map<String, Object> retain(Map<String, Object> raw) {
+        Map<String, Object> retain(Map<String, Object> raw) { return retain(raw, List.of(), Map.of()); }
+
+        Map<String, Object> retain(Map<String, Object> raw, List<Map<String, Object>> open,
+                Map<String, Object> calibration) {
             require(records.size() < MAX_RECORDS, "RECORD_COUNT_BUDGET");
+            require(open.size() <= MAX_OPEN_CALLS, "OPEN_CALL_COUNT_BUDGET");
             Planner plan = new Planner(id(), symbols, indexes);
             Map<String, Object> encoded = plan.record(raw);
             List<Map<String, Object>> candidate = new ArrayList<>(records); candidate.add(encoded);
-            new Snapshot(plan.table(), candidate, List.of(), Map.of());
+            plan.snapshot(candidate, open, calibration);
             // Commit the exact plan only after its whole logical envelope fits.
             for (String value : plan.added.keySet()) {
                 indexes.put(value, symbols.size()); symbols.add(value);
@@ -93,18 +97,7 @@ final class NativeLogCallerEvidence {
         Snapshot snapshot() { return snapshot(List.of(), Map.of()); }
 
         Snapshot snapshot(List<Map<String, Object>> open, Map<String, Object> calibration) {
-            require(open.size() <= MAX_OPEN_CALLS, "OPEN_CALL_COUNT_BUDGET");
-            Planner plan = new Planner(id(), symbols, indexes);
-            List<Map<String, Object>> encodedOpen = new ArrayList<>();
-            for (Map<String, Object> call : open) {
-                if (call.get("entry") instanceof Map<?, ?> entry) {
-                    Map<String, Object> copy = new LinkedHashMap<>(call);
-                    copy.put("entry", plan.record(stringMap(entry)));
-                    encodedOpen.add(immutableMap(copy));
-                } else { encodedOpen.add(plan.record(call)); }
-            }
-            Map<String, Object> encodedCalibration = calibration.isEmpty() ? Map.of() : plan.record(calibration);
-            return new Snapshot(plan.table(), records, encodedOpen, encodedCalibration);
+            return new Planner(id(), symbols, indexes).snapshot(records, open, calibration);
         }
 
         void reset() {
@@ -133,6 +126,21 @@ final class NativeLogCallerEvidence {
             Integer existing = indexes.get(value);
             return existing != null ? existing : added.computeIfAbsent(value, ignored -> symbols.size() + added.size());
         }
+        Snapshot snapshot(List<Map<String, Object>> retained, List<Map<String, Object>> open,
+                Map<String, Object> calibration) {
+            require(open.size() <= MAX_OPEN_CALLS, "OPEN_CALL_COUNT_BUDGET");
+            List<Map<String, Object>> encodedOpen = new ArrayList<>();
+            for (Map<String, Object> call : open) {
+                if (call.get("entry") instanceof Map<?, ?> entry) {
+                    Map<String, Object> copy = new LinkedHashMap<>(call);
+                    copy.put("entry", record(stringMap(entry)));
+                    encodedOpen.add(immutableMap(copy));
+                } else { encodedOpen.add(record(call)); }
+            }
+            Map<String, Object> encodedCalibration = calibration.isEmpty() ? Map.of() : record(calibration);
+            return new Snapshot(table(), retained, encodedOpen, encodedCalibration);
+        }
+
         Map<String, Object> record(Map<String, Object> raw) {
             require(raw != null, "RECORD_REQUIRED");
             Map<String, Object> expanded = new LinkedHashMap<>(raw);
@@ -192,6 +200,58 @@ final class NativeLogCallerEvidence {
         List<Object> result = List.of(List.copyOf(localIndexes.keySet()), List.copyOf(localRows));
         require(bytes(result) <= MAX_RECORD_BYTES, "DECODED_CALLER_BYTE_BUDGET");
         return result;
+    }
+
+    /** Each resolver admits only the immutable tables supplied by its observed boundaries. */
+    static final class Resolver {
+        private final Compatibility compatibility;
+        private final Map<String, Table> tables = new LinkedHashMap<>();
+
+        Resolver(Compatibility compatibility) { this.compatibility = Objects.requireNonNull(compatibility); }
+
+        void register(Table table) {
+            Objects.requireNonNull(table, "table");
+            Table old = tables.putIfAbsent(table.id(), table);
+            require(old == null || old.equals(table), "CONFLICTING_TABLE");
+        }
+
+        List<Object> decode(Object callers) {
+            Table table = null;
+            if (callers instanceof Map<?, ?> reference) {
+                require(reference.get("tableId") instanceof String, "CALLER_REFERENCE_SHAPE");
+                table = tables.get((String) reference.get("tableId"));
+            }
+            return NativeLogCallerEvidence.decode(callers, table, compatibility);
+        }
+
+        Map<String, Object> evidence(List<Map<String, Object>> records) {
+            require(records.size() <= MAX_RECORDS, "RECORD_COUNT_BUDGET");
+            SetCollector selected = new SetCollector();
+            for (var record : records) { selected.visit(record, 0); }
+            List<Map<String, Object>> referenced = selected.ids.stream().map(id -> tables.get(id).evidence()).toList();
+            Map<String, Object> out = Map.of("callerTables", referenced, "records", records);
+            require(bytes(out) <= MAX_PHASE_BYTES, "PHASE_BYTE_BUDGET");
+            return immutableMap(out);
+        }
+
+        private final class SetCollector {
+            private final LinkedHashSet<String> ids = new LinkedHashSet<>();
+            void visit(Object value, int depth) {
+                require(depth <= 16, "EVIDENCE_DEPTH_BUDGET");
+                if (value instanceof Map<?, ?> map) {
+                    if (map.containsKey("callers")) {
+                        Object callers = map.get("callers");
+                        decode(callers);
+                        if (callers instanceof Map<?, ?> reference) { ids.add((String) reference.get("tableId")); }
+                    }
+                    for (var entry : map.entrySet()) {
+                        if (!"callers".equals(entry.getKey())) { visit(entry.getValue(), depth + 1); }
+                    }
+                } else if (value instanceof Collection<?> items) {
+                    for (Object item : items) { visit(item, depth + 1); }
+                }
+            }
+        }
     }
 
     private static boolean numericColumn(int offset) { return offset % 9 == 3 || offset % 9 == 4; }

@@ -65,6 +65,7 @@ class NativeTelemetryPositiveCalibrationIT {
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
         Map<String, Object> harnessInputs = inputHashes(PipelineBenchmarkLiveRunIT.harnessRoot());
         AtomicReference<NativeTelemetryIdentityJdiSession> owned = new AtomicReference<>();
+        var callerResolver = new NativeLogCallerEvidence.Resolver(NativeLogCallerEvidence.Compatibility.ALLOW_LEGACY_RECORD_LOCAL);
         BenchmarkForkEnvironment fork = null;
         Throwable primary = null;
         try {
@@ -132,7 +133,9 @@ class NativeTelemetryPositiveCalibrationIT {
                     boundary = observer.boundary("positive-copy");
                     report.addFork(boundary.evidence());
                     assertThat(boundary.unverified()).as("missing decoder/binding is not a calibrated zero").isEmpty();
+                    callerResolver.register(boundary.callerSymbols());
                     observed.addAll(boundary.records());
+                    callerResolver.evidence(observed);
                     assertThat(observed.size()).as("positive calibration retains a bounded record set")
                             .isLessThanOrEqualTo(MAX_RECORDS);
                     if (has(observed, "JOB", receipt) && has(observed, "LOG", receipt)
@@ -155,7 +158,10 @@ class NativeTelemetryPositiveCalibrationIT {
                         .as("the same real included point is visible in the fresh scrape").isTrue();
                 assertThat(positiveScrape(body, pipeline)).isTrue();
                 assertThat(boundary.decodedAndAuthorityBound()).isTrue();
-                report.addFork(assertScopedLogRead(observed, http, fork.control(), observer.server().baseUrl(), receipt));
+                var logRead = new java.util.LinkedHashMap<>(assertScopedLogRead(observed, http, fork.control(), observer.server().baseUrl(), receipt));
+                logRead.put("nativeLogEvidence", callerResolver.evidence(observed.stream()
+                        .filter(record -> "LOG".equals(record.get("target"))).toList()));
+                report.addFork(logRead);
                 report.addFork(Map.of("action", "positive-visible-calibration", "pipelineId", pipeline,
                         "incarnation", receipt.incarnation(), "generation", receipt.generation(),
                         "coordinationId", receipt.coordinationId(), "ownedPid", observer.server().pid(),
@@ -184,6 +190,7 @@ class NativeTelemetryPositiveCalibrationIT {
                             "CLUSTER_EMITTING_MEMBER", "ALL_TELEMETRY_SURFACE_IDENTITIES")));
         } catch (Exception | Error failure) {
             primary = failure;
+            if (owned.get() != null) { recordFailureEvidence(report, owned.get(), "owned-native-copy", failure); }
             try { report.fail(failure); } catch (RuntimeException reporting) { failure.addSuppressed(reporting); }
             throw failure;
         } finally {
@@ -204,6 +211,16 @@ class NativeTelemetryPositiveCalibrationIT {
                     throw (Error) cleanup;
                 }
             }
+        }
+    }
+
+    static void recordFailureEvidence(BenchmarkLiveReport report, NativeTelemetryIdentityJdiSession observer,
+            String node, Throwable primary) {
+        try {
+            report.addFork(Map.of("action", "incomplete-native-evidence-at-failure", "observedNodeId", node,
+                    "evidence", observer.failureEvidence(), "performanceAcceptanceEligible", false));
+        } catch (Exception | Error recording) {
+            if (recording != primary) { primary.addSuppressed(recording); }
         }
     }
 
@@ -366,6 +383,26 @@ class NativeTelemetryPositiveCalibrationIT {
                 assertThat(bytes.length).as("the executing class stays within its evidence byte budget")
                         .isLessThanOrEqualTo(MAX_RESPONSE_BYTES);
                 inputs.put(type.getSimpleName() + "ExecutingClassSha256", digest(bytes));
+            }
+        }
+        inputs.putAll(callerEvidenceHashes(root, MAX_RESPONSE_BYTES));
+        return Map.copyOf(inputs);
+    }
+
+    static Map<String, Object> callerEvidenceHashes(Path root, int maxClassBytes) throws Exception {
+        Map<String, Object> inputs = new java.util.LinkedHashMap<>();
+        inputs.put("NativeLogCallerEvidenceSource", PipelineBenchmarkLiveRunIT.artifact(root.resolve(
+                "e2e/src/test/java/io/tapstate/e2e/NativeLogCallerEvidence.java")));
+        List<Class<?>> types = new ArrayList<>(List.of(NativeLogCallerEvidence.class));
+        for (int at = 0; at < types.size(); at++) {
+            Class<?> type = types.get(at);
+            types.addAll(List.of(type.getDeclaredClasses()));
+            String name = type.getName().substring(type.getPackageName().length() + 1);
+            try (InputStream stream = type.getResourceAsStream(name + ".class")) {
+                assertThat(stream).as("the executing caller evidence class bytes are available").isNotNull();
+                byte[] bytes = stream.readNBytes(maxClassBytes + 1);
+                assertThat(bytes.length).isLessThanOrEqualTo(maxClassBytes);
+                inputs.put(name + "ExecutingClassSha256", digest(bytes));
             }
         }
         return Map.copyOf(inputs);

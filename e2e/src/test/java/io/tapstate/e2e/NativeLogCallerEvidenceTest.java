@@ -175,6 +175,87 @@ class NativeLogCallerEvidenceTest {
         assertThat(before.table().strings()).doesNotContain("open.Source", "calibrated.Source");
     }
 
+    @Test
+    void resolverExportsOnlyReferencedTablesOnceAcrossImmutablePhases() {
+        var phase = new NativeLogCallerEvidence.Phase("subset");
+        var first = phase.retain(log(1, callers("first.Source")));
+        var firstBoundary = phase.snapshot();
+        phase.reset();
+        var second = phase.retain(log(2, callers("second.Source")));
+        var secondBoundary = phase.snapshot();
+        var resolver = new NativeLogCallerEvidence.Resolver(LEGACY);
+        resolver.register(firstBoundary.table()); resolver.register(firstBoundary.table());
+        resolver.register(secondBoundary.table());
+
+        var subset = resolver.evidence(List.of(first, first, second));
+        assertThat(subset.get("callerTables"))
+                .isEqualTo(List.of(firstBoundary.table().evidence(), secondBoundary.table().evidence()));
+        assertThat(subset.get("records")).isEqualTo(List.of(first, first, second));
+        assertThat(resolver.evidence(List.of(second)).get("callerTables"))
+                .isEqualTo(List.of(secondBoundary.table().evidence()));
+        assertThat((List<?>) resolver.evidence(List.of()).get("callerTables")).isEmpty();
+        assertThat(resolver.decode(first.get("callers"))).isEqualTo(callers("first.Source"));
+        assertThat(resolver.decode(second.get("callers"))).isEqualTo(callers("second.Source"));
+    }
+
+    @Test
+    void resolverFailsClosedOnMissingConflictingAndMalformedSharedTables() {
+        var phase = new NativeLogCallerEvidence.Phase("strict");
+        var record = phase.retain(log(1, callers("exact.Source")));
+        var table = phase.snapshot().table();
+        var resolver = new NativeLogCallerEvidence.Resolver(LEGACY);
+        assertThatThrownBy(() -> resolver.decode(record.get("callers")))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("MISSING_OR_FOREIGN_TABLE");
+        assertThatThrownBy(() -> resolver.evidence(List.of(record)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("MISSING_OR_FOREIGN_TABLE");
+        resolver.register(table);
+        assertThatThrownBy(() -> resolver.register(new NativeLogCallerEvidence.Table(table.id(), List.of("foreign"))))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("CONFLICTING_TABLE");
+        assertThat(resolver.decode(record.get("callers"))).isEqualTo(callers("exact.Source"));
+        Map<String, Object> malformed = new LinkedHashMap<>((Map<String, Object>) record.get("callers"));
+        malformed.put("format", "unknown");
+        assertThatThrownBy(() -> resolver.decode(malformed))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("REFERENCE_SHAPE");
+        assertThat(resolver.decode(callers("legacy.Source"))).isEqualTo(callers("legacy.Source"));
+        assertThatThrownBy(() -> new NativeLogCallerEvidence.Resolver(SHARED).decode(callers("legacy.Source")))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("LEGACY_NOT_SELECTED");
+    }
+
+    @Test
+    void prospectiveOpenAndCalibrationRejectionCannotMutateTheCompletedPhase() {
+        var phase = new NativeLogCallerEvidence.Phase("joint-atomic");
+        phase.retain(log(1, callers("completed.Source")));
+        Map<String, Object> padding = Map.of("target", "JOB", "message", "x".repeat(15_000));
+        while (phase.snapshot().logicalBytes() < 2_040_000) { phase.retain(padding); }
+        var before = phase.snapshot();
+        Map<String, Object> largeOpen = new LinkedHashMap<>(log(3, callers("uncommitted.Open")));
+        largeOpen.put("message", "x".repeat(15_000));
+        var candidate = log(2, callers("uncommitted.Return"));
+        var calibration = log(4, callers("uncommitted.Calibration"));
+        assertThatThrownBy(() -> phase.retain(candidate, List.of(Map.of("entry", largeOpen)), calibration))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("PHASE_BYTE_BUDGET");
+        assertThat(phase.snapshot()).isEqualTo(before);
+        assertThat(before.table().strings()).doesNotContain("uncommitted.Open", "uncommitted.Return", "uncommitted.Calibration");
+    }
+
+    @Test
+    void aRawOpenCallerSpanningResetIsReencodedWithoutLosingEitherBoundary() {
+        var phase = new NativeLogCallerEvidence.Phase("spanning");
+        var entry = log(9, callers("spanning.Source"));
+        var before = phase.snapshot(List.of(Map.of("entry", entry, "invocation", 9L)), Map.of());
+        phase.reset();
+        var returned = phase.retain(entry);
+        var after = phase.snapshot();
+        assertThat(before.table().id()).isNotEqualTo(after.table().id());
+        Map<?, ?> oldEntry = (Map<?, ?>) before.unpairedCalls().getFirst().get("entry");
+        assertThat(NativeLogCallerEvidence.decode(oldEntry.get("callers"), before.table(), SHARED))
+                .isEqualTo(callers("spanning.Source"));
+        assertThat(NativeLogCallerEvidence.decode(returned.get("callers"), after.table(), SHARED))
+                .isEqualTo(callers("spanning.Source"));
+        assertThatThrownBy(() -> NativeLogCallerEvidence.decode(returned.get("callers"), before.table(), SHARED))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("FOREIGN_TABLE");
+    }
+
     private static Map<String, Object> log(long invocation, List<Object> callers) {
         return Map.of("target", "LOG", "invocation", invocation, "callers", callers,
                 "scope", Map.of("incarnation", "real-resource", "generation", 7L));
