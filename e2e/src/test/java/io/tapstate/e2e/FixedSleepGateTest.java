@@ -90,10 +90,15 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/BenchmarkTerminalCapture.java", 1L),
             // The child measurement barrier polls output.ready and child.isAlive for at most ten seconds.
             entry("test/java/io/tapstate/e2e/BenchmarkProcessProbeTest.java", 1L),
-            // Five bounded polls: advancing/quiescent actual records.out, a post-boundary observedAt,
-            // measured marker ACK coverage, and final source-token ACK coverage. The quiet window
+            // The benign owned-process control polls READY and child liveness within ten seconds.
+            entry("test/java/io/tapstate/e2e/BenchmarkOwnedProcessReceiptTest.java", 1L),
+            // The cold writer control polls complete output lines and child liveness within thirty
+            // seconds, retaining the bounded log rather than inferring readiness from elapsed time.
+            entry("test/java/io/tapstate/e2e/BenchmarkWriteReturnProbeIT.java", 1L),
+            // Six bounded polls: fresh native publications, advancing/quiescent actual records.out,
+            // a post-boundary observedAt, measured marker ACK and final source-token ACK. The quiet window
             // rechecks actual counters; neither source pacing nor elapsed time proves delivery.
-            entry("test/java/io/tapstate/e2e/RealBenchmarkForkDriver.java", 5L),
+            entry("test/java/io/tapstate/e2e/RealBenchmarkForkDriver.java", 6L),
             // These named positive stages poll actual authority-bound native receipts plus a fresh
             // scrape within WAIT and MAX_RECORDS; missing or undecoded evidence cannot qualify.
             entry("test/java/io/tapstate/e2e/NativeTelemetryPositiveCalibrationIT.java", 1L),
