@@ -265,9 +265,21 @@ public final class PipelineDraftCompiler {
         TransformBody body = switch (transform.type()) {
             case "map" -> new TransformBody.MapProjection(mapFields(transform.fields()));
             case "filter" -> new TransformBody.Filter(requiredText(transform.fields(), "expr"));
+            case "js", "unwind" -> wizardTransformBody(transform);
             default -> throw new IllegalArgumentException("unsupported wizard transform: " + transform.type());
         };
         return Step.inline(transform.id(), from, body, Map.of());
+    }
+
+    private static TransformBody wizardTransformBody(PipelineDraft.Transform transform) {
+        try {
+            return PipelineRepresentation.body(transform.type(), transform.fields(),
+                    "wizard.transform.fields");
+        } catch (TapstateException error) {
+            Object reason = error.args().get("reason");
+            throw new IllegalArgumentException(reason instanceof String text
+                    ? text : "invalid wizard " + transform.type() + " transform", error);
+        }
     }
 
     private static Map<String, FieldRule> mapFields(Map<String, Object> fields) {
