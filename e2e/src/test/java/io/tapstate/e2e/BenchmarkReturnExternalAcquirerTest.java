@@ -87,6 +87,36 @@ class BenchmarkReturnExternalAcquirerTest {
         assertThatThrownBy(() -> BenchmarkReturnExternalAcquirer.verifyMeasurementNativePackets(windows, packets, phases))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("authenticated phase/cut packet");
     }
+    @Test void obtained_test_support_members_bind_to_their_actual_test_compiler_output() throws Exception {
+        var role = BenchmarkReturnWorkBudgetBindings.SourceRole.DOCKER_GATE;
+        byte[] bytes;
+        try (var stream = io.tapstate.testsupport.DockerGate.class.getResourceAsStream("DockerGate.class")) {
+            bytes = stream.readAllBytes();
+        }
+        var blob = new BenchmarkReturnWorkBudgetBindings.Blob(BenchmarkReturnExternalAcquirer.hash(bytes), bytes.length);
+        var member = new BenchmarkReturnWorkBudgetBindings.CompiledClass(role, role.binaryName(), blob);
+        var source = new BenchmarkReturnWorkBudgetBindings.Source(role, role.sourcePath(), new BenchmarkReturnWorkBudgetBindings.Blob("a".repeat(64), 32));
+        var helper = new BenchmarkReturnWorkBudgetBindings.HelperManifest(1, "route-control", "b".repeat(64), "controlled",
+                "controlled", "c".repeat(64), BenchmarkReturnWorkBudgetProducerAllocations.FORMULA_SHA256,
+                new BenchmarkReturnWorkBudgetBindings.Blob("d".repeat(64), 32), List.of("/controlled/test-support/target/test-classes"),
+                List.of(source), List.of(member), List.of());
+        var actual = new BenchmarkReturnWorkBudgetBindingsIo.Result(List.of(), List.of(source), List.of(member), List.of(), List.of(), Map.of());
+        var receipt = new LinkedHashMap<String, Object>();
+        receipt.put("state", "COMPILER_SOURCE_ROSTER_OBSERVED");
+        receipt.put("scope", "FOUR_OWNED_COMPILER_OUTPUTS_SOURCEFILE_BINARY_AND_BYTE_FACTS_ONLY");
+        receipt.put("directoryVisits", 1L); receipt.put("serviceRequests", 1L);
+        receipt.put("serviceRequestUpper", BenchmarkReturnEmittedRoster.serviceRequestUpper()); receipt.put("consumedBytes", (long) bytes.length);
+        BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> receipt.put(flag, false));
+        receipt.put("sources", List.of(Map.of("role", role.name(), "path", source.path(), "sha256", source.blob().sha256(), "bytes", source.blob().bytes())));
+        var row = new LinkedHashMap<String, Object>(); row.put("role", role.name()); row.put("binaryName", role.binaryName());
+        row.put("sourceFile", "DockerGate.java"); row.put("entry", role.binaryName().replace('.', '/') + ".class");
+        row.put("compilerContainer", "/controlled/test-support/target/test-classes"); row.put("sha256", blob.sha256()); row.put("bytes", blob.bytes());
+        receipt.put("selectedMembers", List.of(row));
+        BenchmarkReturnExternalAcquirer.verifyEmitted(receipt, helper, actual);
+        row.put("compilerContainer", "/controlled/test-support/target/classes");
+        assertThatThrownBy(() -> BenchmarkReturnExternalAcquirer.verifyEmitted(receipt, helper, actual))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("compiler output route differs");
+    }
     private static Map<String, Object> packet(String phase, String cut, BenchmarkCausalClock.Identity owner) {
         return Map.of("phaseKey", phase, "cut", cut, "pid", owner.pid(), "jvmStartTimeMillis", owner.jvmStartTimeMillis());
     }

@@ -531,7 +531,7 @@ final class BenchmarkReturnExternalAcquirer {
                 case "e2e" -> "/e2e/target/test-classes";
                 case "adapter-pdk" -> "/adapters/adapter-pdk/target/classes";
                 case "core-common" -> "/core/core-common/target/classes";
-                case "test-support" -> "/test-support/target/classes";
+                case "test-support" -> "/test-support/target/test-classes";
                 default -> throw new AssertionError("unexpected emitted Java module");
             };
             require(path(text(member.get("compilerContainer"), 4096)).toString().endsWith(suffix), "original compiler output route differs");
