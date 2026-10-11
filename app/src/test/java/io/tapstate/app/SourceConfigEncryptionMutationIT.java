@@ -58,7 +58,8 @@ class SourceConfigEncryptionMutationIT {
     private static final String ROLLBACK_INDEX = "source_mutation_rollback_only";
 
     @Container
-    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--wiredTigerCacheSizeGB", "1.0");
 
     @TempDir Path work;
 
