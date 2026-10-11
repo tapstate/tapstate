@@ -103,16 +103,23 @@ public final class SrsRingReader {
      * it is not the head: a ring outlives the runs that read it, so its head can sit far below what this
      * consumer already landed, and starting there hands the target every change it has again.
      *
-     * <p>This overload preserves the behavior of a volatile ring: a sequence outside its current range
-     * falls back to its head. Durable shared capture uses the log-backed overload instead, which resumes
-     * at the exact next sequence and refuses missing history rather than substituting the hot head.
+     * <p>A next sequence below the volatile ring's head is missing history, even if another consumer
+     * kept this same ring alive. Refuse it rather than skipping read-but-unconfirmed changes. A
+     * confirmed sequence beyond the tail still falls back to the head of a rebuilt ring. Durable shared
+     * capture uses the log-backed overload to recover history below the hot head.
      */
     public static SrsRingReader resumingAfter(SrsRingbuffer ring, long ackedSeq, LongConsumer onAdvance) {
         Objects.requireNonNull(ring, "ring");
         long head = ring.headSequence();
         long tail = ring.tailSequence();
         long next = ackedSeq + 1;
-        long start = next < head || next > tail + 1 ? head : next;
+        if (next < head) {
+            throw new TapstateException(CaptureError.RECOVERY_LOG_GAP, Map.of(
+                    "ring", ring.name(), "sequence", next,
+                    "reason", "the hot ring no longer retains the next change after this consumer's confirmed progress"
+                            + ": head=" + head + ", tail=" + tail), null);
+        }
+        long start = next > tail + 1 ? head : next;
         return new SrsRingReader(ring, start, onAdvance);
     }
 

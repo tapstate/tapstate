@@ -17,6 +17,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -368,18 +369,71 @@ class SrsRingReaderTest {
     }
 
     @Test
-    void aConfirmedChangeTheRingNoLongerHoldsResumesAtTheHeadRatherThanPastIt() {
+    void aStoppedConsumerResumesWithoutLosingReadButUnconfirmedChangesWhileAnotherSharesItsRing() {
+        SrsRingbuffer ring = filled("srs.resume.shared-orders", 4);
+        SrsWriteGate gate = new SrsWriteGate(ring);
+        AtomicLong stoppedRead = new AtomicLong(-1L);
+        AtomicLong otherRead = new AtomicLong(-1L);
+        AtomicLong confirmed = new AtomicLong(-1L);
+        List<Long> target = new ArrayList<>();
+        List<Long> otherTarget = new ArrayList<>();
+        SrsRingReader stopped = new SrsRingReader(ring, 0L, stoppedRead::set);
+        SrsRingReader other = new SrsRingReader(ring, 0L, otherRead::set);
+
+        // The first run reads 0..3, but only 0..1 reach its target before it stops with state kept.
+        assertThat(stopped.fill((item, seq) -> {
+            if (seq <= 1L) {
+                target.add(seq);
+                confirmed.set(seq);
+            }
+        }, 4)).isEqualTo(4);
+        assertThat(other.fill((item, seq) -> otherTarget.add(seq), 4)).isEqualTo(4);
+        assertThat(stoppedRead.get()).isEqualTo(3L);
+        assertThat(confirmed.get()).isEqualTo(1L);
+
+        // Keep this same ring alive: the other consumer drains each gated write while the stopped
+        // consumer's read cursor stays at 3. One capacity of writes evicts its in-flight changes 2..3.
+        for (int seq = 4; seq < 4 + ring.capacity(); seq++) {
+            assertThat(gate.append(insert(seq), Math.min(stoppedRead.get(), otherRead.get())))
+                    .hasValue(seq);
+            assertThat(other.fill((item, sequence) -> otherTarget.add(sequence), 1)).isEqualTo(1);
+        }
+        assertThat(ring.tailSequence()).isEqualTo(stoppedRead.get() + ring.capacity());
+        assertThat(ring.headSequence()).isEqualTo(4L);
+        assertThat(gate.append(insert(12), Math.min(stoppedRead.get(), otherRead.get()))).isEmpty();
+        assertThat(otherTarget).containsExactly(0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L);
+
+        List<Long> replayed = new ArrayList<>();
+        try {
+            SrsRingReader resumed = SrsRingReader.resumingAfter(ring, confirmed.get(), stoppedRead::set);
+            resumed.fill((item, seq) -> replayed.add(seq), 16);
+        } catch (TapstateException refusal) {
+            // A ring that cannot recover the requested history must refuse before serving a later head.
+            assertThat(refusal.code()).isEqualTo(CaptureError.RECOVERY_LOG_GAP);
+            assertThat(replayed).isEmpty();
+            return;
+        }
+        target.addAll(replayed);
+        assertThat(target)
+                .as("the restarted target must receive read-but-unconfirmed changes 2..3 as well as the later changes")
+                .containsExactly(0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L);
+    }
+
+    @Test
+    void aResumeBelowTheRingHeadRefusesMissingHistoryWithACode() {
         SrsRingbuffer ring = filled("srs.resume.below-head", 10);
         assertThat(ring.headSequence())
                 .as("a ring of eight overwrote its oldest two, so the confirmed change is no longer in it")
                 .isEqualTo(2L);
-        SrsRingReader reader = SrsRingReader.resumingAfter(ring, 0, seq -> { });
-        List<Long> sequences = new ArrayList<>();
+        List<Long> published = new ArrayList<>();
+        TapstateException refusal = catchThrowableOfType(TapstateException.class,
+                () -> SrsRingReader.resumingAfter(ring, 0, published::add));
 
-        reader.fill((item, seq) -> sequences.add(seq), 20);
-
-        // Everything the ring still holds came after the confirmed change, so all of it is owed.
-        assertThat(sequences).containsExactly(2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L);
+        assertThat(refusal).isNotNull();
+        assertThat(refusal.code()).isEqualTo(CaptureError.RECOVERY_LOG_GAP);
+        assertThat(refusal.args()).containsEntry("ring", "srs.resume.below-head")
+                .containsEntry("sequence", 1L).containsKey("reason");
+        assertThat(published).isEmpty();
     }
 
     @Test
