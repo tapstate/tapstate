@@ -670,22 +670,27 @@ public class CsvConnector implements TapConnector {
      * put back a table missing the other's rows - and a sink's writers write one table at once as a matter of
      * course, each with a connector of its own and spread over every member, as they would a database.
      *
-     * <p>A lock on a file beside the table is what they meet on, under a name that is not a table's. Nothing held
-     * in this class can do it: each writer's connector is loaded apart from the others', so a lock kept here is a
-     * lock per writer. The file lock is held for this machine as a whole; one already held by another writer in
-     * this process is refused rather than waited on, so that is waited out here as another process's is.
+     * <p>A lock on a file beside the table is what processes meet on, under a name that is not a table's.
+     * Writers in this JVM also meet on an interned, canonical lock path: the string pool is shared even when
+     * their connectors have different class loaders. That monitor covers opening and closing the channel as
+     * well as applying the batch. A released channel's close can otherwise remove a newer channel's lock from
+     * the JDK registry, and on POSIX can release this process's locks on the same file.
      */
     private static <T> T exclusively(Path file, java.util.function.Supplier<T> work) {
         Path lockFile = file.resolveSibling(lockNameOf(file.getFileName().toString()));
         try {
             Files.createDirectories(file.getParent());
-            try (FileChannel channel = FileChannel.open(
-                    lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
-                FileLock held = acquire(channel, file);
-                try {
-                    return work.get();
-                } finally {
-                    held.release();
+            String processLock = ("io.tapstate.e2e.csv-writer:"
+                    + lockFile.getParent().toRealPath().resolve(lockFile.getFileName())).intern();
+            synchronized (processLock) {
+                try (FileChannel channel = FileChannel.open(
+                        lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                    FileLock held = acquire(channel, file);
+                    try {
+                        return work.get();
+                    } finally {
+                        held.release();
+                    }
                 }
             }
         } catch (IOException e) {
