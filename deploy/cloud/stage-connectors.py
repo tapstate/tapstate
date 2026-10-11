@@ -65,7 +65,9 @@ def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         connector_id = entry["id"]
         if not isinstance(connector_id, str) or connector_id not in REQUIRED_IDS:
             raise StageError(f"unexpected connector id: {connector_id!r}")
-        if type(entry["bytes"]) is not int or not 1_000_000 <= entry["bytes"] <= 128_000_000:
+        # The Db2 artifact includes its native runtime; other connector budgets remain unchanged.
+        maximum = 256 * 1024 * 1024 if connector_id == "db2" else 128_000_000
+        if type(entry["bytes"]) is not int or not 1_000_000 <= entry["bytes"] <= maximum:
             raise StageError(f"{connector_id}: invalid shaded JAR length")
         if not isinstance(entry["sha256"], str) or not SHA256.fullmatch(entry["sha256"]):
             raise StageError(f"{connector_id}: invalid SHA-256")
