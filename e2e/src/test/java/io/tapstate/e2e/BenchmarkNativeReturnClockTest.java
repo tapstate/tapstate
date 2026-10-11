@@ -14,6 +14,32 @@ class BenchmarkNativeReturnClockTest {
     private static final BenchmarkCausalClock.Identity OWNED = new BenchmarkCausalClock.Identity(17, 1000);
     private static final BenchmarkCausalClock.Identity ROOT = new BenchmarkCausalClock.Identity(29, 2000);
 
+    @Test void current_actual_clock_helper_bytes_match_the_inspected_direct_getter_binding() throws Exception {
+        var hashes = new LinkedHashMap<String, String>();
+        for (String name : List.of("PdkBenchmarkClock", "PdkBenchmarkClock$Clock", "PdkBenchmarkClock$JniAccess", "PdkBenchmarkClock$NativeAccess")) {
+            String resource = "io/tapstate/adapters/pdk/" + name + ".class";
+            byte[] bytes;
+            try (var input = BenchmarkNativeReturnClockTest.class.getClassLoader().getResourceAsStream(resource)) {
+                assertThat(input).as("actual helper resource %s", resource).isNotNull();
+                bytes = input.readNBytes(1048577);
+            }
+            assertThat(bytes.length).isBetween(1, 1048576);
+            hashes.put(name, java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes)));
+        }
+        var current = receipt(snapshot -> {
+            snapshot.put("classHashes", Map.copyOf(hashes));
+            snapshot.put("classSha256", hashes.get("PdkBenchmarkClock"));
+        }, metadata -> { });
+        var integer = clock(current, current, samples());
+        assertThat(integer.map(OWNED, 150)).isEqualTo(new BenchmarkCausalClock.Interval(150, 150));
+        var nominal = new BenchmarkNativeNominalReturnClock(OWNED, ROOT, LIBRARY, samples(), current, current);
+        assertThat(nominal.map(OWNED, 150)).isEqualTo(new BenchmarkCausalClock.Interval(150, 151));
+        for (String flag : BenchmarkNativeClockEvidence.FLAGS) {
+            assertThat(integer.evidence()).containsEntry(flag, false);
+            assertThat(nominal.evidence()).containsEntry(flag, false);
+        }
+    }
+
     @Test void an_actual_shared_coordinate_keeps_the_logged_point_without_changing_causal_bounds() {
         var causal = new BenchmarkCausalClock(OWNED, samples());
         var nativeClock = clock(receipt(), receipt(), samples());
@@ -86,6 +112,19 @@ class BenchmarkNativeReturnClockTest {
             var changed = receipt(snapshot -> snapshot.put(change.getKey(), change.getValue()), metadata -> { });
             assertThatThrownBy(() -> clock(changed, changed, samples())).isInstanceOf(AssertionError.class);
         }
+    }
+
+    @Test void individually_known_hashes_cannot_form_an_uninspected_mixed_helper_set() {
+        var mixed = receipt(snapshot -> {
+            snapshot.put("classSha256", "a1bdb9f101060206e73b28fd521063bf59789f56fbd9ad78fe82ffed593e9e35");
+            snapshot.put("classHashes", Map.of(
+                    "PdkBenchmarkClock", "a1bdb9f101060206e73b28fd521063bf59789f56fbd9ad78fe82ffed593e9e35",
+                    "PdkBenchmarkClock$Clock", "82c52a87d590e4ac400af03e51827a892d7988e27496883169f817fc83a89751",
+                    "PdkBenchmarkClock$JniAccess", "2ccedc46ae98b4ea4e6c79c112a53fc3953efc3c344d2f3e6ba1e4d78eabaeb2",
+                    "PdkBenchmarkClock$NativeAccess", "4b67c17ed28c1d341d9e27819563d1d89eb017073b8492f808e35da31f5ddfb7"));
+        }, metadata -> { });
+        assertThatThrownBy(() -> clock(mixed, mixed, samples())).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("outside the inspected diagnostic binding");
     }
 
     @Test void changed_boot_offset_scale_fallback_or_qualification_claims_refuse_mapping() {

@@ -12,6 +12,13 @@ final class BenchmarkNativeReturnClock implements BenchmarkReturnPointClock {
             "PdkBenchmarkClock$Clock", "82c52a87d590e4ac400af03e51827a892d7988e27496883169f817fc83a89751",
             "PdkBenchmarkClock$JniAccess", "2ccedc46ae98b4ea4e6c79c112a53fc3953efc3c344d2f3e6ba1e4d78eabaeb2",
             "PdkBenchmarkClock$NativeAccess", "4b67c17ed28c1d341d9e27819563d1d89eb017073b8492f808e35da31f5ddfb7");
+    private static final Map<String, String> BOUNDED_IDENTITY_CLASS_HASHES = Map.of(
+            "PdkBenchmarkClock", "a1bdb9f101060206e73b28fd521063bf59789f56fbd9ad78fe82ffed593e9e35",
+            "PdkBenchmarkClock$Clock", "82c52a87d590e4ac400af03e51827a892d7988e27496883169f817fc83a89751",
+            "PdkBenchmarkClock$JniAccess", "61795d9670600c61b523c4611cbe8600b17e05c156ffebd582f08bd723a209c2",
+            "PdkBenchmarkClock$NativeAccess", "4b67c17ed28c1d341d9e27819563d1d89eb017073b8492f808e35da31f5ddfb7");
+    // Both sets preserve the direct clock read. The newer cold identity reader refuses stalled streams.
+    private static final List<Map<String, String>> INSPECTED_CLASS_HASHES = List.of(CLASS_HASHES, BOUNDED_IDENTITY_CLASS_HASHES);
     private final BenchmarkCausalClock coverage;
     private final Map<String, Object> snapshot;
 
@@ -97,7 +104,7 @@ final class BenchmarkNativeReturnClock implements BenchmarkReturnPointClock {
 
     /** Different binaries or counter routes require fresh validation; hashes are not accuracy proofs. */
     private static void supported(Map<String, Object> snapshot) {
-        require(JNI_SHA256.equals(snapshot.get("loadedJniSha256")) && CLASS_HASHES.equals(snapshot.get("classHashes")),
+        require(JNI_SHA256.equals(snapshot.get("loadedJniSha256")) && INSPECTED_CLASS_HASHES.contains(snapshot.get("classHashes")),
                 "native getter artifact is outside the inspected diagnostic binding");
         require("mach_absolute_time".equals(snapshot.get("osFunction"))
                 && "/usr/lib/system/libsystem_kernel.dylib".equals(snapshot.get("osImagePath"))
