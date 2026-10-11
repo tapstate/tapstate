@@ -42,7 +42,9 @@ class RealBenchmarkForkDriverIT {
     static void requireServices() {
         String cpu = System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY);
         String nominal = System.getProperty(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY);
-        if (cpu != null || nominal != null) {
+        String work = System.getProperty(RealBenchmarkForkDriver.WORK_BUDGET_DIAGNOSTICS_PROPERTY);
+        if (cpu != null || nominal != null || work != null) {
+            RealBenchmarkForkDriver.workBudgetDiagnostics(work, "true".equals(nominal));
             String mode = System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY);
             var calibration = "ON".equals(mode) ? RealBenchmarkForkDriver.CollectorCalibration.ON
                     : "OFF".equals(mode) ? RealBenchmarkForkDriver.CollectorCalibration.OFF : null;
@@ -445,6 +447,11 @@ class RealBenchmarkForkDriverIT {
     static boolean requireRootCpuRunServices(String workload, Runnable services) {
         boolean enabled = requireRootCpuAdmission(workload);
         boolean nominal = requireNominalReturnAdmission(workload);
+        boolean work = RealBenchmarkForkDriver.workBudgetDiagnostics(
+                System.getProperty(RealBenchmarkForkDriver.WORK_BUDGET_DIAGNOSTICS_PROPERTY), nominal);
+        if (work && BenchmarkReturnWorkBudget.current() == null) {
+            throw new AssertionError("return work-budget diagnostics require a registered source/profile scope before service access");
+        }
         if (enabled || nominal) { services.run(); }
         return enabled;
     }
@@ -498,6 +505,19 @@ class RealBenchmarkForkDriverIT {
             if (methodControl || costStages) { throw new AssertionError("native clock cannot mix other return controls"); }
             arguments.add("-D" + RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY + "=" + nativeLibrary);
         }
+        return List.copyOf(arguments);
+    }
+
+    static List<String> returnArguments(boolean methodControl, boolean costStages, String nativeLibrary,
+                                        BenchmarkReturnWorkBudgetDefinitions.ProducerInput workInput) {
+        var original = returnArguments(methodControl, costStages, nativeLibrary);
+        if (workInput == null) { return original; }
+        if (methodControl || costStages || nativeLibrary == null) {
+            throw new AssertionError("return work-budget child arguments require the registered isolated native method");
+        }
+        var arguments = new java.util.ArrayList<>(original);
+        arguments.add("-Dtapstate.benchmark.write-return-work-budget=true");
+        arguments.add("-Dtapstate.benchmark.write-return-work-budget-input=" + workInput.encoded());
         return List.copyOf(arguments);
     }
 

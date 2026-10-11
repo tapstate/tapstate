@@ -37,14 +37,19 @@ final class BenchmarkWriteReturnExpectations {
     static List<Association> associate(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
             List<BenchmarkWriteReturnAssembly.FullCall> calls) {
+        return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.ASSOCIATION,
+                () -> associateBounded(workload, phase, sourceBatches, calls));
+    }
+
+    private static List<Association> associateBounded(BenchmarkWorkloadDefinitions.Workload workload,
+            BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+            List<BenchmarkWriteReturnAssembly.FullCall> calls) {
         require(workload != null && phase != null && sourceBatches != null && calls != null,
                 "input is missing");
         require(phase.measured(), "phase is not measured");
         require(phase.expectedLogicalOutputChanges() >= 0 && phase.expectedLogicalOutputChanges() <= MAX_RECORDS,
                 "phase registration exceeds the record bound");
         require(calls.size() <= MAX_FRAMES, "call roster exceeds the frame bound");
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ASSOCIATION,
-                BenchmarkReturnWorkBudget.Work.records(phase.expectedLogicalOutputChanges()));
         List<BenchmarkForkEnvironment.BatchResult> batches = sourceRoster(phase, sourceBatches);
         List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase);
         Map<String, BenchmarkExpectedChanges.TargetPlan> byTable = new LinkedHashMap<>();
@@ -55,7 +60,6 @@ final class BenchmarkWriteReturnExpectations {
             require(workload.pipelineIds().contains(plan.target().pipelineId()), "target pipeline is unregistered");
             require(plan.batches().size() == batches.size(), "target and source batch rosters differ");
             for (int index = 0; index < batches.size(); index++) {
-                BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, BenchmarkReturnWorkBudget.Work.pass(1));
                 for (BenchmarkMongoDeliveryObserver.ExpectedChange expected : plan.forBatch(index)) {
                     require(expected.kind() == BenchmarkMongoDeliveryObserver.Kind.UPDATE,
                             "fixed measured registration is not an update");
@@ -63,6 +67,7 @@ final class BenchmarkWriteReturnExpectations {
                     require(origins.size() < MAX_RECORDS && origins.putIfAbsent(key,
                             new Origin(plan.target(), batches.get(index))) == null,
                             "expected target key has an ambiguous source batch");
+                    BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, BenchmarkReturnWorkBudget.Work.records(1));
                 }
             }
         }
@@ -73,8 +78,8 @@ final class BenchmarkWriteReturnExpectations {
         Map<Integer, String> writers = new LinkedHashMap<>();
         List<Association> associated = new ArrayList<>(origins.size());
         int frames = 0;
-        for (BenchmarkWriteReturnAssembly.FullCall call : List.copyOf(calls)) {
-            BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(call.rows().size()));
+        for (BenchmarkWriteReturnAssembly.FullCall call : BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                BenchmarkReturnWorkBudget.Activity.COPY, () -> List.copyOf(calls))) {
             require(call != null && call.sequence() > 0 && sequences.add(call.sequence()),
                     "call sequence is missing or duplicate");
             require(call.writer() > 0 && call.writer() <= MAX_WRITERS, "writer number exceeds its bound");
@@ -124,10 +129,11 @@ final class BenchmarkWriteReturnExpectations {
                 associated.add(new Association(origin.target(), logicalKey, source.index(), source.issuedAtNanos(),
                         source.completedAtNanos(), call.sequence(), call.writer(), call.writerIdentity(), call.stream(),
                         call.beganNanos(), call.lastCallbackExitNanos(), call.observedNanos(), row.kind(), workload.inFixedCohort(logicalKey)));
+                BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ASSOCIATION, BenchmarkReturnWorkBudget.Work.records(1));
             }
         }
         require(seen.size() == origins.size(), "measured phase has missing target rows");
-        return List.copyOf(associated);
+        return BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.COPY, () -> List.copyOf(associated));
     }
 
     private static List<BenchmarkForkEnvironment.BatchResult> sourceRoster(
@@ -144,7 +150,7 @@ final class BenchmarkWriteReturnExpectations {
             result.add(source);
             previous = source;
         }
-        return List.copyOf(result);
+        return BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.COPY, () -> List.copyOf(result));
     }
 
     private static Set<String> keyFields(BenchmarkWorkloadDefinitions.Projection projection) {

@@ -23,14 +23,17 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
 
     static BenchmarkTableCaptureSet open(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkForkEnvironment fork) {
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
-        StoreDocuments documents = StoreDocuments.at(fork.storeUri());
+        var scope = BenchmarkReturnWorkBudget.current();
+        StoreDocuments documents = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                () -> StoreDocuments.at(fork.storeUri()));
         try {
             Map<String, Source> sources = new LinkedHashMap<>();
             List<BenchmarkTableTerminalObserver.Marker> markers = new ArrayList<>();
             for (var chain : workload.sourceChains()) {
-                var association = physical(fork.control().positionRead(chain.pipelineId()), chain);
-                Document root = documents.chain(association.chainId());
+                var association = physical(BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                        () -> fork.control().positionRead(chain.pipelineId())), chain);
+                Document root = BenchmarkReturnWorkBudget.request(scope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ,
+                        () -> documents.chain(association.chainId()));
                 if (root == null || !(root.get("epoch") instanceof Long || root.get("epoch") instanceof Integer)
                         || ((Number) root.get("epoch")).longValue() < 1) {
                     throw new AssertionError("benchmark source has no actual capture epoch");
@@ -225,10 +228,11 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
     }
 
     @Override public void close() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.call());
         Throwable primary = null;
-        try { observer.close(); } catch (RuntimeException | Error failure) { primary = failure; }
-        try { documents.close(); } catch (RuntimeException | Error cleanup) {
+        try { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { observer.close(); return null; }); }
+        catch (RuntimeException | Error failure) { primary = failure; }
+        try { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { documents.close(); return null; }); }
+        catch (RuntimeException | Error cleanup) {
             if (primary == null) { primary = cleanup; } else { primary.addSuppressed(cleanup); }
         }
         if (primary instanceof Error failure) { throw failure; }

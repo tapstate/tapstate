@@ -40,7 +40,14 @@ final class BenchmarkWriteReturnPhaseEvidence {
             BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
             BenchmarkWriteReturnCapture.Result capture, BenchmarkReturnPointClock mappedClock,
             String mappedState, Map<String, Object> mappingEvidence) {
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.RAW_RECHECK, BenchmarkReturnWorkBudget.Work.call());
+        return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.RAW_RECHECK,
+                () -> recordVerified(workload, phase, sourceBatches, capture, mappedClock, mappedState, mappingEvidence));
+    }
+
+    private static Map<String, Object> recordVerified(BenchmarkWorkloadDefinitions.Workload workload,
+            BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+            BenchmarkWriteReturnCapture.Result capture, BenchmarkReturnPointClock mappedClock,
+            String mappedState, Map<String, Object> mappingEvidence) {
         require(workload != null && phase != null && sourceBatches != null
                 && capture != null && capture.summary() != null, "actual capture or source registration is missing");
         var summary = capture.summary();
@@ -64,11 +71,9 @@ final class BenchmarkWriteReturnPhaseEvidence {
         require(mappedClock == null || capture.clockMode() == BenchmarkReturnClockSampler.Mode.PERIODIC,
                 "common native counter diagnostics require the complete periodic sample roster");
         for (var call : capture.calls()) {
-            BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK,
-                    new BenchmarkReturnWorkBudget.Work(3, 0, 0, 0, 0, 1, 3, 0));
-            clock.map(owner, call.beganNanos());
-            clock.map(owner, call.lastCallbackExitNanos());
-            clock.map(owner, call.observedNanos());
+            BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK, () -> clock.map(owner, call.beganNanos()));
+            BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK, () -> clock.map(owner, call.lastCallbackExitNanos()));
+            BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK, () -> clock.map(owner, call.observedNanos()));
         }
         boolean clockControl = capture.clockMode() == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL;
         Map<String, Object> p99 = unavailable("FIRST_FINAL_CLOCK_COST_CONTROL");
@@ -149,19 +154,17 @@ final class BenchmarkWriteReturnPhaseEvidence {
         int bytes = 0, frames = 0;
         long epoch = 0, stored = 0;
         for (String encoded : pages) {
-            BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.BASE64,
-                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, encoded == null ? 0 : encoded.length(), 1, 0, 0));
             require(encoded != null && encoded.length() <= 4 * ((MAX_PAGE_BYTES + 2) / 3), "encoded raw page exceeds its bound");
             byte[] pageBytes;
-            try { pageBytes = Base64.getDecoder().decode(encoded); }
+            try { pageBytes = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.BASE64, () -> Base64.getDecoder().decode(encoded)); }
             catch (IllegalArgumentException invalid) { throw new AssertionError("return phase evidence raw page is not base64", invalid); }
-            require(pageBytes.length <= MAX_PAGE_BYTES && Base64.getEncoder().encodeToString(pageBytes).equals(encoded),
+            require(pageBytes.length <= MAX_PAGE_BYTES && BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.BASE64, () -> Base64.getEncoder().encodeToString(pageBytes)).equals(encoded),
                     "raw page is oversized or noncanonical");
             bytes = Math.addExact(bytes, pageBytes.length);
             require(bytes <= MAX_LEDGER_BYTES, "raw ledger exceeds its byte bound");
+            var page = BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.DECODE, () -> BenchmarkWriteReturnLedger.decode(pageBytes));
             BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.DECODE,
-                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, pageBytes.length, 1, 0, 0));
-            var page = BenchmarkWriteReturnLedger.decode(pageBytes);
+                    new BenchmarkReturnWorkBudget.Work(0, 0, 0, 0, pageBytes.length, 1, 0, 0));
             if (epoch == 0) epoch = page.epoch();
             require(epoch > 0 && page.epoch() == epoch, "raw capture epoch changed");
             int header = 32 + page.window().getBytes(StandardCharsets.UTF_8).length

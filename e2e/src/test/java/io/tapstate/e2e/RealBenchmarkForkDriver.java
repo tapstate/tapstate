@@ -35,6 +35,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     static final String RETURN_COLLECTOR_CALIBRATION_PROPERTY = "tapstate.e2e.benchmark.write-return-collector-calibration";
     static final String ROOT_CPU_DIAGNOSTICS_PROPERTY = "tapstate.e2e.benchmark.write-return-root-cpu-diagnostics";
     static final String NOMINAL_RETURN_DIAGNOSTICS_PROPERTY = "tapstate.e2e.benchmark.write-return-nominal-enclosure-diagnostics";
+    static final String WORK_BUDGET_DIAGNOSTICS_PROPERTY = "tapstate.e2e.benchmark.write-return-work-budget-diagnostics";
 
     enum CollectorCalibration { ON, OFF }
 
@@ -419,6 +420,14 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return true;
     }
 
+    static boolean workBudgetDiagnostics(String value, boolean nominalReturn) {
+        if (value == null) { return false; }
+        if (!"true".equals(value) || !nominalReturn) {
+            throw new AssertionError("return work-budget diagnostics require the admitted nominal return method");
+        }
+        return true;
+    }
+
     static BenchmarkReturnPointClock selectNativeReturnClock(boolean nominal,
             java.util.function.Supplier<BenchmarkNativeReturnClock> integerFactory,
             java.util.function.Supplier<BenchmarkNativeNominalReturnClock> nominalFactory) {
@@ -446,15 +455,24 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     static void rootCpuAfterAck(BenchmarkRootCpuEnvelope envelope, BenchmarkRootCpuEnvelope.Ticket common) {
         if (envelope != null) {
             envelope.complete(common);
-            envelope.read(BenchmarkRootCpuEnvelope.Cutoff.AFTER_ACK_COMMON_CHECKPOINTS);
+            if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                    BenchmarkReturnWorkBudget.Work.pass(1));
+            BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                    () -> { envelope.read(BenchmarkRootCpuEnvelope.Cutoff.AFTER_ACK_COMMON_CHECKPOINTS); return null; });
         }
     }
 
     static Map<String, Object> finishRootCpuDiagnostics(BenchmarkRootCpuEnvelope envelope,
             BenchmarkRootCpuEnvelope.Ticket oracleTail) {
         envelope.complete(oracleTail);
-        envelope.read(BenchmarkRootCpuEnvelope.Cutoff.AFTER_COMPLETE_COLLECTION_BEFORE_TERMINAL_SQL);
-        return envelope.evidence();
+        if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                BenchmarkReturnWorkBudget.Work.pass(1));
+        BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                () -> { envelope.read(BenchmarkRootCpuEnvelope.Cutoff.AFTER_COMPLETE_COLLECTION_BEFORE_TERMINAL_SQL); return null; });
+        var evidence = envelope.evidence();
+        if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                BenchmarkReturnWorkBudget.material(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ROOT_CPU, evidence));
+        return evidence;
     }
 
     static void retainRootCpuRefusal(BenchmarkRootCpuEnvelope envelope, Throwable failure,
@@ -590,6 +608,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             PipelineBenchmarkComparison.Arm arm, int armFork, Path applicationJar) throws Exception {
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(arm, "arm");
+        boolean workBudgetRequested = workBudgetDiagnostics(System.getProperty(WORK_BUDGET_DIAGNOSTICS_PROPERTY),
+                "true".equals(System.getProperty(NOMINAL_RETURN_DIAGNOSTICS_PROPERTY)));
+        if (workBudgetRequested && BenchmarkReturnWorkBudget.current() == null) {
+            throw new AssertionError("return work-budget diagnostics require a registered source/profile scope before fixture access");
+        }
         var clockMode = writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile());
         String calibrationValue = System.getProperty(RETURN_COLLECTOR_CALIBRATION_PROPERTY);
@@ -954,8 +977,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         BenchmarkRootCpuEnvelope.Ticket captureCpuTail = null;
         BenchmarkRootCpuEnvelope.Ticket samplerCpuTail = null;
         if (rootCpu != null) {
-            rootCpu.read(BenchmarkRootCpuEnvelope.Cutoff.BEFORE_COLLECTION);
+            var actualCpu = rootCpu;
+            BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                    () -> { actualCpu.read(BenchmarkRootCpuEnvelope.Cutoff.BEFORE_COLLECTION); return null; });
             commonCpu = rootCpu.begin("MEASURED_COMMON_COLLECTION");
+            if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                    BenchmarkReturnWorkBudget.Work.pass(1));
         }
         try (BenchmarkResourceSampler resourceSampler = workload.pilotProfile()
                 ? BenchmarkResourceSampler.openForPhaseBudget(fork.server().pid(), RESOURCE_INTERVAL, ACK_WAIT)
@@ -1030,7 +1057,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                     "completedAtNanos", collectorCommandCheckpoint.completedAtNanos()));
                             collectorCalibrationEvidence.put("commonCommands", collectorCommands(collectorCommandCheckpoint.summary()));
                             rootCpuAfterAck(rootCpu, commonCpu);
-                            if (rootCpu != null) { captureCpuTail = rootCpu.begin("CAPTURE_TAIL"); }
+                            if (rootCpu != null) {
+                                captureCpuTail = rootCpu.begin("CAPTURE_TAIL");
+                                if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                                        BenchmarkReturnWorkBudget.Work.pass(1));
+                            }
                             captureDrainStartedAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
                             collectorCalibrationEvidence.put("captureDrain", Map.of("state", calibrationOff ? "DISABLED" : "IN_PROGRESS",
                                     "startedAtNanos", captureDrainStartedAt));
@@ -1071,6 +1102,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 if (rootCpu != null) {
                     rootCpu.complete(captureCpuTail);
                     samplerCpuTail = rootCpu.begin("SAMPLER_NATIVE_TAIL");
+                    if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                            BenchmarkReturnWorkBudget.Work.pass(2));
                 }
                 resources = resourceSampler.finish();
                 commands = collectorCalibration == null ? commandSampler.finish()
@@ -1211,6 +1244,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         if (rootCpu != null) {
             rootCpu.complete(samplerCpuTail);
             oracleCpuTail = rootCpu.begin("ORACLE_ASSOCIATION_TAIL");
+            if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
+                    BenchmarkReturnWorkBudget.Work.pass(2));
         }
         if (unread != null) {
             System.out.println("benchmark-unread-timeline=" + JsonWriter.write(Map.of("phase", phase.id(),
@@ -1503,10 +1538,14 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         var complete = new java.util.HashSet<String>();
         try {
             while (complete.size() != guards.size()) {
+                if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL,
+                        BenchmarkReturnWorkBudget.Work.pass(guards.size()));
                 for (var entry : guards.entrySet()) {
                     if (complete.contains(entry.getKey())) { continue; }
-                    var snapshot = probe.delivery(entry.getKey());
-                    long flat = control.recordsOut(entry.getKey()).orElseThrow(() ->
+                    var snapshot = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                            BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL, () -> probe.delivery(entry.getKey()));
+                    long flat = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                            BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL, () -> control.recordsOut(entry.getKey())).orElseThrow(() ->
                             new AssertionError("native baseline has no matching flat observation"));
                     if (entry.getValue().observe(snapshot, flat, io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime())) { complete.add(entry.getKey()); }
                 }
@@ -1542,6 +1581,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long previous = before;
         long unchangedSince = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
         while (true) {
+            if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL,
+                    BenchmarkReturnWorkBudget.Work.pass(workload.pipelineIds().size()));
             long after = recordsOut(workload, control);
             long delta = after - before;
             long now = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
@@ -1568,6 +1609,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long previous = recordsOut(workload, control);
         long unchangedSince = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
         while (true) {
+            if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL,
+                    BenchmarkReturnWorkBudget.Work.pass(workload.pipelineIds().size()));
             TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
             long current = recordsOut(workload, control);
             long now = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
@@ -1591,7 +1634,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         Instant boundaryCompletedAt = Instant.now();
         long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
         for (String pipelineId : workload.pipelineIds()) {
-            while (!control.statusObservedAt(pipelineId).isAfter(boundaryCompletedAt)) {
+            while (!BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                    BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL,
+                    () -> control.statusObservedAt(pipelineId)).isAfter(boundaryCompletedAt)) {
                 if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() >= deadline) {
                     throw new AssertionError("no post-boundary observation for " + pipelineId);
                 }
@@ -1603,7 +1648,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static long recordsOut(BenchmarkWorkloadDefinitions.Workload workload, ControlPlane control) {
         long total = 0;
         for (String pipelineId : workload.pipelineIds()) {
-            Optional<Long> value = control.recordsOut(pipelineId);
+            Optional<Long> value = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                    BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL, () -> control.recordsOut(pipelineId));
             if (value.isEmpty()) {
                 throw new AssertionError("records.out is unavailable for " + pipelineId);
             }
@@ -1615,7 +1661,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static long errorTotal(BenchmarkWorkloadDefinitions.Workload workload, ControlPlane control) {
         long total = 0;
         for (String pipelineId : workload.pipelineIds()) {
-            total = Math.addExact(total, control.errorCount(pipelineId).orElseThrow(() ->
+            total = Math.addExact(total, BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                    BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> control.errorCount(pipelineId)).orElseThrow(() ->
                     new AssertionError("error count is unavailable for " + pipelineId)));
         }
         return total;
@@ -1889,7 +1936,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
             while (true) {
                 pending.entrySet().removeIf(entry -> {
-                    Optional<String> ack = fork.control().targetAckForIfPresent(entry.getKey());
+                    Optional<String> ack = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                            BenchmarkReturnWorkBudget.Activity.ACK_POLL, () -> fork.control().targetAckForIfPresent(entry.getKey()));
+                    if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ACK_POLL,
+                            BenchmarkReturnWorkBudget.material(BenchmarkReturnWorkBudget.current(),
+                                    BenchmarkReturnWorkBudget.Activity.ACK_POLL, ack.orElse(null)));
                     lastAcks.put(entry.getKey(), ack.orElse(null));
                     return ack.filter(value -> positionCoverage.covers(value, entry.getValue())).isPresent();
                 });
@@ -1947,7 +1998,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 BenchmarkTerminalCapture capture = entry.getValue();
                 String terminal = capture.awaitTerminal(SIDE_CAR_WAIT);
                 var tableProof = tables.awaitTerminal(chain, terminal);
-                String ack = fork.control().targetAckForIfPresent(chain).orElse(null);
+                String ack = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                        BenchmarkReturnWorkBudget.Activity.ACK_POLL, () -> fork.control().targetAckForIfPresent(chain)).orElse(null);
+                if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ACK_POLL,
+                        BenchmarkReturnWorkBudget.material(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ACK_POLL, ack));
                 String closedTerminal = capture.closeAndTerminal();
                 if (!terminal.equals(closedTerminal)) {
                     throw new AssertionError("sidecar terminal position changed for " + chain.id());
@@ -1968,7 +2022,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
             Optional<String> lastAck = Optional.empty();
             while (true) {
-                Optional<String> ack = control.targetAckForIfPresent(chain);
+                Optional<String> ack = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                        BenchmarkReturnWorkBudget.Activity.ACK_POLL, () -> control.targetAckForIfPresent(chain));
+                if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ACK_POLL,
+                        BenchmarkReturnWorkBudget.material(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.ACK_POLL, ack.orElse(null)));
                 lastAck = ack;
                 if (ack.isPresent() && positionCoverage.covers(ack.get(), sourceToken)) {
                     return ack.get();

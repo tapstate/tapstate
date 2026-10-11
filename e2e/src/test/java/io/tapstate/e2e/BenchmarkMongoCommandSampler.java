@@ -114,10 +114,10 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
     }
 
     static BenchmarkMongoCommandSampler open(String mongoUri) {
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.request());
         Objects.requireNonNull(mongoUri, "Mongo URI");
         ConnectionString connection = new ConnectionString(mongoUri);
-        return new BenchmarkMongoCommandSampler(MongoClients.create(connection), connection);
+        return new BenchmarkMongoCommandSampler(BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, () -> MongoClients.create(connection)), connection);
     }
 
     /** Read the baseline after all fork setup and before issuing measured source SQL. */
@@ -248,15 +248,29 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
         MongoClientSettings settings = MongoClientSettings.builder().applyConnectionString(connection)
                 .applyToSocketSettings(socket -> socket.connectTimeout(5, TimeUnit.SECONDS).readTimeout(5, TimeUnit.SECONDS))
                 .applyToClusterSettings(cluster -> cluster.serverSelectionTimeout(5, TimeUnit.SECONDS)).build();
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.request());
-        try (MongoClient owned = MongoClients.create(settings)) { return read(owned, workScope); }
-        finally { BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.call()); }
+        MongoClient owned = BenchmarkReturnWorkBudget.opaqueRequest(workScope,
+                BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, () -> MongoClients.create(settings));
+        Throwable primary = null;
+        try { return read(owned, workScope); }
+        catch (RuntimeException | Error failure) { primary = failure; throw failure; }
+        finally {
+            try { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { owned.close(); return null; }); }
+            catch (RuntimeException | Error failure) { if (primary != null) { primary.addSuppressed(failure); } else { throw failure; } }
+        }
     }
 
     private static Snapshot read(MongoClient client, BenchmarkReturnWorkBudget.Scope scope) {
         try {
-            Document status = BenchmarkReturnWorkBudget.request(scope, BenchmarkReturnWorkBudget.Activity.COMMAND_READ,
+            Document status = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.COMMAND_READ,
                     () -> client.getDatabase("admin").runCommand(new Document("serverStatus", 1)));
+            if (scope != null && status != null) {
+                // Only these fields are consumed locally. Transport and unused server payloads are opaque.
+                var consumed = new HashMap<String, Object>();
+                consumed.put("host", status.get("host")); consumed.put("pid", status.get("pid")); consumed.put("uptimeMillis", status.get("uptimeMillis"));
+                Object metrics = status.get("metrics");
+                consumed.put("commands", metrics instanceof Document doc ? doc.get("commands") : metrics);
+                BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.COMMAND_READ, consumed);
+            }
             return parse(status);
         } catch (RuntimeException failure) {
             throw new AssertionError("Mongo command counters are unavailable", failure);
@@ -350,11 +364,10 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
 
     @Override
     public synchronized void close() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.call());
         if (!closed) {
             closed = true;
-            if (checkpointWorker != null) { checkpointWorker.shutdownNow(); }
-            if (client != null) { client.close(); }
+            if (checkpointWorker != null) { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, checkpointWorker::shutdownNow); }
+            if (client != null) { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { client.close(); return null; }); }
         }
     }
 }

@@ -13,6 +13,11 @@ final class BenchmarkReturnResourceBounds {
 
     static Map<String, Object> evidence(BenchmarkResourceSampler.Summary full,
                                         List<BenchmarkReturnTimeBounds.Delivery> completeCohort) {
+        return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS, () -> boundedEvidence(full, completeCohort));
+    }
+
+    private static Map<String, Object> boundedEvidence(BenchmarkResourceSampler.Summary full,
+            List<BenchmarkReturnTimeBounds.Delivery> completeCohort) {
         if (full == null || full.sampling().isEmpty()) { return unknown("FULL_RESOURCE_TRACE_UNAVAILABLE"); }
         if (completeCohort == null || completeCohort.isEmpty() || completeCohort.size() > MAX_ROWS) {
             return unknown("COMPLETE_COHORT_UNAVAILABLE");
@@ -22,8 +27,6 @@ final class BenchmarkReturnResourceBounds {
             return unknown("RESOURCE_TRACE_HAS_OMITTED_OR_FAILED_READS");
         }
         var attempts = trace.retainedAttempts();
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS,
-                BenchmarkReturnWorkBudget.Work.pass(attempts.size()));
         if (attempts.size() < 2 || attempts.size() > MAX_ATTEMPTS || trace.attemptCount() != attempts.size()
                 || full.sampleCount() != attempts.size() || trace.retainedAttemptLimit() < attempts.size()
                 || trace.retainedAttemptLimit() > MAX_ATTEMPTS) {
@@ -33,13 +36,13 @@ final class BenchmarkReturnResourceBounds {
         long endLower = Long.MIN_VALUE, endUpper = Long.MIN_VALUE;
         var workScope = BenchmarkReturnWorkBudget.current();
         for (var delivery : completeCohort) {
-            if (workScope != null) { BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS, BenchmarkReturnWorkBudget.Work.records(1)); }
             if (delivery == null || delivery.literalReturn() == null) { return unknown("RETURN_WINDOW_UNAVAILABLE"); }
             var returned = delivery.literalReturn();
             startLower = Math.min(startLower, returned.lowerNanos());
             startUpper = Math.min(startUpper, returned.upperNanos());
             endLower = Math.max(endLower, returned.lowerNanos());
             endUpper = Math.max(endUpper, returned.upperNanos());
+            if (workScope != null) { BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS, BenchmarkReturnWorkBudget.Work.records(1)); }
         }
         BenchmarkResourceSampler.Attempt previous = null;
         long totalReadNanos = 0, maximumReadNanos = 0, fullHeap = 0, fullRss = 0;
@@ -70,6 +73,7 @@ final class BenchmarkReturnResourceBounds {
                 fullHeap = Math.max(fullHeap, reading.heapUsedBytes().orElseThrow());
                 fullRss = Math.max(fullRss, reading.rssBytes().orElseThrow());
                 previous = attempt;
+                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS, BenchmarkReturnWorkBudget.Work.pass(1));
             }
             var first = attempts.getFirst().reading(); var last = attempts.getLast().reading();
             if (Math.subtractExact(last.cpuNanos().orElseThrow(), first.cpuNanos().orElseThrow()) != full.cpuNanos()
@@ -93,6 +97,7 @@ final class BenchmarkReturnResourceBounds {
                 innerHeap = Math.max(innerHeap, attempt.reading().heapUsedBytes().orElseThrow());
                 innerRss = Math.max(innerRss, attempt.reading().rssBytes().orElseThrow());
             }
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS, BenchmarkReturnWorkBudget.Work.pass(1));
             if (attempt.completedAtNanos() >= startLower && attempt.startedAtNanos() <= endUpper) {
                 possibleReads++;
                 possibleHeap = Math.max(possibleHeap, attempt.reading().heapUsedBytes().orElseThrow());

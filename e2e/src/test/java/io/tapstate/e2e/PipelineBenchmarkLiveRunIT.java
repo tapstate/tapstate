@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (System.getProperty(RealBenchmarkForkDriver.WORK_BUDGET_DIAGNOSTICS_PROPERTY) != null) {
+            throw new AssertionError("return work-budget diagnostics cannot establish a live performance gate");
+        }
         if (System.getProperty(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY) != null) {
             throw new AssertionError("nominal return enclosure diagnostics cannot establish a live performance gate");
         }

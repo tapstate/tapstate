@@ -78,10 +78,10 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
                                             Filters.eq("fullDocument.after.id.__tapstate_carried", marker.rowId()))),
                             Filters.in("operationType", "replace", "update"))));
         }
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
-        client = MongoClients.create(uri);
-        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.TABLE_STREAM, BenchmarkReturnWorkBudget.Work.request());
+        client = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> MongoClients.create(uri));
+        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.TABLE_STREAM, BenchmarkReturnWorkBudget.Work.call());
         try {
+            BenchmarkReturnWorkBudget.issued(workLifetime);
             cursor = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG)
                     .watch(List.of(Aggregates.match(Filters.or(Filters.or(selected),
                             Filters.in("operationType", "drop", "rename", "dropDatabase", "invalidate")))))
@@ -105,6 +105,7 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
                 if (event != null) { accept(event); }
             }
         } catch (RuntimeException | AssertionError observerFailure) {
+            BenchmarkReturnWorkBudget.failure(workScope, observerFailure);
             synchronized (this) {
                 if (!closed) { failure = new AssertionError("table marker observation failed", observerFailure); }
                 notifyAll();
@@ -136,10 +137,12 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
             throw new AssertionError("unexpected table marker operation");
         }
         Document record = event.getFullDocument();
+        BenchmarkReturnWorkBudget.requireLocalMaterial(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, record);
         if (record == null || !(record.get("after") instanceof Document after)) {
             throw new AssertionError("table marker has no operation-time row image");
         }
-        int bytes = record.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        String encodedRecord = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, record::toJson);
+        int bytes = encodedRecord.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
         BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE,
                 new BenchmarkReturnWorkBudget.Work(1, 1, 1, 0, bytes, 1, 0, 0));
         if (bytes > 65_536 || eventBytes + bytes > 2 * 1024 * 1024) {
@@ -174,6 +177,7 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
                 throw new AssertionError("table marker event has no stream provenance");
             }
             String resume = event.getResumeToken().toJson();
+            BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, "RESUME_TOKEN_BSON_PRIOR_SHAPE_NOT_BOUND");
             if (resume.length() > 4096) { throw new AssertionError("table marker resume token exceeded its bound"); }
             provenance.put(marker.id(), Map.of("resumeToken", resume, "clusterTime", event.getClusterTime().toString(),
                     "operation", event.getOperationTypeString(), "operationTimeRecordBytes", bytes,
@@ -212,6 +216,10 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
     }
 
     private static String sha256(String value) {
+        var scope = BenchmarkReturnWorkBudget.current();
+        BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, value);
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                new BenchmarkReturnWorkBudget.Work(1, 1, 0, 0, Math.multiplyExact(4L, value.length()), 1, value.length(), 0));
         try {
             return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
                     .digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
@@ -237,7 +245,7 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
         }
         closed = true;
         notifyAll();
-        try { cursor.close(); }
+        try { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { cursor.close(); return null; }); }
         catch (RuntimeException | AssertionError rejected) {
             closeFailure = new AssertionError("table marker cursor close failed", rejected);
         }
@@ -250,13 +258,14 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
             if (closeFailure == null) { closeFailure = new AssertionError("table marker close was interrupted", interrupted); }
             else { closeFailure.addSuppressed(interrupted); }
         }
-        try { client.close(); }
+        try { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { client.close(); return null; }); }
         catch (RuntimeException | AssertionError rejected) {
             if (closeFailure == null) { closeFailure = new AssertionError("table marker client close failed", rejected); }
             else { closeFailure.addSuppressed(rejected); }
         }
         terminated = !reader.isAlive();
         if (!terminated) {
+            BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.TABLE_STREAM, "WORKER_TERMINATION_NOT_OBSERVED");
             AssertionError timeout = new AssertionError("table marker observer did not terminate within its close budget");
             if (closeFailure == null) { closeFailure = timeout; } else { closeFailure.addSuppressed(timeout); }
         }
@@ -264,6 +273,6 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
             if (closeFailure != null && closeFailure != failure) { failure.addSuppressed(closeFailure); }
             closeFailure = failure;
         }
-        if (closeFailure != null) { throw closeFailure; }
+        if (closeFailure != null) { BenchmarkReturnWorkBudget.failure(workScope, closeFailure); throw closeFailure; }
     }
 }

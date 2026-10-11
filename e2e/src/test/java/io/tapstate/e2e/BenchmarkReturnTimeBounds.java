@@ -17,58 +17,84 @@ final class BenchmarkReturnTimeBounds {
     /** Each row shares its full call's return bound; this is not a per-row physical commit time. */
     static List<Delivery> map(List<BenchmarkWriteReturnExpectations.Association> associations,
                               BenchmarkCausalClock.Identity owner, BenchmarkReturnPointClock clock) {
+        return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.ASSOCIATION, () -> mapBounded(associations, owner, clock));
+    }
+
+    private static List<Delivery> mapBounded(List<BenchmarkWriteReturnExpectations.Association> associations,
+            BenchmarkCausalClock.Identity owner, BenchmarkReturnPointClock clock) {
         require(associations != null && associations.size() <= MAX_ROWS && owner != null && clock != null,
                 "bounded source associations and an owned clock are required");
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(associations.size()));
         List<Delivery> deliveries = new ArrayList<>();
         var workScope = BenchmarkReturnWorkBudget.current();
         for (var row : associations) {
             require(row != null, "source association is missing");
             if (!row.fixedCohort()) { continue; }
-            if (workScope != null) {
-                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RETURN_MAP, new BenchmarkReturnWorkBudget.Work(2, 0, 1, 0, 0, 1, 2, 0));
-                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.SOURCE_MAP, BenchmarkReturnWorkBudget.Work.records(1));
-            }
             try {
                 require(Math.subtractExact(row.callLastCallbackExitNanos(), row.callBeganNanos()) >= 0
                         && Math.subtractExact(row.callObservedNanos(), row.callLastCallbackExitNanos()) >= 0,
                         "owned call callback clock order is invalid");
             } catch (ArithmeticException overflow) { throw new AssertionError("return time bounds owned call span overflow", overflow); }
-            var exited = clock.map(owner, row.callLastCallbackExitNanos());
-            var observed = clock.map(owner, row.callObservedNanos());
+            var exited = BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.RETURN_MAP,
+                    () -> clock.map(owner, row.callLastCallbackExitNanos()));
+            var observed = BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.RETURN_MAP,
+                    () -> clock.map(owner, row.callObservedNanos()));
             var returned = new BenchmarkCausalClock.Interval(exited.lowerNanos(), observed.upperNanos());
-            var latency = BenchmarkCausalClock.elapsed(clock.sourcePoint(row.sourceIssuedAtNanos()), returned);
+            var source = BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.SOURCE_MAP,
+                    () -> clock.sourcePoint(row.sourceIssuedAtNanos()));
+            var latency = BenchmarkCausalClock.elapsed(source, returned);
             require(latency.upperNanos() >= 0, "return bound is wholly before its registered source issue");
             deliveries.add(new Delivery(row.target().pipelineId() + "/" + row.target().table(), row.key(),
                     row.callSequence(), observed, returned, latency));
         }
-        return List.copyOf(deliveries);
+        var copy = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.COPY, () -> List.copyOf(deliveries));
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(deliveries.size()));
+        return copy;
     }
 
     /** The lower and upper order statistics enclose every admissible p99 without choosing midpoints. */
     static BenchmarkCausalClock.Interval p99(List<BenchmarkCausalClock.Interval> latencies) {
+        return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.SORT, () -> p99Bounded(latencies));
+    }
+
+    private static BenchmarkCausalClock.Interval p99Bounded(List<BenchmarkCausalClock.Interval> latencies) {
         require(latencies != null && latencies.size() >= 10_000 && latencies.size() <= MAX_ROWS,
                 "p99 requires at least 10000 complete deliveries within the record bound");
-        List<BenchmarkCausalClock.Interval> values = List.copyOf(latencies);
+        var scope = BenchmarkReturnWorkBudget.current();
+        List<BenchmarkCausalClock.Interval> values = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.COPY, () -> List.copyOf(latencies));
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(values.size()));
         int rank = (int) ((99L * values.size() + 99) / 100) - 1;
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.SORT,
-                new BenchmarkReturnWorkBudget.Work(2, 2, 0, 0, 0, 2, Math.multiplyExact(2L, values.size()), 0));
-        long lower = values.stream().map(BenchmarkCausalClock.Interval::lowerNanos).sorted().skip(rank).findFirst().orElseThrow();
-        long upper = values.stream().map(BenchmarkCausalClock.Interval::upperNanos).sorted().skip(rank).findFirst().orElseThrow();
+        long lower = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SORT,
+                () -> values.stream().map(BenchmarkCausalClock.Interval::lowerNanos).sorted().skip(rank).findFirst().orElseThrow());
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.SORT, BenchmarkReturnWorkBudget.Work.pass(values.size()));
+        long upper = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SORT,
+                () -> values.stream().map(BenchmarkCausalClock.Interval::upperNanos).sorted().skip(rank).findFirst().orElseThrow());
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.SORT, BenchmarkReturnWorkBudget.Work.pass(values.size()));
         return new BenchmarkCausalClock.Interval(lower, upper);
     }
 
     /** Covers the actual earliest-to-latest completed-call span; ambiguous zero spans stay unqualified. */
     static BenchmarkCausalClock.Interval span(List<BenchmarkCausalClock.Interval> returns) {
+        return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.SPAN, () -> spanBounded(returns));
+    }
+
+    private static BenchmarkCausalClock.Interval spanBounded(List<BenchmarkCausalClock.Interval> returns) {
         require(returns != null && returns.size() >= 2 && returns.size() <= MAX_ROWS,
                 "return span needs a bounded complete roster");
-        List<BenchmarkCausalClock.Interval> values = List.copyOf(returns);
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.SPAN,
-                new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 4, Math.multiplyExact(4L, values.size()), 0));
-        long firstLower = values.stream().mapToLong(BenchmarkCausalClock.Interval::lowerNanos).min().orElseThrow();
-        long firstUpper = values.stream().mapToLong(BenchmarkCausalClock.Interval::upperNanos).min().orElseThrow();
-        long lastLower = values.stream().mapToLong(BenchmarkCausalClock.Interval::lowerNanos).max().orElseThrow();
-        long lastUpper = values.stream().mapToLong(BenchmarkCausalClock.Interval::upperNanos).max().orElseThrow();
+        var scope = BenchmarkReturnWorkBudget.current();
+        List<BenchmarkCausalClock.Interval> values = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.COPY, () -> List.copyOf(returns));
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(values.size()));
+        long firstLower = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SPAN,
+                () -> values.stream().mapToLong(BenchmarkCausalClock.Interval::lowerNanos).min().orElseThrow());
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.SPAN, BenchmarkReturnWorkBudget.Work.pass(values.size()));
+        long firstUpper = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SPAN,
+                () -> values.stream().mapToLong(BenchmarkCausalClock.Interval::upperNanos).min().orElseThrow());
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.SPAN, BenchmarkReturnWorkBudget.Work.pass(values.size()));
+        long lastLower = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SPAN,
+                () -> values.stream().mapToLong(BenchmarkCausalClock.Interval::lowerNanos).max().orElseThrow());
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.SPAN, BenchmarkReturnWorkBudget.Work.pass(values.size()));
+        long lastUpper = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SPAN,
+                () -> values.stream().mapToLong(BenchmarkCausalClock.Interval::upperNanos).max().orElseThrow());
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.SPAN, BenchmarkReturnWorkBudget.Work.pass(values.size()));
         return BenchmarkCausalClock.elapsed(new BenchmarkCausalClock.Interval(firstLower, firstUpper),
                 new BenchmarkCausalClock.Interval(lastLower, lastUpper));
     }

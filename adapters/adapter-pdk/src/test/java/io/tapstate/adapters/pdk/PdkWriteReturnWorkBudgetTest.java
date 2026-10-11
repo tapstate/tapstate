@@ -20,14 +20,91 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.AbstractMap;
+import java.util.AbstractSet;
+import java.util.AbstractList;
+import java.util.Iterator;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PdkWriteReturnWorkBudgetTest {
+    @Test
+    void actual_serializer_collection_requests_fit_both_report_and_final_tail_allocations() throws Exception {
+        Map<String, Object> tree = evidence(budget());
+        AtomicLong requests = new AtomicLong();
+        String actual = JsonWriter.write(countRequests(tree, requests));
+        assertThat(parse(actual)).isEqualTo(tree);
+        // This observed subset omits builder, character, boxing and hash calls. Even this subset
+        // exceeds the former 32-request report/tail allocation, without relying on source text.
+        assertThat(requests.get()).isGreaterThan(32);
+        assertThat(PdkWriteReturnWorkBudget.Activity.MBEAN_BUDGET.upper[1]).isGreaterThanOrEqualTo(requests.get());
+        var field = PdkWriteReturnWorkBudget.class.getDeclaredField("SEAL_TAIL_UPPER");
+        assertThat(field.trySetAccessible()).isTrue();
+        assertThat(((long[]) field.get(null))[1]).isGreaterThanOrEqualTo(requests.get());
+    }
+
+    @Test
+    void full_rosters_printable_escapes_and_wide_counters_fit_independent_report_shape_and_work_bounds() throws Exception {
+        var budget = budget();
+        for (int i = 0; i < 16; i++) budget.epoch(i, "\\\"".repeat(256));
+        for (int i = 0; i < 32; i++) budget.gap(i + "\\\"".repeat(63));
+        for (String name : List.of("attempts", "completed", "failed", "upper", "material")) {
+            var field = PdkWriteReturnWorkBudget.class.getDeclaredField(name);
+            assertThat(field.trySetAccessible()).isTrue();
+            java.util.Arrays.fill((long[]) field.get(budget), Long.MAX_VALUE);
+        }
+        Map<String, Object> actual = evidence(budget);
+        Shape shape = new Shape(); shape.visit(actual);
+        assertThat(actual.keySet()).containsExactlyInAnyOrderElementsOf(staticList("ROOT_FIELDS"));
+        @SuppressWarnings("unchecked") Map<String, Object> activities = (Map<String, Object>) actual.get("activities");
+        assertThat(activities.keySet()).containsExactlyInAnyOrderElementsOf(staticList("ACTIVITY_NAMES"));
+        assertThat(shape.maps).isEqualTo(staticLong("REPORT_MAPS"));
+        assertThat(shape.entries).isEqualTo(staticLong("REPORT_ENTRIES"));
+        assertThat(shape.nodes).isEqualTo(staticLong("REPORT_NODES"));
+        assertThat(shape.keyChars).isEqualTo(staticLong("REPORT_KEY_CHARS"));
+        assertThat(shape.keyChars + shape.stringChars).isLessThanOrEqualTo(staticLong("REPORT_STRING_CHARS"));
+        assertThat((long) JsonWriter.write(actual).length()).isLessThanOrEqualTo(staticLong("REPORT_JSON_CHARS"));
+        assertThat(staticLong("REPORT_JSON_CHARS")).isLessThanOrEqualTo(65536);
+        assertThat(((Map<?, ?>) actual.get("activities")).get("BOOKKEEPING")).isNotNull();
+    }
+
+    @Test
+    void bookkeeping_allocation_covers_observed_checked_scans_pairing_and_late_mapping_requests() throws Exception {
+        long units = 8;
+        long mutationMath = 3 + units;
+        long basisMathAndOrdinals = 2 + 2 + 2 * units;
+        long mappingWritesIncludingRefusal = 3;
+        long pairingAndNotification = 2 + 6 + 2;
+        long reasonReads = 2 * 128;
+        assertThat(PdkWriteReturnWorkBudget.Activity.BOOKKEEPING.upper[1]).isGreaterThanOrEqualTo(
+                mutationMath + basisMathAndOrdinals + mappingWritesIncludingRefusal + pairingAndNotification + reasonReads);
+        assertThat(PdkWriteReturnWorkBudget.Activity.BOOKKEEPING.upper[4]).isGreaterThanOrEqualTo(8 + 2 * 4);
+        var budget = budget();
+        var span = budget.enter(PdkWriteReturnWorkBudget.Activity.CLOCK_READ); span.success(); span.close();
+        Map<String, Object> actual = evidence(budget);
+        assertThat(actual).containsEntry("pending", 0L);
+        assertThat(count(actual, "CLOCK_READ", "completed")).isEqualTo(1);
+        assertThat(vector(actual, "sourceUpper", "requests")).isGreaterThanOrEqualTo(
+                ((Long) actual.get("bookkeepingInvocations")) * PdkWriteReturnWorkBudget.Activity.BOOKKEEPING.upper[1]);
+    }
+
+    @Test
+    void invalid_epoch_or_reason_material_refuses_before_unbounded_report_material_is_retained() {
+        var budget = budget();
+        budget.epoch(1, "x".repeat(513));
+        budget.gap("x".repeat(10000));
+        Map<String, Object> actual = evidence(budget);
+        assertThat(actual.get("epochs")).asList().isEmpty();
+        assertThat(actual.get("gaps")).asList().contains("EPOCH_WINDOW_BOUND", "GAP_REASON_UNAVAILABLE");
+        assertThat(actual).containsEntry("omitted", 1L).containsEntry("state", "UNKNOWN");
+    }
+
     @Test
     void default_and_nonliteral_true_do_not_construct_an_enabled_ledger() {
         String previous = System.getProperty(PdkWriteReturnWorkBudget.PROPERTY);
@@ -272,8 +349,10 @@ class PdkWriteReturnWorkBudgetTest {
     void a_blocked_external_finalizer_has_one_bounded_owner_wait_and_cannot_later_gain_credit(@TempDir Path directory) throws Exception {
         var budget = budget();
         CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        AtomicReference<Thread> finalizer = new AtomicReference<>();
         Path body = directory.toRealPath().resolve("blocked.json");
         assertThat(budget.arm(body.toString(), "owned", () -> {
+            finalizer.set(Thread.currentThread());
             entered.countDown();
             try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }, false)).isTrue();
@@ -282,7 +361,13 @@ class PdkWriteReturnWorkBudgetTest {
             assertThat(entered.await(1, TimeUnit.SECONDS)).isTrue();
             assertThat(companion(body).getInt(12)).isEqualTo(2);
             assertThat(evidence(budget)).containsEntry("state", "UNKNOWN");
-        } finally { release.countDown(); }
+        } finally {
+            release.countDown();
+            Thread worker = finalizer.get();
+            assertThat(worker).isNotNull();
+            worker.join(TimeUnit.SECONDS.toMillis(5));
+            assertThat(worker.isAlive()).isFalse();
+        }
     }
 
     @Test
@@ -343,4 +428,65 @@ class PdkWriteReturnWorkBudgetTest {
         return ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
     }
     private static void restore(String name, String previous) { if (previous == null) System.clearProperty(name); else System.setProperty(name, previous); }
+
+    @SuppressWarnings("unchecked") private static List<String> staticList(String name) throws Exception {
+        var field = PdkWriteReturnWorkBudget.class.getDeclaredField(name);
+        assertThat(field.trySetAccessible()).isTrue(); return (List<String>) field.get(null);
+    }
+    private static long staticLong(String name) throws Exception {
+        var field = PdkWriteReturnWorkBudget.class.getDeclaredField(name);
+        assertThat(field.trySetAccessible()).isTrue(); return ((Number) field.get(null)).longValue();
+    }
+    private static final class Shape {
+        long maps, entries, nodes, keyChars, stringChars;
+        void visit(Object value) {
+            nodes++;
+            if (value instanceof Map<?, ?> map) {
+                maps++; entries += map.size();
+                for (var entry : map.entrySet()) { keyChars += ((String) entry.getKey()).length(); visit(entry.getValue()); }
+            } else if (value instanceof List<?> list) { for (Object child : list) visit(child); }
+            else if (value instanceof String text) stringChars += text.length();
+        }
+    }
+    @SuppressWarnings("unchecked") private static Object countRequests(Object value, AtomicLong requests) {
+        if (value instanceof Map<?, ?> raw) {
+            Map<String, Object> map = (Map<String, Object>) raw;
+            return new AbstractMap<String, Object>() {
+                @Override public Set<Entry<String, Object>> entrySet() {
+                    requests.incrementAndGet();
+                    return new AbstractSet<>() {
+                        @Override public int size() { return map.size(); }
+                        @Override public Iterator<Entry<String, Object>> iterator() {
+                            requests.incrementAndGet(); var delegate = map.entrySet().iterator();
+                            return new Iterator<>() {
+                                @Override public boolean hasNext() { requests.incrementAndGet(); return delegate.hasNext(); }
+                                @Override public Entry<String, Object> next() {
+                                    requests.incrementAndGet(); var entry = delegate.next();
+                                    return new Entry<>() {
+                                        @Override public String getKey() { requests.incrementAndGet(); return entry.getKey(); }
+                                        @Override public Object getValue() { requests.incrementAndGet(); return countRequests(entry.getValue(), requests); }
+                                        @Override public Object setValue(Object ignored) { throw new UnsupportedOperationException(); }
+                                    };
+                                }
+                            };
+                        }
+                    };
+                }
+            };
+        }
+        if (value instanceof List<?> list) {
+            return new AbstractList<Object>() {
+                @Override public Object get(int index) { return countRequests(list.get(index), requests); }
+                @Override public int size() { return list.size(); }
+                @Override public Iterator<Object> iterator() {
+                    requests.incrementAndGet(); var delegate = list.iterator();
+                    return new Iterator<>() {
+                        @Override public boolean hasNext() { requests.incrementAndGet(); return delegate.hasNext(); }
+                        @Override public Object next() { requests.incrementAndGet(); return countRequests(delegate.next(), requests); }
+                    };
+                }
+            };
+        }
+        return value;
+    }
 }

@@ -51,12 +51,84 @@ final class PdkWriteReturnWorkBudget {
     static final long CLOCK_TRANSFER_UPPER = Math.addExact(Math.multiplyExact(4, CLOCK_SNAPSHOT_BYTES_UPPER), 65536);
     static final long CLOCK_ELEMENT_UPPER = Math.addExact(Math.multiplyExact(8, CLOCK_SNAPSHOT_BYTES_UPPER), 65536);
     static final List<String> UNITS = List.of("calls", "requests", "records", "frames", "bytes", "passes", "elements", "updates");
+    static final int MAX_GAPS = 32;
+    static final int MAX_REASON_CHARS = 128;
+    static final int MAX_WINDOW_BYTES = 512;
+    static final int WINDOW_BASE64_CHARS = 4 * ((MAX_WINDOW_BYTES + 2) / 3);
+    // These are source rosters, not new admission limits. Tests compare the actual tree and enum.
+    static final List<String> ROOT_FIELDS = List.of("schemaVersion", "enabled", "definitionId", "sourceFormulaSha256",
+            "inputSha256", "runId", "pid", "jvmStartTimeMillis", "stage", "lifecycle", "generation", "nonceSha256",
+            "state", "limits", "materialLimits", "actualMaterial", "sourceUpper", "inputRowsAttempted",
+            "sourceUpperIsActualWork", "limitsIndependentlyVerified", "activities", "bookkeepingInvocations",
+            "epochs", "pending", "openWriters", "omitted", "overflow", "overBudget", "gaps", "lateMutations",
+            "sourceSealTailUpper", "sealTailIncludedInSourceUpper", "actualSealTailInCompanion", "processExitObserved",
+            "crashDurabilityQualified", "opaqueScope", "excluded", "costUnit", "structuralBudgetQualified",
+            "accountingErrorBoundQualified", "wholeMethodCostQualified", "collectionCostUpperBoundQualified",
+            "samplingCostQualified", "causalOverheadQualified", "costAcceptanceEligible", "performanceAcceptanceEligible", "formalPerformance");
+    static final List<String> ACTIVITY_NAMES = List.of("CONFIG", "INSTALL", "WRITER_INSTALL", "WRITER_ROSTER",
+            "WRITER_CLOSE_ATTEMPT", "WRITER_CLOSE", "WRITE_WRAPPER", "BEGIN", "ACTIVE_BEGIN", "INACTIVE_BEGIN",
+            "REJECTION", "IDENTITY_ROW", "IDENTITY_PIECE", "KEY_SHAPE", "CALLBACK_WRAPPER", "CALLBACK",
+            "CALLBACK_ERROR", "CALLBACK_EXIT", "RETURN_OBSERVATION", "COMPLETE", "RECEIPT_PIECE", "PUBLICATION",
+            "COST_AGGREGATION", "CLOCK_READ", "CLOCK_INITIALIZATION", "CLOCK_METADATA", "SCOPE_INSTALL",
+            "SCOPE_CACHE_ENTRY", "SCOPE_BEFORE", "SCOPE_AFTER", "TRANSACTION_WRAPPER", "HASH_READ", "HASH_MATERIAL",
+            "ARGUMENT", "ARGUMENT_MATERIAL", "MBEAN_SCALAR", "MBEAN_START", "MBEAN_STOP", "MBEAN_PAGE",
+            "PAGE_FRAME_VISIT", "MBEAN_COST", "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER", "FINAL_WAIT_ITERATION", "BOOKKEEPING");
+    static final List<String> ACTIVITY_FIELDS = List.of("invocations", "completed", "failed", "pending");
+    static final List<String> MATERIAL_FIELDS = List.of("connectorHashBytes", "runtimeArguments", "runtimeArgumentBytes", "primaryKeys");
+    static final List<String> EPOCH_FIELDS = List.of("epoch", "windowBase64");
+    static final int QUALIFICATION_FIELDS = 9;
+    static final long REPORT_MAPS = add(1, 4, 1, 1, ACTIVITY_NAMES.size(), MAX_EPOCHS);
+    static final long REPORT_LISTS = 2;
+    static final long REPORT_ENTRIES = add(ROOT_FIELDS.size(), mul(4, UNITS.size()), MATERIAL_FIELDS.size(),
+            ACTIVITY_NAMES.size(), mul(ACTIVITY_NAMES.size(), ACTIVITY_FIELDS.size()), mul(MAX_EPOCHS, EPOCH_FIELDS.size()));
+    static final long REPORT_LIST_ELEMENTS = add(MAX_EPOCHS, MAX_GAPS);
+    static final long REPORT_NODES = add(1, REPORT_ENTRIES, REPORT_LIST_ELEMENTS);
+    static final long REPORT_KEY_CHARS = add(chars(ROOT_FIELDS), mul(4, chars(UNITS)), chars(MATERIAL_FIELDS),
+            chars(ACTIVITY_NAMES), mul(ACTIVITY_NAMES.size(), chars(ACTIVITY_FIELDS)), mul(MAX_EPOCHS, chars(EPOCH_FIELDS)));
+    // Every root scalar is conservatively allowed 128 ASCII characters; epochs and reasons are
+    // independently bounded before material copying. Numeric rendering has at most 20 characters.
+    static final long REPORT_STRING_CHARS = add(REPORT_KEY_CHARS, mul(ROOT_FIELDS.size(), 128),
+            mul(MAX_EPOCHS, WINDOW_BASE64_CHARS), mul(MAX_GAPS, MAX_REASON_CHARS));
+    static final long REPORT_JSON_CHARS = add(mul(2, REPORT_STRING_CHARS), mul(20, REPORT_NODES), mul(8, REPORT_NODES));
+    // Construction: map factories/puts, vector lookups, enum name/ordinal, list copies, flag iterator,
+    // boxing of every value node, clean(), and the five nonce UTF-8/digest/hex calls.
+    static final long REPORT_BUILD_REQUESTS = add(6, ACTIVITY_NAMES.size(), 1, REPORT_ENTRIES, REPORT_NODES,
+            2, mul(2, ACTIVITY_NAMES.size()), 1, add(mul(2, QUALIFICATION_FIELDS), 2), 5, mul(4, UNITS.size()), 1);
+    // JsonWriter: builder+toString; each map's delimiters/entrySet/iterator/final hasNext; seven
+    // entry calls; four list calls plus three per element; two quotes+terminal length per string;
+    // length/charAt/append per character; and two calls per scalar. All strings are printable ASCII.
+    static final long REPORT_JSON_REQUESTS = add(2, mul(5, REPORT_MAPS), mul(7, REPORT_ENTRIES),
+            mul(4, REPORT_LISTS), mul(3, REPORT_LIST_ELEMENTS), mul(3, add(REPORT_ENTRIES, REPORT_NODES)),
+            mul(3, REPORT_STRING_CHARS), mul(2, REPORT_NODES));
+    static final long REPORT_REQUESTS = add(REPORT_BUILD_REQUESTS, REPORT_JSON_REQUESTS, 2, mul(2, REPORT_JSON_CHARS));
+    static final long REPORT_PASSES = add(4, 1, 1, REPORT_MAPS, REPORT_LISTS, REPORT_ENTRIES, REPORT_NODES, 1);
+    static final long REPORT_ELEMENTS_UPDATES = mul(8, add(REPORT_NODES, REPORT_ENTRIES, REPORT_STRING_CHARS, REPORT_JSON_CHARS));
+    // Text transfer covers two-byte builder characters, ASCII rendering, and the nonce's maximum
+    // UTF-8 input plus digest/hex output. Provider allocation/instruction interiors stay opaque.
+    static final long REPORT_BYTES = add(mul(2, REPORT_STRING_CHARS), REPORT_JSON_CHARS, 64, 32, 64);
+    static final long LEDGER_MUTATION_REQUESTS = add(3, UNITS.size(), 3);
+    static final long LEDGER_BASIS_REQUESTS = add(2, 2, mul(2, UNITS.size()));
+    static final long LEDGER_PAIR_REQUESTS = add(2, 6, 2);
+    static final long LEDGER_METADATA_REQUESTS = add(mul(2, MAX_REASON_CHARS), 8, 8);
+    static final long BOOKKEEPING_REQUESTS = add(LEDGER_MUTATION_REQUESTS, LEDGER_BASIS_REQUESTS,
+            LEDGER_PAIR_REQUESTS, LEDGER_METADATA_REQUESTS);
+    static final long BOOKKEEPING_BYTES = add(8, mul(2, 4), mul(4, MAX_WINDOW_BYTES), MAX_WINDOW_BYTES, WINDOW_BASE64_CHARS);
+    static final long BOOKKEEPING_ELEMENTS_UPDATES = add(mul(8, UNITS.size()), mul(2, MAX_REASON_CHARS),
+            MAX_WINDOW_BYTES, WINDOW_BASE64_CHARS, 16);
+    // Raw prechecks use at most six byte/string passes. JsonReader's peek/length/charAt/append and
+    // number/literal paths get twelve calls per input character; JsonWriter's control escape path
+    // gets five. The preparse roster has at most 64 tokens/nodes. Startup additionally renders the
+    // fixed formula rosters and eight coefficients per activity before digesting the ASCII formula.
+    static final long CONFIG_BOOTSTRAP_REQUESTS = add(mul(8, REPORT_ENTRIES), mul(4, REPORT_KEY_CHARS),
+            mul(4, mul(ACTIVITY_NAMES.size(), UNITS.size())), 8);
+    static final long CONFIG_REQUESTS = add(mul(6, MAX_INPUT_BYTES), mul(12, MAX_INPUT_BYTES),
+            mul(5, MAX_INPUT_BYTES), mul(64, 32), CONFIG_BOOTSTRAP_REQUESTS);
 
     /* Each invocation allocation is independent of retained rows or successful admission. Variable
        material is accounted before traversal/copy, with separate actual material observations.
        The fixed allocations bound this collector's source operations; opaque callees stay requests. */
     enum Activity {
-        CONFIG(1, 2048, 0, 0, MAX_INPUT_BYTES * 8L, 16, MAX_INPUT_BYTES * 16L, MAX_INPUT_BYTES * 16L),
+        CONFIG(1, CONFIG_REQUESTS, 0, 0, MAX_INPUT_BYTES * 8L, 16, MAX_INPUT_BYTES * 16L, MAX_INPUT_BYTES * 16L),
         INSTALL(1, 24, 0, 0, 2048, 4, 256, 64),
         WRITER_INSTALL(1, 16, 0, 0, 2048, 4, 512, 64),
         WRITER_ROSTER(1, 4, 0, 0, 0, 1, 16, 16),
@@ -99,23 +171,31 @@ final class PdkWriteReturnWorkBudget {
         MBEAN_PAGE(1, 32, 0, 0, 65536L * 8, 8, 65536L * 8, 128),
         PAGE_FRAME_VISIT(0, 4, 0, 1, 0, 1, 8, 4),
         MBEAN_COST(1, 32, 0, 0, 8192L * 4, 6, 8192L * 4, 128),
-        MBEAN_BUDGET(1, 32, 0, 0, MAX_RECEIPT_BYTES * 8L, 8, MAX_RECEIPT_BYTES * 8L, 128),
+        MBEAN_BUDGET(1, REPORT_REQUESTS, 0, 0, REPORT_BYTES, REPORT_PASSES, REPORT_ELEMENTS_UPDATES, REPORT_ELEMENTS_UPDATES),
         ARM(1, 64, 0, 0, 16384, 8, 16384, 128),
         SHUTDOWN(1, 16, 0, 0, 4096, 4, 512, 64),
         FINAL_OWNER(1, 32, 0, 0, 4096, 4, 512, 64),
         FINAL_WAIT_ITERATION(1, 4, 0, 0, 0, 2, 32, 16),
-        BOOKKEEPING(1, 2, 0, 0, 0, 4, 128, 128);
+        BOOKKEEPING(1, BOOKKEEPING_REQUESTS, 0, 0, BOOKKEEPING_BYTES, 6, BOOKKEEPING_ELEMENTS_UPDATES, BOOKKEEPING_ELEMENTS_UPDATES);
 
         final long[] upper;
         Activity(long... upper) { this.upper = upper; }
     }
 
-    static final String FORMULA = formula();
-    static final String SOURCE_FORMULA_SHA256 = sha(FORMULA.getBytes(StandardCharsets.US_ASCII));
     /* The serialization/write/close/digest/companion tail is not an invented actual observation.
        It has one body open/write/force/close, two mapping forces and bounded stores. No write retry. */
-    private static final long[] SEAL_TAIL_UPPER = { 1, 32, 0, 0, MAX_RECEIPT_BYTES * 12L + SEAL_BYTES * 8L,
-            16, MAX_RECEIPT_BYTES * 12L + SEAL_BYTES * 8L, 256 };
+    // Tail outside report rendering: eight checked vector additions; four body channel calls;
+    // ByteBuffer.wrap; three body digest/hex calls (two are used); ten normal companion stores,
+    // two forces, two clean() calls, and the countDown/owner-return calls. Refusal stores and
+    // interrupt handling get their own finite branch reserve; gap bookkeeping is counted separately.
+    static final long SEAL_NON_REPORT_REQUESTS = add(UNITS.size(), 4, 1, 3, 10, 2, 2, 2,
+            add(2, 2, 1, 1, 1, 1));
+    static final long[] SEAL_TAIL_UPPER = { 1, add(REPORT_REQUESTS, SEAL_NON_REPORT_REQUESTS), 0, 0,
+            add(REPORT_BYTES, mul(3, MAX_RECEIPT_BYTES), mul(8, SEAL_BYTES)),
+            add(REPORT_PASSES, 4), add(REPORT_ELEMENTS_UPDATES, mul(8, SEAL_BYTES), MAX_RECEIPT_BYTES),
+            add(REPORT_ELEMENTS_UPDATES, mul(8, UNITS.size()), mul(8, SEAL_BYTES)) };
+    static final String FORMULA = formula();
+    static final String SOURCE_FORMULA_SHA256 = sha(FORMULA.getBytes(StandardCharsets.US_ASCII));
     private static PdkWriteReturnWorkBudget installed;
 
     private final long pid;
@@ -275,14 +355,21 @@ final class PdkWriteReturnWorkBudget {
 
     synchronized void gap(String reason) {
         mutation();
-        if (gaps.size() < 32) gaps.add(reason);
+        if (!ascii(reason, MAX_REASON_CHARS)) {
+            reason = "GAP_REASON_UNAVAILABLE";
+            try { omitted = Math.incrementExact(omitted); } catch (ArithmeticException failure) { overflow = true; }
+        }
+        if (gaps.size() < MAX_GAPS) gaps.add(reason);
         else { try { omitted = Math.incrementExact(omitted); } catch (ArithmeticException failure) { overflow = true; } }
     }
 
     synchronized void epoch(long epoch, String window) {
         mutation();
         if (epochs.size() == MAX_EPOCHS) { gap("EPOCH_ROSTER_OVERFLOW"); return; }
-        epochs.add(Map.of("epoch", epoch, "windowBase64", Base64.getEncoder().encodeToString(window.getBytes(StandardCharsets.UTF_8))));
+        if (window == null || window.length() > MAX_WINDOW_BYTES) { gap("EPOCH_WINDOW_BOUND"); return; }
+        byte[] encoded = window.getBytes(StandardCharsets.UTF_8);
+        if (encoded.length > MAX_WINDOW_BYTES) { gap("EPOCH_WINDOW_BOUND"); return; }
+        epochs.add(Map.of("epoch", epoch, "windowBase64", Base64.getEncoder().encodeToString(encoded)));
     }
 
     private void mutation() {
@@ -483,9 +570,24 @@ final class PdkWriteReturnWorkBudget {
     }
 
     private static String formula() {
-        var result = new StringBuilder("WRITE_RETURN_PRODUCER_WORK_V1;units=calls,requests,records,frames,bytes,passes,elements,updates;opaque=requests;actual=basis;upper=checked-allocation;native-copy-requests=2053;native-copy-bytes=16593;hash-material=16MiB+4*256KiB+5*8192;hash-requests=2*(hash-material+5)+2053+1024;clock-transfer=4*(hash-material+16593)+65536;clock-elements-updates=8*(hash-material+16593)+65536;key-shape=2;frame=65536;call-rows=1024;error-entries=512;epochs=16;config-depth=4;config-tokens=64;config-string=1024;config-number=20;seal=256;seal-tail=1,32,0,0,788480,16,788480,256;");
+        var result = new StringBuilder("WRITE_RETURN_PRODUCER_WORK_V1;units=calls,requests,records,frames,bytes,passes,elements,updates;opaque=requests;actual=basis;upper=checked-allocation;native-copy-requests=2053;native-copy-bytes=16593;hash-material=16MiB+4*256KiB+5*8192;hash-requests=2*(hash-material+5)+2053+1024;clock-transfer=4*(hash-material+16593)+65536;clock-elements-updates=8*(hash-material+16593)+65536;key-shape=2;frame=65536;call-rows=1024;error-entries=512;epochs=16;gaps=32;reason=128;config-depth=4;config-tokens=64;config-string=1024;config-number=20;seal=256;request-unit=explicit-JDK-provider-and-boxing-invocations;json-map=5+7*entries;json-list=4+3*elements;json-string=3+3*chars;json-scalar=2;ascii=2+2*chars;");
+        result.append("rootFields=").append(String.join(",", ROOT_FIELDS)).append(';');
+        result.append("activityNames=").append(String.join(",", ACTIVITY_NAMES)).append(';');
+        result.append("report=").append(REPORT_MAPS).append(',').append(REPORT_LISTS).append(',')
+                .append(REPORT_ENTRIES).append(',').append(REPORT_NODES).append(',').append(REPORT_STRING_CHARS)
+                .append(',').append(REPORT_JSON_CHARS).append(',').append(REPORT_BUILD_REQUESTS).append(',')
+                .append(REPORT_JSON_REQUESTS).append(',').append(REPORT_REQUESTS).append(';');
+        result.append("seal-tail="); for (long n : SEAL_TAIL_UPPER) result.append(n).append(','); result.append(';');
         for (Activity a : Activity.values()) { result.append(a.name()).append('='); for (long n : a.upper) result.append(n).append(','); result.append(';'); }
         return result.toString();
+    }
+
+    private static long add(long... values) {
+        long total = 0; for (long value : values) total = Math.addExact(total, value); return total;
+    }
+    private static long mul(long left, long right) { return Math.multiplyExact(left, right); }
+    private static long chars(List<String> values) {
+        long total = 0; for (String value : values) total = Math.addExact(total, value.length()); return total;
     }
 
     private static Map<String, Object> vector(long[] value) {
@@ -512,6 +614,9 @@ final class PdkWriteReturnWorkBudget {
     }
     private static String sha(byte[] bytes) { return HexFormat.of().formatHex(digest(bytes)); }
 
+    // Aggregate limits are independently registered admission ceilings, not future lifetime bounds.
+    // Complete actual invocation basis times the source matrix bounds this run independently; neither
+    // caller ceilings nor the observed prefix certify cost or replace the frozen performance gates.
     private record Config(String inputSha, String runId, long[] limits, long connectorBytes,
                           int argumentCount, long argumentBytes, String failure) {
         Map<String, Object> materialLimits() {

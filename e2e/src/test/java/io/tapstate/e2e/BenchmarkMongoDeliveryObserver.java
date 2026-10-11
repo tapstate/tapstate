@@ -138,10 +138,10 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         this.targetId = Objects.requireNonNull(targetId, "target identity");
         this.targetCollection = Objects.requireNonNull(targetCollection, "target collection");
         this.keyOf = Objects.requireNonNull(keyOf, "target key extractor");
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
-        this.client = MongoClients.create(address);
-        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.TARGET_STREAM, BenchmarkReturnWorkBudget.Work.request());
+        this.client = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> MongoClients.create(address));
+        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.TARGET_STREAM, BenchmarkReturnWorkBudget.Work.call());
         try {
+            BenchmarkReturnWorkBudget.issued(workLifetime);
             this.cursor = client.getDatabase(databaseName).watch()
                     .fullDocument(FullDocument.UPDATE_LOOKUP)
                     .maxAwaitTime(CURSOR_MAX_AWAIT.toMillis(), TimeUnit.MILLISECONDS)
@@ -407,6 +407,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 if (!closed) { fail("target change-stream read gate interrupted", e); }
             }
         } catch (RuntimeException | AssertionError e) {
+            BenchmarkReturnWorkBudget.failure(workScope, e);
             synchronized (lock) {
                 if (!closed) {
                     fail("target change-stream reader failed", e);
@@ -426,12 +427,14 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private void accept(ChangeStreamDocument<Document> change, long startedReadNanos, long observedAtNanos) {
         BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, BenchmarkReturnWorkBudget.Work.records(1));
         MongoNamespace namespace = change.getNamespace();
+        if (namespace != null) { BenchmarkReturnWorkBudget.requireLocalMaterial(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, namespace.toString()); }
         if (namespace == null || !databaseName.equals(namespace.getDatabaseName())) {
             return;
         }
         OperationType operation = change.getOperationType();
         if (BARRIER_COLLECTION.equals(namespace.getCollectionName())) {
             Document body = change.getFullDocument();
+            BenchmarkReturnWorkBudget.requireLocalMaterial(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, body);
             synchronized (lock) {
                 if (operation == OperationType.INSERT && body != null
                         && Objects.equals(pendingBarrierId, body.getString("_id"))) {
@@ -457,6 +460,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             return;
         }
         Document body = change.getFullDocument();
+        BenchmarkReturnWorkBudget.requireLocalMaterial(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, body);
         if (body == null) {
             synchronized (lock) {
                 fail("target change has no full document on " + targetCollection, null);
@@ -663,22 +667,24 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         }
         readGate.close();
         try {
-            cursor.close();
+            BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { cursor.close(); return null; });
         } finally {
             boolean readerStopped = false;
             try {
                 readerStopped = reader.join(Duration.ofSeconds(2));
+                if (!readerStopped) { BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.TARGET_STREAM, "WORKER_TERMINATION_NOT_OBSERVED"); }
             } catch (InterruptedException e) {
+                BenchmarkReturnWorkBudget.failure(workScope, e);
                 Thread.currentThread().interrupt();
             } finally {
                 try {
                     retainNativeOperationWalls(readerStopped);
                     if (pendingBarrierId != null) {
-                        client.getDatabase(databaseName).getCollection(BARRIER_COLLECTION)
-                                .deleteOne(Filters.eq("_id", pendingBarrierId));
+                        BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_BARRIER,
+                                () -> client.getDatabase(databaseName).getCollection(BARRIER_COLLECTION).deleteOne(Filters.eq("_id", pendingBarrierId)));
                     }
                 } finally {
-                    client.close();
+                    BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { client.close(); return null; });
                 }
             }
         }

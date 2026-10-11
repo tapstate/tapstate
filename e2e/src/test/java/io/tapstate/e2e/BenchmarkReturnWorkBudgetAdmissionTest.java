@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -101,6 +102,30 @@ class BenchmarkReturnWorkBudgetAdmissionTest {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("excluded activity");
     }
 
+    @Test void an_intended_method_attempt_cannot_replace_the_actual_request_completion() throws Exception {
+        var fixture = fixture(); var receipt = mutable(fixture.receipt());
+        row(receipt, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT).put("completedRequests", 0L);
+        assertThatThrownBy(() -> verify(fixture, receipt)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("issued requests");
+        var mismatch = mutable(fixture.receipt());
+        row(mismatch, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT).put("issuedRequests", 0L);
+        assertThatThrownBy(() -> verify(fixture, mismatch)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("issued requests");
+    }
+
+    @Test void self_accounting_is_recomputed_and_cannot_be_replaced_by_a_caller_upper() throws Exception {
+        var fixture = fixture(); var replaced = mutable(fixture.receipt());
+        @SuppressWarnings("unchecked") var upper = new LinkedHashMap<>((Map<String, Object>) replaced.get("selfSourceUpper"));
+        upper.put("requests", 0L); replaced.put("selfSourceUpper", upper);
+        assertThatThrownBy(() -> verify(fixture, replaced)).isInstanceOf(AssertionError.class).hasMessageContaining("self upper");
+        var missing = mutable(fixture.receipt());
+        @SuppressWarnings("unchecked") var counters = (Map<String, Object>) missing.get("selfCounters");
+        counters.remove("outputCloneBytes");
+        assertThatThrownBy(() -> verify(fixture, missing)).isInstanceOf(AssertionError.class).hasMessageContaining("self counter roster");
+        var overflow = mutable(fixture.receipt()); overflow.put("selfOverflow", true);
+        assertThatThrownBy(() -> verify(fixture, overflow)).isInstanceOf(AssertionError.class).hasMessageContaining("overflowed");
+    }
+
     @Test void output_failure_preserves_the_primary_and_cannot_become_complete() {
         var definition = definition(false, Set.of()); var original = new java.io.IOException("controlled writer failed");
         try (var scope = BenchmarkReturnWorkBudget.activate(definition, OWNER.runId())) {
@@ -111,6 +136,33 @@ class BenchmarkReturnWorkBudgetAdmissionTest {
             assertThatThrownBy(() -> BenchmarkReturnWorkBudgetAdmission.verifyCounters(definition, OWNER, scope.finish()))
                     .isInstanceOf(AssertionError.class).hasMessageContaining("open or refused");
         }
+    }
+
+    @Test void actual_file_bytes_and_the_registered_tree_plan_bind_the_completed_write(@TempDir java.nio.file.Path directory) throws Exception {
+        var definition = definition(false, Set.of());
+        var plan = new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(8, 8, 32, 64, 32, 24);
+        var tree = BenchmarkReturnWorkBudgetDefinitions.freezeOutputTree(Map.of("body", "value"), plan);
+        BenchmarkReturnWorkBudget.PreparedOutput prepared;
+        Map<String, Object> completed;
+        var path = directory.toRealPath().resolve("output.json");
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition, OWNER.runId())) {
+            scope.bindRoot(OWNER.pid(), OWNER.jvmStartTimeMillis());
+            prepared = scope.prepareOutput("controlled", new BenchmarkReturnWorkBudget.TreePlan(plan.nodeUpper(),
+                    plan.stringUtf8Upper(), plan.encodedUpperBytes(), plan.depthUpper()), tree.value(), plan.sha256());
+            scope.writeOutput(prepared, bytes -> java.nio.file.Files.write(path, bytes));
+            BenchmarkReturnWorkBudgetAdmission.verifyOutputFile(path, prepared, plan, scope.snapshot());
+            completed = scope.finish();
+            BenchmarkReturnWorkBudgetAdmission.verifyCounters(definition, OWNER, completed);
+        }
+        var substituted = new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(9, 8, 32, 64, 32, 24);
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetAdmission.verifyOutputFile(path, prepared, substituted, completed))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("registered prior plan");
+        var sameBytesDifferentShape = new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(8, 7, 31, 64, 31, 24);
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetAdmission.verifyOutputFile(path, prepared, sameBytesDifferentShape, completed))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("registered material plan");
+        java.nio.file.Files.writeString(path, "corrupt");
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetAdmission.verifyOutputFile(path, prepared, plan, completed))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("length differs");
     }
 
     @Test void source_multiplication_overflow_and_work_after_seal_are_refused() throws Exception {

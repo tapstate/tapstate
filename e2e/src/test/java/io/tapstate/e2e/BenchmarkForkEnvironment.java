@@ -194,7 +194,8 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     /** Allows a diagnostic baseline after setup while the real first START is still pending. */
     static BenchmarkForkEnvironment open(BenchmarkWorkloadDefinitions.Workload workload,
             Path applicationJar, String forkId, BootLauncher launcher, BeforeStart beforeStart) throws Exception {
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
+        var scope = BenchmarkReturnWorkBudget.current();
+        var opening = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(applicationJar, "applicationJar");
         if (!Files.isRegularFile(applicationJar) || forkId == null || forkId.isBlank()) {
@@ -202,7 +203,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         }
         String namespace = "bench_" + workload.id() + "_"
                 + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-        SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture();
+        SharedPostgres.Fixture postgresFixture = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, SharedPostgres::fixture);
         SharedPostgres.Closing bootClosing = postgresFixture.pending("owned benchmark boot");
         Connection source = null;
         OwnedBoot boot = null;
@@ -218,12 +219,14 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             String operatorDatabase = namespace + "_operator";
             String operatorStateUri = SharedMongo.replicaSetUrl(operatorDatabase);
 
-            source = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
-                    ? SharedMySql.connect(sourceSettings) : SharedPostgres.connect(sourceSettings);
+            source = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    () -> workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
+                            ? SharedMySql.connect(sourceSettings) : SharedPostgres.connect(sourceSettings));
             execute(source, workload.setupSql());
             // The view database is product-wide on this replica set. Forks run serially, and the
             // preceding application process is closed before these shared collections are dropped.
-            workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri);
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    () -> { workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri); return null; });
             if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
                 Map<String, Object> identity = SharedMongo.diagnosticIdentity();
                 System.out.println("benchmark-owned-mongo-clock-fixture=" + JsonWriter.write(identity));
@@ -231,7 +234,8 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                     throw new AssertionError("clock rejection evidence requires an actual owned Mongo build identity");
                 }
             }
-            boot = Objects.requireNonNull(launcher.launch(storeUri, operatorDatabase, applicationJar));
+            boot = Objects.requireNonNull(BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                    () -> launcher.launch(storeUri, operatorDatabase, applicationJar)));
             RealProcessServer server = boot.server();
             OwnedBoot ownedBoot = boot;
             postgresFixture.bind(bootClosing, ownedBoot, ownedBoot::terminated);
@@ -248,14 +252,23 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             bindings.put("captureBoundary", "AFTER_SOURCE_FIXTURE_PREPARATION_BEFORE_PIPELINE_CONFIGURATION_AND_START");
             ownedProcessReceipt = BenchmarkOwnedProcessReceipt.capture(server, applicationJar, bindings);
             ControlPlane readiness = new ControlPlane(server.baseUrl());
-            Await.until("benchmark owned boot readiness", () -> { ownedBoot.check(); return readiness.healthy(); },
+            Await.until("benchmark owned boot readiness", () -> { ownedBoot.check(); return BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, readiness::healthy); },
                     () -> "owned process alive=" + server.isAlive());
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("benchmark", "benchmark-password");
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                    () -> { control.bootstrapAndLogin("benchmark", "benchmark-password"); return null; });
             String sourceConnector = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
                     ? "mysql" : "postgres";
-            control.registerConnector(sourceConnector, ConnectorJars.bytesFor(sourceConnector));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            byte[] sourceJar = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                    () -> ConnectorJars.bytesFor(sourceConnector));
+            BenchmarkReturnWorkBudget.connectorBytes(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, sourceJar);
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                    () -> { control.registerConnector(sourceConnector, sourceJar); return null; });
+            byte[] targetJar = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                    () -> ConnectorJars.bytesFor("mongodb"));
+            BenchmarkReturnWorkBudget.connectorBytes(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, targetJar);
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                    () -> { control.registerConnector("mongodb", targetJar); return null; });
             Map<String, String> resources = workload.resources(sourceSettings, externalTargetUri);
             Map<String, String> sourceResources = new LinkedHashMap<>();
             for (BenchmarkWorkloadDefinitions.SourceChain chain : workload.sourceChains()) {
@@ -266,26 +279,33 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                 }
                 sourceResources.put(file, sourceYaml);
             }
-            control.apply(sourceResources);
+            BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, sourceResources);
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, () -> { control.apply(sourceResources); return null; });
             Map<String, Object> connectorConfig = workload.connectorConfig(sourceSettings);
             for (BenchmarkWorkloadDefinitions.SourceChain chain : workload.sourceChains()) {
-                control.discoverSchema(chain.sourceId(), sourceConnector, connectorConfig);
+                BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, connectorConfig);
+                BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                        () -> { control.discoverSchema(chain.sourceId(), sourceConnector, connectorConfig); return null; });
             }
             // Apply validates references within the submitted workspace, so the discovered sources
             // travel with their dependents again even though their content is unchanged.
-            control.apply(resources);
+            BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, resources);
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, () -> { control.apply(resources); return null; });
             Objects.requireNonNull(beforeStart, "beforeStart").accept(boot);
             for (String pipeline : workload.pipelineIds()) {
-                control.lifecycle(pipeline, LifecycleVerb.START);
+                BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                        () -> { control.lifecycle(pipeline, LifecycleVerb.START); return null; });
             }
             for (String pipeline : workload.pipelineIds()) {
                 awaitRunning(control, pipeline);
             }
-            mongo = MongoClients.create(storeUri);
+            mongo = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> MongoClients.create(storeUri));
+            BenchmarkReturnWorkBudget.done(opening);
             return new BenchmarkForkEnvironment(workload, forkId, sourceSettings, storeUri,
                     externalTargetUri, managedViewsUri, operatorStateUri, boot, ownedProcessReceipt,
                     control, source, mongo, postgresFixture, bootClosing);
         } catch (Exception | Error failure) {
+            BenchmarkReturnWorkBudget.failed(opening, failure);
             if (ownedProcessReceipt != null) {
                 try { ownedProcessReceipt.verifyBeforeClose(); }
                 catch (Exception | Error recording) { if (recording != failure) { failure.addSuppressed(recording); } }
@@ -306,7 +326,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private static void closeAfterFailure(AutoCloseable resource, Throwable failure) {
         if (resource == null) { return; }
-        try { resource.close(); }
+        try { BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { resource.close(); return null; }); }
         catch (Exception | Error cleanupFailure) {
             if (cleanupFailure != failure) { failure.addSuppressed(cleanupFailure); }
         }
@@ -314,12 +334,13 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     /** Ends only the owned application, retaining this fork's live SQL and Mongo fixtures. */
     void closeBoot() throws Exception {
-        boot.close();
+        BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { boot.close(); return null; });
     }
 
     private static void awaitRunning(ControlPlane control, String pipeline) {
         Await.until(pipeline + " to run", PIPELINE_WAIT,
-                () -> control.state(pipeline).filter(PipelineState.RUNNING::equals).isPresent(),
+                () -> BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                        () -> control.state(pipeline)).filter(PipelineState.RUNNING::equals).isPresent(),
                 () -> String.valueOf(control.state(pipeline)));
     }
 
@@ -546,7 +567,9 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         long unreadableRoots = 0;
         List<String> examples = new ArrayList<>(5);
         List<String> firstRoots = new ArrayList<>(5);
+        BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, "NEST_COLD_DIAGNOSTIC_CURSOR_PRIOR_CARDINALITY_UNBOUND");
         for (Document root : collection.find().maxTime(15, TimeUnit.SECONDS)) {
+            BenchmarkReturnWorkBudget.requireLocalMaterial(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, root);
             rootCount++;
             addExample(firstRoots, root);
             Object rawItems = root.get("items");
@@ -589,7 +612,9 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private static void addExample(List<String> examples, Document root) {
         if (examples.size() < 5) {
-            examples.add(abbreviate(root.toJson(), 4096));
+            var scope = BenchmarkReturnWorkBudget.current();
+            BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, root);
+            examples.add(abbreviate(BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, root::toJson), 4096));
         }
     }
 
@@ -610,14 +635,19 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                 ? managedViewsUri : externalTargetUri;
         String database = Objects.requireNonNull(new ConnectionString(uri).getDatabase(), "target database");
         MongoCollection<Document> collection = mongo.getDatabase(database).getCollection(expectation.table());
-        long count = collection.countDocuments();
+        long count = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, collection::countDocuments);
         if (count != expectation.rows()) {
             return new TargetResult(expectation, count, null);
         }
-        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, BenchmarkReturnWorkBudget.Work.request());
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, BenchmarkReturnWorkBudget.Work.call());
         List<Document> documents;
-        try { documents = collection.find().into(new ArrayList<>()); BenchmarkReturnWorkBudget.returned(work, documents); }
+        try { BenchmarkReturnWorkBudget.issued(work); documents = collection.find().into(new ArrayList<>()); BenchmarkReturnWorkBudget.done(work); }
         catch (RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
+        if (workScope != null) {
+            if (documents.size() > expectation.rows()) { BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, "TARGET_CARDINALITY_PRIOR_BOUND_EXCEEDED"); }
+            for (Document document : documents) { BenchmarkReturnWorkBudget.requireLocalMaterial(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, document); }
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.ASSOCIATION, BenchmarkReturnWorkBudget.Work.records(documents.size()));
+        }
         try {
             return new TargetResult(expectation, documents.size(),
                     BenchmarkWorkloadDefinitions.checksumOf(expectation, documents));
@@ -630,9 +660,11 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         if (sql.isEmpty()) {
             return;
         }
-        try (Statement statement = connection.createStatement()) {
+        var scope = BenchmarkReturnWorkBudget.current();
+        try (Statement statement = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, connection::createStatement)) {
             for (String command : sql) {
-                statement.execute(command);
+                BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, command);
+                BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> statement.execute(command));
             }
         }
     }
@@ -652,7 +684,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         closed = true;
         Throwable primary = null;
         for (AutoCloseable resource : List.of(bootClosing, source, mongo, postgresFixture)) {
-            try { resource.close(); }
+            try { BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { resource.close(); return null; }); }
             catch (Exception | Error failure) {
                 if (primary == null) { primary = failure; } else if (primary != failure) { primary.addSuppressed(failure); }
             }

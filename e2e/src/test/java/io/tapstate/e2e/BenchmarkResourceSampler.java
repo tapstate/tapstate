@@ -30,8 +30,9 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     private final Duration interval;
     private final LongSupplier nanoTime;
     private final TerminationWaiter terminationWaiter;
-    private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor(
-            Thread.ofVirtual().name("benchmark-resource-sampler").factory());
+    private final ScheduledExecutorService worker = BenchmarkReturnWorkBudget.opaqueRequest(workScope,
+            BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> Executors.newSingleThreadScheduledExecutor(
+                    Thread.ofVirtual().name("benchmark-resource-sampler").factory()));
     private final ResourceTotals resources = new ResourceTotals();
     private final AttemptLog attempts;
     private final Object lifecycle = new Object();
@@ -59,6 +60,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
                                      Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval,
                                      LongSupplier nanoTime, TerminationWaiter terminationWaiter, int retention) {
         attempts = new AttemptLog(retention);
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.BOOKKEEPING, BenchmarkReturnWorkBudget.Work.pass(retention));
         published = new PublishedDiagnostics(attempts.snapshot(), Optional.empty());
         this.probe = probe;
         this.source = Objects.requireNonNull(source, "sample source");
@@ -196,18 +198,18 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     record Checkpoint(Summary summary, long attemptIndex, long startedAtNanos, long completedAtNanos) { }
 
     void start() {
-        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_OPEN, BenchmarkReturnWorkBudget.Work.call());
         synchronized (lifecycle) {
             if (started || finished) {
                 throw new IllegalStateException("resource sampler can start only once");
             }
             started = true;
+            workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_OPEN, BenchmarkReturnWorkBudget.Work.call());
         }
         record();
         synchronized (lifecycle) {
             if (!finished) {
-                periodicSamples = worker.scheduleWithFixedDelay(this::record, interval.toNanos(), interval.toNanos(),
-                        TimeUnit.NANOSECONDS);
+                periodicSamples = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                        () -> worker.scheduleWithFixedDelay(this::record, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS));
             }
         }
     }
@@ -328,6 +330,9 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     }
 
     private SamplingFailure finishFailure(FailureStage stage, FailureReason reason, Throwable cause) {
+        BenchmarkReturnWorkBudget.failure(workScope, cause);
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.FAILURE_RETENTION,
+                BenchmarkReturnWorkBudget.Work.pass(attempts.retention));
         // A timed-out read may still hold this object's monitor. Only immutable published data is read here.
         PublishedDiagnostics snapshot = published;
         return new SamplingFailure(null, stage, reason, snapshot.completed(), snapshot.pending(), cause);
@@ -350,11 +355,12 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     }
 
     private synchronized void record(boolean finalRead, boolean checkpointRead) {
+        var work = BenchmarkReturnWorkBudget.begin(workScope, finalRead ? BenchmarkReturnWorkBudget.Activity.RESOURCE_FINAL
+                : BenchmarkReturnWorkBudget.Activity.RESOURCE_READ, BenchmarkReturnWorkBudget.Work.call());
         if (failure != null) {
+            BenchmarkReturnWorkBudget.done(work);
             return;
         }
-        var work = BenchmarkReturnWorkBudget.begin(workScope, finalRead ? BenchmarkReturnWorkBudget.Activity.RESOURCE_FINAL
-                : BenchmarkReturnWorkBudget.Activity.RESOURCE_READ, BenchmarkReturnWorkBudget.Work.request());
         long startedAt = nanoTime.getAsLong();
         published = new PublishedDiagnostics(published.completed(),
                 Optional.of(new PendingRead(published.completed().attemptCount() + 1, startedAt, finalRead, checkpointRead)));
@@ -363,6 +369,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         Throwable unavailable = null;
         String failureType = null;
         try {
+            BenchmarkReturnWorkBudget.issued(work);
             sample = source.get();
             if (sample == null || !sample.complete()) {
                 outcome = Outcome.UNAVAILABLE;
@@ -376,6 +383,8 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         } finally {
             // This duration covers the external read itself; bookkeeping and scheduled delay are separate.
             attempts.append(startedAt, nanoTime.getAsLong(), outcome, failureType, sample);
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.BOOKKEEPING,
+                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 2, Math.multiplyExact(2L, attempts.retention), 1));
             published = new PublishedDiagnostics(attempts.snapshot(), Optional.empty());
             if (unavailable != null) { BenchmarkReturnWorkBudget.failed(work, unavailable); }
             else { BenchmarkReturnWorkBudget.done(work, new BenchmarkReturnWorkBudget.Work(0, 0, 1, 0, 0, 1, 4, 1)); }
@@ -626,8 +635,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     @Override
     public void close() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.call());
-        worker.shutdownNow();
+        BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, worker::shutdownNow);
         if (probe != null) {
             probe.close();
         }

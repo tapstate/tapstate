@@ -92,6 +92,30 @@ class BenchmarkReturnWorkBudgetDefinitionsTest {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("plan is missing");
     }
 
+    @Test void producer_registration_encoding_is_canonical_and_preserves_independent_limits() {
+        var limits = new BenchmarkReturnWorkBudget.Work(1, 2, 3, 4, 5, 6, 7, 8);
+        var input = new BenchmarkReturnWorkBudgetDefinitions.ProducerInput("controlled-run", "a".repeat(64), limits,
+                1024, 12, 2048);
+        byte[] raw = java.util.Base64.getDecoder().decode(input.encoded());
+        var text = new String(raw, StandardCharsets.US_ASCII);
+        var parsed = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(text);
+        assertThat(text).isEqualTo(JsonWriter.write(parsed));
+        assertThat(parsed.get("limits")).isEqualTo(limits.evidence());
+        assertThat(parsed.get("sourceFormulaSha256")).isEqualTo(BenchmarkReturnWorkBudgetProducerSeal.FORMULA_SHA256);
+        assertThat(raw.length).isLessThanOrEqualTo(16384);
+        assertThatThrownBy(() -> new BenchmarkReturnWorkBudgetDefinitions.ProducerInput("controlled-run", "a".repeat(64), limits,
+                134217729, 12, 2048)).isInstanceOf(AssertionError.class);
+        assertThatThrownBy(() -> new BenchmarkReturnWorkBudgetDefinitions.ProducerInput("controlled-run", "a".repeat(64), limits,
+                1024, 129, 2048)).isInstanceOf(AssertionError.class);
+    }
+
+    @Test void equal_encoded_byte_bounds_do_not_identify_different_material_plans() {
+        var first = new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(8, 8, 32, 64, 32, 24);
+        var changedShape = new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(8, 7, 31, 64, 31, 24);
+        assertThat(first.encodedUpperBytes()).isEqualTo(changedShape.encodedUpperBytes());
+        assertThat(first.sha256()).isNotEqualTo(changedShape.sha256());
+    }
+
     private static BenchmarkReturnWorkBudgetDefinitions.OutputPlan plan(long nodes, int depth, int leafBytes, long stringBytes) {
         return new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(nodes, depth, leafBytes, stringBytes, 32, 24);
     }

@@ -112,6 +112,110 @@ class BenchmarkReturnWorkBudgetTest {
         }
     }
 
+    @Test void an_actual_reader_liveness_refusal_records_an_attempt_without_issuing_a_getter_or_clock() {
+        var getters = new AtomicInteger(); var clocks = new AtomicInteger();
+        var connection = (javax.management.MBeanServerConnection) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{javax.management.MBeanServerConnection.class},
+                (proxy, method, arguments) -> { getters.incrementAndGet(); throw new AssertionError("getter must remain unissued"); });
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "reader-guard")) {
+            var reader = new BenchmarkWriteReturnReader(new BenchmarkCausalClock.Identity(17, 1000), connection,
+                    () -> false, clocks::incrementAndGet);
+            assertThatThrownBy(() -> reader.clockSample(0)).isInstanceOf(AssertionError.class).hasMessageContaining("has exited");
+            var clock = row(scope.snapshot(), "CLOCK_REQUEST");
+            assertThat(clock).containsEntry("attempts", 1L).containsEntry("failedAttempts", 1L)
+                    .containsEntry("issuedRequests", 0L).containsEntry("completedRequests", 0L);
+            assertThat(map(clock, "actual")).containsEntry("requests", 0L);
+            assertThat(getters).hasValue(0); assertThat(clocks).hasValue(0);
+        }
+    }
+
+    @Test void an_issued_checked_service_retains_pending_then_the_same_primary_failure() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        var thrown = new AtomicReference<Throwable>(); IOException original = new IOException("controlled service refusal");
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "checked-service")) {
+            Thread worker = Thread.ofPlatform().daemon(true).start(() -> {
+                try {
+                    BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> {
+                        entered.countDown(); if (!release.await(2, TimeUnit.SECONDS)) { throw new AssertionError("release is missing"); }
+                        throw original;
+                    });
+                } catch (Throwable failure) { thrown.set(failure); }
+            });
+            try {
+                assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+                var pending = scope.snapshot();
+                assertThat(row(pending, "RUNTIME_READ")).containsEntry("issuedRequests", 1L).containsEntry("completedRequests", 0L);
+                assertThat(pending).containsEntry("pendingOperations", 1L);
+                release.countDown(); worker.join(2000); assertThat(worker.isAlive()).isFalse();
+                assertThat(thrown.get()).isSameAs(original); assertThat(scope.primaryCause()).isSameAs(original);
+                assertThat(row(scope.snapshot(), "RUNTIME_READ")).containsEntry("completedRequests", 1L).containsEntry("failedRequests", 1L);
+                assertThat(pending).containsEntry("pendingOperations", 1L);
+            } finally { release.countDown(); worker.join(2000); }
+        }
+    }
+
+    @Test void a_failed_first_return_mapper_does_not_fabricate_the_second_map_or_source_map() {
+        var owner = new BenchmarkCausalClock.Identity(17, 1000);
+        var target = BenchmarkWorkloadDefinitions.byId("copy").phase("cdc-update").targets().getFirst();
+        var row = new BenchmarkWriteReturnExpectations.Association(target, "1", 0, 150, 160,
+                1, 1, "pdk.state.bench_copy.sink", "orders", 1500, 2200, 2500, 2, true);
+        AssertionError primary = new AssertionError("controlled first point refusal"); var calls = new AtomicInteger();
+        BenchmarkReturnPointClock clock = (identity, point) -> { calls.incrementAndGet(); throw primary; };
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "mapper-failure")) {
+            assertThatThrownBy(() -> BenchmarkReturnTimeBounds.map(List.of(row), owner, clock)).isSameAs(primary);
+            assertThat(calls).hasValue(1); assertThat(scope.primaryCause()).isSameAs(primary);
+            assertThat(row(scope.snapshot(), "RETURN_MAP")).containsEntry("attempts", 1L).containsEntry("failedAttempts", 1L);
+            assertThat(row(scope.snapshot(), "SOURCE_MAP")).containsEntry("attempts", 0L);
+        }
+    }
+
+    @Test void p99_copy_failure_cannot_be_reported_as_two_completed_sorts() {
+        var input = new java.util.ArrayList<BenchmarkCausalClock.Interval>();
+        for (int index = 0; index < 10_000; index++) { input.add(new BenchmarkCausalClock.Interval(index, index + 1)); }
+        input.set(77, null);
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "sort-copy-failure")) {
+            assertThatThrownBy(() -> BenchmarkReturnTimeBounds.p99(input)).isInstanceOf(NullPointerException.class);
+            assertThat(row(scope.snapshot(), "SORT")).containsEntry("failedAttempts", 1L).containsEntry("issuedRequests", 0L);
+            assertThat(row(scope.snapshot(), "COPY")).containsEntry("failedRequests", 1L);
+        }
+    }
+
+    @Test void local_material_is_rejected_before_consumer_copy_and_never_claims_transport_allocation() {
+        var consumed = new AtomicInteger(); String oversized = "x".repeat(BenchmarkReturnWorkBudget.MAX_MATERIAL_LEAF_CHARACTERS + 1);
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "material-bound")) {
+            assertThatThrownBy(() -> {
+                BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, oversized);
+                consumed.incrementAndGet();
+            }).isInstanceOf(AssertionError.class);
+            var receipt = scope.snapshot(); assertThat(receipt).containsEntry("state", "UNKNOWN");
+            assertThat(row(receipt, "STREAM_ACCEPT")).containsEntry("gap", "LOCAL_CONSUMPTION_BOUND_UNAVAILABLE");
+            assertThat(map(receipt, "localMaterialBounds")).containsEntry("scope", "LOCAL_OBSERVER_CONSUMPTION_EXCLUDES_OPAQUE_RPC_ALLOCATION");
+            assertThat(consumed).hasValue(0);
+        }
+    }
+
+    @Test void all_three_self_counter_overflows_are_sticky_and_preserve_existing_primary_and_output() throws Exception {
+        for (String field : List.of("outputCloneBytes", "outputHashBytes", "outputTreeNodeVisits")) {
+            try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "self-overflow")) {
+                IOException primary = new IOException("existing primary"); scope.failed(primary);
+                var counter = scope.getClass().getDeclaredField(field); counter.setAccessible(true); counter.setLong(scope, Long.MAX_VALUE);
+                var prepared = prepare(scope); assertThat(prepared.bytes()).isNotEmpty();
+                var receipt = scope.snapshot(); assertThat(receipt).containsEntry("state", "UNKNOWN").containsEntry("selfOverflow", true);
+                assertThat(scope.primaryCause()).isSameAs(primary);
+                assertThat(map(receipt, "output")).containsEntry("state", "OUTPUT_PENDING");
+            }
+        }
+    }
+
+    @Test void source_byte_limit_is_a_prior_definition_input_and_not_the_observed_payload_size() {
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "prior-bytes")) {
+            assertThatThrownBy(() -> scope.requirePriorBytes(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, 100_001))
+                    .isInstanceOf(AssertionError.class);
+            assertThat(row(scope.snapshot(), "INPUT_FINGERPRINT")).containsEntry("attempts", 0L)
+                    .containsEntry("gap", "PRIOR_SOURCE_BYTE_LIMIT_MISSING_OR_EXCEEDED");
+        }
+    }
+
     private static BenchmarkReturnWorkBudget.Definition definition() {
         var perOperation = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
         for (var activity : BenchmarkReturnWorkBudget.Activity.values()) {

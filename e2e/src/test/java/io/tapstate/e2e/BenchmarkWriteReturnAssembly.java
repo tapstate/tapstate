@@ -60,14 +60,15 @@ final class BenchmarkWriteReturnAssembly {
     }
 
     void add(byte[] bytes) {
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.DECODE, BenchmarkReturnWorkBudget.Work.call());
         requireOpen();
         try {
             require(bytes != null && bytes.length <= MAX_PAGE_BYTES, "page exceeds its byte bound");
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.DECODE,
-                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, bytes.length, 1, 0, 0));
             int nextRawBytes = Math.addExact(rawBytes, bytes.length);
             require(nextRawBytes <= MAX_RAW_BYTES, "raw ledger exceeds its byte bound");
-            var page = BenchmarkWriteReturnLedger.decode(bytes);
+            var page = BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.DECODE, () -> BenchmarkWriteReturnLedger.decode(bytes));
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.DECODE,
+                    new BenchmarkReturnWorkBudget.Work(0, 0, 0, 0, bytes.length, 1, 0, 0));
             require(page.epoch() > 0 && window.equals(page.window()), "page has another capture window");
             require(page.cursor() == nextCursor, "completion cursor has a gap or replay");
             require(!seenPage || page.epoch() == epoch, "capture epoch changed");
@@ -75,16 +76,18 @@ final class BenchmarkWriteReturnAssembly {
             require(page.totalFrames() <= MAX_FRAMES, "frame roster exceeds its bound");
             if (!RECORDED.equals(page.state())) { unknownState = true; }
             for (var part : page.calls()) {
+                BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.FRAME_VISIT, () -> { addPart(part); return null; });
                 BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.FRAME_VISIT,
-                        new BenchmarkReturnWorkBudget.Work(1, 0, part.rows().size(), 1, 0, 1, part.rows().size(), 0));
-                addPart(part);
+                        new BenchmarkReturnWorkBudget.Work(0, 0, part.rows().size(), 1, 0, 1, part.rows().size(), 0));
             }
             seenPage = true;
             epoch = page.epoch();
             nextCursor = page.nextCursor();
             totalFrames = page.totalFrames();
             rawBytes = nextRawBytes;
+            BenchmarkReturnWorkBudget.done(work);
         } catch (AssertionError | RuntimeException invalid) {
+            BenchmarkReturnWorkBudget.failed(work, invalid);
             failed = true;
             throw refusal(invalid);
         }

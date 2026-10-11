@@ -16,20 +16,25 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
     private final BenchmarkReturnWorkBudget.Ticket workLifetime = BenchmarkReturnWorkBudget.begin(workScope,
             BenchmarkReturnWorkBudget.Activity.HELLO_CLIENT, BenchmarkReturnWorkBudget.Work.call());
     private final Runnable closeSource;
-    private final ScheduledThreadPoolExecutor worker = (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(1);
+    private final ScheduledThreadPoolExecutor worker = BenchmarkReturnWorkBudget.opaqueRequest(workScope,
+            BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(1));
     private final List<BenchmarkTargetClock.Reading> readings = new ArrayList<>();
     private Throwable failure;
     private boolean closed;
 
     static BenchmarkTargetClockSampler open(String uri) {
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
-        var client = MongoClients.create(uri);
+        var scope = BenchmarkReturnWorkBudget.current();
+        var client = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> MongoClients.create(uri));
         try {
             var admin = client.getDatabase("admin").withTimeout(1, TimeUnit.SECONDS);
             BenchmarkReturnWorkBudget.request(BenchmarkReturnWorkBudget.Activity.PING_REQUEST,
                     () -> admin.runCommand(new org.bson.Document("ping", 1)));
-            return new BenchmarkTargetClockSampler(() -> BenchmarkTargetClock.read(admin), client::close);
-        } catch (RuntimeException | Error failure) { client.close(); throw failure; }
+            return new BenchmarkTargetClockSampler(() -> BenchmarkTargetClock.read(admin),
+                    () -> BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { client.close(); return null; }));
+        } catch (RuntimeException | Error failure) {
+            BenchmarkReturnWorkBudget.failure(scope, failure);
+            client.close(); throw failure;
+        }
     }
 
     BenchmarkTargetClockSampler(Supplier<BenchmarkTargetClock.Reading> source, Runnable closeSource) {
@@ -50,6 +55,7 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
                 readings.add(next);
             }
         } catch (RuntimeException | Error problem) {
+            BenchmarkReturnWorkBudget.failure(workScope, problem);
             synchronized (this) { if (failure == null) { failure = problem; } }
         }
     }
@@ -85,9 +91,11 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
             worker.shutdownNow(); Thread.currentThread().interrupt();
             throw new AssertionError("target clock sampling shutdown was interrupted", interrupted);
         } finally {
-            closeSource.run();
-            if (closed) { BenchmarkReturnWorkBudget.done(workLifetime); }
-            else { BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.HELLO_CLIENT, "WORKER_TERMINATION_NOT_OBSERVED"); }
+            try { BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { closeSource.run(); return null; }); }
+            finally {
+                if (closed) { BenchmarkReturnWorkBudget.done(workLifetime); }
+                else { BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.HELLO_CLIENT, "WORKER_TERMINATION_NOT_OBSERVED"); }
+            }
         }
     }
 }

@@ -46,40 +46,60 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     static BenchmarkProcessProbe open(long pid) {
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
+        var scope = BenchmarkReturnWorkBudget.current();
+        var opening = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
         if (pid <= 0) {
-            throw new IllegalArgumentException("a child JVM PID must be positive");
+            var invalid = new IllegalArgumentException("a child JVM PID must be positive");
+            BenchmarkReturnWorkBudget.failed(opening, invalid); throw invalid;
         }
-        ProcessHandle child = ProcessHandle.of(pid).orElse(null);
-        if (child == null || !child.isAlive()) {
+        ProcessHandle child = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO,
+                () -> ProcessHandle.of(pid).orElse(null));
+        if (child == null || !BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive)) {
+            BenchmarkReturnWorkBudget.done(opening);
             return new BenchmarkProcessProbe(pid, null, null, null);
         }
 
         VirtualMachine attached = null;
         JMXConnector jmx = null;
         MBeanServerConnection connection = null;
+        BenchmarkReturnWorkBudget.Ticket attaching = null;
         try {
+            attaching = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
+            BenchmarkReturnWorkBudget.issued(attaching);
             attached = VirtualMachine.attach(Long.toString(pid));
-            String address = attached.getAgentProperties().getProperty(
+            BenchmarkReturnWorkBudget.done(attaching);
+            VirtualMachine actualAttached = attached;
+            var properties = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, actualAttached::getAgentProperties);
+            BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ,
+                    BenchmarkReturnWorkBudget.material(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, properties));
+            String address = properties.getProperty(
                     "com.sun.management.jmxremote.localConnectorAddress");
             if (address == null || address.isBlank()) {
-                address = attached.startLocalManagementAgent();
+                address = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                        actualAttached::startLocalManagementAgent);
             }
-            jmx = JMXConnectorFactory.connect(new JMXServiceURL(address));
-            connection = jmx.getMBeanServerConnection();
+            JMXServiceURL actualAddress = new JMXServiceURL(address);
+            jmx = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                    () -> JMXConnectorFactory.connect(actualAddress));
+            JMXConnector actualJmx = jmx;
+            connection = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.REGISTRATION_READ,
+                    actualJmx::getMBeanServerConnection);
         } catch (AttachNotSupportedException | IOException | SecurityException e) {
-            closeQuietly(jmx);
+            BenchmarkReturnWorkBudget.failed(attaching, e); BenchmarkReturnWorkBudget.failed(opening, e);
+            closeQuietly(jmx, scope);
             jmx = null;
             connection = null;
         } finally {
             if (attached != null) {
                 try {
-                    attached.detach();
+                    VirtualMachine actualAttached = attached;
+                    BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { actualAttached.detach(); return null; });
                 } catch (IOException ignored) {
                     // A live JMX connection remains usable after the attach transport closes.
                 }
             }
         }
+        BenchmarkReturnWorkBudget.done(opening);
         return new BenchmarkProcessProbe(pid, child, jmx, connection);
     }
 
@@ -92,34 +112,27 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             throw new AssertionError("owned return probe has no verified resource runtime");
         }
         return new BenchmarkWriteReturnReader(new BenchmarkCausalClock.Identity(ownedPid, start),
-                connection, child::isAlive, io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime);
+                connection, () -> BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive), io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime);
     }
 
     /** Retains runtime identity through the existing resource connection before the measured window. */
     Map<String, Object> runtimeEvidence() {
         BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.call());
         long before = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
-        boolean aliveBefore = child != null && child.isAlive();
+        boolean aliveBefore = child != null && BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive);
         if (!aliveBefore || connection == null) {
             return Map.of("status", "UNKNOWN", "reason", "OWNED_RUNTIME_UNAVAILABLE", "ownedPid", ownedPid);
         }
         try {
-            RuntimeMXBean runtime = ManagementFactory.newPlatformMXBeanProxy(
-                    connection, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
-            long actualPid = runtime.getPid();
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
-            long startMillis = runtime.getStartTime();
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
-            List<String> arguments = runtime.getInputArguments();
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
-            String vmName = runtime.getVmName();
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
-            String vmVersion = runtime.getVmVersion();
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
-            String vmVendor = runtime.getVmVendor();
+            RuntimeMXBean runtime = runtimeProxy();
+            long actualPid = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getPid);
+            long startMillis = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getStartTime);
+            List<String> arguments = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getInputArguments);
+            String vmName = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getVmName);
+            String vmVersion = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getVmVersion);
+            String vmVendor = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getVmVendor);
             Map<String, String> version = Map.of("vmName", vmName, "vmVersion", vmVersion, "vmVendor", vmVendor);
-            boolean aliveAfter = child.isAlive();
+            boolean aliveAfter = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive);
             if (actualPid != ownedPid || startMillis <= 0 || !aliveAfter || arguments.size() > 128
                     || arguments.stream().anyMatch(value -> value.length() > 16384)
                     || arguments.stream().mapToLong(value -> 4L * value.length() + 16).sum() > 2L * 1024 * 1024 - 4096
@@ -168,7 +181,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
 
     /** Uses the already owned connection, without changing the ordinary four-resource sample. */
     CompilationReading compilationRead() {
-        if (child == null || !child.isAlive()) {
+        if (child == null || !BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive)) {
             return unknownCompilation(null, null, CompilationUnknownReason.CHILD_EXITED, null);
         }
         if (connection == null) {
@@ -180,8 +193,8 @@ final class BenchmarkProcessProbe implements AutoCloseable {
                     access.unknownReason(), access.failureType());
         }
         try {
-            long millis = access.compiler().getTotalCompilationTime();
-            if (!child.isAlive()) {
+            long millis = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, access.compiler()::getTotalCompilationTime);
+            if (!BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive)) {
                 return unknownCompilation(access.compilerName(), true, CompilationUnknownReason.CHILD_EXITED, null);
             }
             if (millis < 0) {
@@ -200,16 +213,15 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         String name = null;
         Boolean supported = null;
         try {
-            RuntimeMXBean runtime = ManagementFactory.newPlatformMXBeanProxy(
-                    connection, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
-            if (runtime.getPid() != ownedPid) {
+            RuntimeMXBean runtime = runtimeProxy();
+            if (BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getPid) != ownedPid) {
                 compilationAccess = new CompilationAccess(null, null, null,
                         CompilationUnknownReason.OWNED_PID_MISMATCH, null);
             } else {
-                CompilationMXBean compiler = ManagementFactory.newPlatformMXBeanProxy(
-                        connection, ManagementFactory.COMPILATION_MXBEAN_NAME, CompilationMXBean.class);
-                name = compiler.getName();
-                supported = compiler.isCompilationTimeMonitoringSupported();
+                CompilationMXBean compiler = BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.REGISTRATION_READ,
+                        () -> ManagementFactory.newPlatformMXBeanProxy(connection, ManagementFactory.COMPILATION_MXBEAN_NAME, CompilationMXBean.class));
+                name = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, compiler::getName);
+                supported = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, compiler::isCompilationTimeMonitoringSupported);
                 CompilationUnknownReason reason = name == null || name.isBlank()
                         ? CompilationUnknownReason.INVALID_COMPILER_NAME
                         : supported ? CompilationUnknownReason.NONE : CompilationUnknownReason.MONITORING_UNSUPPORTED;
@@ -240,7 +252,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             @Override public long ownedPid() { return ownedPid; }
 
             private void requireConnection() {
-                if (connection == null || child == null || !child.isAlive()) {
+                if (connection == null || child == null || !BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive)) {
                     throw new IllegalStateException("owned JVM thread readings are unavailable");
                 }
             }
@@ -249,8 +261,8 @@ final class BenchmarkProcessProbe implements AutoCloseable {
                 requireConnection();
                 if (threads == null) {
                     try {
-                        threads = ManagementFactory.newPlatformMXBeanProxy(connection,
-                                ManagementFactory.THREAD_MXBEAN_NAME, com.sun.management.ThreadMXBean.class);
+                        threads = BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.REGISTRATION_READ,
+                                () -> ManagementFactory.newPlatformMXBeanProxy(connection, ManagementFactory.THREAD_MXBEAN_NAME, com.sun.management.ThreadMXBean.class));
                     } catch (IOException failure) { throw new UncheckedIOException(failure); }
                 }
                 return threads;
@@ -260,26 +272,28 @@ final class BenchmarkProcessProbe implements AutoCloseable {
                 requireConnection();
                 if (runtime == null) {
                     try {
-                        runtime = ManagementFactory.newPlatformMXBeanProxy(connection,
-                                ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
+                        runtime = runtimeProxy();
                     } catch (IOException failure) { throw new UncheckedIOException(failure); }
                 }
-                return new BenchmarkThreadPointDiagnostics.Identity(runtime.getPid(), runtime.getStartTime(), child.isAlive());
+                return new BenchmarkThreadPointDiagnostics.Identity(
+                        BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getPid),
+                        BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, runtime::getStartTime), BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive));
             }
 
             @Override public BenchmarkThreadPointDiagnostics.CpuCapability cpuCapability() {
-                boolean supported = threads().isThreadCpuTimeSupported();
+                boolean supported = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> threads().isThreadCpuTimeSupported());
                 return new BenchmarkThreadPointDiagnostics.CpuCapability(supported,
-                        supported ? threads().isThreadCpuTimeEnabled() : null);
+                        supported ? BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> threads().isThreadCpuTimeEnabled()) : null);
             }
 
-            @Override public long[] threadIds() { return threads().getAllThreadIds(); }
+            @Override public long[] threadIds() { return BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> threads().getAllThreadIds()); }
 
-            @Override public long[] cpuNanos(long[] ids) { return threads().getThreadCpuTime(ids); }
+            @Override public long[] cpuNanos(long[] ids) { return BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> threads().getThreadCpuTime(ids)); }
 
             @Override public List<BenchmarkThreadPointDiagnostics.ThreadRow> threadInfo(long[] ids, int maxDepth) {
                 if (maxDepth < 0 || maxDepth > 64) { throw new IllegalArgumentException("thread point depth is outside its bound"); }
-                ThreadInfo[] actual = threads().getThreadInfo(ids, maxDepth);
+                ThreadInfo[] actual = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> threads().getThreadInfo(ids, maxDepth));
+                BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, "THREAD_PAYLOAD_LOCAL_SHAPE_FORMULA_UNAVAILABLE");
                 var result = new ArrayList<BenchmarkThreadPointDiagnostics.ThreadRow>(actual.length);
                 for (ThreadInfo info : actual) {
                     if (info == null) { result.add(null); continue; }
@@ -305,11 +319,10 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     Snapshot sample() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, BenchmarkReturnWorkBudget.Work.request());
-        if (child == null || !child.isAlive()) {
+        if (child == null || !BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive)) {
             return unavailable();
         }
-        OptionalLong cpu = child.info().totalCpuDuration().stream()
+        OptionalLong cpu = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::info).totalCpuDuration().stream()
                 .mapToLong(Duration::toNanos).findFirst();
         if (cpu.isEmpty()) {
             cpu = jmxCpu();
@@ -318,15 +331,13 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     private OptionalLong jmxCpu() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CPU_FALLBACK, BenchmarkReturnWorkBudget.Work.request());
         if (connection == null) {
             return OptionalLong.empty();
         }
         try {
-            com.sun.management.OperatingSystemMXBean operatingSystem = ManagementFactory.newPlatformMXBeanProxy(
-                    connection, ManagementFactory.OPERATING_SYSTEM_MXBEAN_NAME,
-                    com.sun.management.OperatingSystemMXBean.class);
-            long nanos = operatingSystem.getProcessCpuTime();
+            com.sun.management.OperatingSystemMXBean operatingSystem = BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.REGISTRATION_READ,
+                    () -> ManagementFactory.newPlatformMXBeanProxy(connection, ManagementFactory.OPERATING_SYSTEM_MXBEAN_NAME, com.sun.management.OperatingSystemMXBean.class));
+            long nanos = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.CPU_FALLBACK, operatingSystem::getProcessCpuTime);
             return nanos >= 0 ? OptionalLong.of(nanos) : OptionalLong.empty();
         } catch (IOException | RuntimeException e) {
             return OptionalLong.empty();
@@ -334,14 +345,13 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     private OptionalLong heapUsed() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.HEAP_READ, BenchmarkReturnWorkBudget.Work.request());
         if (connection == null) {
             return OptionalLong.empty();
         }
         try {
-            MemoryMXBean heap = ManagementFactory.newPlatformMXBeanProxy(
-                    connection, ManagementFactory.MEMORY_MXBEAN_NAME, MemoryMXBean.class);
-            long used = heap.getHeapMemoryUsage().getUsed();
+            MemoryMXBean heap = BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.REGISTRATION_READ,
+                    () -> ManagementFactory.newPlatformMXBeanProxy(connection, ManagementFactory.MEMORY_MXBEAN_NAME, MemoryMXBean.class));
+            long used = BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.HEAP_READ, heap::getHeapMemoryUsage).getUsed();
             return used >= 0 ? OptionalLong.of(used) : OptionalLong.empty();
         } catch (IOException | RuntimeException e) {
             return OptionalLong.empty();
@@ -354,15 +364,15 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         }
         try {
             List<GarbageCollectorMXBean> collectors =
-                    ManagementFactory.getPlatformMXBeans(connection, GarbageCollectorMXBean.class);
+                    BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.GC_ROSTER,
+                            () -> ManagementFactory.getPlatformMXBeans(connection, GarbageCollectorMXBean.class));
             BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.GC_ROSTER, BenchmarkReturnWorkBudget.Work.pass(collectors.size()));
             if (collectors.isEmpty()) {
                 return OptionalLong.empty();
             }
             long total = 0;
             for (GarbageCollectorMXBean collector : collectors) {
-                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.GC_READ, BenchmarkReturnWorkBudget.Work.request());
-                long elapsed = collector.getCollectionTime();
+                long elapsed = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.GC_READ, collector::getCollectionTime);
                 if (elapsed < 0) {
                     return OptionalLong.empty();
                 }
@@ -375,23 +385,33 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     private OptionalLong rss() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, BenchmarkReturnWorkBudget.Work.request());
         Process command;
         try {
-            command = new ProcessBuilder("ps", "-o", "rss=", "-p", Long.toString(child.pid()))
-                    .redirectErrorStream(true).start();
+            command = BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS,
+                    () -> new ProcessBuilder("ps", "-o", "rss=", "-p", Long.toString(child.pid())).redirectErrorStream(true).start());
         } catch (IOException | SecurityException e) {
             return OptionalLong.empty();
         }
         try {
-            if (!command.waitFor(PS_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
-                command.destroyForcibly();
+            if (!BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS,
+                    () -> command.waitFor(PS_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))) {
+                BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, command::destroyForcibly);
+                BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, "RSS_EXIT_NOT_OBSERVED_AFTER_ABORT");
                 return OptionalLong.empty();
             }
-            if (command.exitValue() != 0) {
+            if (BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, command::exitValue) != 0) {
                 return OptionalLong.empty();
             }
-            String output = new String(command.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            var input = command.getInputStream();
+            byte[] raw = BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS,
+                    () -> workScope == null ? input.readAllBytes() : input.readNBytes(BenchmarkReturnWorkBudget.MAX_MATERIAL_LEAF_CHARACTERS + 1));
+            if (workScope != null) {
+                BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { input.close(); return null; });
+            }
+            if (workScope != null && raw.length > BenchmarkReturnWorkBudget.MAX_MATERIAL_LEAF_CHARACTERS) {
+                BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, "RSS_LOCAL_RESPONSE_BOUND_EXCEEDED"); return OptionalLong.empty();
+            }
+            String output = new String(raw, StandardCharsets.UTF_8).trim();
             BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, BenchmarkReturnWorkBudget.Work.bytes(Math.multiplyExact(4L, output.length())));
             if (!output.matches("[0-9]+")) {
                 return OptionalLong.empty();
@@ -401,10 +421,16 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         } catch (IOException | NumberFormatException | ArithmeticException e) {
             return OptionalLong.empty();
         } catch (InterruptedException e) {
-            command.destroyForcibly();
+            BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, command::destroyForcibly);
+            BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, "RSS_EXIT_NOT_OBSERVED_AFTER_ABORT");
             Thread.currentThread().interrupt();
             return OptionalLong.empty();
         }
+    }
+
+    private RuntimeMXBean runtimeProxy() throws IOException {
+        return BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.REGISTRATION_READ,
+                () -> ManagementFactory.newPlatformMXBeanProxy(connection, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class));
     }
 
     private static Snapshot unavailable() {
@@ -413,14 +439,13 @@ final class BenchmarkProcessProbe implements AutoCloseable {
 
     @Override
     public void close() {
-        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.request());
-        closeQuietly(jmx);
+        closeQuietly(jmx, workScope);
     }
 
-    private static void closeQuietly(JMXConnector connector) {
+    private static void closeQuietly(JMXConnector connector, BenchmarkReturnWorkBudget.Scope scope) {
         if (connector != null) {
             try {
-                connector.close();
+                BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { connector.close(); return null; });
             } catch (IOException ignored) {
                 // Connection loss only makes subsequent readings unavailable.
             }

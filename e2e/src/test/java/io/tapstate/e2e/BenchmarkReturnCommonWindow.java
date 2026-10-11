@@ -26,10 +26,13 @@ final class BenchmarkReturnCommonWindow {
     }
 
     static Map<String, Object> evidence(List<BenchmarkReturnTimeBounds.Delivery> completeCohort) {
+        return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW, () -> boundedEvidence(completeCohort));
+    }
+
+    private static Map<String, Object> boundedEvidence(List<BenchmarkReturnTimeBounds.Delivery> completeCohort) {
         require(completeCohort != null && !completeCohort.isEmpty() && completeCohort.size() <= MAX_ROWS,
                 "complete bounded cohort is required");
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW,
-                BenchmarkReturnWorkBudget.Work.pass(completeCohort.size()));
+        var scope = BenchmarkReturnWorkBudget.current();
         var calls = new LinkedHashMap<Long, Call>();
         var targets = new LinkedHashMap<String, List<Call>>();
         var keys = new HashSet<TargetKey>();
@@ -49,6 +52,7 @@ final class BenchmarkReturnCommonWindow {
                         "one full call has inconsistent target or return bounds");
             }
             require(++call.weight <= MAX_CALL_ROWS, "one call exceeds its native row bound");
+            BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW, BenchmarkReturnWorkBudget.Work.records(1));
         }
 
         long startLower = Long.MIN_VALUE, startUpper = Long.MIN_VALUE;
@@ -71,9 +75,6 @@ final class BenchmarkReturnCommonWindow {
                     "lastBoundsNanos", List.of(lastLower, lastUpper)));
         }
         var out = new LinkedHashMap<String, Object>();
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW,
-                new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 10,
-                        Math.addExact(Math.multiplyExact((long) calls.size(), calls.size()), Math.multiplyExact(10L, calls.size())), 0));
         out.put("performanceAcceptanceEligible", false);
         out.put("samplingCostQualified", false);
         out.put("membershipRule", "ORIGINAL_OPEN_LOWER_CLOSED_UPPER_COMMON_TARGET_INTERVAL");
@@ -91,12 +92,20 @@ final class BenchmarkReturnCommonWindow {
         for (Call call : calls.values()) {
             long lower = call.returned.lowerNanos(), upper = call.returned.upperNanos();
             // A call is always at or before its own target's maximum; only other targets constrain the closed end.
-            boolean beforeOtherEnds = targetLastLower.entrySet().stream().allMatch(target ->
-                    target.getKey().equals(call.target) || upper <= target.getValue());
+            boolean beforeOtherEnds = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW,
+                    () -> targetLastLower.entrySet().stream().allMatch(target -> {
+                        boolean matches = target.getKey().equals(call.target) || upper <= target.getValue();
+                        if (scope != null) { BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW, BenchmarkReturnWorkBudget.Work.pass(1)); }
+                        return matches;
+                    }));
             boolean definite = lower > startUpper && beforeOtherEnds;
             boolean possible = upper > startLower && lower <= endUpper;
-            boolean ownLatest = targets.get(call.target).stream().allMatch(other ->
-                    other == call || lower >= other.returned.upperNanos());
+            boolean ownLatest = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW,
+                    () -> targets.get(call.target).stream().allMatch(other -> {
+                        boolean matches = other == call || lower >= other.returned.upperNanos();
+                        if (scope != null) { BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW, BenchmarkReturnWorkBudget.Work.pass(1)); }
+                        return matches;
+                    }));
             // Such a call is the common-end variable itself, preserving the inclusive final bin.
             boolean atCommonEnd = ownLatest && beforeOtherEnds;
             if (definite) { completedLower += call.weight; }
@@ -115,6 +124,7 @@ final class BenchmarkReturnCommonWindow {
                 if (definite && definitelyAbove && definitelyBelow) { binLower[bin] += call.weight; }
                 if (possible && possiblyAbove && possiblyBelow) { binUpper[bin] += call.weight; }
             }
+            if (scope != null) { BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW, BenchmarkReturnWorkBudget.Work.pass(BINS)); }
         }
         var bins = new ArrayList<Map<String, Object>>(BINS);
         boolean everyBinProgress = true;

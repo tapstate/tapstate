@@ -96,7 +96,7 @@ final class BenchmarkOwnedProcessReceipt {
         Map<String, Object> safeBindings = safeMap(bindings, 0);
         String sha = null; long size = -1;
         try {
-            size = Files.size(application); sha = hashFile(application, size);
+            size = BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, () -> Files.size(application)); sha = hashFile(application, size);
             int at = command.indexOf("-jar");
             if (at < 0 || at + 1 >= command.size()
                     || !Path.of(command.get(at + 1)).toAbsolutePath().normalize().equals(application)) {
@@ -207,7 +207,7 @@ final class BenchmarkOwnedProcessReceipt {
             catch (IllegalThreadStateException unavailable) { reasons.add("OWNED_EXIT_OUTCOME_UNAVAILABLE"); }
         }
         try {
-            if (applicationSha256 == null || Files.size(application) != applicationBytes
+            if (applicationSha256 == null || BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, () -> Files.size(application)) != applicationBytes
                     || !applicationSha256.equals(hashFile(application, applicationBytes))) {
                 reasons.add("APPLICATION_CHANGED_OR_UNAVAILABLE_AFTER_CLOSE");
             }
@@ -263,13 +263,22 @@ final class BenchmarkOwnedProcessReceipt {
     }
 
     static Snapshot read(long pid) {
+        var scope = BenchmarkReturnWorkBudget.current();
         try {
-            var handle = ProcessHandle.of(pid);
+            var handle = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, () -> ProcessHandle.of(pid));
             if (handle.isEmpty()) { return new Snapshot(pid, null, null, null, false, "HANDLE_UNAVAILABLE"); }
-            ProcessHandle process = handle.orElseThrow(); var info = process.info();
-            return new Snapshot(pid, info.startInstant().orElse(null), info.command().orElse(null),
-                    info.arguments().map(java.util.Arrays::asList).orElse(null), process.isAlive(), null);
+            ProcessHandle process = handle.orElseThrow();
+            var info = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, process::info);
+            var started = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, info::startInstant);
+            var command = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, info::command);
+            if (command.isPresent()) { BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, command.orElseThrow()); }
+            var arguments = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, info::arguments);
+            if (arguments.isPresent()) { BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, arguments.orElseThrow()); }
+            return new Snapshot(pid, started.orElse(null), command.orElse(null),
+                    arguments.map(java.util.Arrays::asList).orElse(null),
+                    BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, process::isAlive), null);
         } catch (RuntimeException | AssertionError unavailable) {
+            BenchmarkReturnWorkBudget.failure(scope, unavailable);
             return new Snapshot(pid, null, null, null, false, unavailable.getClass().getSimpleName());
         }
     }
@@ -277,19 +286,21 @@ final class BenchmarkOwnedProcessReceipt {
     private static boolean sameExecutable(String actual, String expected) {
         try {
             Path a = Path.of(actual).toAbsolutePath().normalize(), b = Path.of(expected).toAbsolutePath().normalize();
-            return a.equals(b) || a.toRealPath().equals(b.toRealPath());
+            return a.equals(b) || BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, a::toRealPath)
+                    .equals(BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, b::toRealPath));
         } catch (Exception unavailable) { return false; }
     }
 
     private static Map<String, Object> driverRuntime() {
         Map<String, Object> out = new LinkedHashMap<>();
         for (String key : List.of("java.version", "java.vendor", "java.vm.name", "java.vm.version", "os.name", "os.arch", "os.version")) {
-            String value = System.getProperty(key); bounded(value); out.put(key, value);
+            String value = BenchmarkReturnWorkBudget.request(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> System.getProperty(key)); bounded(value); out.put(key, value);
         }
-        out.put("jvmInputArguments", sanitizedArguments(ManagementFactory.getRuntimeMXBean().getInputArguments()));
+        out.put("jvmInputArguments", sanitizedArguments(BenchmarkReturnWorkBudget.request(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.RUNTIME_READ,
+                () -> ManagementFactory.getRuntimeMXBean().getInputArguments())));
         Map<String, Object> env = new LinkedHashMap<>();
         for (String key : List.of("LANG", "LC_ALL", "LC_CTYPE", "TZ")) {
-            String value = System.getenv(key); bounded(value); env.put(key, value);
+            String value = BenchmarkReturnWorkBudget.request(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> System.getenv(key)); bounded(value); env.put(key, value);
         }
         out.put("whitelistedEnvironment", Collections.unmodifiableMap(env));
         return Collections.unmodifiableMap(out);
@@ -297,6 +308,7 @@ final class BenchmarkOwnedProcessReceipt {
 
     static List<String> sanitizedArguments(List<String> arguments) {
         boundedArguments(arguments);
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(arguments.size()));
         List<String> out = new ArrayList<>(); boolean path = false;
         for (int at = 0; at < arguments.size(); at++) {
             String value = arguments.get(at);
@@ -331,6 +343,7 @@ final class BenchmarkOwnedProcessReceipt {
     }
 
     private static Map<String, Object> safeMap(Map<String, ?> input, int depth) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(input.size()));
         require(depth <= 4, "binding depth exceeded"); Map<String, Object> out = new LinkedHashMap<>();
         input.forEach((key, value) -> {
             if (value instanceof Map<?, ?> map) {
@@ -345,27 +358,47 @@ final class BenchmarkOwnedProcessReceipt {
     }
 
     private static String hashFile(Path path, long size) throws Exception {
-        require(size >= 0 && Files.isRegularFile(path), "application must be a sized regular file");
-        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
-                new BenchmarkReturnWorkBudget.Work(1, 1, 0, 0, Math.addExact(size, 1), 1, 0, 0));
-        MessageDigest digest = MessageDigest.getInstance("SHA-256"); byte[] buffer = new byte[65536]; long remaining = size;
-        try (InputStream input = Files.newInputStream(path)) {
-            while (remaining > 0) {
-                int count = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
-                if (count < 0) { throw new AssertionError("application changed during hashing"); }
-                digest.update(buffer, 0, count); remaining -= count;
+        var scope = BenchmarkReturnWorkBudget.current();
+        require(size >= 0 && BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                () -> Files.isRegularFile(path)), "application must be a sized regular file");
+        if (scope != null) { scope.requirePriorBytes(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, Math.addExact(size, 1)); }
+        MessageDigest digest = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                () -> MessageDigest.getInstance("SHA-256"));
+        byte[] buffer = new byte[65536]; long remaining = size;
+        InputStream actual = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, () -> Files.newInputStream(path));
+        try (InputStream input = scope == null ? actual : new java.io.FilterInputStream(actual) {
+            @Override public void close() throws java.io.IOException {
+                BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { super.close(); return null; });
             }
-            require(input.read() == -1 && Files.size(path) == size, "application changed during hashing");
+        }) {
+            while (remaining > 0) {
+                int wanted = (int) Math.min(buffer.length, remaining);
+                int count = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        () -> input.read(buffer, 0, wanted));
+                if (count < 0) { throw new AssertionError("application changed during hashing"); }
+                BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        () -> { digest.update(buffer, 0, count); return null; });
+                BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        new BenchmarkReturnWorkBudget.Work(0, 0, 0, 0, Math.multiplyExact(2L, count), 2, count, 0));
+                remaining -= count;
+            }
+            require(BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, input::read) == -1
+                    && BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, () -> Files.size(path)) == size,
+                    "application changed during hashing");
         }
-        return HexFormat.of().formatHex(digest.digest());
+        return HexFormat.of().formatHex(BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, digest::digest));
     }
 
     private static String digestArguments(List<String> values) {
+        boundedArguments(values); var scope = BenchmarkReturnWorkBudget.current();
+        BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, BenchmarkReturnWorkBudget.Work.pass(values.size()));
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             for (String value : values) {
                 byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
                 digest.update(java.nio.ByteBuffer.allocate(4).putInt(bytes.length).array()); digest.update(bytes);
+                BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        new BenchmarkReturnWorkBudget.Work(0, 2, 0, 0, Math.addExact(4L, bytes.length), 1, bytes.length, 0));
             }
             return HexFormat.of().formatHex(digest.digest());
         } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
@@ -378,6 +411,7 @@ final class BenchmarkOwnedProcessReceipt {
     }
     private static void bounded(String value) { require(value == null || value.length() <= MAX_STRING, "string bound exceeded"); }
     private static long boundedValue(Object value, int depth) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.BOOKKEEPING, BenchmarkReturnWorkBudget.Work.pass(1));
         require(depth <= 8, "receipt depth exceeded"); long bytes = 32;
         if (value == null || value instanceof Number || value instanceof Boolean) { return 16; }
         if (value instanceof String text) { bounded(text); return 4L * text.length() + 16; }

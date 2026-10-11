@@ -26,10 +26,51 @@ final class BenchmarkReturnWorkBudgetDefinitions {
             long structuralAndNumbers = Math.multiplyExact(nodeUpper, Math.addExact(8L, numberTextUpper));
             return Math.addExact(structuralAndNumbers, Math.multiplyExact(6L, stringUtf8Upper));
         }
+
+        String sha256() {
+            String value = "OUTPUT_TREE_PLAN_V1:" + nodeUpper + ":" + depthUpper + ":" + leafUtf8Upper + ":"
+                    + stringUtf8Upper + ":" + keyUtf8Upper + ":" + numberTextUpper;
+            try {
+                var scope = BenchmarkReturnWorkBudget.current();
+                if (scope != null) { scope.add(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, value.length(), 1, value.length(), 0)); }
+                return BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        () -> java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                                .digest(value.getBytes(StandardCharsets.US_ASCII))));
+            } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        }
     }
 
     record CheckedTree(long nodes, long stringUtf8Bytes, long primitiveElements, long transientUtf8CopyUpperBytes) { }
     record FrozenTree(Object value, CheckedTree work) { }
+
+    record ProducerInput(String runId, String inputSha256, BenchmarkReturnWorkBudget.Work independentlyRegisteredUpper,
+                         long connectorHashBytes, int runtimeArguments, long runtimeArgumentBytes) {
+        ProducerInput {
+            require(runId != null && !runId.isEmpty() && runId.length() <= 128
+                            && runId.chars().allMatch(c -> c >= 32 && c <= 126)
+                            && inputSha256 != null && inputSha256.matches("[a-f0-9]{64}")
+                            && independentlyRegisteredUpper != null, "producer input registration is missing");
+            require(connectorHashBytes >= 1 && connectorHashBytes <= 128L * 1024 * 1024
+                            && runtimeArguments >= 0 && runtimeArguments <= 128
+                            && runtimeArgumentBytes >= 0 && runtimeArgumentBytes <= 2093056,
+                    "producer material registration exceeds the source caps");
+        }
+
+        String encoded() {
+            var input = new java.util.LinkedHashMap<String, Object>();
+            input.put("schemaVersion", 1); input.put("definitionId", "WRITE_RETURN_PRODUCER_WORK_V1");
+            input.put("sourceFormulaSha256", BenchmarkReturnWorkBudgetProducerSeal.FORMULA_SHA256);
+            input.put("inputSha256", inputSha256); input.put("runId", runId);
+            input.put("limits", independentlyRegisteredUpper.evidence());
+            input.put("materialLimits", Map.of("connectorHashBytes", connectorHashBytes, "runtimeArguments", runtimeArguments,
+                    "runtimeArgumentBytes", runtimeArgumentBytes, "primaryKeys", 2));
+            var tree = freezeOutputTree(input, new OutputPlan(128, 4, 1024, 8192, 128, 24));
+            byte[] raw = io.tapstate.core.common.JsonWriter.write(tree.value()).getBytes(StandardCharsets.US_ASCII);
+            require(raw.length <= 16384, "producer input encoding exceeds its fixed transport cap");
+            return java.util.Base64.getEncoder().encodeToString(raw);
+        }
+    }
 
     /** Validate the supplied bounded tree before a JSON writer is allowed to allocate its output buffer. */
     static CheckedTree requireOutputTree(Object tree, OutputPlan prior) {

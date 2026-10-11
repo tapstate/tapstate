@@ -154,13 +154,14 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
                     || retainedPageBytes + bytes.length > 2 * 1024 * 1024) {
                 throw new AssertionError("owned return capture page exceeds its retention bound");
             }
+            retainedPages.add(BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.BASE64,
+                    () -> java.util.Base64.getEncoder().encodeToString(bytes)));
             BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.BASE64,
-                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, bytes.length, 1, bytes.length, 0));
-            retainedPages.add(java.util.Base64.getEncoder().encodeToString(bytes));
+                    new BenchmarkReturnWorkBudget.Work(0, 0, 0, 0, bytes.length, 1, bytes.length, 0));
             retainedPageBytes += bytes.length;
+            var page = BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.DECODE, () -> BenchmarkWriteReturnLedger.decode(bytes));
             BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.DECODE,
-                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, bytes.length, 1, 0, 0));
-            var page = BenchmarkWriteReturnLedger.decode(bytes);
+                    new BenchmarkReturnWorkBudget.Work(0, 0, 0, 0, bytes.length, 1, 0, 0));
             if (page.epoch() != epoch) { throw new AssertionError("owned return capture epoch changed after start"); }
             int headerBytes = 32 + page.window().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
                     + page.state().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
@@ -178,11 +179,9 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         var calls = assembly.finish(summary.completedCalls(), summary.reportedRecords());
         var clock = new BenchmarkCausalClock(samples.getFirst().identity(), samples);
         for (var call : calls) {
-            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK,
-                    new BenchmarkReturnWorkBudget.Work(3, 0, 0, 0, 0, 1, 3, 0));
-            clock.map(samples.getFirst().identity(), call.beganNanos());
-            clock.map(samples.getFirst().identity(), call.lastCallbackExitNanos());
-            clock.map(samples.getFirst().identity(), call.observedNanos());
+            BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK, () -> clock.map(samples.getFirst().identity(), call.beganNanos()));
+            BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK, () -> clock.map(samples.getFirst().identity(), call.lastCallbackExitNanos()));
+            BenchmarkReturnWorkBudget.operation(workScope, BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK, () -> clock.map(samples.getFirst().identity(), call.observedNanos()));
         }
         if (costStageDiagnostics) {
             try { terminalCostStages = access.costStages(epoch, window, summary.completedCalls()); }
