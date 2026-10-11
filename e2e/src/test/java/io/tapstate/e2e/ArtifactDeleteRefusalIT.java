@@ -7,9 +7,14 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -82,6 +87,38 @@ class ArtifactDeleteRefusalIT {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void anInlineViewProtectsItsManagedStoreThroughBothDeleteRoutes(Tiers tier, @TempDir Path directory)
+            throws Exception {
+        try (ServerHandle server = tier.launch(storeUri("delete_managed_view_store", tier))) {
+            ControlPlane control = connected(server, directory);
+            control.apply(viewWorkspace());
+            ControlPlane.StoredArtifact before = control.artifact("views").orElseThrow();
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+            // Pin the existing diagnostic projection of each public route.
+            Map<String, String> inUseCodes = Map.of("sources", "source.in-use", "artifacts", IN_USE);
+
+            for (String kind : List.of("sources", "artifacts")) {
+                HttpRequest request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/" + kind + "/views"))
+                        .timeout(Duration.ofSeconds(30))
+                        .header("Authorization", "Bearer " + control.credential())
+                        .header("If-Match", "\"" + before.contentHash() + "\"")
+                        .DELETE().build();
+                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                ControlPlane.Refusal refusal = ControlPlane.interpretRefusal(
+                        response.statusCode(), response.body(), "deleting the managed view store through " + kind);
+
+                assertThat(refusal.status()).isEqualTo(409);
+                assertThat(refusal.code()).isEqualTo(inUseCodes.get(kind));
+                assertThat(refusal.params())
+                        .isEqualTo(Map.of("id", "views", "referrers", List.of(PIPELINE_ID)));
+                assertThat(control.artifact("views")).contains(before);
+                assertThat(control.artifactIds()).contains(PIPELINE_ID, SOURCE_ID, "views");
+            }
+        }
+    }
+
     private static ControlPlane connected(ServerHandle server, Path directory) throws Exception {
         ControlPlane control = new ControlPlane(server.baseUrl());
         control.bootstrapAndLogin("e2e", "e2e-password");
@@ -98,6 +135,19 @@ class ArtifactDeleteRefusalIT {
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put("source.tap.yml", sourceYaml());
         resources.put("pipeline.tap.yml", pipelineYaml());
+        return resources;
+    }
+
+    private static Map<String, String> viewWorkspace() {
+        Map<String, String> resources = new LinkedHashMap<>();
+        resources.put("source.tap.yml", sourceYaml());
+        resources.put("pipeline.tap.yml", """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: %s
+                view: { id: order_state, from: orders, primary_key: id }
+                """.formatted(PIPELINE_ID, SOURCE_ID));
         return resources;
     }
 
