@@ -260,6 +260,22 @@ class StageConnectorsTest(unittest.TestCase):
             staged_license = self.staged / "release/licenses" / entry["name"]
             self.assertEqual(staged_license.read_bytes(), (self.jars / entry["name"]).read_bytes())
 
+    def test_bundled_db2_runtime_has_a_bound_without_expanding_other_connector_budgets(self) -> None:
+        db2 = next(entry for entry in self.entries if entry["id"] == "db2")
+        db2["bytes"] = 203_082_147
+        self.write_lock()
+        entries, _ = MODULE.read_lock(self.lock)
+        self.assertEqual(next(entry for entry in entries if entry["id"] == "db2")["bytes"], 203_082_147)
+        db2["bytes"] = 256 * 1024 * 1024 + 1
+        self.write_lock()
+        with self.assertRaisesRegex(MODULE.StageError, "db2: invalid shaded JAR length"):
+            MODULE.read_lock(self.lock)
+        db2["bytes"] = 203_082_147
+        next(entry for entry in self.entries if entry["id"] == "mysql")["bytes"] = 203_082_147
+        self.write_lock()
+        with self.assertRaisesRegex(MODULE.StageError, "mysql: invalid shaded JAR length"):
+            MODULE.read_lock(self.lock)
+
     def test_missing_or_extra_jar_refuses_without_staging(self) -> None:
         (self.jars / "mysql-connector.jar").unlink()
         with self.assertRaisesRegex(MODULE.StageError, "missing="):

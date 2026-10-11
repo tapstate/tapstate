@@ -605,8 +605,10 @@ class CloudExternalConfigStartupIT {
         Path log = directory.resolve("startup.log");
         Path bootJar = JARS.get(distribution);
         assertThat(bootJar).isRegularFile();
+        // The Cloud fixture loads the bundled Db2 runtime; preserve the smaller on-prem budget.
+        String heap = distribution == Distribution.CLOUD ? "-Xmx1024m" : "-Xmx384m";
         List<String> command = new ArrayList<>(List.of(
-                Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx384m"));
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(), heap));
         if (carrier == Carrier.JVM) {
             values.forEach((key, value) -> command.add("-D" + key + "=" + value));
         }

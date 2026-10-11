@@ -114,6 +114,23 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
+    void aBundledDb2RuntimeHasItsOwnBoundAndStillNeedsMatchingArtifactBytes() throws Exception {
+        Object originalLength = entry("db2").get("bytes");
+        entry("db2").put("bytes", 203_082_147);
+        writeLock();
+        // Admission of the declared size does not authorize the smaller fixture's actual bytes.
+        refused(this::gate, "artifact-missing-or-mismatched");
+        assertThat(loaded).isEmpty();
+        entry("db2").put("bytes", 256L * 1024 * 1024 + 1);
+        writeLock();
+        refused(this::gate, "lock-invalid");
+        entry("db2").put("bytes", originalLength);
+        entry("mysql").put("bytes", 203_082_147);
+        writeLock();
+        refused(this::gate, "lock-invalid");
+    }
+
+    @Test
     void aMissingExternalLockCannotAuthorizeCloudStartup() throws Exception {
         byte[] trusted = lockBytes();
         Files.delete(release.resolve("connectors.lock.json"));
