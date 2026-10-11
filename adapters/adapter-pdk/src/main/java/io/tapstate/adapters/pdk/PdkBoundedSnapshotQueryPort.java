@@ -37,7 +37,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
 
     private final ConnectorProvisioner provisioner;
     private final Clock clock;
-    private final ConnectorInstancePool<PdkConnector> pool;
+    private final ConnectorInstancePool<PreviewConnector> pool;
     private final ScheduledExecutorService evictions;
 
     public PdkBoundedSnapshotQueryPort(ConnectorProvisioner provisioner) {
@@ -49,27 +49,10 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         this.clock = Objects.requireNonNull(clock, "clock");
         ConnectorInstancePool.Limits limits = new ConnectorInstancePool.Limits(
                 2, 8, Duration.ofSeconds(2), Duration.ofSeconds(42), Duration.ofMinutes(5));
-        this.pool = new ConnectorInstancePool<>(config -> {
-            PdkConnector connector = PdkConnector.open(
-                    config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
-            try {
-                connector.underLoader(() -> {
-                    connector.connector().init(connector.context());
-                    return null;
-                });
-                return connector;
-            } catch (Throwable failed) {
-                connector.stopQuietly();
-                connector.close();
-                if (failed instanceof Error error) throw error;
-                if (failed instanceof RuntimeException runtime) throw runtime;
-                throw new TapstateException(ConnectorError.DISCOVER_FAILED,
-                        Map.of("connector", config.connectorId(), "detail", "preview connector initialization failed"),
-                        null);
-            }
-        }, connector -> {
-            connector.stopQuietly();
-            connector.close();
+        this.pool = new ConnectorInstancePool<>(config -> new PreviewConnector(PdkConnector.open(
+                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings())), instance -> {
+            instance.connector.stopQuietly();
+            instance.connector.close();
         }, limits, clock);
         this.evictions = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "preview-connector-eviction");
@@ -104,19 +87,24 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         ensureBeforeDeadline(request);
         ConnectionConfig config = new ConnectionConfig(
                 request.sourceId(), request.connectorId(), request.settings());
-        return pool.call(config, connector -> queryWith(connector, request, cancellation), PdkConnector::isAlive);
+        return pool.call(config, instance -> queryWith(instance, request, cancellation), PreviewConnector::reusable);
     }
 
-    private BoundedSnapshotQueryResult queryWith(PdkConnector connector,
+    private BoundedSnapshotQueryResult queryWith(PreviewConnector instance,
             BoundedSnapshotQueryRequest request, BoundedQueryCancellation cancellation) {
+        PdkConnector connector = instance.connector;
         BoundedQueryCancellation.Registration stopOnCancel = cancellation.onCancel(connector::stopQuietly);
         try {
             cancellation.throwIfCancelled();
+            ensureBeforeDeadline(request);
             QueryByAdvanceFilterFunction query = connector.functions().getQueryByAdvanceFilterFunction();
             if (query == null) {
                 throw new TapstateException(ConnectorError.CAPABILITY_MISSING,
                         Map.of("connector", connector.connectorId(), "capability", "query-by-advance-filter"), null);
             }
+            instance.initialize();
+            cancellation.throwIfCancelled();
+            ensureBeforeDeadline(request);
             TapTable table = discover(connector, request);
             List<Envelope> rows = new ArrayList<>(Math.min(request.limit(), 1024));
             int[] queryCount = {0};
@@ -168,6 +156,39 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                     !request.stableOrder().isEmpty(), queryCount[0], clock.instant());
         } finally {
             stopOnCancel.close();
+        }
+    }
+
+    /** Initialization belongs to the timed, cancellable call, while a healthy lease reuses it once. */
+    private static final class PreviewConnector {
+        private final PdkConnector connector;
+        private boolean initialized;
+
+        private PreviewConnector(PdkConnector connector) {
+            this.connector = connector;
+        }
+
+        private void initialize() {
+            if (initialized) {
+                return;
+            }
+            try {
+                connector.underLoader(() -> {
+                    connector.connector().init(connector.context());
+                    return null;
+                });
+                initialized = true;
+            } catch (Throwable failed) {
+                if (failed instanceof Error error) throw error;
+                if (failed instanceof RuntimeException runtime) throw runtime;
+                throw new TapstateException(ConnectorError.DISCOVER_FAILED,
+                        Map.of("connector", connector.connectorId(),
+                                "detail", "preview connector initialization failed"), null);
+            }
+        }
+
+        private boolean reusable() {
+            return initialized && connector.isAlive();
         }
     }
 
