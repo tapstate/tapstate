@@ -137,6 +137,8 @@ final class BenchmarkReturnWorkBudgetProfile {
         upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, producerBindingLocal, BenchmarkReturnWorkBudget.Work::plus);
         var coldTransportLocal = BenchmarkReturnWorkBudgetRun.coldPacketTransportUpper();
         upper.merge(BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, coldTransportLocal, BenchmarkReturnWorkBudget.Work::plus);
+        var emittedLocal = BenchmarkReturnEmittedRoster.localUpper();
+        upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, emittedLocal, BenchmarkReturnWorkBudget.Work::plus);
         var gaps = new ArrayList<Gap>();
         for (var activity : BenchmarkReturnWorkBudget.Activity.values()) {
             if (!upper.containsKey(activity) && !excluded.contains(activity)) {
@@ -161,6 +163,7 @@ final class BenchmarkReturnWorkBudgetProfile {
         registration.put("producerOriginDecodeSourceUpper", producerOriginLocal.evidence());
         registration.put("producerOriginBindingSourceUpper", producerBindingLocal.evidence());
         registration.put("producerColdTransportSourceUpper", coldTransportLocal.evidence());
+        registration.put("emittedRosterLocalSourceUpper", emittedLocal.evidence());
         registration.put("terminalSourceTail", BenchmarkReturnWorkBudgetSourceTails.terminalEvidence(reporting.plan()));
         registration.put("structuralWorkBudgetQualified", false); registration.put("wholeMethodCostQualified", false);
         return new Prepared(inputs, upper, excluded, reporting.plan(), registration, gaps);

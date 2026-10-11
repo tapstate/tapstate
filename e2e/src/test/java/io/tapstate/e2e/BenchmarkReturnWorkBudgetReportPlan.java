@@ -116,6 +116,11 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         add(parts, "ROOT_CLASS_ORIGIN_PACKETS", "actualInputBindings.actualRootOrigins/producer.actualRootOrigins",
                 2, 128L + 512L * mapNodes(7), 32768L + 512L * (7L * 128 + 256 + 4096 + 1024 + 64 + 256),
                 4096, 5, "FIXED_512_NAMED_CLASSES_SEVEN_ROW_FIELDS_ASCII_PATH4096_ENTRY1024_NAME256_SHA64_HEADER128_NODES");
+        add(parts, "EMITTED_COMPILER_ROSTER", "actualInputBindings.actualEmittedRoster",
+                1, 128L + BenchmarkReturnWorkBudgetBindings.SourceRole.values().length * mapNodes(4) + 512L * mapNodes(7),
+                32768L + BenchmarkReturnWorkBudgetBindings.SourceRole.values().length * (4L * 128 + 128 + 512 + 64)
+                        + 512L * (7L * 128 + 128 + 256 + 256 + 64 + 4096 + 1024),
+                4096, 5, "THREE_OWNED_COMPILER_OUTPUTS_ALL_NAMED_SOURCE_ROLES_512_SELECTED_MEMBERS_PRIOR_FIELD_CAPS");
         add(parts, "NATIVE_BASELINE_CHECKPOINTS", "BenchmarkNativeCounterBaseline.evidence.before/after",
                 2L * (1 + 2 + 1), mapNodes(10) + 2L * 4096 + 128 + 1,
                 PAGE_BYTES + 10L * 64 + 4L * 512, 512, 5,
