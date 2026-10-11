@@ -19,7 +19,7 @@ class BenchmarkReturnWorkBudgetProfileTest {
         var prepared = BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, files(false)));
         assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.CLOCK_REQUEST))
                 .isEqualTo(new BenchmarkReturnWorkBudget.Work(1, 1, 0, 0, 496, 0, 10, 0));
-        assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SORT).elements()).isEqualTo(48_000);
+        assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SORT).elements()).isEqualTo(2L * 48_000);
         assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SPAN).elements()).isEqualTo(4L * 48_000);
         assertThat(prepared.explicitExcludedActivities()).containsExactly(BenchmarkReturnWorkBudget.Activity.ROOT_CPU);
         assertThat(prepared.gaps()).isEmpty();

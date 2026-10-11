@@ -111,6 +111,9 @@ final class BenchmarkReturnWorkBudgetProfile {
         var reporting = BenchmarkReturnWorkBudgetReportPlan.prepare(inputs.workload());
         knownComponentBounds(upper, inputs, reporting.plan());
         knownRootBounds(upper, inputs, reporting.plan());
+        var measured = inputs.workload().phases().stream().filter(PhaseInput::measured).findFirst().orElseThrow();
+        upper.putAll(BenchmarkReturnLocalSourceWork.bounds(new BenchmarkReturnLocalSourceWork.Capacity(
+                measured.logicalOutputs(), measured.logicalOutputs() / 2, measured.batches())));
         var gaps = new ArrayList<Gap>();
         for (var activity : BenchmarkReturnWorkBudget.Activity.values()) {
             if (!upper.containsKey(activity) && !excluded.contains(activity)) {
