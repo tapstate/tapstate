@@ -136,8 +136,7 @@ def main():
                    'connector witness cohort differs from plan')
     shards.require(len(plan['shards']) == 10, 'connector lane requires ten shards')
     if args.command == 'run':
-        (args.root / LEDGER).unlink(missing_ok=True)
-        shutil.rmtree(args.root / LEDGERS, ignore_errors=True)
+        # The shard runner preflights all owned paths before resetting any evidence.
         engine('run', args, '--plan', args.plan, '--shard', args.shard, '--repo-local', args.repo_local)
     elif args.command == 'pack':
         selected = shards.selected(plan, args.shard)

@@ -4,7 +4,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export SHARD_GATE="$here/ci-shard.sh"
 python3 - <<'PY'
-import json, os, pathlib, subprocess, tempfile
+import json, os, pathlib, shutil, subprocess, tempfile
 from collections import Counter
 with tempfile.TemporaryDirectory() as tmp:
     root = pathlib.Path(tmp)
@@ -47,10 +47,71 @@ with tempfile.TemporaryDirectory() as tmp:
     loads=[sum(hints[t['class']] for t in s['tests']) for s in p['shards']]
     assert loads==[s['estimated_seconds'] for s in p['shards']]
     assert max(loads)<=1.5*sum(loads)/len(loads)
-    put('bin/mvn', '#!/bin/sh\nprintf "%s\\n" "$@" > "'+str(root/'mvn-args')+'"\n')
+    # New XML must never borrow old coverage or either witness ledger namespace.
+    cleanup_modules=['.', 'e2e', 'runtime/engine', 'core', 'arch-tests']
+    for module in cleanup_modules:
+        for phase in ['surefire', 'failsafe']:
+            put(module+'/target/'+phase+'-reports/TEST-stale.xml','old XML')
+        for name in ['jacoco.exec', 'jacoco-it.exec']:
+            put(module+'/target/'+name,'old coverage')
+        put(module+'/target/classes/Keep.class','production bytecode')
+        put(module+'/target/test-classes/Keep.class','test bytecode')
+    put('e2e/target/witness-ledger.txt','old ordinary ledger')
+    put('e2e/target/witness-ledgers/123.txt','old selected ledger')
+    put('bin/mvn', '#!/bin/sh\nprintf "%s\\n" "$@" > "'+str(root/'mvn-args')+'"\n'
+        +'mkdir -p "'+str(root/'core/target/surefire-reports')+'"\n'
+        +'printf new > "'+str(root/'core/target/surefire-reports/TEST-new.xml')+'"\n'
+        +'printf new >> "'+str(root/'core/target/jacoco.exec')+'"\n')
     (root/'bin/mvn').chmod(0o755)
-    subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')],check=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']})
-    args=(root/'mvn-args').read_text().splitlines(); assert '-am' not in args and 'verify' in args and '-pl' in args
+    environment={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']}
+    run_command=[os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')]
+    executed=subprocess.run(run_command,check=True,env=environment,capture_output=True,text=True)
+    args=(root/'mvn-args').read_text().splitlines()
+    assert not (root/'e2e/target/witness-ledger.txt').exists(), 'old ordinary ledger survived'
+    assert not (root/'e2e/target/witness-ledgers').exists(), 'old selected ledger survived'
+    assert (root/'core/target/jacoco.exec').read_text()=='new', 'coverage must be from this verify, without append residue'
+    assert (root/'core/target/surefire-reports/TEST-new.xml').read_text()=='new'
+    for module in cleanup_modules:
+        assert not list((root/module/'target').glob('*-reports/TEST-stale.xml'))
+        assert not (root/module/'target/jacoco-it.exec').exists()
+        assert (root/module/'target/classes/Keep.class').read_text()=='production bytecode'
+        assert (root/module/'target/test-classes/Keep.class').read_text()=='test bytecode'
+    timing=[json.loads(line.split(' ',1)[1]) for line in executed.stdout.splitlines() if line.startswith('CI_PHASE_JSON ')]
+    assert [(r['phase'],r['event']) for r in timing]==[(phase,event) for phase in ['reset-test-evidence','selected-verify'] for event in ['start','end']]
+    for start,end in zip(timing[::2],timing[1::2]):
+        assert end['status']=='success' and end['monotonic_ns']>=start['monotonic_ns']
+        assert end['elapsed_ns']==end['monotonic_ns']-start['monotonic_ns']
+        assert start['source_sha']==end['source_sha']==added['source_sha'] and end['shard_id']=='rest'
+    # Validate every removal first: even a later unsafe path must leave all evidence untouched.
+    outside_context=tempfile.TemporaryDirectory()
+    outside=pathlib.Path(outside_context.name)
+    external={'sentinel':'foreign', 'surefire-reports/TEST-foreign.xml':'foreign XML',
+              'jacoco.exec':'foreign coverage', 'jacoco-it.exec':'foreign IT coverage'}
+    for name,value in external.items():
+        path=outside/name; path.parent.mkdir(parents=True,exist_ok=True); path.write_text(value)
+    for relative in ['core/target', 'core/target/surefire-reports', 'core/target/jacoco.exec', 'e2e/target/witness-ledgers']:
+        path=root/relative
+        if path.is_dir(): shutil.rmtree(path)
+        elif path.exists(): path.unlink()
+        path.parent.mkdir(parents=True,exist_ok=True); path.symlink_to(outside,target_is_directory=True)
+        put('e2e/target/failsafe-reports/TEST-retain.xml','must survive failed preflight')
+        (root/'mvn-args').unlink(missing_ok=True)
+        rejected=subprocess.run(run_command,env=environment,capture_output=True,text=True)
+        assert rejected.returncode!=0 and 'unsafe cleanup path' in rejected.stderr, (relative,rejected.stdout,rejected.stderr)
+        assert all((outside/name).read_text()==value for name,value in external.items()) and not (root/'mvn-args').exists()
+        assert (root/'e2e/target/failsafe-reports/TEST-retain.xml').read_text()=='must survive failed preflight'
+        path.unlink()
+    outside_context.cleanup()
+    # A failed verify gets an explicit failed timing end and cannot retain a success receipt.
+    put('bin/mvn','#!/bin/sh\nexit 7\n'); (root/'bin/mvn').chmod(0o755)
+    failed=subprocess.run(run_command,env=environment,capture_output=True,text=True)
+    assert failed.returncode!=0
+    failed_timing=[json.loads(line.split(' ',1)[1]) for line in failed.stdout.splitlines() if line.startswith('CI_PHASE_JSON ')]
+    assert failed_timing[-1]['phase']=='selected-verify' and failed_timing[-1]['status']=='failure'
+    receipt=json.loads((root/'target/ci-shards/run-rest.json').read_text())
+    assert receipt['status']=='failure'
+
+    assert '-am' not in args and 'verify' in args and '-pl' in args
     assert any(a.startswith('-Dtest=') and all(name in a for name in ['FixedSleepGateTest','ErrorCodeGatesTest','NestStateSerialFormGatesTest']) for a in args)
     assert set(args[args.index('-pl')+1].split(','))=={'arch-tests', 'core', 'e2e'}, 'source-scanning gates must run in their owning modules'
     # A custom Maven selector must not disappear from both sides of admission.

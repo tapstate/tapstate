@@ -18,12 +18,20 @@ with tempfile.TemporaryDirectory() as tmp:
         put(module+'/src/test/java/sample/'+name+'.java','package sample; class '+name+' {}')
     subprocess.run([os.environ['SHARD_GATE'],'plan','--root',tmp,'--output',str(root/'plan.json')],check=True)
     plan=json.loads((root/'plan.json').read_text())
+    put('bin/mvn','#!/bin/sh\nexit 0\n'); (root/'bin/mvn').chmod(0o755)
+    os.environ['PATH']=str(root/'bin')+':'+os.environ['PATH']
     for shard in plan['shards']:
         # Each runner has only its own fresh reports, despite having compiled the full reactor.
         for module in ['e2e','runtime/engine','core']:
             shutil.rmtree(root/module/'target',ignore_errors=True)
             put(module+'/target/classes/sample/Production.class','bytecode')
             put(module+'/target/test-classes/sample/Helper.class','helper-bytecode')
+        # The real helper owns reset and records a successful selected verify.
+        subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),
+                        '--shard',shard['id'],'--repo-local',str(root/'m2')],check=True,capture_output=True)
+        if any(t['module']=='e2e' and t['kind']=='it' for t in shard['tests']):
+            put('e2e/target/witness-ledger.txt','current ordinary witness\n')
+            put('e2e/target/witness-ledgers/123.txt','current selected witness\n')
         for test in shard['tests']:
             phase='failsafe' if test['kind']=='it' else 'surefire'
             name=test['class']; count='0' if name.endswith('DisabledTest') else '1'
@@ -55,6 +63,12 @@ with tempfile.TemporaryDirectory() as tmp:
                        for p in paths for c in ET.parse(p).getroot().findall('testcase'))
     assert case_counts(artifacts.rglob('TEST-*.xml'))==case_counts((root/'restored').rglob('TEST-*.xml'))
     assert len(list((root/'restored').rglob('TEST-*.xml')))==8
+    assert len(list((root/'restored/target/ci-shards').rglob('run.json')))==4
+    for shard_id in ['e2e-1','e2e-2']:
+        raw=root/'restored/target/ci-shards'/shard_id/'e2e/target'
+        assert (raw/'witness-ledger.txt').read_text()=='current ordinary witness\n'
+        assert (raw/'witness-ledgers/123.txt').read_text()=='current selected witness\n'
+    assert not (root/'restored/e2e/target/witness-ledger.txt').exists(), 'raw shard ledgers must not collide'
     backup=root/'backup'; shutil.copytree(artifacts,backup)
     def reset(): shutil.rmtree(artifacts); shutil.copytree(backup,artifacts)
     for path in ['engine/files/runtime/engine/target/classes/sample/Production.class',
@@ -80,7 +94,49 @@ with tempfile.TemporaryDirectory() as tmp:
     (artifacts/'engine/files/runtime/engine/target/test-classes/sample/EngineTest.class').unlink(); verify(False, rehash=True); reset()
     alien=artifacts/'engine/files/other/target/surefire-reports'; alien.mkdir(parents=True)
     (alien/'TEST-extra.xml').write_text('<testsuite name="sample.ExtraTest" tests="1" errors="0" failures="0"/>'); verify(False, rehash=True); reset()
+    # A declared raw ledger and successful source/run-bound verify are mandatory evidence.
+    ledger=artifacts/'e2e-1/files/e2e/target/witness-ledger.txt'
+    ledger.unlink(); verify(False, rehash=True); reset()
+    put('artifacts/e2e-1/files/e2e/target/witness-ledgers/extra.txt','unknown ledger')
+    verify(False, rehash=True); reset()
+    for field,value in [('source_sha','old'), ('status','failure'), ('run_id','old-run'), ('run_attempt',999)]:
+        manifest=artifacts/'engine/manifest.json'; m=json.loads(manifest.read_text())
+        m['provenance'][field]=value; manifest.write_text(json.dumps(m))
+        raw=artifacts/'engine/files'/m['provenance_path']; raw.write_text(json.dumps(m['provenance']))
+        verify(False, rehash=True); reset()
+    # Inner phase metadata is a versioned run observation, not arbitrary truthy JSON.
+    for field,value in [('schema',999), ('command','pack'), ('run_attempt',True)]:
+        manifest=artifacts/'engine/manifest.json'; m=json.loads(manifest.read_text())
+        m['provenance']['verify'][field]=value; manifest.write_text(json.dumps(m))
+        (artifacts/'engine/files'/m['provenance_path']).write_text(json.dumps(m['provenance']))
+        verify(False, rehash=True); reset()
+    manifest=artifacts/'engine/manifest.json'; m=json.loads(manifest.read_text())
+    for phase in ['reset','verify']:
+        for field in ['started_monotonic_ns','monotonic_ns','elapsed_ns']:
+            m['provenance'][phase][field]=False
+    manifest.write_text(json.dumps(m)); (artifacts/'engine/files'/m['provenance_path']).write_text(json.dumps(m['provenance']))
+    verify(False, rehash=True); reset()
+    manifest=artifacts/'engine/manifest.json'; m=json.loads(manifest.read_text())
+    m['provenance']['verify']['started_monotonic_ns']=0
+    m['provenance']['verify']['elapsed_ns']=m['provenance']['verify']['monotonic_ns']
+    manifest.write_text(json.dumps(m)); (artifacts/'engine/files'/m['provenance_path']).write_text(json.dumps(m['provenance']))
+    verify(False, rehash=True); reset()
+    manifest=artifacts/'engine/manifest.json'; m=json.loads(manifest.read_text()); m['schema']=1; manifest.write_text(json.dumps(m))
+    verify(False); reset()
+    marker=artifacts/'engine/files/target/ci-shards/run-engine.json'; marker.unlink()
+    verify(False, rehash=True); reset()
+    # Admission must preflight every restore path before any shard changes the destination.
+    with tempfile.TemporaryDirectory() as external_tmp:
+        outside=pathlib.Path(external_tmp)
+        foreign=outside/'ci-shards/e2e-1/run.json'; foreign.parent.mkdir(parents=True); foreign.write_text('external receipt')
+        destination=root/'linked-restore'; destination.mkdir()
+        (destination/'target').symlink_to(outside,target_is_directory=True)
+        result=subprocess.run([os.environ['AGGREGATE_GATE'],'verify','--root',tmp,'--plan',str(root/'plan.json'),
+                               '--artifacts',str(artifacts),'--restore',str(destination)],capture_output=True,text=True)
+        assert result.returncode!=0 and 'unsafe restore path' in result.stderr, 'linked restore destination was admitted'
+        assert foreign.read_text()=='external receipt', 'restore overwrote external metadata'
+        assert {p.name for p in destination.iterdir()}=={'target'}, 'unsafe restore partially wrote ordinary evidence'
     # A test added after planning invalidates the source-selected cohort.
     put('core/src/test/java/sample/NewTest.java','package sample; class NewTest {}'); verify(False)
-print('ci-aggregate smoke: 19 admission cases and shard-local bytecode payload passed')
+print('ci-aggregate smoke: admission controls and shard-local bytecode payload passed')
 PY

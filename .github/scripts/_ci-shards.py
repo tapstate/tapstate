@@ -3,14 +3,19 @@
 import argparse
 import copy
 from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 import xml.etree.ElementTree as ET
 
 
@@ -189,18 +194,139 @@ def selected(plan, name):
     return matches[0]
 
 
+def execution_identity():
+    run_id, attempt = os.environ.get('GITHUB_RUN_ID'), os.environ.get('GITHUB_RUN_ATTEMPT')
+    if run_id is None and attempt is None:
+        require(os.environ.get('GITHUB_ACTIONS') != 'true', 'missing Actions execution identity')
+        return dict(execution='local', run_id=None, run_attempt=None)
+    require(run_id is not None and attempt is not None and run_id.isdecimal() and attempt.isdecimal()
+            and int(run_id) > 0 and int(attempt) > 0, 'invalid Actions execution identity')
+    return dict(execution='github-actions', run_id=run_id, run_attempt=int(attempt))
+
+
+@contextmanager
+def phase_timing(phase, command, plan=None, shard=None):
+    """Bounded observations only: no wait predicate, timeout, or lifecycle is changed."""
+    identity = dict(schema=1, command=command, phase=phase, shard_id=shard,
+                    source_sha=plan['source_sha'] if plan else None,
+                    cohort_hash=plan['cohort_hash'] if plan else None, **execution_identity())
+    started = time.monotonic_ns()
+    state = dict(identity, event='start', monotonic_ns=started,
+                 utc=datetime.now(timezone.utc).isoformat())
+    print('CI_PHASE_JSON ' + json.dumps(state, sort_keys=True), flush=True)
+    status = 'failure'
+    try:
+        yield state
+        status = 'success'
+    finally:
+        ended = time.monotonic_ns()
+        state.update(event='end', monotonic_ns=ended, elapsed_ns=ended-started,
+                     started_monotonic_ns=started, status=status,
+                     ended_utc=datetime.now(timezone.utc).isoformat())
+        print('CI_PHASE_JSON ' + json.dumps(state, sort_keys=True), flush=True)
+
+
+def owned_path(root, relative, operation='cleanup'):
+    """Refuse links in every path component before any owned evidence is removed."""
+    relative = safe_path(relative)
+    current = root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        require(not current.is_symlink(), 'unsafe ' + operation + ' path: ' + relative.as_posix())
+        require(index == len(relative.parts)-1 or not current.exists() or current.is_dir(),
+                'invalid ' + operation + ' path parent: ' + relative.as_posix())
+    require(current.resolve().is_relative_to(root), 'unsafe ' + operation + ' path: ' + relative.as_posix())
+    return current
+
+
+def provenance_path(shard):
+    return Path('target/ci-shards') / ('run-' + shard['id'] + '.json')
+
+
+def reset_test_evidence(root, shard):
+    paths = []
+    for module, _ in reactor(root):
+        target = Path(module) / 'target'
+        paths += [(target / name, True) for name in ['surefire-reports', 'failsafe-reports']]
+        paths += [(target / name, False) for name in ['jacoco.exec', 'jacoco-it.exec']]
+    paths += [(Path('e2e/target/witness-ledger.txt'), False),
+              (Path('e2e/target/witness-ledgers'), True), (provenance_path(shard), False)]
+    # Preflight the whole set, including absent paths and dangling links. A refusal
+    # must not partially reset another module or follow a target link out of checkout.
+    owned = [(owned_path(root, path.as_posix()), directory) for path, directory in paths]
+    for path, directory in owned:
+        require(not path.exists() or (path.is_dir() if directory else path.is_file()),
+                'invalid cleanup path type: ' + str(path))
+    for path, directory in owned:
+        if directory:
+            if path.exists():
+                shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def validate_provenance(value, plan, shard):
+    identity = execution_identity()
+    require(isinstance(value, dict), 'invalid run provenance object')
+    require(type(value.get('schema')) is int and value['schema'] == 1 and value.get('source_sha') == plan['source_sha']
+            and value.get('cohort_hash') == plan['cohort_hash'] and value.get('shard_id') == shard['id']
+            and all(value.get(k) == v for k, v in identity.items()), 'run provenance differs: ' + shard['id'])
+    require(value.get('run_attempt') is None or type(value['run_attempt']) is int, 'invalid run attempt type')
+    require(value.get('status') == 'success', 'selected verify did not succeed: ' + shard['id'])
+    require(re.fullmatch(r'[0-9a-f]{32}', value.get('invocation_id', '')) is not None,
+            'invalid run invocation: ' + shard['id'])
+    for phase in ['reset', 'verify']:
+        observed = value.get(phase, {})
+        require(isinstance(observed, dict), 'invalid run phase object: ' + phase)
+        require(observed.get('run_attempt') is None or type(observed['run_attempt']) is int, 'invalid phase attempt type')
+        require(type(observed.get('schema')) is int and observed['schema'] == 1 and observed.get('command') == 'run'
+                and observed.get('status') == 'success' and observed.get('event') == 'end'
+                and observed.get('phase') == ('reset-test-evidence' if phase == 'reset' else 'selected-verify')
+                and observed.get('source_sha') == plan['source_sha'] and observed.get('cohort_hash') == plan['cohort_hash']
+                and observed.get('shard_id') == shard['id']
+                and all(observed.get(k) == v for k, v in identity.items()), 'invalid run phase: ' + phase)
+        start, end, elapsed = (observed.get(k) for k in ['started_monotonic_ns', 'monotonic_ns', 'elapsed_ns'])
+        require(all(type(n) is int and n >= 0 for n in [start, end, elapsed])
+                and end >= start and elapsed == end-start, 'invalid monotonic run interval: ' + phase)
+        for field in ['utc', 'ended_utc']:
+            require(isinstance(observed.get(field), str), 'missing run timestamp')
+            timestamp = datetime.fromisoformat(observed[field])
+            require(timestamp.tzinfo is not None, 'run timestamp has no timezone')
+    require(value['verify']['started_monotonic_ns'] >= value['reset']['monotonic_ns'],
+            'verify precedes reset: ' + shard['id'])
+
+
+def ledger_paths(root, shard):
+    result = []
+    if 'e2e' not in {t['module'] for t in shard['tests']}:
+        return result
+    legacy = owned_path(root, 'e2e/target/witness-ledger.txt')
+    if legacy.exists():
+        require(legacy.is_file(), 'invalid witness ledger')
+        result.append(legacy)
+    directory = owned_path(root, 'e2e/target/witness-ledgers')
+    if directory.exists():
+        require(directory.is_dir(), 'invalid witness ledger directory')
+        for path in sorted(directory.iterdir()):
+            require(path.is_file() and not path.is_symlink() and re.fullmatch(r'[0-9]+\.txt', path.name),
+                    'unexpected witness ledger path: ' + str(path))
+            result.append(path)
+    return sorted(result)
+
+
 def run_shard(args, root, plan):
     shard = selected(plan, args.shard)
     require(shard['tests'], 'cannot run empty shard')
     modules = sorted({t['module'] for t in shard['tests']})
-    # Only stale test results are removed. install has built every module, including
-    # test classes and sources consumed by repository-wide source-scanning gates.
-    for module, _ in reactor(root):
-        target = root / module / 'target'
-        for directory in ['surefire-reports', 'failsafe-reports']:
-            shutil.rmtree(target / directory, ignore_errors=True)
-        for filename in ['jacoco.exec', 'jacoco-it.exec']:
-            (target / filename).unlink(missing_ok=True)
+    # Retain installed outputs and the original verify hooks; only declared test
+    # evidence and this shard's freshness receipt are reset in the owned checkout.
+    with phase_timing('reset-test-evidence', 'run', plan, shard['id']) as reset:
+        reset_test_evidence(root, shard)
+    receipt = dict(schema=1, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
+                   shard_id=shard['id'], invocation_id=uuid.uuid4().hex,
+                   status='running', reset=reset, **execution_identity())
+    marker = owned_path(root, provenance_path(shard).as_posix())
+    write(marker, receipt)
     command = ['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
     for kind, flag in [('unit', 'test'), ('it', 'it.test')]:
         names = sorted({t['class'] for t in shard['tests'] if t['kind'] == kind})
@@ -212,7 +338,12 @@ def run_shard(args, root, plan):
     if examples:
         command += ['-Dtapstate.e2e.published-examples=' + ','.join(examples),
                     '-DforkCount=1', '-DreuseForks=true', '-Djunit.jupiter.execution.parallel.enabled=false']
-    subprocess.run(command, cwd=root, check=True)
+    try:
+        with phase_timing('selected-verify', 'run', plan, shard['id']) as observed:
+            subprocess.run(command, cwd=root, check=True)
+    finally:
+        receipt.update(status=observed['status'], verify=observed)
+        write(marker, receipt)
 
 
 def reports(root, shard):
@@ -266,21 +397,29 @@ def reports(root, shard):
 
 def pack(args, root, plan):
     shard = selected(plan, args.shard)
+    marker = owned_path(root, provenance_path(shard).as_posix())
+    require(marker.is_file(), 'missing current run provenance: ' + shard['id'])
+    provenance = read(marker)
+    validate_provenance(provenance, plan, shard)
+    witness_ledgers = ledger_paths(root, shard)
     report_paths, statistics, report_classes = reports(root, shard)
     output = Path(args.output)
     require(not output.exists(), 'artifact output already exists: ' + str(output))
     files = output / 'files'
-    paths = report_paths + [root / p for p in shard['required_exec']]
+    paths = report_paths + [root / p for p in shard['required_exec']] + witness_ledgers + [marker]
     for module in sorted({t['module'] for t in shard['tests']}):
         paths += [p for p in (root / module / 'target/test-classes').rglob('*') if p.is_file()]
     for path in paths:
         require(not path.is_symlink(), 'symlink artifact: ' + str(path))
+        owned_path(root, path.relative_to(root).as_posix())
         dest = files / path.relative_to(root)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, dest)
-    write(output / 'manifest.json', dict(schema=1, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
+    write(output / 'manifest.json', dict(schema=2, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
                                         shard_id=shard['id'], tests=shard['tests'], required_exec=shard['required_exec'],
                                         statistics=statistics, report_classes=report_classes,
+                                        provenance=provenance, provenance_path=provenance_path(shard).as_posix(),
+                                        witness_ledgers=[p.relative_to(root).as_posix() for p in witness_ledgers],
                                         files={p.relative_to(files).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                                                for p in sorted(files.rglob('*')) if p.is_file()}))
     print('packed ' + shard['id'] + ': ' + str(len(shard['tests'])) + ' source-selected units')
@@ -288,31 +427,49 @@ def pack(args, root, plan):
 
 def verify(args, root, plan):
     artifacts = Path(args.artifacts)
+    require(not artifacts.is_symlink(), 'symlink artifact root')
+    artifacts = artifacts.resolve()
     expected_ids = {s['id'] for s in plan['shards']}
     require(artifacts.is_dir(), 'missing artifact root')
     require({p.name for p in artifacts.iterdir()} == expected_ids, 'artifact shard set differs from declared shards')
     admitted = []
     for shard in plan['shards']:
         directory = artifacts / shard['id']
+        require(directory.is_dir() and not directory.is_symlink(), 'invalid shard artifact directory')
+        require((directory / 'manifest.json').is_file() and not (directory / 'manifest.json').is_symlink(), 'invalid shard manifest file')
         manifest = read(directory / 'manifest.json')
         declared_files = manifest.pop('files')
         declared_statistics = manifest.pop('statistics')
         declared_classes = manifest.pop('report_classes')
-        require(manifest == dict(schema=1, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
+        provenance = manifest.pop('provenance')
+        marker = manifest.pop('provenance_path')
+        ledgers = manifest.pop('witness_ledgers')
+        validate_provenance(provenance, plan, shard)
+        require(marker == provenance_path(shard).as_posix(), 'run provenance path differs')
+        require(isinstance(ledgers, list) and ledgers == sorted(set(ledgers))
+                and all(re.fullmatch(r'e2e/target/(?:witness-ledger\.txt|witness-ledgers/[0-9]+\.txt)', p) for p in ledgers)
+                and (not ledgers or 'e2e' in {t['module'] for t in shard['tests']}), 'invalid witness ledger manifest')
+        require(manifest == dict(schema=2, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
                                  shard_id=shard['id'], tests=shard['tests'], required_exec=shard['required_exec']),
                 'shard manifest differs: ' + shard['id'])
         files = directory / 'files'
+        require(files.is_dir() and not files.is_symlink(), 'invalid artifact files directory')
         actual_files = {}
         for path in files.rglob('*'):
             require(not path.is_symlink(), 'symlink artifact: ' + str(path))
             if path.is_file():
                 relative = path.relative_to(files).as_posix()
-                require(re.fullmatch(r'.+/target/(?:test-classes/.+|(?:surefire|failsafe)-reports/TEST-[^/]+\.xml|jacoco(?:-it)?\.exec)', relative),
+                metadata = relative == marker or relative in ledgers
+                require(metadata or re.fullmatch(r'.+/target/(?:test-classes/.+|(?:surefire|failsafe)-reports/TEST-[^/]+\.xml|jacoco(?:-it)?\.exec)', relative),
                         'unexpected artifact path: ' + relative)
-                require(relative.split('/target/', 1)[0] in {t['module'] for t in shard['tests']},
+                require(metadata or relative.split('/target/', 1)[0] in {t['module'] for t in shard['tests']},
                         'artifact outside shard modules: ' + relative)
                 actual_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
         require(actual_files == declared_files, 'artifact files differ from manifest: ' + shard['id'])
+        require(marker in actual_files and read(files / safe_path(marker)) == provenance,
+                'raw run provenance differs: ' + shard['id'])
+        actual_ledgers = [p.relative_to(files).as_posix() for p in ledger_paths(files, shard)]
+        require(actual_ledgers == ledgers, 'witness ledger file set differs: ' + shard['id'])
         _, statistics, report_classes = reports(files, shard)
         require(statistics == declared_statistics and report_classes == declared_classes,
                 'report evidence differs from manifest: ' + shard['id'])
@@ -323,21 +480,35 @@ def verify(args, root, plan):
         admitted.append((shard, files))
     # Nothing reaches the restored tree until all shards passed admission.
     destination = Path(args.restore)
+    require(not destination.is_symlink(), 'unsafe restore path: destination root')
+    destination = destination.resolve()
     shared_reports = {}
+    restorations = []
     for shard, files in admitted:
         for path in sorted(files.rglob('*')):
             require(not path.is_symlink(), 'symlink artifact: ' + str(path))
             if not path.is_file():
                 continue
             relative = path.relative_to(files)
+            if relative.as_posix() == provenance_path(shard).as_posix():
+                relative = Path('target/ci-shards') / shard['id'] / 'run.json'
+            elif re.fullmatch(r'e2e/target/(?:witness-ledger\.txt|witness-ledgers/[0-9]+\.txt)', relative.as_posix()):
+                relative = Path('target/ci-shards') / shard['id'] / relative
             if relative.as_posix() in shard['required_exec']:
                 relative = Path('target/ci-shards') / shard['id'] / relative
             if path.name.startswith('TEST-') and any('example' in t and path.name == 'TEST-' + t['class'] + '.xml' for t in shard['tests']):
                 shared_reports.setdefault(relative, []).append(path)
+                merge_target = owned_path(destination, relative.as_posix(), 'restore')
+                require(not merge_target.exists() or merge_target.is_file(),
+                        'invalid restore path type: ' + str(merge_target))
                 relative = Path('target/ci-shards') / shard['id'] / relative
-            target = destination / safe_path(relative.as_posix())
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, target)
+            target = owned_path(destination, relative.as_posix(), 'restore')
+            require(not target.exists() or target.is_file(), 'invalid restore path type: ' + str(target))
+            restorations.append((path, target))
+    # All artifacts and every destination are admitted before the first copy.
+    for path, target in restorations:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
     for relative, paths in shared_reports.items():
         suites = [ET.parse(path).getroot() for path in paths]
         merged = copy.deepcopy(suites[0])
@@ -350,7 +521,7 @@ def verify(args, root, plan):
         for attr in ['tests', 'failures', 'errors', 'skipped']:
             merged.set(attr, str(sum(int(s.get(attr, '0')) for s in suites)))
         merged.set('time', str(sum(float(s.get('time', '0')) for s in suites)))
-        target = destination / safe_path(relative.as_posix())
+        target = owned_path(destination, relative.as_posix(), 'restore')
         target.parent.mkdir(parents=True, exist_ok=True)
         ET.ElementTree(merged).write(target, encoding='utf-8', xml_declaration=True)
     print('admitted ' + str(len(plan['expected'])) + ' source-selected units exactly once across ' + str(len(admitted)) + ' shards')
@@ -381,10 +552,17 @@ def main():
     args = parser.parse_args()
     root = Path(args.root).resolve()
     if args.command == 'plan':
-        make_plan(args, root)
+        with phase_timing('discover-plan', 'plan'):
+            make_plan(args, root)
     else:
         plan = load_plan(args, root)
-        {'run': run_shard, 'pack': pack, 'verify': verify}[args.command](args, root, plan)
+        operation = {'run': run_shard, 'pack': pack, 'verify': verify}[args.command]
+        if args.command == 'run':
+            operation(args, root, plan)
+        else:
+            with phase_timing('pack-evidence' if args.command == 'pack' else 'admit-restore-evidence',
+                              args.command, plan, args.shard if args.command == 'pack' else None):
+                operation(args, root, plan)
 
 
 if __name__ == '__main__':
