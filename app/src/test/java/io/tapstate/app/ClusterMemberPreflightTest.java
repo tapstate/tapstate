@@ -217,6 +217,57 @@ class ClusterMemberPreflightTest {
                 coded -> assertThat(coded.code()).isEqualTo(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID));
     }
 
+    @Test
+    void workloadClaimRenewalMustPrecedeTheNodeSessionBound() {
+        assertThat(List.of(Duration.ofSeconds(9), Duration.ofSeconds(10))).allSatisfy(renewInterval -> {
+            ClusterProperties cluster = cluster("cluster-a", "node-a");
+            cluster.setNodeSessionTtl(Duration.ofSeconds(9));
+            cluster.setNodeSessionRenewInterval(Duration.ofSeconds(3));
+            cluster.setWorkloadClaimTtl(Duration.ofSeconds(30));
+            cluster.setWorkloadClaimRenewInterval(renewInterval);
+
+            Throwable invalid = catchThrowable(() -> ClusterMemberPreflight.validate(
+                    clusteredHazelcast(), cluster, control("https://node-a.internal:8080")));
+
+            assertThat(invalid).as("business renewal interval %s is not below the node-session bound", renewInterval)
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID));
+        });
+    }
+
+    @Test
+    void defaultAndCoherentShortLeaseWindowsPassPreflight() {
+        ClusterProperties defaults = cluster("cluster-a", "node-a");
+        assertThat(ClusterMemberPreflight.validate(
+                clusteredHazelcast(), defaults, control("https://node-a.internal:8080")))
+                .as("the default node and workload lease windows remain valid")
+                .isNotNull();
+
+        ClusterProperties shortLeases = cluster("cluster-a", "node-a");
+        shortLeases.setNodeSessionTtl(Duration.ofSeconds(9));
+        shortLeases.setNodeSessionRenewInterval(Duration.ofSeconds(3));
+        shortLeases.setWorkloadClaimTtl(Duration.ofSeconds(9));
+        shortLeases.setWorkloadClaimRenewInterval(Duration.ofSeconds(3));
+        assertThat(ClusterMemberPreflight.validate(
+                clusteredHazelcast(), shortLeases, control("https://node-a.internal:8080")))
+                .as("both short lease windows admit renewal before their configured bounds")
+                .isNotNull();
+    }
+
+    @Test
+    void aSingleNodeDoesNotApplyClusterWorkloadLeaseBounds() {
+        ClusterProperties single = new ClusterProperties();
+        single.setNodeSessionTtl(Duration.ofSeconds(9));
+        single.setNodeSessionRenewInterval(Duration.ofSeconds(3));
+        single.setWorkloadClaimTtl(Duration.ofSeconds(30));
+        single.setWorkloadClaimRenewInterval(Duration.ofSeconds(10));
+
+        assertThat(ClusterMemberPreflight.validate(
+                singleNodeHazelcast("127.0.0.1"), single, control(null)))
+                .as("single-node execution acquires no cluster node-session identity")
+                .isNull();
+    }
+
     private static HazelcastProperties clusteredHazelcast() {
         HazelcastProperties properties = new HazelcastProperties();
         properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);

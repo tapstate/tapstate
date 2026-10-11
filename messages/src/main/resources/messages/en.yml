@@ -145,8 +145,8 @@ boot.node-session-ttl-invalid:
   message: "The node-session lease lifetime must be positive."
   solution: "Set tapstate.cluster.node-session-ttl to a positive duration."
 boot.workload-claim-renew-interval-invalid:
-  message: "The workload-claim renewal interval must be positive and shorter than its lease."
-  solution: "Set tapstate.cluster.workload-claim-renew-interval below tapstate.cluster.workload-claim-ttl."
+  message: "The workload-claim renewal interval must be positive and shorter than the workload-claim and node-session lease lifetimes."
+  solution: "Set tapstate.cluster.workload-claim-renew-interval below both tapstate.cluster.workload-claim-ttl and tapstate.cluster.node-session-ttl."
 boot.workload-claim-ttl-invalid:
   message: "The workload-claim lease must be positive."
   solution: "Set tapstate.cluster.workload-claim-ttl to a positive duration."

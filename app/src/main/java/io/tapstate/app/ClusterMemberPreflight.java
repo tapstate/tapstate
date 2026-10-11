@@ -99,7 +99,8 @@ final class ClusterMemberPreflight {
         if (cluster.getWorkloadClaimRenewInterval() == null
                 || cluster.getWorkloadClaimRenewInterval().isNegative()
                 || cluster.getWorkloadClaimRenewInterval().isZero()
-                || cluster.getWorkloadClaimRenewInterval().compareTo(cluster.getWorkloadClaimTtl()) >= 0) {
+                || cluster.getWorkloadClaimRenewInterval().compareTo(cluster.getWorkloadClaimTtl()) >= 0
+                || cluster.getWorkloadClaimRenewInterval().compareTo(cluster.getNodeSessionTtl()) >= 0) {
             throw new TapstateException(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID, Map.of(), null);
         }
         if (cluster.getMembershipReconcileInterval() == null

@@ -665,7 +665,8 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         if (!holdRecoveryClaim()) { return; }
         Map<String, ClusterExecutionMember> live = liveMembers();
         ClusterExecutionProfile profile = stores.clusterProfiles().profile(properties.getId()).orElseThrow();
-        for (String pipeline : pipelineIds) {
+        // Discover the same retained set in a stable order; assigned queue sequences remain unchanged.
+        for (String pipeline : pipelineIds.stream().sorted().toList()) {
             try { discover(pipeline, profile, live); }
             catch (TapstateException unavailable) { LOG.warn("Recovery discovery for {} failed [{}]", pipeline, unavailable.code().code(), unavailable); }
         }
