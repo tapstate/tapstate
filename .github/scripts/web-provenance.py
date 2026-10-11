@@ -11,9 +11,17 @@ import re
 import sys
 import tarfile
 import zipfile
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from posixpath import normpath
 from typing import Any
+
+
+PROFILE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "web-assets-profile.py"
+PROFILE_SPEC = spec_from_file_location("web_assets_profile", PROFILE_SCRIPT)
+assert PROFILE_SPEC is not None and PROFILE_SPEC.loader is not None
+PROFILE = module_from_spec(PROFILE_SPEC)
+PROFILE_SPEC.loader.exec_module(PROFILE)
 
 
 class ProvenanceError(Exception):
@@ -24,20 +32,80 @@ def sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+def normalize_cloud_console_url(value: Any) -> str:
+    try:
+        return PROFILE.normalize_cloud_console_url(value)
+    except PROFILE.WebAssetsError as exc:
+        raise ProvenanceError("Cloud Console URL is not a valid explicit HTTPS URL") from exc
+
+
+def declared_profile(web_profile: str, cloud_console_url: str | None) -> tuple[str, str | None]:
+    if web_profile not in {"cloud", "onprem"}:
+        raise ProvenanceError("a known Web profile must be declared explicitly")
+    if web_profile == "cloud":
+        if cloud_console_url is None:
+            raise ProvenanceError("the declared Cloud profile requires a Cloud Console URL")
+        return web_profile, normalize_cloud_console_url(cloud_console_url)
+    if cloud_console_url is not None:
+        raise ProvenanceError("the declared on-prem profile must not contain a Cloud Console URL")
+    return web_profile, None
+
+
+def validate_profile_metadata(props: dict[str, str], description: str) -> tuple[str, str | None]:
+    profile = props.get("web.profile")
+    if profile not in {"cloud", "onprem"}:
+        raise ProvenanceError(f"{description} is missing a known Web profile")
+    if profile == "onprem":
+        if "cloud.console.url" in props:
+            raise ProvenanceError(f"{description} on-prem metadata contains a Cloud Console URL")
+        return profile, None
+    url = props.get("cloud.console.url")
+    normalized_url = normalize_cloud_console_url(url)
+    if url != normalized_url:
+        raise ProvenanceError(f"{description} Cloud Console URL is not canonical")
+    return profile, normalized_url
+
+
+def verify_declared_profile(props: dict[str, str], web_profile: str,
+                            cloud_console_url: str | None) -> None:
+    expected_profile, expected_url = declared_profile(web_profile, cloud_console_url)
+    actual_profile, actual_url = validate_profile_metadata(props, "Boot JAR")
+    if actual_profile != expected_profile:
+        raise ProvenanceError("Boot JAR profile disagrees with the declared build input")
+    if actual_url != expected_url:
+        raise ProvenanceError("Boot JAR Cloud Console URL disagrees with the declared build input")
+
+
+def verify_declared_boot_jar(props: dict[str, str], boot_jar_sha256: str) -> None:
+    if not isinstance(boot_jar_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", boot_jar_sha256):
+        raise ProvenanceError("declared Boot JAR SHA-256 must be 64 lowercase hexadecimal characters")
+    if props.get("image.boot-jar.sha256") != boot_jar_sha256:
+        raise ProvenanceError("embedded Boot JAR bytes disagree with the declared build input")
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_json_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProvenanceError(f"cannot read JSON {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ProvenanceError(f"{path} must contain a JSON object")
     return value
 
 
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProvenanceError("JSON provenance or OCI metadata contains a duplicate field")
+        result[key] = value
+    return result
+
+
 def blob_path(layout: Path, digest: str) -> Path:
-    algorithm, separator, encoded = digest.partition(":")
-    if not separator or algorithm != "sha256" or len(encoded) != 64:
-        raise ProvenanceError(f"unsupported OCI digest: {digest}")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ProvenanceError("OCI descriptor has an invalid SHA-256 digest")
+    algorithm, encoded = digest.split(":", 1)
     path = layout / "blobs" / algorithm / encoded
     try:
         payload = path.read_bytes()
@@ -51,6 +119,8 @@ def blob_path(layout: Path, digest: str) -> Path:
 def properties_from_jar(jar_bytes: bytes, platform: str) -> dict[str, str]:
     try:
         with zipfile.ZipFile(io.BytesIO(jar_bytes)) as jar:
+            if len(jar.namelist()) != len(set(jar.namelist())):
+                raise ProvenanceError(f"{platform} Boot JAR contains a duplicate ZIP entry")
             raw = jar.read("META-INF/tapstate-web.properties").decode("utf-8")
             files_manifest = jar.read("META-INF/tapstate-web.files.sha256")
             static_files = {
@@ -92,25 +162,66 @@ def properties_from_jar(jar_bytes: bytes, platform: str) -> dict[str, str]:
             raise ProvenanceError(f"{platform} packaged Web file does not match its manifest: {name}")
     if hashlib.sha256(files_manifest).hexdigest() != props.get("files.sha256"):
         raise ProvenanceError(f"{platform} Web manifest content disagrees with files.sha256 metadata")
+    validate_profile_metadata(props, f"{platform} Boot JAR")
+    props["image.boot-jar.sha256"] = hashlib.sha256(jar_bytes).hexdigest()
     return props
 
 
-def metadata_from_layer(layer: bytes, platform: str) -> dict[str, str]:
+def metadata_from_layer(layer: bytes, platform: str, jar_seen: bool = False) -> dict[str, str]:
+    result = None
     try:
         with tarfile.open(fileobj=io.BytesIO(layer), mode="r:*") as archive:
             for entry in archive:
                 normalized = normpath(entry.name.removeprefix("./"))
-                if entry.isfile() and normalized == "opt/tapstate/tapstate.jar":
+                if normalized in {"opt", "opt/tapstate"} and not entry.isdir():
+                    raise ProvenanceError(f"{platform} OCI image has a linked or non-directory Boot JAR parent")
+                if (jar_seen or result is not None) and normalized in {
+                        ".wh.opt", "opt/.wh.tapstate", "opt/tapstate/.wh.tapstate.jar",
+                        ".wh..wh..opq", "opt/.wh..wh..opq", "opt/tapstate/.wh..wh..opq"}:
+                    raise ProvenanceError(f"{platform} OCI image deletes a Boot JAR input")
+                if normalized == "opt/tapstate/tapstate.jar":
+                    if not entry.isfile() or result is not None:
+                        raise ProvenanceError(f"{platform} OCI image has a linked or duplicate Boot JAR input")
                     stream = archive.extractfile(entry)
                     if stream is None:
                         break
-                    return properties_from_jar(stream.read(), platform)
+                    jar_bytes = stream.read()
+                    result = properties_from_jar(jar_bytes, platform)
     except (tarfile.TarError, OSError) as exc:
         raise ProvenanceError(f"cannot inspect {platform} OCI layer: {exc}") from exc
-    raise ProvenanceError(f"{platform} OCI image does not contain /opt/tapstate/tapstate.jar")
+    if result is None:
+        raise ProvenanceError(f"{platform} OCI image does not contain /opt/tapstate/tapstate.jar")
+    return result
 
 
-def image_metadata(layout: Path) -> tuple[str, dict[str, dict[str, str]]]:
+def validate_image_labels(props: dict[str, str], labels: dict[str, Any], platform: str) -> None:
+    required_labels = {
+        "org.opencontainers.image.version": "release.version",
+        "org.opencontainers.image.revision": "tapstate.revision",
+        "io.tapstate.web.revision": "revision",
+        "io.tapstate.web.files.sha256": "files.sha256",
+        "io.tapstate.web.profile": "web.profile",
+    }
+    for label, property_name in required_labels.items():
+        if not labels.get(label):
+            raise ProvenanceError(f"{platform} image is missing label {label}")
+        if labels[label] != props.get(property_name):
+            raise ProvenanceError(f"{platform} label {label} disagrees with Boot JAR metadata")
+    profile, console_url = validate_profile_metadata(props, f"{platform} Boot JAR")
+    distribution = labels.get("io.tapstate.distribution")
+    if not isinstance(distribution, str) or distribution not in {"cloud", "onprem"}:
+        raise ProvenanceError(f"{platform} image is missing a known distribution")
+    if distribution != profile:
+        raise ProvenanceError(f"{platform} image distribution disagrees with the Boot JAR profile")
+    url_label = labels.get("io.tapstate.web.cloud-console-url")
+    if profile == "cloud" and url_label != console_url:
+        raise ProvenanceError(f"{platform} image Cloud Console URL label disagrees with Boot JAR metadata")
+    if profile == "onprem" and url_label is not None and url_label != "":
+        raise ProvenanceError(f"{platform} on-prem image has a Cloud Console URL label")
+    props["image.distribution"] = distribution
+
+
+def image_metadata(layout: Path) -> tuple[str, dict[str, str]]:
     root = load_json(layout / "index.json")
     roots = root.get("manifests")
     if not isinstance(roots, list) or len(roots) != 1 or not isinstance(roots[0], dict):
@@ -129,23 +240,27 @@ def image_metadata(layout: Path) -> tuple[str, dict[str, dict[str, str]]]:
         if not isinstance(descriptor, dict):
             continue
         platform_info = descriptor.get("platform") or {}
-        if platform_info.get("os") != "linux" or platform_info.get("architecture") not in {"amd64", "arm64"}:
+        if not isinstance(platform_info, dict):
+            raise ProvenanceError("OCI archive has malformed platform metadata")
+        architecture = platform_info.get("architecture")
+        if architecture is not None and not isinstance(architecture, str):
+            raise ProvenanceError("OCI archive has malformed platform metadata")
+        if platform_info.get("os") != "linux" or architecture not in {"amd64", "arm64"}:
             continue
         platform = f"linux/{platform_info['architecture']}"
         if platform in metadata:
             raise ProvenanceError(f"OCI archive contains duplicate platform {platform}")
         manifest = load_json(blob_path(layout, descriptor.get("digest", "")))
         config_descriptor = manifest.get("config", {})
+        if not isinstance(config_descriptor, dict):
+            raise ProvenanceError(f"{platform} image has no valid OCI config descriptor")
         config = load_json(blob_path(layout, config_descriptor.get("digest", "")))
-        labels = config.get("config", {}).get("Labels")
+        image_config = config.get("config")
+        if not isinstance(image_config, dict):
+            raise ProvenanceError(f"{platform} image has no valid OCI config")
+        labels = image_config.get("Labels")
         if not isinstance(labels, dict):
             raise ProvenanceError(f"{platform} image has no OCI config labels")
-        required_labels = {
-            "org.opencontainers.image.version": "release.version",
-            "org.opencontainers.image.revision": "tapstate.revision",
-            "io.tapstate.web.revision": "revision",
-            "io.tapstate.web.files.sha256": "files.sha256",
-        }
         layer_descriptors = manifest.get("layers")
         if not isinstance(layer_descriptors, list):
             raise ProvenanceError(f"{platform} image has no layers")
@@ -155,17 +270,17 @@ def image_metadata(layout: Path) -> tuple[str, dict[str, dict[str, str]]]:
                 raise ProvenanceError(f"{platform} image has a malformed layer descriptor")
             layer_path = blob_path(layout, layer_descriptor.get("digest", ""))
             try:
-                jar_props = metadata_from_layer(layer_path.read_bytes(), platform)
+                candidate = metadata_from_layer(layer_path.read_bytes(), platform, jar_props is not None)
             except ProvenanceError as exc:
                 if "does not contain" not in str(exc):
                     raise
+            else:
+                if jar_props is not None:
+                    raise ProvenanceError(f"{platform} image contains duplicate Boot JAR inputs across layers")
+                jar_props = candidate
         if jar_props is None:
             raise ProvenanceError(f"{platform} image has no Boot JAR provenance")
-        for label, property_name in required_labels.items():
-            if not labels.get(label):
-                raise ProvenanceError(f"{platform} image is missing label {label}")
-            if labels[label] != jar_props.get(property_name):
-                raise ProvenanceError(f"{platform} label {label} disagrees with Boot JAR metadata")
+        validate_image_labels(jar_props, labels, platform)
         metadata[platform] = jar_props
 
     if set(metadata) != {"linux/amd64", "linux/arm64"}:
@@ -184,8 +299,18 @@ def expected_metadata(version: str, tapstate_revision: str, web_revision: str) -
     }
 
 
+def image_repository(props: dict[str, str]) -> str:
+    distribution = props.get("image.distribution")
+    if distribution not in {"cloud", "onprem"}:
+        raise ProvenanceError("image has an unknown distribution")
+    return "ghcr.io/tapstate/tapstate-cloud" if distribution == "cloud" else "ghcr.io/tapstate/tapstate"
+
+
 def create(args: argparse.Namespace) -> None:
+    web_profile, console_url = declared_profile(args.web_profile, args.cloud_console_url)
     digest, props = image_metadata(args.oci_layout)
+    verify_declared_profile(props, web_profile, console_url)
+    verify_declared_boot_jar(props, args.boot_jar_sha256)
     for key, expected in expected_metadata(args.version, args.tapstate_revision, args.web_revision).items():
         if props.get(key) != expected:
             raise ProvenanceError(f"image metadata {key} is {props.get(key)!r}, expected {expected!r}")
@@ -195,25 +320,30 @@ def create(args: argparse.Namespace) -> None:
     provenance = {
         "schemaVersion": 1,
         "releaseVersion": args.version,
+        "bootJarSha256": args.boot_jar_sha256,
         "tapstate": {"repository": "tapstate/tapstate", "revision": args.tapstate_revision},
         "web": {
             "repository": "tapstate/tapstate-web",
             "revision": args.web_revision,
             "filesSha256": files_digest,
+            "profile": web_profile,
         },
         "image": {
-            "repository": "ghcr.io/tapstate/tapstate",
+            "repository": image_repository(props),
             "tag": args.version,
             "manifestDigest": digest,
             "platforms": ["linux/amd64", "linux/arm64"],
         },
     }
-    verify_values(provenance, digest, props)
+    if console_url is not None:
+        provenance["web"]["cloudConsoleUrl"] = console_url
+    verify_values(provenance, digest, props, web_profile, console_url, args.boot_jar_sha256)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def verify_values(provenance: dict[str, Any], digest: str, props: dict[str, str]) -> None:
+def verify_values(provenance: dict[str, Any], digest: str, props: dict[str, str],
+                  web_profile: str, cloud_console_url: str | None, boot_jar_sha256: str) -> None:
     try:
         version = provenance["releaseVersion"]
         tapstate_revision = provenance["tapstate"]["revision"]
@@ -234,7 +364,21 @@ def verify_values(provenance: dict[str, Any], digest: str, props: dict[str, str]
         raise ProvenanceError("provenance Tapstate repository is unexpected")
     if web.get("repository") != "tapstate/tapstate-web":
         raise ProvenanceError("provenance Web repository is unexpected")
-    if image.get("repository") != "ghcr.io/tapstate/tapstate":
+    declared, declared_url = declared_profile(web_profile, cloud_console_url)
+    verify_declared_profile(props, declared, declared_url)
+    verify_declared_boot_jar(props, boot_jar_sha256)
+    if provenance.get("bootJarSha256") != boot_jar_sha256:
+        raise ProvenanceError("provenance Boot JAR SHA-256 disagrees with the declared build input")
+    if web.get("profile") != declared:
+        raise ProvenanceError("provenance Web profile disagrees with the declared build input")
+    if declared == "cloud":
+        raw_url = web.get("cloudConsoleUrl")
+        normalized_url = normalize_cloud_console_url(raw_url)
+        if raw_url != normalized_url or normalized_url != declared_url:
+            raise ProvenanceError("provenance Cloud Console URL disagrees with the declared build input")
+    elif "cloudConsoleUrl" in web:
+        raise ProvenanceError("on-prem provenance must not contain a Cloud Console URL")
+    if image.get("repository") != image_repository(props):
         raise ProvenanceError("provenance image repository is unexpected")
     if image.get("tag") != version:
         raise ProvenanceError("provenance image tag disagrees with the release version")
@@ -262,7 +406,8 @@ def verify_values(provenance: dict[str, Any], digest: str, props: dict[str, str]
 def verify(args: argparse.Namespace) -> None:
     provenance = load_json(args.provenance)
     digest, props = image_metadata(args.oci_layout)
-    verify_values(provenance, digest, props)
+    verify_values(provenance, digest, props, args.web_profile, args.cloud_console_url,
+                  args.boot_jar_sha256)
     print(f"verified OCI archive {digest} against Boot JAR metadata and {args.provenance}")
 
 
@@ -275,10 +420,16 @@ def parser() -> argparse.ArgumentParser:
     make.add_argument("--version", required=True)
     make.add_argument("--tapstate-revision", required=True)
     make.add_argument("--web-revision", required=True)
+    make.add_argument("--web-profile", choices=("cloud", "onprem"), required=True)
+    make.add_argument("--cloud-console-url")
+    make.add_argument("--boot-jar-sha256", required=True)
     make.set_defaults(run=create)
     check = commands.add_parser("verify")
     check.add_argument("--oci-layout", type=Path, required=True)
     check.add_argument("--provenance", type=Path, required=True)
+    check.add_argument("--web-profile", choices=("cloud", "onprem"), required=True)
+    check.add_argument("--cloud-console-url")
+    check.add_argument("--boot-jar-sha256", required=True)
     check.set_defaults(run=verify)
     return root
 

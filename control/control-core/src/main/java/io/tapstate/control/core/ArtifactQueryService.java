@@ -1,5 +1,6 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.AssemblyIdentity;
@@ -15,17 +16,18 @@ import java.util.Optional;
 /**
  * The resource-type-agnostic read side of the double-layer model: the store is the truth layer, and a
  * read returns an artifact from that layer — never from a local draft (server-as-truth). Public Source
- * reads redact Mongo URI userinfo while their stored resource, content hash, and typed internal reads
- * remain unchanged. {@link ApplyService} is the write side; this is its read peer.
+ * reads omit connector config and redact Mongo URI userinfo in remaining display fields, while their
+ * stored resource, content hash, and typed internal reads remain unchanged. {@link ApplyService} is the
+ * write side; this is its read peer.
  *
- * <p>Non-sensitive artifacts retain the byte-stable canonical form produced by the same {@link
- * CanonicalWriter} as offline authoring. A Source projection starts from that form and replaces only
- * Mongo URI userinfo; it is deliberately display-only and keeps the authoritative hash beside it.
+ * <p>Non-Source reads remain byte-stable canonical output. A Source read is a display projection produced
+ * by the same writer; the server remains the truth for its omitted connection configuration.
  */
 public final class ArtifactQueryService {
 
     private final ArtifactStore store;
     private final CanonicalWriter writer = new CanonicalWriter();
+    private final DslParser parser = new DslParser();
     private final SourceReadProjection sourceProjection = new SourceReadProjection();
 
     public ArtifactQueryService(ArtifactStore store) {
@@ -68,8 +70,7 @@ public final class ArtifactQueryService {
 
     /**
      * Lists stored artifacts of the given {@code kind} as their canonical form; a null or blank kind is
-     * "no filter" and returns every artifact, the same as {@link #list()}. Read-by-kind lives here in
-     * the read service so a face stays a pure projection of the verb rather than filtering results itself.
+     * "no filter" and returns every artifact, the same as {@link #list()}.
      */
     public List<ArtifactListEntry> list(String kind) {
         if (kind == null || kind.isBlank()) {
@@ -79,9 +80,7 @@ public final class ArtifactQueryService {
     }
 
     private StoredArtifact view(Resource resource) {
-        // The hash comes back beside the canonical form rather than being derivable from it: it is taken
-        // over the resource's structure, so a caller holding only these bytes cannot recompute it and
-        // must hand this field straight back as a precondition.
+        // The authoritative hash travels beside the display projection and is not derived from it.
         String canonical = resource instanceof SourceResource source
                 ? sourceProjection.canonicalForRead(source) : writer.write(resource);
         return new StoredArtifact(resource.id(), resource.kind(), canonical, CanonicalHash.of(resource));
@@ -89,11 +88,21 @@ public final class ArtifactQueryService {
 
     private ArtifactListEntry view(StoredArtifactRecord row) {
         String canonical = row.canonicalForm();
-        if ("source".equals(row.kind()) && canonical != null) {
-            canonical = sourceProjection.canonicalForRead(canonical);
+        if ("source".equals(row.kind())) {
+            if (!row.readable() || canonical == null) {
+                canonical = SourceReadProjection.WITHHELD;
+            } else {
+                try {
+                    Resource parsed = parser.parse(canonical);
+                    canonical = parsed instanceof SourceResource source
+                            ? sourceProjection.canonicalForRead(source)
+                            : SourceReadProjection.WITHHELD;
+                } catch (RuntimeException unsafeSource) {
+                    canonical = SourceReadProjection.WITHHELD;
+                }
+            }
         }
-        return new ArtifactListEntry(
-                row.id(), row.kind(), canonical, row.contentHash(), row.readable());
+        return new ArtifactListEntry(row.id(), row.kind(), canonical, row.contentHash(), row.readable());
     }
 
     private StoredResource typedView(Resource resource) {

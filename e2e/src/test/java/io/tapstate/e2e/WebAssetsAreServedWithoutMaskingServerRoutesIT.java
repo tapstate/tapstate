@@ -29,8 +29,9 @@ class WebAssetsAreServedWithoutMaskingServerRoutesIT {
             control.bootstrapAndLogin("web-assets", "web-assets-password");
 
             HttpClient client = HttpClient.newHttpClient();
-            HttpResponse<String> root = get(client, server.baseUrl(), "/");
-            HttpResponse<String> deepRoute = get(client, server.baseUrl(), "/pipelines/orders/edit/api");
+            HttpResponse<String> root = document(client, server.baseUrl(), "/");
+            HttpResponse<String> deepRoute = document(client, server.baseUrl(), "/pipelines/orders/edit/api");
+            HttpResponse<String> newClientRoute = document(client, server.baseUrl(), "/views/orders");
             HttpResponse<String> asset = get(client, server.baseUrl(), "/assets/web-packaging.js");
             HttpResponse<String> health = get(client, server.baseUrl(), "/healthz");
             HttpResponse<String> apiMissing = client.send(
@@ -46,6 +47,11 @@ class WebAssetsAreServedWithoutMaskingServerRoutesIT {
             assertThat(root.body()).contains("Tapstate Web packaging fixture");
             assertThat(deepRoute.statusCode()).isEqualTo(200);
             assertThat(deepRoute.body()).isEqualTo(root.body());
+            assertThat(newClientRoute.statusCode()).isEqualTo(200);
+            assertThat(newClientRoute.body()).isEqualTo(root.body());
+            HttpResponse<String> nonDocument = get(client, server.baseUrl(), "/views/orders");
+            assertThat(nonDocument.statusCode()).isEqualTo(401);
+            assertThat(nonDocument.body()).doesNotContain("Tapstate Web packaging fixture");
             assertThat(asset.statusCode()).isEqualTo(200);
             assertThat(asset.body()).contains("webPackagingFixture");
             assertThat(health.statusCode()).isEqualTo(200);
@@ -62,5 +68,10 @@ class WebAssetsAreServedWithoutMaskingServerRoutesIT {
         return client.send(
                 HttpRequest.newBuilder(baseUrl.resolve(path)).GET().build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+    }
+
+    private static HttpResponse<String> document(HttpClient client, URI baseUrl, String path) throws Exception {
+        return client.send(HttpRequest.newBuilder(baseUrl.resolve(path)).header("Accept", "text/html")
+                .GET().build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
     }
 }

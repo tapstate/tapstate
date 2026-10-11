@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -15,6 +17,7 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -34,6 +37,36 @@ class NodeSessionLeaseTest {
         lease.close();
 
         assertThat(store.released.get()).isTrue();
+    }
+
+    @Test
+    void aLiveNodeSessionRenewsAndReleasesItsKeyringAcknowledgement() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        RecordingKeyring keyring = new RecordingKeyring(false);
+        NodeSessionLease lease = new NodeSessionLease(
+                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), keyring,
+                () -> { });
+
+        assertThat(keyring.acknowledged.await(1, TimeUnit.SECONDS)).isTrue();
+        lease.close();
+
+        assertThat(keyring.acknowledgements).hasValueGreaterThanOrEqualTo(1);
+        assertThat(keyring.released.get()).isTrue();
+    }
+
+    @Test
+    void aKeyringEpochRefusalStopsTheMemberEvenWhenTheNodeClaimRenewed() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        RecordingKeyring keyring = new RecordingKeyring(true);
+        CountDownLatch memberStopped = new CountDownLatch(1);
+        NodeSessionLease lease = new NodeSessionLease(
+                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), keyring,
+                memberStopped::countDown);
+        try {
+            assertThat(memberStopped.await(1, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            lease.close();
+        }
     }
 
     @Test
@@ -224,6 +257,33 @@ class NodeSessionLeaseTest {
         @Override
         public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
             return Optional.of(new WorkloadClaimReading(CLAIM, LIVE_LEASE));
+        }
+    }
+
+    private static final class RecordingKeyring implements SourceConfigKeyringSession {
+        private final boolean refuse;
+        private final CountDownLatch acknowledged = new CountDownLatch(1);
+        private final AtomicInteger acknowledgements = new AtomicInteger();
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private RecordingKeyring(boolean refuse) {
+            this.refuse = refuse;
+        }
+
+        @Override
+        public void acknowledge(WorkloadClaim session, Duration ttl) {
+            acknowledgements.incrementAndGet();
+            acknowledged.countDown();
+            if (refuse) {
+                throw new TapstateException(
+                        io.tapstate.adapters.mongostore.StoreError.SOURCE_CONFIG_KEYRING_NOT_READY,
+                        java.util.Map.of(), null);
+            }
+        }
+
+        @Override
+        public void release(WorkloadClaim session) {
+            released.set(true);
         }
     }
 }

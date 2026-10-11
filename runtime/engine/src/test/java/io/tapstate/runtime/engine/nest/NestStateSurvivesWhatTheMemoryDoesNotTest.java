@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.math.BigDecimal;
+import io.tapstate.core.model.EmbedAs;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -64,6 +66,7 @@ class NestStateSurvivesWhatTheMemoryDoesNotTest {
         join.getTcpIpConfig().setEnabled(false);
         join.getAutoDetectionConfig().setEnabled(false);
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
         config.addMapConfig(NestSettings.defaults().backedStateMaps());
         member = Hazelcast.newHazelcastInstance(config);
         NestStateMapStoreFactory.bindTo(member, store);
@@ -137,6 +140,32 @@ class NestStateSurvivesWhatTheMemoryDoesNotTest {
         ResolverState reread = stores(NAMESPACE).forResolver(vertex(NAMESPACE)).load(List.of("C1"));
         assertThat(reread).isNotNull();
         assertThat(reread.parentKey()).isEqualTo("parent-1");
+    }
+
+    @Test
+    void aReleasedDecimalKeyRecoversTheWholeDocumentFromColdStateAfterRestart() {
+        String namespace = "nest.p1.n1.$root";
+        NestVertex rootVertex = new NestVertex(List.of(), "n1", namespace,
+                List.of("id"), List.of(), List.of());
+        RootAssembly written = new RootAssembly();
+        Map<String, Object> row = Map.of("id", new BigDecimal("100.00"), "customer", "before-restart");
+        written.applyRoot(row, new SourceOrder(0, 1));
+        written.applyElement(new ElementRef(List.of("orders"), null, List.of("O1"), null),
+                Map.of("order_id", "O1", "amount", 10L), new SourceOrder(0, 2), Map.of());
+        List<Object> releasedKey = List.of(new BigDecimal("100"));
+        stores(namespace).forAssembler(rootVertex).save(releasedKey, written);
+        assertThat(store.keysIn(namespace)).containsExactly("[100]~m");
+
+        member.getMap(namespace).destroy();
+        RootAssembly restored = stores(namespace).forAssembler(rootVertex)
+                .load(NestKeys.valuesOf(row, List.of("id"), namespace));
+
+        assertThat(restored).isNotNull();
+        Map<String, Object> document = restored.render(List.of(
+                new EmbedSlot("orders", EmbedAs.ARRAY, List.of()))).orElseThrow();
+        assertThat(document).containsEntry("customer", "before-restart");
+        assertThat(document.get("orders")).isEqualTo(List.of(Map.of("order_id", "O1", "amount", 10L)));
+        assertThat(row.get("id")).isEqualTo(new BigDecimal("100.00"));
     }
 
     /**

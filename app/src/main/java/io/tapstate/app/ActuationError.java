@@ -17,6 +17,9 @@ import java.util.Set;
  */
 enum ActuationError implements TapstateErrorCode {
 
+    /** A bounded Pipeline preview could not be completed without weakening its read or size guarantees. */
+    PREVIEW_REFUSED("actuation.preview-refused", Set.of("reason")),
+
     /** A start named a pipeline id with no stored artifact to run: {@code pipeline} is the id given. */
     PIPELINE_NOT_FOUND("actuation.pipeline-not-found", Set.of("pipeline")),
 
