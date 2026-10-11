@@ -30,7 +30,9 @@ class BenchmarkReturnWorkBudgetProfileTest {
         var bPrepared = BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, files(false)));
         assertThat(((Map<?, ?>) bPrepared.inputRegistrationInfo().get("outputPlanSource")).get("mode"))
                 .isEqualTo("B_PLAIN_ON_PERIODIC_NOMINAL");
-        assertThat(prepared.fieldsRegisteredOutputPlan()).isEqualTo(bPrepared.fieldsRegisteredOutputPlan());
+        assertThat(prepared.fieldsRegisteredOutputPlan()).isEqualTo(BenchmarkReturnWorkBudgetReportPlan.prepare(ORIGINAL, true).plan());
+        assertThat(bPrepared.fieldsRegisteredOutputPlan()).isEqualTo(BenchmarkReturnWorkBudgetReportPlan.prepare(ORIGINAL, false).plan());
+        assertThat(prepared.fieldsRegisteredOutputPlan().nodeUpper()).isGreaterThan(bPrepared.fieldsRegisteredOutputPlan().nodeUpper());
         assertThat(BenchmarkReturnWorkBudget.current()).isNull();
         var b = inputs(ORIGINAL, false, files(false));
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(
@@ -76,7 +78,9 @@ class BenchmarkReturnWorkBudgetProfileTest {
             var activities = (Map<String, Object>) snapshot.get("activities");
             @SuppressWarnings("unchecked")
             var shared = (Map<String, Object>) activities.get("SHARED_SUPPORT");
-            assertThat(shared).containsEntry("attempts", 2L).containsEntry("completedAttempts", 2L)
+            // Source roster and target plan each enter one layout and its single batch;
+            // the two associated records remain separate actual entries.
+            assertThat(shared).containsEntry("attempts", 6L).containsEntry("completedAttempts", 6L)
                     .containsEntry("actualCountComplete", true);
             @SuppressWarnings("unchecked")
             var actual = (Map<String, Object>) shared.get("actual");

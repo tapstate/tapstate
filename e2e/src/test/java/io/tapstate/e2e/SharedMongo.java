@@ -71,29 +71,82 @@ final class SharedMongo {
 
     /** The URL of a database on the shared replica set; the caller's name keeps its data its own. */
     static synchronized String replicaSetUrl(String database) {
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MONGO_URI, () -> {
         if (container == null) {
-            DockerGate.require();
+            BenchmarkSharedSupportSourceWork.dockerGate();
             MongoDBContainer starting = new MongoDBContainer(IMAGE);
-            configuredCacheBudget().ifPresent(budget -> {
+            configuredCacheBudget().ifPresent(budget -> BenchmarkSharedSupportSourceWork.entered(
+                    BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, BenchmarkSharedSupportSourceWork.Kind.MONGO_ARGUMENTS, () -> {
                 // Preserve the replica-set arguments supplied by the container binding.
-                var arguments = new ArrayList<>(Arrays.asList(starting.getCommandParts()));
-                arguments.add("--wiredTigerCacheSizeGB=" + budget.toPlainString());
+                String[] parts = starting.getCommandParts();
+                BenchmarkSharedSupportSourceWork.commandParts(parts);
+                var arguments = new ArrayList<>(Arrays.asList(parts));
+                arguments.add(cacheArgument(budget));
                 starting.withCommand(arguments.toArray(String[]::new));
-            });
+                return null;
+            }));
             starting.start();
             container = starting;
         }
         return container.getReplicaSetUrl(database);
+
+                });
     }
 
     /** A startup input, never a total mongod memory limit or a late reconfiguration. */
     static synchronized Optional<BigDecimal> configuredCacheBudget() {
-        if (cacheBudget != null) { return cacheBudget; }
-        String configured = System.getProperty(CACHE_BUDGET_PROPERTY);
-        if (configured == null) { return cacheBudget = Optional.empty(); }
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MONGO_CONFIGURATION,
+                () -> cacheBudget = configuredCacheBudgetUsing(cacheBudget, () -> System.getProperty(CACHE_BUDGET_PROPERTY)));
+    }
+
+    static Optional<BigDecimal> configuredCacheBudgetUsing(Optional<BigDecimal> cached,
+            java.util.function.Supplier<String> property) {
+        if (cached != null) {
+            requireScopedCachePresence(cached);
+            cached.ifPresent(SharedMongo::requireScopedCacheBudget);
+            return cached;
+        }
+        String configured = property.get();
+        if (configured == null) {
+            Optional<BigDecimal> absent = Optional.empty();
+            requireScopedCachePresence(absent);
+            return absent;
+        }
+        return Optional.of(parseCacheBudget(configured));
+    }
+
+    private static void requireScopedCachePresence(Optional<BigDecimal> budget) {
+        var scope = BenchmarkReturnWorkBudget.current();
+        if (scope != null && budget.isEmpty()) {
+            BenchmarkReturnWorkBudget.gap(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    "MONGO_CACHE_BUDGET_MISSING_FROM_FROZEN_SOURCE_RECIPE");
+            throw new AssertionError("active shared Mongo frozen cache budget is absent");
+        }
+    }
+
+    static BigDecimal parseCacheBudget(String configured) {
+        BenchmarkSharedSupportSourceWork.local(configured);
         BigDecimal budget = new BigDecimal(configured);
         if (budget.signum() <= 0) { throw new IllegalArgumentException("the shared Mongo cache budget must be positive"); }
-        return cacheBudget = Optional.of(budget.stripTrailingZeros());
+        requireScopedCacheBudget(budget);
+        return budget.stripTrailingZeros();
+    }
+
+    static String cacheArgument(BigDecimal budget) {
+        requireScopedCacheBudget(budget);
+        return "--wiredTigerCacheSizeGB=" + budget.toPlainString();
+    }
+
+    private static void requireScopedCacheBudget(BigDecimal budget) {
+        var scope = BenchmarkReturnWorkBudget.current();
+        // Equality checks both value and scale without expanding a scientific decimal into text.
+        if (scope != null && !BigDecimal.valueOf(5, 1).equals(budget)) {
+            BenchmarkReturnWorkBudget.gap(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    "MONGO_CACHE_BUDGET_DIFFERS_FROM_FROZEN_VALUE_OR_SCALE");
+            throw new AssertionError("active shared Mongo cache budget differs from the frozen value or scale");
+        }
     }
 
     /** Exact owned fixture identity, read only during diagnostic setup. */

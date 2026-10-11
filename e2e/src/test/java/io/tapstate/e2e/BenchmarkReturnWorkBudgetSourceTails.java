@@ -76,7 +76,8 @@ final class BenchmarkReturnWorkBudgetSourceTails {
         long elements = add(mul(records, ROW_FIELDS), mul(FACTORY_CALLS, scalarSlots), recipeChars);
         long bytes = add(mul(4, characters), mul(4, recipeChars));
         var upper = work(FACTORY_CALLS + 3L, requests, records, 0, bytes,
-                add(mul(FACTORY_CALLS, 8), 3 * 8L, targetSortCalls), elements, elements);
+                add(mul(FACTORY_CALLS, 8), 3 * 8L, targetSortCalls), elements, elements)
+                .plus(BenchmarkSharedSupportSourceWork.factoryUpper());
         var evidence = metadata("FACTORY_SOURCE_UPPER_ONLY", upper, List.of(
                 "SEVEN_ORIGINAL_STATELESS_96000_CONSTRUCTS", "ONE_ALL_COPY_STATELESS_STATEFUL_12000_INITIALIZER",
                 "SETUP_SQL_ROW_TEMPLATES_500_BATCHES_AND_UPDATE_RANGES100", "SIX_PHASE_COVERAGE_AND_TARGET_CHECKSUM_TRAVERSALS",

@@ -207,6 +207,7 @@ class BenchmarkReturnEmittedRosterTest {
             case "e2e" -> "e2e/target/test-classes";
             case "adapter-pdk" -> "adapters/adapter-pdk/target/classes";
             case "core-common" -> "core/core-common/target/classes";
+            case "test-support" -> "test-support/target/test-classes";
             default -> throw new AssertionError("controlled Java module differs");
         });
     }

@@ -59,7 +59,10 @@ final class BenchmarkReturnWorkBudgetBindings {
         PDK_BEAN("PdkWriteReturnProbeMBean", "adapter-pdk"), PDK_SCOPE("PdkMongoWriteScope", "adapter-pdk"),
         PDK_CLOCK("PdkBenchmarkClock", "adapter-pdk"), PDK_WRITER("PdkSinkWriter", "adapter-pdk"),
         PDK_ORIGINS("PdkReturnOrigins", "adapter-pdk"),
-        JSON_WRITER("JsonWriter", "core-common"), JSON_READER("JsonReader", "core-common"), JNI_SOURCE;
+        JSON_WRITER("JsonWriter", "core-common"), JSON_READER("JsonReader", "core-common"), JNI_SOURCE,
+        SHARED_SOURCE_WORK("BenchmarkSharedSupportSourceWork"), SHARED_POSTGRES("SharedPostgres"), SHARED_MONGO("SharedMongo"),
+        REAL_PROCESS_SERVER("RealProcessServer"), SERVER_HANDLE("ServerHandle"),
+        DOCKER_GATE("DockerGate", "test-support");
 
         private final String binaryName, sourcePath, module;
         SourceRole(String name) {
@@ -68,15 +71,18 @@ final class BenchmarkReturnWorkBudgetBindings {
         }
         SourceRole(String name, String module) {
             this.module = module;
-            binaryName = (module.equals("adapter-pdk") ? "io.tapstate.adapters.pdk." : "io.tapstate.core.common.") + name;
-            sourcePath = (module.equals("adapter-pdk") ? "adapters/adapter-pdk" : "core/core-common")
-                    + "/src/main/java/" + binaryName.replace('.', '/') + ".java";
+            binaryName = (module.equals("adapter-pdk") ? "io.tapstate.adapters.pdk."
+                    : module.equals("test-support") ? "io.tapstate.testsupport." : "io.tapstate.core.common.") + name;
+            sourcePath = (module.equals("adapter-pdk") ? "adapters/adapter-pdk"
+                    : module.equals("test-support") ? "test-support" : "core/core-common")
+                    + (module.equals("test-support") ? "/src/test/java/" : "/src/main/java/")
+                    + binaryName.replace('.', '/') + ".java";
         }
         SourceRole() { module = "native"; binaryName = null; sourcePath = "e2e/src/test/resources/benchmark-clock/mach_clock_jni.c"; }
         String binaryName() { return binaryName; }
         String sourcePath() { return sourcePath; }
         String module() { return module; }
-        Set<Owner> owners() { return module.equals("e2e") ? Set.of(Owner.ROOT) : Set.of(Owner.ROOT, Owner.PRODUCER); }
+        Set<Owner> owners() { return module.equals("e2e") || module.equals("test-support") ? Set.of(Owner.ROOT) : Set.of(Owner.ROOT, Owner.PRODUCER); }
     }
 
     enum JdkRole {

@@ -40,14 +40,16 @@ public final class Await {
         long start = System.nanoTime();
         long deadline = start + bound.toNanos();
         while (true) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            if (System.nanoTime() - deadline >= 0) {
-                throw new AssertionError("timed out after " + Duration.ofNanos(System.nanoTime() - start)
-                        + " (bound " + bound + ") waiting for " + what + "; last read " + lastReading.get());
-            }
-            sleep(POLL);
+            boolean completed = BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                    BenchmarkSharedSupportSourceWork.Kind.AWAIT_ITERATION, () -> {
+                        if (condition.getAsBoolean()) return true;
+                        if (System.nanoTime() - deadline >= 0) {
+                            throw new AssertionError("timed out after " + Duration.ofNanos(System.nanoTime() - start)
+                                    + " (bound " + bound + ") waiting for " + what + "; last read " + lastReading.get());
+                        }
+                        sleep(POLL); return false;
+                    });
+            if (completed) return;
         }
     }
 

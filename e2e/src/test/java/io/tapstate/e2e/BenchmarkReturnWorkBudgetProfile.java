@@ -118,10 +118,10 @@ final class BenchmarkReturnWorkBudgetProfile {
         var upper = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
         var excluded = EnumSet.noneOf(BenchmarkReturnWorkBudget.Activity.class);
         if (!flags.rootCpu()) { excluded.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU); }
-        var reporting = BenchmarkReturnWorkBudgetReportPlan.prepare(inputs.workload());
+        var reporting = BenchmarkReturnWorkBudgetReportPlan.prepare(inputs.workload(), separateWriter);
         Map<String, Object> reportingMetadata = reporting.metadata();
         if (separateWriter) {
-            require(reportingMetadata.size() <= 32 && "B_PLAIN_ON_PERIODIC_NOMINAL".equals(reportingMetadata.get("mode")),
+            require(reportingMetadata.size() <= 32 && "A_PLAIN_PERIODIC_NOMINAL_SEPARATE_PRODUCER_WRITER".equals(reportingMetadata.get("mode")),
                     "source reporting metadata mode or fixed roster differs");
             var projected = new LinkedHashMap<>(reportingMetadata);
             projected.put("mode", "A_PLAIN_PERIODIC_NATIVE_DOMAIN_CALIBRATION_ABSENT_NOMINAL");
@@ -140,6 +140,13 @@ final class BenchmarkReturnWorkBudgetProfile {
         // A reader entry includes canonical re-encoding. Standalone encoding has its own COPY entry.
         upper.merge(BenchmarkReturnWorkBudget.Activity.DECODE, decode.plus(encode), BenchmarkReturnWorkBudget.Work::plus);
         upper.merge(BenchmarkReturnWorkBudget.Activity.COPY, encode, BenchmarkReturnWorkBudget.Work::plus);
+        require(inputs.workload().setupStatements() == BenchmarkSharedSupportSourceWork.SQL_STATEMENTS
+                        && inputs.workload().phases().stream().allMatch(phase -> phase.statementsPerBatch() == 1),
+                "shared fixture source recipe differs from the fixed stateless input");
+        upper.merge(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.sharedUpper(), BenchmarkSharedSupportSourceWork::maximum);
+        upper.merge(BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                BenchmarkSharedSupportSourceWork.cleanupUpper(), BenchmarkSharedSupportSourceWork::maximum);
         var localRegistration = BenchmarkReturnLocalSourceWork.registrationLocalUpper();
         upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, localRegistration, BenchmarkReturnWorkBudget.Work::plus);
         var writerRegistration = BenchmarkReturnWorkBudgetRun.producerWriterRegistrationUpper();

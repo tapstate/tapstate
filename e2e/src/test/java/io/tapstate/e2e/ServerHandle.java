@@ -69,7 +69,10 @@ interface ServerHandle extends AutoCloseable {
      */
     static void discardStagingDirectory(Path directory) {
         try {
-            FileSystemUtils.deleteRecursively(directory);
+            BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                    BenchmarkSharedSupportSourceWork.Kind.STAGING_DELETE, () -> {
+                        FileSystemUtils.deleteRecursively(directory); return null;
+                    });
         } catch (IOException e) {
             throw new UncheckedIOException("could not delete the server's staging directory " + directory, e);
         }

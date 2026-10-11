@@ -585,7 +585,7 @@ class BenchmarkReturnWorkBudgetRunTest {
                 "BOOT-INF/lib/core-common-controlled.jar", zip(commonMembers)));
         Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR), app);
         replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR, app);
-        for (var item : compiled) if (!item.role().module().equals("e2e")) origins.add(new Origin(Owner.PRODUCER,
+        for (var item : compiled) if (item.role().owners().contains(Owner.PRODUCER)) origins.add(new Origin(Owner.PRODUCER,
                 item.role(), item.binaryName(), paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).toString(),
                 "BOOT-INF/lib/" + item.role().module() + "-controlled.jar!/" + item.binaryName().replace('.', '/') + ".class",
                 writer != null && item.role() == SourceRole.PDK_WRITER ? writer.compiled().blob() : item.blob(), sha256(app)));

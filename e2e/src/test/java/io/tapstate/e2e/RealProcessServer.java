@@ -431,10 +431,18 @@ final class RealProcessServer implements ServerHandle {
         return tail(output);
     }
 
-    @Override public boolean terminated() { return !process.isAlive(); }
+    @Override public boolean terminated() {
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                BenchmarkSharedSupportSourceWork.Kind.PLAIN_PROCESS_CLOSE, () -> !process.isAlive());
+    }
 
     @Override
     public void close() {
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                BenchmarkSharedSupportSourceWork.Kind.PLAIN_PROCESS_CLOSE, () -> { closeBounded(); return null; });
+    }
+
+    private void closeBounded() {
         process.destroy();
         try {
             if (!process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS)) {

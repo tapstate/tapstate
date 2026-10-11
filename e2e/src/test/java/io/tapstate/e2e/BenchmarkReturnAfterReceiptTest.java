@@ -173,7 +173,8 @@ class BenchmarkReturnAfterReceiptTest {
         }
         for (String suffix : List.of("$Clock", "$JniAccess", "$NativeAccess"))
             classes.add(new CompiledClass(SourceRole.PDK_CLOCK, SourceRole.PDK_CLOCK.binaryName() + suffix, blob("clock" + suffix)));
-        List<String> classpath = List.of("/controlled/e2e", "/controlled/adapter-pdk.jar", "/controlled/core-common.jar");
+        List<String> classpath = List.of("/controlled/e2e", "/controlled/adapter-pdk.jar", "/controlled/core-common.jar",
+                "/controlled/test-support.jar");
         var origins = new ArrayList<Origin>(); var observed = new ArrayList<ObservedOrigin>();
         var app = files.stream().filter(f -> f.role() == BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).findFirst().orElseThrow();
         for (var c : classes) {

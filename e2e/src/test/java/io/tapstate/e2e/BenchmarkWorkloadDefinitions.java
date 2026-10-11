@@ -158,11 +158,18 @@ final class BenchmarkWorkloadDefinitions {
          * longer, start the next batch when it completes; never catch up by releasing a burst.
          */
         List<List<String>> batches() {
-            List<List<String>> batches = new ArrayList<>();
-            for (int offset = 0; offset < sql.size(); offset += statementsPerBatch) {
-                batches.add(sql.subList(offset, offset + statementsPerBatch));
-            }
-            return List.copyOf(batches);
+            return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    BenchmarkSharedSupportSourceWork.Kind.BATCH_LAYOUT, () -> {
+                List<List<String>> batches = new ArrayList<>();
+                for (int offset = 0; offset < sql.size(); offset += statementsPerBatch) {
+                    int current = offset;
+                    BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            BenchmarkSharedSupportSourceWork.Kind.BATCH_ROW, () -> {
+                        batches.add(sql.subList(current, current + statementsPerBatch)); return null;
+                    });
+                }
+                return List.copyOf(batches);
+            });
         }
     }
 
@@ -252,13 +259,52 @@ final class BenchmarkWorkloadDefinitions {
          * The prior server must already be stopped before this method runs.
          */
         void resetTargets(String externalTargetUri, String managedViewsUri, String operatorStateUri) {
+            resetTargetsUsing(externalTargetUri, managedViewsUri, operatorStateUri, MongoClients::create);
+        }
+        void resetTargetsUsing(String externalTargetUri, String managedViewsUri, String operatorStateUri,
+                java.util.function.Function<ConnectionString, MongoClient> clients) {
+            BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    BenchmarkSharedSupportSourceWork.Kind.TARGET_RESET, () -> {
+                        resetTargetsBounded(externalTargetUri, managedViewsUri, operatorStateUri, clients);
+                        return null;
+                    });
+        }
+
+        private void resetTargetsBounded(String externalTargetUri, String managedViewsUri, String operatorStateUri,
+                java.util.function.Function<ConnectionString, MongoClient> clients) {
+            if (BenchmarkReturnWorkBudget.current() != null) {
+                BenchmarkSharedSupportSourceWork.uri(externalTargetUri);
+                BenchmarkSharedSupportSourceWork.uri(managedViewsUri);
+                BenchmarkSharedSupportSourceWork.uri(operatorStateUri);
+                if (!id.equals(STATELESS) || targetResets().size() != 1) {
+                    BenchmarkReturnWorkBudget.gap(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            "SHARED_RESET_OUTSIDE_ORIGINAL_STATELESS_SOURCE_RECIPE");
+                }
+            }
             for (TargetExpectation target : targetResets()) {
                 String uri = target.location() == TargetLocation.MANAGED_VIEW
                         ? managedViewsUri : externalTargetUri;
                 ConnectionString address = new ConnectionString(uri);
                 String database = Objects.requireNonNull(address.getDatabase(), "target URI has no database");
-                try (MongoClient client = MongoClients.create(address)) {
-                    client.getDatabase(database).getCollection(target.table()).drop();
+                var scope = BenchmarkReturnWorkBudget.current();
+                MongoClient client = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                        () -> clients.apply(address));
+                Throwable primary = null;
+                try {
+                    var targetDatabase = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            () -> client.getDatabase(database));
+                    var collection = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            () -> targetDatabase.getCollection(target.table()));
+                    BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            () -> { collection.drop(); return null; });
+                } catch (RuntimeException | Error failure) { primary = failure; throw failure; }
+                finally {
+                    try { BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                            () -> { client.close(); return null; }); }
+                    catch (RuntimeException | Error closeFailure) {
+                        if (primary == null) throw closeFailure;
+                        if (closeFailure != primary) primary.addSuppressed(closeFailure);
+                    }
                 }
             }
             if (id.equals(STATEFUL)) {

@@ -45,6 +45,10 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     }
 
     static Prepared prepare(BenchmarkReturnWorkBudgetProfile.WorkloadInput workload) {
+        return prepare(workload, false);
+    }
+
+    static Prepared prepare(BenchmarkReturnWorkBudgetProfile.WorkloadInput workload, boolean separateProducerWriter) {
         require(workload != null && "stateless".equals(workload.id()) && workload.rows() == 96000 && workload.seed() == 424242,
                 "only the unchanged stateless pilot is registered");
         require(workload.equals(BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless")),
@@ -143,6 +147,17 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         add(parts, "CLOCK_REQUEST_COST_AND_FAILURE_PACKETS", "Capture.clockRequests/producerCostStages/native-clock refusal packet",
                 3, SOURCE_PACKET_NODES, SOURCE_PACKET_BYTES, MAX_LEAF, SOURCE_PACKET_DEPTH,
                 "FIVE_REQUEST_ROLES_BOUNDED_EIGHT_KIB_AND_GUARDED_NESTED_FAILURE_PACKETS");
+        if (separateProducerWriter) {
+            // Actual report projections: profile.producerWriter, inputBindings.producerWriter,
+            // inputBindings.actualIo.producerWriter. Each fixed tuple has ten fields; the registered
+            // projection contract conservatively permits 32, two 4096 paths, one 512 source path,
+            // one 256 binary name, two 64 digests, two 20 numeric scalars and 128 fixed literals.
+            long writerStrings = 32L * 128 + 2L * 4096 + 512 + 256 + 2L * 64 + 2L * 20 + 128;
+            add(parts, "OPTIONAL_PRODUCER_WRITER_SCALAR_PROJECTIONS",
+                    "Profile.inputRegistrationInfo/Run.bindingEvidence/BindingsIo.actualWriter.evidence",
+                    3, mapNodes(32), writerStrings, 4096, 3,
+                    "THREE_FIXED_PRODUCER_ONLY_TUPLE_MAPS_PRIOR_PATH4096_FIELDS32_NO_OBSERVED_SIZE_CAP");
+        }
         long nodes = 1, strings = 0;
         for (Component part : parts) {
             nodes = Math.addExact(nodes, part.nodes()); strings = Math.addExact(strings, part.strings());
@@ -152,7 +167,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         var metadata = Map.<String, Object>ofEntries(
                 Map.entry("state", "SOURCE_DERIVED_COMPLETE_PILOT_REPORT_ENVELOPE"),
                 Map.entry("scope", "ONE_COMPLETE_FORK_OR_ONE_CONTROLLED_STDOUT_FAILURE_TREE"),
-                Map.entry("mode", "B_PLAIN_ON_PERIODIC_NOMINAL"), Map.entry("rows", workload.rows()), Map.entry("seed", workload.seed()),
+                Map.entry("mode", separateProducerWriter ? "A_PLAIN_PERIODIC_NOMINAL_SEPARATE_PRODUCER_WRITER" : "B_PLAIN_ON_PERIODIC_NOMINAL"), Map.entry("rows", workload.rows()), Map.entry("seed", workload.seed()),
                 Map.entry("components", parts.stream().map(Component::evidence).toList()),
                 Map.entry("encodingInvocationBasis", "COMPLETE_ACTUAL_REPORT_SERIALIZE_CALLS_NO_FUTURE_STDOUT_COUNT_BOUND"),
                 Map.entry("sourceGuardDependencies", List.of(

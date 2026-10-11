@@ -9,13 +9,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkReturnWorkBudgetSourceTailsTest {
     @Test
-    void factory_upper_includes_seven_original_constructs_and_all_three_initializer_workloads() {
+    void factory_upper_includes_seven_original_constructs_three_initializer_workloads_and_four_support_tables() {
         var workload = BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless");
         var upper = BenchmarkReturnWorkBudgetSourceTails.factoryUpper(workload);
         var evidence = BenchmarkReturnWorkBudgetSourceTails.factoryEvidence(workload);
         assertThat(evidence).containsEntry("factoryCalls", 7).containsEntry("initializerFactories", 3)
                 .containsEntry("actualCompletionObserved", false).containsEntry("futureLifetimeCountBoundClaimed", false);
-        assertThat(upper.calls()).isEqualTo(10);
+        // openFromProperties inspects once and open revalidates once before activation.
+        // Both inspections build the shared and cleanup tables.
+        assertThat(upper.calls()).isEqualTo(14);
         assertThat(upper.records()).isGreaterThan(7L * 96000);
         assertThat((Long) evidence.get("initializerRecords")).isGreaterThan(3L * 12000);
         assertThat(upper.requests()).isGreaterThan(upper.records());

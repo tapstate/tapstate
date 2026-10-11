@@ -66,9 +66,17 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         }
         boolean terminated() { return server.terminated(); }
         @Override public void close() throws Exception {
-            if (admission != null) { admission.close(); }
-            else if (telemetry != null) { telemetry.close(); }
-            else { server.close(); }
+            BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                    BenchmarkSharedSupportSourceWork.Kind.CLOSING, () -> {
+                        if (BenchmarkReturnWorkBudget.current() != null && (admission != null || telemetry != null)) {
+                            BenchmarkReturnWorkBudget.gap(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                                    "OWNED_CLOSE_OUTSIDE_REGISTERED_PLAIN_BODY");
+                        }
+                        if (admission != null) { admission.close(); }
+                        else if (telemetry != null) { telemetry.close(); }
+                        else { server.close(); }
+                        return null;
+                    });
         }
     }
 
@@ -203,7 +211,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         }
         String namespace = "bench_" + workload.id() + "_"
                 + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-        SharedPostgres.Fixture postgresFixture = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, SharedPostgres::fixture);
+        SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture();
         SharedPostgres.Closing bootClosing = postgresFixture.pending("owned benchmark boot");
         Connection source = null;
         OwnedBoot boot = null;
@@ -219,14 +227,12 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             String operatorDatabase = namespace + "_operator";
             String operatorStateUri = SharedMongo.replicaSetUrl(operatorDatabase);
 
-            source = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
-                    () -> workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
-                            ? SharedMySql.connect(sourceSettings) : SharedPostgres.connect(sourceSettings));
+            source = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
+                    ? SharedMySql.connect(sourceSettings) : SharedPostgres.connect(sourceSettings);
             execute(source, workload.setupSql());
             // The view database is product-wide on this replica set. Forks run serially, and the
             // preceding application process is closed before these shared collections are dropped.
-            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
-                    () -> { workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri); return null; });
+            workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri);
             if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
                 Map<String, Object> identity = SharedMongo.diagnosticIdentity();
                 System.out.println("benchmark-owned-mongo-clock-fixture=" + JsonWriter.write(identity));
@@ -656,15 +662,41 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         }
     }
 
-    private static void execute(Connection connection, List<String> sql) throws Exception {
-        if (sql.isEmpty()) {
-            return;
-        }
+    static void execute(Connection connection, List<String> sql) throws Exception {
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.SQL_PARENT, () -> {
+                    executeBounded(connection, sql);
+                    return null;
+                });
+    }
+
+    private static void executeBounded(Connection connection, List<String> sql) throws Exception {
         var scope = BenchmarkReturnWorkBudget.current();
-        try (Statement statement = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, connection::createStatement)) {
+        if (scope != null && sql.size() > BenchmarkSharedSupportSourceWork.SQL_STATEMENTS) {
+            BenchmarkReturnWorkBudget.gap(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    "SQL_HELPER_EXCEEDS_REGISTERED_STATELESS_SETUP_OR_SINGLE_BATCH_SHAPE");
+            throw new AssertionError("SQL helper exceeds its registered local statement shape");
+        }
+        if (sql.isEmpty()) return;
+        Statement statement = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, connection::createStatement);
+        Throwable primary = null;
+        try {
             for (String command : sql) {
-                BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, command);
-                BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> statement.execute(command));
+                BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                        BenchmarkSharedSupportSourceWork.Kind.SQL_COMMAND, () -> {
+                            BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, command);
+                            BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> statement.execute(command));
+                            return null;
+                        });
+            }
+        } catch (Exception | Error failure) { primary = failure; throw failure; }
+        finally {
+            try {
+                BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                        () -> { statement.close(); return null; });
+            } catch (Exception | Error closeFailure) {
+                if (primary == null) throw closeFailure;
+                if (closeFailure != primary) primary.addSuppressed(closeFailure);
             }
         }
     }

@@ -322,7 +322,7 @@ final class BenchmarkReturnRootOrigins {
                 "jvmStartTimeMillis", runtime.jvmStartTimeMillis(), "javaHome", runtime.javaHome(), "javaVersion", runtime.javaVersion());
     }
     private static boolean packageName(String name) {
-        return name.startsWith("io.tapstate.e2e.") || name.startsWith("io.tapstate.adapters.pdk.") || name.startsWith("io.tapstate.core.common.");
+        return name.startsWith("io.tapstate.e2e.") || name.startsWith("io.tapstate.adapters.pdk.") || name.startsWith("io.tapstate.core.common.") || name.startsWith("io.tapstate.testsupport.");
     }
     private static void bounded(String value, int cap) {
         require(value != null && !value.isBlank() && value.length() <= cap

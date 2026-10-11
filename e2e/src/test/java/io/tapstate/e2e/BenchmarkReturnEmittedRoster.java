@@ -27,7 +27,7 @@ import static io.tapstate.e2e.BenchmarkReturnWorkBudgetBindings.*;
 final class BenchmarkReturnEmittedRoster {
     static final int DIRECTORY_VISITS = 40000, SELECTED_MEMBERS = 512, MEMBER_BYTES = 1048576;
     private static final Map<String, String> OUTPUTS = Map.of("e2e", "e2e/target/test-classes",
-            "adapter-pdk", "adapters/adapter-pdk/target/classes", "core-common", "core/core-common/target/classes");
+            "adapter-pdk", "adapters/adapter-pdk/target/classes", "core-common", "core/core-common/target/classes", "test-support", "test-support/target/test-classes");
     @FunctionalInterface interface Streams { InputStream open(Path path) throws IOException; }
     @FunctionalInterface interface Walks { Stream<Path> open(Path path) throws IOException; }
     record Member(SourceRole role, String binaryName, String sourceFile, Blob blob, String compilerContainer, String entry) { }
@@ -79,7 +79,7 @@ final class BenchmarkReturnEmittedRoster {
                 require(bySource.put(role.module() + ":" + sourceFile(role), role) == null, "source file owner is ambiguous");
             }
             var binaries = new HashSet<String>();
-            for (String module : List.of("e2e", "adapter-pdk", "core-common")) {
+            for (String module : List.of("e2e", "adapter-pdk", "core-common", "test-support")) {
                 Path output = root.resolve(OUTPUTS.get(module)); canonical(output);
                 require(request(() -> Files.isDirectory(output, LinkOption.NOFOLLOW_LINKS)), "owned compiler output is missing");
                 Stream<Path> paths = request(() -> walks.open(output));
@@ -249,7 +249,7 @@ final class BenchmarkReturnEmittedRoster {
                 "sha256", s.blob().sha256(), "bytes", s.blob().bytes())).toList());
         map.put("selectedMembers", members.stream().map(m -> Map.of("role", m.role().name(), "binaryName", m.binaryName(), "sourceFile", m.sourceFile(),
                 "sha256", m.blob().sha256(), "bytes", m.blob().bytes(), "compilerContainer", m.compilerContainer(), "entry", m.entry())).toList());
-        map.put("scope", "THREE_OWNED_COMPILER_OUTPUTS_SOURCEFILE_BINARY_AND_BYTE_FACTS_ONLY");
+        map.put("scope", "FOUR_OWNED_COMPILER_OUTPUTS_SOURCEFILE_BINARY_AND_BYTE_FACTS_ONLY");
         map.put("boundBasis", "FIXED_DIRECTORY_VISIT_SOURCE_ROLE_MEMBER_BYTE_AND_SELECTED_MEMBER_CAPS");
         map.put("opaqueServiceInternals", "IO_PROVIDER_AND_DIGEST_INTERNAL_CPU_OR_ELAPSED_EXCLUDED");
         for (String flag : List.of("loadedRuntimeOriginsQualified", "emittedMemberCompletenessQualified", "runtimeInstructionBytesQualified", "sourceCoverageQualified",

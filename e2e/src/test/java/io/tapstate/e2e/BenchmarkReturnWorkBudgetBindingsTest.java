@@ -289,7 +289,8 @@ class BenchmarkReturnWorkBudgetBindingsTest {
         var root = new Runtime(Owner.ROOT, run, 11, 1000, home, "21.0.9");
         var producer = new Runtime(Owner.PRODUCER, run, 17, 2000, home, "21.0.9");
         var owners = new OwnedRuntimes(root, producer);
-        List<String> classpath = List.of("/controlled/e2e/test-classes", "/controlled/adapter-pdk.jar", "/controlled/core-common.jar");
+        List<String> classpath = List.of("/controlled/e2e/test-classes", "/controlled/adapter-pdk.jar", "/controlled/core-common.jar",
+                "/controlled/test-support.jar");
         var origins = new ArrayList<Origin>(); var observed = new ArrayList<ObservedOrigin>();
         var application = files.stream().filter(f -> f.role() == BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).findFirst().orElseThrow();
         for (var item : classes) {
