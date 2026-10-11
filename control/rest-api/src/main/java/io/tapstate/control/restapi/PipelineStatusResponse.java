@@ -15,13 +15,14 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * The wire shape of a Pipeline's merged authoring, artifact, desired-state, and runtime projection, plus why
- * its run died when it did. A saved Pipeline has a status before its first runtime observation.
+ * The wire shape of the latest actual Pipeline observation. Optional UI metadata qualifies the observation
+ * while state, failure, and observation time remain the runtime facts consumed by existing clients.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record PipelineStatusResponse(
         String pipelineId,
-        PipelineCatalogItem.DisplayState state,
+        PipelineState state,
+        PipelineCatalogItem.UiState displayState,
         Failure failure,
         Instant observedAt,
         Long observedAgeMillis,
@@ -45,7 +46,7 @@ record PipelineStatusResponse(
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
         Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(status.pipelineId(),
-                PipelineCatalogItem.DisplayState.valueOf(status.state().name()),
+                status.state(), PipelineCatalogItem.UiState.valueOf(status.state().name()),
                 failure(status.failure(), catalog), observedAt,
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
@@ -53,20 +54,17 @@ record PipelineStatusResponse(
                 status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance());
     }
 
-    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
-        return of(item, catalog, null);
-    }
-
     static PipelineStatusResponse of(
             PipelineCatalogItem item, MessageCatalog catalog, PipelineStatus runtime) {
         PipelineCatalogItem.Status status = item.status();
-        Instant observedAt = status.observedAt();
-        return new PipelineStatusResponse(item.id(), status.state(), failure(status.failure(), catalog),
+        Instant observedAt = runtime.observedAt();
+        return new PipelineStatusResponse(item.id(), runtime.state(), status.displayState(),
+                failure(runtime.failure(), catalog),
                 observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, Clock.systemUTC().instant()).toMillis()),
-                status.desiredState(), status.observedState(), item.hasArtifact(),
-                runtime == null ? null : ExecutionPlanResponse.of(runtime.plan()),
-                runtime == null || runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance());
+                status.desiredState(), runtime.state(), item.hasArtifact(),
+                ExecutionPlanResponse.of(runtime.plan()),
+                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance());
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {

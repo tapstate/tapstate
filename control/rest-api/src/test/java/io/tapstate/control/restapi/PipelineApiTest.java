@@ -339,6 +339,7 @@ class PipelineApiTest {
             assertThat(draftOnly.containsKey(forbidden)).as(forbidden).isFalse();
         }
         assertThat(((Map<?, ?>) draftOnly.get("status")).get("state")).isEqualTo("NEW");
+        assertThat(((Map<?, ?>) draftOnly.get("status")).get("displayState")).isEqualTo("DRAFT");
 
         Map<?, ?> merged = catalogItems.stream()
                 .map(item -> (Map<?, ?>) item)
@@ -390,6 +391,18 @@ class PipelineApiTest {
                 .body(Map.of("revision", 2)).retrieve().toEntity(Map.class);
         assertThat(published.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(published.getBody()).containsEntry("published", true).containsKey("artifactHash");
+        Map<?, ?> afterPublish = ((List<?>) client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class).getBody().get("items")).stream()
+                .map(item -> (Map<?, ?>) item)
+                .filter(item -> "draft-p1".equals(item.get("id")))
+                .findFirst().orElseThrow();
+        assertThat(afterPublish.get("hasArtifact")).isEqualTo(true);
+        assertThat(afterPublish.get("contentHash")).isEqualTo(published.getBody().get("artifactHash"));
+        assertThat(((Map<?, ?>) afterPublish.get("status")).get("state")).isEqualTo("NEW");
+        assertThat(((Map<?, ?>) afterPublish.get("status")).get("displayState")).isEqualTo("NEW");
+        assertThat(context.getBean(PipelineCatalogService.class).find("draft-p1").orElseThrow().hasArtifact())
+                .isTrue();
 
         ResponseEntity<Void> deleted = client().method(HttpMethod.DELETE)
                 .uri("/api/pipelines/draft-p1/draft")
@@ -1233,8 +1246,8 @@ class PipelineApiTest {
         }
 
         @Bean
-        FakePipelineDraftStore pipelineDraftStore() {
-            return new FakePipelineDraftStore();
+        FakePipelineDraftStore pipelineDraftStore(FakeArtifactStore artifacts) {
+            return new FakePipelineDraftStore(artifacts);
         }
 
         @Bean
@@ -1701,6 +1714,15 @@ class PipelineApiTest {
     static final class FakePipelineDraftStore implements PipelineDraftStore {
         private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
         private final Map<String, Long> lastRevision = new LinkedHashMap<>();
+        private final FakeArtifactStore artifacts;
+
+        FakePipelineDraftStore() {
+            this(null);
+        }
+
+        FakePipelineDraftStore(FakeArtifactStore artifacts) {
+            this.artifacts = artifacts;
+        }
 
         synchronized void clear() {
             drafts.clear();
@@ -1787,6 +1809,22 @@ class PipelineApiTest {
             if (!Objects.equals(current.baseArtifactHash(), publication.expectedArtifactHash())) {
                 return PipelineDraftMutation.ARTIFACT_CONFLICT;
             }
+            if (artifacts == null) {
+                throw new AssertionError("a publication fixture must own its artifact store");
+            }
+            Resource existing = artifacts.get(publication.pipelineId()).orElse(null);
+            if ((existing != null && !(existing instanceof PipelineResource))
+                    || !Objects.equals(existing == null ? null : CanonicalHash.of(existing),
+                            publication.expectedArtifactHash())) {
+                return PipelineDraftMutation.ARTIFACT_CONFLICT;
+            }
+            for (Map.Entry<String, String> dependency : publication.workspacePreconditions().entrySet()) {
+                Resource resource = artifacts.get(dependency.getKey()).orElse(null);
+                if (resource == null || !Objects.equals(CanonicalHash.of(resource), dependency.getValue())) {
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+            }
+            artifacts.saveAll(List.of(publication.artifact()));
             drafts.put(publication.pipelineId(), new PipelineDraft(
                     current.pipelineId(), current.schemaVersion(), current.revision(), current.mode(),
                     current.name(), current.description(), current.graph(), current.wizard(),

@@ -106,6 +106,7 @@ public final class PipelineCatalogService {
             target = null;
         }
         boolean hasArtifact = artifact != null;
+        PipelineCatalogItem.DisplayState state = displayState(target, observed);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
@@ -121,7 +122,8 @@ public final class PipelineCatalogService {
                 artifact == null ? null : artifact.contentHash(),
                 hasArtifact,
                 new PipelineCatalogItem.Status(
-                        displayState(target, observed, hasArtifact),
+                        state,
+                        hasArtifact ? PipelineCatalogItem.UiState.valueOf(state.name()) : PipelineCatalogItem.UiState.DRAFT,
                         target,
                         observed,
                         observation == null ? null : observation.failure(),
@@ -140,10 +142,7 @@ public final class PipelineCatalogService {
     }
 
     private static PipelineCatalogItem.DisplayState displayState(
-            PipelineState desired, PipelineState observed, boolean hasArtifact) {
-        if (!hasArtifact) {
-            return PipelineCatalogItem.DisplayState.DRAFT;
-        }
+            PipelineState desired, PipelineState observed) {
         if (desired == PipelineState.STOPPED && observed != PipelineState.STOPPED) {
             return PipelineCatalogItem.DisplayState.STOPPING;
         }

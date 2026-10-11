@@ -224,6 +224,34 @@ class PipelineObservationApiTest {
     }
 
     @Test
+    void lifecycleConsumersReadObservedStatesWhileUiTransitionsHaveTheirOwnField() {
+        PipelineState[][] transitions = {
+                {PipelineState.STOPPED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.PAUSED},
+                {PipelineState.PAUSED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.STOPPED}
+        };
+        String[] displays = {"STARTING", "PAUSING", "RESUMING", "STOPPING"};
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        FakeStoppedPipelines lifecycle = context.getBean(FakeStoppedPipelines.class);
+        String token = machineToken(Scope.READ);
+        for (int index = 0; index < transitions.length; index++) {
+            PipelineState observed = transitions[index][0];
+            lifecycle.intent("pl1", transitions[index][1]);
+            observations.save(new Observation("pl1", observed, Map.of(), Map.of(), Map.of(), null, NOW));
+
+            Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+            assertThat(PipelineState.valueOf((String) body.get("state"))).isEqualTo(observed);
+            assertThat(body).containsEntry("displayState", displays[index])
+                    .containsEntry("observedState", observed.name())
+                    .containsEntry("desiredState", transitions[index][1].name());
+        }
+    }
+
+    @Test
     void statusOfAFailedPipelineCarriesTheCodedReasonAndItsRenderedMessage() {
         // The code is the stable machine identity and the params are the variable data; the message is
         // rendered here, where the catalog lives, so every face prints one wording rather than each
@@ -553,20 +581,26 @@ class PipelineObservationApiTest {
 
         // Never applied is permanent: a caller that read this as the transient unconverged window would
         // wait out its whole bound on what is almost always a mistyped id.
-        assertThat(body.code()).isEqualTo("pipeline.not-found");
-        assertThat(body.params()).containsEntry("id", "ghost");
+        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.params()).containsEntry("pipeline", "ghost");
     }
 
     @Test
-    void aReadOfAnAppliedPipelineWithoutObservationHasAnActionableStatus() {
+    void aReadOfAnAppliedPipelineThatHasNotConvergedYetRetainsTheUnobservedContract() {
         context.getBean(FakeObservationStore.class).clear();
+        context.getBean(FakeStoppedPipelines.class).intent("pl1", PipelineState.RUNNING);
 
-        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+        ApiError body = client().get().uri("/api/pipelines/pl1/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
 
-        assertThat(body).containsEntry("pipelineId", "pl1").containsEntry("state", "NEW")
-                .containsEntry("hasArtifact", true);
+        assertThat(body.code()).isEqualTo("monitor.no-observation");
+        assertThat(body.params()).containsEntry("pipeline", "pl1");
+        assertThat(context.getBean(PipelineCatalogService.class).find("pl1").orElseThrow().status().state().name())
+                .isEqualTo("STARTING");
     }
 
     // ---- the interceptor guards a read like any other verb ----
@@ -985,6 +1019,11 @@ class PipelineObservationApiTest {
     static final class FakeStoppedPipelines {
 
         private final Map<String, PipelineState> actual = new LinkedHashMap<>();
+        private final Map<String, DesiredState> intents = new LinkedHashMap<>();
+
+        void intent(String pipelineId, PipelineState target) {
+            intents.put(pipelineId, new DesiredState(pipelineId, target, "fixture-revision"));
+        }
 
         void running(String pipelineId) {
             actual.put(pipelineId, PipelineState.RUNNING);
@@ -992,6 +1031,7 @@ class PipelineObservationApiTest {
 
         void reset() {
             actual.clear();
+            intents.clear();
         }
 
         DesiredStore desired() {
@@ -1003,12 +1043,12 @@ class PipelineObservationApiTest {
 
                 @Override
                 public Optional<DesiredState> read(String pipelineId) {
-                    return Optional.empty();
+                    return Optional.ofNullable(intents.get(pipelineId));
                 }
 
                 @Override
                 public List<String> pipelineIds() {
-                    return List.of();
+                    return List.copyOf(intents.keySet());
                 }
 
                 @Override
