@@ -263,6 +263,10 @@ final class Repl {
      */
     private volatile boolean streamCancelled;
 
+    /** Guarded by this REPL's monitor so cancellation cannot interrupt the next command. */
+    private Thread connectionRequestThread;
+    private boolean connectionRequestCancelled;
+
     /** The bound a one-shot status waits for a second reading; shortened by tests that script a publisher that never moves on. */
     private Duration rateWait = RATE_WAIT;
 
@@ -401,9 +405,13 @@ final class Repl {
         return sessionExitCode;
     }
 
-    /** Requests any in-flight {@code --watch} / {@code --follow} stream to stop; wired to Ctrl-C in {@link #run}. */
-    void cancelStream() {
+    /** Stops a stream or connection request; wired to Ctrl-C in the interactive loop. */
+    synchronized void cancelStream() {
         streamCancelled = true;
+        if (connectionRequestThread != null) {
+            connectionRequestCancelled = true;
+            connectionRequestThread.interrupt();
+        }
     }
 
     private boolean isStreamCancelled() {
@@ -4964,16 +4972,36 @@ final class Repl {
     /** Runs a schema discovery for a connection with the connector and settings it declares. */
     private ConnectionDiscoverSchemaOutcome discoverSchemaFor(
             String connectionId, String connector, Map<String, Object> config) {
-        return withFailover(() -> controlPlane.discoverSchema(
+        return withConnectionCancellation(() -> controlPlane.discoverSchema(
                 session.landingNode(), session.credential(), connectionId, connector, config),
                 o -> o instanceof ConnectionDiscoverSchemaOutcome.Unreachable);
     }
 
     /** Runs the connector's connection test for a connection with the connector and settings it declares. */
     private ConnectionTestOutcome testConnectionFor(String connectionId, String connector, Map<String, Object> config) {
-        return withFailover(() -> controlPlane.test(
+        return withConnectionCancellation(() -> controlPlane.test(
                 session.landingNode(), session.credential(), connectionId, connector, config),
                 o -> o instanceof ConnectionTestOutcome.Unreachable);
+    }
+
+    /** Cancels an unbounded connection exchange on Ctrl-C without losing the session or retrying it. */
+    private <T> T withConnectionCancellation(Supplier<T> call, Predicate<T> unreachable) {
+        synchronized (this) {
+            connectionRequestThread = Thread.currentThread();
+            connectionRequestCancelled = false;
+        }
+        try {
+            return withFailover(call,
+                    outcome -> !Thread.currentThread().isInterrupted() && unreachable.test(outcome));
+        } finally {
+            synchronized (this) {
+                connectionRequestThread = null;
+                if (connectionRequestCancelled) {
+                    // The transport restores its interrupt; consume only a terminal cancellation here.
+                    Thread.interrupted();
+                }
+            }
+        }
     }
 
     /** Reads a connection's stored discovered model, without running a discovery. */
@@ -6009,37 +6037,42 @@ final class Repl {
         // system(true) for a real terminal; dumb(true) degrades silently to a dumb terminal when
         // there is no TTY (piped / redirected input) instead of printing a JLine warning.
         try (Terminal terminal = TerminalBuilder.builder().system(true).dumb(true).build()) {
-            this.terminal = () -> !"dumb".equalsIgnoreCase(terminal.getType());
-            if (prompter == null) {
-                // bind the masked-input reader to the REPL's own terminal (which this try owns and closes)
-                prompter = new JLinePrompter(terminal, false);
-            }
-            LineReader reader = readerFor(terminal,
-                    TapstateCompleter.forRepl(commandLine, SchemaNavigator.bundled()));
-            // Ctrl-C stops an in-flight watch/follow stream. The line reader saves and restores the signal
-            // handlers around readLine (where Ctrl-C stays "clear the line"), so this handler is active only
-            // while a dispatched verb runs -- exactly when a stream is blocking the loop.
-            terminal.handle(Terminal.Signal.INT, signal -> cancelStream());
-            // A dumb terminal answers zero rather than failing, which would render every frame at
-            // nothing wide; the conventional width stands in for it.
-            screenWidth = () -> terminal.getWidth() > 0 ? terminal.getWidth() : DEFAULT_SCREEN_WIDTH;
-            while (true) {
-                String line;
-                try {
-                    line = reader.readLine(prompt());
-                } catch (UserInterruptException e) {
-                    continue;   // Ctrl-C clears the current line and keeps the session
-                } catch (EndOfFileException e) {
-                    break;      // Ctrl-D ends the session
-                }
-                if (!dispatch(line)) {
-                    break;
-                }
-            }
+            run(terminal);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
         out.println("bye");
         out.flush();
+    }
+
+    /** Runs the same interactive loop on a caller-owned terminal. */
+    void run(Terminal terminal) {
+        this.terminal = () -> !"dumb".equalsIgnoreCase(terminal.getType());
+        if (prompter == null) {
+            // Bind the masked-input reader to the REPL's own terminal.
+            prompter = new JLinePrompter(terminal, false);
+        }
+        LineReader reader = readerFor(terminal,
+                TapstateCompleter.forRepl(commandLine, SchemaNavigator.bundled()));
+        // Ctrl-C stops a stream or an active connection request. The line reader saves and restores the signal
+        // handlers around readLine (where Ctrl-C stays "clear the line"), so this handler is active only
+        // while a dispatched verb runs.
+        terminal.handle(Terminal.Signal.INT, signal -> cancelStream());
+        // A dumb terminal answers zero rather than failing, which would render every frame at
+        // nothing wide; the conventional width stands in for it.
+        screenWidth = () -> terminal.getWidth() > 0 ? terminal.getWidth() : DEFAULT_SCREEN_WIDTH;
+        while (true) {
+            String line;
+            try {
+                line = reader.readLine(prompt());
+            } catch (UserInterruptException e) {
+                continue;   // Ctrl-C clears the current line and keeps the session
+            } catch (EndOfFileException e) {
+                break;      // Ctrl-D ends the session
+            }
+            if (!dispatch(line)) {
+                break;
+            }
+        }
     }
 }

@@ -3,15 +3,18 @@ package io.tapstate.control.client;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -87,11 +90,10 @@ public final class HttpControlClient implements AutoCloseable {
             return new ControlResponse.Unreachable();
         }
         try {
-            Duration requestTimeout = timeout(budget);
             HttpRequest.Builder request = HttpRequest.newBuilder(endpoint(baseUrl, path))
-                    .timeout(requestTimeout)
                     .header("Authorization", "Bearer " + token)
                     .header("Accept", "application/json");
+            budget.timeout(lightTimeout, heavyTimeout).ifPresent(request::timeout);
             if (ifMatch != null) {
                 request.header("If-Match", ifMatch);
             }
@@ -100,28 +102,51 @@ public final class HttpControlClient implements AutoCloseable {
             } else {
                 request.header("Content-Type", "application/json").method(method, body);
             }
-            CompletableFuture<HttpResponse<String>> future = client.sendAsync(
-                    request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            inFlight.add(future);
-            if (closed.get()) {
-                future.cancel(true);
-            }
-            try {
-                try {
-                    return decode(future.get(
-                            Math.max(1, requestTimeout.toMillis()), TimeUnit.MILLISECONDS));
-                } catch (InterruptedException | TimeoutException error) {
-                    future.cancel(true);
-                    throw error;
-                }
-            } finally {
-                inFlight.remove(future);
-            }
+            return decode(send(request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)));
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
             return new ControlResponse.Unreachable();
-        } catch (ExecutionException | TimeoutException | RuntimeException error) {
+        } catch (IOException | RuntimeException error) {
             return new ControlResponse.Unreachable();
+        }
+    }
+
+    /**
+     * Sends a request with its declared deadline, or waits for completion when none is declared.
+     * Connection establishment remains bounded; interruption and close cancel the exchange.
+     */
+    public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler)
+            throws IOException, InterruptedException {
+        CompletableFuture<HttpResponse<T>> future = client.sendAsync(request, handler);
+        inFlight.add(future);
+        if (closed.get()) {
+            future.cancel(true);
+        }
+        Optional<Duration> timeout = request.timeout();
+        try {
+            return timeout.isPresent()
+                    ? future.get(Math.max(1, timeout.get().toMillis()), TimeUnit.MILLISECONDS)
+                    : future.get();
+        } catch (InterruptedException error) {
+            future.cancel(true);
+            throw error;
+        } catch (TimeoutException error) {
+            future.cancel(true);
+            throw new HttpTimeoutException("HTTP request exceeded " + timeout.orElseThrow());
+        } catch (ExecutionException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error fatal) {
+                throw fatal;
+            }
+            throw new IOException("HTTP request failed", cause);
+        } finally {
+            inFlight.remove(future);
         }
     }
 
@@ -147,10 +172,6 @@ public final class HttpControlClient implements AutoCloseable {
                 ? value
                 : "The server refused the request.";
         return new ControlResponse.Rejected(status, code, message, params(object.get("params")));
-    }
-
-    private Duration timeout(RequestBudget budget) {
-        return budget == RequestBudget.HEAVY ? heavyTimeout : lightTimeout;
     }
 
     private static URI endpoint(URI baseUrl, String path) {

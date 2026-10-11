@@ -145,7 +145,7 @@ final class McpOperationExecutor {
     private McpResult connectionWrite(Map<String, Object> arguments, String path) {
         Map<String, Object> expanded = new LinkedHashMap<>(arguments);
         expanded.put("settings", EnvironmentExpander.expand(arguments.get("settings"), environment));
-        return post(path, expanded, RequestBudget.HEAVY);
+        return post(path, expanded, RequestBudget.CONNECTION);
     }
 
     private McpResult sourceDraft(Map<String, Object> arguments) {
