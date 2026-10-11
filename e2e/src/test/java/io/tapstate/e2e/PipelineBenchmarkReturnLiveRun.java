@@ -107,7 +107,7 @@ final class PipelineBenchmarkReturnLiveRun {
                 "-Dit.test=RealBenchmarkForkDriverIT#" + text(object(registration.get("expectedCase")).get("name"), 256)));
         for (var entry : properties.entrySet()) {
             String key = text(entry.getKey(), 512);
-            require(key.startsWith("tapstate.e2e.") && key.matches("[A-Za-z0-9._-]+"), "slot property is outside the benchmark namespace");
+            requireSlotProperty(key);
             command.add("-D" + key + "=" + text(entry.getValue(), 16384));
         }
         require((slot.arm() == PipelineBenchmarkComparison.Arm.A ? config.a() : config.b()).toString()
@@ -164,6 +164,11 @@ final class PipelineBenchmarkReturnLiveRun {
                 path(text(input.get("javaHome"), 4096)), path(text(input.get("baselineJar"), 4096)),
                 path(text(input.get("candidateJar"), 4096)), blob(object(input.get("baselineJarBytes"))),
                 blob(object(input.get("candidateJarBytes"))), slots);
+    }
+    static void requireSlotProperty(String key) {
+        require(key != null && key.length() <= 512
+                && (key.startsWith("tapstate.e2e.") || key.equals(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY))
+                && key.matches("[A-Za-z0-9._-]+"), "slot property is outside the benchmark namespace");
     }
     private static Map<String, Object> evaluation(BenchmarkReturnIntervalComparison.Evaluation evaluation) {
         var workloads = new EnumMap<PipelineBenchmarkComparison.Workload, Object>(PipelineBenchmarkComparison.Workload.class);

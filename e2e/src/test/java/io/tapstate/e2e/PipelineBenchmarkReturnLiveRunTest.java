@@ -38,6 +38,12 @@ class PipelineBenchmarkReturnLiveRunTest {
         plan.put("method", BenchmarkReturnMethodAdmission.METHOD); plan.put("gate", "BUSINESS_OPTIMIZATION");
         assertThatThrownBy(() -> PipelineBenchmarkReturnLiveRun.config(plan)).isInstanceOf(AssertionError.class);
     }
+    @Test void frozen_native_library_property_is_forwarded_without_opening_other_namespaces() {
+        PipelineBenchmarkReturnLiveRun.requireSlotProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY);
+        PipelineBenchmarkReturnLiveRun.requireSlotProperty("tapstate.e2e.benchmark-smoke.arm");
+        for (String foreign : List.of("java.home", "it.test", "tapstate.benchmark.unknown", "tapstate.e2e.invalid=key"))
+            assertThatThrownBy(() -> PipelineBenchmarkReturnLiveRun.requireSlotProperty(foreign)).isInstanceOf(AssertionError.class);
+    }
     private static Map<String, Object> plan() {
         var slots = new ArrayList<Map<String, Object>>(); int at = 0;
         for (String workload : List.of("copy", "stateless", "stateful")) {
