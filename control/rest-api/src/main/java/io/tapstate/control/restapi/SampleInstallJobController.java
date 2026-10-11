@@ -59,7 +59,7 @@ final class SampleInstallJobController {
 
     @Verb("sample-source.list")
     @GetMapping("/sample-sources/installations/{jobId}")
-    Status status(@PathVariable String jobId) {
+    Status status(@PathVariable("jobId") String jobId) {
         Job job = jobs.get(jobId);
         if (job == null || !job.principal.equals(AuthenticatedCaller.subject())) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
