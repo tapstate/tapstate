@@ -25,6 +25,13 @@ final class BenchmarkWriteReturnReader {
     private final LongSupplier clock;
     private final ObjectName name;
     private final ObjectName runtimeName;
+    private final ClockRequests clockRequests;
+
+    enum ClockRequestRole {
+        PERIODIC_CLOCK(512), START_VALIDATION(1), STOP_VALIDATION(1), SUMMARY_VALIDATION(1), PAGE_VALIDATION(514);
+        private final long maximumRequests;
+        ClockRequestRole(long maximumRequests) { this.maximumRequests = maximumRequests; }
+    }
 
     BenchmarkWriteReturnReader(BenchmarkCausalClock.Identity identity, MBeanServerConnection connection,
                               BooleanSupplier alive, LongSupplier clock) {
@@ -32,6 +39,8 @@ final class BenchmarkWriteReturnReader {
         this.connection = java.util.Objects.requireNonNull(connection);
         this.alive = java.util.Objects.requireNonNull(alive);
         this.clock = java.util.Objects.requireNonNull(clock);
+        clockRequests = "true".equals(System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY))
+                ? new ClockRequests(identity) : null;
         try {
             name = new ObjectName(NAME);
             runtimeName = new ObjectName(java.lang.management.ManagementFactory.RUNTIME_MXBEAN_NAME);
@@ -259,11 +268,19 @@ final class BenchmarkWriteReturnReader {
     }
 
     BenchmarkCausalClock.Sample clockSample(long sequence) {
-        requireAlive();
-        long before = clock.getAsLong();
+        return clockSample(sequence, ClockRequestRole.PERIODIC_CLOCK);
+    }
+
+    /** Validation points remain outside the periodic sample roster. */
+    BenchmarkCausalClock.Sample clockSample(long sequence, ClockRequestRole role) {
+        ClockRequests.Ticket request = clockRequests == null ? null : clockRequests.begin(role);
         try {
+            requireAlive();
+            long before = clock.getAsLong();
+            if (request != null) { clockRequests.started(request, before); }
             var attributes = connection.getAttributes(name, new String[]{"Pid", "JvmStartTimeMillis", "NanoTime"});
             long after = clock.getAsLong();
+            if (request != null) { clockRequests.returned(request, after); }
             requireAlive();
             Map<String, Object> values = new HashMap<>();
             for (Object entry : attributes) {
@@ -277,11 +294,19 @@ final class BenchmarkWriteReturnReader {
             }
             var actual = new BenchmarkCausalClock.Identity(number(values, "Pid"), number(values, "JvmStartTimeMillis"));
             if (!identity.equals(actual)) { throw new AssertionError("return clock has another owned runtime identity"); }
-            return new BenchmarkCausalClock.Sample(sequence, actual, before, after, number(values, "NanoTime"));
+            var sample = new BenchmarkCausalClock.Sample(sequence, actual, before, after, number(values, "NanoTime"));
+            if (request != null) { clockRequests.finished(request, null); }
+            return sample;
         } catch (java.io.IOException | javax.management.JMException unavailable) {
+            if (request != null) { clockRequests.finished(request, unavailable); }
             throw new AssertionError("owned return clock is unavailable", unavailable);
+        } catch (RuntimeException | Error failure) {
+            if (request != null) { clockRequests.finished(request, failure); }
+            throw failure;
         }
     }
+
+    Map<String, Object> clockRequestsEvidence() { return clockRequests == null ? Map.of() : clockRequests.evidence(); }
 
     boolean start(String window) { return control("start", new Object[]{window}, new String[]{String.class.getName()}); }
     boolean stop() { return control("stop", new Object[0], new String[0]); }
@@ -291,7 +316,7 @@ final class BenchmarkWriteReturnReader {
 
     /** Terminal totals are actual probe reads; caller closure still requires stop and full page coverage. */
     Summary summary() {
-        clockSample(0);
+        clockSample(0, ClockRequestRole.SUMMARY_VALIDATION);
         String[] names = {"Pid", "JvmStartTimeMillis", "Window", "State", "CompletedCalls", "FailedCalls",
                 "ReportedRecords", "OpenCalls", "RetainedBytes"};
         try {
@@ -323,7 +348,7 @@ final class BenchmarkWriteReturnReader {
     }
 
     byte[] page(long completionCursor) {
-        clockSample(0);
+        clockSample(0, ClockRequestRole.PAGE_VALIDATION);
         try {
             Object result = connection.invoke(name, "read", new Object[]{completionCursor}, new String[]{"long"});
             requireAlive();
@@ -337,7 +362,7 @@ final class BenchmarkWriteReturnReader {
     }
 
     private boolean control(String operation, Object[] arguments, String[] signature) {
-        clockSample(0);
+        clockSample(0, operation.equals("start") ? ClockRequestRole.START_VALIDATION : ClockRequestRole.STOP_VALIDATION);
         try {
             Object result = connection.invoke(name, operation, arguments, signature);
             requireAlive();
@@ -361,5 +386,129 @@ final class BenchmarkWriteReturnReader {
             throw new AssertionError("return summary text is missing or exceeds its bound");
         }
         return text;
+    }
+
+    /** One Reader instance's existing clock-attribute request brackets, not all JMX or method activity. */
+    private static final class ClockRequests {
+        private static final int MAX_PARTIALS = 8;
+        private final BenchmarkCausalClock.Identity owner;
+        private final java.util.EnumMap<ClockRequestRole, Row> rows = new java.util.EnumMap<>(ClockRequestRole.class);
+        private final java.util.LinkedHashMap<Long, Ticket> partials = new java.util.LinkedHashMap<>();
+        private long ordinal;
+        private long omittedPartials;
+        private String unknownReason;
+
+        private static final class Ticket {
+            private final long ordinal;
+            private final ClockRequestRole role;
+            private Long before;
+            private Long after;
+            private boolean finished;
+            private String failureType;
+            Ticket(long ordinal, ClockRequestRole role) { this.ordinal = ordinal; this.role = role; }
+        }
+
+        private static final class Row {
+            long attempts, requests, successes, failures, brackets, sum, maximum;
+            boolean elapsedComplete = true;
+            Map<String, Object> first = Map.of(), last = Map.of();
+            long firstOrdinal = Long.MAX_VALUE, lastOrdinal = Long.MIN_VALUE;
+        }
+
+        ClockRequests(BenchmarkCausalClock.Identity owner) {
+            this.owner = owner;
+            for (ClockRequestRole role : ClockRequestRole.values()) { rows.put(role, new Row()); }
+        }
+
+        synchronized Ticket begin(ClockRequestRole role) {
+            java.util.Objects.requireNonNull(role);
+            Row row = rows.get(role); row.attempts = increment(row.attempts); ordinal = increment(ordinal);
+            var ticket = new Ticket(ordinal, role);
+            if (partials.size() < MAX_PARTIALS) { partials.put(ordinal, ticket); }
+            else { omittedPartials = increment(omittedPartials); unknown("PARTIAL_RETENTION_LIMIT"); }
+            return ticket;
+        }
+
+        synchronized void started(Ticket ticket, long before) {
+            ticket.before = before; Row row = rows.get(ticket.role); row.requests = increment(row.requests);
+            if (row.requests > ticket.role.maximumRequests) { unknown("ROLE_REQUEST_LIMIT"); }
+            bounds(ticket);
+        }
+
+        synchronized void returned(Ticket ticket, long after) { ticket.after = after; bounds(ticket); }
+
+        synchronized void finished(Ticket ticket, Throwable failure) {
+            ticket.finished = true; Row row = rows.get(ticket.role);
+            if (failure == null) { row.successes = increment(row.successes); }
+            else {
+                row.failures = increment(row.failures); unknown("CLOCK_REQUEST_FAILED");
+                String type = failure.getClass().getName(); ticket.failureType = type.length() <= 96 ? type : "TYPE_NAME_EXCEEDS_BOUND";
+            }
+            bounds(ticket);
+            if (ticket.before != null && ticket.after != null) {
+                row.brackets = increment(row.brackets);
+                try {
+                    long duration = Math.subtractExact(ticket.after, ticket.before);
+                    if (duration < 0) { throw new ArithmeticException("clock request bracket moved backward"); }
+                    row.maximum = Math.max(row.maximum, duration); row.sum = Math.addExact(row.sum, duration);
+                } catch (ArithmeticException invalid) { row.elapsedComplete = false; unknown("ELAPSED_ORDER_OR_OVERFLOW"); }
+                partials.remove(ticket.ordinal);
+            } else { row.elapsedComplete = false; }
+        }
+
+        private void bounds(Ticket ticket) {
+            if (ticket.before == null) { return; }
+            Row row = rows.get(ticket.role); var actual = new java.util.LinkedHashMap<String, Object>();
+            actual.put("requestOrdinal", ticket.ordinal); actual.put("startedAtNanos", ticket.before);
+            if (ticket.after != null) { actual.put("completedAtNanos", ticket.after); }
+            actual.put("outcome", !ticket.finished ? "PENDING" : ticket.failureType == null ? "SUCCESS" : "FAILED");
+            if (ticket.ordinal <= row.firstOrdinal) { row.firstOrdinal = ticket.ordinal; row.first = Map.copyOf(actual); }
+            if (ticket.ordinal >= row.lastOrdinal) { row.lastOrdinal = ticket.ordinal; row.last = Map.copyOf(actual); }
+        }
+
+        synchronized Map<String, Object> evidence() {
+            var result = new java.util.LinkedHashMap<String, Object>();
+            boolean pending = partials.values().stream().anyMatch(ticket -> !ticket.finished);
+            result.put("state", unknownReason != null || pending ? "UNKNOWN" : "RECORDED_DIAGNOSTIC");
+            result.put("reason", unknownReason != null ? unknownReason : pending ? "REQUEST_IN_FLIGHT" : "OBSERVED_REQUEST_BRACKETS_ONLY");
+            result.put("scope", "ACTUAL_CAPTURE_READER_INSTANCE_CLOCK_ATTRIBUTE_REQUESTS_ONLY");
+            result.put("excluded", "OTHER_READERS_REGISTRATION_NATIVE_METADATA_CONTROL_PAGE_BODIES_UNBRACKETED_VALIDATION_BOOKKEEPING_AND_JMX_TAIL");
+            result.put("elapsedScope", "EXISTING_CALLER_POINTS_MAY_INCLUDE_INSIDE_BRACKET_BOOKKEEPING_NOT_EXACT_GETTER_SERVICE_CPU_OR_ACTIVITY_DURATION");
+            result.put("ownedPid", owner.pid()); result.put("ownedJvmStartTimeMillis", owner.jvmStartTimeMillis());
+            var roles = new java.util.LinkedHashMap<String, Object>();
+            for (var entry : rows.entrySet()) {
+                Row row = entry.getValue(); var value = new java.util.LinkedHashMap<String, Object>();
+                value.put("maximumRequests", entry.getKey().maximumRequests); value.put("attemptCount", row.attempts);
+                value.put("requestCount", row.requests); value.put("successCount", row.successes); value.put("failureCount", row.failures);
+                value.put("closedBracketCount", row.brackets); value.put("elapsedSumNanos", row.sum); value.put("elapsedMaxNanos", row.maximum);
+                value.put("elapsedAggregationComplete", row.elapsedComplete && row.requests == row.brackets
+                        && row.successes <= row.attempts && row.failures == row.attempts - row.successes);
+                value.put("firstActualBracket", row.first); value.put("lastActualBracket", row.last);
+                roles.put(entry.getKey().name(), Map.copyOf(value));
+            }
+            result.put("roles", Map.copyOf(roles)); result.put("omittedPartialRequests", omittedPartials);
+            result.put("partialRequests", partials.values().stream().map(ticket -> {
+                var value = new java.util.LinkedHashMap<String, Object>(); value.put("requestOrdinal", ticket.ordinal); value.put("role", ticket.role.name());
+                value.put("state", ticket.finished ? "FAILED_WITHOUT_COMPLETE_BRACKET" : "PENDING");
+                if (ticket.before != null) { value.put("startedAtNanos", ticket.before); }
+                if (ticket.after != null) { value.put("completedAtNanos", ticket.after); }
+                if (ticket.failureType != null) { value.put("failureType", ticket.failureType); }
+                return Map.copyOf(value);
+            }).toList());
+            result.put("clockQualified", false); result.put("samplingCostQualified", false); result.put("wholeMethodCostQualified", false);
+            result.put("roleCpuQualified", false); result.put("causalOverheadQualified", false); result.put("performanceAcceptanceEligible", false);
+            Map<String, Object> snapshot = Map.copyOf(result);
+            if (io.tapstate.core.common.JsonWriter.write(snapshot).getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 8192) {
+                throw new AssertionError("clock request evidence exceeds its fixed byte budget");
+            }
+            return snapshot;
+        }
+
+        private long increment(long value) {
+            try { return Math.addExact(value, 1); }
+            catch (ArithmeticException overflow) { unknown("COUNT_OVERFLOW"); return value; }
+        }
+
+        private void unknown(String reason) { if (unknownReason == null) { unknownReason = reason; } }
     }
 }

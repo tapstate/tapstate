@@ -9,6 +9,62 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkWriteReturnCaptureTest {
+    @Test void disabled_clock_request_retention_never_calls_the_diagnostic_access_helper() throws Exception {
+        try (var property = new ClockRequestProperty(null)) {
+            var access = new Fake(); access.refuseClockRequestRead = true;
+            try (var capture = BenchmarkWriteReturnCapture.open(access, "measured",
+                    BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL)) {
+                capture.finish();
+                assertThat(capture.retainedEvidence()).doesNotContainKey("clockRequests");
+            }
+            assertThat(access.clockRequestReads).hasValue(0);
+            var refused = new Fake(); refused.acceptStart = false; refused.refuseClockRequestRead = true;
+            var failure = org.assertj.core.api.Assertions.catchThrowable(() -> BenchmarkWriteReturnCapture.open(
+                    refused, "measured", BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL));
+            assertThat(failure).isInstanceOf(AssertionError.class).hasMessageContaining("start was refused");
+            assertThat(failure.getSuppressed()).hasSize(1);
+            assertThat(failure.getSuppressed()[0]).hasMessageContaining("ABORTED_BEFORE_SUCCESSFUL_STOP");
+            assertThat(BenchmarkWriteReturnCapture.retainedClockRequests(failure)).isEmpty();
+            assertThat(refused.clockRequestReads).hasValue(0);
+        }
+    }
+
+    @Test void early_failure_freezes_nested_clock_request_facts_without_repeating_a_clock_or_page() throws Exception {
+        try (var property = new ClockRequestProperty("true")) {
+            var row = new java.util.LinkedHashMap<String, Object>(); row.put("requestCount", 1L);
+            var rows = new java.util.ArrayList<Object>(); rows.add(row);
+            var ledger = new java.util.LinkedHashMap<String, Object>();
+            ledger.put("state", "UNKNOWN"); ledger.put("partialRequests", rows); ledger.put("wholeMethodCostQualified", false);
+            var access = new Fake(); access.acceptStart = false; access.clockRequests = ledger;
+            var failure = org.assertj.core.api.Assertions.catchThrowable(() -> BenchmarkWriteReturnCapture.open(
+                    access, "measured", BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL));
+            var retained = BenchmarkWriteReturnCapture.retainedClockRequests(failure);
+            row.put("requestCount", 999L); rows.clear(); ledger.clear();
+            var retainedRows = (java.util.List<?>) retained.get("partialRequests");
+            var retainedRow = (java.util.Map<?, ?>) retainedRows.getFirst();
+            assertThat(retainedRow.get("requestCount")).isEqualTo(1L);
+            assertThat(retained.get("state")).isEqualTo("UNKNOWN");
+            assertThatThrownBy(retained::clear).isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(retainedRows::clear).isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(retainedRow::clear).isInstanceOf(UnsupportedOperationException.class);
+            assertThat(access.clockRequestReads).hasValue(1);
+            assertThat(access.clockReads).hasValue(1); assertThat(access.pageReads).hasValue(0);
+            assertThat(access.stops).hasValue(0);
+        }
+    }
+
+    private static final class ClockRequestProperty implements AutoCloseable {
+        private final String prior = System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY);
+        ClockRequestProperty(String value) {
+            if (value == null) { System.clearProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY); }
+            else { System.setProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY, value); }
+        }
+        public void close() {
+            if (prior == null) { System.clearProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY); }
+            else { System.setProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY, prior); }
+        }
+    }
+
     @Test void first_and_last_actual_getters_enclose_the_complete_owned_capture() throws Exception {
         var access = new Fake();
         try (var capture = BenchmarkWriteReturnCapture.open(access, "measured")) {
@@ -142,6 +198,9 @@ class BenchmarkWriteReturnCaptureTest {
         final AtomicInteger starts = new AtomicInteger(), stops = new AtomicInteger();
         final AtomicInteger clockReads = new AtomicInteger();
         final AtomicInteger pageReads = new AtomicInteger(), costStageReads = new AtomicInteger();
+        final AtomicInteger clockRequestReads = new AtomicInteger();
+        java.util.Map<String, Object> clockRequests = java.util.Map.of();
+        boolean refuseClockRequestRead;
         java.util.Map<String, Object> costStages = java.util.Map.of("state", "RECORDED", "samplingCostQualified", false);
         BenchmarkWriteReturnReader.CostStagesRefusal costStageRefusal;
         boolean acceptStart = true, acceptStop = true, foreignSummary, extraCount, wrongBytes, throwStop, failedSummary;
@@ -173,6 +232,11 @@ class BenchmarkWriteReturnCaptureTest {
                     wrongBytes ? 0 : page.length - 32 - "measured".length() - "RECORDED_SCOPE_UNQUALIFIED".length());
         }
         public byte[] page(long cursor) { pageReads.incrementAndGet(); return page; }
+        public java.util.Map<String, Object> clockRequestsEvidence() {
+            clockRequestReads.incrementAndGet();
+            if (refuseClockRequestRead) { throw new AssertionError("disabled capture requested clock diagnostics"); }
+            return clockRequests;
+        }
         public java.util.Map<String, Object> costStages(long epoch, String window, long completedCalls) {
             costStageReads.incrementAndGet();
             if (stops.get() != 1 || pageReads.get() != 2 || epoch != 1 || !"measured".equals(window) || completedCalls != 1) {

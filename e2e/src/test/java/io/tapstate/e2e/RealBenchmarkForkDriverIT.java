@@ -41,11 +41,16 @@ class RealBenchmarkForkDriverIT {
     @BeforeAll
     static void requireServices() {
         String cpu = System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY);
-        if (cpu != null) {
+        String nominal = System.getProperty(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY);
+        if (cpu != null || nominal != null) {
             String mode = System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY);
             var calibration = "ON".equals(mode) ? RealBenchmarkForkDriver.CollectorCalibration.ON
                     : "OFF".equals(mode) ? RealBenchmarkForkDriver.CollectorCalibration.OFF : null;
-            RealBenchmarkForkDriver.rootCpuDiagnostics(cpu, calibration);
+            if (cpu != null) { RealBenchmarkForkDriver.rootCpuDiagnostics(cpu, calibration); }
+            if (nominal != null) {
+                RealBenchmarkForkDriver.nominalReturnDiagnostics(nominal,
+                        "true".equals(System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY)), calibration);
+            }
             return;
         }
         requireBenchmarkServices();
@@ -77,6 +82,7 @@ class RealBenchmarkForkDriverIT {
 
     private static void run(String workloadId) throws Exception {
         boolean rootCpuDiagnostics = requireRootCpuRunServices(workloadId, RealBenchmarkForkDriverIT::requireBenchmarkServices);
+        boolean nominalReturnDiagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY);
         Path forkOutput = forkOutput();
         PipelineBenchmarkComparison.Arm arm = PipelineBenchmarkComparison.Arm.valueOf(
                 System.getProperty(ARM_PROPERTY, "A"));
@@ -310,6 +316,13 @@ class RealBenchmarkForkDriverIT {
                                             ? "RETURN_COLLECTOR_CALIBRATION_DISABLED_PRODUCER" : "RETURN_METHOD_COST_CONTROL_DISABLED_PRODUCER"));
                         } else {
                             assertThat(capture).containsEntry("clockSamplingMode", returnClockMode.name());
+                            if (nominalReturnDiagnostics) {
+                                assertThat(capture).containsEntry("state", "CONDITIONAL_UNROUNDED_NOMINAL_RETURN_BOUNDS")
+                                        .containsEntry("returnTimeCoordinate", "UNROUNDED_NOMINAL_COUNTER_ENCLOSURES");
+                                for (String flag : BenchmarkNativeClockEvidence.FLAGS) {
+                                    assertThat(capture.get(flag)).isEqualTo(false);
+                                }
+                            }
                         }
                         if (costStages) {
                             assertThat(((Map<?, ?>) capture.get("producerCostStages")).get("state"))
@@ -399,6 +412,10 @@ class RealBenchmarkForkDriverIT {
                     if (costStages) { output.put("writeReturnCostStages", true); }
                     if (nativeLibrary != null) { output.put("nativeClockDiagnostic", true); }
                     if (nativeCounterDomain) { output.put("nativeCounterDomainDiagnostic", true); }
+                    if (nominalReturnDiagnostics) {
+                        output.put("nominalReturnEnclosureDiagnostic", true);
+                        output.put("nominalReturnPerformanceAcceptanceEligible", false);
+                    }
                     if (collectorCalibration != null) {
                         output.put("returnCollectorCalibration", collectorCalibration.name());
                         output.put("returnCollectorCalibrationAcceptanceEligible", false);
@@ -427,8 +444,35 @@ class RealBenchmarkForkDriverIT {
 
     static boolean requireRootCpuRunServices(String workload, Runnable services) {
         boolean enabled = requireRootCpuAdmission(workload);
-        if (enabled) { services.run(); }
+        boolean nominal = requireNominalReturnAdmission(workload);
+        if (enabled || nominal) { services.run(); }
         return enabled;
+    }
+
+    static boolean requireNominalReturnAdmission(String workload) {
+        String value = System.getProperty(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY);
+        if (value == null) { return false; }
+        if (!"true".equals(value)) { return RealBenchmarkForkDriver.nominalReturnDiagnostics(value, false, null); }
+        boolean diagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY);
+        boolean pilot = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot");
+        var clocks = RealBenchmarkForkDriver.writeReturnClockMode(
+                System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_CLOCK_CONTROL_PROPERTY), diagnostics, pilot);
+        var arm = PipelineBenchmarkComparison.Arm.valueOf(System.getProperty(ARM_PROPERTY, "A"));
+        boolean plain = "PLAIN".equals(System.getProperty(MODE_PROPERTY, "PLAIN"));
+        boolean output = RealBenchmarkForkDriver.explicitCalibrationOutput();
+        var calibration = RealBenchmarkForkDriver.collectorCalibration(
+                System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY), workload, arm,
+                diagnostics, pilot, clocks, System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY),
+                plain, output, RealBenchmarkForkDriver.conflictingCalibrationControls());
+        String nativeLibrary = RealBenchmarkForkDriver.nativeClockLibrary(
+                System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY), diagnostics, pilot, clocks,
+                !"stateless".equals(workload) || !RealBenchmarkForkDriver.nativeClockArmAllowed(arm,
+                        Boolean.getBoolean(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY))
+                        || !plain || !output || RealBenchmarkForkDriver.conflictingReturnControls());
+        boolean nativeDomain = RealBenchmarkForkDriver.nativeCounterDomain(
+                System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY), nativeLibrary, diagnostics,
+                pilot, clocks, RealBenchmarkForkDriver.conflictingReturnControls());
+        return RealBenchmarkForkDriver.nominalReturnDiagnostics(value, nativeDomain, calibration);
     }
 
     static boolean requireRootCpuAdmission(String workload) {

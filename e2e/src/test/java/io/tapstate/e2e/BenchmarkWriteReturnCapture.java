@@ -12,6 +12,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         boolean stop();
         BenchmarkWriteReturnReader.Summary summary();
         byte[] page(long cursor);
+        default Map<String, Object> clockRequestsEvidence() { return Map.of(); }
         default Map<String, Object> costStages(long epoch, String window, long completedCalls) {
             throw new AssertionError("cost-stage diagnostic access is unavailable");
         }
@@ -41,6 +42,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     private final String window;
     private final BenchmarkReturnClockSampler sampler;
     private final boolean costStageDiagnostics;
+    private final boolean clockRequestDiagnostics;
     private boolean captureStarted;
     private boolean completed;
     private boolean closed;
@@ -67,6 +69,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
             public boolean stop() { return reader.stop(); }
             public BenchmarkWriteReturnReader.Summary summary() { return reader.summary(); }
             public byte[] page(long cursor) { return reader.page(cursor); }
+            public Map<String, Object> clockRequestsEvidence() { return reader.clockRequestsEvidence(); }
             public Map<String, Object> costStages(long epoch, String value, long completedCalls) {
                 return reader.costStages(epoch, value, completedCalls);
             }
@@ -96,6 +99,14 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
             return capture;
         } catch (RuntimeException | Error failure) {
             try { capture.close(); } catch (RuntimeException | Error closing) { failure.addSuppressed(closing); }
+            if (capture.clockRequestDiagnostics) {
+                try {
+                    Map<String, Object> requests = access.clockRequestsEvidence();
+                    if (!requests.isEmpty()) { failure.addSuppressed(new ClockRequestsRetention(requests)); }
+                } catch (RuntimeException | Error recording) {
+                    if (recording != failure) { failure.addSuppressed(recording); }
+                }
+            }
             throw failure;
         }
     }
@@ -111,6 +122,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
             throw new AssertionError("cost-stage diagnostics require the unchanged periodic return capture");
         }
         this.costStageDiagnostics = costStageDiagnostics;
+        clockRequestDiagnostics = "true".equals(System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY));
         sampler = new BenchmarkReturnClockSampler(access::clock, mode);
     }
 
@@ -186,10 +198,54 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
                         "reportedRecords", terminalSummary.reportedRecords(), "failedCalls", terminalSummary.failedCalls(),
                         "retainedBytes", terminalSummary.retainedBytes()),
                 "retainedPagesBase64", List.copyOf(retainedPages), "performanceAcceptanceEligible", false);
-        if (!costStageDiagnostics) { return evidence; }
+        if (!costStageDiagnostics && !clockRequestDiagnostics) { return evidence; }
         var withStages = new java.util.LinkedHashMap<String, Object>(evidence);
-        withStages.put("costStages", terminalCostStages);
+        if (costStageDiagnostics) { withStages.put("costStages", terminalCostStages); }
+        if (clockRequestDiagnostics) {
+            Map<String, Object> requests = access.clockRequestsEvidence();
+            if (!requests.isEmpty()) { withStages.put("clockRequests", immutableClockRequests(requests)); }
+        }
         return Map.copyOf(withStages);
+    }
+
+    static Map<String, Object> retainedClockRequests(Throwable failure) {
+        Throwable[] suppressed = failure.getSuppressed();
+        for (int index = Math.max(0, suppressed.length - 8); index < suppressed.length; index++) {
+            if (suppressed[index] instanceof ClockRequestsRetention receipt) { return receipt.evidence; }
+        }
+        return Map.of();
+    }
+
+    private static final class ClockRequestsRetention extends AssertionError {
+        private final Map<String, Object> evidence;
+        ClockRequestsRetention(Map<String, Object> evidence) {
+            super("owned clock request facts retained without another read");
+            this.evidence = immutableClockRequests(evidence);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> immutableClockRequests(Map<String, Object> evidence) {
+        var snapshot = (Map<String, Object>) immutableClockValue(evidence, 0, new int[1]);
+        if (io.tapstate.core.common.JsonWriter.write(snapshot).getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 8192) {
+            throw new AssertionError("retained clock requests exceed their byte budget");
+        }
+        return snapshot;
+    }
+
+    private static Object immutableClockValue(Object value, int depth, int[] nodes) {
+        if (depth > 8 || ++nodes[0] > 512) { throw new AssertionError("clock request facts exceed their structural bound"); }
+        if (value instanceof Map<?, ?> map) {
+            var copy = new java.util.LinkedHashMap<String, Object>();
+            for (var entry : map.entrySet()) {
+                if (!(entry.getKey() instanceof String key) || key.length() > 128) { throw new AssertionError("clock request fact key is invalid"); }
+                copy.put(key, immutableClockValue(entry.getValue(), depth + 1, nodes));
+            }
+            return Map.copyOf(copy);
+        }
+        if (value instanceof List<?> list) { return list.stream().map(item -> immutableClockValue(item, depth + 1, nodes)).toList(); }
+        if (value instanceof String text && text.length() <= 512 || value instanceof Long || value instanceof Integer || value instanceof Boolean) { return value; }
+        throw new AssertionError("clock request fact value is outside its bounded domain");
     }
 
     @Override public void close() {

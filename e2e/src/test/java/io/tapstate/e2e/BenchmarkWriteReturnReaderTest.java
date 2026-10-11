@@ -9,7 +9,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -19,6 +24,223 @@ class BenchmarkWriteReturnReaderTest {
     private static final String RETURN_FLAG = "-Dtapstate.benchmark.write-return=";
     private static final String COST_FLAG = "-Dtapstate.benchmark.write-return-cost-stages=";
     private static final String NATIVE_FLAG = "-Dtapstate.benchmark.native-clock-library=";
+
+    @Test void clock_roles_account_for_existing_requests_without_adding_points_or_getters() {
+        try (var property = new ClockLedgerProperty("true")) {
+            var fixture = new ClockFixture(); var reader = fixture.reader();
+            reader.start("measured"); var first = reader.clockSample(0); reader.summary();
+            reader.page(0); reader.page(1); reader.stop(); var last = reader.clockSample(1);
+            assertThat(first).isEqualTo(new BenchmarkCausalClock.Sample(0, OWNER, 103, 104, 103));
+            assertThat(last).isEqualTo(new BenchmarkCausalClock.Sample(1, OWNER, 113, 114, 113));
+            assertThat(fixture.operations).containsExactly("clock", "start", "clock", "clock", "summary",
+                    "clock", "read", "clock", "read", "clock", "stop", "clock");
+            assertThat(fixture.clockGetters).hasValue(7); assertThat(fixture.clockCalls).hasValue(14);
+            var evidence = reader.clockRequestsEvidence(); assertThat(evidence).containsEntry("state", "RECORDED_DIAGNOSTIC");
+            for (var entry : Map.of("PERIODIC_CLOCK", 2L, "START_VALIDATION", 1L, "STOP_VALIDATION", 1L,
+                    "SUMMARY_VALIDATION", 1L, "PAGE_VALIDATION", 2L).entrySet()) {
+                assertThat(clockRole(evidence, entry.getKey())).containsEntry("requestCount", entry.getValue())
+                        .containsEntry("successCount", entry.getValue()).containsEntry("failureCount", 0L)
+                        .containsEntry("elapsedSumNanos", entry.getValue()).containsEntry("elapsedMaxNanos", 1L)
+                        .containsEntry("elapsedAggregationComplete", true);
+            }
+            assertThatThrownBy(evidence::clear).isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(() -> clockRole(evidence, "PERIODIC_CLOCK").put("requestCount", 999L)).isInstanceOf(UnsupportedOperationException.class);
+            assertThatThrownBy(() -> clockMap(clockRole(evidence, "PERIODIC_CLOCK"), "firstActualBracket").clear())
+                    .isInstanceOf(UnsupportedOperationException.class);
+        }
+    }
+
+    @Test void absent_false_and_noncanonical_properties_leave_the_default_reader_and_capture_inert() {
+        for (String value : new String[]{null, "false", "TRUE"}) {
+            try (var property = new ClockLedgerProperty(value)) {
+                var fixture = new ClockFixture(); var reader = fixture.reader();
+                try (var capture = BenchmarkWriteReturnCapture.open(reader, "measured", BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL)) {
+                    var result = capture.finish(); assertThat(result.samples()).extracting(BenchmarkCausalClock.Sample::sequence).containsExactly(0L, 1L);
+                    assertThat(capture.retainedEvidence()).doesNotContainKey("clockRequests");
+                }
+                assertThat(reader.clockRequestsEvidence()).isEmpty();
+                assertThat(fixture.clockGetters).hasValue(7); assertThat(fixture.clockCalls).hasValue(14);
+            }
+        }
+    }
+
+    @Test void complete_capture_retains_validation_costs_without_putting_validation_samples_in_the_periodic_roster() {
+        try (var property = new ClockLedgerProperty("true")) {
+            var fixture = new ClockFixture(); var reader = fixture.reader();
+            try (var capture = BenchmarkWriteReturnCapture.open(reader, "measured", BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL)) {
+                var result = capture.finish(); var evidence = clockMap(capture.retainedEvidence(), "clockRequests");
+                assertThat(result.samples()).extracting(BenchmarkCausalClock.Sample::sequence).containsExactly(0L, 1L);
+                assertThat(clockRole(evidence, "PERIODIC_CLOCK")).containsEntry("requestCount", 2L);
+                assertThat(clockRole(evidence, "PAGE_VALIDATION")).containsEntry("requestCount", 2L);
+                assertThat(clockRole(evidence, "START_VALIDATION")).containsEntry("requestCount", 1L);
+                assertThat(clockRole(evidence, "STOP_VALIDATION")).containsEntry("requestCount", 1L);
+                assertThat(clockRole(evidence, "SUMMARY_VALIDATION")).containsEntry("requestCount", 1L);
+                assertThat(fixture.clockGetters).hasValue(7); assertThat(fixture.clockCalls).hasValue(14);
+                assertThat(evidence).containsEntry("wholeMethodCostQualified", false).containsEntry("roleCpuQualified", false);
+            }
+        }
+    }
+
+    @Test void failed_clock_requests_keep_partial_points_and_the_original_cause_without_an_extra_end_read() {
+        try (var property = new ClockLedgerProperty("true")) {
+            var fixture = new ClockFixture(); fixture.failClockAt = 1; var reader = fixture.reader();
+            assertThatThrownBy(() -> reader.clockSample(0)).isInstanceOf(AssertionError.class).hasCause(fixture.clockFailure);
+            var evidence = reader.clockRequestsEvidence(); assertThat(evidence).containsEntry("state", "UNKNOWN");
+            assertThat(clockRole(evidence, "PERIODIC_CLOCK")).containsEntry("requestCount", 1L).containsEntry("failureCount", 1L)
+                    .containsEntry("closedBracketCount", 0L).containsEntry("elapsedAggregationComplete", false);
+            assertThat(clockMap(clockRole(evidence, "PERIODIC_CLOCK"), "lastActualBracket")).containsEntry("startedAtNanos", 101L)
+                    .doesNotContainKey("completedAtNanos");
+            assertThat(clockRows(evidence, "partialRequests").getFirst()).containsEntry("startedAtNanos", 101L).doesNotContainKey("completedAtNanos");
+            assertThat(fixture.clockCalls).hasValue(1); assertThat(fixture.clockGetters).hasValue(1);
+            assertThat(io.tapstate.core.common.JsonWriter.write(evidence)).doesNotContain("controlled private failure detail");
+        }
+    }
+
+    @Test void a_blocked_external_clock_getter_does_not_hold_bookkeeping_or_mark_a_pending_role_complete() throws Exception {
+        try (var property = new ClockLedgerProperty("true")) {
+            var fixture = new ClockFixture(); CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+            fixture.getterHook = () -> { entered.countDown(); clockAwait(release); }; var reader = fixture.reader();
+            var failure = new AtomicReference<Throwable>();
+            Thread worker = Thread.ofPlatform().daemon(true).start(() -> { try { reader.clockSample(0); } catch (Throwable failed) { failure.set(failed); } });
+            try {
+                clockAwait(entered); var pending = reader.clockRequestsEvidence();
+                assertThat(pending).containsEntry("state", "UNKNOWN");
+                assertThat(clockRole(pending, "PERIODIC_CLOCK")).containsEntry("elapsedAggregationComplete", false)
+                        .containsEntry("requestCount", 1L).containsEntry("closedBracketCount", 0L);
+                assertThat(clockRows(pending, "partialRequests").getFirst()).doesNotContainKey("completedAtNanos");
+                release.countDown(); worker.join(2000); assertThat(worker.isAlive()).isFalse(); assertThat(failure.get()).isNull();
+                assertThat(reader.clockRequestsEvidence()).containsEntry("state", "RECORDED_DIAGNOSTIC");
+                assertThat(clockRows(pending, "partialRequests").getFirst()).doesNotContainKey("completedAtNanos");
+                assertThat(fixture.clockCalls).hasValue(2);
+            } finally { release.countDown(); worker.join(2000); }
+        }
+    }
+
+    @Test void elapsed_overflow_and_partial_retention_limits_remain_unknown_with_finite_raw_counters() {
+        try (var property = new ClockLedgerProperty("true")) {
+            var fixture = new ClockFixture(); AtomicInteger points = new AtomicInteger();
+            fixture.clock = () -> points.getAndIncrement() % 2 == 0 ? Long.MIN_VALUE : -1L;
+            var reader = fixture.reader(); reader.clockSample(0); reader.clockSample(1);
+            var evidence = reader.clockRequestsEvidence(); assertThat(evidence).containsEntry("state", "UNKNOWN");
+            assertThat(clockRole(evidence, "PERIODIC_CLOCK")).containsEntry("successCount", 2L).containsEntry("closedBracketCount", 2L)
+                    .containsEntry("elapsedSumNanos", Long.MAX_VALUE).containsEntry("elapsedAggregationComplete", false);
+            var failed = new ClockFixture(); failed.failClockAt = -1; var partialReader = failed.reader();
+            for (int index = 0; index < 9; index++) { assertThatThrownBy(() -> partialReader.clockSample(0)).hasCause(failed.clockFailure); }
+            var bounded = partialReader.clockRequestsEvidence(); assertThat(clockRows(bounded, "partialRequests")).hasSize(8);
+            assertThat(bounded).containsEntry("omittedPartialRequests", 1L).containsEntry("state", "UNKNOWN");
+            assertThat(clockRole(bounded, "PERIODIC_CLOCK")).containsEntry("failureCount", 9L);
+            assertThat(io.tapstate.core.common.JsonWriter.write(bounded).getBytes(java.nio.charset.StandardCharsets.UTF_8).length).isLessThanOrEqualTo(8192);
+        }
+    }
+
+    @Test void page_observation_includes_the_existing_rejected_tail_request_and_does_not_change_read_results() {
+        try (var property = new ClockLedgerProperty("true")) {
+            var fixture = new ClockFixture(); var reader = fixture.reader();
+            for (int index = 0; index < 514; index++) { assertThat(reader.page(0)).isSameAs(fixture.page); }
+            assertThat(clockRole(reader.clockRequestsEvidence(), "PAGE_VALIDATION")).containsEntry("maximumRequests", 514L)
+                    .containsEntry("requestCount", 514L);
+            assertThat(reader.clockRequestsEvidence()).containsEntry("state", "RECORDED_DIAGNOSTIC");
+            assertThat(reader.page(0)).isSameAs(fixture.page);
+            assertThat(reader.clockRequestsEvidence()).containsEntry("state", "UNKNOWN");
+            assertThat(clockRole(reader.clockRequestsEvidence(), "PAGE_VALIDATION")).containsEntry("requestCount", 515L);
+            assertThat(fixture.clockCalls).hasValue(1030); assertThat(fixture.clockGetters).hasValue(515);
+        }
+    }
+
+    @Test void finish_failure_retains_its_actual_capture_reader_ledger_without_retrying_the_failed_clock() {
+        try (var property = new ClockLedgerProperty("true")) {
+            var fixture = new ClockFixture(); fixture.failClockAt = 6;
+            try (var capture = BenchmarkWriteReturnCapture.open(fixture.reader(), "measured", BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL)) {
+                assertThatThrownBy(capture::finish).hasCause(fixture.clockFailure);
+                var evidence = clockMap(capture.retainedEvidence(), "clockRequests");
+                assertThat(evidence).containsEntry("state", "UNKNOWN");
+                assertThat(clockRole(evidence, "SUMMARY_VALIDATION")).containsEntry("failureCount", 1L).containsEntry("elapsedAggregationComplete", false);
+                assertThat(clockRows(evidence, "partialRequests").getFirst()).doesNotContainKey("completedAtNanos");
+                assertThat(fixture.clockGetters).hasValue(6); assertThat(fixture.clockCalls).hasValue(11);
+            }
+            assertThat(fixture.clockGetters).hasValue(6);
+        }
+    }
+
+    @Test void open_failure_keeps_the_primary_and_finds_the_appended_typed_receipt_after_existing_suppressed_failures() {
+        for (String value : new String[]{"true", null}) {
+            try (var property = new ClockLedgerProperty(value)) {
+                var fixture = new ClockFixture(); var cause = new java.io.IOException("controlled primary cause");
+                var primary = new IllegalStateException("controlled start failure", cause);
+                for (int index = 0; index < 9; index++) { primary.addSuppressed(new AssertionError("ordinary suppressed failure " + index)); }
+                fixture.startFailure = primary;
+                assertThatThrownBy(() -> BenchmarkWriteReturnCapture.open(fixture.reader(), "measured", BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL))
+                        .isSameAs(primary).hasCause(cause);
+                Map<String, Object> retained = BenchmarkWriteReturnCapture.retainedClockRequests(primary);
+                if (value == null) { assertThat(retained).isEmpty(); assertThat(primary.getSuppressed()).hasSize(10); }
+                else {
+                    assertThat(clockRole(retained, "START_VALIDATION")).containsEntry("requestCount", 1L);
+                    assertThat(primary.getSuppressed()).hasSize(11); assertThatThrownBy(retained::clear).isInstanceOf(UnsupportedOperationException.class);
+                }
+                assertThat(primary.getSuppressed()[9]).hasMessageContaining("ABORTED_BEFORE_SUCCESSFUL_STOP");
+                assertThat(fixture.clockGetters).hasValue(2); assertThat(fixture.clockCalls).hasValue(4);
+            }
+        }
+    }
+
+    private static final class ClockLedgerProperty implements AutoCloseable {
+        private final String before = System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY);
+        ClockLedgerProperty(String value) {
+            if (value == null) { System.clearProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY); }
+            else { System.setProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY, value); }
+        }
+        public void close() {
+            if (before == null) { System.clearProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY); }
+            else { System.setProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY, before); }
+        }
+    }
+
+    private static final class ClockFixture {
+        final AtomicLong root = new AtomicLong(100);
+        final AtomicInteger clockCalls = new AtomicInteger(), clockGetters = new AtomicInteger();
+        final List<String> operations = java.util.Collections.synchronizedList(new ArrayList<>());
+        final java.io.IOException clockFailure = new java.io.IOException("controlled private failure detail");
+        final byte[] page;
+        LongSupplier clock = () -> { clockCalls.incrementAndGet(); return root.incrementAndGet(); };
+        Runnable getterHook = () -> { };
+        int failClockAt;
+        RuntimeException startFailure;
+        ClockFixture() {
+            byte[] window = "measured".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] state = "RECORDED_SCOPE_UNQUALIFIED".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            page = java.nio.ByteBuffer.allocate(32 + window.length + state.length).putInt(0x57525031).putInt(3).putLong(1)
+                    .putInt(0).putInt(0).putInt(0).putShort((short) window.length).put(window).putShort((short) state.length).put(state).array();
+        }
+        BenchmarkWriteReturnReader reader() {
+            var connection = (MBeanServerConnection) Proxy.newProxyInstance(BenchmarkWriteReturnReaderTest.class.getClassLoader(),
+                    new Class<?>[]{MBeanServerConnection.class}, (proxy, method, arguments) -> {
+                        if (method.getName().equals("getAttributes")) {
+                            if (((String[]) arguments[1]).length == 3) {
+                                operations.add("clock"); int count = clockGetters.incrementAndGet(); getterHook.run();
+                                if (failClockAt == -1 || failClockAt == count) { throw clockFailure; }
+                                return attributes(17L, 1_000L, root.get());
+                            }
+                            operations.add("summary"); return summary(0L, 0L, 0L, 0L, 0L);
+                        }
+                        if (method.getName().equals("invoke")) {
+                            String operation = (String) arguments[1]; operations.add(operation);
+                            if (operation.equals("start") && startFailure != null) { throw startFailure; }
+                            if (operation.equals("read")) { return page; }
+                            if (operation.equals("start") || operation.equals("stop")) { return true; }
+                        }
+                        throw new AssertionError("unexpected ledger management operation: " + method.getName());
+                    });
+            return new BenchmarkWriteReturnReader(OWNER, connection, () -> true, clock);
+        }
+    }
+
+    @SuppressWarnings("unchecked") private static Map<String, Object> clockMap(Map<String, Object> values, String key) { return (Map<String, Object>) values.get(key); }
+    private static Map<String, Object> clockRole(Map<String, Object> values, String role) { return clockMap(clockMap(values, "roles"), role); }
+    @SuppressWarnings("unchecked") private static List<Map<String, Object>> clockRows(Map<String, Object> values, String key) { return (List<Map<String, Object>>) values.get(key); }
+    private static void clockAwait(CountDownLatch latch) {
+        try { if (!latch.await(2, TimeUnit.SECONDS)) { throw new AssertionError("clock ledger control barrier did not complete"); } }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError("clock ledger control barrier interrupted", interrupted); }
+    }
 
     @Test void native_metadata_uses_one_cold_getter_and_actual_root_and_owned_runtime_identities() {
         var fixture = nativeFixture();

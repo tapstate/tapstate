@@ -260,8 +260,12 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("source batch roster");
     }
 
-    private record Fixture(BenchmarkWorkloadDefinitions.Workload workload, BenchmarkWorkloadDefinitions.Phase phase,
+    record Fixture(BenchmarkWorkloadDefinitions.Workload workload, BenchmarkWorkloadDefinitions.Phase phase,
             List<BenchmarkForkEnvironment.BatchResult> batches, BenchmarkWriteReturnCapture.Result result) { }
+
+    static Fixture nativeFixture(BenchmarkWorkloadDefinitions.Workload workload) throws Exception {
+        return commonCounterFixture(fixture(workload, false));
+    }
 
     private static Fixture fixture(BenchmarkWorkloadDefinitions.Workload workload, boolean broad) throws Exception {
         var phase = workload.phase("cdc-update");
@@ -368,9 +372,13 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
     }
     private static final String LIBRARY = BenchmarkNativeClockEvidenceTest.LIBRARY;
     private static final BenchmarkCausalClock.Identity ROOT = new BenchmarkCausalClock.Identity(29, 2000);
-    private static BenchmarkNativeNominalReturnClock nominalClock(BenchmarkWriteReturnCapture.Result result) {
+    static BenchmarkNativeNominalReturnClock nominalClock(BenchmarkWriteReturnCapture.Result result) {
         var owner = result.samples().getFirst().identity();
         return new BenchmarkNativeNominalReturnClock(owner, ROOT, LIBRARY, result.samples(), cold(owner), cold(owner));
+    }
+    static BenchmarkNativeReturnClock integerClock(BenchmarkWriteReturnCapture.Result result) {
+        var owner = result.samples().getFirst().identity();
+        return new BenchmarkNativeReturnClock(owner, ROOT, LIBRARY, result.samples(), cold(owner), cold(owner));
     }
     /** Synthetic cold facts reuse the existing complete source, call and raw-page fixtures. */
     private static Map<String, Object> cold(BenchmarkCausalClock.Identity owner) {
