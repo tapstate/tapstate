@@ -62,26 +62,38 @@ final class RowScript {
     }
 
     private final Context context;
+    private final String previewExecutionId;
     private final Value process;
     private final Value filter;
     // A JS truthiness coercion, so a filter verdict follows JS rules (0 / '' / null / undefined = false).
     private final Value toBool;
 
     RowScript(String source) {
+        this(source, null);
+    }
+
+    RowScript(String source, String previewExecutionId) {
+        this.previewExecutionId = previewExecutionId;
         this.context = Context.newBuilder("js").engine(ENGINE).allowHostAccess(HostAccess.EXPLICIT).build();
+        PreviewJsExecutionRegistry.register(previewExecutionId, context);
         try {
-            context.eval("js", source);
-        } catch (PolyglotException e) {
-            throw TransformErrors.scriptCompileFailed(e);
+            try {
+                context.eval("js", source);
+            } catch (PolyglotException e) {
+                throw TransformErrors.scriptCompileFailed(e);
+            }
+            this.toBool = context.eval("js", "(x) => !!x");
+            Value bindings = context.getBindings("js");
+            this.process = bindings.getMember("process");
+            if (process == null || !process.canExecute()) {
+                throw TransformErrors.scriptNoProcess();
+            }
+            Value declaredFilter = bindings.getMember("filter");
+            this.filter = declaredFilter != null && declaredFilter.canExecute() ? declaredFilter : null;
+        } catch (RuntimeException | Error failure) {
+            closeAfterConstructionFailure();
+            throw failure;
         }
-        this.toBool = context.eval("js", "(x) => !!x");
-        Value bindings = context.getBindings("js");
-        this.process = bindings.getMember("process");
-        if (process == null || !process.canExecute()) {
-            throw TransformErrors.scriptNoProcess();
-        }
-        Value declaredFilter = bindings.getMember("filter");
-        this.filter = declaredFilter != null && declaredFilter.canExecute() ? declaredFilter : null;
     }
 
     /** Runs the script for one event, returning the events it becomes (empty to drop). */
@@ -110,6 +122,24 @@ final class RowScript {
             // A guest-side failure (a thrown error, a bad property access) is a user-diagnosable
             // condition: surface it as a coded diagnostic, not a bare crash that fails the job opaquely.
             throw TransformErrors.scriptFailed(e);
+        }
+    }
+
+    void close() {
+        try {
+            context.close();
+        } finally {
+            PreviewJsExecutionRegistry.unregister(previewExecutionId, context);
+        }
+    }
+
+    private void closeAfterConstructionFailure() {
+        try {
+            context.close(true);
+        } catch (RuntimeException ignored) {
+            // Construction is already failing; keep the original diagnostic.
+        } finally {
+            PreviewJsExecutionRegistry.unregister(previewExecutionId, context);
         }
     }
 

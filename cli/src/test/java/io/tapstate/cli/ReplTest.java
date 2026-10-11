@@ -183,6 +183,7 @@ class ReplTest {
         /** The canned connected-verb outcomes (used when the target base is healthy) and their call logs. */
         ApplyOutcome applyOutcome = new ApplyOutcome.Unreachable();
         GetOutcome getOutcome = new GetOutcome.Unreachable();
+        ConnectionSettingsOutcome connectionSettingsOutcome;
         DeleteOutcome deleteOutcome = new DeleteOutcome.Unreachable();
         /** Every removal asked for, as {@code credential@base/id#hash} — the hash is what the tests pin. */
         final List<String> deleteCalls = new ArrayList<>();
@@ -428,6 +429,20 @@ class ReplTest {
         public GetOutcome get(URI baseUrl, String credential, String id) {
             getCalls.add(credential + "@" + baseUrl + "/" + id);
             return healthy.contains(baseUrl) ? getOutcome : new GetOutcome.Unreachable();
+        }
+
+        @Override
+        public ConnectionSettingsOutcome connectionSettings(URI baseUrl, String credential, String id) {
+            if (!healthy.contains(baseUrl)) return new ConnectionSettingsOutcome.Unreachable();
+            if (connectionSettingsOutcome != null) return connectionSettingsOutcome;
+            // Legacy fixtures already carry the complete Source. The production transport instead
+            // obtains the protected config from the dedicated Source endpoint.
+            if (getOutcome instanceof GetOutcome.Found found
+                    && new io.tapstate.core.dsl.DslParser().parse(found.artifact().canonicalForm())
+                    instanceof io.tapstate.core.model.SourceResource source) {
+                return new ConnectionSettingsOutcome.Found(source.connector(), source.config());
+            }
+            return new ConnectionSettingsOutcome.Unreachable();
         }
 
         @Override
@@ -1973,14 +1988,40 @@ class ReplTest {
     void getWhileAuthenticatedFetchesTheArtifactFromTheServer() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source",
+                        "version: tapstate/v1\nkind: source\nid: src_kfk\nconnector: kafka\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("kind: source").contains("src_kfk");
+        assertThat(out).doesNotContain("cannot be applied as-is");
         // the credential travels to the current landing node
         assertThat(client.getCalls).containsExactly("jwt-tok@http://node1:7900/src_kfk");
+    }
+
+    @Test
+    void getWarnsThatARedactedSourceCannotBeAppliedAsIs() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact(
+                "atlas", "source",
+                "version: tapstate/v1\nkind: source\nid: atlas\n"
+                        + "config: { uri: 'mongodb+srv://<redacted>@cluster.example/test' }\n"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("get atlas")).isTrue();
+
+        String output = h.sink().toString().substring(mark);
+        assertThat(output).contains("mongodb+srv://<redacted>@cluster.example/test")
+                .contains("cannot be applied as-is", "provide complete settings")
+                .doesNotContain("sentinel-secret");
+
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("atlas", "source", "<redacted-source>"));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("get atlas")).isTrue();
+        assertThat(h.sink().toString().substring(mark))
+                .contains("<redacted-source>", "cannot be applied as-is");
     }
 
     /**
@@ -2798,6 +2839,44 @@ class ReplTest {
     }
 
     @Test
+    void probesUseDedicatedSettingsWhenTheGenericSourceHasNoConfig() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("my-mongo", "source", """
+                version: tapstate/v1
+                kind: source
+                id: my-mongo
+                connector: mongodb
+                """));
+        client.connectionSettingsOutcome = new ConnectionSettingsOutcome.Found(
+                "mongodb", Map.of("uri", "mongodb://<redacted>@db.example/rows", "isUri", true));
+        client.testOutcome = passedReport();
+        client.discoverSchemaOutcome = new ConnectionDiscoverSchemaOutcome.Discovered(
+                new ConnectionSchema("my-mongo", "mongodb", List.of(), 1752000000000L));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().dispatch("test my-mongo");
+        h.repl().dispatch("discover-schema my-mongo");
+        assertThat(client.testCalls).hasSize(1);
+        assertThat(client.discoverSchemaCalls).hasSize(1);
+        assertThat(client.testCalls.getFirst()).contains("db.example/rows");
+        assertThat(client.discoverSchemaCalls.getFirst()).contains("db.example/rows");
+        assertThat(h.sink().toString()).doesNotContain("db.example/rows");
+    }
+
+    @Test
+    void aRefusedDedicatedSettingsReadNeverRunsAProbe() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = storedConnection();
+        client.connectionSettingsOutcome = new ConnectionSettingsOutcome.Rejected(
+                "control.forbidden", "Protected Source read refused");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().dispatch("test my-mongo");
+        h.repl().dispatch("discover-schema my-mongo");
+        assertThat(client.testCalls).isEmpty();
+        assertThat(client.discoverSchemaCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("control.forbidden", "Protected Source read refused");
+    }
+
+    @Test
     void testOnANonSourceIdReportsNotATestableConnectionAndDoesNotProbe() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
@@ -3131,7 +3210,7 @@ class ReplTest {
     }
 
     @Test
-    void registerDownloadsBothPublishedEnterpriseConnectorsById(@TempDir Path workdir) {
+    void registerDownloadsPublishedAtlasAndEnterpriseConnectorsById(@TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("enterprise", "hash-abc", "2.0.9", true));
@@ -3144,22 +3223,66 @@ class ReplTest {
         });
         int mark = h.sink().toString().length();
 
+        assertThat(h.repl().dispatch("register mongodb-atlas")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
         assertThat(h.repl().dispatch("register oracle")).isTrue();
         assertThat(h.repl().lastExitCode()).isZero();
         assertThat(h.repl().dispatch("register sqlserver")).isTrue();
         assertThat(h.repl().lastExitCode()).isZero();
 
         assertThat(fetched).containsExactly(
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/mongodb-atlas-connector.jar"),
                 URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/oracle-connector.jar"),
                 URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/sqlserver-connector.jar"));
         assertThat(client.registerCalls).containsExactly(
                 "jwt-tok@http://node1:7900 x" + jar.length,
+                "jwt-tok@http://node1:7900 x" + jar.length,
                 "jwt-tok@http://node1:7900 x" + jar.length);
         assertThat(h.sink().toString().substring(mark))
+                .contains("downloading mongodb-atlas-connector.jar from github.com")
                 .contains("downloading oracle-connector.jar from github.com")
                 .contains("downloading sqlserver-connector.jar from github.com")
+                .contains("uploading mongodb-atlas-connector.jar (" + jar.length + " B)")
                 .contains("uploading oracle-connector.jar (" + jar.length + " B)")
                 .contains("uploading sqlserver-connector.jar (" + jar.length + " B)");
+    }
+
+    @Test
+    void registerPublishedAtlasFromPublicReleaseWhenEnabled(@TempDir Path workdir) {
+        assumeTrue(Boolean.getBoolean("tapstate.it.published-connectors"),
+                "requires the live public connector release");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("mongodb-atlas", "hash-atlas", "2.0.5-SNAPSHOT", true));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register mongodb-atlas")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x19764088");
+        assertThat(h.sink().toString())
+                .contains("downloading mongodb-atlas-connector.jar from github.com")
+                .contains("uploading mongodb-atlas-connector.jar")
+                .contains("registered  mongodb-atlas  hash-atlas");
+    }
+
+    @Test
+    void registerPublishedAwsRdsMysqlFromPublicReleaseWhenEnabled(@TempDir Path workdir) {
+        assumeTrue(Boolean.getBoolean("tapstate.it.published-connectors"),
+                "requires the live public connector release");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("aws-rds-mysql", "hash-rds", "2.0.5-SNAPSHOT", true));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register aws-rds-mysql")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x47043627");
+        assertThat(h.sink().toString())
+                .contains("downloading aws-rds-mysql-connector.jar from github.com")
+                .contains("uploading aws-rds-mysql-connector.jar")
+                .contains("registered  aws-rds-mysql  hash-rds");
     }
 
     @Test

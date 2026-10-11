@@ -8,16 +8,13 @@ import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 
 import java.nio.file.Path;
+import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * Sweeps the connector seed directory once at startup and logs each artifact's fate. Failures are
- * per-artifact and already contained in the sweep's outcomes, so a defective seed jar is a warning
- * in the log, never a failed boot; what does register is exactly what the release shipped in the
- * directory. A seed path that is misconfigured (exists but is not a directory) or a directory the
- * process cannot list is deliberately not contained: that fault hides every shipped connector at
- * once, so it fails the boot loudly instead of degrading silently.
+ * Sweeps the connector seed directory once at startup. On-prem keeps optional, best-effort seeds;
+ * Cloud requires its complete verified release to register and load before becoming ready.
  */
 final class SeedSweepRunner implements ApplicationRunner {
 
@@ -25,15 +22,33 @@ final class SeedSweepRunner implements ApplicationRunner {
 
     private final SeedConnectorSweep sweep;
     private final Path seedDir;
+    private final CloudConnectorSeedReadiness cloudReadiness;
 
     SeedSweepRunner(SeedConnectorSweep sweep, Path seedDir) {
+        this(sweep, seedDir, null);
+    }
+
+    SeedSweepRunner(SeedConnectorSweep sweep, Path seedDir, CloudConnectorSeedReadiness cloudReadiness) {
         this.sweep = Objects.requireNonNull(sweep, "sweep");
         this.seedDir = Objects.requireNonNull(seedDir, "seedDir");
+        this.cloudReadiness = cloudReadiness;
     }
 
     @Override
     public void run(ApplicationArguments args) {
-        report(sweep.sweep(seedDir));
+        List<SeedOutcome> outcomes;
+        try {
+            outcomes = sweep.sweep(seedDir);
+        } catch (UncheckedIOException failure) {
+            if (cloudReadiness != null) {
+                throw CloudConnectorSeedReadiness.sweepUnavailable();
+            }
+            throw failure;
+        }
+        if (cloudReadiness != null) {
+            cloudReadiness.verifyRegistrations(outcomes);
+        }
+        report(outcomes);
     }
 
     /** One log line per artifact: seeded, already registered, or not registered with the reason. */

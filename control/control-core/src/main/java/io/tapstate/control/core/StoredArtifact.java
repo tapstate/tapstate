@@ -3,10 +3,11 @@ package io.tapstate.control.core;
 import java.util.Objects;
 
 /**
- * The truth-layer view of one stored artifact returned by a read: its id, kind, public canonical
- * representation, and the content hash of the authoritative resource. A Source presentation can carry
- * redacted URI userinfo, so its bytes do not determine the hash and cannot be applied as authored input.
- * The server, not a local draft, remains the source of the stored resource (server-as-truth).
+ * The truth-layer view of one stored artifact returned by a read: its id, kind, public representation,
+ * and the content hash of the authoritative resource. A Source presentation omits connector config and
+ * can carry redacted URI userinfo in other display fields. Its bytes therefore do not determine the hash.
+ * Reapplying a config-omitting Source retains its stored config, while a display marker outside that
+ * omitted field is refused. The server, not a local draft, remains the stored-resource source of truth.
  *
  * <p>The hash travels with the read because it is the precondition an edit or a removal must supply, and
  * not every caller can compute it: a remote model driving the tool surface cannot take a SHA-256 of the

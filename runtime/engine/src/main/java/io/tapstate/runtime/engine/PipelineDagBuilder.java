@@ -320,7 +320,7 @@ public final class PipelineDagBuilder {
      */
     public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
             FrontierBinding frontier) {
-        return build(pipeline, bindings, sinkAck, frontier, ExecutionShape.totalOne());
+        return build(pipeline, bindings, sinkAck, frontier, ExecutionShape.totalOne(), new NodeVertices(), null);
     }
 
     /**
@@ -332,7 +332,7 @@ public final class PipelineDagBuilder {
      */
     public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
             FrontierBinding frontier, ExecutionShape shape) {
-        return build(pipeline, bindings, sinkAck, frontier, shape, new NodeVertices());
+        return build(pipeline, bindings, sinkAck, frontier, shape, new NodeVertices(), null);
     }
 
     /**
@@ -342,6 +342,17 @@ public final class PipelineDagBuilder {
      */
     public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
             FrontierBinding frontier, ExecutionShape shape, NodeVertices drawn) {
+        return build(pipeline, bindings, sinkAck, frontier, shape, drawn, null);
+    }
+
+    /** Builds a total-one topology with optional side taps for bounded pipeline preview. */
+    public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
+            FrontierBinding frontier, DagTraceBinding trace) {
+        return build(pipeline, bindings, sinkAck, frontier, ExecutionShape.totalOne(), new NodeVertices(), trace);
+    }
+
+    private static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
+            FrontierBinding frontier, ExecutionShape shape, NodeVertices drawn, DagTraceBinding trace) {
         Objects.requireNonNull(shape, "shape");
         DAG dag = new DAG();
         Map<String, Vertex> byKey = new HashMap<>();
@@ -365,8 +376,10 @@ public final class PipelineDagBuilder {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
             }
             for (String sourceKey : sourceKeys) {
-                byKey.put(sourceKey, dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey)));
+                Vertex source = dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey));
+                byKey.put(sourceKey, source);
                 drawn.add(sourceKey, sourceKey);
+                attachTrace(dag, sourceKey, source, trace, outboundOrdinal, inboundOrdinal, shape);
                 // Per vertex rather than per source: a source reading several tables reads several chains,
                 // and a bound carrying one of their names for all of them would say how far one table had
                 // travelled about changes of a table nobody had read.
@@ -413,6 +426,9 @@ public final class PipelineDagBuilder {
                             topology.isPassthrough() && shape.isNative(step.id())
                                     ? RoutingKeys.forNode(step.id(), shape.inputKeysOf(step.id()))
                                     : null));
+                    attachTraceInputs(dag, step.id(), inline.from(), bindings, byKey, trace,
+                            outboundOrdinal, inboundOrdinal, shape);
+                    attachTrace(dag, step.id(), byKey.get(step.id()), trace, outboundOrdinal, inboundOrdinal, shape);
                     if (chains != null) {
                         chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
@@ -435,6 +451,9 @@ public final class PipelineDagBuilder {
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             bindings.join().stores(), bindings.join().displaced(),
                             shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn)));
+                    attachTraceInputs(dag, step.id(), inline.from(), bindings, byKey, trace,
+                            outboundOrdinal, inboundOrdinal, shape);
+                    attachTrace(dag, step.id(), byKey.get(step.id()), trace, outboundOrdinal, inboundOrdinal, shape);
                     if (chains != null) {
                         chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
@@ -450,6 +469,9 @@ public final class PipelineDagBuilder {
                     chains.derived(step.id(), upstream);
                 }
                 connect(dag, verticesOf(upstream, byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
+                attachTraceInputs(dag, step.id(), step.from(), bindings, byKey, trace,
+                        outboundOrdinal, inboundOrdinal, shape);
+                attachTrace(dag, step.id(), vertex, trace, outboundOrdinal, inboundOrdinal, shape);
             }
         }
 
@@ -556,6 +578,40 @@ public final class PipelineDagBuilder {
     /** One sink a graph draws: its vertex, the producers it reads, the writers it opens and the batch it forms. */
     private record SinkNode(String name, List<String> upstream, SupplierEx<? extends SinkWriter> writers,
             BatchSpec batch) {
+    }
+
+    private static void attachTrace(DAG dag, String nodeId, Vertex source, DagTraceBinding trace,
+            Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal, ExecutionShape shape) {
+        if (trace == null) {
+            return;
+        }
+        Vertex tap = dag.newVertex(trace.vertexName(nodeId), trace.vertices().apply(nodeId));
+        connect(dag, List.of(source), tap, outboundOrdinal, inboundOrdinal, shape);
+    }
+
+    private static void attachTraceInputs(DAG dag, String nodeId, FromClause from, DagBindings bindings,
+            Map<String, Vertex> byKey, DagTraceBinding trace,
+            Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal, ExecutionShape shape) {
+        if (trace == null) {
+            return;
+        }
+        Map<String, List<Vertex>> inputs = new LinkedHashMap<>();
+        if (from instanceof FromClause.Aliases aliases) {
+            aliases.aliases().keySet().forEach(alias -> inputs.put(
+                    alias, verticesOf(aliasUpstream(from, alias, bindings), byKey)));
+        } else if (from instanceof FromClause.Flow flow) {
+            for (int index = 0; index < flow.refs().size(); index++) {
+                inputs.put("input-" + index, verticesOf(resolve(flow.refs().get(index), bindings), byKey));
+            }
+        }
+        inputs.forEach((alias, producers) -> {
+            if (producers.isEmpty()) {
+                throw new IllegalStateException("trace input '" + alias + "' for step '" + nodeId
+                        + "' has no producer");
+            }
+            Vertex tap = dag.newVertex(trace.inputVertexName(nodeId, alias), trace.inputs().apply(nodeId, alias));
+            connect(dag, producers, tap, outboundOrdinal, inboundOrdinal, shape);
+        });
     }
 
     /**

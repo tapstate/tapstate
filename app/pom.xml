@@ -30,6 +30,7 @@
 
   <properties>
     <mainClass>io.tapstate.app.Bootstrap</mainClass>
+    <tapstate.it.jvmArgs></tapstate.it.jvmArgs>
   </properties>
 
   <dependencyManagement>
@@ -59,6 +60,14 @@
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <!-- Cloud owns this SDK and publishes it through Tapdata Nexus. The managed assembly delegates
+         code exchange, JWT verification, callback verification, and C2 transport to this contract;
+         Tapstate retains only local-session and status-projection policy. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>cloud-control-plane-sdk</artifactId>
+      <version>${cloud.sdk.version}</version>
     </dependency>
     <!-- The password-hashing primitive (adaptive salted hash) backing the control ring's hasher port.
          A self-contained crypto library, version-managed by the platform BOM; the raw hash algorithm
@@ -248,6 +257,20 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <!-- Order the isolated MCP executable before its real-process integration witnesses. Neither the
+         sidecar nor its framework belongs in the service or in the host test JVM. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>mcp-server</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
     <!-- Testcontainers: a throwaway Mongo replica-set to witness that the assembly root exposes a
          working StorePort bean (the all role) against a real store. Skipped automatically where
          Docker is absent, so a Docker-less build stays green. -->
@@ -273,10 +296,26 @@
         <directory>src/main/resources</directory>
       </resource>
       <resource>
+        <directory>${project.basedir}/../deploy/cloud</directory>
+        <targetPath>META-INF/tapstate</targetPath>
+        <includes>
+          <include>connectors.lock.json</include>
+        </includes>
+      </resource>
+      <resource>
         <directory>${project.build.directory}/generated-resources/tapstate-web</directory>
       </resource>
     </resources>
     <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>io.tapstate:mcp-server</classpathDependencyExclude>
+          </classpathDependencyExcludes>
+        </configuration>
+      </plugin>
       <!-- Stamp the module openings the shipped boot jar needs into its manifest, so a bare `java -jar`
            has them without the caller setting JAVA_OPTS (the spring-boot repackage below preserves the
            jar manifest's own entries). Two unrelated things need them.
@@ -315,10 +354,18 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <configuration>
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>io.tapstate:mcp-server</classpathDependencyExclude>
+          </classpathDependencyExcludes>
+          <!-- The PDK runtime uses cglib to bind real connector configuration. Mirror the Boot JAR's
+               manifest opening in the integration-test fork while retaining JaCoCo's argLine. Extra
+               JVM arguments are reserved for local live-test environment requirements. -->
+          <argLine>@{argLine} --add-opens java.base/java.lang=ALL-UNNAMED ${tapstate.it.jvmArgs}</argLine>
           <!-- The packaged boot jar, handed to the boot-jar guard IT so it can assert the PDK runtime is
                bundled into the shipped artifact (repackage runs in package, before integration-test). -->
           <systemPropertyVariables>
             <tapstate.app.boot-jar>${project.build.directory}/${project.build.finalName}-boot.jar</tapstate.app.boot-jar>
+            <tapstate.app.mcp-boot-jar>${project.basedir}/../control/mcp-server/target/mcp-server-${revision}-boot.jar</tapstate.app.mcp-boot-jar>
           </systemPropertyVariables>
         </configuration>
         <executions>

@@ -6,6 +6,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.ChangeSet.Fence;
+import io.tapstate.adapters.mongostore.MigrationError;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.testsupport.RequiresDocker;
@@ -17,6 +18,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Clock;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -24,6 +27,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -171,6 +175,43 @@ class MigrationRunnerIT {
     }
 
     @Test
+    void aDriverFailureDoesNotExposeDocumentValuesAndStillResumesAtTheFailedStep() {
+        MongoDatabase database = freshDatabase("runner_driver_failure");
+        String sentinel = "controlled-migration-secret-value";
+        database.getCollection("duplicate_proof").insertOne(new Document("_id", sentinel));
+        AtomicInteger firstRan = new AtomicInteger();
+        ChangeSet duplicateWrite = new ChangeSet() {
+            @Override public int version() { return 2; }
+            @Override public String changeSetName() { return "controlled-driver-failure"; }
+            @Override public void up(MongoDatabase target, Fence fence) {
+                fence.requireStillHeld();
+                target.getCollection("duplicate_proof").insertOne(new Document("_id", sentinel));
+            }
+        };
+        TapstateException failure = catchThrowableOfType(() -> MigrationRunner.migrate(database,
+                List.of(counting(1, firstRan), duplicateWrite), LOCK_TTL, PATIENT, CLOCK), TapstateException.class);
+        assertThat(failure).isNotNull();
+        assertThat(failure.code()).isEqualTo(MigrationError.CHANGESET_FAILED);
+        assertThat(failure.args()).containsExactlyEntriesOf(Map.of(
+                "changeset", "controlled-driver-failure", "cause", "MongoWriteException code=11000"));
+        assertThat(failure.getCause()).isNull();
+        StringWriter stack = new StringWriter();
+        failure.printStackTrace(new PrintWriter(stack));
+        assertThat(stack.toString()).doesNotContain(sentinel, "E11000", "duplicate_proof");
+        assertThat(installedVersion(database)).isEqualTo(1);
+        assertThat(schemaDocuments(database).find(SCHEMA_ID).first().get("lock", Document.class))
+                .doesNotContainKeys("owner", "since", "heartbeat");
+        assertThat(database.getCollection("duplicate_proof").countDocuments()).isEqualTo(1);
+
+        AtomicInteger secondRan = new AtomicInteger();
+        MigrationRunner.migrate(database, List.of(counting(1, firstRan), counting(2, secondRan)),
+                LOCK_TTL, PATIENT, CLOCK);
+        assertThat(firstRan).hasValue(1);
+        assertThat(secondRan).hasValue(1);
+        assertThat(installedVersion(database)).isEqualTo(2);
+    }
+
+    @Test
     void aChangesetWhoseLockWasTakenAwayDoesNotRecordWhatItDid() {
         MongoDatabase database = freshDatabase("runner_fenced");
 
@@ -305,7 +346,8 @@ class MigrationRunnerIT {
                 .containsExactly("V1BaselineIndexes", "V2StructuredArtifacts", "V3RecordedSrsSwitches",
                         "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
-                        "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex");
+                        "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
+                        "V12EncryptSourceConfigs");
 
         MigrationRunner.migrate(database);
 

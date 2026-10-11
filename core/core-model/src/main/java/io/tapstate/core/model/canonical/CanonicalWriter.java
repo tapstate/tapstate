@@ -221,6 +221,8 @@ public final class CanonicalWriter {
                 m.freeMap("labels", new TreeMap<>(md.labels()));
             }
             m.scalar("description", md.description());
+            m.scalar("cloud", md.cloud());
+            m.scalar("user_id", md.userId());
             b.put("metadata", m.build());
         }
     }
@@ -347,10 +349,10 @@ public final class CanonicalWriter {
     private Node fieldRules(Map<String, FieldRule> fields) {
         B b = new B();
         for (Map.Entry<String, FieldRule> e : fields.entrySet()) {
-            b.put(e.getKey(), switch (e.getValue()) {
+            b.putRequired(e.getKey(), switch (e.getValue()) {
                 case FieldRule.Rename r -> scalar("$" + r.sourceField());
                 case FieldRule.Drop ignored -> scalar(Boolean.FALSE);
-                case FieldRule.Literal l -> scalar(l.value());
+                case FieldRule.Literal l -> literalValue(l.value());
                 case FieldRule.Computed c -> new Node.ScalarN("=" + c.celExpr(), Node.Style.EXPRESSION);
             });
         }
@@ -643,6 +645,21 @@ public final class CanonicalWriter {
             return new Node.SeqN(items);
         }
         return scalar(v);
+    }
+
+    /** Literal collection values are data, so their empty members must survive serialization. */
+    private static Node literalValue(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            B builder = new B();
+            for (Map.Entry<String, Object> entry : new TreeMap<>(asStringMap(map)).entrySet()) {
+                builder.putRequired(entry.getKey(), literalValue(entry.getValue()));
+            }
+            return builder.build();
+        }
+        if (value instanceof List<?> list) {
+            return new Node.SeqN(list.stream().map(CanonicalWriter::literalValue).toList());
+        }
+        return scalar(value);
     }
 
     @SuppressWarnings("unchecked")

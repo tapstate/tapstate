@@ -102,6 +102,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * this vertex holds is in a document or on its way into one.
      */
     private final NestDeadLetter deadLetter;
+    private final boolean settleMissingReferencesOnComplete;
+    private boolean settledMissingReferencesOnComplete;
 
     /**
      * Keys keeping the record of a deletion, which is where the sweep that drops them has to look. Kept for
@@ -130,6 +132,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * again from it, reading the row it wanted rather than being told about it.
      */
     private final Set<Object> waiting = new LinkedHashSet<>();
+
+    /** Event times of documents held only for referenced rows that may be absent from a finite sample. */
+    private final Map<Object, Long> waitingTimestamps = new LinkedHashMap<>();
 
     /** When the records of deletion were last swept, or null before the first sweep. */
     private Long forgottenAt;
@@ -332,9 +337,21 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             ReplayFloor floor, NestSettings settings, NestClock clock, NestSendPolicy sending,
             NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter,
             Map<String, NestStore<Map<String, Object>>> referenced) {
+        this(vertex, slots, store, outputStream, axes, chainsByOrdinal, floor, settings, clock,
+                sending, parking, deadLetter, referenced, false);
+    }
+
+    /** A bounded preview may settle absent references once all of its finite inputs have completed. */
+    public AssemblerProcessor(NestVertex vertex, List<EmbedSlot> slots, NestStore<RootAssembly> store,
+            String outputStream, ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal,
+            ReplayFloor floor, NestSettings settings, NestClock clock, NestSendPolicy sending,
+            NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter,
+            Map<String, NestStore<Map<String, Object>>> referenced,
+            boolean settleMissingReferencesOnComplete) {
         this.referenced = Map.copyOf(referenced);
         this.parking = parking;
         this.deadLetter = Objects.requireNonNull(deadLetter, "deadLetter");
+        this.settleMissingReferencesOnComplete = settleMissingReferencesOnComplete;
         this.vertex = Objects.requireNonNull(vertex, "vertex");
         this.slots = List.copyOf(slots);
         this.store = Objects.requireNonNull(store, "store");
@@ -713,12 +730,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return;
         }
         ElementRef ref = new ElementRef(edge.pathId(), null,
-                NestKeys.valuesOf(row, edge.elementKey()), null);
+                NestKeys.valuesOf(row, edge.elementKey(), vertex.mapName()), null);
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
         ElementRef from = was == null ? null
-                : new ElementRef(edge.pathId(), null, NestKeys.valuesOf(was, edge.elementKey()), null);
-        List<Object> joining = NestKeys.valuesOf(row, edge.keyFields());
-        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, edge.keyFields());
+                : new ElementRef(edge.pathId(), null, NestKeys.valuesOf(was, edge.elementKey(), vertex.mapName()), null);
+        List<Object> joining = NestKeys.valuesOf(row, edge.keyFields(), vertex.mapName());
+        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, edge.keyFields(), vertex.mapName());
         boolean departed = leaving != null && !leaving.equals(joining);
         // Which document this copy is about is the key it was routed on, not the key its row now names. The
         // departure copy was sent here by what the row is leaving, so that is the document this instance
@@ -782,9 +799,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private void handleRoot(NestInbound edge, Envelope event, Map<String, Object> row, SourceOrder order,
             Map<Object, Touched> touched) {
-        List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey());
+        List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName());
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
-        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, vertex.partitionKey());
+        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, vertex.partitionKey(), vertex.mapName());
         boolean movedKey = leaving != null && !leaving.equals(key);
         if (edge.carriesDepartures()) {
             // Every root row travels the twin edge, not only the ones that moved - an edge cannot filter.
@@ -1104,6 +1121,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * is what is still owed rather than what has just been paid.
      */
     private void settle(Map<Object, Touched> touched) {
+        settle(touched, false);
+    }
+
+    /** Settles documents against the completed bounded sample, where absent references cannot arrive later. */
+    private void settle(Map<Object, Touched> touched, boolean allowMissingReferences) {
         Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
             document.assembly.render(slots, resolved).ifPresentOrElse(
@@ -1112,11 +1134,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                         if (isOwedAHandOver(key)) {
                             return;
                         }
-                        if (document.assembly.waitsForARowItPointsAt(slots, resolved)) {
-                            waiting.add(key);
+                        if (!allowMissingReferences
+                                && document.assembly.waitsForARowItPointsAt(slots, resolved)) {
+                            waitForReference(key, document.ts);
                             return;
                         }
-                        waiting.remove(key);
+                        stopWaitingForReference(key);
                         Map<String, ChainPosition> unsent = document.assembly.lowestUnsentByChain();
                         if (mayGoOutNow(key, unsent)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
@@ -1141,7 +1164,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                             // The window goes with it. What it was holding back names a key that is gone,
                             // and the row bringing that key back is a change nothing should delay.
                             windows.remove(key);
-                            waiting.remove(key);
+                            stopWaitingForReference(key);
                         }
                     });
             store.save(key, document.assembly, document.heldNothing);
@@ -1260,7 +1283,38 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     @Override
     public boolean complete() {
+        if (!flush()) {
+            return false;
+        }
+        if (settleMissingReferencesOnComplete && !settledMissingReferencesOnComplete) {
+            Map<Object, Touched> touched = new LinkedHashMap<>();
+            for (Object key : List.copyOf(waiting)) {
+                RootAssembly assembly = store.load(key);
+                if (assembly == null) {
+                    stopWaitingForReference(key);
+                    continue;
+                }
+                Touched document = new Touched(assembly, false);
+                document.ts = waitingTimestamps.getOrDefault(key, 0L);
+                touched.put(key, document);
+            }
+            settle(touched, true);
+            settledMissingReferencesOnComplete = true;
+            if (!flush()) {
+                return false;
+            }
+        }
         return sendFolded(false);
+    }
+
+    private void waitForReference(Object key, long ts) {
+        waiting.add(key);
+        waitingTimestamps.put(key, ts);
+    }
+
+    private void stopWaitingForReference(Object key) {
+        waiting.remove(key);
+        waitingTimestamps.remove(key);
     }
 
     private boolean sendFolded(boolean onlyWhatHasRunOut) {
@@ -1314,10 +1368,10 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 // Recorded as well as skipped, so the next turn takes the cheap exit above rather than
                 // reading the same absence again. A restart arrives here with nothing recorded, which is
                 // what this covers: the drain that first saw the wait may be on the other side of it.
-                waiting.add(entry.getKey());
+                waitForReference(entry.getKey(), window.ts);
                 continue;
             }
-            waiting.remove(entry.getKey());
+            stopWaitingForReference(entry.getKey());
             outgoing.add(Envelope.insert(window.ts, outputStream, rendered.get(), null)
                     .withPositions(assembly.covered())
                     // As on the drain's own path. A document released by the window is the same document

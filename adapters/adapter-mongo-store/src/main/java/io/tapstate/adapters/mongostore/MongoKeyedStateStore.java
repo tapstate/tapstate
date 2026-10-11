@@ -7,7 +7,9 @@ import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
+import org.bson.BsonMaximumSizeExceededException;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.bson.types.MaxKey;
@@ -157,12 +159,12 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
                 .returnDocument(ReturnDocument.BEFORE);
         Document before;
         try {
-            before = StoreIo.call(
-                    () -> collection.findOneAndUpdate(byId(namespace, key), onInsert, asItWas));
-        } catch (TapstateException e) {
-            if (!(e.getCause() instanceof MongoException mongo)
-                    || ErrorCategory.fromErrorCode(mongo.getCode()) != ErrorCategory.DUPLICATE_KEY) {
-                throw e;
+            before = collection.findOneAndUpdate(byId(namespace, key), onInsert, asItWas);
+        } catch (BsonMaximumSizeExceededException tooLarge) {
+            throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", "unknown"), null);
+        } catch (MongoException failure) {
+            if (ErrorCategory.fromErrorCode(failure.getCode()) != ErrorCategory.DUPLICATE_KEY) {
+                throw StoreIo.coded(failure);
             }
             // findAndModify reports duplicate keys as command failures, not write failures.
             // Lost the race: somebody else inserted between the check and the write. Their value is the

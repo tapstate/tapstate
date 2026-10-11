@@ -733,7 +733,7 @@ public final class RootAssembly implements Serializable {
             Map<String, Set<List<Object>>> needed) {
         for (EmbedSlot slot : slots) {
             if (slot.isReference()) {
-                List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields());
+                List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields(), slot.lookupMap());
                 if (!key.contains(null)) {
                     needed.computeIfAbsent(slot.lookupMap(), namespace -> new LinkedHashSet<>()).add(key);
                 }
@@ -1062,7 +1062,7 @@ public final class RootAssembly implements Serializable {
             if (slot.isReference()) {
                 // Read off the row this level already carries. The columns holding the reference are ones
                 // the row has anyway, so pointing at something costs the document no bytes of its own.
-                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields());
+                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields(), slot.lookupMap());
                 Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
                 // A row that is not filed at all has not been fetched; one filed and empty has been
                 // deleted. Neither is something to render, and frozen at its last value is the one thing
@@ -1104,7 +1104,7 @@ public final class RootAssembly implements Serializable {
             }
             Map<String, Object> flat = null;
             if (slot.isReference()) {
-                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields());
+                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields(), slot.lookupMap());
                 Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
                 if (row != null && !row.isEmpty()) {
                     flat = new LinkedHashMap<>(row);

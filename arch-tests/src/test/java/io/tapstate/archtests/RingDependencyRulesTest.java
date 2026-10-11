@@ -358,7 +358,8 @@ class RingDependencyRulesTest {
                         // control-core decouples from the runtime through the storage port
                         "io.tapstate.spi.store..",
                         // the synchronous control-to-runtime seam: the probe whitelist (a closed set
-                        // of six — connection test, schema discovery, and the four query channels).
+                        // of seven — connection test, schema discovery, four data-browser channels,
+                        // and finite Pipeline preview).
                         // Every other control<->runtime interaction stays store-decoupled; this
                         // narrow channel is the one compile reference control-core holds into the
                         // runtime ring
@@ -369,7 +370,7 @@ class RingDependencyRulesTest {
                         + "whitelist only. It stays framework-free — Spring lives in "
                         + "rest-api (the HTTP presentation face), never here — so the apply / registry "
                         + "logic is unit-testable without a container; it reaches the runtime only "
-                        + "through the store, save for the probe whitelist (a closed set of six)")
+                        + "through the store, save for the probe whitelist (a closed set of seven)")
                 .check(tapstateClasses);
     }
 
@@ -404,21 +405,20 @@ class RingDependencyRulesTest {
     }
 
     @Test
-    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly the six named probes "
+    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly the seven named probes "
             + "— no further channel")
     void r5_controlToRuntimeSyncWhitelistHasNoFurtherChannel() {
         // A control-to-runtime sync channel is a runtime interface control reaches for. The whitelist is
-        // a closed set of exactly six such interfaces: connection test, schema discovery, and the four
-        // channels the data browser needs (listing a source's collections, reading its documents,
-        // reading its table stats, and following its changes). The probes' value types are storage-port
+        // a closed set of exactly seven such interfaces: connection test, schema discovery, the four
+        // data-browser channels, and finite Pipeline preview. The probes' value types are storage-port
         // types (the connection config or query request they take, the result they return), carried as
         // payload, not channels of their own. This gate bans a further channel — another probe interface
         // control depends on. Widening the whitelist must change this gate and the sync-whitelist
-        // decision, not slip in beside it (a seventh probe interface control reaches for turns this red).
+        // decision, not slip in beside it (an eighth probe interface control reaches for turns this red).
         //
         // The set is spelled out here because the decision is what the names encode; the four query
         // channels are named ahead of the code that implements them, so until then this gate is green
-        // without proving anything. What it does from the first day is refuse a seventh.
+        // without proving anything. What it does from the first day is refuse an eighth.
         DescribedPredicate<JavaClass> aRuntimeSyncChannelOutsideTheWhitelist =
                 resideInAPackage("io.tapstate.runtime.probe..")
                         .and(DescribedPredicate.describe("interfaces", JavaClass::isInterface))
@@ -428,12 +428,13 @@ class RingDependencyRulesTest {
                         .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserFindProbe")))
                         .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserStatsProbe")))
                         .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserTailProbe")))
+                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.PipelinePreviewProbe")))
                         .as("a control-to-runtime sync channel outside the whitelist");
         noClasses().that().resideInAPackage("io.tapstate.control..")
                 .should().dependOnClassesThat(aRuntimeSyncChannelOutsideTheWhitelist)
                 .allowEmptyShould(true)
-                .because("the control-to-runtime sync whitelist is a closed set of exactly six members "
-                        + "— the connection probe, the schema-discovery probe and the four query probes; "
+                .because("the control-to-runtime sync whitelist is a closed set of exactly seven members "
+                        + "— connection, discovery, four data-browser, and Pipeline preview probes; "
                         + "a further synchronous channel must change this gate and the sync-whitelist "
                         + "decision, not slip in beside it")
                 .check(tapstateClasses);
@@ -514,8 +515,8 @@ class RingDependencyRulesTest {
     void r9_controlAndRuntimeDoNotReferenceEachOther() {
         // The control-to-runtime half carries the single R5 exception: control may reach the runtime
         // synchronously only through the probe whitelist (io.tapstate.runtime.probe), a closed set of
-        // six. Any other runtime package is still forbidden; the exactness gates above pin that
-        // whitelist to exactly six channels of one operation each.
+        // seven. Any other runtime package is still forbidden; the exactness gates above pin that
+        // whitelist to exactly seven channels of one operation each.
         noClasses().that().resideInAPackage("io.tapstate.control..")
                 .should().dependOnClassesThat(
                         JavaClass.Predicates.resideInAPackage("io.tapstate.runtime..")
@@ -524,7 +525,7 @@ class RingDependencyRulesTest {
                 .because("control writes desired state and the runtime watches and converges; they "
                         + "decouple through the store and hold no reference to each other — the sole "
                         + "exception is the synchronous probe whitelist "
-                        + "(io.tapstate.runtime.probe), a closed set of six")
+                        + "(io.tapstate.runtime.probe), a closed set of seven")
                 .check(tapstateClasses);
         // The runtime-to-control half stays a blanket ban: the runtime never reaches up into control.
         noClasses().that().resideInAPackage("io.tapstate.runtime..")

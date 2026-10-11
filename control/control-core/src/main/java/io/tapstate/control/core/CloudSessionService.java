@@ -1,0 +1,171 @@
+package io.tapstate.control.core;
+
+import io.tapstate.spi.store.CloudSessionContext;
+import io.tapstate.spi.store.CloudSessionIdentity;
+import io.tapstate.spi.store.CloudSessionRecord;
+import io.tapstate.spi.store.CloudSessionStore;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.core.common.TapstateException;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.Base64;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Map;
+
+/** Cluster-local sliding sessions: the Cloud JWT lifetime is relevant only when the login is created. */
+public final class CloudSessionService {
+
+    public static final Duration IDLE_TTL = Duration.ofMinutes(30);
+    private static final String PREFIX = "tcs_";
+    private final CloudSessionStore sessions;
+    private final CloudSessionIdentity identity;
+    private final TokenSecrets secrets;
+    private final Clock clock;
+    private final CloudAuthenticationObserver observer;
+
+    public CloudSessionService(
+            CloudSessionStore sessions, CloudSessionIdentity identity, TokenSecrets secrets, Clock clock) {
+        this(sessions, identity, secrets, clock, CloudAuthenticationObserver.NONE);
+    }
+
+    public CloudSessionService(CloudSessionStore sessions, CloudSessionIdentity identity, TokenSecrets secrets,
+            Clock clock, CloudAuthenticationObserver observer) {
+        this.sessions = Objects.requireNonNull(sessions, "sessions");
+        this.identity = Objects.requireNonNull(identity, "identity");
+        this.secrets = Objects.requireNonNull(secrets, "secrets");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        this.observer = Objects.requireNonNull(observer, "observer");
+    }
+
+    public CloudSessionIdentity identity() {
+        return identity;
+    }
+
+    public static boolean isSessionToken(String presented) {
+        return presented != null && presented.startsWith(PREFIX);
+    }
+
+    /** Creates one cookie only from a verified, still-in-window proof for this exact deployment. */
+    public Optional<CreatedCloudSession> create(CloudLoginIdentity login) {
+        return create(login, null);
+    }
+
+    public Optional<CreatedCloudSession> create(CloudLoginIdentity login, CloudSessionContext clusterContext) {
+        Objects.requireNonNull(login, "login");
+        var now = clock.instant();
+        if (!identity.equals(login.deployment())) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.DEPLOYMENT_MISMATCH);
+            return Optional.empty();
+        }
+        if (!login.jwtExpiresAt().isAfter(now)) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.JWT_EXPIRED);
+            return Optional.empty();
+        }
+        if (login.scope() == Scope.ADMIN) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.ADMIN_SCOPE);
+            return Optional.empty();
+        }
+        if (clusterContext != null && (!Objects.equals(clusterContext.organizationId(), login.organizationId())
+                || !Objects.equals(clusterContext.clusterId(), login.clusterId())
+                || !identity.clusterId().equals(clusterContext.clusterId()))) {
+            return Optional.empty();
+        }
+        GeneratedSecret secret = secrets.generate();
+        var expires = now.plus(IDLE_TTL);
+        CloudSessionRecord record = new CloudSessionRecord(identity, login.jwtId(), secret.secretHash(),
+                login.userId(), login.scope().name(), false, now, now, expires, clusterContext);
+        if (!sessions.create(record)) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.DUPLICATE_OR_REVOKED_JTI);
+            return Optional.empty();
+        }
+        String id = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(login.jwtId().getBytes(StandardCharsets.UTF_8));
+        return Optional.of(new CreatedCloudSession(PREFIX + id + "." + secret.secret(), expires));
+    }
+
+    /** Every successful local authentication refreshes idle expiry, without consulting Cloud or the JWT. */
+    public Optional<VerifiedToken> authenticate(String cookie) {
+        return authenticatedRecord(cookie).map(record -> new VerifiedToken(record.userId(), scopeOf(record.scope())));
+    }
+
+    public Optional<CloudSessionContext> clusterContext(String cookie) {
+        return authenticatedRecord(cookie).map(CloudSessionRecord::clusterContext).filter(Objects::nonNull);
+    }
+
+    private Optional<CloudSessionRecord> authenticatedRecord(String cookie) {
+        return parse(cookie).flatMap(parsed -> {
+            var now = clock.instant();
+            return sessions.authenticate(identity, parsed.jwtId(), secrets.hash(parsed.secret()),
+                    now, now.plus(IDLE_TTL));
+        });
+    }
+
+    public boolean logout(String cookie) {
+        return parse(cookie).map(parsed -> sessions.logout(
+                identity, parsed.jwtId(), secrets.hash(parsed.secret()), clock.instant())).orElse(false);
+    }
+
+    /** Caller must already have authenticated the Cloud back-channel callback. */
+    public void invalidateJwt(String jwtId) {
+        if (jwtId == null || jwtId.isBlank()) {
+            throw new IllegalArgumentException("jwtId must be non-blank");
+        }
+        sessions.invalidate(identity, jwtId, clock.instant());
+    }
+
+    private static Optional<CookieParts> parse(String cookie) {
+        if (cookie == null || !cookie.startsWith(PREFIX)) {
+            return Optional.empty();
+        }
+        String body = cookie.substring(PREFIX.length());
+        int split = body.indexOf('.');
+        if (split <= 0 || split == body.length() - 1 || body.indexOf('.', split + 1) >= 0) {
+            return Optional.empty();
+        }
+        String encodedId = body.substring(0, split);
+        String secret = body.substring(split + 1);
+        if (!tokenPart(encodedId) || !tokenPart(secret)) {
+            return Optional.empty();
+        }
+        try {
+            byte[] decoded = Base64.getUrlDecoder().decode(encodedId);
+            String jwtId = new String(decoded, StandardCharsets.UTF_8);
+            if (jwtId.isBlank() || !encodedId.equals(Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    jwtId.getBytes(StandardCharsets.UTF_8)))) {
+                return Optional.empty();
+            }
+            return Optional.of(new CookieParts(jwtId, secret));
+        } catch (IllegalArgumentException malformed) {
+            return Optional.empty();
+        }
+    }
+
+    private static boolean tokenPart(String value) {
+        return !value.isEmpty() && value.codePoints().allMatch(code -> code >= 'A' && code <= 'Z'
+                || code >= 'a' && code <= 'z' || code >= '0' && code <= '9' || code == '-' || code == '_');
+    }
+
+    private static Scope scopeOf(String stored) {
+        try {
+            Scope scope = Scope.valueOf(stored);
+            if (scope == Scope.ADMIN) {
+                throw unreadableScope();
+            }
+            return scope;
+        } catch (IllegalArgumentException unknown) {
+            // A persisted value is untrusted storage data, not a programmer invariant. Enum parser
+            // messages quote that value, so never attach the parser cause or value to the diagnostic.
+            throw unreadableScope();
+        }
+    }
+
+    private static TapstateException unreadableScope() {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", "cloud-session", "field", "scope"), null);
+    }
+
+    private record CookieParts(String jwtId, String secret) { }
+}

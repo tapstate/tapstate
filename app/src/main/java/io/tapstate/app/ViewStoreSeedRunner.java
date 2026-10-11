@@ -11,8 +11,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 
 /**
- * Registers the managed state store views materialize into, once at startup, so a deployment has one
- * without anyone declaring it.
+ * Registers the managed state store views materialize into, once at on-prem startup, so a deployment
+ * has one without anyone declaring it. Cloud startup disables this runner.
  *
  * <p>It used to be a file the demo script wrote and the user applied, which made the store look like part
  * of the workspace an author owns. It is not: it is the deployment's, the same store the server already
@@ -25,9 +25,8 @@ import org.springframework.beans.factory.SmartInitializingSingleton;
  * and a second setting would be one more thing to get wrong for a deployment that has no second instance
  * to name.
  *
- * <p>Seeding never overwrites. The insert is the store's atomic create, so an author who has declared
- * their own resource under this id keeps it, and the seed reports that it found one rather than replacing
- * what somebody meant to put there.
+ * <p>Seeding never overwrites an existing resource. Cloud startup neither creates a views Source nor
+ * renews an existing connection from deployment credentials.
  */
 final class ViewStoreSeedRunner implements SmartInitializingSingleton {
 
@@ -45,11 +44,17 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     private final ArtifactStore artifacts;
     private final String serverStoreUri;
     private final String tlsCaFile;
+    private final boolean enabled;
 
     ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile) {
+        this(artifacts, serverStoreUri, tlsCaFile, true);
+    }
+
+    ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, boolean enabled) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
-        this.serverStoreUri = Objects.requireNonNull(serverStoreUri, "serverStoreUri");
-        this.tlsCaFile = tlsCaFile;
+        this.serverStoreUri = enabled ? Objects.requireNonNull(serverStoreUri, "serverStoreUri") : null;
+        this.tlsCaFile = enabled ? tlsCaFile : null;
+        this.enabled = enabled;
     }
 
     @Override
@@ -58,6 +63,7 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     }
 
     void seed() {
+        if (!enabled) return;
         String id = ViewTargetResolver.STATE_STORE_SOURCE_ID;
         if (trustCannotTravelInTheUri()) {
             // Seeding anyway would register a connection that can never be made: the connector would
@@ -105,7 +111,11 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * exactly as a rewritten path does.
      */
     static String viewsUri(String serverStoreUri) {
-        String database = ViewTargetResolver.STATE_STORE_SOURCE_ID;
+        return viewsUri(serverStoreUri, ViewTargetResolver.STATE_STORE_SOURCE_ID);
+    }
+
+    static String viewsUri(String serverStoreUri, String database) {
+        Objects.requireNonNull(database, "database");
         int scheme = serverStoreUri.indexOf("://");
         int authorityStart = scheme < 0 ? 0 : scheme + 3;
         int query = serverStoreUri.indexOf('?', authorityStart);

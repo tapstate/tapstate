@@ -1,39 +1,54 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.MonitorError;
+import io.tapstate.control.core.PipelineCatalogItem;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineError;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineSnapshot;
+import io.tapstate.control.core.PipelineStatus;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Map;
+
 /**
- * The three store-backed observation read faces projected onto HTTP: status / metrics / snapshot, each a
- * {@code GET} on a pipeline instance ({@code GET /api/pipelines/{id}/status}). Each handler is a thin
- * pass-through to the control-core query service — it names the pipeline, reads its latest published
- * observation, and returns the projection — and carries no business logic of its own. The reads mutate
- * nothing, so unlike the lifecycle write verbs they are unaudited and name no caller principal; the
- * interceptor still authenticates and grade-checks them like every other verb.
- *
- * <p>A read of a pipeline that has published no observation is not a bare 404: the query service raises the
- * coded {@code monitor.no-observation} diagnostic, which the shared advice renders as a structured 404 body,
- * so the same read serves a frontend with no stderr/exit channel.
+ * Status reads the merged authoring, artifact, intent, and observation projection; metrics and snapshot
+ * remain observation-only. A saved Pipeline always has a status even before its first run.
  */
 @RestController
 class PipelineObservationController {
 
     private final PipelineObservationQueryService observations;
+    private final PipelineCatalogService pipelines;
     private final MessageCatalog catalog;
 
-    PipelineObservationController(PipelineObservationQueryService observations, MessageCatalog catalog) {
+    PipelineObservationController(PipelineObservationQueryService observations,
+            PipelineCatalogService pipelines, MessageCatalog catalog) {
         this.observations = observations;
+        this.pipelines = pipelines;
         this.catalog = catalog;
     }
 
     @Verb("pipeline.status")
     @GetMapping("/pipelines/{id}/status")
     PipelineStatusResponse status(@PathVariable("id") String id) {
-        return PipelineStatusResponse.of(observations.status(id), catalog);
+        PipelineCatalogItem item = pipelines.find(id).orElseThrow(() ->
+                new TapstateException(PipelineError.NOT_FOUND, Map.of("id", id), null));
+        PipelineStatus runtime = null;
+        if (item.status().observedState() != null) {
+            try {
+                runtime = observations.status(id);
+            } catch (TapstateException failure) {
+                if (failure.code() != MonitorError.NO_OBSERVATION) {
+                    throw failure;
+                }
+            }
+        }
+        return PipelineStatusResponse.of(item, catalog, runtime);
     }
 
     @Verb("pipeline.metrics")

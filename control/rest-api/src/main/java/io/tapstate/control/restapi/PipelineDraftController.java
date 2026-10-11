@@ -103,7 +103,25 @@ class PipelineDraftController {
     Map<String, Object> preview(@PathVariable("id") String id,
             @RequestBody(required = false) Map<String, Object> body) {
         long expected = body == null ? currentRevision(id) : number(body.get("revision"), "revision");
-        PipelineResource artifact = service().preview(id, expected);
+        PipelineResource artifact;
+        if (body != null && body.containsKey("candidate")) {
+            if (!(body.get("candidate") instanceof Map<?, ?> raw)) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "candidate must be a draft object"), null);
+            }
+            Map<String, Object> candidate = new java.util.LinkedHashMap<>();
+            raw.forEach((key, value) -> {
+                if (!(key instanceof String field)) {
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "candidate field names must be strings"), null);
+                }
+                candidate.put(field, value);
+            });
+            artifact = service().previewCandidate(id,
+                    parse(candidate, id, expected, AuthenticatedCaller.subject()));
+        } else {
+            artifact = service().preview(id, expected);
+        }
         return Map.of("pipelineId", id, "revision", expected, "artifact", artifact,
                 "dsl", new CanonicalWriter().write(artifact));
     }

@@ -8,6 +8,8 @@ import io.tapstate.messages.MessageCatalog;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
@@ -31,6 +33,8 @@ import java.util.List;
  */
 @SpringBootApplication
 public class Bootstrap {
+
+    private static final Logger LOG = LoggerFactory.getLogger(Bootstrap.class);
 
     /** Exit code when a coded diagnostic was reported (matches the CLI's convention). */
     private static final int EXIT_CODED_DIAGNOSTIC = 1;
@@ -60,6 +64,8 @@ public class Bootstrap {
         // exit 0, which is what an operator asking the process to stop expects.
         app.setRegisterShutdownHook(false);
         ConfigurableApplicationContext context = app.run(args);
+        // run() returns only after all startup runners and the application-ready event complete.
+        LOG.info("Tapstate application is ready");
         new GracefulShutdown(context::close, Runtime.getRuntime()::halt).install();
     }
 

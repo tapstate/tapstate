@@ -1,5 +1,12 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
+import com.mongodb.MongoWriteException;
+import com.mongodb.ServerAddress;
+import com.mongodb.WriteError;
+import com.mongodb.client.FindIterable;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
@@ -8,9 +15,12 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
+import org.bson.BsonDocument;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
+import java.lang.reflect.Proxy;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -110,6 +120,46 @@ class MongoArtifactStoreTest {
             new Fixture("serve", "orders_api", "serve", SERVE));
 
     @Test
+    @SuppressWarnings("unchecked")
+    void anUnreadableIdObservationPreservesTheOriginalDuplicateStoreFault() {
+        MongoWriteException original = new MongoWriteException(
+                new WriteError(11000, "duplicate-write-secret-sentinel", new BsonDocument()), new ServerAddress());
+        FindIterable<Document> unreadable = (FindIterable<Document>) Proxy.newProxyInstance(
+                FindIterable.class.getClassLoader(), new Class<?>[]{FindIterable.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("projection")) {
+                        assertThat(args[0]).isEqualTo(new Document("_id", 1));
+                        return proxy;
+                    }
+                    if (method.getName().equals("first")) {
+                        throw new MongoException(13, "id-observation-secret-sentinel");
+                    }
+                    throw new AssertionError("unexpected observation operation: " + method.getName());
+                });
+        MongoCollection<Document> collection = (MongoCollection<Document>) Proxy.newProxyInstance(
+                MongoCollection.class.getClassLoader(), new Class<?>[]{MongoCollection.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("insertOne")) throw original;
+                    if (method.getName().equals("find")) {
+                        assertThat(args[0]).isEqualTo(new Document("_id", "orders"));
+                        return unreadable;
+                    }
+                    throw new AssertionError("unexpected collection operation: " + method.getName());
+                });
+        MongoClient client = (MongoClient) Proxy.newProxyInstance(MongoClient.class.getClassLoader(),
+                new Class<?>[]{MongoClient.class}, (proxy, method, args) -> {
+                    throw new AssertionError("single create does not use a client session");
+                });
+        MongoArtifactStore store = new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32]));
+
+        Throwable failure = catchThrowable(() -> store.create(PARSER.parse(SOURCE)));
+
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, coded -> {
+            assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+            assertThat(coded.args()).containsExactlyEntriesOf(Map.of("detail", "MongoWriteException code=11000"));
+            assertThat(coded.getCause()).isNull();
+        });
+    }
+
+    @Test
     void documentCarriesIdKindAndStructuredBodyForEveryKind() {
         for (Fixture fixture : FIXTURES) {
             Resource resource = PARSER.parse(canonical(fixture.raw()));
@@ -140,6 +190,30 @@ class MongoArtifactStoreTest {
                     .as("a stored %s reconstructs to the same canonical form", fixture.label())
                     .isEqualTo(canonical);
         }
+    }
+
+    @Test
+    void managedAttributionSurvivesTheStructuredMongoDocumentRoundTrip() {
+        Resource attributed = PARSER.parse("""
+                version: tapstate/v1
+                kind: source
+                id: cloud_source
+                metadata:
+                  cloud: true
+                  user_id: cloud-user-7
+                connector: mongodb-atlas
+                config: {}
+                """);
+
+        Document document = MongoArtifactStore.toDocument(attributed);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> metadata = (Map<String, Object>) document.get("body", Document.class).get("metadata");
+        Resource reconstructed = MongoArtifactStore.toResource(document);
+
+        assertThat(metadata.get("cloud")).isEqualTo(true);
+        assertThat(metadata.get("user_id")).isEqualTo("cloud-user-7");
+        assertThat(reconstructed.metadata().cloud()).isTrue();
+        assertThat(reconstructed.metadata().userId()).isEqualTo("cloud-user-7");
     }
 
     @Test

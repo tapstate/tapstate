@@ -65,6 +65,10 @@ final class ViewTargetResolver {
      * path believed it was updating.
      */
     static ViewTarget resolve(ViewBlock.Inline view) {
+        return resolve(view, STATE_STORE_SOURCE_ID);
+    }
+
+    static ViewTarget resolve(ViewBlock.Inline view, String storeId) {
         Storage storage = view.storage();
         if (storage != null && storage.hot() != null) {
             throw unsupportedTier(view, "hot");
@@ -90,7 +94,7 @@ final class ViewTargetResolver {
                 }
             }
         }
-        return new ViewTarget(STATE_STORE_SOURCE_ID, collection, view.primaryKey(), indexes);
+        return new ViewTarget(storeId, collection, view.primaryKey(), indexes);
     }
 
     private static TapstateException unsupportedTier(ViewBlock.Inline view, String tier) {

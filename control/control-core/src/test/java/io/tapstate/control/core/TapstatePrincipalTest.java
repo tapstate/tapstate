@@ -28,4 +28,14 @@ class TapstatePrincipalTest {
         assertThat(principal.tokenId()).contains("tok-17");
         assertThat(principal.permits(Scope.WRITE)).isTrue();
     }
+
+    @Test
+    void aLocalCloudSessionCarriesTheVerifiedUserWithoutAMachineTokenOrJwtClassification() {
+        TapstatePrincipal principal = TapstatePrincipal.cloudSession(new VerifiedToken("stable-cloud-user", Scope.WRITE));
+        assertThat(principal.subject()).isEqualTo("stable-cloud-user");
+        assertThat(principal.credentialType()).isEqualTo(CredentialType.CLOUD_SESSION);
+        assertThat(principal.scopes()).containsExactlyInAnyOrder(Scope.READ, Scope.WRITE);
+        assertThat(principal.tokenId()).isEmpty();
+        assertThat(principal.permits(Scope.ADMIN)).isFalse();
+    }
 }

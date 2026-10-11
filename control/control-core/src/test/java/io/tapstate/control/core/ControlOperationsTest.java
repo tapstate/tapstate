@@ -24,9 +24,13 @@ class ControlOperationsTest {
                         "source.draft",
                         "source.list",
                         "source.get",
+                        "source.reveal-config",
                         "source.schema",
                         "source.update",
                         "source.delete",
+                        "sample-source.list",
+                        "sample-source.install",
+                        "state-store.connect",
                         "connection.test",
                         "connection.test-result",
                         "connection.discover-schema",
@@ -39,8 +43,10 @@ class ControlOperationsTest {
                         "data-browser.find",
                         "data-browser.stats",
                         "cluster.members",
+                        "cluster.context",
                         "pipeline.list",
                         "pipeline.catalog",
+                        "view.list",
                         "pipeline.get",
                         "pipeline.layout.get",
                         "pipeline.layout.update",
@@ -52,6 +58,7 @@ class ControlOperationsTest {
                         "pipeline-draft.replace",
                         "pipeline-draft.delete",
                         "pipeline-draft.preview",
+                        "pipeline.preview",
                         "pipeline-draft.publish",
                         "pipeline-draft.rebase",
                         "pipeline.start",
@@ -68,6 +75,7 @@ class ControlOperationsTest {
                         "pipeline.set-position",
                         "pipeline.derived-schema",
                         "pipeline.accept-derived-schema",
+                        "auth.current-user",
                         "user.create",
                         "user.passwd",
                         "user.list",
@@ -80,6 +88,7 @@ class ControlOperationsTest {
     void scopesMatchTheOperationInventory() {
         assertThat(registry.resolve("artifact.apply").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("artifact.validate").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("pipeline.preview").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.get").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.list").scope()).isEqualTo(Scope.READ);
         // artifact.delete removes a stored resource for good, so it is the most consequential write in
@@ -89,6 +98,7 @@ class ControlOperationsTest {
         assertThat(registry.resolve("source.draft").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("source.reveal-config").scope()).isEqualTo(Scope.ADMIN);
         assertThat(registry.resolve("source.schema").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.update").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("source.delete").scope()).isEqualTo(Scope.WRITE);
@@ -144,6 +154,7 @@ class ControlOperationsTest {
                         "source.create",
                         "source.update",
                         "source.delete",
+                        "source.reveal-config",
                         "connection.test",
                         "connection.discover-schema",
                         "connector.register",
@@ -165,6 +176,7 @@ class ControlOperationsTest {
                 "artifact.get",
                 "artifact.list",
                 "artifact.validate",
+                "pipeline.preview",
                 "source.draft",
                 "source.list",
                 "source.get",
@@ -196,22 +208,29 @@ class ControlOperationsTest {
     }
 
     @Test
-    void theRegistryOpensEveryL1OperationOnTheCliFace() {
-        // A scope statement about the registry alone: the CLI face opens every registered operation and
-        // clips none of them. Whether each one has a verb behind it is not knowable from here
-        // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(60);
-        assertThat(registry.all()).allSatisfy(op ->
+    void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
+        // The cluster context is REST-only. The reveal reservation stays unpublished until its
+        // dedicated authorizer exists.
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(66);
+        assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
+                && !"cluster.context".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
+        assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
+        assertThat(registry.resolve("cluster.context").exposure())
+                .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
     }
 
     @Test
     void everyOperationIsStagedAtTheOneShippedStageOnEveryFaceItIsOpenOn() {
-        // One stage across the whole registry, not one per face. A second stage in here is what makes a
+        // One stage across every published face, not one per face. The reserved reveal operation has no
+        // published face in this release; an empty exposure is the fail-closed state this test excludes.
+        // A second non-empty stage in here is what makes a
         // face's surface depend on which ceiling it happened to name, which is the thing the ceilingless
         // exposedOn(Frontend) exists to remove — an entry left at another stage would put it back.
-        assertThat(registry.all()).allSatisfy(op ->
+        assertThat(registry.all()).filteredOn(op -> !op.exposure().isEmpty()).allSatisfy(op ->
                 assertThat(op.exposure().values()).as(op.id()).containsOnly(Maturity.CURRENT));
+        assertThat(registry.all()).filteredOn(op -> op.exposure().isEmpty())
+                .extracting(Operation::id).containsExactly("source.reveal-config");
     }
 
     @Test
@@ -239,8 +258,11 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "sample-source.list", "sample-source.install", "state-store.connect",
+                        "cluster.context", "view.list",
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
+                        "pipeline.preview",
                         "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog");
     }
 

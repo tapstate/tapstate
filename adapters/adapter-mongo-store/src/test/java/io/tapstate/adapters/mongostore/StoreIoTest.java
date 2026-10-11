@@ -12,6 +12,8 @@ import org.bson.BsonDocument;
 import org.bson.BsonMaximumSizeExceededException;
 import org.junit.jupiter.api.Test;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -21,7 +23,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 /**
  * StoreIo is the single translation point from driver exceptions to io-domain coded diagnostics, so
  * no driver type escapes the module (rule R3). A driver security failure maps to store-unauthorized,
- * any other driver failure to store-unavailable carrying the driver's detail, and a non-driver
+ * any other driver failure to store-unavailable carrying safe type/code detail, and a non-driver
  * throwable passes straight through — a coded reconstruction failure or a bare invariant crash must
  * not be relabelled a driver failure.
  */
@@ -33,7 +35,7 @@ class StoreIoTest {
     }
 
     @Test
-    void mapsADriverFailureToStoreUnavailableCarryingTheDetail() {
+    void mapsADriverFailureToStoreUnavailableCarryingSafeDetail() {
         Throwable thrown = catchThrowable(() -> StoreIo.call(() -> {
             throw new MongoException("connection reset");
         }));
@@ -41,7 +43,28 @@ class StoreIoTest {
         assertThat(thrown).isInstanceOf(TapstateException.class);
         TapstateException coded = (TapstateException) thrown;
         assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
-        assertThat(coded.args()).containsEntry("detail", "connection reset");
+        assertThat(coded.args()).containsEntry("detail", "MongoException");
+    }
+
+    @Test
+    void serverSuppliedDriverDetailsCannotPutConnectionCredentialsInErrorsOrLogs() {
+        MongoWriteException driver = new MongoWriteException(
+                new WriteError(26,
+                        "operation failed for mongodb://state:metadata-secret@db.example/metadata"
+                                + "?proxyPassword=option-secret",
+                        new BsonDocument()),
+                new ServerAddress(), Set.of());
+
+        TapstateException coded = (TapstateException) catchThrowable(() -> StoreIo.call(() -> {
+            throw driver;
+        }));
+
+        assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+        assertThat(coded.args()).containsEntry("detail", "MongoWriteException code=26");
+        assertThat(coded.args().toString()).doesNotContain("state:metadata-secret", "option-secret");
+        StringWriter stack = new StringWriter();
+        coded.printStackTrace(new PrintWriter(stack));
+        assertThat(stack.toString()).doesNotContain("state:metadata-secret", "option-secret");
     }
 
     @Test

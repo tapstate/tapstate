@@ -38,6 +38,7 @@ public record PipelineCatalogItem(
     }
 
     public enum DisplayState {
+        DRAFT,
         NEW,
         STARTING,
         RUNNING,
