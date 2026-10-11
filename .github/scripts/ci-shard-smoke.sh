@@ -145,6 +145,26 @@ with tempfile.TemporaryDirectory() as tmp:
     assert receipt['enabled'] is True and receipt['providers']==['io.tapstate.testsupport.CiCaseEvidence']
     assert receipt['build_inputs_sha256']==hashlib.sha256((root/'build-inputs.json').read_bytes()).hexdigest()
     assert {(s['module'],s['kind']) for s in receipt['checked_scopes']}=={('arch-tests','unit'),('core','unit'),('e2e','unit')}
+    # Maven resolves the language aggregator as a nonarchive POM alongside its real JARs.
+    aggregator=root/'m2/org/graalvm/polyglot/js-community/24.1.2/js-community-24.1.2.pom'
+    aggregator.parent.mkdir(parents=True)
+    language_pom='<project><modelVersion>4.0.0</modelVersion><groupId>org.graalvm.polyglot</groupId><artifactId>js-community</artifactId><version>24.1.2</version><packaging>pom</packaging></project>'
+    aggregator.write_text(language_pom)
+    classpaths['core']=[ordinary,aggregator]; build_inputs()
+    pom_result=subprocess.run(opted,env=environment,capture_output=True,text=True)
+    assert pom_result.returncode==0, pom_result.stdout+pom_result.stderr
+    for before,after in [('<packaging>pom</packaging>','<packaging>jar</packaging>'),
+                         ('<artifactId>js-community</artifactId>','<artifactId>other</artifactId>'),
+                         ('<version>24.1.2</version>','<version>24.1.3</version>')]:
+        aggregator.write_text(language_pom.replace(before,after)); build_inputs()
+        reject_observer(opted,'nonarchive classpath POM')
+    aggregator.write_text('not XML'); build_inputs()
+    reject_observer(opted,'nonarchive classpath POM')
+    classpaths['core']=[ordinary]
+    # Renaming POM XML to a declared JAR must not become an escape from archive admission.
+    ordinary.write_text(language_pom); build_inputs()
+    reject_observer(opted,'File is not a zip file')
+    jar(ordinary); build_inputs()
     for field,value in [('source_sha','wrong-source'),('run_id','another-run'),('run_attempt','999')]:
         changed=build_inputs(); changed[field]=value; put('build-inputs.json',json.dumps(changed))
         reject_observer(opted,'source/run/attempt differs')

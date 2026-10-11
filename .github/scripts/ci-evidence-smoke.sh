@@ -122,6 +122,28 @@ class PublishedExamplesIT {
     forged=save('forged-additions.json',[inv['cases'][0]])
     run(candidate_compare+['--additions',str(forged)],False,'overlap original')
     core_source.write_text(old_source); reset()
+    # Public hash receipts reveal no literal arguments, skip plaintext or private paths.
+    private_inventory=json.loads(inventory.read_text())
+    private_inventory['source_origin']=dict(kind='authenticated-git-archive',source_sha='a'*40,source_archive_sha256='b'*64,private_path='/private/credential-sentinel')
+    secret_case=next(record for record in private_inventory['cases'] if record['method']=='values')
+    secret_method=next(method for method in private_inventory['methods'] if method['method']=='values')
+    position=secret_method['parameters'].index(secret_case['parameter']);secret_method['parameters'][position]='credential-token-sentinel';secret_case['parameter']='credential-token-sentinel'
+    private_file=save('private-inventory.json',private_inventory)
+    public_inventory=root/'public-hashes.json'
+    run(['export-hashes','--input',str(private_file),'--output',str(public_inventory)])
+    public_text=public_inventory.read_text();assert 'credential-token-sentinel' not in public_text and 'credential-sentinel' not in public_text and 'annotations' not in public_text
+    # Identity hashes alone never certify execution or lawful skips.
+    all_skipped=json.loads(before.read_text())
+    for record in all_skipped['cases']:
+        record['status']='skipped';record['skip']=dict(type='fixture',reason='unexpected skip',raw={})
+    all_skipped_file=save('all-skipped.json',all_skipped)
+    run(['compare','--inventory',str(inventory),'--before',str(before),'--after',str(all_skipped_file),'--output',str(comparison)],False,'execution or skip differs')
+    expected_hashes=root/'expected-hashes.json';actual_hashes=root/'actual-hashes.json'
+    run(['export-hashes','--input',str(inventory),'--output',str(expected_hashes)])
+    run(['export-hashes','--input',str(all_skipped_file),'--output',str(actual_hashes)])
+    hash_result=root/'identity-only.json'
+    run(['compare-hashes','--expected',str(expected_hashes),'--actual',str(actual_hashes),'--output',str(hash_result)])
+    hash_receipt=json.loads(hash_result.read_text());assert hash_receipt['identity_equal'] and not hash_receipt['complete'] and not hash_receipt['ability_proven'] and hash_receipt['mandatory_comparison']=='compare'
     # Unknown source constructs are observations, never complete equivalence.
     unknown = put(source,'core/src/test/java/sample/FutureTest.java','package sample; class FutureTest { @TestFactory Stream tests() {} }')
     run(['inventory','--root',str(source),'--lane','ci','--output',str(root/'unknown.json')]); assert not json.loads((root/'unknown.json').read_text())['complete']; unknown.unlink()

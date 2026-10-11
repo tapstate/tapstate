@@ -16,10 +16,15 @@ with tempfile.TemporaryDirectory() as tmp:
         put(module+'/src/test/java/sample/'+name+'.java','package sample; class '+name+' {}')
     subprocess.run([os.environ['SHARD_GATE'],'plan','--root',tmp,'--output',str(root/'plan.json')],check=True)
     plan=json.loads((root/'plan.json').read_text())
+    put('bin/mvn','#!/bin/sh\nexit 0\n'); (root/'bin/mvn').chmod(0o755)
+    os.environ['PATH']=str(root/'bin')+':'+os.environ['PATH']
     for shard in plan['shards']:
         for module in ['e2e','runtime/engine','core']:
             shutil.rmtree(root/module/'target',ignore_errors=True)
             put(module+'/target/classes/sample/Production.class','bytecode')
+        # Exercise the real reset/verify freshness protocol before fixture reports are written.
+        subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),
+                        '--shard',shard['id'],'--repo-local',str(root/'m2')],check=True,capture_output=True)
         for test in shard['tests']:
             phase='failsafe' if test['kind']=='it' else 'surefire'; name=test['class']
             put(test['module']+'/target/test-classes/'+name.replace('.', '/')+'.class','test-bytecode')

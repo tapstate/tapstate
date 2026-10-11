@@ -84,10 +84,32 @@ jobs:
       # Only input hashes and tool versions are shared; raw configuration and credentials are excluded.
       - name: Record pre-test build inputs
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --resolve-classpath --output "$RUNNER_TEMP/ci-inputs/build-inputs.json"
+      - name: Derive complete test identities before selection
+        run: |
+          .github/scripts/ci-evidence.sh inventory --root . --lane ci --published-connectors absent --native-cli-presence absent --output "$RUNNER_TEMP/source-inventory.json"
+          .github/scripts/ci-evidence.sh resolve --root . --inventory "$RUNNER_TEMP/source-inventory.json" --inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --repo-local "$RUNNER_TEMP/m2" --output "$RUNNER_TEMP/resolved-inventory.json"
+          .github/scripts/ci-evidence.sh export-hashes --input "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/ci-inputs/expected-case-hashes.json"
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
         run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json"
+      - name: Record the observed test identity hashes
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/resolved-inventory.json" ] && \
+             .github/scripts/ci-evidence.sh reports --root . --lane ci --inventory "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/observations.json"; then
+            .github/scripts/ci-evidence.sh export-hashes --input "$RUNNER_TEMP/observations.json" --output "$RUNNER_TEMP/ci-inputs/observed-case-hashes.json"
+          else
+            mkdir -p "$RUNNER_TEMP/ci-inputs"
+            python3 - "$RUNNER_TEMP/ci-inputs/observed-case-hashes.json" <<'PY_INCOMPLETE'
+          import json, os, sys
+          with open(sys.argv[1], 'w') as output:
+              json.dump({'schema': 1, 'type': 'observed-case-hashes', 'complete': False,
+                         'ability_proven': False, 'run_id': os.environ['GITHUB_RUN_ID'],
+                         'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                         'reason': 'original test evidence could not be parsed completely'}, output)
+          PY_INCOMPLETE
+          fi
       - name: Record post-test input hashes
         if: always()
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --phase post-test-before-pack --output "$RUNNER_TEMP/ci-inputs/post-test-inputs.json"

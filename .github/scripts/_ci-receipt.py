@@ -202,8 +202,7 @@ def inputs(args):
     require(dependencies, 'no resolved dependency byte evidence')
     source_files = {}
     for name in git(root, 'ls-files').splitlines():
-        if name.endswith(('.java', '.xml', '.yml', '.yaml', '.json', '.sh', '.py', '.properties')):
-            source_files[name] = digest(shards.owned_path(root, name))
+        source_files[name] = digest(shards.owned_path(root, name))
     java = subprocess.run(['java', '-version'], capture_output=True, text=True, cwd=root)
     require(java.returncode == 0 and java.stderr.strip(), 'Java version evidence unavailable')
     value = {'schema': 1, 'source_sha': git(root, 'rev-parse', 'HEAD'),

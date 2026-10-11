@@ -421,6 +421,26 @@ def classpath_coordinate(root, scope, relative, inputs):
     return group + ':' + artifact
 
 
+def nonarchive_classpath_pom(scope, relative, path):
+    """A proven type-pom dependency cannot contribute archive service entries."""
+    try:
+        tree = pom(path)
+    except ET.ParseError as error:
+        raise ValueError('invalid nonarchive classpath POM') from error
+    group = tree.findtext('groupId') or tree.findtext('parent/groupId')
+    artifact = tree.findtext('artifactId')
+    version = tree.findtext('version') or tree.findtext('parent/version')
+    require(tree.tag == 'project' and tree.findtext('modelVersion') == '4.0.0'
+            and tree.findtext('packaging') == 'pom' and group and artifact and version
+            and all(re.fullmatch(r'[A-Za-z0-9_.+-]+', value) for value in [group, artifact, version]),
+            'unproven nonarchive classpath POM type or coordinates')
+    parts = safe_path(relative).parts
+    require(scope == 'repository' and len(parts) >= 4
+            and group == '.'.join(parts[:-3]) and artifact == parts[-3] and version == parts[-2]
+            and parts[-1] == artifact + '-' + version + '.pom',
+            'nonarchive classpath POM coordinates differ from Maven repository path')
+
+
 def case_observer(args, root, plan, modules):
     if not args.case_evidence:
         require(args.build_inputs is None, '--build-inputs requires --case-evidence')
@@ -493,6 +513,10 @@ def case_observer(args, root, plan, modules):
             actual_hash, actual_size, jar_providers = inspected[path]
             require(actual_hash == entry['sha256'] and actual_size == entry['size'],
                     'resolved test classpath bytes changed after input capture')
+            if active and jar_providers is None and path.suffix == '.pom':
+                nonarchive_classpath_pom(scope, relative, path)
+                jar_providers = set()
+                inspected[path][2] = jar_providers
             if active and jar_providers is None:
                 jar_providers = set()
                 with zipfile.ZipFile(path) as archive:
