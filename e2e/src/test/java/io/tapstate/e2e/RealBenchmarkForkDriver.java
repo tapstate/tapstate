@@ -1011,7 +1011,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), rootRaw);
                 nativeClockBefore = BenchmarkReturnWorkBudgetRun.rootClockMetadataBeforeEvidence(nativeClockBefore, workload.id() + "/" + phase.id());
                 if (BenchmarkReturnWorkBudgetRun.current() != null) {
-                    BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockBefore);
+                    BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockBefore, workload.id() + "/" + phase.id(),
+                            BenchmarkReturnWorkBudgetRun.NativeMetadataCut.BEFORE);
                 }
             } else if (System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
                 var workRun = BenchmarkReturnWorkBudgetRun.current();
@@ -1022,7 +1023,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 nativeClockBefore = resourceSampler.writeReturnReader().nativeClockEvidence(
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), BenchmarkReturnWorkBudgetRun.rootClockMetadataBefore(workload.id() + "/" + phase.id()));
                 nativeClockBefore = BenchmarkReturnWorkBudgetRun.rootClockMetadataBeforeEvidence(nativeClockBefore, workload.id() + "/" + phase.id());
-                if (workRun != null) { workRun.recordNativeClassMetadata(nativeClockBefore); }
+                if (workRun != null) { workRun.recordNativeClassMetadata(nativeClockBefore, workload.id() + "/" + phase.id(),
+                            BenchmarkReturnWorkBudgetRun.NativeMetadataCut.BEFORE); }
             }
             if (methodCostProtocol) {
                 returnRegistrationBefore = resourceSampler.writeReturnReader().registrationEvidence(!methodControl);
@@ -1148,7 +1150,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     nativeClockAfter = collectorOwnedClockEvidence(collectorCalibration, resourceSampler.writeReturnReader(),
                             System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), rootRaw);
                     if (BenchmarkReturnWorkBudgetRun.current() != null) {
-                        BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockAfter);
+                        BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockAfter, workload.id() + "/" + phase.id(),
+                            BenchmarkReturnWorkBudgetRun.NativeMetadataCut.AFTER);
                     }
                     collectorCalibrationEvidence.put("state", "INCREMENTAL_RETURN_COLLECTOR_DIAGNOSTIC_ONLY");
                 } else if (System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
@@ -1157,7 +1160,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     nativeClockAfter = resourceSampler.writeReturnReader().nativeClockEvidence(
                             System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), actualAfterRootRaw);
                     if (BenchmarkReturnWorkBudgetRun.current() != null) {
-                        BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockAfter);
+                        BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockAfter, workload.id() + "/" + phase.id(),
+                            BenchmarkReturnWorkBudgetRun.NativeMetadataCut.AFTER);
                     }
                 }
                 if (methodCostProtocol) {

@@ -19,7 +19,7 @@ class BenchmarkReturnWorkBudgetSourceTailsTest {
         // Both inspections build the shared and cleanup tables.
         // Four new table/catalogue entries, one private cache and one readless initializer add
         // plus two scoped-material tables to the previous fourteen. This is a fixed source tail, not observed completion.
-        assertThat(upper.calls()).isEqualTo(22);
+        assertThat(upper.calls()).isEqualTo(23);
         assertThat(evidence).containsEntry("returnComponentTableConstructions", 2)
                 .containsEntry("returnComponentCatalogueConstructions", 2)
                 .containsEntry("privateAuthenticatedProfileCacheConstructions", 1)
@@ -40,8 +40,48 @@ class BenchmarkReturnWorkBudgetSourceTailsTest {
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetSourceTails.factoryUpper(
                 BenchmarkReturnWorkBudgetProfile.WorkloadInput.from(BenchmarkWorkloadDefinitions.pacedCalibration("stateless"))))
                 .isInstanceOf(AssertionError.class);
-        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetSourceTails.factoryUpper(
-                BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateful"))).isInstanceOf(AssertionError.class);
+        assertThat(BenchmarkReturnWorkBudgetSourceTails.factoryUpper(
+                BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateful")).requests()).isPositive();
+    }
+
+    @Test void original_geometry_is_source_exact_and_no_selected_factory_count_or_opaque_flags_change() {
+        long[] full = {96000, 96000, 288000}; long[] cohort = {48000, 48000, 144000};
+        int at = 0;
+        for (String id : List.of("copy", "stateless", "stateful")) {
+            var input = BenchmarkReturnWorkBudgetProfile.WorkloadInput.original(id);
+            var shape = BenchmarkReturnWorkBudgetSourceTails.geometry(input);
+            assertThat(shape.phases()).isEqualTo(id.equals("copy") ? 4 : 6);
+            assertThat(shape.measuredPhases()).isEqualTo(id.equals("stateful") ? 2 : 1);
+            assertThat(shape.measuredOutputs()).isEqualTo(full[at]); assertThat(shape.cohortRows()).isEqualTo(cohort[at++]);
+            var evidence = BenchmarkReturnWorkBudgetSourceTails.factoryEvidence(input);
+            assertThat(evidence).containsEntry("factoryCalls", 7).containsEntry("initializerFactories", 3)
+                    .containsEntry("nativeClassPacketRosterFactories", 1).containsEntry("actualCompletionObserved", false)
+                    .containsEntry("wholeMethodCostQualified", false).containsEntry("futureLifetimeCountBoundClaimed", false);
+        }
+        var stateless = BenchmarkReturnWorkBudgetSourceTails.geometry(BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless"));
+        assertThat(stateless.allOutputs()).isEqualTo(240250);
+        var stateful = BenchmarkReturnWorkBudgetSourceTails.geometry(BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateful"));
+        assertThat(stateful.sourceRows()).isEqualTo(384356); assertThat(stateful.targetRows()).isEqualTo(1152002);
+        assertThat(stateful.nestedItems()).isEqualTo(865537); assertThat(stateful.nestedRoots()).isEqualTo(576001);
+        assertThat(stateful.coverageEntries()).isEqualTo(16);
+        assertThat(stateful.statements()).isEqualTo(3470);
+    }
+
+    @Test void roster_guard_rejects_before_walk_and_phase_cadence_or_target_mutations_cannot_borrow_source_credit() {
+        var input = BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateful");
+        var phases = new java.util.ArrayList<>(input.phases()); var first = phases.get(3);
+        phases.set(3, new BenchmarkReturnWorkBudgetProfile.PhaseInput(first.id(), first.stage(), first.measured(),
+                first.logicalOutputs(), first.statements(), first.statementsPerBatch(), first.batches(), 50000000,
+                first.logicalCoverage(), first.targets()));
+        var changed = new BenchmarkReturnWorkBudgetProfile.WorkloadInput(input.id(), input.rows(), input.seed(), input.database(),
+                input.setupStatements(), input.pipelines(), input.sourceChains(), phases);
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetSourceTails.geometry(changed))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("original phase scalar recipe");
+        phases = new java.util.ArrayList<>(input.phases()); phases.add(input.phases().getLast());
+        var extra = new BenchmarkReturnWorkBudgetProfile.WorkloadInput(input.id(), input.rows(), input.seed(), input.database(),
+                input.setupStatements(), input.pipelines(), input.sourceChains(), phases);
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetSourceTails.geometry(extra))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("topology");
     }
 
     @Test

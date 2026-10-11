@@ -31,6 +31,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     private final String nonce;
     private final BenchmarkReturnWorkBudgetDefinitions.ProducerInput producerInput;
     private final BenchmarkWorkloadDefinitions.Workload canonicalWorkload;
+    private final NativeClassPacketRoster nativeClassPacketRoster;
     private BenchmarkReturnWorkBudgetProducerSeal.Registration producerRegistration;
     private Map<String, Object> producerEvidence = Map.of("state", "NOT_BOUND");
     private final java.util.ArrayList<Capture> captures = new java.util.ArrayList<>();
@@ -196,6 +197,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         var profile = this.profile;
         definition = profile.requireDefinition();
         canonicalWorkload = BenchmarkWorkloadDefinitions.steadyPilot(profile.inputs().workload().id());
+        nativeClassPacketRoster = new NativeClassPacketRoster(canonicalWorkload);
         this.paths = Map.copyOf(paths); this.output = output; producerBody = body; this.nonce = nonce;
         long unlimited = Long.MAX_VALUE;
         producerInput = new BenchmarkReturnWorkBudgetDefinitions.ProducerInput(profile.inputs().runId(),
@@ -538,10 +540,21 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     /** Consumes already obtained cold metadata; it never queries the owned process or reads a clock. */
     void recordNativeClassMetadata(Map<String, Object> nativeEvidence) {
         requireActive();
+        BenchmarkReturnWorkBudget.operation(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> {
+            require(nativeClassPacketRoster.expectedPackets() == 2,
+                    "multiple measured phases require explicit cold phase and cut");
+            recordNativeClassMetadata(nativeEvidence, nativeClassPacketRoster.phaseKeys().getFirst(),
+                    producerClassMetadata.isEmpty() ? NativeMetadataCut.BEFORE : NativeMetadataCut.AFTER);
+            return null;
+        });
+    }
+
+    void recordNativeClassMetadata(Map<String, Object> nativeEvidence, String phaseKey, NativeMetadataCut cut) {
+        requireActive();
         var install = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
                 BenchmarkReturnWorkBudget.Work.call());
         try {
-            consumeNativeClassMetadata(nativeEvidence);
+            consumeNativeClassMetadata(nativeEvidence, phaseKey, cut);
             BenchmarkReturnWorkBudget.done(install);
         } catch (RuntimeException | Error failure) {
             BenchmarkReturnWorkBudget.failed(install, failure);
@@ -549,10 +562,11 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         }
     }
 
-    private void consumeNativeClassMetadata(Map<String, Object> nativeEvidence) {
+    private void consumeNativeClassMetadata(Map<String, Object> nativeEvidence, String phaseKey, NativeMetadataCut cut) {
         require(authenticated != null && producerRegistration != null && nativeEvidence != null
                         && "NATIVE_RECORDED".equals(nativeEvidence.get("state")), "actual cold native class evidence is missing");
-        require(producerClassMetadata.size() < 2, "cold native class receipt roster exceeds before/after bound");
+        require(producerClassMetadata.size() == nativeClassPacketRoster.recordedPackets(), "cold packet publication count differs");
+        nativeClassPacketRoster.requireNext(phaseKey, cut, producerRegistration.runtime());
         Map<?, ?> metadata = map(nativeEvidence.get("ownedMetadata"));
         require(number(metadata, "pid") == producerRegistration.runtime().pid()
                         && number(metadata, "jvmStartTimeMillis") == producerRegistration.runtime().jvmStartTimeMillis(), "actual cold class runtime differs");
@@ -567,15 +581,20 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
             require(expected.equals(map(snapshot.get("classHashes"))), "actual cold class hashes differ from authenticated application entries");
         }
         var origins = consumeProducerOrigins(nativeEvidence.get("producerOrigins"), nativeEvidence.get("raw"));
-        producerClassMetadata.add(Map.of("pid", producerRegistration.runtime().pid(),
+        var packet = Map.<String, Object>of("pid", producerRegistration.runtime().pid(),
                 "jvmStartTimeMillis", producerRegistration.runtime().jvmStartTimeMillis(), "classHashes", Map.copyOf(expected),
-                "producerOrigins", origins.evidence()));
+                "producerOrigins", origins.evidence(), "phaseKey", phaseKey, "cut", cut.name());
+        var nextPackets = new java.util.ArrayList<>(producerClassMetadata);
+        nextPackets.add(packet);
         var bindings = new LinkedHashMap<String, Object>(bindingEvidence);
-        bindings.put("actualProducerOrigins", List.copyOf(producerClassMetadata));
+        bindings.put("actualProducerOrigins", List.copyOf(nextPackets));
         require(bindings.get("gaps") instanceof List<?> existing && existing.size() <= 8, "binding gap roster differs");
         bindings.put("gaps", ((List<?>) bindings.get("gaps")).stream()
                 .filter(gap -> !"PRODUCER_LOADED_ORIGINS_BEYOND_CLOCK_NOT_OBSERVED".equals(gap)).toList());
-        bindingEvidence = Map.copyOf(bindings);
+        var published = Map.copyOf(bindings);
+        producerClassMetadata.add(packet);
+        nativeClassPacketRoster.record(phaseKey, cut, producerRegistration.runtime());
+        bindingEvidence = published;
     }
 
     private BenchmarkReturnProducerOrigins.Parsed consumeProducerOrigins(Object value, Object nativeRaw) {
@@ -616,10 +635,91 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     static BenchmarkReturnWorkBudget.Work producerOriginBindingUpper() {
         long origins = 2L * MAX_CLASSES, parts = 34;
         long text = Math.addExact(Math.multiplyExact(origins, 256), Math.multiplyExact(parts, 4096 + 2L * 1024 + 512 + 128 + 256 + 64));
-        return new BenchmarkReturnWorkBudget.Work(Math.addExact(128, Math.multiplyExact(16, origins + parts)),
+        var original = new BenchmarkReturnWorkBudget.Work(Math.addExact(128, Math.multiplyExact(16, origins + parts)),
                 Math.addExact(128, Math.multiplyExact(32, text)), parts, 0,
                 Math.addExact(Math.multiplyExact(64, origins + parts), Math.multiplyExact(8, parts)), 8,
                 Math.addExact(origins, Math.multiplyExact(8, parts)), Math.addExact(origins, parts));
+        return original.plus(nativeClassPacketBindingUpper());
+    }
+
+    /** Added local phase/cut checks and bounded twelve-reference publication, per entered packet.
+     * Includes the existing caller label's id/phase accessors and at most128-character concatenation;
+     * the four old call sites use this label without another clock, metadata getter or JMX request.
+     */
+    static BenchmarkReturnWorkBudget.Work nativeClassPacketBindingUpper() {
+        long packets = NativeClassPacketRoster.MAX_PACKETS, phases = NativeClassPacketRoster.MAX_PHASES;
+        long characters = Math.multiplyExact(4, NativeClassPacketRoster.KEY_CHARS);
+        long slots = Math.addExact(Math.addExact(Math.multiplyExact(7, packets), phases), characters);
+        return new BenchmarkReturnWorkBudget.Work(1, Math.addExact(128, Math.multiplyExact(32, slots)), 0, packets,
+                Math.addExact(Math.multiplyExact(128, packets + phases), Math.multiplyExact(4, characters)), 4,
+                Math.multiplyExact(8, slots), Math.multiplyExact(4, slots));
+    }
+
+    /** One pre-scope constructor walks the already cached original phase roster; no factory is repeated. */
+    static BenchmarkReturnWorkBudget.Work nativeClassPacketRosterFactoryUpper() {
+        long phases = NativeClassPacketRoster.MAX_PHASES;
+        long characters = Math.multiplyExact(phases, NativeClassPacketRoster.KEY_CHARS);
+        long slots = Math.addExact(Math.multiplyExact(16, phases), characters);
+        return new BenchmarkReturnWorkBudget.Work(1, Math.addExact(128, Math.multiplyExact(16, slots)), 0,
+                NativeClassPacketRoster.MAX_PACKETS, Math.addExact(1024, Math.multiplyExact(8, characters)), 4,
+                Math.multiplyExact(8, slots), Math.multiplyExact(4, slots));
+    }
+
+    /** Complete roster check and two scalar report annotations, apart from report serialization. */
+    static BenchmarkReturnWorkBudget.Work nativeClassPacketAfterExitUpper() {
+        long slots = Math.addExact(16, NativeClassPacketRoster.MAX_PACKETS);
+        return new BenchmarkReturnWorkBudget.Work(1, Math.addExact(64, Math.multiplyExact(16, slots)), 0, 0,
+                Math.addExact(256, Math.multiplyExact(32, slots)), 4,
+                Math.multiplyExact(8, slots), Math.multiplyExact(4, slots));
+    }
+
+    enum NativeMetadataCut { BEFORE, AFTER }
+
+    /** State is private to an original Run; a standalone projection grants no runtime authority. */
+    static final class NativeClassPacketRoster {
+        static final int MAX_PHASES = 6, MAX_PACKETS = 12, KEY_CHARS = 128;
+        private final List<String> phaseKeys;
+        private final int expectedPackets;
+        private int recordedPackets;
+        private BenchmarkCausalClock.Identity owner;
+
+        NativeClassPacketRoster(BenchmarkWorkloadDefinitions.Workload original) {
+            require(original != null && original.phases().size() <= MAX_PHASES, "original phase roster exceeds its prior cap");
+            var keys = new java.util.ArrayList<String>(); var unique = new java.util.HashSet<String>();
+            for (var phase : original.phases()) if (phase.measured()) {
+                require(original.id() != null && phase.id() != null && !original.id().isEmpty() && !phase.id().isEmpty()
+                                && Math.addExact(Math.addExact(original.id().length(), 1), phase.id().length()) <= KEY_CHARS,
+                        "original measured phase key exceeds its prior cap");
+                String key = original.id() + "/" + phase.id();
+                require(key.chars().allMatch(c -> c >= 32 && c <= 126) && unique.add(key),
+                        "original measured phase key is duplicated or malformed");
+                keys.add(key);
+            }
+            require(!keys.isEmpty() && keys.size() <= MAX_PHASES, "original measured phase roster is missing");
+            phaseKeys = List.copyOf(keys); expectedPackets = Math.multiplyExact(2, phaseKeys.size());
+            require(expectedPackets <= MAX_PACKETS, "original cold packet roster exceeds its prior cap");
+        }
+        List<String> phaseKeys() { return phaseKeys; }
+        int expectedPackets() { return expectedPackets; }
+        int recordedPackets() { return recordedPackets; }
+        void requireNext(String phaseKey, NativeMetadataCut cut, BenchmarkCausalClock.Identity actualOwner) {
+            require(recordedPackets < expectedPackets, "cold native class receipt roster exceeds before/after bound");
+            require(phaseKey != null && phaseKey.length() <= KEY_CHARS && cut != null && actualOwner != null,
+                    "cold packet phase, cut or owner is missing");
+            require(phaseKeys.get(recordedPackets / 2).equals(phaseKey)
+                            && cut == (recordedPackets % 2 == 0 ? NativeMetadataCut.BEFORE : NativeMetadataCut.AFTER),
+                    "cold packet phase or cut differs from the original measured roster");
+            require(owner == null || owner.equals(actualOwner), "cold packet owner changed between measured phases");
+        }
+        void record(String phaseKey, NativeMetadataCut cut, BenchmarkCausalClock.Identity actualOwner) {
+            requireNext(phaseKey, cut, actualOwner);
+            if (owner == null) owner = actualOwner;
+            recordedPackets = Math.incrementExact(recordedPackets);
+        }
+        void requireComplete() {
+            require(owner != null && recordedPackets == expectedPackets,
+                    "actual original measured before/after cold packet roster is incomplete");
+        }
     }
 
     /** The ASCII transport guard consumes the fixed packet once before copying or decoding. */
@@ -718,7 +818,12 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         requireActive(); require(producerRegistration != null, "producer final receipt was never armed");
         require(!observedRootOrigins.isEmpty(), "actual root class origins were not observed before services");
         require(emittedRoster != null, "actual complete emitted compiler roster was not observed before services");
-        require(producerClassMetadata.size() == 2, "actual before/after cold class metadata was not bound");
+        BenchmarkReturnWorkBudget.operation(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> {
+            nativeClassPacketRoster.requireComplete();
+            require(producerClassMetadata.size() == nativeClassPacketRoster.expectedPackets(),
+                    "actual before/after cold class metadata was not bound");
+            return null;
+        });
         var bound = BenchmarkReturnWorkBudgetProducerSeal.verifyAfterExit(producerBody, producerRegistration, actual);
         var arithmetic = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(bound.body());
         reconcileCaptures(bound.body(), captures);
@@ -726,7 +831,13 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         facts.put("state", "POST_EXIT_BYTES_AND_SOURCE_ARITHMETIC_BOUND"); facts.put("body", bound.body());
         facts.put("bodySha256", bound.bodySha256()); facts.put("companionSha256", bound.companionSha256());
         facts.put("allocation", arithmetic); facts.put("captureCountPairing", "MATCHED_ORIGINAL_FULL_WIRE_RECEIPTS");
-        facts.put("actualInputBindings", bindingEvidence); facts.put("producerClassMetadata", List.copyOf(producerClassMetadata));
+        facts.put("actualInputBindings", bindingEvidence);
+        BenchmarkReturnWorkBudget.operation(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> {
+            facts.put("producerClassMetadata", List.copyOf(producerClassMetadata));
+            facts.put("producerClassMetadataExpectedPhaseKeys", nativeClassPacketRoster.phaseKeys());
+            facts.put("producerClassMetadataExpectedPackets", nativeClassPacketRoster.expectedPackets());
+            return null;
+        });
         facts.put("actualRootOrigins", rootOriginEvidence);
         facts.put("runtimeCoverageQualified", false);
         facts.put("structuralWorkBudgetQualified", false); facts.put("wholeMethodCostQualified", false);

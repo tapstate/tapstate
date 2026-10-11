@@ -92,7 +92,7 @@ final class BenchmarkReturnWorkBudgetProfile {
     static Prepared inspect(Inputs inputs) {
         require(inputs != null, "profile scalar inputs are missing");
         var flags = inputs.flags();
-        boolean separateWriter = "A".equals(flags.arm()) && "stateless".equals(inputs.workload().id()) && inputs.producerWriter() != null;
+        boolean separateWriter = "A".equals(flags.arm()) && Set.of("copy", "stateless", "stateful").contains(inputs.workload().id()) && inputs.producerWriter() != null;
         require(("B".equals(flags.arm()) && inputs.producerWriter() == null || separateWriter)
                         && "PLAIN".equals(flags.captureMode()) && "PERIODIC".equals(flags.clockMode())
                         && "ON".equals(flags.collectorMode()) && flags.steadyPilot() && flags.nativeLibrary()
@@ -129,9 +129,13 @@ final class BenchmarkReturnWorkBudgetProfile {
         }
         knownComponentBounds(upper, inputs, reporting.plan());
         knownRootBounds(upper, inputs, reporting.plan());
-        var measured = inputs.workload().phases().stream().filter(PhaseInput::measured).findFirst().orElseThrow();
+        var measured = inputs.workload().phases().stream().filter(PhaseInput::measured).toList();
+        require(!measured.isEmpty() && measured.size() <= 2, "original measured phase roster differs");
+        long fullRows = measured.stream().mapToLong(PhaseInput::logicalOutputs).max().orElseThrow();
+        long batches = measured.stream().mapToLong(PhaseInput::batches).max().orElseThrow();
         upper.putAll(BenchmarkReturnLocalSourceWork.bounds(new BenchmarkReturnLocalSourceWork.Capacity(
-                measured.logicalOutputs(), measured.logicalOutputs() / 2, measured.batches())));
+                fullRows, fullRows / 2, batches),
+                BenchmarkReturnLocalSourceWork.AssociationRecipe.ORIGINAL_FIXED_ONE_OR_TWO_INTEGER_KEYS_AND_COLD_SQL));
         long manifestBytes = Math.max(files.get(FileRole.COMMON_HELPER_MANIFEST).bytes(), files.get(FileRole.JDK_INPUT_MANIFEST).bytes());
         int manifestFields = BenchmarkReturnBindingsManifestReader.maximumFields(inputs.producerWriter() == null
                 ? BenchmarkReturnWorkBudgetBindings.SCHEMA_VERSION : BenchmarkReturnWorkBudgetBindings.PRODUCER_WRITER_SCHEMA_VERSION);
@@ -141,8 +145,8 @@ final class BenchmarkReturnWorkBudgetProfile {
         upper.merge(BenchmarkReturnWorkBudget.Activity.DECODE, decode.plus(encode), BenchmarkReturnWorkBudget.Work::plus);
         upper.merge(BenchmarkReturnWorkBudget.Activity.COPY, encode, BenchmarkReturnWorkBudget.Work::plus);
         require(inputs.workload().setupStatements() == BenchmarkSharedSupportSourceWork.geometry(inputs.workload().id()).setupStatements()
-                        && inputs.workload().phases().stream().allMatch(phase -> phase.statementsPerBatch() == 1),
-                "shared fixture source recipe differs from the fixed stateless input");
+                        && inputs.workload().phases().stream().allMatch(phase -> phase.statementsPerBatch() >= 1 && phase.statementsPerBatch() <= 2),
+                "shared fixture source recipe differs from the original input");
         upper.merge(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
                 BenchmarkSharedSupportSourceWork.sharedUpper(), BenchmarkSharedSupportSourceWork::maximum);
         upper.merge(BenchmarkReturnWorkBudget.Activity.CLEANUP,
@@ -325,7 +329,7 @@ final class BenchmarkReturnWorkBudgetProfile {
         try { return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(source.toString().getBytes(StandardCharsets.US_ASCII))); }
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
-    private static void text(String value, int bound) { require(value != null && !value.isBlank() && value.length() <= bound
+    private static void text(String value, int bound) { require(value != null && value.length() <= bound && !value.isBlank()
             && value.chars().allMatch(character -> character >= 32 && character <= 126), "profile text is missing or exceeds its bound"); }
     private static void digest(String value) { require(value != null && value.matches("[a-f0-9]{64}"), "profile digest is missing"); }
     private static void require(boolean condition, String reason) { if (!condition) { throw new AssertionError("return work profile " + reason); } }

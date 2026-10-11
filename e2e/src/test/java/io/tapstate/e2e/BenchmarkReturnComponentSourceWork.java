@@ -65,6 +65,8 @@ final class BenchmarkReturnComponentSourceWork {
         out.merge(BenchmarkReturnWorkBudget.Activity.COPY, pooledCopyUpper(), BenchmarkReturnComponentSourceWork::maximum);
         BenchmarkReturnCaptureMaterialBounds.upper().forEach((activity, bound) ->
                 out.merge(activity, bound, BenchmarkReturnComponentSourceWork::maximum));
+        out.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                BenchmarkReturnWorkBudgetRun.nativeClassPacketAfterExitUpper(), BenchmarkReturnComponentSourceWork::maximum);
         var vectors = new LinkedHashMap<String, Object>();
         for (var actor : BenchmarkReturnWorkBudget.Activity.values()) {
             var value = out.get(actor);
@@ -109,11 +111,13 @@ final class BenchmarkReturnComponentSourceWork {
                     8, ROWS + BATCHES + HELLO + CALLS + SAMPLES + PAGES, BATCHES + HELLO + CALLS + SAMPLES);
             // Comparator key extraction can run twice per comparison; C^2 is a source bound, not an observed total.
             // Existing raw decode/association/map/p99/common helpers keep their independently counted child entries.
+            // Six phase projections, two target accessors/maps per phase and four bounded chain
+            // descriptions add fixed source calls. SQL scalar traversal is the separately entered shared guard.
             case VERIFY_PHASE -> row(add(1024, mul(8, mul(CALLS, CALLS)), mul(64, CALLS), mul(32, SAMPLES),
-                    mul(32, BATCHES), mul(128, HELLO), mul(4, jsonRequests(NATIVE_CHARS))),
-                    ROWS, CALLS, add(mul(32, CALLS + BATCHES + HELLO), mul(32, ROWS)), 16,
-                    add(mul(CALLS, CALLS), mul(4, SAMPLES), mul(4, BATCHES), mul(4, HELLO), ROWS),
-                    add(CALLS, BATCHES, HELLO, ROWS));
+                    mul(32, BATCHES), mul(128, HELLO), mul(4, jsonRequests(NATIVE_CHARS)), mul(64, 6 * 2 + 4)),
+                    ROWS, CALLS, add(mul(32, CALLS + BATCHES + HELLO), mul(32, ROWS), mul(4, 4 * 6L * 512)), 16,
+                    add(mul(CALLS, CALLS), mul(4, SAMPLES), mul(4, BATCHES), mul(4, HELLO), ROWS, 6 * 2 + 4 * 6),
+                    add(CALLS, BATCHES, HELLO, ROWS, 6 * 2 + 4));
             case METHOD_EVIDENCE -> row(256, 0, 0, 8192, 4, 128, 64);
             case INSPECTION_COPY -> row(64, 0, 0, 512, 2, 16, 16);
             case DELIVERIES_COPY -> row(add(32, mul(8, ROWS)), ROWS, 0, mul(16, ROWS), 2, ROWS, ROWS);
@@ -185,7 +189,7 @@ final class BenchmarkReturnComponentSourceWork {
         // formula varargs, Work validation/material and maxima. No JSON encoder is invoked here.
         // Ninety-six additional slots cover the two independent pooled row formulas and merges:
         // each has at most ten arithmetic/helper slots, 24 maximum APIs and one map merge.
-        long requests = add(64, 96, 256, mul(kinds, FORMULA_SLOTS + MAXIMUM_SLOTS + TABLE_ENTRY_SLOTS), mul(24, fields));
+        long requests = add(64, 96, 256, 64, mul(kinds, FORMULA_SLOTS + MAXIMUM_SLOTS + TABLE_ENTRY_SLOTS), mul(24, fields));
         long scalarSlots = add(mul(kinds, FORMULA_SLOTS + 8L * UNITS), mul(2, actors), kinds, 32, mul(12, fields));
         return new BenchmarkReturnWorkBudget.Work(1, requests, kinds, 0, mul(8, scalarSlots),
                 4, add(mul(2, scalarSlots), fields), add(scalarSlots, fields)).times(entries);
@@ -254,21 +258,9 @@ final class BenchmarkReturnComponentSourceWork {
 
     static void guardWorkload(BenchmarkWorkloadDefinitions.Workload workload) {
         if (BenchmarkReturnWorkBudget.current() == null || workload == null) return;
-        require("stateless".equals(workload.id()) && workload.rows() == 96000 && workload.seed() == 424242,
-                "component source recipe is limited to stateless");
-        require(workload.pipelineIds().size() == 1 && workload.sourceChains().size() == 1 && workload.setupSql().size() == 194
-                && workload.phases().size() == PHASES, "workload projection exceeds prior shape");
-        for (String name : workload.pipelineIds()) text(name, 512);
-        for (var chain : workload.sourceChains()) {
-            text(chain.id(), 512); text(chain.pipelineId(), 512); text(chain.sourceId(), 512); text(chain.table(), 512); text(chain.terminalLogicalId(), 512);
-        }
-        for (var phase : workload.phases()) {
-            text(phase.id(), 128);
-            require(phase.sql().size() <= BATCHES && phase.targets().size() == 1 && phase.expectedLogicalCoverage().size() == 1,
-                    "phase projection exceeds prior shape");
-            for (var item : phase.expectedLogicalCoverage().entrySet()) text(item.getKey(), 512);
-            for (var target : phase.targets()) { text(target.pipelineId(), 512); text(target.table(), 512); text(target.checksum(), 64); }
-        }
+        // Exact phase/SQL equality is checked by the active Run against its cached canonical input.
+        // This independently bounded material walk covers all three unchanged source geometries.
+        BenchmarkSharedSupportSourceWork.originalWorkload(workload);
     }
 
     static void guardCapture(BenchmarkWriteReturnCapture.Result capture) {

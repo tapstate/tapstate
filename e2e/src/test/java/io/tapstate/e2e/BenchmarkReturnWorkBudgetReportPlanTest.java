@@ -94,8 +94,56 @@ class BenchmarkReturnWorkBudgetReportPlanTest {
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetReportPlan.completePilot(wrongSeed)).isInstanceOf(AssertionError.class);
         var paced = BenchmarkReturnWorkBudgetProfile.WorkloadInput.from(BenchmarkWorkloadDefinitions.pacedCalibration("stateless"));
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetReportPlan.completePilot(paced)).isInstanceOf(AssertionError.class);
-        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetReportPlan.completePilot(
-                BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("copy"))).isInstanceOf(AssertionError.class);
+        assertThat(BenchmarkReturnWorkBudgetReportPlan.completePilot(
+                BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("copy")).nodeUpper()).isPositive();
+    }
+
+    @Test void original_all_three_geometries_scale_every_measured_report_family_and_keep_per_fork_receipts_once() {
+        for (String id : List.of("copy", "stateless", "stateful")) {
+            var input = BenchmarkReturnWorkBudgetProfile.WorkloadInput.original(id);
+            var shape = BenchmarkReturnWorkBudgetSourceTails.geometry(input);
+            var prepared = BenchmarkReturnWorkBudgetReportPlan.prepareWithReturnComponents(input, false);
+            var parts = index(prepared); long phases = id.equals("stateful") ? 2 : 1;
+            assertThat(prepared.metadata()).containsEntry("measuredPhases", phases)
+                    .containsEntry("fullMeasuredOutputs", id.equals("stateful") ? 288000L : 96000L)
+                    .containsEntry("pooledCohortRows", id.equals("stateful") ? 144000L : 48000L);
+            assertThat(parts.get("SOURCE_BATCH_DOUBLE_REPRESENTATION").rows()).isEqualTo(960 * phases);
+            assertThat(parts.get("RAW_RETURN_BASE64").rows()).isEqualTo(phases);
+            assertThat(parts.get("RESOURCE_TRACES_AND_REFUSALS").rows()).isEqualTo(3 * phases * 4096);
+            assertThat(parts.get("RETURN_CLOCK_ROSTERS").rows()).isEqualTo(2 * phases * 512);
+            assertThat(parts.get("RETURN_ROWS_IF_MATERIALIZED").rows()).isEqualTo(phases * 262144);
+            assertThat(parts.get("NATIVE_METADATA_AND_REGISTRATIONS").rows()).isEqualTo(8 * phases);
+            assertThat(parts.get("PRODUCER_COLD_ORIGIN_PACKETS").rows()).isEqualTo(6 * phases);
+            assertThat(parts.get("NATIVE_BASELINE_CHECKPOINTS").rows()).isEqualTo(8 * phases);
+            assertThat(parts.get("LEGACY_TARGET_HELLO_TIMELINE").rows()).isEqualTo(6002 * phases);
+            assertThat(parts.get("ROOT_CPU_ENVELOPE").rows()).isEqualTo(phases);
+            assertThat(parts.get("METHOD_SOURCE_BATCH_PROJECTION").rows()).isEqualTo(shape.measuredBatches() + phases);
+            assertThat(parts.get("METHOD_RAW_RETURN_PAGES").rows()).isEqualTo(phases);
+            assertThat(parts.get("METHOD_ADMISSION_HEADERS").rows()).isEqualTo(phases + 1);
+            assertThat(parts.get("METHOD_COMMON_WINDOW_CERTIFICATES").rows()).isEqualTo(2 * phases);
+            assertThat(parts.get("METHOD_SERIAL_HELLO_READINGS").rows()).isEqualTo(6000 * phases);
+            assertThat(parts.get("OWNED_RUNTIME_AND_FAILURE_RECEIPT").rows()).isEqualTo(2);
+            assertThat(parts.get("ROOT_CLASS_ORIGIN_PACKETS").rows()).isEqualTo(2);
+            assertThat(parts.get("EMITTED_COMPILER_ROSTER").rows()).isEqualTo(1);
+            assertThat(parts.get("PRODUCER_WORK_BODY_AND_EVALUATION").rows()).isEqualTo(2);
+            assertThat(parts.get("NATIVE_CLASS_PHASE_AND_CUT_ROSTER").rows()).isEqualTo(3);
+            assertThat(prepared.components()).hasSizeLessThanOrEqualTo(64);
+        }
+    }
+
+    @Test void stateful_complete_measured_timeline_and_declared_cold_roster_header_fit_before_serialization() {
+        var prepared = BenchmarkReturnWorkBudgetReportPlan.prepareWithReturnComponents(
+                BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateful"), false);
+        var full = java.util.Collections.nCopies(288000, 1L);
+        var cohort = java.util.Collections.nCopies(144000, 2L);
+        var packet = Map.of("deliveryNanos", cohort, "fullObservedAtNanos", full,
+                "cohortObservedAtNanos", cohort, "cohortServerOperationWallMillis", cohort,
+                "cohortOperationStreams", List.of(cohort), "producerClassMetadataExpectedPhaseKeys",
+                List.of("stateful/cold-read", "stateful/cdc-update"), "producerClassMetadataExpectedPackets", 4);
+        var checked = BenchmarkReturnWorkBudgetDefinitions.requireOutputTree(packet, prepared.plan());
+        assertThat(checked.nodes()).isGreaterThan(288000 + 4L * 144000);
+        assertThat(prepared.metadata()).containsEntry("wholeMethodCostQualified", false)
+                .containsEntry("performanceAcceptanceEligible", false);
     }
 
     @Test

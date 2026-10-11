@@ -231,6 +231,19 @@ class BenchmarkReturnMethodAdmissionTest {
         for (String flag : BenchmarkReturnProducerOrigins.FLAGS) assertThat(bound.evidence()).containsEntry(flag, false);
     }
 
+    @Test void a_same_count_altered_phase_sql_cannot_enter_the_cached_original_method() throws Exception {
+        var original = fixture(); var facts = phase(original, cold(original.result().samples().getFirst().identity()),
+                cold(original.result().samples().getFirst().identity()));
+        var sql = new ArrayList<>(facts.phase().sql()); sql.set(0, "UPDATE altered_source SET qty = qty + 1 WHERE id BETWEEN 1 AND 100");
+        var altered = new BenchmarkWorkloadDefinitions.Phase(facts.phase().id(), facts.phase().stage(), facts.phase().measured(),
+                facts.phase().expectedLogicalOutputChanges(), sql, facts.phase().statementsPerBatch(), facts.phase().batchInterval(),
+                facts.phase().expectedLogicalCoverage(), facts.phase().targets());
+        var changed = new BenchmarkReturnMethodAdmission.PhaseFacts(facts.workload(), altered, facts.sourceBatches(), facts.capture(),
+                facts.root(), facts.owned(), facts.nativeBefore(), facts.nativeAfter(), facts.serialHello());
+        assertThatThrownBy(() -> BenchmarkReturnMethodAdmission.verifyPhase(control(), changed))
+                .isInstanceOf(BenchmarkReturnMethodAdmission.Refusal.class).hasMessageContaining("ORIGINAL_PHASE_SQL_OR_CADENCE_DIFFERS");
+    }
+
     private static BenchmarkReturnMethodAdmission.AdmittedMethod control() {
         return BenchmarkReturnMethodAdmission.admitForControl(preflight(), inspected -> { });
     }

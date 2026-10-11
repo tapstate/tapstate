@@ -45,7 +45,7 @@ final class BenchmarkReturnMethodAdmission {
         private final BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile profile;
         private CostRecipe(BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile profile) { this.profile = profile; }
         BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile profile() { return profile; }
-        Set<String> supportedWorkloads() { return Set.of("stateless"); }
+        Set<String> supportedWorkloads() { return Set.of(profile.prepared().inputs().workload().id()); }
         Map<String, Object> evidence() {
             return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.METHOD_EVIDENCE, this::evidenceBounded);
         }
@@ -53,7 +53,7 @@ final class BenchmarkReturnMethodAdmission {
             var out = facts("CACHED_STRUCTURAL_RECIPE_REQUIRING_SEPARATE_COMPLETE_COST_PROOF");
             out.put("definitionId", profile.definition().definitionId());
             out.put("sourceFormulaSha256", profile.definition().sourceFormulaSha256());
-            out.put("supportedWorkloads", List.of("stateless")); return Map.copyOf(out);
+            out.put("supportedWorkloads", List.of(profile.prepared().inputs().workload().id())); return Map.copyOf(out);
         }
     }
 
@@ -184,7 +184,7 @@ final class BenchmarkReturnMethodAdmission {
     private static CostRecipe structuralRecipeBounded(BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile profile) {
         require(profile != null && profile.prepared() != null, "STRUCTURAL_RECIPE_MISSING");
         var input = profile.prepared().inputs();
-        require("stateless".equals(input.workload().id()) && input.workload().rows() == 96000
+        require(Set.of("copy", "stateless", "stateful").contains(input.workload().id()) && input.workload().rows() == 96000
                 && input.workload().seed() == 424242, "STRUCTURAL_RECIPE_WORKLOAD_UNSUPPORTED");
         require(profile.definition().sourceFormulaSha256().equals(profile.prepared().requireDefinition().sourceFormulaSha256()),
                 "STRUCTURAL_RECIPE_DEFINITION_DIFFERS");

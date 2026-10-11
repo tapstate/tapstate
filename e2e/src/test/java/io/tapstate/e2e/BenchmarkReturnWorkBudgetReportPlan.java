@@ -17,7 +17,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     private static final int OUTER_DEPTH = 12;
     private static final int SOURCE_KEY_BYTES = 4 * SOURCE_LEAF_CHARS;
     private static final int MAX_LEAF = Math.max(SOURCE_KEY_BYTES, base64(PAGE_BYTES));
-    static final int RETURN_COMPONENT_CATALOGUE_ROWS = 15, CATALOGUE_ROWS = 64;
+    static final int RETURN_COMPONENT_CATALOGUE_ROWS = 16, CATALOGUE_ROWS = 64;
 
     record Component(String id, String sourceBranch, long rows, long nodesPerRow, long stringsPerRow,
                      int leafUtf8Upper, int localDepthUpper, String boundBasis) {
@@ -60,61 +60,57 @@ final class BenchmarkReturnWorkBudgetReportPlan {
 
     private static Prepared prepare(BenchmarkReturnWorkBudgetProfile.WorkloadInput workload,
                                     boolean separateProducerWriter, boolean returnComponents) {
-        require(workload != null && "stateless".equals(workload.id()) && workload.rows() == 96000 && workload.seed() == 424242,
-                "only the unchanged stateless pilot is registered");
-        require(workload.equals(BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless")),
+        var shape = BenchmarkReturnWorkBudgetSourceTails.geometry(workload);
+        // Keep this existing canonical-source comparison once per profile inspection. The
+        // preceding shape guard bounds every caller roster before equals traverses its values.
+        require(workload.equals(BenchmarkReturnWorkBudgetProfile.WorkloadInput.original(workload.id())),
                 "original pipeline, target, phase, coverage or cadence inputs differ");
-        long measuredPhases = workload.phases().stream().filter(BenchmarkReturnWorkBudgetProfile.PhaseInput::measured).count();
-        require(measuredPhases == 1 && workload.pipelines().size() == 1 && workload.sourceChains().size() == 1,
-                "fixed pilot topology differs");
-        var phase = workload.phases().stream().filter(BenchmarkReturnWorkBudgetProfile.PhaseInput::measured).findFirst().orElseThrow();
-        require(phase.logicalOutputs() == 96000 && phase.batches() == 960 && phase.targets().size() == 1,
-                "fixed pilot output or source batch roster differs");
-        long full = phase.logicalOutputs(), cohort = full / 2;
-        long sourceCoverage = 0, allOutputs = 0;
-        for (var candidate : workload.phases()) {
-            sourceCoverage = Math.addExact(sourceCoverage, candidate.logicalCoverage().size());
-            allOutputs = Math.addExact(allOutputs, candidate.logicalOutputs());
-        }
-        long chains = workload.sourceChains().size();
+        long measuredPhases = shape.measuredPhases();
+        long full = shape.measuredOutputs(), cohort = shape.cohortRows();
+        long sourceCoverage = shape.coverageEntries(), allOutputs = shape.allOutputs();
+        long chains = shape.chains();
         var parts = new ArrayList<Component>();
         // Scalar maps: raw fork, fork summary, phase, timeline, schedule, confirmation, anchor,
         // resources, interval/rate, common-window certificate, root CPU scope, and disabled branches.
         int[] scalarFields = {29, 24, 50, 14, 8, 10, 5, 6, 9, 40, 10, 12};
         long scalarNodes = 0, scalarStrings = 0;
-        for (int fields : scalarFields) {
-            scalarNodes = Math.addExact(scalarNodes, mapNodes(fields));
-            scalarStrings = Math.addExact(scalarStrings, Math.multiplyExact(fields, 128L + 512));
+        long[] scalarCopies = {1, 1, measuredPhases, measuredPhases, shape.phases(),
+                Math.multiplyExact(shape.phases(), shape.targets()), chains, measuredPhases, measuredPhases,
+                measuredPhases, measuredPhases, measuredPhases};
+        for (int index = 0; index < scalarFields.length; index++) {
+            int fields = scalarFields[index]; long copies = scalarCopies[index];
+            scalarNodes = Math.addExact(scalarNodes, Math.multiplyExact(copies, mapNodes(fields)));
+            scalarStrings = Math.addExact(scalarStrings, Math.multiplyExact(copies, Math.multiplyExact(fields, 128L + 512)));
         }
         add(parts, "SCALAR_REPORT_SCAFFOLDS", "RealBenchmarkForkDriverIT.run/PipelineBenchmarkLiveRunIT.fork/phaseEvidence",
                 1, scalarNodes, scalarStrings, 512, 4, "FIXED_MAP_FIELD_INVENTORIES_AND_LITERAL_TEXT");
         add(parts, "FORK_DELIVERY_LATENCIES", "PipelineBenchmarkLiveRunIT.fork.deliveryNanos",
                 cohort + 1, 1, 0, 32, 2, "ORIGINAL_COMPLETE_MIDDLE_HALF");
         add(parts, "FULL_AND_COHORT_TIMELINES", "PipelineBenchmarkLiveRunIT.phaseEvidence.deliveryTimeline",
-                Math.addExact(full, Math.multiplyExact(3, cohort)) + 5, 1, 0, 32, 4,
+                Math.addExact(Math.addExact(full, Math.multiplyExact(3, cohort)), Math.multiplyExact(5, measuredPhases)), 1, 0, 32, 4,
                 "FULL_OBSERVATION_PLUS_COHORT_OBSERVATION_OPERATION_AND_STREAM_ARRAYS");
         long coverageEntries = Math.addExact(sourceCoverage, Math.addExact(Math.multiplyExact(2, allOutputs), chains));
         add(parts, "ALL_COVERAGE_MAPS", "PipelineBenchmarkLiveRunIT.fork.declaredSourceCoverage/observedTargetCoverage/logicalCoverage",
                 coverageEntries + 3, 2, 128, 128, 2, "SUM_ALL_ORIGINAL_PHASE_DOMAINS_WITHOUT_DEDUPLICATION");
         add(parts, "SOURCE_BATCH_DOUBLE_REPRESENTATION", "phaseEvidence.sourceBatches/BenchmarkWriteReturnPhaseEvidence.sourceBatches",
-                phase.batches(), mapNodes(8) + mapNodes(3), 8L * 64 + 4L * 40 + 3L * 64, 128, 4,
-                "ORIGINAL_960_BATCH_ROSTER_IN_BOTH_MAP_SHAPES");
+                shape.measuredBatches(), mapNodes(8) + mapNodes(3), 8L * 64 + 4L * 40 + 3L * 64, 128, 4,
+                "SUM_ORIGINAL_MEASURED_BATCH_ROSTERS_EACH_960_IN_BOTH_MAP_SHAPES");
         // A single encoded tree can include a full resource trace and its resource-bounds projection,
         // plus the retained refusal trace. These are separate representations of the same attempts.
         add(parts, "RESOURCE_TRACES_AND_REFUSALS", "samplingEvidence/BenchmarkReturnResourceBounds/collectorSamplingRefusal",
-                3L * RESOURCE_ATTEMPTS, mapNodes(11) + 2L * 5, 11L * 64 + 4L * 40 + 64 + MAX_LEAF,
+                Math.multiplyExact(Math.multiplyExact(3, measuredPhases), RESOURCE_ATTEMPTS), mapNodes(11) + 2L * 5, 11L * 64 + 4L * 40 + 64 + MAX_LEAF,
                 MAX_LEAF, 6, "RETAINED_ATTEMPT_CAP_4096_WITH_READING_AND_UTC_FIELDS");
         add(parts, "RAW_RETURN_BASE64", "BenchmarkWriteReturnPhaseEvidence.pagesBase64/BenchmarkWriteReturnCapture.retainedEvidence",
-                1, 2L * (PAGES + 1), 2L * base64Total(RAW_BYTES, PAGES), base64(PAGE_BYTES), 3,
+                measuredPhases, 2L * (PAGES + 1), 2L * base64Total(RAW_BYTES, PAGES), base64(PAGE_BYTES), 3,
                 "COMPLETE_RAW_TWO_MIB_WITH_INDEPENDENT_PADDING_FOR_EACH_OF_512_PAGES");
         add(parts, "RETURN_CLOCK_ROSTERS", "BenchmarkWriteReturnPhaseEvidence.clockSamples/Capture.retainedEvidence.samples",
-                2L * CLOCK_SAMPLES, mapNodes(6), 6L * 64, 128, 4, "COMPLETE_PERIODIC_CAP_512_NO_CONTROL_SAMPLES_INSERTED");
+                Math.multiplyExact(Math.multiplyExact(2, measuredPhases), CLOCK_SAMPLES), mapNodes(6), 6L * 64, 128, 4, "COMPLETE_PERIODIC_CAP_512_NO_CONTROL_SAMPLES_INSERTED");
         add(parts, "RETURN_CALL_AND_ROW_REPRESENTATION", "BenchmarkWriteReturnLedger/Assembly/Expectations retained diagnostics",
-                FRAMES, mapNodes(24), 24L * 128, 512, 6, "FRAME_CAP_512_CALL_ROW_CAP_1024_NO_FULL_ROW_METADATA_DUPLICATION");
+                Math.multiplyExact(measuredPhases, FRAMES), mapNodes(24), 24L * 128, 512, 6, "FRAME_CAP_512_CALL_ROW_CAP_1024_NO_FULL_ROW_METADATA_DUPLICATION");
         add(parts, "RETURN_ROWS_IF_MATERIALIZED", "bounded return row/key/association failure projections",
-                RETURN_ROWS, mapNodes(12), 12L * 128, 512, 8, "DERIVED_512_PIECES_TIMES_512_ROWS_INCLUDES_PARTIAL_REFUSALS");
+                Math.multiplyExact(measuredPhases, RETURN_ROWS), mapNodes(12), 12L * 128, 512, 8, "DERIVED_512_PIECES_TIMES_512_ROWS_INCLUDES_PARTIAL_REFUSALS");
         add(parts, "TABLE_CONFIRMATIONS", "PipelineBenchmarkLiveRunIT.tableConfirmation/terminalMetaReceipts/sourceChains",
-                2L * chains, SOURCE_PACKET_NODES + mapNodes(11) + WRITERS + 1,
+                Math.multiplyExact(Math.multiplyExact(2, chains), measuredPhases), SOURCE_PACKET_NODES + mapNodes(11) + WRITERS + 1,
                 PAGE_BYTES + 2L * MAX_LEAF + 11L * 128 + WRITERS * 256L, MAX_LEAF, SOURCE_PACKET_DEPTH,
                 "PRIOR_64_KIB_JSON_DEPTH16_TOKEN4096_SOURCE_TOKEN_AND_FOUR_WRITER_BINDING");
         add(parts, "OWNED_RUNTIME_AND_FAILURE_RECEIPT", "BenchmarkOwnedProcessReceipt.buildEvidence/runtime-at-failure",
@@ -123,10 +119,10 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         // Both cold native reads contain owned/root parsed and raw evidence. The source guards apply
         // before local consumption; this uses their caps, not a sampled encoded packet size.
         add(parts, "NATIVE_METADATA_AND_REGISTRATIONS", "targetClockQualification.nativeClockBefore/nativeClockAfter/registrationBefore/After",
-                8, SOURCE_PACKET_NODES, SOURCE_PACKET_BYTES, MAX_LEAF, SOURCE_PACKET_DEPTH,
+                Math.multiplyExact(8, measuredPhases), SOURCE_PACKET_NODES, SOURCE_PACKET_BYTES, MAX_LEAF, SOURCE_PACKET_DEPTH,
                 "TWO_COLD_READS_FOUR_ROOT_OWNED_RAW_PARSED_PACKET_FORMS");
         add(parts, "PRODUCER_COLD_ORIGIN_PACKETS", "nativeClockBefore/nativeClockAfter/producerClassMetadata",
-                6, SOURCE_PACKET_NODES, 2L * 2080768 + 8192, 64512, 8,
+                Math.multiplyExact(6, measuredPhases), SOURCE_PACKET_NODES, 2L * 2080768 + 8192, 64512, 8,
                 "TWO_COLD_READS_TWO_DIRECT_AND_TWO_NESTED_POST_EXIT_BINDINGS_PLAIN_RAW34_AND_TYPED32_PRIOR_PART_CAPS");
         add(parts, "ROOT_CLASS_ORIGIN_PACKETS", "actualInputBindings.actualRootOrigins/producer.actualRootOrigins",
                 2, 128L + 512L * mapNodes(7), 32768L + 512L * (7L * 128 + 256 + 4096 + 1024 + 64 + 256),
@@ -137,17 +133,17 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                         + 512L * (7L * 128 + 128 + 256 + 256 + 64 + 4096 + 1024),
                 4096, 5, "FOUR_OWNED_COMPILER_OUTPUTS_ALL_NAMED_SOURCE_ROLES_512_SELECTED_MEMBERS_PRIOR_FIELD_CAPS");
         add(parts, "NATIVE_BASELINE_CHECKPOINTS", "BenchmarkNativeCounterBaseline.evidence.before/after",
-                2L * (1 + 2 + 1), mapNodes(10) + 2L * 4096 + 128 + 1,
+                Math.multiplyExact(measuredPhases, 2L * (1 + 2 + 1)), mapNodes(10) + 2L * 4096 + 128 + 1,
                 PAGE_BYTES + 10L * 64 + 4L * 512, 512, 5,
                 "C0_TWO_SUCCESSORS_AND_LAST_ONLY_VECTOR4096_SINKS128_COMBINED64_KIB");
         add(parts, "LEGACY_TARGET_HELLO_TIMELINE", "targetClockQualification.sampledInterior/allBefore/allAfter",
-                6000L + 2, mapNodes(9), 9L * 64 + 4L * SOURCE_LEAF_CHARS + 24, MAX_LEAF, 5,
+                Math.multiplyExact(measuredPhases, 6000L + 2), mapNodes(9), 9L * 64 + 4L * SOURCE_LEAF_CHARS + 24, MAX_LEAF, 5,
                 "FIXED_NINE_FIELDS_PRIMARY65536_CHAR_GUARD_OBJECTID24_HEX_NO_RAW_HELLO_PAYLOAD");
         add(parts, "COMMAND_AND_TARGET_READ_RECEIPTS", "mongoCommands/targetObserverReadCosts/targetWitnessReadReceipts",
-                4, SOURCE_PACKET_NODES + 256L * mapNodes(6), SOURCE_PACKET_BYTES + 256L * 6 * 64,
+                Math.multiplyExact(4, measuredPhases), SOURCE_PACKET_NODES + 256L * mapNodes(6), SOURCE_PACKET_BYTES + 256L * 6 * 64,
                 MAX_LEAF, SOURCE_PACKET_DEPTH, "CONSUMED_COMMAND_PACKET_BOUND_AND_SLOW_READ_RETENTION256");
         add(parts, "ROOT_CPU_ENVELOPE", "targetClockQualification.rootCpuDiagnostics/rootCpuDiagnosticScope",
-                1, 4096, 4096, 4096, 8, "THREE_CUTOFFS_FOUR_OPERATIONS_FIXED_FOUR_KIB_TRANSPORT");
+                measuredPhases, 4096, 4096, 4096, 8, "THREE_CUTOFFS_FOUR_OPERATIONS_FIXED_FOUR_KIB_TRANSPORT");
         add(parts, "PRODUCER_WORK_BODY_AND_EVALUATION", "producer post-exit body/BenchmarkReturnWorkBudgetProducerAllocations",
                 2, 2L * PRODUCER_ACTORS * mapNodes(4) + 2L * PRODUCER_ACTORS + 16L * mapNodes(2) + 4L * mapNodes(8),
                 PAGE_BYTES, PAGE_BYTES, 8, "TRUSTED_48_ACTIVITY_ROSTER_16_EPOCHS_BOUNDED_SEAL_BODY");
@@ -156,7 +152,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 4096L + 1024L * ROOT_ACTORS + 128L * PENDING, MAX_LEAF, 8,
                 "ROOT57_ACTIVITY_VECTOR_MAPS_SELF_COUNTERS_PENDING128_AND_PRIVATE_RELEASE_TAIL");
         add(parts, "CLOCK_REQUEST_COST_AND_FAILURE_PACKETS", "Capture.clockRequests/producerCostStages/native-clock refusal packet",
-                3, SOURCE_PACKET_NODES, SOURCE_PACKET_BYTES, MAX_LEAF, SOURCE_PACKET_DEPTH,
+                Math.multiplyExact(3, measuredPhases), SOURCE_PACKET_NODES, SOURCE_PACKET_BYTES, MAX_LEAF, SOURCE_PACKET_DEPTH,
                 "FIVE_REQUEST_ROLES_BOUNDED_EIGHT_KIB_AND_GUARDED_NESTED_FAILURE_PACKETS");
         if (separateProducerWriter) {
             // Actual report projections: profile.producerWriter, inputBindings.producerWriter,
@@ -169,7 +165,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                     3, mapNodes(32), writerStrings, 4096, 3,
                     "THREE_FIXED_PRODUCER_ONLY_TUPLE_MAPS_PRIOR_PATH4096_FIELDS32_NO_OBSERVED_SIZE_CAP");
         }
-        if (returnComponents) { addReturnComponentCatalogue(parts, measuredPhases, phase.batches()); }
+        if (returnComponents) { addReturnComponentCatalogue(parts, measuredPhases, shape.measuredBatches()); }
         long nodes = 1, strings = 0;
         for (Component part : parts) {
             nodes = Math.addExact(nodes, part.nodes()); strings = Math.addExact(strings, part.strings());
@@ -181,6 +177,9 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 Map.entry("scope", "ONE_COMPLETE_FORK_OR_ONE_CONTROLLED_STDOUT_FAILURE_TREE"),
                 Map.entry("mode", separateProducerWriter ? "A_PLAIN_PERIODIC_NOMINAL_SEPARATE_PRODUCER_WRITER" : "B_PLAIN_ON_PERIODIC_NOMINAL"), Map.entry("rows", workload.rows()), Map.entry("seed", workload.seed()),
                 Map.entry("components", parts.stream().map(Component::evidence).toList()),
+                Map.entry("workload", workload.id()), Map.entry("measuredPhases", measuredPhases),
+                Map.entry("fullMeasuredOutputs", full), Map.entry("pooledCohortRows", cohort),
+                Map.entry("measuredSourceBatches", shape.measuredBatches()),
                 Map.entry("encodingInvocationBasis", "COMPLETE_ACTUAL_REPORT_SERIALIZE_CALLS_NO_FUTURE_STDOUT_COUNT_BOUND"),
                 Map.entry("sourceGuardDependencies", List.of(
                         "CONFIRMED_CONSUMER_JSON_PRIOR_UTF8_65536_DEPTH16_TOKENS4096",
@@ -213,7 +212,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     }
 
     private static void addReturnComponentCatalogueBounded(List<Component> parts, long phases, long batches) {
-        require(phases > 0 && phases <= 6 && batches >= 0 && batches <= 960,
+        require(phases > 0 && phases <= 2 && batches == Math.multiplyExact(phases, 960),
                 "return component projection scalar roster differs");
         require(parts != null && parts.size() <= CATALOGUE_ROWS - RETURN_COMPONENT_CATALOGUE_ROWS,
                 "return report prior descriptor roster exceeds its cap");
@@ -223,10 +222,10 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 phases, mapNodes(64) + 3L * mapNodes(4), 64L * (128 + 512), 8192, 6,
                 "FIXED_PHASE_SUMMARY_INTERVAL_RATE_AND_EIGHTEEN_FALSE_FIELDS");
         add(parts, "METHOD_SOURCE_BATCH_PROJECTION", "BenchmarkWriteReturnPhaseEvidence.sourceBatches",
-                phases * (batches + 1), mapNodes(3), 3L * 64, 128, 4,
+                Math.addExact(batches, phases), mapNodes(3), 3L * 64, 128, 4,
                 "ONE_THREE_NUMERIC_FIELD_MAP_PER_ORIGINAL_BATCH_PLUS_LIST_NODE");
         add(parts, "METHOD_CLOCK_SAMPLE_PROJECTION", "BenchmarkWriteReturnPhaseEvidence.clockSamples",
-                phases * (CLOCK_SAMPLES + 1L), mapNodes(6), 6L * 64, 128, 4,
+                Math.multiplyExact(phases, CLOCK_SAMPLES + 1L), mapNodes(6), 6L * 64, 128, 4,
                 "ONE_COMPLETE_PERIODIC_SAMPLE_ROSTER_MAX512_PLUS_LIST_NODE");
         add(parts, "METHOD_RAW_RETURN_PAGES", "BenchmarkWriteReturnPhaseEvidence.pagesBase64",
                 phases, PAGES + 1L, base64Total(RAW_BYTES, PAGES), base64(PAGE_BYTES), 3,
@@ -235,7 +234,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 phases, 4096, 65536, 8192, 16,
                 "OWNED_IMMUTABLE_ROUTE_METADATA_PRIOR_FREEZE4096_NODES_65536_UTF8");
         add(parts, "METHOD_ADMISSION_HEADERS", "AdmittedMethod.evidence/CostRecipe.evidence",
-                phases + 1, 4096, 65536, 8192, 16,
+                Math.addExact(phases, 1), 4096, 65536, 8192, 16,
                 "ONE_ROOT_HEADER_PLUS_ONE_NESTED_HEADER_EACH_PHASE_ROUTE_AND_COST_RECIPE_INCLUDED");
         long authorityNodes = mapNodes(64) + 6 + 5 + 2 + mapNodes(4);
         long authorityStrings = 64L * (128 + 512) + 6L * 512 + 4L * (128 + 64) + 5L * 512;
@@ -266,12 +265,17 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 32L * (128 + 512) + CATALOGUE_ROWS * (9L * 128 + 3L * 512),
                 512, 6, "PRIOR64_SOURCE_DESCRIPTOR_MAPS_ID_BRANCH_BASIS512_WITH_FIXED_NUMERIC_FIELDS");
         add(parts, "RETURN_COMPONENT_FACTORY_TAIL_EVIDENCE", "SourceTails.factoryEvidence/preScopeSourceTail",
-                1, mapNodes(34) + 6L * mapNodes(8) + 7,
-                34L * (128 + 512) + 6L * 512 + 6L * 8 * 128,
-                512, 5, "FULL_FIXED_FACTORY_DESCRIPTOR_WITH_FOUR_NEW_EIGHT_UNIT_TAILS_AND_ORIGINAL_UPPER");
+                1, mapNodes(35) + 7L * mapNodes(8) + 7,
+                35L * (128 + 512) + 6L * 512 + 7L * 8 * 128,
+                512, 5, "THIRTYFIVE_FIXED_FIELDS_SEVEN_VECTORS_INCLUDES_SELECTED_GEOMETRY_AND_NATIVE_ROSTER_FACTORY");
         add(parts, "METHOD_EARLY_ROOT_OBSERVATION_BASIS", "Run.rootClockMetadataBeforeEvidence/rootClockMetadataBeforeBasis",
                 phases, mapNodes(3), 3L * 128 + 2L * 128, 512, 3,
                 "ADDITIONAL_FIXED_EARLY_OR_FRESH_BASIS_FIELD_NATIVE_PAYLOAD_REMAINS_IN_ITS_ORIGINAL_PACKET_ROW");
+        long packets = Math.multiplyExact(2, phases);
+        add(parts, "NATIVE_CLASS_PHASE_AND_CUT_ROSTER", "Run.recordNativeClassMetadata/afterExit producer phase/cut projections",
+                3, mapNodes(2) + Math.multiplyExact(packets, mapNodes(2)) + phases + 1,
+                2L * 128 + Math.multiplyExact(packets, 2L * 128 + 128 + 5) + Math.multiplyExact(phases, 128),
+                128, 5, "THREE_BOUNDED_REPORT_PROJECTIONS_TWO_PACKETS_PER_ORIGINAL_MEASURED_PHASE_KEYS128_CUT5");
         require(parts.size() <= CATALOGUE_ROWS, "return report catalogue exceeds its prior descriptor roster");
     }
 
