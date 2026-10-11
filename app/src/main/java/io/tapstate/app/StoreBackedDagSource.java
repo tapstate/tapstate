@@ -1246,11 +1246,10 @@ final class StoreBackedDagSource implements DagSource {
      * the last of each parent's expanded rows and losing the rest, filling the table, reporting
      * nothing, and reading exactly like a step that never ran. So the columns each node says it adds
      * are appended here, after the table's own and in the order the nodes added them. For rows that
-     * passed through an expansion, source origins follow pure renames so the parent identity does
-     * not disappear when its column gets another name. Other streams retain the name-intersection
-     * rule. If a projection copies a source column into several aliases, its last alias identifies
-     * the parent, matching the key passed to the expansion port. A stream that has not passed
-     * through an expansion keeps the rule it has always used.
+     * passed through a projection, source origins follow pure renames so identity does not
+     * disappear when a key column gets another name. If an expansion copies a source column into
+     * several aliases, its last alias identifies the parent, matching the key passed to the
+     * expansion port.
      */
     static TargetTable publishedAs(TargetTable base, NodeColumns produced, NodeColumns atTheSource) {
         Map<String, TargetField> declared = new LinkedHashMap<>();
@@ -1271,8 +1270,7 @@ final class StoreBackedDagSource implements DagSource {
             fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false,
                     inferred,
                     produced.numericTypes().get(column), produced.stringTypes().get(column)));
-            TargetField identity = produced.expanded()
-                    ? declared.get(produced.origins().get(column)) : carried;
+            TargetField identity = declared.get(produced.origins().get(column));
             if (identity != null && identity.primaryKey()
                     && (!produced.expanded() || column.equals(parentNames.get(identity.name())))) {
                 key.add(column);

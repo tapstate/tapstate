@@ -467,12 +467,12 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 throw refused("the preview exceeded its 45 second execution deadline");
             } catch (java.util.concurrent.ExecutionException failed) {
                 Throwable cause = failed.getCause();
-                while (cause instanceof java.util.concurrent.ExecutionException
-                        || cause instanceof java.util.concurrent.CompletionException) {
+                Set<Throwable> seen = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+                while (cause != null && seen.add(cause)) {
+                    if (cause instanceof TapstateException coded) {
+                        throw coded;
+                    }
                     cause = cause.getCause();
-                }
-                if (cause instanceof TapstateException coded) {
-                    throw coded;
                 }
                 throw refused("the isolated preview pipeline failed during execution");
             }
