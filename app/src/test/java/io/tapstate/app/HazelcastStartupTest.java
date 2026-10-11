@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -202,6 +203,133 @@ class HazelcastStartupTest {
             owner.close();
         }
         assertThat(interruptedStop).isFalse();
+    }
+
+    @Test
+    void failedOwnerConstructionPreservesTheFailureAndReleasesItsExactReservedSessionAfterShutdown() {
+        WorkloadClaim reserved = bootstrapClaim(Instant.now().plusSeconds(2));
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.release(same(reserved))).thenReturn(true);
+        var userContext = new ConcurrentHashMap<String, Object>();
+        userContext.put(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY, reserved);
+        AtomicBoolean active = new AtomicBoolean(true);
+        HazelcastInstance member = memberWhoseContextBecomesUnavailableAfterShutdown(userContext, active);
+        AtomicBoolean configured = new AtomicBoolean();
+        TapstateException failure = new TapstateException(BootError.PROFILE_SESSION_LOST, Map.of(), null);
+
+        assertThatThrownBy(() -> HazelcastConfiguration.finishPostFormation(member,
+                () -> { throw failure; }, () -> configured.set(true), store, reserved)).isSameAs(failure);
+
+        assertThat(configured).isFalse();
+        assertThat(active).isFalse();
+        verify(member).shutdown();
+        verify(store).release(same(reserved));
+        verifyNoMoreInteractions(store);
+    }
+
+    @Test
+    void postformationFailurePreservesTheBareInvariantAfterItsOwnerShutsTheMemberDown() {
+        WorkloadClaim reserved = bootstrapClaim(Instant.now().plusSeconds(2));
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.renew(any(), any())).thenReturn(Optional.of(reserved));
+        when(store.release(same(reserved))).thenReturn(true);
+        ClusterProfileStore profiles = mock(ClusterProfileStore.class);
+        var userContext = new ConcurrentHashMap<String, Object>();
+        userContext.put(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY, reserved);
+        AtomicBoolean active = new AtomicBoolean(true);
+        HazelcastInstance member = memberWhoseContextBecomesUnavailableAfterShutdown(userContext, active);
+        AtomicReference<NodeSessionLease> owned = new AtomicReference<>();
+        IllegalStateException failure = new IllegalStateException("postformation invariant failed");
+        try {
+            assertThatThrownBy(() -> HazelcastConfiguration.finishPostFormation(member, () -> {
+                NodeSessionLease owner = new NodeSessionLease(store, reserved, System.nanoTime(), Duration.ofSeconds(2),
+                        Duration.ofMillis(20), member::shutdown, profiles, HazelcastStartupTest::bootstrapIdentity, bootstrapIdentity());
+                owned.set(owner);
+                return owner;
+            }, () -> { throw failure; }, store, reserved)).isSameAs(failure);
+
+            assertThat(active).isFalse();
+            assertThat(owned.get().proof().live()).isFalse();
+            verify(member).shutdown();
+            verify(store, times(1)).release(same(reserved));
+        } finally {
+            if (owned.get() != null) { owned.get().close(); }
+        }
+    }
+
+    @Test
+    void anOwnerLostDuringConstructionCannotBeReleasedAsAnUnownedReservation() throws Exception {
+        WorkloadClaim reserved = bootstrapClaim(Instant.now().plusSeconds(2));
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.renew(any(), any())).thenReturn(Optional.empty());
+        ClusterProfileStore profiles = mock(ClusterProfileStore.class);
+        var userContext = new ConcurrentHashMap<String, Object>();
+        userContext.put(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY, reserved);
+        AtomicBoolean active = new AtomicBoolean(true);
+        HazelcastInstance member = memberWhoseContextBecomesUnavailableAfterShutdown(userContext, active);
+        AtomicReference<NodeSessionLease> owned = new AtomicReference<>();
+        CountDownLatch stopped = new CountDownLatch(1);
+        try {
+            assertThatThrownBy(() -> HazelcastConfiguration.finishPostFormation(member, () -> {
+                NodeSessionLease owner = new NodeSessionLease(store, reserved, System.nanoTime(), Duration.ofSeconds(2),
+                        Duration.ofMillis(20), () -> { member.shutdown(); stopped.countDown(); }, profiles,
+                        HazelcastStartupTest::bootstrapIdentity, bootstrapIdentity());
+                owned.set(owner);
+                try {
+                    assertThat(stopped.await(1, TimeUnit.SECONDS))
+                            .as("the refused immediate renewal must stop the member before owner publication").isTrue();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while waiting for the refused startup owner", interrupted);
+                }
+                return owner;
+            }, () -> { }, store, reserved)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(BootError.PROFILE_SESSION_LOST));
+
+            assertThat(active).isFalse();
+            assertThat(owned.get().proof().live()).isFalse();
+            assertThat(userContext.get(HazelcastConfiguration.NODE_SESSION_OWNER_CONTEXT_KEY)).isSameAs(owned.get());
+            verify(store, never()).release(any());
+        } finally {
+            if (owned.get() != null) { owned.get().close(); }
+        }
+    }
+
+    @Test
+    void anAlreadyInactiveMemberStillReleasesItsUnownedReservationAndReportsTheNativeCause() {
+        WorkloadClaim reserved = bootstrapClaim(Instant.now().plusSeconds(2));
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.release(same(reserved))).thenReturn(true);
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        HazelcastInstanceNotActiveException cause = new HazelcastInstanceNotActiveException();
+        when(member.getUserContext()).thenThrow(cause);
+        AtomicBoolean supplied = new AtomicBoolean();
+        AtomicBoolean configured = new AtomicBoolean();
+
+        Throwable failure = catchThrowable(() -> HazelcastConfiguration.finishPostFormation(member, () -> {
+            supplied.set(true);
+            return NodeSessionLease.inactive();
+        }, () -> configured.set(true), store, reserved));
+
+        assertThat(supplied).isFalse();
+        assertThat(configured).isFalse();
+        verify(store).release(same(reserved));
+        verifyNoMoreInteractions(store);
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, coded -> {
+            assertThat(coded.code()).isEqualTo(BootError.HAZELCAST_UNAVAILABLE);
+            assertThat(coded.getCause()).isSameAs(cause);
+        });
+    }
+
+    private static HazelcastInstance memberWhoseContextBecomesUnavailableAfterShutdown(
+            ConcurrentHashMap<String, Object> userContext, AtomicBoolean active) {
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenAnswer(call -> {
+            if (!active.get()) { throw new HazelcastInstanceNotActiveException(); }
+            return userContext;
+        });
+        doAnswer(call -> { active.set(false); return null; }).when(member).shutdown();
+        return member;
     }
 
     private static WorkloadClaim bootstrapClaim(Instant until) {

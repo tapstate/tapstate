@@ -52,6 +52,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -175,98 +177,111 @@ class HazelcastConfiguration {
                     io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
                     ClusterMembershipGate.PROTECTION_NAME);
         }
+        return finishPostFormation(member,
+                () -> createNodeSessionLease(member, clusterProperties, workloadClaims, clusterProfiles), () -> {
+            if (member.getUserContext().get(NODE_SESSION_CONTEXT_KEY) instanceof io.tapstate.spi.store.WorkloadClaim) {
+                StorePort store = storePorts.getIfAvailable();
+                if (store != null) endWhatDepartedMembersLeaveOpen(member, store);
+            }
+            // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
+            // engine that no longer exists. Have that written down on the member: the engine reads it to fail the
+            // pipelines the member carried, and the process's liveness reads it to report the process broken.
+            MemberOutOfMemory.watch(member);
+            // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
+            // Jet source and resolved member-side -- can reach it through the user context and publish durable
+            // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
+            if (srsMetaStore != null) {
+                member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, srsMetaStore);
+            }
+            // Bind the change log too, so the capture runtime can cut it back at the durable frontier. The
+            // rings already reach it through their own configuration; this is the same store, reached the way
+            // everything else the runtime resolves member-side is reached. A run with no store binds nothing,
+            // and nothing is cut -- because nothing was written down either.
+            if (srsLogStore != null) {
+                member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, srsLogStore);
+            }
+            // Bind the connector provisioner onto the member so a sink-writer factory -- carried onto the Jet
+            // sink vertex and resolved member-side -- can reach it and open its target connector. A run with no
+            // provisioner (mongo disabled) binds nothing, and the member is then not sink-capable: a sink open
+            // fails loudly rather than silently dropping writes.
+            if (connectorProvisioner != null) {
+                member.getUserContext().put(
+                        PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY, connectorProvisioner);
+                // One table of shared sink connectors per member. Only an artifact certified to serve several writers
+                // at once ever enters it; every other artifact runs a connector per writer, as it always has.
+                member.getUserContext().put(
+                        PdkSinkWriterFactory.SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY, new SharedSinkConnectors());
+            }
+            // Bind the layer a connector's own notes are kept in onto the member, for the same reason the
+            // provisioner is: the sink-writer factory crosses to whichever member runs the sink vertex and a live
+            // store does not survive the crossing, so the node travels and the store is picked up where the
+            // connector is actually opened. The read side needs no such indirection -- it opens its connector in
+            // the process that holds the store -- which is why only the write side reaches through here. A run
+            // with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes for the life
+            // of the open, exactly as it did before there was anywhere to file them.
+            if (nestStateStore != null) {
+                member.getUserContext().put(
+                        PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY, nestStateStore);
+            }
+            // Bind the snapshot buffer onto the member so a source vertex -- resolved member-side by the ring name
+            // it carries -- can drain this ring's snapshot rows and emit them ahead of the cdc tail. The coordinator
+            // holds the same instance and fills it through the snapshot pass-through. A run with no buffer (mongo
+            // disabled) binds nothing, and a source then emits no snapshot ahead of the tail.
+            if (snapshotBuffer != null) {
+                member.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, snapshotBuffer);
+            }
+            // Bind the layer behind the nest state maps onto the member, so a store named in a map's
+            // configuration -- and built by the substrate on whichever member runs that map -- can reach it.
+            // The configuration carries the name and not the instance because a configuration added once the
+            // member is running is written down and broadcast, and a live store does not survive that. A run
+            // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
+            if (operatorStateStores != null) {
+                NestStateMapStoreFactory.bindTo(member, operatorStateStores);
+            } else if (nestStateStore != null) {
+                NestStateMapStoreFactory.bindTo(member, nestStateStore);
+            }
+            if (nestStateStore != null) {
+                // The same layer, bound again under the join's own key. One key shared between them would
+                // read as tidier and would make "these two are told about different layers" impossible to
+                // say - which is a thing a deployment may one day want to say, and a thing neither of them
+                // could then express without the other noticing.
+                JoinStateMapStoreFactory.bindTo(member, nestStateStore);
+            }
+            if (operatorStateStores != null) {
+                makeNestCapable(member, operatorStateStores, nestSettings);
+            } else {
+                makeNestCapable(member, nestStateStore, nestSettings);
+            }
+            makeJoinCapable(member, nestStateStore);
+            // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
+            // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
+            // reached through a handle that does not survive being written into a graph. A run with no store
+            // (mongo disabled) binds nothing, and a nest vertex then refuses to start rather than running on
+            // with nowhere to put what it cannot assemble -- which is the failure this channel exists to stop.
+            if (operatorStateStores != null) {
+                DurableNestDeadLetter.bindTo(member, operatorStateStores);
+            } else if (nestDeadLetterStore != null) {
+                DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
+            }
+        }, claimStore, identity == null ? null : identity.nodeSession());
+    }
+
+    /** Completes formation and releases only a reservation whose renewal owner was never installed. */
+    static HazelcastInstance finishPostFormation(HazelcastInstance member, Supplier<NodeSessionLease> startOwner,
+            Runnable configure, @Nullable WorkloadClaimStore claimStore,
+            @Nullable io.tapstate.spi.store.WorkloadClaim reservedSession) {
+        ConcurrentMap<String, Object> userContext = null;
         try {
-            return finishPostFormation(member,
-                    () -> createNodeSessionLease(member, clusterProperties, workloadClaims, clusterProfiles), () -> {
-                if (member.getUserContext().get(NODE_SESSION_CONTEXT_KEY) instanceof io.tapstate.spi.store.WorkloadClaim) {
-                    StorePort store = storePorts.getIfAvailable();
-                    if (store != null) endWhatDepartedMembersLeaveOpen(member, store);
-                }
-                // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
-                // engine that no longer exists. Have that written down on the member: the engine reads it to fail the
-                // pipelines the member carried, and the process's liveness reads it to report the process broken.
-                MemberOutOfMemory.watch(member);
-                // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
-                // Jet source and resolved member-side -- can reach it through the user context and publish durable
-                // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
-                if (srsMetaStore != null) {
-                    member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, srsMetaStore);
-                }
-                // Bind the change log too, so the capture runtime can cut it back at the durable frontier. The
-                // rings already reach it through their own configuration; this is the same store, reached the way
-                // everything else the runtime resolves member-side is reached. A run with no store binds nothing,
-                // and nothing is cut -- because nothing was written down either.
-                if (srsLogStore != null) {
-                    member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, srsLogStore);
-                }
-                // Bind the connector provisioner onto the member so a sink-writer factory -- carried onto the Jet
-                // sink vertex and resolved member-side -- can reach it and open its target connector. A run with no
-                // provisioner (mongo disabled) binds nothing, and the member is then not sink-capable: a sink open
-                // fails loudly rather than silently dropping writes.
-                if (connectorProvisioner != null) {
-                    member.getUserContext().put(
-                            PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY, connectorProvisioner);
-                    // One table of shared sink connectors per member. Only an artifact certified to serve several writers
-                    // at once ever enters it; every other artifact runs a connector per writer, as it always has.
-                    member.getUserContext().put(
-                            PdkSinkWriterFactory.SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY, new SharedSinkConnectors());
-                }
-                // Bind the layer a connector's own notes are kept in onto the member, for the same reason the
-                // provisioner is: the sink-writer factory crosses to whichever member runs the sink vertex and a live
-                // store does not survive the crossing, so the node travels and the store is picked up where the
-                // connector is actually opened. The read side needs no such indirection -- it opens its connector in
-                // the process that holds the store -- which is why only the write side reaches through here. A run
-                // with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes for the life
-                // of the open, exactly as it did before there was anywhere to file them.
-                if (nestStateStore != null) {
-                    member.getUserContext().put(
-                            PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY, nestStateStore);
-                }
-                // Bind the snapshot buffer onto the member so a source vertex -- resolved member-side by the ring name
-                // it carries -- can drain this ring's snapshot rows and emit them ahead of the cdc tail. The coordinator
-                // holds the same instance and fills it through the snapshot pass-through. A run with no buffer (mongo
-                // disabled) binds nothing, and a source then emits no snapshot ahead of the tail.
-                if (snapshotBuffer != null) {
-                    member.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, snapshotBuffer);
-                }
-                // Bind the layer behind the nest state maps onto the member, so a store named in a map's
-                // configuration -- and built by the substrate on whichever member runs that map -- can reach it.
-                // The configuration carries the name and not the instance because a configuration added once the
-                // member is running is written down and broadcast, and a live store does not survive that. A run
-                // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
-                if (operatorStateStores != null) {
-                    NestStateMapStoreFactory.bindTo(member, operatorStateStores);
-                } else if (nestStateStore != null) {
-                    NestStateMapStoreFactory.bindTo(member, nestStateStore);
-                }
-                if (nestStateStore != null) {
-                    // The same layer, bound again under the join's own key. One key shared between them would
-                    // read as tidier and would make "these two are told about different layers" impossible to
-                    // say - which is a thing a deployment may one day want to say, and a thing neither of them
-                    // could then express without the other noticing.
-                    JoinStateMapStoreFactory.bindTo(member, nestStateStore);
-                }
-                if (operatorStateStores != null) {
-                    makeNestCapable(member, operatorStateStores, nestSettings);
-                } else {
-                    makeNestCapable(member, nestStateStore, nestSettings);
-                }
-                makeJoinCapable(member, nestStateStore);
-                // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
-                // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
-                // reached through a handle that does not survive being written into a graph. A run with no store
-                // (mongo disabled) binds nothing, and a nest vertex then refuses to start rather than running on
-                // with nowhere to put what it cannot assemble -- which is the failure this channel exists to stop.
-                if (operatorStateStores != null) {
-                    DurableNestDeadLetter.bindTo(member, operatorStateStores);
-                } else if (nestDeadLetterStore != null) {
-                    DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
-                }
-            });
+            userContext = Objects.requireNonNull(member.getUserContext(), "member user context");
+            return finishPostFormation(member, startOwner, configure);
         } catch (RuntimeException | Error failure) {
-            if (!member.getUserContext().containsKey(NODE_SESSION_OWNER_CONTEXT_KEY) && identity != null && claimStore != null) {
-                try { claimStore.release(identity.nodeSession()); }
+            if ((userContext == null || !userContext.containsKey(NODE_SESSION_OWNER_CONTEXT_KEY))
+                    && reservedSession != null && claimStore != null) {
+                try { claimStore.release(reservedSession); }
                 catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (failure instanceof HazelcastException || failure instanceof HazelcastInstanceNotActiveException) {
+                throw new TapstateException(BootError.HAZELCAST_UNAVAILABLE, Map.of(), failure);
             }
             throw failure;
         }
@@ -277,13 +292,14 @@ class HazelcastConfiguration {
             Runnable configure) {
         NodeSessionLease owner = null;
         try {
+            var userContext = member.getUserContext();
             owner = startOwner.get();
-            member.getUserContext().put(NODE_SESSION_OWNER_CONTEXT_KEY, owner);
+            userContext.put(NODE_SESSION_OWNER_CONTEXT_KEY, owner);
             configure.run();
             NodeSessionLease.Proof proof = owner.proof();
             if (proof != null) {
                 if (!proof.live()) throw new TapstateException(BootError.PROFILE_SESSION_LOST, Map.of(), null);
-                member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, proof.claim());
+                userContext.put(NODE_SESSION_CONTEXT_KEY, proof.claim());
             }
             return member;
         } catch (RuntimeException | Error failure) {

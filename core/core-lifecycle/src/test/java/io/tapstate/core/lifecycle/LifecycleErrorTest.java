@@ -26,7 +26,9 @@ class LifecycleErrorTest {
                 // a start or resume named a draft without an executable source-to-output path
                 "lifecycle.pipeline-not-runnable",
                 // a lifecycle verb named a pipeline that was never applied
-                "lifecycle.unknown-pipeline");
+                "lifecycle.unknown-pipeline",
+                "lifecycle.cluster-capacity-refused",
+                "lifecycle.cluster-capacity-unproven");
     }
 
     @Test
@@ -44,5 +46,9 @@ class LifecycleErrorTest {
                 .containsExactlyInAnyOrder("pipeline");
         assertThat(LifecycleError.PIPELINE_NOT_RUNNABLE.placeholders())
                 .containsExactlyInAnyOrder("pipeline");
+        assertThat(LifecycleError.CLUSTER_CAPACITY_REFUSED.placeholders())
+                .containsExactlyInAnyOrder("node", "resource", "occupied", "requested", "limit");
+        assertThat(LifecycleError.CLUSTER_CAPACITY_UNPROVEN.placeholders())
+                .containsExactlyInAnyOrder("pipeline", "reason");
     }
 }
