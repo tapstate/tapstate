@@ -9,6 +9,8 @@ import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -24,11 +26,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.spy;
 
 /**
@@ -369,6 +379,153 @@ class PipelineActuationOwnershipTest {
                 .when(durable).read(ORDERS);
         assertThat(nodeA.beginExecution("orders", (expected, topology, members) -> Optional.empty()).allowed()).isFalse();
         assertThat(nodeA.currentClaim("orders")).isEmpty();
+    }
+
+    @Test
+    void aTopologyOnlyRenewalRefusalRefreshesTheSameLiveAuthorityBeforeItsShortLeaseRunsOut() {
+        ShortLeaseScene scene = shortLeaseScene();
+        WorkloadClaim original = scene.original();
+        assertThat(original.leaseUntil()).isEqualTo(T0.plus(RENEW).plusSeconds(2));
+        assertThat(scene.durable().read(ORDERS).orElseThrow().leaseRemaining()).isEqualTo(Duration.ofSeconds(2));
+        scene.addMember();
+
+        scene.ownership().renewDue();
+
+        assertThat(scene.ownership().currentClaim("orders"))
+                .as("a topology-only refusal must not discard the still-live owning authority")
+                .isPresent();
+        WorkloadClaim refreshed = scene.ownership().currentClaim("orders").orElseThrow();
+        assertThat(refreshed.key()).isEqualTo(original.key());
+        assertThat(refreshed.owner()).isEqualTo(original.owner());
+        assertThat(refreshed.claimGeneration()).isEqualTo(original.claimGeneration());
+        assertThat(refreshed.executionGeneration()).isEqualTo(original.executionGeneration());
+        assertThat(refreshed.profileGeneration()).isEqualTo(original.profileGeneration());
+        assertThat(refreshed.topologyRevision()).isEqualTo(8);
+        assertThat(refreshed.contextExecutionGeneration()).isEqualTo(original.contextExecutionGeneration());
+        assertThat(refreshed.executionClaimGeneration()).isEqualTo(original.executionClaimGeneration());
+        assertThat(refreshed.executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-b", "node-c")
+                .isEqualTo(original.executionNodeIds());
+        assertThat(refreshed.executionMembers()).isEqualTo(original.executionMembers());
+        assertThat(refreshed.executionProfile()).isEqualTo(original.executionProfile());
+        assertThat(refreshed.executionTopologyRevision()).isEqualTo(original.executionTopologyRevision());
+        assertThat(refreshed.executionIncarnation()).isEqualTo(original.executionIncarnation());
+        assertThat(refreshed.executionRevision()).isEqualTo(original.executionRevision());
+        scene.move(Duration.ofSeconds(2).plusMillis(1));
+        assertThat(scene.ownership().permit("orders").granted()).isTrue();
+        assertThat(scene.ownership().proveExecution(scene.fence()))
+                .as("the original run remains authorized after its old short lease would have expired")
+                .isTrue();
+        verify(scene.durable(), times(1)).acquire(ORDERS, NODE_A, 8, TTL);
+        verify(scene.durable(), times(1)).advanceExecution(any(WorkloadClaim.class), anyLong(), anySet());
+    }
+
+    @Test
+    void aTopologyRefreshCannotAdoptAnExpiredForeignOrChangedAuthority() {
+        for (String phase : List.of("before", "during")) {
+            for (String change : List.of("expired", "foreign", "claim", "execution", "profile")) {
+                ShortLeaseScene scene = shortLeaseScene();
+                AtomicBoolean changed = new AtomicBoolean();
+                if (phase.equals("before")) {
+                    changeAuthority(scene, change);
+                    changed.set(true);
+                } else {
+                    doAnswer(invocation -> {
+                        changeAuthority(scene, change);
+                        changed.set(true);
+                        WorkloadClaimAttempt answer = (WorkloadClaimAttempt) invocation.callRealMethod();
+                        if (!change.equals("profile")) { return answer; }
+                        WorkloadClaim anotherProfile = withNextProfile(answer.claim());
+                        return answer.acquired() ? WorkloadClaimAttempt.acquired(anotherProfile)
+                                : WorkloadClaimAttempt.refused(anotherProfile);
+                    }).when(scene.durable()).acquire(ORDERS, NODE_A, 8, TTL);
+                }
+                scene.addMember();
+
+                scene.ownership().renewDue();
+
+                assertThat(scene.ownership().currentClaim("orders")).as("%s: %s", phase, change).isEmpty();
+                assertThat(scene.ownership().permit("orders").granted()).as("%s: %s", phase, change).isFalse();
+                int issued = change.equals("execution") && changed.get() ? 2 : 1;
+                verify(scene.durable(), times(issued)).advanceExecution(any(WorkloadClaim.class), anyLong(), anySet());
+            }
+        }
+    }
+
+    @Test
+    void aFailedRenewalWithoutATopologyChangeDoesNotUseLeaseRefreshAcquire() {
+        ShortLeaseScene scene = shortLeaseScene();
+        doReturn(Optional.empty()).when(scene.durable()).renew(scene.original(), TTL);
+
+        scene.ownership().renewDue();
+
+        assertThat(scene.ownership().currentClaim("orders")).isEmpty();
+        assertThat(scene.ownership().permit("orders").granted()).isFalse();
+        verify(scene.durable(), times(1)).acquire(ORDERS, NODE_A, 7, TTL);
+        verify(scene.durable(), times(1)).advanceExecution(any(WorkloadClaim.class), anyLong(), anySet());
+    }
+
+    private static ShortLeaseScene shortLeaseScene() {
+        InMemoryWorkloadClaimStore durable = spy(new InMemoryWorkloadClaimStore());
+        durable.clockAt(T0);
+        // A store can grant less than the requested lease; the first answer has two seconds left at renewal.
+        doAnswer(invocation -> durable.acquire(ORDERS, NODE_A, 7, RENEW.plusSeconds(2)))
+                .when(durable).acquire(ORDERS, NODE_A, 7, TTL);
+        ClusterMembershipGate gate = eligibleGate();
+        gate.canCommit(Set.of("node-a", "node-b", "node-c"));
+        AtomicLong askedAtNanos = new AtomicLong();
+        PipelineActuationOwnership owner = new PipelineActuationOwnership("cluster-a", NODE_A, gate,
+                new ClusterWorkloadClaims(durable, gate), TTL, RENEW, askedAtNanos::get);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        var run = owner.beginExecution("orders");
+        assertThat(run.allowed()).isTrue();
+        ShortLeaseScene scene = new ShortLeaseScene(owner, durable, gate, askedAtNanos,
+                owner.currentClaim("orders").orElseThrow(), run.fence());
+        scene.move(RENEW);
+        return scene;
+    }
+
+    private static void changeAuthority(ShortLeaseScene scene, String change) {
+        switch (change) {
+            case "expired" -> scene.move(Duration.ofSeconds(3));
+            case "foreign" -> {
+                assertThat(scene.durable().release(scene.original())).isTrue();
+                assertThat(scene.durable().acquire(ORDERS, NODE_B, 7, TTL).acquired()).isTrue();
+            }
+            case "claim" -> {
+                assertThat(scene.durable().release(scene.original())).isTrue();
+                assertThat(scene.durable().acquire(ORDERS, NODE_A, 7, TTL).claim().claimGeneration())
+                        .isEqualTo(scene.original().claimGeneration() + 1);
+            }
+            case "execution" -> assertThat(scene.durable().advanceExecution(scene.original(), 7,
+                    scene.original().executionNodeIds())).isPresent();
+            case "profile" -> doAnswer(invocation -> {
+                WorkloadClaimReading reading = (WorkloadClaimReading) ((Optional<?>) invocation.callRealMethod()).orElseThrow();
+                return Optional.of(new WorkloadClaimReading(withNextProfile(reading.claim()), reading.leaseRemaining()));
+            }).when(scene.durable()).read(ORDERS);
+            default -> throw new IllegalStateException("unexpected authority change");
+        }
+    }
+
+    private static WorkloadClaim withNextProfile(WorkloadClaim claim) {
+        return new WorkloadClaim(claim.key(), claim.owner(), claim.claimGeneration(), claim.executionGeneration(),
+                claim.topologyRevision(), claim.leaseUntil(), claim.contextExecutionGeneration(), claim.executionClaimGeneration(),
+                claim.executionNodeIds(), claim.failureClaimGeneration(), claim.failureAfterMemberLoss(), claim.profileGeneration() + 1,
+                claim.executionProfile(), claim.executionTopologyRevision(), claim.executionIncarnation(), claim.executionRevision(),
+                claim.executionMembers());
+    }
+
+    private record ShortLeaseScene(PipelineActuationOwnership ownership, InMemoryWorkloadClaimStore durable,
+            ClusterMembershipGate gate, AtomicLong nanos, WorkloadClaim original, ExecutionFence fence) {
+        void move(Duration elapsed) {
+            durable.elapse(elapsed);
+            nanos.addAndGet(elapsed.toNanos());
+        }
+
+        void addMember() {
+            Set<String> current = Set.of("node-a", "node-b", "node-c", "node-d");
+            gate.install(new ClusterMembership("cluster-a", 8, current));
+            gate.canCommit(current);
+        }
     }
 
     private PipelineActuationOwnership ownership(WorkloadOwner owner) {

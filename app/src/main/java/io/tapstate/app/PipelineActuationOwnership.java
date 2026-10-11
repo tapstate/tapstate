@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -264,8 +265,7 @@ final class PipelineActuationOwnership {
         WorkloadClaim expected = state.claim;
         Optional<WorkloadClaim> advanced;
         try {
-            // At the claim's own topology revision, which is the committed one: a revision change refuses
-            // the renew above, so a claim still held is a claim granted under the current topology.
+            // The allocation is fenced under the acquisition revision carried by the exact owning claim.
             advanced = Objects.requireNonNull(advance, "advance")
                     .advance(expected, expected.topologyRevision(), runMembers);
         } catch (RuntimeException unreachable) {
@@ -454,10 +454,9 @@ final class PipelineActuationOwnership {
      * A run submitted over a claim this member no longer holds dies at its first write, and the member that
      * holds the pipeline then reads that death as the pipeline's.
      *
-     * <p>Read rather than renewed: what is asked is who holds the run's generations now, and a renewal is
-     * also refused for a claim granted under a topology revision a member joining has since moved, which
-     * the same owner takes again on its next pass under the same generations. True on a single node, where
-     * nothing is fenced.
+     * <p>Read rather than renewed: this proves the run's generations independently of a topology-only
+     * lease refresh. The renewer refreshes acquisition topology while that same authority remains live.
+     * True on a single node, where nothing is fenced.
      */
     boolean proveExecution(ExecutionFence fence) {
         if (!fenced || fence == null) {
@@ -691,7 +690,10 @@ final class PipelineActuationOwnership {
     private Permit renew(Held state, long now) {
         Optional<WorkloadClaim> renewed;
         try {
-            renewed = claims.renew(state.claim, ttl);
+            ClusterMembership current = membership.committed();
+            renewed = current != null && current.revision() != state.claim.topologyRevision()
+                    ? refreshAcquisitionTopology(state.claim, current.revision())
+                    : claims.renew(state.claim, ttl);
         } catch (RuntimeException unreachable) {
             // The coordination store is the only thing that can say this member still owns the pipeline,
             // and it did not answer. Unproved is the same as lost here: the alternative is to keep driving
@@ -706,6 +708,34 @@ final class PipelineActuationOwnership {
         }
         state.claim = renewed.get();
         return new Permit(true, state.claim);
+    }
+
+    /** Refreshes acquisition topology only while the original authority and execution remain proved. */
+    private Optional<WorkloadClaim> refreshAcquisitionTopology(WorkloadClaim expected, long topologyRevision) {
+        WorkloadClaimFence authority = WorkloadClaimFence.from(expected);
+        return claims.read(expected.key()).filter(WorkloadClaimReading::leased)
+                .map(WorkloadClaimReading::claim)
+                .filter(current -> authority.sameAuthorityAs(WorkloadClaimFence.from(current))
+                        && sameFrozenExecution(expected, current))
+                .flatMap(current -> claims.acquire(expected.key(), expected.owner(), topologyRevision, ttl))
+                .filter(WorkloadClaimAttempt::acquired)
+                .map(WorkloadClaimAttempt::claim)
+                .filter(refreshed -> refreshed.topologyRevision() == topologyRevision
+                        && authority.sameAuthorityAs(WorkloadClaimFence.from(refreshed))
+                        && sameFrozenExecution(expected, refreshed));
+    }
+
+    private static boolean sameFrozenExecution(WorkloadClaim expected, WorkloadClaim actual) {
+        return expected.contextExecutionGeneration() == actual.contextExecutionGeneration()
+                && expected.executionClaimGeneration() == actual.executionClaimGeneration()
+                && expected.executionNodeIds().equals(actual.executionNodeIds())
+                && expected.executionMembers().equals(actual.executionMembers())
+                && Objects.equals(expected.executionProfile(), actual.executionProfile())
+                && Objects.equals(expected.executionTopologyRevision(), actual.executionTopologyRevision())
+                && Objects.equals(expected.executionIncarnation(), actual.executionIncarnation())
+                && Objects.equals(expected.executionRevision(), actual.executionRevision())
+                && expected.failureClaimGeneration() == actual.failureClaimGeneration()
+                && expected.failureAfterMemberLoss() == actual.failureAfterMemberLoss();
     }
 
     private Permit acquire(String pipelineId, Held state, long now) {
