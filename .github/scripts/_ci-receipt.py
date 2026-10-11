@@ -194,10 +194,171 @@ def dependency_models(repository, hashes):
                     attributes = dict(line.split(': ', 1) for line in manifest.splitlines() if ': ' in line)
                     if attributes.get('Implementation-Title') == gav[1] and attributes.get('Implementation-Version') == gav[2]:
                         fact.update(producer_identity_verified=True, producer_identity_source='embedded-implementation-manifest')
+                    elif attributes.get('Bundle-SymbolicName') == gav[0] + '.' + gav[1] and attributes.get('Bundle-Version') == gav[2]:
+                        fact.update(producer_identity_verified=True, producer_identity_source='embedded-osgi-manifest')
         except (ValueError, OSError, UnicodeError, zipfile.BadZipFile):
             fact.update(archive_type_verified=False, producer_identity_verified=False, producer_identity_source=None)
         producers[relative] = fact
     return models, producers
+
+
+def class_structure(data):
+    """Read only JVM Class constants and the class header; never emit other UTF8 constants."""
+    require(data[:4] == b'\xca\xfe\xba\xbe' and 12 <= len(data) <= 32 * 1024 * 1024, 'invalid runtime class bytes')
+    count = int.from_bytes(data[8:10], 'big')
+    position, slot, strings, classes = 10, 1, {}, {}
+    sizes = {3: 4, 4: 4, 5: 8, 6: 8, 8: 2, 9: 4, 10: 4, 11: 4, 12: 4, 15: 3, 16: 2, 17: 4, 18: 4, 19: 2, 20: 2}
+    while slot < count:
+        require(position < len(data), 'truncated runtime constant pool')
+        tag = data[position]; position += 1
+        if tag == 1:
+            require(position + 2 <= len(data), 'truncated runtime class string')
+            length = int.from_bytes(data[position:position+2], 'big'); position += 2
+            strings[slot] = data[position:position+length]; position += length
+        elif tag == 7:
+            require(position+2 <= len(data), 'truncated runtime Class constant')
+            classes[slot] = int.from_bytes(data[position:position+2], 'big'); position += 2
+        else:
+            require(tag in sizes, 'unsupported runtime constant pool tag')
+            position += sizes[tag]
+        require(position <= len(data), 'truncated runtime constant pool value')
+        slot += 2 if tag in (5, 6) else 1
+    def name(index):
+        if not index: return None
+        require(index in classes and classes[index] in strings, 'invalid runtime class reference')
+        value = strings[classes[index]].decode('utf-8')
+        require(re.fullmatch(r'(?:\[+(?:[ZBCSIJFD]|L[\w$/]+;)|[\w$/]+)', value), 'unsafe runtime class name')
+        return value
+    require(position+8 <= len(data), 'truncated runtime class header')
+    flags, this, parent, interfaces = (int.from_bytes(data[position+i:position+i+2], 'big') for i in [0,2,4,6])
+    require(position+8+interfaces*2 <= len(data), 'truncated runtime interface list')
+    return dict(name=name(this), access_flags=flags, super_class=name(parent),
+                interfaces=[name(int.from_bytes(data[position+8+i*2:position+10+i*2], 'big')) for i in range(interfaces)],
+                class_references=sorted({name(index) for index in classes}))
+
+
+def runtime_class_metadata(args, value):
+    if not args.runtime_class_dir:
+        return dict(enabled=False), []
+    require(args.phase == 'post-test-before-pack' and os.environ.get('RUNNER_TEMP'), 'runtime metadata requires a post-test worker capture')
+    directory = Path(args.runtime_class_dir)
+    worker = Path(os.environ['RUNNER_TEMP']).resolve()
+    require(directory.is_absolute() and directory.name == 'ci-runtime-bytecode' and '..' not in directory.parts
+            and directory.absolute() == Path(os.environ['RUNNER_TEMP']).absolute() / 'ci-runtime-bytecode'
+            and Path(args.output).resolve().parent.parent == worker, 'runtime bytecode must stay outside input artifacts in the worker sibling')
+    require(directory.is_dir() and not directory.is_symlink() and not directory.resolve().is_relative_to(Path(args.root).resolve()), 'unsafe runtime dump root')
+    origin_path = directory / 'capture-origin.json'
+    require(origin_path.is_file() and not origin_path.is_symlink(), 'missing runtime dump origin')
+    origin = json.loads(origin_path.read_text())
+    require(isinstance(origin, dict), 'invalid runtime origin object')
+    execution = origin.get('execution')
+    require(execution in ['github-actions','local'], 'invalid runtime execution origin')
+    require(origin.get('run_attempt') is None or type(origin['run_attempt']) is int, 'invalid runtime attempt type')
+    run_id = origin.get('run_id') if execution == 'github-actions' else 'local'
+    attempt = origin.get('run_attempt') if execution == 'github-actions' else 1
+    require(type(origin.get('schema')) is int and origin['schema'] == 1 and origin.get('source_sha') == value['source_sha']
+            and str(run_id) == str(value['run_id']) and str(attempt) == str(value['run_attempt'])
+            and origin.get('status') == 'success' and re.fullmatch(r'[0-9a-f]{32}', origin.get('invocation_id', ''))
+            and isinstance(origin.get('shard_id'), str) and origin['shard_id'], 'runtime dump source/run/attempt/verify differs')
+    require(origin.get('runtime_class_capture') == dict(enabled=True, jacoco_version='0.8.13', raw_scope='worker-private-input-sibling')
+            and value['jacoco_version'] == '0.8.13', 'runtime dump must use the existing pinned JaCoCo agent')
+    verify = origin.get('verify', {})
+    reset = origin.get('reset', {})
+    for phase, record in [('reset-test-evidence', reset), ('selected-verify', verify)]:
+        require(isinstance(record, dict) and type(record.get('schema')) is int and record['schema']==1
+                and record.get('command')=='run' and record.get('phase')==phase and record.get('event')=='end'
+                and record.get('status')=='success' and record.get('execution')==execution
+                and record.get('cohort_hash')==origin.get('cohort_hash') and record.get('source_sha')==value['source_sha']
+                and record.get('shard_id')==origin['shard_id'] and record.get('run_id')==origin.get('run_id')
+                and record.get('run_attempt')==origin.get('run_attempt')
+                and (record.get('run_attempt') is None or type(record['run_attempt']) is int), 'runtime dump verification provenance differs')
+        start, end, elapsed = [record.get(key) for key in ['started_monotonic_ns','monotonic_ns','elapsed_ns']]
+        require(all(type(number) is int and number>=0 for number in [start,end,elapsed])
+                and end>=start and elapsed==end-start, 'runtime dump interval differs')
+        require(isinstance(record.get('utc'), str) and isinstance(record.get('ended_utc'), str), 'runtime dump UTC origin missing')
+        started_utc=datetime.fromisoformat(record['utc'].replace('Z','+00:00'))
+        ended_utc=datetime.fromisoformat(record['ended_utc'].replace('Z','+00:00'))
+        require(started_utc.tzinfo is not None and ended_utc.tzinfo is not None and ended_utc>=started_utc, 'runtime dump UTC interval differs')
+    require(verify['started_monotonic_ns']>=reset['monotonic_ns']
+            and datetime.fromisoformat(verify['utc'].replace('Z','+00:00'))>=datetime.fromisoformat(reset['ended_utc'].replace('Z','+00:00')), 'runtime verify precedes fresh reset')
+    require(isinstance(origin.get('cohort_hash'), str) and re.fullmatch(r'[0-9a-f]{64}',origin['cohort_hash']), 'runtime cohort binding missing')
+    before = Path(args.output).resolve().parent / 'build-inputs.json'
+    build_hash = origin.get('case_observer', {}).get('build_inputs_sha256')
+    require(before.is_file() and not before.is_symlink() and isinstance(build_hash,str)
+            and re.fullmatch(r'[0-9a-f]{64}',build_hash) and digest(before)==build_hash, 'runtime pre-test input byte binding differs')
+    known = {}
+    for ids, hashes, segment, label in [('production_class_ids','production_files','/target/classes/','production'),
+                                        ('test_class_ids','test_files','/target/test-classes/','test')]:
+        for relative, identity in value[ids].items():
+            classname = relative.split(segment,1)[1].removesuffix('.class')
+            known.setdefault(classname, []).append(dict(name=classname,class_id=identity,sha256=value[hashes][relative],origin=label))
+    entries = {}
+    for classpath in value['resolved_test_classpaths'].values():
+        for entry in classpath:
+            entries[entry['identity']] = entry
+            for name, record in entry['own_classes'].items():
+                known.setdefault(name, []).append(dict(name=name,class_id=record['class_id'],sha256=record['sha256'],origin='resolved-classpath'))
+    candidates = []
+    dump_count, dump_bytes, own_count, known_count = 0, 0, 0, 0
+    for path in safe_files(directory):
+        if path == origin_path: continue
+        require(path.suffix == '.class', 'unexpected private runtime dump file')
+        dump_count += 1; dump_bytes += path.stat().st_size
+        relative = path.relative_to(directory).as_posix()
+        if not relative.startswith('io/tapstate/'): continue
+        own_count += 1
+        data = path.read_bytes(); structure = class_structure(data); identity = crc64(data); checksum = hashlib.sha256(data).hexdigest()
+        require(relative == structure['name'] + '.' + identity + '.class', 'runtime dump filename/name/CRC differs')
+        if structure['name'] in known:
+            require(any(record['class_id']==identity and record['sha256']==checksum for record in known[structure['name']]),
+                    'runtime dump differs from compiled class with the same name')
+            known_count += 1
+            continue
+        references = structure['class_references']
+        normalized_references = {ref.lstrip('[').removeprefix('L').removesuffix(';') if ref.startswith('[') else ref for ref in references}
+        compiled = {json.dumps(record,sort_keys=True):record for ref in normalized_references for record in known.get(ref,[])}
+        framework = {'spring_cglib': [], 'mockito': [], 'bytebuddy': []}
+        for ref in references:
+            normalized = ref.lstrip('[').removeprefix('L').removesuffix(';') if ref.startswith('[') else ref
+            for family,prefix in [('spring_cglib','org/springframework/cglib/'),('mockito','org/mockito/'),('bytebuddy','net/bytebuddy/')]:
+                if normalized.startswith(prefix): framework[family].append(normalized)
+        framework = {family: sorted(set(values)) for family,values in framework.items()}
+        candidates.append(dict(**structure,class_id=identity,sha256=checksum,compiled_references=sorted(compiled.values(),key=lambda r:(r['name'],r['class_id'],r['origin'])),framework_references=framework,framework_origins=[]))
+    # Pin framework structure references only to actual resolved, hash-bound JARs.
+    jar_cache = {}
+    for candidate in candidates:
+        wanted = {ref for references in candidate['framework_references'].values() for ref in references}
+        for identity, entry in entries.items():
+            if not identity.endswith('.jar'): continue
+            scope,_,relative = identity.partition('/')
+            model = value['dependency_coordinate_models'].get(relative[:-4]+'.pom', {}) if scope=='repository' else {}
+            if not model.get('coordinate_type_verified') or not model.get('gav') or not model['gav'][0].startswith(('org.springframework','org.mockito','net.bytebuddy')):
+                continue
+            path = Path(args.repo_local).resolve()/relative if scope=='repository' else Path(args.root).resolve()/relative
+            if identity not in jar_cache:
+                require(digest(path)==entry['sha256'], 'runtime framework dependency bytes differ from captured input')
+                with zipfile.ZipFile(path) as archive: jar_cache[identity] = set(archive.namelist())
+            matching = sorted(ref for ref in wanted if ref+'.class' in jar_cache[identity])
+            if matching:
+                require(model.get('coordinate_type_verified'), 'runtime framework coordinates are unproven')
+                candidate['framework_origins'].append(dict(gav=model['gav'],sha256=entry['sha256'],class_references=matching))
+        captured = {ref for source in candidate['framework_origins'] for ref in source['class_references']}
+        candidate['unresolved_framework_references'] = sorted(wanted-captured)
+        candidate['ambiguous_framework_references'] = sorted(ref for ref in wanted
+            if len({source['sha256'] for source in candidate['framework_origins'] if ref in source['class_references']})>1)
+    ids_by_name = {}
+    for candidate in candidates: ids_by_name.setdefault(candidate['name'], []).append(candidate['class_id'])
+    for candidate in candidates:
+        normalized = {ref.lstrip('[').removeprefix('L').removesuffix(';') if ref.startswith('[') else ref for ref in candidate['class_references']}
+        candidate['runtime_references'] = [dict(name=ref,class_ids=sorted(set(ids_by_name[ref]))) for ref in sorted(normalized) if ref in ids_by_name and ref!=candidate['name']]
+    agent = 'org/jacoco/org.jacoco.agent/0.8.13/org.jacoco.agent-0.8.13-runtime.jar'
+    require(agent in value['dependency_repository_files'] and digest(Path(args.repo_local).resolve()/agent)==value['dependency_repository_files'][agent], 'runtime JaCoCo agent byte binding missing or changed')
+    capture = dict(enabled=True,jacoco_version='0.8.13',agent_sha256=value['dependency_repository_files'][agent],
+                   source_sha=origin['source_sha'],run_id=str(run_id),run_attempt=int(attempt),shard_id=origin['shard_id'],
+                   invocation_id=origin['invocation_id'],status='success',reset=reset,verify=verify,cohort_hash=origin['cohort_hash'],
+                   build_inputs_sha256=build_hash,capture_origin_sha256=digest(origin_path),raw_bytes_uploaded=False,
+                   dump_class_count=dump_count,dump_byte_count=dump_bytes,own_dump_class_count=own_count,known_dump_class_count=known_count,candidate_class_count=len(candidates))
+    return capture, sorted(candidates,key=lambda r:(r['name'],r['class_id']))
 
 
 def inputs(args):
@@ -300,10 +461,12 @@ def inputs(args):
              'toolchain': {'java': java.stderr,
                            'maven': command(['mvn', '--version']), 'os': platform.platform(), 'architecture': platform.machine(),
                            'cpu_count': os.cpu_count()},
-             'elapsed_seconds': (time.monotonic_ns() - start) / 1e9}
+             'elapsed_seconds': None}
+    value['runtime_class_capture'], value['runtime_generated_classes'] = runtime_class_metadata(args, value)
     if args.resolve_classpath:
         expected_modules = {t['module'] for t in shards.discover(root)}
         require(expected_modules <= set(classpaths), 'selected test module classpaths missing: ' + str(sorted(expected_modules - set(classpaths))))
+    value['elapsed_seconds'] = (time.monotonic_ns() - start) / 1e9
     write(Path(args.output), value)
     print('CI_PHASE_JSON ' + json.dumps({'schema': 1, 'phase': 'capture-build-inputs', 'input_phase': args.phase, 'event': 'end',
                                          'elapsed_seconds': value['elapsed_seconds'], 'status': 'success'}))
@@ -486,6 +649,7 @@ def main():
     p.add_argument('--output', required=True)
     p.add_argument('--resolve-classpath', action='store_true')
     p.add_argument('--phase', choices=['pre-test-after-install', 'post-test-before-pack'], default='pre-test-after-install')
+    p.add_argument('--runtime-class-dir', help='private existing-JaCoCo class dumps in the worker input sibling')
     p = commands.add_parser('resources')
     p.add_argument('--root', default='.')
     p.add_argument('--output', required=True)

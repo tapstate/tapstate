@@ -220,6 +220,42 @@ with tempfile.TemporaryDirectory() as tmp:
     assert it_receipt['checked_scopes']==[dict(module='e2e',kind='it',dependency_excludes=['io.tapstate:mcp-server'])]
     reject_observer(opted,'e2e/unit')
     put('e2e/pom.xml',saved_pom); classpaths['e2e']=[ordinary]; build_inputs()
+    # Existing agent dumps stay in a fresh private worker sibling, outside metadata/artifact inputs.
+    with tempfile.TemporaryDirectory() as worker_tmp:
+        worker=pathlib.Path(worker_tmp); capture_inputs=worker/'ci-inputs'; capture_inputs.mkdir()
+        captured=capture_inputs/'build-inputs.json'; captured.write_text((root/'build-inputs.json').read_text())
+        runtime_command=opted.copy(); runtime_command[runtime_command.index('--build-inputs')+1]=str(captured)
+        runtime=worker/'ci-runtime-bytecode'
+        runtime_command+=['--runtime-class-dir',str(runtime)]
+        runtime_env={**environment,'RUNNER_TEMP':str(worker)}
+        success=subprocess.run(runtime_command,env=runtime_env,capture_output=True,text=True)
+        assert success.returncode==0,success.stdout+success.stderr
+        runtime_args=(root/'mvn-args').read_text().splitlines()
+        runtime_flag='-Djacoco.classDumpDir='+str(runtime.resolve())
+        assert runtime_args.count(runtime_flag)==1
+        assert [a for a in runtime_args if a!=runtime_flag]==observed, 'runtime capture must retain the original agent/selector/lifecycle settings'
+        marker=json.loads((root/'target/ci-shards/run-rest.json').read_text())
+        origin=runtime/'capture-origin.json'
+        assert marker['runtime_class_capture']['capture_origin_sha256']==hashlib.sha256(origin.read_bytes()).hexdigest()
+        assert marker['runtime_class_capture']['build_inputs_sha256']==hashlib.sha256(captured.read_bytes()).hexdigest()
+        assert marker['runtime_class_capture']['cohort_hash']==added['cohort_hash']
+        assert json.loads(origin.read_text())['status']=='success'
+        def runtime_reject(command,message,env=runtime_env):
+            put('e2e/target/failsafe-reports/TEST-runtime-preserve.xml','must survive runtime preflight')
+            (root/'mvn-args').unlink(missing_ok=True)
+            result=subprocess.run(command,env=env,capture_output=True,text=True)
+            assert result.returncode!=0 and message in result.stderr,(message,result.stdout,result.stderr)
+            assert not (root/'mvn-args').exists()
+            assert (root/'e2e/target/failsafe-reports/TEST-runtime-preserve.xml').read_text()=='must survive runtime preflight'
+        runtime_reject(runtime_command,'must be fresh')
+        shutil.rmtree(runtime)
+        runtime.symlink_to(capture_inputs,target_is_directory=True)
+        runtime_reject(runtime_command,'unsafe runtime dump path')
+        runtime.unlink()
+        bad=runtime_command.copy(); bad[-1]=str(capture_inputs/'ci-runtime-bytecode')
+        runtime_reject(bad,'worker input sibling')
+        wrong_worker={**runtime_env,'RUNNER_TEMP':str(worker/'foreign')}
+        runtime_reject(runtime_command,'current worker',env=wrong_worker)
     # Validate every removal first: even a later unsafe path must leave all evidence untouched.
     outside_context=tempfile.TemporaryDirectory()
     outside=pathlib.Path(outside_context.name)

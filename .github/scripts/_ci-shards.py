@@ -553,10 +553,29 @@ def case_observer(args, root, plan, modules):
                 audit_elapsed_ns=time.monotonic_ns()-started)
 
 
+def fresh_runtime_directory(args, root):
+    if not args.runtime_class_dir:
+        return None
+    require(args.case_evidence and args.build_inputs, 'runtime capture requires case evidence and build inputs')
+    require(os.environ.get('RUNNER_TEMP'), 'runtime capture requires the current worker RUNNER_TEMP')
+    worker = Path(os.environ['RUNNER_TEMP']).resolve()
+    requested = Path(args.runtime_class_dir)
+    require(requested.is_absolute() and '..' not in requested.parts and requested.name == 'ci-runtime-bytecode',
+            'unsafe runtime class directory')
+    require(Path(args.build_inputs).resolve().parent.parent == worker,
+            'runtime capture must be outside the declared input directory in the current worker')
+    directory = owned_path(worker, 'ci-runtime-bytecode', 'runtime dump')
+    require(requested.absolute() == Path(os.environ['RUNNER_TEMP']).absolute() / 'ci-runtime-bytecode'
+            and not directory.is_relative_to(root), 'runtime bytecode must stay in the worker input sibling')
+    require(not directory.exists(), 'runtime class directory must be fresh')
+    return directory
+
+
 def run_shard(args, root, plan):
     shard = selected(plan, args.shard)
     require(shard['tests'], 'cannot run empty shard')
     modules = sorted({t['module'] for t in shard['tests']})
+    runtime_directory = fresh_runtime_directory(args, root)
     if args.case_evidence:
         with phase_timing('audit-case-observer', 'run', plan, shard['id']):
             observer = case_observer(args, root, plan, modules)
@@ -566,14 +585,20 @@ def run_shard(args, root, plan):
     # evidence and this shard's freshness receipt are reset in the owned checkout.
     with phase_timing('reset-test-evidence', 'run', plan, shard['id']) as reset:
         reset_test_evidence(root, shard)
+        if runtime_directory:
+            runtime_directory.mkdir()
         if args.class_gate_dir:
             # This fresh metadata directory belongs to the same declared input capture.
             owned_path(Path(args.build_inputs).resolve().parent, 'class-gates', 'observer ledger').mkdir()
     receipt = dict(schema=1, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
                    shard_id=shard['id'], invocation_id=uuid.uuid4().hex,
-                   status='running', reset=reset, case_observer=observer, **execution_identity())
+                   status='running', reset=reset, case_observer=observer,
+                   runtime_class_capture=dict(enabled=bool(runtime_directory), jacoco_version='0.8.13',
+                                              raw_scope='worker-private-input-sibling'), **execution_identity())
     marker = owned_path(root, provenance_path(shard).as_posix())
     write(marker, receipt)
+    if runtime_directory:
+        write(runtime_directory / 'capture-origin.json', receipt)
     command = ['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
     for kind, flag in [('unit', 'test'), ('it', 'it.test')]:
         names = sorted({t['class'] for t in shard['tests'] if t['kind'] == kind})
@@ -583,6 +608,8 @@ def run_shard(args, root, plan):
                     '-Djunit.jupiter.extensions.autodetection.enabled=true', '-Dtapstate.ci.case-evidence=true']
         if args.class_gate_dir:
             command += ['-Dtapstate.ci.class-gate-dir=' + str(Path(args.class_gate_dir).resolve())]
+    if runtime_directory:
+        command += ['-Djacoco.classDumpDir=' + str(runtime_directory)]
     # Selectors span several modules. Exact admission below catches any missing class;
     # Maven must permit the modules in which a selector has no local match.
     command += ['-Dsurefire.failIfNoSpecifiedTests=false', '-Dfailsafe.failIfNoSpecifiedTests=false']
@@ -595,6 +622,10 @@ def run_shard(args, root, plan):
             subprocess.run(command, cwd=root, check=True)
     finally:
         receipt.update(status=observed['status'], verify=observed)
+        if runtime_directory:
+            write(runtime_directory / 'capture-origin.json', receipt)
+            receipt['runtime_class_capture'].update(capture_origin_sha256=file_digest(runtime_directory / 'capture-origin.json'),
+                                                   build_inputs_sha256=observer['build_inputs_sha256'],cohort_hash=plan['cohort_hash'])
         write(marker, receipt)
 
 
@@ -804,6 +835,7 @@ def main():
             command.add_argument('--case-evidence', action='store_true', help='enable the passive built case observer')
             command.add_argument('--build-inputs', help='current pre-test resolved classpaths required by the observer')
             command.add_argument('--class-gate-dir', help='fresh metadata directory beside the declared input capture')
+            command.add_argument('--runtime-class-dir', help='fresh private worker sibling for existing JaCoCo class dumps')
         if name == 'pack':
             command.add_argument('--output', required=True)
         if name == 'verify':

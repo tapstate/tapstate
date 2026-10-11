@@ -12,18 +12,37 @@ evidence = importlib.util.module_from_spec(spec); spec.loader.exec_module(eviden
 checks = 0
 with tempfile.TemporaryDirectory() as temporary:
     root = pathlib.Path(temporary)
-    source = root/'source'; reports = root/'reports'
+    source = root/'source'; reports = root/'fixture-artifact/files'
     def put(base, path, value):
         target = base/path; target.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(value, bytes): target.write_bytes(value)
         else: target.write_text(value)
         return target
+    fixture_ledger_modes={}
+    def fixture_selector(report_root, inventory_file):
+        inv=json.loads(pathlib.Path(inventory_file).read_text());policies=[m['published_policy'] for m in inv['methods'] if m.get('published_policy')]
+        examples=sorted({identity.rsplit(' on ',1)[0] for policy in policies for identity in policy['cases']})
+        tests=[dict(module='e2e',kind='it',**{'class':'sample.PublishedExamplesIT'},example=example) for example in examples]
+        if fixture_ledger_modes.get(str(report_root))=='default':tests=[dict(module='e2e',kind='it',**{'class':'sample.PublishedExamplesIT'})]
+        inputs=put(report_root.parent,'build-inputs.json',json.dumps(dict(schema=1,phase='pre-test-after-install',source_sha=inv['source_sha'],run_id='123',run_attempt='1',source_files=inv['sources'])))
+        phase=dict(status='success',source_sha=inv['source_sha'],cohort_hash='f'*64,shard_id='fixture',run_id='123',run_attempt=1)
+        provenance=dict(schema=1,status='success',source_sha=inv['source_sha'],cohort_hash='f'*64,shard_id='fixture',run_id='123',run_attempt=1,case_observer=dict(build_inputs_sha256=hashlib.sha256(inputs.read_bytes()).hexdigest()),reset=phase|dict(phase='reset-test-evidence'),verify=phase|dict(phase='selected-verify'))
+        marker='target/ci-shards/run-fixture.json';put(report_root,marker,json.dumps(provenance))
+        manifest=put(report_root.parent,'manifest.json',json.dumps(dict(schema=2,source_sha=inv['source_sha'],cohort_hash='f'*64,shard_id='fixture',tests=tests,provenance=provenance,provenance_path=marker,files={path.relative_to(report_root).as_posix():hashlib.sha256(path.read_bytes()).hexdigest() for path in report_root.rglob('*') if path.is_file()})))
+        return ['--artifact-manifest',str(manifest),'--inputs',str(inputs)]
     def run(command, expected=True, reason=None):
         global checks
+        command=list(command)
+        if command[0]=='reports' and '--artifact-manifest' not in command and '--shard-plan' not in command:
+            fixture_inv=json.loads(pathlib.Path(command[command.index('--inventory')+1]).read_text())
+            if any(method.get('published_policy') for method in fixture_inv['methods']):command+=fixture_selector(pathlib.Path(command[command.index('--root')+1]),command[command.index('--inventory')+1])
         result = subprocess.run([os.environ['EVIDENCE_TOOL'], *command], capture_output=True, text=True)
         assert (result.returncode == 0) == expected, result.stdout + result.stderr
         if reason is not None: assert reason in result.stderr, result.stderr
         checks += 1
+        if expected and command[0]=='inventory':
+            fixture_output=pathlib.Path(command[command.index('--output')+1]);fixture=json.loads(fixture_output.read_text())
+            if fixture.get('source_sha') is None:fixture['source_sha']='a'*40;fixture_output.write_text(json.dumps(fixture))
     def save(name, value): return put(root, name, json.dumps(value))
     put(source,'pom.xml','<project><modules><module>core</module><module>e2e</module></modules></project>')
     for module in ('core','e2e'):
@@ -40,9 +59,13 @@ class CoreTest extends Base {
     put(source,'core/src/test/java/sample/Base.java','package sample; abstract class Base { @Test void inherited() {} }')
     put(source,'e2e/src/test/java/sample/PublishedExamplesIT.java','''package sample;
 class PublishedExamplesIT {
+  void ledger(Path specification, Tiers tier) { WitnessLedger.record(specification, tier); }
   @ParameterizedTest @MethodSource("everyPublishedExampleOnEveryTier")
   void thePublishedExampleRuns(Path specification, Tiers tier) {}
 }''')
+    original_helper_root=pathlib.Path(os.environ['EVIDENCE_MODULE']).parents[2]/'e2e/src/test/java/io/tapstate/e2e'
+    for filename in ('WitnessLedger.java','PublishedExampleSelection.java'):
+        put(source,'e2e/src/test/java/sample/'+filename,(original_helper_root/filename).read_text().replace('package io.tapstate.e2e;','package sample;'))
     put(source,'e2e/src/test/java/sample/E2eConnectorJar.java','package sample; class E2eConnectorJar { static final String CONNECTOR_ID = "e2e_file"; }')
     for example in ('alpha','beta'): put(source,'e2e/examples/'+example+'/case.e2e.yml','setup:\n  connectors: [e2e_file]\n')
     inventory = root/'inventory.json'
@@ -215,15 +238,52 @@ class PublishedExamplesIT {
     hash_result=root/'identity-only.json'
     run(['compare-hashes','--expected',str(expected_hashes),'--actual',str(actual_hashes),'--output',str(hash_result)])
     hash_receipt=json.loads(hash_result.read_text());assert hash_receipt['identity_equal'] and not hash_receipt['complete'] and not hash_receipt['ability_proven'] and hash_receipt['mandatory_comparison']=='compare'
+    # Both original serializers are bound to actual selector/provenance. Raw
+    # labels remain intact while their independent case identities agree.
+    full_labels=list(expected);serializer=next(m['published_policy']['ledger_serializer'] for m in inv['methods'] if m.get('published_policy'))
+    fixture_ledger_modes[str(reports)]='default';ledger.write_text('\n'.join(serializer['aliases'][label]['default'] for label in full_labels)+'\n');compare()
+    default_observation=json.loads(after.read_text());assert default_observation['ledger']!=default_observation['canonical_ledger'] and default_observation['canonical_ledger']==full_labels
+    default_ledger=ledger.read_text();ledger.write_text(default_ledger+full_labels[0]+'\n')
+    run(['reports','--root',str(reports),'--lane','ci','--inventory',str(inventory),'--output',str(after)],False,'wrong-mode published ledger alias');ledger.write_text(default_ledger)
+    labels=default_ledger.splitlines();labels[-1]=labels[0];ledger.write_text('\n'.join(labels)+'\n');compare(False,'ledger multiset differs');ledger.write_text(default_ledger)
+    ledger.write_text('\n'.join(default_ledger.splitlines()[:-1])+'\n');compare(False,'ledger multiset differs');ledger.write_text(default_ledger)
+    ledger.write_text(default_ledger+'unknown-slug on IN_PROCESS\n');run(['reports','--root',str(reports),'--lane','ci','--inventory',str(inventory),'--output',str(after)],False,'unknown or wrong-mode');ledger.write_text(default_ledger)
+    # A selector receipt cannot claim the other serialization mode.
+    forged_mode=copy.deepcopy(default_observation);forged_mode['ledger_selector']['mode']='selected';save('wrong-ledger-mode.json',forged_mode)
+    run(['compare','--inventory',str(inventory),'--before',str(before),'--after',str(root/'wrong-ledger-mode.json'),'--output',str(comparison)],False,'serializer mode differs from actual selector')
+    # Even identical labels/outcomes cannot waive a changed helper implementation.
+    for filename in ('WitnessLedger.java','PublishedExampleSelection.java'):
+        changed=copy.deepcopy(inv);helper='e2e/src/test/java/sample/'+filename;new_hash='e'*64
+        changed['sources'][helper]=new_hash
+        next(m['published_policy']['ledger_serializer'] for m in changed['methods'] if m.get('published_policy'))['helper_sources'][helper]=new_hash
+        changed_inv=save('changed-serializer-inventory.json',changed);changed_obs=copy.deepcopy(default_observation);changed_obs['source_inventory_sha256']=hashlib.sha256(changed_inv.read_bytes()).hexdigest();changed_obs['ledger_selector']['helpers'][helper]=new_hash
+        save('changed-serializer-observation.json',changed_obs)
+        run(['compare','--inventory',str(inventory),'--candidate-inventory',str(changed_inv),'--before',str(before),'--after',str(root/'changed-serializer-observation.json'),'--output',str(comparison)],False,'published gate source contract changed')
+    ambiguous=put(source,'e2e/examples/other/alpha/case.e2e.yml','setup:\n  connectors: [e2e_file]\n')
+    run(['inventory','--root',str(source),'--lane','ci','--output',str(root/'ambiguous-aliases.json')]);assert any('ambiguous published ledger aliases' in row['reason'] for row in json.loads((root/'ambiguous-aliases.json').read_text())['unresolved']);ambiguous.unlink()
+    fixture_ledger_modes.pop(str(reports));reset()
+    # The pre-pack CI route reads the same successful raw verify receipt, rather
+    # than accepting a caller-supplied mode or inferring it from ledger text.
+    fixture_args=fixture_selector(reports,inventory);fixture_manifest=json.loads(pathlib.Path(fixture_args[1]).read_text());planned=fixture_manifest['tests']
+    cohort=hashlib.sha256(json.dumps(sorted((row['module'],row['kind'],row['class'],row['example']) for row in planned)).encode()).hexdigest()
+    plan=save('published-shard-plan.json',dict(schema=1,source_sha='a'*40,cohort_hash=cohort,expected=planned,shards=[dict(id='fixture',tests=planned)]))
+    receipt=fixture_manifest['provenance'];receipt['cohort_hash']=cohort
+    for phase in ['reset','verify']:receipt[phase]['cohort_hash']=cohort
+    marker=reports/fixture_manifest['provenance_path'];marker.write_text(json.dumps(receipt))
+    prepack=['reports','--root',str(reports),'--lane','ci','--inventory',str(inventory),'--shard-plan',str(plan),'--shard','fixture','--inputs',fixture_args[3],'--output',str(after)]
+    run(prepack);assert json.loads(after.read_text())['complete'] and json.loads(after.read_text())['ledger_selector']['mode']=='selected'
+    receipt['run_attempt']=2;marker.write_text(json.dumps(receipt));run(prepack,False,'run/attempt differs');reset()
     # Unknown source constructs are observations, never complete equivalence.
     unknown = put(source,'core/src/test/java/sample/FutureTest.java','package sample; class FutureTest { @TestFactory Stream tests() {} }')
     run(['inventory','--root',str(source),'--lane','ci','--output',str(root/'unknown.json')]); assert not json.loads((root/'unknown.json').read_text())['complete']; unknown.unlink()
     # Match the existing ordinary-PR capability mix: every spec still has both XML
     # identities, while only the 18 synthetic specs may vouch in the success ledger.
-    policy_source=root/'policy-source'; policy_reports=root/'policy-reports'
+    policy_source=root/'policy-source'; policy_reports=root/'policy-artifact/files'
     put(policy_source,'pom.xml','<project><modules><module>e2e</module></modules></project>')
     put(policy_source,'e2e/pom.xml',(source/'e2e/pom.xml').read_text())
     put(policy_source,'e2e/src/test/java/sample/E2eConnectorJar.java',(source/'e2e/src/test/java/sample/E2eConnectorJar.java').read_text())
+    for filename in ('WitnessLedger.java','PublishedExampleSelection.java'):
+        put(policy_source,'e2e/src/test/java/sample/'+filename,(source/'e2e/src/test/java/sample'/filename).read_text())
     put(policy_source,'e2e/src/test/java/sample/RealConnectorGate.java','package sample; class RealConnectorGate { void require() { switch (decision) { case SKIP -> Assumptions.abort("original real connector gate"); } } }')
     put(policy_source,'e2e/src/test/java/sample/PublishedExamplesIT.java',(source/'e2e/src/test/java/sample/PublishedExamplesIT.java').read_text().replace('class PublishedExamplesIT {','class PublishedExamplesIT { void gate() { RealConnectorGate.require(real.toArray(String[]::new)); }'))
     for n in range(53):
@@ -348,6 +408,92 @@ class PublishedExamplesIT {
     save('coverage-post.json',broken);run(growth_command);assert not json.loads((root/'growth-coverage.json').read_text())['complete']
     broken=copy.deepcopy(bound_growth);broken['dependency_coordinate_models'][provider+'.pom']['packaging']='pom'
     save('coverage-post.json',broken);run(growth_command,False,'non-JAR model type')
+    # Generated classes require exact current dump IDs and structural/framework
+    # provenance; suffixes alone and a forged known-class ID never grant admission.
+    runtime_pre=copy.deepcopy(input_snapshot)
+    base_name='io/tapstate/fixture/TestBase';base_path='core/target/test-classes/'+base_name+'.class'
+    runtime_pre['test_class_ids']={base_path:'1'*16};runtime_pre['test_files']={base_path:'2'*64}
+    runtime_repo=root/'runtime-framework-repository';runtime_models={};runtime_producers={};runtime_hashes={};cp=[]
+    for gav,ref in [(['org.springframework','spring-core','7.0.8'],'org/springframework/cglib/proxy/Factory'),(['org.mockito','mockito-core','5.23.0'],'org/mockito/internal/creation/bytebuddy/access/MockAccess')]:
+        relative=gav[0].replace('.','/')+'/'+gav[1]+'/'+gav[2]+'/'+gav[1]+'-'+gav[2]
+        put(runtime_repo,relative+'.pom','<project><groupId>'+gav[0]+'</groupId><artifactId>'+gav[1]+'</artifactId><version>'+gav[2]+'</version></project>')
+        jar=runtime_repo/(relative+'.jar')
+        with zipfile.ZipFile(jar,'w') as archive:
+            archive.writestr(ref+'.class',b'fixture')
+            if gav[1]=='spring-core':archive.writestr('org/springframework/cglib/reflect/FastClass.class',b'fixture')
+            archive.writestr('META-INF/MANIFEST.MF','Implementation-Title: '+gav[1]+'\nImplementation-Version: '+gav[2]+'\n')
+        for suffix in ('.pom','.jar'):runtime_hashes[relative+suffix]=receipt_module.digest(runtime_repo/(relative+suffix))
+        cp.append(dict(identity='repository/'+relative+'.jar',sha256=runtime_hashes[relative+'.jar'],own_classes={}))
+    runtime_models,runtime_producers=receipt_module.dependency_models(runtime_repo,runtime_hashes)
+    agent_path='org/jacoco/org.jacoco.agent/0.8.13/org.jacoco.agent-0.8.13-runtime.jar';runtime_hashes[agent_path]='f'*64
+    runtime_pre.update(resolved_test_classpaths={'core':cp},dependency_repository_files=runtime_hashes)
+    runtime_input_file=save('runtime-inputs.json',runtime_pre);runtime_input_hash=hashlib.sha256(runtime_input_file.read_bytes()).hexdigest()
+    capture=dict(enabled=True,raw_bytes_uploaded=False,jacoco_version='0.8.13',agent_sha256='f'*64,source_sha='a'*40,run_id='123',run_attempt=1,build_inputs_sha256=runtime_input_hash,shard_id='rest',invocation_id='c'*32,cohort_hash='d'*64,capture_origin_sha256='e'*64,status='success')
+    capture['verify']=dict(schema=1,execution='github-actions',command='run',event='end',phase='selected-verify',status='success',source_sha='a'*40,run_id='123',run_attempt=1,shard_id='rest',cohort_hash='d'*64,utc='1970-01-01T00:00:01+00:00',ended_utc='1970-01-01T00:00:02+00:00',started_monotonic_ns=100,monotonic_ns=1100,elapsed_ns=1000)
+    capture['reset']=capture['verify']|dict(phase='reset-test-evidence',ended_utc='1970-01-01T00:00:01+00:00',started_monotonic_ns=0,monotonic_ns=100,elapsed_ns=100)
+    runtime_binding=json.loads(binding.read_text())|dict(runtime_class_capture={field:copy.deepcopy(capture[field]) for field in ['shard_id','invocation_id','cohort_hash','capture_origin_sha256','reset','verify']})
+    base=dict(name=base_name,class_id='1'*16,sha256='2'*64,origin='test')
+    def generated(name,identifier,parent,interfaces,refs,family):
+        structure=dict(name=name,class_id=identifier,sha256='9'*64,access_flags=33,super_class=parent,interfaces=interfaces,class_references=sorted(set([name,parent,*interfaces,*refs])))
+        compiled=[base] if base_name in structure['class_references'] else []
+        families={key:[] for key in ('spring_cglib','mockito','bytebuddy')};families[family]=[ref for ref in structure['class_references'] if ref.startswith('org/springframework/cglib/' if family=='spring_cglib' else 'org/mockito/')]
+        origins=[dict(gav=['org.springframework','spring-core','7.0.8'] if family=='spring_cglib' else ['org.mockito','mockito-core','5.23.0'],sha256=cp[0 if family=='spring_cglib' else 1]['sha256'],class_references=families[family])] if families[family] else []
+        return structure|dict(compiled_references=compiled,framework_references=families,framework_origins=origins,unresolved_framework_references=[],runtime_references=[])
+    spring=generated(base_name+'$$SpringCGLIB$$0','3'*16,base_name,['org/springframework/cglib/proxy/Factory'],[],'spring_cglib')
+    mock=generated(base_name+'$MockitoMock$fixture','4'*16,base_name,['org/mockito/internal/creation/bytebuddy/access/MockAccess'],[],'mockito')
+    auxiliary=generated(mock['name']+'$auxiliary$fixture','5'*16,'java/lang/Object',['java/util/concurrent/Callable'],[mock['name']],'bytebuddy')
+    auxiliary['runtime_references']=[dict(name=mock['name'],class_ids=[mock['class_id']])]
+    runtime_post=runtime_pre|dict(phase='post-test-before-pack',runtime_class_capture=capture,runtime_generated_classes=[spring,mock,auxiliary],dependency_coordinate_models=runtime_models,dependency_producer_facts=runtime_producers)
+    def runtime_check(snapshot,success=True,reason=None,bound=None):
+        global checks
+        try:result=evidence.verified_runtime_classes(runtime_pre,snapshot,bound or runtime_binding,runtime_input_hash)
+        except ValueError as error:
+            assert not success and (reason is None or reason in str(error)),str(error)
+        else:assert success;assert len(result)==len(snapshot['runtime_generated_classes'])
+        checks+=1
+    runtime_check(runtime_post)
+    local=copy.deepcopy(runtime_post);local['runtime_class_capture']['run_id']='local'
+    for phase in ('reset','verify'):local['runtime_class_capture'][phase].update(execution='local',run_id=None,run_attempt=None)
+    local_binding=copy.deepcopy(runtime_binding);local_binding['run_id']='local'
+    for phase in ('reset','verify'):local_binding['runtime_class_capture'][phase]=copy.deepcopy(local['runtime_class_capture'][phase])
+    local_pre=runtime_pre|dict(run_id='local')
+    # This focused call preserves raw local null identities; it never fabricates Actions IDs.
+    accepted=evidence.verified_runtime_classes(local_pre,local,local_binding,runtime_input_hash);assert len(accepted)==3;checks+=1
+    fast=generated(base_name+'$$SpringCGLIB$$FastClass$$1','7'*16,'org/springframework/cglib/reflect/FastClass',[],[spring['name']],'spring_cglib')
+    fast['runtime_references']=[dict(name=spring['name'],class_ids=[spring['class_id']])]
+    chained=copy.deepcopy(runtime_post);chained['runtime_generated_classes'].append(fast);runtime_check(chained)
+    serializable=copy.deepcopy(runtime_post);serializable['runtime_generated_classes'][2]['interfaces'].append('java/io/Serializable');serializable['runtime_generated_classes'][2]['class_references'].append('java/io/Serializable');runtime_check(serializable)
+    # Distinct CRCs of the same generated name must both survive admission.
+    variants=copy.deepcopy(runtime_post);variant=copy.deepcopy(spring);variant['class_id']='6'*16;variants['runtime_generated_classes'].append(variant);runtime_check(variants)
+    for field,value,reason in [('run_id','old','source/run/attempt/input differs'),('build_inputs_sha256','0'*64,'source/run/attempt/input differs'),('capture_origin_sha256','0'*64,'actual shard provenance'),('agent_sha256','0'*64,'agent bytes differ'),('raw_bytes_uploaded',True,'unsupported runtime capture')]:
+        bad=copy.deepcopy(runtime_post);bad['runtime_class_capture'][field]=value;runtime_check(bad,False,reason)
+    for field,value,reason in [('compiled_references',[],'compiled references differ'),('framework_origins',[],'origin set differs'),('unresolved_framework_references',['missing'],'incomplete'),('super_class','java/lang/Object','invalid runtime class header')]:
+        bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][0][field]=value;runtime_check(bad,False,reason)
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][0]['framework_origins'][0]['sha256']='0'*64;runtime_check(bad,False,'producer/bytes differ')
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][0]['name']=base_name;runtime_check(bad,False,'cannot exempt a compiled class')
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'].append(copy.deepcopy(spring));runtime_check(bad,False,'duplicate runtime class')
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][2]['runtime_references'][0]['class_ids']=['0'*16];runtime_check(bad,False,'reference set is incomplete')
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][0]['framework_origins']*=2;runtime_check(bad,False,'ambiguous runtime framework reference producer')
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][0]['super_class']='java/lang/Object';bad['runtime_generated_classes'][0]['class_references'].append('java/lang/Object');runtime_check(bad,False,'unsupported or unanchored')
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][0]['class_references'].append('io/tapstate/foreign/Unknown');runtime_check(bad,False,'unclosed own structural reference')
+    bad=copy.deepcopy(runtime_post);bad['runtime_generated_classes'][0]['class_references'].append('[Lio/tapstate/foreign/Unknown;');runtime_check(bad,False,'unclosed own structural reference')
+    bad=copy.deepcopy(runtime_binding);bad['runtime_class_capture']['invocation_id']='0'*32;runtime_check(runtime_post,False,'actual shard provenance',bad)
+    bad=copy.deepcopy(runtime_post);bad['runtime_class_capture']['verify']['utc']='1970-01-01T00:00:01';bound=copy.deepcopy(runtime_binding);bound['runtime_class_capture']['verify']=bad['runtime_class_capture']['verify'];runtime_check(bad,False,'timestamps lack timezone',bound)
+    bad=copy.deepcopy(runtime_post);bad['runtime_class_capture']['run_attempt']='1';runtime_check(bad,False,'capture attempt type')
+    bad=copy.deepcopy(runtime_post);bad['runtime_class_capture']['verify']['run_attempt']='1';bound=copy.deepcopy(runtime_binding);bound['runtime_class_capture']['verify']=copy.deepcopy(bad['runtime_class_capture']['verify']);runtime_check(bad,False,'phase attempt type',bound)
+    # Even identically malformed post and binding phase objects are rejected.
+    for field,value,reason in [('schema',999,'invalid runtime phase contract'),('execution','made-up','invalid runtime phase contract'),('command','fake','invalid runtime phase contract'),('event','start','invalid runtime phase contract'),('elapsed_ns',-1,'monotonic clocks'),('started_monotonic_ns',True,'monotonic clocks')]:
+        bad=copy.deepcopy(runtime_post);bad['runtime_class_capture']['verify'][field]=value;bound=copy.deepcopy(runtime_binding);bound['runtime_class_capture']['verify']=copy.deepcopy(bad['runtime_class_capture']['verify']);runtime_check(bad,False,reason,bound)
+    bad=copy.deepcopy(runtime_post);bad['runtime_class_capture']['verify']['elapsed_ns']=999;bound=copy.deepcopy(runtime_binding);bound['runtime_class_capture']['verify']=copy.deepcopy(bad['runtime_class_capture']['verify']);runtime_check(bad,False,'monotonic clocks',bound)
+    bad=copy.deepcopy(runtime_post);bad['runtime_class_capture']['reset']['ended_utc']='1970-01-01T00:00:02+00:00';bound=copy.deepcopy(runtime_binding);bound['runtime_class_capture']['reset']=copy.deepcopy(bad['runtime_class_capture']['reset']);runtime_check(bad,False,'reset must finish',bound)
+    # Exercise the public coverage command: exact dump identity admits one class,
+    # while an identical name with an unobserved CRC is rejected.
+    runtime_post_file=save('runtime-post.json',runtime_post);runtime_binding_file=save('runtime-binding.json',runtime_binding)
+    own_exec=b'\x11'+bytes.fromhex(spring['class_id'])+utf(spring['name'])+b'\x02\x03'
+    execfile.write_bytes(exec_data()+own_exec)
+    runtime_cov=['coverage','--root',str(coverage_root),'--binding',str(runtime_binding_file),'--inputs',str(runtime_input_file),'--test-inputs',str(runtime_post_file),'--output',str(root/'runtime-coverage.json')]
+    run(runtime_cov);assert json.loads((root/'runtime-coverage.json').read_text())['complete']
+    execfile.write_bytes(exec_data()+own_exec.replace(bytes.fromhex(spring['class_id']),b'\x00'*8));run(runtime_cov,False,'undeclared own bytecode');execfile.write_bytes(exec_data())
     gate_record = dict(id='ci:build:dispatch',required=True,applicable=True,applicability='workflow_dispatch',contract_sha256='f'*64,scope='always',conclusion='success')
     gates_before=save('gates-before.json',dict(schema=1,gates=[gate_record])); gates_after=save('gates-after.json',dict(schema=1,gates=[gate_record]))
     def gate(success=True,reason=None):run(['gates','--baseline',str(gates_before),'--candidate',str(gates_after),'--output',str(root/'gates-diff.json')],success,reason)

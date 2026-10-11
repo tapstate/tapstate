@@ -605,7 +605,18 @@ def published_policy(root, source, examples, sources, mode):
         if abort:
             message, gate_hash = json.loads(abort.group(1)), digest(gate.read_bytes())
             sources[gate.relative_to(root).as_posix()] = gate_hash
+    ledger_source, selection_source = source.parent / 'WitnessLedger.java', source.parent / 'PublishedExampleSelection.java'
+    require(ledger_source.is_file() and selection_source.is_file(), 'published ledger serializer sources are missing')
+    ledger_text, selection_text = ledger_source.read_text(), selection_source.read_text()
+    require(all(part in ledger_text for part in ('System.getProperty(PublishedExampleSelection.PROPERTY) == null',
+            'specification.getParent().getFileName().toString()', "specification.toString().replace('\\\\', '/')", 'example + " on " + tier.name()')) and
+            'WitnessLedger.record(specification, tier)' in source.read_text() and
+            'static final String PROPERTY = "tapstate.e2e.published-examples";' in selection_text,
+            'published ledger serializer requires an independently reviewed source contract')
+    helper_sources = {path.relative_to(root).as_posix(): digest(path.read_bytes()) for path in (ledger_source, selection_source)}
+    sources.update(helper_sources)
     policies = {}
+    aliases = {}
     for example in examples:
         relative = example.relative_to(root / 'e2e').as_posix()
         text = example.read_text()
@@ -620,11 +631,13 @@ def published_policy(root, source, examples, sources, mode):
             require(message and gate_hash and 'RealConnectorGate.require(real.toArray(String[]::new))' in source.read_text(),
                     'real-connector skip policy is not bound to the original source gate')
         for tier in ('IN_PROCESS', 'REAL_PROCESS'):
+            aliases[relative + ' on ' + tier] = dict(default=example.parent.name + ' on ' + tier, selected=relative + ' on ' + tier)
             policies[relative + ' on ' + tier] = dict(requires_real=real, mode=mode, connectors=ids,
                     expected_status='skipped' if real and mode == 'absent' else 'executed',
                     skip_message=message if real and mode == 'absent' else None)
         sources[example.relative_to(root).as_posix()] = digest(example.read_bytes())
-    return dict(cases=policies, gate_sha256=gate_hash, published_source_sha256=digest(source.read_bytes()), synthetic_source_sha256=digest(synthetic_source.read_bytes()))
+    require(len({row['default'] for row in aliases.values()}) == len(aliases) and len({row['selected'] for row in aliases.values()}) == len(aliases), 'ambiguous published ledger aliases')
+    return dict(cases=policies, ledger_serializer=dict(helper_sources=helper_sources, aliases=aliases), gate_sha256=gate_hash, published_source_sha256=digest(source.read_bytes()), synthetic_source_sha256=digest(synthetic_source.read_bytes()))
 
 
 def source_parameters(root, source, declaration, sources):
@@ -953,6 +966,83 @@ def class_not_applicable(inv, snapshot_suites, actual_cases, records, inputs):
     return result, unknown
 
 
+def ledger_selector(args, root, inv, files):
+    require(bool(args.artifact_manifest) != bool(args.shard_plan), 'published ledger requires one actual artifact manifest or shard plan selector')
+    require(args.inputs, 'published ledger selector requires prepared run inputs')
+    inputs = load(args.inputs)
+    actual_source = inv.get('provider_probe', {}).get('actual_source_sha') or inv.get('source_sha')
+    require(actual_source == inputs.get('source_sha') and re.fullmatch(r'[0-9a-f]{40}', actual_source or ''), 'published selector/source origin differs')
+    require(type(inputs.get('schema')) is int and inputs['schema'] == 1 and inputs.get('phase') == 'pre-test-after-install', 'published selector inputs are not prepared')
+    if args.artifact_manifest:
+        path = Path(args.artifact_manifest).resolve(); manifest = load(path)
+        require(path.parent / 'files' == root and type(manifest.get('schema')) is int and manifest['schema'] == 2, 'published artifact root/schema differs')
+        require(all(manifest.get('files', {}).get(name) == sha for name, sha in files.items()), 'published raw report/ledger artifact hashes differ')
+        tests, provenance, source, cohort, shard = manifest['tests'], manifest['provenance'], manifest['source_sha'], manifest['cohort_hash'], manifest['shard_id']
+        marker = Path(manifest['provenance_path'])
+        require(not marker.is_absolute() and '..' not in marker.parts and (root / marker).is_file() and not (root / marker).is_symlink() and load(root / marker) == provenance, 'published raw provenance differs')
+        receipt_sha = digest(path.read_bytes())
+    else:
+        require(args.shard and re.fullmatch(r'[A-Za-z0-9_-]+', args.shard), 'published shard identity is invalid')
+        path = Path(args.shard_plan); plan = load(path)
+        require(type(plan.get('schema')) is int and plan['schema'] == 1, 'published shard plan schema differs')
+        identities = [tuple(test[field] for field in ('module', 'kind', 'class')) + ((test['example'],) if 'example' in test else ()) for test in plan['expected']]
+        require(plan['cohort_hash'] == digest(json.dumps(sorted(identities)).encode()), 'published plan cohort differs')
+        matches = [entry for entry in plan['shards'] if entry['id'] == args.shard]
+        require(len(matches) == 1, 'published shard selector is missing or duplicate')
+        tests, source, cohort, shard = matches[0]['tests'], plan['source_sha'], plan['cohort_hash'], args.shard
+        marker = root / 'target/ci-shards' / ('run-' + shard + '.json')
+        require(marker.is_file() and not marker.is_symlink(), 'published selected verify provenance is missing')
+        provenance = load(marker); receipt_sha = digest(path.read_bytes())
+    require(source == actual_source and provenance.get('source_sha') == source and provenance.get('cohort_hash') == cohort and provenance.get('shard_id') == shard and provenance.get('status') == 'success', 'published selector provenance differs')
+    require(type(provenance.get('schema')) is int and provenance['schema'] == 1 and str(provenance.get('run_id')) == str(inputs.get('run_id')) and str(provenance.get('run_attempt')) == str(inputs.get('run_attempt')), 'published selector run/attempt differs')
+    require(provenance.get('case_observer', {}).get('build_inputs_sha256') == digest(Path(args.inputs).read_bytes()), 'published selector prepared input hash differs')
+    for name, phase in [('reset', 'reset-test-evidence'), ('verify', 'selected-verify')]:
+        record = provenance.get(name, {})
+        require(record.get('phase') == phase and record.get('status') == 'success' and record.get('source_sha') == source and record.get('cohort_hash') == cohort and record.get('shard_id') == shard and str(record.get('run_id')) == str(inputs.get('run_id')) and str(record.get('run_attempt')) == str(inputs.get('run_attempt')), 'published selector phase origin differs')
+    selected = [test for test in tests if test.get('class', '').endswith('.PublishedExamplesIT')]
+    source_classes = {method['class'] for method in inv['methods'] if method.get('published_policy')}
+    require(selected and all(test.get('module') == 'e2e' and test.get('kind') == 'it' and test['class'] in source_classes for test in selected), 'published selector contains no source class')
+    require(all('example' in test for test in selected) or all('example' not in test for test in selected), 'mixed published class and example selectors')
+    mode = 'selected' if all('example' in test for test in selected) else 'default'
+    examples = [test['example'] for test in selected] if mode == 'selected' else None
+    require(examples is None or len(examples) == len(set(examples)), 'duplicate published example selector')
+    policies = [method['published_policy'] for method in inv['methods'] if method.get('published_policy')]
+    require(policies and all(isinstance(policy.get('ledger_serializer'), dict) for policy in policies), 'published inventory lacks a bound ledger serializer contract')
+    serializers = [policy['ledger_serializer'] for policy in policies]
+    aliases = {identity: row for serializer in serializers for identity, row in serializer['aliases'].items()}
+    require(examples is None or all(example + ' on IN_PROCESS' in aliases for example in examples), 'published selector has unknown source example')
+    helpers = {name: sha for serializer in serializers for name, sha in serializer['helper_sources'].items()}
+    require(all(inputs.get('source_files', {}).get(name) == sha for name, sha in helpers.items()), 'published serializer helper input hashes differ')
+    return dict(mode=mode, examples=examples, actual_published_selector=selected, source_sha=source, run_id=inputs['run_id'], attempt=inputs['run_attempt'], shard=shard, selector_receipt_sha256=receipt_sha, run_provenance_sha256=digest(json.dumps(provenance, sort_keys=True).encode()), helpers=helpers)
+
+
+def canonical_ledger(inv, raw, selector):
+    policies = [method['published_policy'] for method in inv['methods'] if method.get('published_policy')]
+    require(policies and all(isinstance(policy.get('ledger_serializer'), dict) for policy in policies), 'published inventory lacks a bound ledger serializer contract')
+    serializers = [policy['ledger_serializer'] for policy in policies]
+    aliases = {identity: row for serializer in serializers for identity, row in serializer['aliases'].items()}
+    require(selector.get('mode') in ('default', 'selected'), 'published ledger selector mode is missing')
+    actual = selector.get('actual_published_selector')
+    source_classes = {method['class'] for method in inv['methods'] if method.get('published_policy')}
+    require(isinstance(actual, list) and actual and all(isinstance(row, dict) and row.get('module') == 'e2e' and row.get('kind') == 'it' and row.get('class') in source_classes for row in actual), 'published actual selector is missing or invalid')
+    derived = 'selected' if all('example' in row for row in actual) else 'default' if all('example' not in row for row in actual) and len(actual) == 1 else None
+    require(derived == selector['mode'] and selector.get('examples') == ([row['example'] for row in actual] if derived == 'selected' else None), 'published serializer mode differs from actual selector')
+    helpers = {name: sha for serializer in serializers for name, sha in serializer['helper_sources'].items()}
+    require(selector.get('helpers') == helpers and selector.get('source_sha') == (inv.get('provider_probe', {}).get('actual_source_sha') or inv.get('source_sha')) and all(isinstance(selector.get(field), str) and re.fullmatch(r'[0-9a-f]{64}', selector[field]) for field in ('selector_receipt_sha256', 'run_provenance_sha256')), 'published serializer source/selector binding differs')
+    reverse = {}
+    for identity, row in aliases.items():
+        label = row[selector['mode']]
+        require(label not in reverse, 'ambiguous published ledger alias')
+        reverse[label] = identity
+    result = []
+    for label in raw:
+        require(label in reverse, 'unknown or wrong-mode published ledger alias')
+        identity = reverse[label]
+        require(selector.get('examples') is None or identity.rsplit(' on ', 1)[0] in selector['examples'], 'ledger identity is outside actual published selector')
+        result.append(identity)
+    return result
+
+
 def reports(args):
     root = Path(args.root).resolve()
     inv = load(args.inventory)
@@ -1062,6 +1152,13 @@ def reports(args):
         require(not path.is_symlink(), 'symlink witness ledger')
         ledgers.extend(path.read_text().splitlines())
         files[path.relative_to(root).as_posix()] = digest(path.read_bytes())
+    ledger_selection, canonical_ledgers = None, []
+    if ledgers or any(case['class'].endswith('.PublishedExamplesIT') for case in cases):
+        if args.artifact_manifest or args.shard_plan:
+            ledger_selection = ledger_selector(args, root, inv, files)
+            canonical_ledgers = canonical_ledger(inv, ledgers, ledger_selection)
+        else:
+            unknown.append(dict(reason='published ledger has no actual selector/provenance binding'))
     source_not_applicable = []
     class_records = []
     run_binding, inputs_sha256, class_files = None, None, {}
@@ -1082,7 +1179,7 @@ def reports(args):
         _, class_unknown = class_not_applicable(inv, suites, cases, [], {})
         unknown.extend(class_unknown)
     value = dict(schema=SCHEMA, type='test-observation', lane=args.lane, source_inventory_sha256=digest(Path(args.inventory).read_bytes()),
-                 cases=cases, suites=suites, class_gate_records=class_records, class_gate_files=class_files, input_binding=run_binding, inputs_sha256=inputs_sha256, source_not_applicable=source_not_applicable, source_not_applicable_count=len(source_not_applicable), actual_xml_case_count=len(cases), ledger=ledgers, files=files, unresolved=unknown, complete=inv['complete'] and not unknown)
+                 cases=cases, suites=suites, class_gate_records=class_records, class_gate_files=class_files, input_binding=run_binding, inputs_sha256=inputs_sha256, source_not_applicable=source_not_applicable, source_not_applicable_count=len(source_not_applicable), actual_xml_case_count=len(cases), ledger=ledgers, canonical_ledger=canonical_ledgers, ledger_selector=ledger_selection, files=files, unresolved=unknown, complete=inv['complete'] and not unknown)
     output(args.output, value)
     print(json.dumps(dict(cases=len(cases), source_not_applicable=len(source_not_applicable), unresolved=len(unknown), complete=value['complete']), sort_keys=True))
 
@@ -1144,7 +1241,7 @@ def compare_tests(args):
         failures.append('original class gate helper source hash changed or missing')
     for method, policy in original_policies.items():
         other = candidate_policies.get(method)
-        if other is None or any(policy.get(field) != other.get(field) for field in ('gate_sha256', 'synthetic_source_sha256', 'published_source_sha256')):
+        if other is None or any(policy.get(field) != other.get(field) for field in ('gate_sha256', 'synthetic_source_sha256', 'published_source_sha256', 'ledger_serializer')):
             failures.append('published gate source contract changed')
         elif any(other['cases'].get(case) != value for case, value in policy['cases'].items()):
             failures.append('published applicability or allowed-skip contract changed')
@@ -1191,8 +1288,14 @@ def compare_tests(args):
                 elif case['status'] == 'skipped' and (case['skip'] is None or case['skip']['reason'] != policy['skip_message']):
                     failures.append(label + ' published skip reason differs from original source gate')
             expected_ledger = Counter(published_identity for published_identity, policy in policies.items() if policy['expected_status'] == 'executed')
-            if Counter(snapshot['ledger']) != expected_ledger:
-                failures.append(label + ' published ledger multiset differs from source applicable executed specs and tiers')
+            try:
+                normalized_ledger = canonical_ledger(target_inventory, snapshot['ledger'], snapshot.get('ledger_selector') or {})
+                if normalized_ledger != snapshot.get('canonical_ledger'):
+                    failures.append(label + ' canonical published ledger differs from preserved raw evidence')
+                if Counter(normalized_ledger) != expected_ledger:
+                    failures.append(label + ' published ledger multiset differs from source applicable executed specs and tiers')
+            except ValueError as error:
+                failures.append(label + ' published ledger contract rejected: ' + str(error))
     skip_before = {identity(c): (c['status'], skip_identity(c['skip'])) for c in before['cases'] + before.get('source_not_applicable', []) if c['parameter'] is not None}
     skip_after = {identity(c): (c['status'], skip_identity(c['skip'])) for c in after['cases'] + after.get('source_not_applicable', []) if c['parameter'] is not None and identity(c) in expected}
     if skip_before != skip_after:
@@ -1337,11 +1440,168 @@ def cached_artifact_facts(name, snapshot):
             return False
         require(models[model_path]['packaging'] == 'jar', 'cached provider JAR has a non-JAR model type')
         require(producer.get('gav') == models[model_path]['gav'] and producer.get('sha256') == hashes[name] and producer.get('pom_path') == model_path and producer.get('pom_sha256') == hashes.get(model_path), 'cached JAR producer model/bytes differ')
-        require(producer.get('producer_identity_source') in ('embedded-pom-properties', 'embedded-implementation-manifest') and type(producer.get('pom_properties_present')) is bool, 'unsupported cached JAR producer evidence')
+        require(producer.get('producer_identity_source') in ('embedded-pom-properties', 'embedded-implementation-manifest', 'embedded-osgi-manifest') and type(producer.get('pom_properties_present')) is bool, 'unsupported cached JAR producer evidence')
         require(type(producer.get('own_class_count')) is int and producer['own_class_count'] >= 0, 'cached JAR own-class count is missing')
         if producer['own_class_count']:
             return False
     return True
+
+
+def verified_runtime_classes(inputs, post, binding, inputs_sha256):
+    """Admit structural generated-class facts bound to the actual successful shard."""
+    records = post.get('runtime_generated_classes', []) if post else []
+    capture = post.get('runtime_class_capture', {}) if post else {}
+    if not capture.get('enabled'):
+        require(not records, 'runtime classes lack an enabled current capture')
+        return {}
+    require(capture.get('enabled') is True and capture.get('raw_bytes_uploaded') is False and
+            capture.get('jacoco_version') == inputs.get('jacoco_version') == '0.8.13', 'unsupported runtime capture')
+    for field, expected in [('source_sha', binding['source_sha']), ('run_id', str(binding['run_id'])),
+                            ('run_attempt', str(binding['attempt'])), ('build_inputs_sha256', inputs_sha256)]:
+        require(str(capture.get(field)) == str(expected), 'runtime capture source/run/attempt/input differs: ' + field)
+    require(type(capture.get('run_attempt')) is int and capture['run_attempt'] > 0, 'invalid runtime capture attempt type')
+    origin = binding.get('runtime_class_capture', {})
+    for field, pattern in [('shard_id', r'[A-Za-z0-9_-]+'), ('invocation_id', r'[0-9a-f]{32}'),
+                           ('cohort_hash', r'[0-9a-f]{64}'), ('capture_origin_sha256', r'[0-9a-f]{64}')]:
+        require(isinstance(capture.get(field), str) and re.fullmatch(pattern, capture[field]) and
+                capture[field] == origin.get(field), 'runtime capture differs from actual shard provenance: ' + field)
+    require(capture.get('status') == 'success', 'runtime capture has no successful selected verify')
+    from datetime import datetime
+    intervals = {}
+    for field, phase in [('reset', 'reset-test-evidence'), ('verify', 'selected-verify')]:
+        record = capture.get(field, {})
+        require(record == origin.get(field), 'runtime phase differs from actual shard provenance: ' + field)
+        require(type(record.get('schema')) is int and record['schema'] == 1 and record.get('event') == 'end' and
+                record.get('command') == 'run' and record.get('phase') == phase and record.get('status') == 'success' and
+                record.get('execution') == ('local' if str(binding['run_id']) == 'local' else 'github-actions'), 'invalid runtime phase contract: ' + field)
+        for name in ('source_sha', 'run_id', 'run_attempt', 'shard_id', 'cohort_hash'):
+            expected = capture[name]
+            actual = record.get(name)
+            if actual is None and record['execution'] == 'local' and name in ('run_id', 'run_attempt'):
+                actual = 'local' if name == 'run_id' else 1
+            require(str(actual) == str(expected), 'runtime phase origin differs: ' + name)
+        require((record['execution'] == 'local' and record.get('run_attempt') is None) or
+                (type(record.get('run_attempt')) is int and record['run_attempt'] > 0), 'invalid runtime phase attempt type')
+        clocks = [record.get(name) for name in ('started_monotonic_ns', 'monotonic_ns', 'elapsed_ns')]
+        require(all(type(value) is int and value >= 0 for value in clocks) and clocks[1] - clocks[0] == clocks[2],
+                'invalid runtime phase monotonic clocks: ' + field)
+        start_time = datetime.fromisoformat(record['utc'].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(record['ended_utc'].replace('Z', '+00:00'))
+        require(start_time.tzinfo is not None and end_time.tzinfo is not None, 'runtime verify timestamps lack timezone')
+        start, end = int(start_time.timestamp() * 1000), int(end_time.timestamp() * 1000)
+        require(binding['started_ms'] <= start <= end <= binding['completed_ms'], 'runtime phase interval differs from coverage run')
+        intervals[field] = (start, end, clocks[0], clocks[1])
+    require(intervals['reset'][1] <= intervals['verify'][0] and intervals['reset'][3] <= intervals['verify'][2],
+            'runtime reset must finish before selected verify')
+    agent = 'org/jacoco/org.jacoco.agent/0.8.13/org.jacoco.agent-0.8.13-runtime.jar'
+    require(re.fullmatch(r'[0-9a-f]{64}', capture.get('agent_sha256', '')) and
+            capture['agent_sha256'] == inputs.get('dependency_repository_files', {}).get(agent), 'runtime agent bytes differ')
+    known, classpath = {}, {}
+    for metadata, id_field, hash_field, segment, label in [
+            (inputs, 'production_class_ids', 'production_files', '/target/classes/', 'production'),
+            (post, 'test_class_ids', 'test_files', '/target/test-classes/', 'test')]:
+        for relative, identity in metadata[id_field].items():
+            name = relative.split(segment, 1)[1].removesuffix('.class')
+            row = dict(name=name, class_id=identity, sha256=metadata[hash_field][relative], origin=label)
+            known.setdefault(name, set()).add(json.dumps(row, sort_keys=True))
+    for entries in inputs['resolved_test_classpaths'].values():
+        for entry in entries:
+            classpath.setdefault(entry['identity'], set()).add(entry['sha256'])
+            for name, record in entry['own_classes'].items():
+                row = dict(name=name, class_id=record['class_id'], sha256=record['sha256'], origin='resolved-classpath')
+                known.setdefault(name, set()).add(json.dumps(row, sort_keys=True))
+    require(all(len(hashes) == 1 for hashes in classpath.values()), 'ambiguous resolved runtime framework bytes')
+    families = {'spring_cglib': ('org/springframework/cglib/', ['org.springframework', 'spring-core']),
+                'mockito': ('org/mockito/', ['org.mockito', 'mockito-core']),
+                'bytebuddy': ('net/bytebuddy/', ['net.bytebuddy', 'byte-buddy'])}
+    admitted, by_name = {}, {}
+    require(isinstance(records, list) and all(isinstance(record, dict) for record in records), 'runtime class metadata must preserve each name/class ID')
+    captured_names = {record.get('name') for record in records}
+    for record in records:
+        name, identity = record.get('name'), record.get('class_id')
+        require(isinstance(name, str) and name.startswith('io/tapstate/') and re.fullmatch(r'[A-Za-z0-9_$/]+', name) and
+                re.fullmatch(r'[0-9a-f]{16}', identity or '') and re.fullmatch(r'[0-9a-f]{64}', record.get('sha256', '')),
+                'invalid runtime class name/ID/hash')
+        require(name not in known, 'runtime generated metadata cannot exempt a compiled class')
+        require((name, identity) not in admitted, 'duplicate runtime class name/ID')
+        refs = record.get('class_references')
+        require(isinstance(refs, list) and len(refs) == len(set(refs)) and name in refs and all(
+                isinstance(ref, str) and re.fullmatch(r'(?:\[+(?:[ZBCSIJFD]|L[A-Za-z0-9_$/]+;)|[A-Za-z0-9_$/]+)', ref) for ref in refs),
+                'invalid runtime structural references')
+        normalized = {ref.lstrip('[').removeprefix('L').removesuffix(';') if ref.startswith('[') else ref for ref in refs}
+        own_references = {ref for ref in normalized if ref.startswith('io/tapstate/')}
+        require(own_references <= known.keys() | captured_names, 'unclosed own structural reference')
+        require(type(record.get('access_flags')) is int and 0 <= record['access_flags'] <= 65535 and
+                isinstance(record.get('interfaces'), list) and len(record['interfaces']) == len(set(record['interfaces'])) and
+                set(record['interfaces']) <= normalized and record.get('super_class') in normalized, 'invalid runtime class header')
+        expected_compiled = {row for ref in normalized for row in known.get(ref, set())}
+        require({json.dumps(row, sort_keys=True) for row in record.get('compiled_references', [])} == expected_compiled,
+                'runtime compiled references differ from actual bytecode inputs')
+        expected_framework = {family: sorted(ref for ref in normalized if ref.startswith(prefix))
+                              for family, (prefix, unused) in families.items()}
+        require(record.get('framework_references') == expected_framework and record.get('unresolved_framework_references') == [],
+                'runtime framework structural references are incomplete')
+        origins, seen = record.get('framework_origins'), {}
+        require(isinstance(origins, list), 'runtime framework origins are missing')
+        for producer in origins:
+            gav = producer.get('gav')
+            require(isinstance(gav, list) and len(gav) == 3 and all(isinstance(part, str) and re.fullmatch(r'[A-Za-z0-9_.+-]+', part) for part in gav),
+                    'invalid runtime framework coordinates')
+            relative = gav[0].replace('.', '/') + '/' + gav[1] + '/' + gav[2] + '/' + gav[1] + '-' + gav[2] + '.jar'
+            require(classpath.get('repository/' + relative) == {producer.get('sha256')} and
+                    post['dependency_repository_files'].get(relative) == producer.get('sha256') and cached_artifact_facts(relative, post),
+                    'runtime framework producer/bytes differ from actual classpath')
+            references = producer.get('class_references')
+            require(isinstance(references, list) and references and len(references) == len(set(references)), 'invalid runtime framework producer references')
+            for ref in references:
+                matches = [family for family, (prefix, coordinate) in families.items() if ref.startswith(prefix) and gav[:2] == coordinate]
+                require(len(matches) == 1 and ref in expected_framework[matches[0]], 'foreign runtime framework producer reference')
+                require(ref not in seen, 'ambiguous runtime framework reference producer')
+                seen[ref] = (tuple(gav), producer['sha256'])
+        require(set(seen) == {ref for refs in expected_framework.values() for ref in refs}, 'runtime framework origin set differs')
+        admitted[name, identity] = record
+        by_name.setdefault(name, set()).add(identity)
+    # Keep all variants. An auxiliary reference must bind the full captured set,
+    # then each variant must have a closed structural chain to original classes.
+    roles = {}
+    for key, record in admitted.items():
+        references = {ref.lstrip('[').removeprefix('L').removesuffix(';') if ref.startswith('[') else ref for ref in record['class_references']}
+        expected_refs = {name: sorted(by_name[name]) for name in references if name in by_name and name != record['name']}
+        actual_refs = record.get('runtime_references')
+        require(isinstance(actual_refs, list) and len(actual_refs) == len(expected_refs) and
+                {row.get('name'): row.get('class_ids') for row in actual_refs} == expected_refs, 'runtime generated reference set is incomplete or ambiguous')
+        compiled = {row['name'] for row in record['compiled_references']}
+        base = {name for name in compiled if record['name'].startswith(name + '$$SpringCGLIB$$')}
+        family = record['framework_references']
+        if base and family['spring_cglib'] and (record['super_class'] in base or record['super_class'] == 'org/springframework/cglib/reflect/FastClass'):
+            roles[key] = 'spring-cglib'
+        elif compiled and family['mockito'] and 'org/mockito/internal/creation/bytebuddy/access/MockAccess' in record['interfaces'] and any(
+                record['name'].startswith(name + '$MockitoMock$') and (record['super_class'] == name or name in record['interfaces']) for name in compiled):
+            roles[key] = 'mockito-subclass'
+    pending = set(admitted) - set(roles)
+    while pending:
+        newly = []
+        for key in pending:
+            record = admitted[key]
+            parents = [(ref['name'], identity) for ref in record['runtime_references'] for identity in ref['class_ids']]
+            if (parents and all(parent in roles and roles[parent] == 'mockito-subclass' for parent in parents) and
+                    record['super_class'] == 'java/lang/Object' and set(record['interfaces']) <= {'java/util/concurrent/Callable', 'java/lang/Runnable', 'java/io/Serializable'} and set(record['interfaces']) & {'java/util/concurrent/Callable', 'java/lang/Runnable'} and
+                    any(record['name'].startswith(parent[0] + '$auxiliary$') for parent in parents)):
+                newly.append((key, 'mockito-auxiliary'))
+            elif (parents and all(parent in roles and roles[parent] == 'spring-cglib' for parent in parents) and
+                  record['super_class'] == 'org/springframework/cglib/reflect/FastClass' and
+                  record['framework_references']['spring_cglib'] and all(
+                      record['name'].startswith(parent[0].split('$$SpringCGLIB$$', 1)[0] + '$$SpringCGLIB$$FastClass$$') for parent in parents)):
+                newly.append((key, 'spring-cglib'))
+        if not newly:
+            break
+        for key, role in newly:
+            roles[key] = role
+            pending.remove(key)
+    require(not pending, 'unsupported or unanchored generated own class: ' + ', '.join(name for name, unused in sorted(pending)))
+    return {key: dict(**record, verified_structural_role=roles[key],
+                      framework_reference_scope='resolved-reactor-test-classpath-union',
+                      runtime_realm_proven=False, generator_causality_proven=False) for key, record in admitted.items()}
 
 
 def coverage(args):
@@ -1362,6 +1622,7 @@ def coverage(args):
     production, test_classes, expected_names, production_modules = {}, {}, {}, {}
     repository_growth = {}
     dependency_unknown = []
+    post, runtime_classes = None, {}
     observed_sha = current_sha(Path(args.production_root).resolve() if args.production_root else root)
     require(observed_sha is None or observed_sha == binding['source_sha'], 'coverage source SHA differs from production checkout')
     production_root = Path(args.production_root).resolve() if args.production_root else root
@@ -1431,6 +1692,8 @@ def coverage(args):
             expected_names.setdefault(classname.removesuffix('.class'), set()).add(destination[key]['class_id'])
             if destination is production and not class_access_flags(path.read_bytes()) & (0x8000 | 0x1000):
                 production_modules.setdefault(module, set()).add(classname.removesuffix('.class'))
+    if args.inputs and post:
+        runtime_classes = verified_runtime_classes(inputs, post, binding, digest(Path(args.inputs).read_bytes()))
     require(production, 'production class bytes are required to verify JaCoCo class IDs')
     require(all(len(values) == 1 for values in expected_names.values()), 'conflicting production class IDs')
     report_classes = binding['required_report_classes']
@@ -1455,7 +1718,7 @@ def coverage(args):
                     'stale or out-of-run coverage session: ' + relative)
         for record in parsed['classes']:
             if record['name'].startswith('io/tapstate/'):
-                require(record['name'] in expected_names, 'undeclared own bytecode in JaCoCo data: ' + record['name'])
+                require(record['name'] in expected_names or (record['name'], record['class_id']) in runtime_classes, 'undeclared own bytecode in JaCoCo data: ' + record['name'])
             if record['name'] in expected_names:
                 require(record['class_id'] in expected_names[record['name']], 'JaCoCo class ID differs from production: ' + record['name'])
         executions[relative] = dict(sha256=digest(path.read_bytes()), size=path.stat().st_size, **parsed)
@@ -1480,7 +1743,7 @@ def coverage(args):
                         hits.append([report_path, package.get('name'), source.get('name'), int(line.get('nr')),
                                      int(line.get('ci', '0')), int(line.get('cb', '0'))])
     value = dict(schema=SCHEMA, type='coverage-observation', binding=binding, production=production, test_classes=test_classes, executions=executions,
-                 reports=reports_found, covered_lines_branches=hits, dependency_repository_growth=repository_growth, dependency_growth_accounting='all additions retained; download and verification cost remains inside original steps', unresolved=unresolved, complete=bool(reports_found) and not unresolved)
+                 reports=reports_found, covered_lines_branches=hits, runtime_generated_classes=list(runtime_classes.values()), runtime_capture=(post.get('runtime_class_capture') if post else None), dependency_repository_growth=repository_growth, dependency_growth_accounting='all additions retained; download and verification cost remains inside original steps', unresolved=unresolved, complete=bool(reports_found) and not unresolved)
     output(args.output, value)
     print(json.dumps(dict(exec_files=len(executions), production_classes=len(production), coverage_xml=len(reports_found), complete=value['complete']), sort_keys=True))
 
@@ -1782,7 +2045,7 @@ def export_hashes(args):
                   source_origin=({field: value['source_origin'][field] for field in ('kind', 'source_sha', 'source_archive_sha256', 'source_receipt_sha256') if field in value['source_origin']} if value.get('source_origin') else None), actual_source_sha=value.get('provider_probe', {}).get('actual_source_sha'),
                   original_source_sha=value.get('provider_probe', {}).get('original_source_sha'),
                   provider_probe_sha256=digest(json.dumps(value.get('provider_probe'), sort_keys=True, separators=(',', ':')).encode()),
-                  input_binding=value.get('input_binding'), inputs_sha256=value.get('inputs_sha256'), class_gate_files=value.get('class_gate_files', {}), actual_xml_case_count=value.get('actual_xml_case_count'), source_not_applicable_count=value.get('source_not_applicable_count'), ledger_digests=[digest(entry.encode()) for entry in value.get('ledger', [])], methods=methods, cases=cases, case_count=len(cases), unresolved_count=len(value.get('unresolved', [])), ability_proven=False)
+                  input_binding=value.get('input_binding'), inputs_sha256=value.get('inputs_sha256'), class_gate_files=value.get('class_gate_files', {}), actual_xml_case_count=value.get('actual_xml_case_count'), source_not_applicable_count=value.get('source_not_applicable_count'), ledger_digests=[digest(entry.encode()) for entry in value.get('canonical_ledger', [])], raw_ledger_digests=[digest(entry.encode()) for entry in value.get('ledger', [])], ledger_selector_sha256=digest(json.dumps(value.get('ledger_selector'), sort_keys=True).encode()), methods=methods, cases=cases, case_count=len(cases), unresolved_count=len(value.get('unresolved', [])), ability_proven=False)
     output(args.output, public)
 
 
@@ -1818,6 +2081,9 @@ def main():
     rep.add_argument('--root', default='.')
     rep.add_argument('--lane', required=True)
     rep.add_argument('--inventory', required=True)
+    rep.add_argument('--artifact-manifest', help='Packed shard manifest binding actual published selector and provenance')
+    rep.add_argument('--shard-plan', help='Pre-pack shard plan bound to the successful actual verify receipt')
+    rep.add_argument('--shard', help='Shard identity in the supplied selector plan')
     rep.add_argument('--class-gates', help='Explicit task-owned hash-only BeforeAll ledger directory')
     rep.add_argument('--binding', help='Actual run/attempt/source binding for class gate receipts')
     rep.add_argument('--inputs', help='Verified prepared source/test bytecode hashes for class applicability')
