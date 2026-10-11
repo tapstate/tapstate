@@ -16,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import static io.tapstate.e2e.BenchmarkReturnWorkBudgetBindings.*;
 
 /** Binds a source profile to registered files before services and to the original child after exit. */
 final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
@@ -35,6 +36,12 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     private boolean finished;
     record Capture(long epoch, String window, long calls, long rows) { }
     private BenchmarkReturnWorkBudgetAdmission.Runtime rootRuntime;
+    private HelperManifest helperManifest;
+    private JdkManifest jdkManifest;
+    private BenchmarkReturnWorkBudgetBindingsIo.Result authenticated;
+    private Map<String, Object> bindingEvidence = Map.of("state", "NOT_AUTHENTICATED");
+    private Map<String, Object> classpathEvidence = Map.of("state", "NOT_READ");
+    private final java.util.ArrayList<Map<String, Object>> producerClassMetadata = new java.util.ArrayList<>();
 
     private BenchmarkReturnWorkBudgetRun(BenchmarkReturnWorkBudgetProfile.Prepared profile,
             Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths, Path output, Path body, String nonce) {
@@ -162,7 +169,10 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
             run.bindFiles();
             return run;
         } catch (IOException | RuntimeException | Error failure) {
-            run.scope.failed(failure); run.close(); throw failure;
+            run.scope.failed(failure);
+            try { run.close(); }
+            catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            throw failure;
         }
     }
 
@@ -173,6 +183,11 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
                 () -> ProcessHandle.current().pid());
         scope.bindRoot(pid, start);
         rootRuntime = new BenchmarkReturnWorkBudgetAdmission.Runtime(profile.inputs().runId(), pid, start);
+        Path sourceRoot = absolute(scalar(PREFIX + "sourceRoot", 4096));
+        Path actualSourceRoot = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, sourceRoot::toRealPath);
+        require(sourceRoot.equals(actualSourceRoot) && BenchmarkReturnWorkBudget.external(scope,
+                BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> Files.isDirectory(sourceRoot, LinkOption.NOFOLLOW_LINKS)),
+                "actual source root is missing or noncanonical");
         for (var file : profile.inputs().files()) {
             String hash = fingerprint(paths.get(file.role()), file.bytes());
             require(hash.equals(file.sha256()), "actual registered file digest differs: " + file.role());
@@ -188,6 +203,145 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
                 absolute(scalar("tapstate.e2e.benchmark-smoke.jar", 4096))), "actual application path differs");
         require(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.NATIVE_LIBRARY).equals(
                 absolute(scalar(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY, 4096))), "actual native library path differs");
+        authenticateManifests(sourceRoot, pid, start);
+    }
+
+    private void authenticateManifests(Path sourceRoot, long pid, long start) throws IOException {
+        var install = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                BenchmarkReturnWorkBudget.Work.call());
+        try {
+            authenticateManifestDocuments(sourceRoot, pid, start);
+            BenchmarkReturnWorkBudget.done(install);
+        } catch (IOException | RuntimeException | Error failure) {
+            BenchmarkReturnWorkBudget.failed(install, failure);
+            throw failure;
+        }
+    }
+
+    private void authenticateManifestDocuments(Path sourceRoot, long pid, long start) throws IOException {
+        var declared = new java.util.ArrayList<FileFact>();
+        for (var file : profile.inputs().files()) declared.add(new FileFact(file.role(), paths.get(file.role()).toString(),
+                new Blob(file.sha256(), file.bytes())));
+        FileFact helperFile = declared.stream().filter(file -> file.role() == BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST).findFirst().orElseThrow();
+        FileFact jdkFile = declared.stream().filter(file -> file.role() == BenchmarkReturnWorkBudgetProfile.FileRole.JDK_INPUT_MANIFEST).findFirst().orElseThrow();
+        helperManifest = BenchmarkReturnBindingsManifestReader.readHelper(Path.of(helperFile.path()), helperFile.blob());
+        jdkManifest = BenchmarkReturnBindingsManifestReader.readJdk(Path.of(jdkFile.path()), jdkFile.blob());
+        require(helperManifest.schemaVersion() == SCHEMA_VERSION && jdkManifest.schemaVersion() == SCHEMA_VERSION
+                        && profile.inputs().runId().equals(helperManifest.runId()) && profile.inputs().runId().equals(jdkManifest.runId())
+                        && profile.inputs().inputSha256().equals(helperManifest.inputSha256()) && profile.inputs().inputSha256().equals(jdkManifest.inputSha256()),
+                "manifest run, input or schema differs");
+        require(definition.definitionId().equals(helperManifest.rootDefinitionId())
+                        && definition.sourceFormulaSha256().equals(helperManifest.rootFormulaSha256())
+                        && BenchmarkReturnWorkBudgetProducerAllocations.FORMULA_SHA256.equals(helperManifest.producerFormulaSha256()),
+                "manifest source definition differs");
+        var actualClasspath = actualClasspath();
+        require(helperManifest.failsafeClasspath().equals(actualClasspath), "current actual ordered classpath differs");
+        String home = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> System.getProperty("java.home"));
+        String version = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> System.getProperty("java.version"));
+        require(home != null && version != null && (version.equals("21") || version.startsWith("21.")), "actual root JDK runtime is unavailable");
+        Path actualHome = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> absolute(home).toRealPath());
+        require(actualHome.toString().equals(jdkManifest.javaHome()) && version.equals(jdkManifest.javaVersion()), "actual root JDK identity differs");
+        var requiredJdk = java.util.EnumSet.allOf(JdkRole.class);
+        if (!profile.inputs().flags().rootCpu()) requiredJdk.remove(JdkRole.CPU_PROVIDER);
+        require(jdkManifest.files().stream().map(JdkFile::role).collect(java.util.stream.Collectors.toSet()).equals(requiredJdk), "JDK file role roster differs");
+        authenticated = BenchmarkReturnWorkBudgetBindingsIo.authenticate(sourceRoot,
+                paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR), declared, helperManifest, jdkManifest);
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("state", "ACTUAL_DECLARED_BYTES_AND_ROOT_RUNTIME_RECORDED");
+        evidence.put("runId", profile.inputs().runId()); evidence.put("inputSha256", profile.inputs().inputSha256());
+        evidence.put("rootDefinitionId", definition.definitionId()); evidence.put("rootFormulaSha256", definition.sourceFormulaSha256());
+        evidence.put("producerFormulaSha256", helperManifest.producerFormulaSha256()); evidence.put("actualIo", authenticated.evidence());
+        evidence.put("actualRootRuntime", Map.of("pid", pid, "jvmStartTimeMillis", start,
+                "javaHome", actualHome.toString(), "javaVersion", version));
+        evidence.put("actualOrderedClasspath", actualClasspath); evidence.put("classpathSource", "CURRENT_SUREFIRE_TEST_CLASS_PATH_PROPERTY");
+        evidence.put("classpathTokenEvidence", classpathEvidence);
+        evidence.put("gaps", List.of("ACTUAL_LOADED_ROOT_CLASS_ORIGINS_NOT_OBSERVED", "EMITTED_MEMBER_COMPLETENESS_NOT_OBSERVED",
+                "FRESH_FAILSAFE_XML_LIFECYCLE_NOT_INFERRED_FROM_DECLARED_DIGEST", "VM_TRANSFORMED_INSTRUCTION_BODY_NOT_CLAIMED"));
+        evidence.put("runtimeOriginAuthenticationQualified", false); evidence.put("emittedMemberCompletenessQualified", false);
+        evidence.put("runtimeInstructionBytesQualified", false); evidence.put("structuralWorkBudgetQualified", false);
+        evidence.put("wholeMethodCostQualified", false); evidence.put("performanceAcceptanceEligible", false);
+        bindingEvidence = Map.copyOf(evidence);
+    }
+
+    private List<String> actualClasspath() throws IOException {
+        String raw = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ,
+                () -> System.getProperty("surefire.test.class.path"));
+        require(raw != null && !raw.isEmpty() && raw.length() <= 512L * 4097, "actual Failsafe classpath is missing or exceeds its bound");
+        String[] entries = raw.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1);
+        require(entries.length <= Math.addExact(MAX_CLASSPATH, 1), "actual classpath token roster exceeds its bound");
+        var paths = new java.util.ArrayList<String>(); var seen = new java.util.HashSet<String>();
+        var absent = new java.util.ArrayList<String>(); int terminalEmpty = 0;
+        for (int index = 0; index < entries.length; index++) {
+            String entry = entries[index];
+            if (entry.isEmpty()) {
+                require(index == entries.length - 1 && index > 0, "actual classpath has an interior empty entry");
+                terminalEmpty++; continue;
+            }
+            require(entry.length() <= 4096, "actual classpath has an oversized entry");
+            require(paths.size() < MAX_CLASSPATH, "actual classpath origin roster exceeds its bound");
+            Path path = absolute(entry);
+            boolean exists = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ,
+                    () -> Files.exists(path, LinkOption.NOFOLLOW_LINKS));
+            if (exists) {
+                Path real = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, path::toRealPath);
+                require(path.equals(real), "actual classpath has a linked origin");
+            } else absent.add(entry);
+            require(seen.add(entry), "actual classpath has a repeated origin"); paths.add(entry);
+        }
+        require(!paths.isEmpty(), "actual classpath has no declared nonempty origin");
+        String hash;
+        try {
+            byte[] rawBytes = raw.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            scope.add(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, BenchmarkReturnWorkBudget.Work.bytes(rawBytes.length));
+            hash = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                    () -> HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(rawBytes)));
+        } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        classpathEvidence = Map.of("rawPropertySha256", hash, "rawTokenCount", entries.length,
+                "terminalEmptyTokens", terminalEmpty, "terminalEmptyTokenInterpretation", "RETAINED_NOT_RESOLVED_TO_CWD_RUNTIME_SEMANTICS_UNQUALIFIED",
+                "absentDeclaredOrigins", List.copyOf(absent), "runtimeClasspathCompletenessQualified", false);
+        return List.copyOf(paths);
+    }
+
+    Map<String, Object> bindingEvidence() { return bindingEvidence; }
+
+    /** Consumes already obtained cold metadata; it never queries the owned process or reads a clock. */
+    void recordNativeClassMetadata(Map<String, Object> nativeEvidence) {
+        requireActive();
+        var install = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                BenchmarkReturnWorkBudget.Work.call());
+        try {
+            consumeNativeClassMetadata(nativeEvidence);
+            BenchmarkReturnWorkBudget.done(install);
+        } catch (RuntimeException | Error failure) {
+            BenchmarkReturnWorkBudget.failed(install, failure);
+            throw failure;
+        }
+    }
+
+    private void consumeNativeClassMetadata(Map<String, Object> nativeEvidence) {
+        require(authenticated != null && producerRegistration != null && nativeEvidence != null
+                        && "NATIVE_RECORDED".equals(nativeEvidence.get("state")), "actual cold native class evidence is missing");
+        require(producerClassMetadata.size() < 2, "cold native class receipt roster exceeds before/after bound");
+        Map<?, ?> metadata = map(nativeEvidence.get("ownedMetadata"));
+        require(number(metadata, "pid") == producerRegistration.runtime().pid()
+                        && number(metadata, "jvmStartTimeMillis") == producerRegistration.runtime().jvmStartTimeMillis(), "actual cold class runtime differs");
+        var expected = new LinkedHashMap<String, Object>();
+        for (String suffix : List.of("", "$Clock", "$JniAccess", "$NativeAccess")) {
+            String binary = "io.tapstate.adapters.pdk.PdkBenchmarkClock" + suffix;
+            var origin = authenticated.origins().stream().filter(item -> item.owner() == Owner.PRODUCER && item.binaryName().equals(binary)).findFirst().orElseThrow();
+            expected.put("PdkBenchmarkClock" + suffix, origin.classBytes().sha256());
+        }
+        for (String boundary : List.of("before", "after")) {
+            Map<?, ?> snapshot = map(metadata.get(boundary));
+            require(expected.equals(map(snapshot.get("classHashes"))), "actual cold class hashes differ from authenticated application entries");
+        }
+        producerClassMetadata.add(Map.of("pid", producerRegistration.runtime().pid(),
+                "jvmStartTimeMillis", producerRegistration.runtime().jvmStartTimeMillis(), "classHashes", Map.copyOf(expected)));
+    }
+    private static Map<?, ?> map(Object value) { require(value instanceof Map<?, ?>, "actual class metadata object is missing"); return (Map<?, ?>) value; }
+    private static long number(Map<?, ?> value, String field) {
+        Object raw = value.get(field); require(raw instanceof Long || raw instanceof Integer, "actual class runtime integer is missing");
+        return ((Number) raw).longValue();
     }
 
     private String fingerprint(Path path, long priorBytes) throws IOException {
@@ -268,6 +422,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
 
     void afterExit(BenchmarkOwnedProcessReceipt actual) throws IOException {
         requireActive(); require(producerRegistration != null, "producer final receipt was never armed");
+        require(producerClassMetadata.size() == 2, "actual before/after cold class metadata was not bound");
         var bound = BenchmarkReturnWorkBudgetProducerSeal.verifyAfterExit(producerBody, producerRegistration, actual);
         var arithmetic = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(bound.body());
         reconcileCaptures(bound.body(), captures);
@@ -275,6 +430,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         facts.put("state", "POST_EXIT_BYTES_AND_SOURCE_ARITHMETIC_BOUND"); facts.put("body", bound.body());
         facts.put("bodySha256", bound.bodySha256()); facts.put("companionSha256", bound.companionSha256());
         facts.put("allocation", arithmetic); facts.put("captureCountPairing", "MATCHED_ORIGINAL_FULL_WIRE_RECEIPTS");
+        facts.put("actualInputBindings", bindingEvidence); facts.put("producerClassMetadata", List.copyOf(producerClassMetadata));
         facts.put("runtimeCoverageQualified", false);
         facts.put("structuralWorkBudgetQualified", false); facts.put("wholeMethodCostQualified", false);
         producerEvidence = Map.copyOf(facts);

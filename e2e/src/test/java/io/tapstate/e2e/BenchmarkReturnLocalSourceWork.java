@@ -21,6 +21,28 @@ final class BenchmarkReturnLocalSourceWork {
 
     private BenchmarkReturnLocalSourceWork() { }
 
+    /** Run's local registration work; byte/ZIP provider work remains in its separate IO actors. */
+    static BenchmarkReturnWorkBudget.Work registrationLocalUpper() {
+        long files = BenchmarkReturnWorkBudgetProfile.FileRole.values().length;
+        long sources = BenchmarkReturnWorkBudgetBindings.SourceRole.values().length;
+        long classes = BenchmarkReturnWorkBudgetBindings.MAX_CLASSES;
+        long origins = mul(2, classes), classpath = BenchmarkReturnWorkBudgetBindings.MAX_CLASSPATH;
+        long jdk = BenchmarkReturnWorkBudgetBindings.JdkRole.values().length;
+        long roster = add(128, files, sources, classes, origins, classpath, jdk);
+        // CP parsing/hash is bounded before split, including one serializer delimiter per origin.
+        // Typed source/class/origin/JDK fields are bounded by the reader before the local loops.
+        long characters = add(mul(classpath, 4097), mul(files, add(4096, 128, 64, 20)),
+                mul(sources, add(512, 64, 64, 20)), mul(classes, add(256, 64, 64, 20)),
+                mul(origins, add(4096, 1024, 256, 128, 64, 64, 20)), mul(jdk, add(4096, 128, 64, 20)),
+                4096, mul(2, BenchmarkReturnWorkBudgetBindings.MAX_MANIFEST_BYTES));
+        // Inclusive API slots: string/path checks, stream predicates and projections, records,
+        // map/list/enum/boxing, checked arithmetic, hashing setup and immutable evidence fields.
+        return new BenchmarkReturnWorkBudget.Work(add(64, mul(16, roster)),
+                add(1024, mul(32, characters), mul(256, roster)), 0, 0,
+                add(mul(4, characters), mul(128, roster)), 12,
+                add(mul(4, characters), mul(16, roster)), mul(8, roster));
+    }
+
     static Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> bounds(Capacity capacity) {
         return bounds(capacity, AssociationRecipe.ORIGINAL_FIXED_UPDATE_TWO_INTEGER_KEYS);
     }

@@ -21,6 +21,14 @@ class BenchmarkReturnWorkBudgetProfileTest {
                 .isEqualTo(new BenchmarkReturnWorkBudget.Work(1, 1, 0, 0, 496, 0, 10, 0));
         assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SORT).elements()).isEqualTo(2L * 48_000);
         assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SPAN).elements()).isEqualTo(4L * 48_000);
+        // Each byte can be a source character visited by both owned encoding loops. One opaque
+        // COPY request alone does not bound those explicit charAt calls.
+        assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.COPY).requests())
+                .isGreaterThanOrEqualTo(2L * 1024 * 1024);
+        assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.DECODE).bytes())
+                .isGreaterThanOrEqualTo(2L * 1024 * 1024);
+        assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS).bytes())
+                .isGreaterThanOrEqualTo(4L * 512 * 4097);
         assertThat(prepared.explicitExcludedActivities()).containsExactly(BenchmarkReturnWorkBudget.Activity.ROOT_CPU);
         assertThat(prepared.gaps()).isEmpty();
         var definition = prepared.requireDefinition();
@@ -67,12 +75,18 @@ class BenchmarkReturnWorkBudgetProfileTest {
         int connector = 0; while (oversized.get(connector).role() != BenchmarkReturnWorkBudgetProfile.FileRole.CONNECTOR_JAR_1) { connector++; }
         oversized.set(connector, new BenchmarkReturnWorkBudgetProfile.FileInput(BenchmarkReturnWorkBudgetProfile.FileRole.CONNECTOR_JAR_1,
                 HASH, BenchmarkReturnWorkBudget.MAX_CONNECTOR_INPUT_BYTES + 1));
+        var oversizedManifest = new ArrayList<>(files(false));
+        int manifest = 0; while (oversizedManifest.get(manifest).role() != BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST) { manifest++; }
+        oversizedManifest.set(manifest, new BenchmarkReturnWorkBudgetProfile.FileInput(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST,
+                HASH, BenchmarkReturnWorkBudgetBindings.MAX_MANIFEST_BYTES + 1));
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, missing)))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("file scalars");
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, repeated)))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("repeated");
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, oversized)))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("connector scalar");
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, oversizedManifest)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("manifest scalar");
         assertThat(BenchmarkReturnWorkBudget.current()).isNull();
     }
 

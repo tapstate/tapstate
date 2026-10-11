@@ -1008,6 +1008,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 }
                 nativeClockBefore = collectorOwnedClockEvidence(collectorCalibration, resourceSampler.writeReturnReader(),
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), rootRaw);
+                if (BenchmarkReturnWorkBudgetRun.current() != null) {
+                    BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockBefore);
+                }
             } else if (System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
                 nativeClockBefore = resourceSampler.writeReturnReader().nativeClockEvidence(
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), BenchmarkReturnWorkBudgetRun.rootClockMetadata());
@@ -1134,6 +1137,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     collectorCalibrationEvidence.put("registrationAfter", returnRegistrationAfter);
                     nativeClockAfter = collectorOwnedClockEvidence(collectorCalibration, resourceSampler.writeReturnReader(),
                             System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), rootRaw);
+                    if (BenchmarkReturnWorkBudgetRun.current() != null) {
+                        BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockAfter);
+                    }
                     collectorCalibrationEvidence.put("state", "INCREMENTAL_RETURN_COLLECTOR_DIAGNOSTIC_ONLY");
                 } else if (System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
                     nativeClockAfter = resourceSampler.writeReturnReader().nativeClockEvidence(

@@ -151,8 +151,8 @@ class BenchmarkReturnWorkBudgetBindingsTest {
         assertThatThrownBy(() -> fixture.withActual(actual(fixture, files, fixture.actual().sources(), fixture.actual().classes(),
                 fixture.actual().origins(), fixture.actual().jdkFiles())).verify())
                 .isInstanceOf(AssertionError.class).hasMessageContaining("digest or prior size differs");
-        var overlarge = fixture(false, true);
-        assertThatThrownBy(overlarge::verify).isInstanceOf(AssertionError.class).hasMessageContaining("manifest exceeds prior material cap");
+        assertThatThrownBy(() -> fixture(false, true)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("manifest scalar exceeds its source cap");
     }
 
     @Test void jdk_artifact_roster_origin_and_conditional_cpu_provider_do_not_follow_file_labels_alone() {

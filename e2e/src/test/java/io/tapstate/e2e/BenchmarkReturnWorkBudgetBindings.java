@@ -26,7 +26,7 @@ final class BenchmarkReturnWorkBudgetBindings {
         ROOT_REPORT_PLAN("BenchmarkReturnWorkBudgetReportPlan"), ROOT_RUN("BenchmarkReturnWorkBudgetRun"),
         LOCAL_SOURCE_WORK("BenchmarkReturnLocalSourceWork"),
         ROOT_BINDINGS("BenchmarkReturnWorkBudgetBindings"), ROOT_SEAL("BenchmarkReturnWorkBudgetProducerSeal"),
-        BINDINGS_IO("BenchmarkReturnWorkBudgetBindingsIo"),
+        BINDINGS_IO("BenchmarkReturnWorkBudgetBindingsIo"), MANIFEST_READER("BenchmarkReturnBindingsManifestReader"),
         ROOT_ALLOCATIONS("BenchmarkReturnWorkBudgetProducerAllocations"), ROOT_CLOCK_WORK("BenchmarkReturnRootClockWork"),
         ROOT_SOURCE_TAILS("BenchmarkReturnWorkBudgetSourceTails"), ROOT_CPU("BenchmarkRootCpuEnvelope"),
         NATIVE_QUEUE("BenchmarkNativeQueueProbe"), NATIVE_BASELINE("BenchmarkNativeCounterBaseline"),

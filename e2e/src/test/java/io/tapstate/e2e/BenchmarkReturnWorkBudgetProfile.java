@@ -104,6 +104,10 @@ final class BenchmarkReturnWorkBudgetProfile {
         for (var role : List.of(FileRole.CONNECTOR_JAR_1, FileRole.CONNECTOR_JAR_2, FileRole.CONNECTOR_JAR_3, FileRole.CONNECTOR_JAR_4, FileRole.CONNECTOR_JAR_5)) {
             require(files.get(role).bytes() <= BenchmarkReturnWorkBudget.MAX_CONNECTOR_INPUT_BYTES, "connector scalar exceeds its source cap");
         }
+        for (var role : List.of(FileRole.COMMON_HELPER_MANIFEST, FileRole.JDK_INPUT_MANIFEST)) {
+            require(files.get(role).bytes() <= BenchmarkReturnWorkBudgetBindings.MAX_MANIFEST_BYTES,
+                    "manifest scalar exceeds its source cap");
+        }
 
         var upper = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
         var excluded = EnumSet.noneOf(BenchmarkReturnWorkBudget.Activity.class);
@@ -114,6 +118,15 @@ final class BenchmarkReturnWorkBudgetProfile {
         var measured = inputs.workload().phases().stream().filter(PhaseInput::measured).findFirst().orElseThrow();
         upper.putAll(BenchmarkReturnLocalSourceWork.bounds(new BenchmarkReturnLocalSourceWork.Capacity(
                 measured.logicalOutputs(), measured.logicalOutputs() / 2, measured.batches())));
+        long manifestBytes = Math.max(files.get(FileRole.COMMON_HELPER_MANIFEST).bytes(), files.get(FileRole.JDK_INPUT_MANIFEST).bytes());
+        int manifestFields = BenchmarkReturnBindingsManifestReader.maximumFields();
+        var decode = BenchmarkReturnBindingsManifestReader.decodingWorkUpper(manifestBytes, manifestFields);
+        var encode = BenchmarkReturnBindingsManifestReader.encodingWorkUpper(manifestBytes, manifestFields);
+        // A reader entry includes canonical re-encoding. Standalone encoding has its own COPY entry.
+        upper.merge(BenchmarkReturnWorkBudget.Activity.DECODE, decode.plus(encode), BenchmarkReturnWorkBudget.Work::plus);
+        upper.merge(BenchmarkReturnWorkBudget.Activity.COPY, encode, BenchmarkReturnWorkBudget.Work::plus);
+        var localRegistration = BenchmarkReturnLocalSourceWork.registrationLocalUpper();
+        upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, localRegistration, BenchmarkReturnWorkBudget.Work::plus);
         var gaps = new ArrayList<Gap>();
         for (var activity : BenchmarkReturnWorkBudget.Activity.values()) {
             if (!upper.containsKey(activity) && !excluded.contains(activity)) {
@@ -129,6 +142,9 @@ final class BenchmarkReturnWorkBudgetProfile {
         registration.put("outputPlanSource", reporting.metadata());
         registration.put("preScopeSourceTail", BenchmarkReturnWorkBudgetSourceTails.factoryEvidence(inputs.workload()));
         registration.put("rootCounterColdSourceTail", BenchmarkReturnRootClockWork.evidence());
+        registration.put("manifestCodecSourceUpper", Map.of("priorByteCap", manifestBytes, "priorFieldCap", manifestFields,
+                "decoder", decode.evidence(), "encoder", encode.evidence(), "opaqueProviderInstructionsExcluded", true));
+        registration.put("registrationLocalSourceUpper", localRegistration.evidence());
         registration.put("terminalSourceTail", BenchmarkReturnWorkBudgetSourceTails.terminalEvidence(reporting.plan()));
         registration.put("structuralWorkBudgetQualified", false); registration.put("wholeMethodCostQualified", false);
         return new Prepared(inputs, upper, excluded, reporting.plan(), registration, gaps);

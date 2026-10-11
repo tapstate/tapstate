@@ -14,6 +14,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.io.ByteArrayOutputStream;
+import java.util.zip.ZipOutputStream;
+import java.util.zip.ZipEntry;
+import static io.tapstate.e2e.BenchmarkReturnWorkBudgetBindings.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -112,11 +116,151 @@ class BenchmarkReturnWorkBudgetRunTest {
                         .containsEntry("wholeMethodCostQualified", false);
                 assertThat(receipt.get("rootRuntime")).isEqualTo(Map.of("pid", ProcessHandle.current().pid(),
                         "jvmStartTimeMillis", ManagementFactory.getRuntimeMXBean().getStartTime()));
+                assertThat(run.bindingEvidence()).containsEntry("state", "ACTUAL_DECLARED_BYTES_AND_ROOT_RUNTIME_RECORDED")
+                        .containsEntry("wholeMethodCostQualified", false).containsEntry("runtimeOriginAuthenticationQualified", false);
+                assertThat(((Map<?, ?>) run.bindingEvidence().get("actualIo")).get("state"))
+                        .isEqualTo("DECLARED_BYTE_FACTS_AUTHENTICATED");
+                Map<?, ?> actors = (Map<?, ?>) receipt.get("activities");
+                assertThat(((Map<?, ?>) actors.get("INSTALL_BINDINGS")).get("completedAttempts")).isEqualTo(1L);
                 assertThat(Files.exists(fixture.output())).isFalse();
                 assertThat(Files.exists(fixture.body())).isFalse();
             }
             assertInactive();
         }
+    }
+
+    @Test void missing_or_foreign_source_root_refuses_before_any_service_can_be_used() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("source-root"); configure(fixture);
+            System.clearProperty(BenchmarkReturnWorkBudgetRun.PREFIX + "sourceRoot");
+            assertThatThrownBy(() -> fixture.open()).isInstanceOf(AssertionError.class).hasMessageContaining("registered scalar is missing");
+            assertInactive();
+            System.setProperty(BenchmarkReturnWorkBudgetRun.PREFIX + "sourceRoot", fixture.output().getParent().toString());
+            assertThatThrownBy(() -> fixture.open()).isInstanceOf(java.nio.file.NoSuchFileException.class);
+            assertInactive();
+        }
+    }
+
+    @Test void opaque_fake_manifests_are_not_accepted_as_authenticated_source_documents() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("opaque-manifest"); configure(fixture);
+            byte[] raw = "opaque-helper".getBytes(StandardCharsets.US_ASCII);
+            Files.write(fixture.paths().get(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST), raw);
+            var changed = replaceManifest(fixture, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, raw);
+            assertThatThrownBy(changed::open).isInstanceOf(AssertionError.class).hasMessageContaining("manifest");
+            assertInactive();
+        }
+    }
+
+    @Test void helper_document_input_and_root_formula_are_semantically_checked_after_byte_hashing() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("semantic-doc"); configure(fixture); var h = fixture.helper();
+            for (boolean input : List.of(true, false)) {
+                var changed = new HelperManifest(h.schemaVersion(), h.runId(), input ? "b".repeat(64) : h.inputSha256(),
+                        h.buildId(), h.rootDefinitionId(), input ? h.rootFormulaSha256() : "0".repeat(64),
+                        h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), h.sources(), h.classes(), h.origins());
+                byte[] raw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(changed);
+                Files.write(fixture.paths().get(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST), raw);
+                var exactHash = replaceManifest(fixture, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, raw);
+                assertThatThrownBy(exactHash::open).isInstanceOf(AssertionError.class)
+                        .hasMessageContaining(input ? "manifest run, input or schema differs" : "manifest source definition differs");
+                assertInactive();
+            }
+        }
+    }
+
+    @Test void actual_source_and_current_classpath_are_not_borrowed_from_caller_manifest_content() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("actual-source"); configure(fixture);
+            Path source = fixture.sourceRoot().resolve(SourceRole.ROOT_RUN.sourcePath());
+            byte[] original = Files.readAllBytes(source); byte[] changed = original.clone(); changed[0] ^= 1; Files.write(source, changed);
+            assertThatThrownBy(fixture::open).isInstanceOf(AssertionError.class).hasMessageContaining("actual byte digest or length differs");
+            assertInactive(); Files.write(source, original);
+            System.setProperty("surefire.test.class.path", fixture.home().toString());
+            assertThatThrownBy(fixture::open).isInstanceOf(AssertionError.class).hasMessageContaining("current actual ordered classpath differs");
+            assertInactive();
+        }
+    }
+
+    @Test void terminal_separator_is_retained_as_unqualified_token_not_resolved_as_a_cwd_class_origin() throws Exception {
+        try (var saved = new Properties()) {
+            var original = fixture("terminal-token");
+            var entries = new ArrayList<String>(); entries.add(original.classes().toString());
+            for (int i = 1; i < MAX_CLASSPATH; i++) entries.add(original.output().getParent().resolve("absent-origin-" + i).toString());
+            var h = original.helper();
+            var helper = new HelperManifest(h.schemaVersion(), h.runId(), h.inputSha256(), h.buildId(),
+                    h.rootDefinitionId(), h.rootFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(),
+                    entries, h.sources(), h.classes(), h.origins());
+            byte[] raw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper);
+            Path manifest = original.paths().get(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST);
+            Files.write(manifest, raw);
+            var fixture = replaceManifest(original, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, raw);
+            helper = helperFormula(helper, fixture.profile().requireDefinition().sourceFormulaSha256());
+            raw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper); Files.write(manifest, raw);
+            fixture = replaceManifest(fixture, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, raw);
+            configure(fixture);
+            String classpath = String.join(java.io.File.pathSeparator, entries);
+            System.setProperty("surefire.test.class.path", classpath + java.io.File.pathSeparator);
+            try (var run = fixture.open()) {
+                Map<?, ?> tokens = (Map<?, ?>) run.bindingEvidence().get("classpathTokenEvidence");
+                assertThat(tokens.get("terminalEmptyTokens")).isEqualTo(1);
+                assertThat(tokens.get("rawTokenCount")).isEqualTo(MAX_CLASSPATH + 1);
+                assertThat(tokens.get("runtimeClasspathCompletenessQualified")).isEqualTo(false);
+                assertThat(run.bindingEvidence().get("actualOrderedClasspath")).isEqualTo(entries);
+            }
+            assertInactive();
+            System.setProperty("surefire.test.class.path", classpath + java.io.File.pathSeparator
+                    + fixture.output().getParent().resolve("extra-origin"));
+            var bounded = fixture;
+            assertThatThrownBy(bounded::open).isInstanceOf(AssertionError.class).hasMessageContaining("origin roster exceeds");
+            assertInactive();
+        }
+    }
+
+    @Test void cold_class_packets_bind_existing_owned_identity_and_authenticated_application_entries_without_reads() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("cold-class-packets"); configure(fixture);
+            try (var run = fixture.open()) {
+                var requests = new java.util.concurrent.atomic.AtomicInteger();
+                var connection = (javax.management.MBeanServerConnection) java.lang.reflect.Proxy.newProxyInstance(
+                        getClass().getClassLoader(), new Class<?>[]{javax.management.MBeanServerConnection.class},
+                        (proxy, method, arguments) -> {
+                            if (!method.getName().equals("invoke") || !arguments[1].equals("armWorkBudgetFinalReceipt"))
+                                throw new AssertionError("unexpected owned metadata operation");
+                            requests.incrementAndGet(); return true;
+                        });
+                var reader = new BenchmarkWriteReturnReader(new BenchmarkCausalClock.Identity(18, 99), connection,
+                        () -> true, () -> { throw new AssertionError("unexpected clock read"); });
+                run.registerProducer(reader, Map.of("state", "RECORDED_ENABLED", "pid", 18L, "jvmStartTimeMillis", 99L));
+                var hashes = new LinkedHashMap<String, Object>();
+                fixture.helper().classes().stream().filter(item -> item.role() == SourceRole.PDK_CLOCK)
+                        .forEach(item -> hashes.put(item.binaryName().substring(item.binaryName().lastIndexOf('.') + 1), item.blob().sha256()));
+                Throwable foreign = org.assertj.core.api.Assertions.catchThrowable(
+                        () -> run.recordNativeClassMetadata(nativePacket(19, 99, hashes)));
+                assertThat(foreign).isInstanceOf(AssertionError.class).hasMessageContaining("actual cold class runtime differs");
+                assertThat(BenchmarkReturnWorkBudget.current().snapshot()).containsEntry("state", "UNKNOWN");
+                assertThat(BenchmarkReturnWorkBudget.current().primaryCause()).isSameAs(foreign);
+                var changed = new LinkedHashMap<>(hashes); changed.put("PdkBenchmarkClock", "f".repeat(64));
+                assertThatThrownBy(() -> run.recordNativeClassMetadata(nativePacket(18, 99, changed)))
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("actual cold class hashes differ");
+                run.recordNativeClassMetadata(nativePacket(18, 99, hashes));
+                run.recordNativeClassMetadata(nativePacket(18, 99, hashes));
+                assertThatThrownBy(() -> run.recordNativeClassMetadata(nativePacket(18, 99, hashes)))
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("before/after bound");
+                assertThat(requests.get()).isEqualTo(1);
+                assertThat(BenchmarkReturnWorkBudget.current().snapshot()).containsEntry("state", "UNKNOWN");
+                assertThat(BenchmarkReturnWorkBudget.current().primaryCause()).isSameAs(foreign);
+                assertThat(run.bindingEvidence()).containsEntry("runtimeInstructionBytesQualified", false)
+                        .containsEntry("emittedMemberCompletenessQualified", false);
+            }
+            assertInactive();
+        }
+    }
+
+    private static Map<String, Object> nativePacket(long pid, long start, Map<String, Object> hashes) {
+        var snapshot = Map.of("classHashes", Map.copyOf(hashes));
+        return Map.of("state", "NATIVE_RECORDED", "ownedMetadata", Map.of("pid", pid,
+                "jvmStartTimeMillis", start, "before", snapshot, "after", snapshot));
     }
 
     @Test void changed_actual_file_length_refuses_and_releases_both_active_references() throws Exception {
@@ -216,7 +360,11 @@ class BenchmarkReturnWorkBudgetRunTest {
     }
 
     private Fixture fixture(String name) throws Exception {
+        // These owned byte fixtures are authenticated material; they are never loaded or executed as runtime code.
         Path parent = Files.createDirectory(directory.resolve(name)).toRealPath();
+        Path sourceRoot = Files.createDirectory(parent.resolve("source")).toRealPath();
+        Path classes = Files.createDirectory(parent.resolve("classes")).toRealPath();
+        Path home = Files.createDirectory(parent.resolve("jdk")).toRealPath();
         var paths = new EnumMap<BenchmarkReturnWorkBudgetProfile.FileRole, Path>(BenchmarkReturnWorkBudgetProfile.FileRole.class);
         var files = new ArrayList<BenchmarkReturnWorkBudgetProfile.FileInput>();
         for (var role : BenchmarkReturnWorkBudgetProfile.FileRole.values()) {
@@ -227,14 +375,98 @@ class BenchmarkReturnWorkBudgetRunTest {
             paths.put(role, path);
             files.add(new BenchmarkReturnWorkBudgetProfile.FileInput(role, sha256(content), content.length));
         }
+        var sources = new ArrayList<Source>();
+        for (var role : List.of(SourceRole.ROOT_RUN, SourceRole.PDK_CLOCK)) {
+            byte[] content = ("controlled owned source:" + role.name()).getBytes(StandardCharsets.US_ASCII);
+            Path target = sourceRoot.resolve(role.sourcePath()); Files.createDirectories(target.getParent()); Files.write(target, content);
+            sources.add(new Source(role, role.sourcePath(), blob(content)));
+        }
+        var compiled = new ArrayList<CompiledClass>(); var origins = new ArrayList<Origin>();
+        var jarMembers = new LinkedHashMap<String, byte[]>();
+        for (var role : List.of(SourceRole.ROOT_RUN, SourceRole.PDK_CLOCK)) {
+            for (String suffix : role == SourceRole.PDK_CLOCK ? List.of("", "$Clock", "$JniAccess", "$NativeAccess") : List.of("")) {
+                String binary = role.binaryName() + suffix; String member = binary.replace('.', '/') + ".class";
+                byte[] content = ("controlled class bytes:" + binary).getBytes(StandardCharsets.US_ASCII);
+                compiled.add(new CompiledClass(role, binary, blob(content)));
+                Path classFile = classes.resolve(member); Files.createDirectories(classFile.getParent()); Files.write(classFile, content);
+                origins.add(new Origin(Owner.ROOT, role, binary, classes.toString(), member, blob(content), null));
+                if (role == SourceRole.PDK_CLOCK) jarMembers.put(member, content);
+            }
+        }
+        byte[] nested = zip(jarMembers); byte[] app = zip(Map.of("BOOT-INF/lib/adapter-pdk-controlled.jar", nested));
+        Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR), app);
+        replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR, app);
+        for (var item : compiled) if (item.role() == SourceRole.PDK_CLOCK) origins.add(new Origin(Owner.PRODUCER,
+                item.role(), item.binaryName(), paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).toString(),
+                "BOOT-INF/lib/adapter-pdk-controlled.jar!/" + item.binaryName().replace('.', '/') + ".class", item.blob(), sha256(app)));
+        var jdkFiles = new ArrayList<JdkFile>();
+        for (var role : JdkRole.values()) {
+            if (role == JdkRole.CPU_PROVIDER) continue;
+            Path target = home.resolve(role.relativePath()); Files.createDirectories(target.getParent());
+            byte[] content = ("controlled JDK bytes:" + role.name()).getBytes(StandardCharsets.US_ASCII); Files.write(target, content);
+            jdkFiles.add(new JdkFile(role, target.toString(), blob(content)));
+        }
         var workload = BenchmarkWorkloadDefinitions.steadyPilot("stateless");
-        var inputs = new BenchmarkReturnWorkBudgetProfile.Inputs("controlled-" + name,
-                sha256(("controlled-input:" + name).getBytes(StandardCharsets.UTF_8)),
-                BenchmarkReturnWorkBudgetProfile.WorkloadInput.from(workload), files,
-                new BenchmarkReturnWorkBudgetProfile.Flags("B", "PLAIN", "PERIODIC", "ON",
-                        true, true, true, true, false, Set.of()));
-        return new Fixture(workload, BenchmarkReturnWorkBudgetProfile.inspect(inputs), Map.copyOf(paths),
-                parent.resolve("fork.json"), parent.resolve("producer.json"));
+        String runId = "controlled-" + name, inputHash = sha256(("controlled-input:" + name).getBytes(StandardCharsets.US_ASCII));
+        var jdk = new JdkManifest(1, runId, inputHash, home.toString(), System.getProperty("java.version"), jdkFiles);
+        byte[] jdkRaw = BenchmarkReturnWorkBudgetBindingsIo.jdkBytes(jdk);
+        Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.JDK_INPUT_MANIFEST), jdkRaw);
+        replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.JDK_INPUT_MANIFEST, jdkRaw);
+        var helper = new HelperManifest(1, runId, inputHash, "controlled-build", BenchmarkReturnWorkBudgetProfile.DEFINITION_ID,
+                "0".repeat(64), BenchmarkReturnWorkBudgetProducerAllocations.FORMULA_SHA256, blob("actual-xml".getBytes(StandardCharsets.US_ASCII)),
+                List.of(classes.toString()), sources, compiled, origins);
+        byte[] helperRaw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper);
+        Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST), helperRaw);
+        replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, helperRaw);
+        var inputs = inputs(runId, inputHash, workload, files);
+        var profile = BenchmarkReturnWorkBudgetProfile.inspect(inputs);
+        helper = helperFormula(helper, profile.requireDefinition().sourceFormulaSha256());
+        helperRaw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper);
+        Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST), helperRaw);
+        replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, helperRaw);
+        profile = BenchmarkReturnWorkBudgetProfile.inspect(inputs(runId, inputHash, workload, files));
+        assertThat(profile.requireDefinition().sourceFormulaSha256()).isEqualTo(helper.rootFormulaSha256());
+        return new Fixture(workload, profile, Map.copyOf(paths), parent.resolve("fork.json"), parent.resolve("producer.json"),
+                sourceRoot, classes, home, helper, jdk);
+    }
+
+    private static BenchmarkReturnWorkBudgetProfile.Inputs inputs(String run, String hash, BenchmarkWorkloadDefinitions.Workload workload,
+            List<BenchmarkReturnWorkBudgetProfile.FileInput> files) {
+        return new BenchmarkReturnWorkBudgetProfile.Inputs(run, hash, BenchmarkReturnWorkBudgetProfile.WorkloadInput.from(workload), files,
+                new BenchmarkReturnWorkBudgetProfile.Flags("B", "PLAIN", "PERIODIC", "ON", true, true, true, true, false, Set.of()));
+    }
+    private static HelperManifest helperFormula(HelperManifest h, String formula) {
+        return new HelperManifest(h.schemaVersion(), h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(), formula,
+                h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), h.sources(), h.classes(), h.origins());
+    }
+    private static void replace(List<BenchmarkReturnWorkBudgetProfile.FileInput> files, BenchmarkReturnWorkBudgetProfile.FileRole role,
+                                byte[] content) throws Exception {
+        for (int i = 0; i < files.size(); i++) if (files.get(i).role() == role) {
+            files.set(i, new BenchmarkReturnWorkBudgetProfile.FileInput(role, sha256(content), content.length)); return;
+        }
+        throw new AssertionError("controlled file role missing");
+    }
+    private static Fixture replaceManifest(Fixture fixture, BenchmarkReturnWorkBudgetProfile.FileRole role, byte[] raw) throws Exception {
+        var files = new ArrayList<>(fixture.profile().inputs().files()); replace(files, role, raw);
+        var in = fixture.profile().inputs();
+        var profile = BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(in.runId(), in.inputSha256(),
+                in.workload(), files, in.flags()));
+        return new Fixture(fixture.workload(), profile, fixture.paths(), fixture.output(), fixture.body(),
+                fixture.sourceRoot(), fixture.classes(), fixture.home(), fixture.helper(), fixture.jdk());
+    }
+    private static Blob blob(byte[] value) throws Exception { return new Blob(sha256(value), value.length); }
+    private static byte[] zip(Map<String, byte[]> values) throws Exception {
+        var raw = new ByteArrayOutputStream();
+        try (var zip = new ZipOutputStream(raw)) {
+            // Stored fixture entries preserve the prior outer-byte bound for every nested member.
+            for (var item : values.entrySet()) {
+                var crc = new java.util.zip.CRC32(); crc.update(item.getValue());
+                var entry = new ZipEntry(item.getKey()); entry.setMethod(ZipEntry.STORED);
+                entry.setSize(item.getValue().length); entry.setCompressedSize(item.getValue().length); entry.setCrc(crc.getValue());
+                zip.putNextEntry(entry); zip.write(item.getValue()); zip.closeEntry();
+            }
+        }
+        return raw.toByteArray();
     }
 
     private static void configure(Fixture fixture) {
@@ -244,6 +476,9 @@ class BenchmarkReturnWorkBudgetRunTest {
         System.setProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY,
                 fixture.paths().get(BenchmarkReturnWorkBudgetProfile.FileRole.NATIVE_LIBRARY).toString());
         System.setProperty("tapstate.e2e.benchmark-smoke.fork", "2");
+        System.setProperty(BenchmarkReturnWorkBudgetRun.PREFIX + "sourceRoot", fixture.sourceRoot().toString());
+        System.setProperty("surefire.test.class.path", fixture.classes().toString());
+        System.setProperty("java.home", fixture.home().toString());
     }
 
     private static BenchmarkWorkloadDefinitions.Workload changedMeasuredCadence(BenchmarkWorkloadDefinitions.Workload workload) {
@@ -267,7 +502,8 @@ class BenchmarkReturnWorkBudgetRunTest {
     }
 
     private record Fixture(BenchmarkWorkloadDefinitions.Workload workload, BenchmarkReturnWorkBudgetProfile.Prepared profile,
-                           Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths, Path output, Path body) {
+                           Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths, Path output, Path body,
+                           Path sourceRoot, Path classes, Path home, HelperManifest helper, JdkManifest jdk) {
         Path application() { return paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR); }
         BenchmarkReturnWorkBudgetRun open() throws IOException {
             return BenchmarkReturnWorkBudgetRun.open(profile, paths, output, body, "controlled-nonce");
@@ -281,6 +517,7 @@ class BenchmarkReturnWorkBudgetRunTest {
                     RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY,
                     "tapstate.e2e.benchmark-smoke.jar", RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY,
                     "tapstate.e2e.benchmark-smoke.fork",
+                    BenchmarkReturnWorkBudgetRun.PREFIX + "sourceRoot", "surefire.test.class.path", "java.home",
                     BenchmarkReturnWorkBudgetRun.PREFIX + "file.APP_JAR.path")) {
                 before.put(key, System.getProperty(key)); System.clearProperty(key);
             }
