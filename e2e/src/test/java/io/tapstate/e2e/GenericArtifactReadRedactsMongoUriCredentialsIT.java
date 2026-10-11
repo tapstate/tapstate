@@ -10,7 +10,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** The public artifact read keeps a MongoDB location useful without returning its URI credentials. */
+/** The public artifact read omits a Source connection config instead of returning its credentials. */
 class GenericArtifactReadRedactsMongoUriCredentialsIT {
 
     private static final String SOURCE_ID = "atlas";
@@ -39,8 +39,8 @@ class GenericArtifactReadRedactsMongoUriCredentialsIT {
 
             String canonical = control.artifact(SOURCE_ID).orElseThrow().canonicalForm();
             assertThat(canonical)
-                    .contains("mongodb+srv://<redacted>@cluster.example/test")
-                    .doesNotContain("probe", "sentinel-secret");
+                    .contains("id: atlas", "connector: mongodb-atlas")
+                    .doesNotContain("config:", "cluster.example", "probe", "sentinel-secret");
         }
     }
 }

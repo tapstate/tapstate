@@ -27,6 +27,7 @@ public record PipelineCatalogItem(
     /** Runtime truth and the current lifecycle target, exposed together so a list can show in-flight changes. */
     public record Status(
             DisplayState state,
+            UiState displayState,
             PipelineState desiredState,
             PipelineState observedState,
             ObservationFailure failure,
@@ -34,10 +35,32 @@ public record PipelineCatalogItem(
 
         public Status {
             Objects.requireNonNull(state, "state");
+            Objects.requireNonNull(displayState, "displayState");
+        }
+
+        public Status(DisplayState state, PipelineState desiredState, PipelineState observedState,
+                ObservationFailure failure, Instant observedAt) {
+            this(state, UiState.valueOf(state.name()), desiredState, observedState, failure, observedAt);
         }
     }
 
     public enum DisplayState {
+        NEW,
+        STARTING,
+        RUNNING,
+        PAUSING,
+        PAUSED,
+        RESUMING,
+        STOPPING,
+        STOPPED,
+        COMPLETED,
+        FAILED,
+        UNAVAILABLE
+    }
+
+    /** Authoring-aware UI projection carried separately from the existing catalog state vocabulary. */
+    public enum UiState {
+        DRAFT,
         NEW,
         STARTING,
         RUNNING,

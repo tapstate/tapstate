@@ -1,27 +1,30 @@
 package io.tapstate.app;
 
+import io.tapstate.control.restapi.SpaNavigationRequest;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.server.ResponseStatusException;
 
 /**
  * Sends the browser's client-side navigation routes to the packaged SPA entry point.
  *
- * <p>This is deliberately an allowlist, not a catch-all. The control API, authentication, liveness,
- * connector icon, and every other server-owned path keep their normal dispatcher behavior, including
- * their 404 responses. Static assets are served by Spring Boot's classpath resource handler and never
- * reach this controller.
+ * <p>Only browser document navigations under client-owned paths receive the SPA shell. Server-owned
+ * paths and static assets retain their normal dispatch and error behavior.
  */
 @Controller
 class SpaRouteController {
 
     @GetMapping({
             "/",
-            "/login",
-            "/pipelines/{*path}",
-            "/sources/{*path}",
-            "/explorations/{*path}"
+            "/{first:" + SpaNavigationRequest.CLIENT_ROOT_PATTERN + "}",
+            "/{first:" + SpaNavigationRequest.CLIENT_ROOT_PATTERN + "}/{*path}"
     })
-    String serveSpaEntryPoint() {
+    String serveSpaEntryPoint(HttpServletRequest request) {
+        if (!SpaNavigationRequest.matches(request)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+        }
         return "forward:/index.html";
     }
 }

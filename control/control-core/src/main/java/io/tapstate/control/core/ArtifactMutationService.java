@@ -247,6 +247,11 @@ public final class ArtifactMutationService {
         // same io diagnostic, including the removal of the document that cannot be read.
         Resource target = store.get(id)
                 .orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
+        if (target instanceof SourceResource source && source.metadata() != null
+                && "true".equals(source.metadata().labels().get("store"))) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "the state store cannot be removed through artifact deletion"), null);
+        }
 
         // A read-only inventory may omit a row this build cannot reconstruct. A destructive check may
         // not: without the resource, its references are unknown rather than absent, so the strict list

@@ -13,8 +13,9 @@ import io.tapstate.adapters.pdk.PdkSchemaDiscoverer;
 import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LivePipelines;
-import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
@@ -55,16 +56,27 @@ import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineProjectionService;
 import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelinePreviewService;
 import io.tapstate.control.core.PipelineViewService;
+import io.tapstate.control.core.ViewCatalogService;
+import io.tapstate.control.core.SampleSourceService;
+import io.tapstate.control.core.SampleSourceCredentialsProvider;
+import io.tapstate.control.core.StateStoreSetupService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
+import io.tapstate.control.core.ResourceAttributionPolicy;
+import io.tapstate.control.core.StateDatabasePolicy;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
+import io.tapstate.control.core.SourceConfigRevealAuthorizer;
+import io.tapstate.control.core.SourceConfigRevealService;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
+import tools.jackson.databind.json.JsonMapper;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SessionService;
@@ -79,6 +91,7 @@ import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.probe.ConnectionProbe;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.runtime.probe.DataBrowserCollectionsProbe;
 import io.tapstate.runtime.probe.DataBrowserFindProbe;
 import io.tapstate.runtime.probe.DataBrowserStatsProbe;
@@ -105,6 +118,7 @@ import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.SchemaDiscoverer;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SessionStore;
+import io.tapstate.spi.store.CloudSessionStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.TokenStore;
@@ -174,6 +188,11 @@ class ControlPlaneConfiguration {
     @Bean
     SessionStore sessionStore(MongoAuthStores authStores) {
         return authStores.sessions();
+    }
+
+    @Bean
+    CloudSessionStore cloudSessionStore(MongoAuthStores authStores, CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? authStores.cloudSessions() : null;
     }
 
     @Bean
@@ -326,8 +345,32 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    CredentialAuthenticator credentialAuthenticator(TokenService tokenService, TokenSigner tokenSigner) {
-        return new CredentialAuthenticator(tokenService, tokenSigner);
+    CredentialAuthenticator credentialAuthenticator(
+            TokenService tokenService, TokenSigner tokenSigner, CloudRuntimeSettings cloud,
+            ObjectProvider<CloudAuthenticationService> managedAuthentication) {
+        // The managed verifier is supplied by the Cloud SDK integration. Until that provider is wired,
+        // refusing every credential is the safe behavior: a Cloud runtime must never fall back to the
+        // local issuer or accept an on-prem machine token merely because the external client is absent.
+        // The Cloud credential surface is the local opaque session. SDK JWT verification is used
+        // only while that session is created; workload requests neither validate nor refresh a Cloud JWT.
+        return cloud.cloud()
+                ? new CredentialAuthenticator(credential -> {
+                    CloudAuthenticationService service = managedAuthentication.getIfAvailable();
+                    return service == null ? java.util.Optional.empty() : service.authenticate(credential);
+                })
+                : new CredentialAuthenticator(tokenService, tokenSigner);
+    }
+
+    /** Direct on-prem/absent-SDK seam retained for focused assembly tests. */
+    CredentialAuthenticator credentialAuthenticator(
+            TokenService tokenService, TokenSigner tokenSigner, CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? CredentialAuthenticator.refusing()
+                : new CredentialAuthenticator(tokenService, tokenSigner);
+    }
+
+    @Bean
+    AuthenticationMode authenticationMode(CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? AuthenticationMode.CLOUD : AuthenticationMode.ON_PREM;
     }
 
     @Bean
@@ -335,7 +378,7 @@ class ControlPlaneConfiguration {
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
             SchemaStore schemaStore, @Nullable NestSettings nestSettings,
             SchemaDerivation derivation, LivePipelines livePipelines,
-            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -363,12 +406,44 @@ class ControlPlaneConfiguration {
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories(),
                         new ExecutionAdvisories()),
-                derivation, livePipelines, DeploymentProfile.parse(deploymentProfile));
+                derivation, livePipelines, attribution, stateDatabasePolicy);
+    }
+
+    /** Preserves the direct assembly seam used by focused on-prem wiring tests. */
+    ApplyService applyService(
+            ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
+            SchemaStore schemaStore, @Nullable NestSettings nestSettings,
+            SchemaDerivation derivation, LivePipelines livePipelines) {
+        return applyService(artifactStore, connectorCatalogView, auditGate, schemaStore, nestSettings,
+                derivation, livePipelines, ResourceAttributionPolicy.onPrem(), StateDatabasePolicy.ON_PREM);
+    }
+
+    @Bean
+    ResourceAttributionPolicy resourceAttributionPolicy(CloudRuntimeSettings cloud) {
+        return cloud.cloud()
+                ? ResourceAttributionPolicy.managedCloud()
+                : ResourceAttributionPolicy.onPrem();
+    }
+
+    @Bean
+    StateDatabasePolicy stateDatabasePolicy(CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? StateDatabasePolicy.CLOUD : StateDatabasePolicy.ON_PREM;
     }
 
     @Bean
     ArtifactQueryService artifactQueryService(ArtifactStore artifactStore) {
         return new ArtifactQueryService(artifactStore);
+    }
+
+    @Bean
+    SourceConfigRevealAuthorizer sourceConfigRevealAuthorizer() {
+        return SourceConfigRevealAuthorizer.denyAll();
+    }
+
+    @Bean
+    SourceConfigRevealService sourceConfigRevealService(
+            SourceConfigRevealAuthorizer authorizer, ArtifactStore artifactStore) {
+        return new SourceConfigRevealService(authorizer, artifactStore);
     }
 
     /**
@@ -475,17 +550,27 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SeedSweepRunner seedSweepRunner(SeedConnectorSweep sweep, ConnectorPluginProperties properties) {
-        return new SeedSweepRunner(sweep, properties.getSeedDir());
+    SeedSweepRunner seedSweepRunner(
+            SeedConnectorSweep sweep, ConnectorPluginProperties properties, CloudRuntimeSettings cloud,
+            ConnectorRegistry registry, ConnectorCatalogStore catalog, ConnectorSpecStore specs, CapabilityDeriver deriver) {
+        var readiness = cloud.cloud()
+                ? CloudConnectorSeedReadiness.checkedRelease(
+                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver)
+                : null;
+        return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness);
     }
 
     @Bean
-    ViewStoreSeedRunner viewStoreSeedRunner(ArtifactStore artifactStore, MongoProperties mongoProperties) {
+    ViewStoreSeedRunner viewStoreSeedRunner(
+            ArtifactStore artifactStore, MongoProperties mongoProperties, CloudRuntimeSettings cloud) {
         // The managed ArtifactStore, not the raw one behind it. Reaching past the decorator would make
         // this the one write in the process that skips secret tracking -- and the resource it writes is
         // built from the deployment's own store URI, which is the last one that should be the exception.
         // It changes nothing observable while the mongodb catalog marks `uri` non-secret; what it
         // removes is a seam where a later change to that marking would silently not apply here.
+        // Only on-prem deployments seed a views Source. Cloud never publishes its metadata
+        // connection as a Source and leaves any existing views resource untouched on restart.
+        if (cloud.cloud()) return new ViewStoreSeedRunner(artifactStore, null, null, false);
         return new ViewStoreSeedRunner(artifactStore, mongoProperties.getUri(), mongoProperties.getTlsCaFile());
     }
 
@@ -621,6 +706,12 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    PipelinePreviewService pipelinePreviewService(
+            ApplyService applyService, PipelinePreviewProbe probe, Clock clock) {
+        return new PipelinePreviewService(applyService, probe, clock);
+    }
+
+    @Bean
     PipelineCatalogService pipelineCatalogService(
             ArtifactQueryService artifacts,
             PipelineDraftService pipelineDrafts,
@@ -728,6 +819,32 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    SampleSourceCredentialsProvider sampleSourceCredentialsProvider(
+            CloudRuntimeSettings cloudSettings, JsonMapper objectMapper,
+            @Value("${tapstate.sample.host:113.98.206.139}") String host,
+            @Value("${tapstate.sample.password:}") String password) {
+        if (cloudSettings.cloud()) {
+            return new CloudSampleSourceCredentialsProvider(cloudSettings, objectMapper);
+        }
+        return new ConfiguredSampleSourceCredentialsProvider(host, password);
+    }
+
+    @Bean
+    SampleSourceService sampleSourceService(SourceProjectionService sources, SchemaDiscoveryService discovery,
+            ConnectionTestService connections, ConnectorCatalogView connectors,
+            SampleSourceCredentialsProvider credentialsProvider) {
+        return new SampleSourceService(sources, discovery, connections, connectors, credentialsProvider);
+    }
+
+    @Bean
+    StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
+            SourceRepresentation representation, ConnectionTestService connections,
+            CloudRuntimeSettings cloud) {
+        return new StateStoreSetupService(apply, artifacts, representation,
+                cloud.cloud() ? DeploymentProfile.CLOUD : DeploymentProfile.ON_PREM, connections);
+    }
+
+    @Bean
     PipelineRepresentation pipelineRepresentation() {
         return new PipelineRepresentation();
     }
@@ -738,6 +855,13 @@ class ControlPlaneConfiguration {
             PipelineRepresentation representation,
             PipelineObservationQueryService observations) {
         return new PipelineViewService(artifactQueryService, representation, observations);
+    }
+
+    @Bean
+    ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
+            PipelineObservationQueryService observations, DataBrowserService browser,
+            SourceSchemaQueryService schemas) {
+        return new ViewCatalogService(artifacts, observations, browser, schemas);
     }
 
     @Bean

@@ -50,6 +50,7 @@ final class YamlEmitter {
                 sb.append('\n');
                 writeSeq(sb, q, indent + 2);
             }
+            case Node.MapN m when m.entries().isEmpty() -> sb.append(" {}\n");
             case Node.MapN m -> {
                 sb.append('\n');
                 writeMap(sb, m, indent + 2, null);
@@ -62,9 +63,15 @@ final class YamlEmitter {
             switch (item) {
                 case Node.ScalarN s -> sb.append(" ".repeat(indent)).append("- ")
                         .append(renderScalar(s, false)).append('\n');
+                case Node.MapN m when m.entries().isEmpty() ->
+                        sb.append(" ".repeat(indent)).append("- {}\n");
                 case Node.MapN m -> writeMap(sb, m, indent + 2, " ".repeat(indent) + "- ");
-                case Node.SeqN ignored ->
-                        throw new IllegalStateException("sequence of sequences does not occur in the grammar");
+                case Node.SeqN nested when isFlow(nested) -> sb.append(" ".repeat(indent)).append("- ")
+                        .append(renderFlow(nested)).append('\n');
+                case Node.SeqN nested -> {
+                    sb.append(" ".repeat(indent)).append("-\n");
+                    writeSeq(sb, nested, indent + 2);
+                }
             }
         }
     }
