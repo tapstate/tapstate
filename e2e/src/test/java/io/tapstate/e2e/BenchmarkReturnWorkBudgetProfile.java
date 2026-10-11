@@ -127,6 +127,8 @@ final class BenchmarkReturnWorkBudgetProfile {
         upper.merge(BenchmarkReturnWorkBudget.Activity.COPY, encode, BenchmarkReturnWorkBudget.Work::plus);
         var localRegistration = BenchmarkReturnLocalSourceWork.registrationLocalUpper();
         upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, localRegistration, BenchmarkReturnWorkBudget.Work::plus);
+        var localIo = BenchmarkReturnWorkBudgetBindingsIo.localIoUpper();
+        localIo.forEach((activity, bound) -> upper.merge(activity, bound, BenchmarkReturnWorkBudget.Work::plus));
         var gaps = new ArrayList<Gap>();
         for (var activity : BenchmarkReturnWorkBudget.Activity.values()) {
             if (!upper.containsKey(activity) && !excluded.contains(activity)) {
@@ -145,6 +147,8 @@ final class BenchmarkReturnWorkBudgetProfile {
         registration.put("manifestCodecSourceUpper", Map.of("priorByteCap", manifestBytes, "priorFieldCap", manifestFields,
                 "decoder", decode.evidence(), "encoder", encode.evidence(), "opaqueProviderInstructionsExcluded", true));
         registration.put("registrationLocalSourceUpper", localRegistration.evidence());
+        registration.put("bindingIoLocalSourceUpper", localIo.entrySet().stream().collect(java.util.stream.Collectors.toMap(
+                entry -> entry.getKey().name(), entry -> entry.getValue().evidence())));
         registration.put("terminalSourceTail", BenchmarkReturnWorkBudgetSourceTails.terminalEvidence(reporting.plan()));
         registration.put("structuralWorkBudgetQualified", false); registration.put("wholeMethodCostQualified", false);
         return new Prepared(inputs, upper, excluded, reporting.plan(), registration, gaps);

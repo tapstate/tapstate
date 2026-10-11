@@ -121,7 +121,7 @@ class BenchmarkReturnWorkBudgetRunTest {
                 assertThat(((Map<?, ?>) run.bindingEvidence().get("actualIo")).get("state"))
                         .isEqualTo("DECLARED_BYTE_FACTS_AUTHENTICATED");
                 Map<?, ?> actors = (Map<?, ?>) receipt.get("activities");
-                assertThat(((Map<?, ?>) actors.get("INSTALL_BINDINGS")).get("completedAttempts")).isEqualTo(1L);
+                assertThat(((Map<?, ?>) actors.get("INSTALL_BINDINGS")).get("completedAttempts")).isEqualTo(2L);
                 assertThat(Files.exists(fixture.output())).isFalse();
                 assertThat(Files.exists(fixture.body())).isFalse();
             }

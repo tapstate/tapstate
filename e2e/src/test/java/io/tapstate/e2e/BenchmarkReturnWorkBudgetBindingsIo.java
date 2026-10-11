@@ -17,6 +17,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
@@ -47,8 +48,11 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
         Blob blob() { require(sha256 != null && bytes > 0, "declared material is empty"); return new Blob(sha256, bytes); }
     }
 
-    private BenchmarkReturnWorkBudgetBindingsIo(Streams streams) {
-        require(streams != null, "stream source missing"); this.streams = streams; scope = BenchmarkReturnWorkBudget.current();
+    BenchmarkReturnWorkBudgetBindingsIo(Streams streams) {
+        this(BenchmarkReturnWorkBudget.current(), streams);
+    }
+    private BenchmarkReturnWorkBudgetBindingsIo(BenchmarkReturnWorkBudget.Scope scope, Streams streams) {
+        require(streams != null, "stream source missing"); this.streams = streams; this.scope = scope;
     }
 
     static Result authenticate(Path sourceRoot, Path application, List<FileFact> files,
@@ -57,9 +61,15 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
     }
     static Result authenticate(Path sourceRoot, Path application, List<FileFact> files,
                                HelperManifest helper, JdkManifest jdk, Streams streams) throws IOException {
-        var reader = new BenchmarkReturnWorkBudgetBindingsIo(streams);
-        try { return reader.read(sourceRoot, application, files, helper, jdk); }
-        catch (IOException | RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failure(reader.scope, failure); throw failure; }
+        var scope = BenchmarkReturnWorkBudget.current();
+        var entry = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
+        try {
+            var reader = new BenchmarkReturnWorkBudgetBindingsIo(scope, streams);
+            var result = reader.read(sourceRoot, application, files, helper, jdk);
+            BenchmarkReturnWorkBudget.done(entry); return result;
+        } catch (IOException | RuntimeException | Error failure) {
+            BenchmarkReturnWorkBudget.failure(scope, failure); BenchmarkReturnWorkBudget.failed(entry, failure); throw failure;
+        }
     }
 
     private Result read(Path sourceRoot, Path application, List<FileFact> declared, HelperManifest helper, JdkManifest jdk) throws IOException {
@@ -189,7 +199,7 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
                 require(item != null && !item.isDirectory() && item.getSize() >= 0 && item.getSize() <= cap, "nested module missing or exceeds outer prior byte cap");
                 InputStream raw = request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> zip.getInputStream(item));
                 origins.addAll(closing(raw, () -> {
-                    var bounded = new Limited(raw, cap);
+                    var bounded = limitedStream(raw, cap);
                     ZipInputStream nested = request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> new ZipInputStream(bounded));
                     return closing(nested, () -> nested(nested, cap, module.getValue()));
                 }));
@@ -266,7 +276,7 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
         });
     }
     private Path canonical(Path path) throws IOException {
-        require(path != null && path.isAbsolute() && path.equals(path.normalize()), "path is not absolute and normalized");
+        require(path != null && path.toString().length() <= 4096 && path.isAbsolute() && path.equals(path.normalize()), "path is not absolute, normalized or within its source cap");
         require(!request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> Files.isSymbolicLink(path)), "linked file refused");
         Path real = request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, path::toRealPath);
         require(path.equals(real), "linked or noncanonical path refused"); return path;
@@ -311,22 +321,60 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
     private void copy(long bytes, long elements) {
         BenchmarkReturnWorkBudget.add(scope, BenchmarkReturnWorkBudget.Activity.COPY, new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, bytes, 1, elements, 0));
     }
+    InputStream limitedStream(InputStream input, long cap) { return new Limited(input, cap); }
     private final class Limited extends InputStream {
         private final InputStream input; private final long cap; private long count;
-        Limited(InputStream input, long cap) { this.input = input; this.cap = cap; }
+        Limited(InputStream input, long cap) {
+            require(input != null && cap >= 0 && cap < Long.MAX_VALUE, "limited stream input or source cap differs");
+            this.input = input; this.cap = cap;
+        }
         @Override public int read() throws IOException {
-            int value = request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, input::read);
-            if (value >= 0) { count = Math.incrementExact(count); consumed(1); require(count <= cap, "module stream exceeds outer prior byte cap"); }
-            return value;
+            var entry = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, BenchmarkReturnWorkBudget.Work.call());
+            try {
+                int value = request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, input::read);
+                if (value >= 0) { count = Math.incrementExact(count); consumed(1); require(count <= cap, "module stream exceeds outer prior byte cap"); }
+                BenchmarkReturnWorkBudget.done(entry); return value;
+            } catch (IOException | RuntimeException | Error failure) {
+                BenchmarkReturnWorkBudget.failure(scope, failure); BenchmarkReturnWorkBudget.failed(entry, failure); throw failure;
+            }
         }
         @Override public int read(byte[] buffer, int off, int len) throws IOException {
-            if (len == 0) { return 0; }
-            int wanted = Math.toIntExact(Math.min(len, Math.addExact(Math.subtractExact(cap, count), 1)));
-            int read = request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> input.read(buffer, off, wanted));
-            if (read >= 0) { require(read > 0, "module stream made no progress"); count = Math.addExact(count, read); consumed(read); require(count <= cap, "module stream exceeds outer prior byte cap"); }
-            return read;
+            var entry = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, BenchmarkReturnWorkBudget.Work.call());
+            try {
+                Objects.requireNonNull(buffer); Objects.checkFromIndexSize(off, len, buffer.length);
+                if (len == 0) { BenchmarkReturnWorkBudget.done(entry); return 0; }
+                int wanted = Math.toIntExact(Math.min(Math.min(len, BUFFER_BYTES), Math.addExact(Math.subtractExact(cap, count), 1)));
+                int read = request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> input.read(buffer, off, wanted));
+                if (read >= 0) { require(read > 0, "module stream made no progress"); count = Math.addExact(count, read); consumed(read); require(count <= cap, "module stream exceeds outer prior byte cap"); }
+                BenchmarkReturnWorkBudget.done(entry); return read;
+            } catch (IOException | RuntimeException | Error failure) {
+                BenchmarkReturnWorkBudget.failure(scope, failure); BenchmarkReturnWorkBudget.failed(entry, failure); throw failure;
+            }
         }
         @Override public void close() throws IOException { request(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, () -> { input.close(); return null; }); }
+    }
+
+    /** Additive local source/API allowance per complete entered actor; service interiors and codec work are separate. */
+    static Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> localIoUpper() {
+        long paths = 4096, names = 1024, buffer = BUFFER_BYTES;
+        long predicates = Math.addExact(paths, Math.addExact(names, buffer));
+        long roster = Math.addExact(BenchmarkReturnWorkBudgetProfile.FileRole.values().length, SourceRole.values().length);
+        roster = Math.addExact(roster, Math.addExact(MAX_CLASSES, Math.multiplyExact(2L, MAX_CLASSES)));
+        roster = Math.addExact(roster, Math.addExact(JdkRole.values().length, Math.addExact(Math.multiplyExact(2L, MAX_CLASSES), 32)));
+        var bounds = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
+        // The scalar branch allowance is separate from bounded caller-owned predicate/character visits.
+        bounds.put(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, new BenchmarkReturnWorkBudget.Work(
+                Math.addExact(64, predicates), Math.addExact(64, predicates), 0, 0,
+                Math.addExact(buffer, Math.multiplyExact(2, Math.addExact(paths, names))), 4, Math.multiplyExact(4, predicates), 64));
+        bounds.put(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, new BenchmarkReturnWorkBudget.Work(
+                8, 8, 0, 0, 96, 2, 96, 8));
+        bounds.put(BenchmarkReturnWorkBudget.Activity.COPY, new BenchmarkReturnWorkBudget.Work(
+                1, 1, 0, 0, buffer, 1, buffer, 1));
+        bounds.put(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, new BenchmarkReturnWorkBudget.Work(
+                Math.addExact(128, Math.multiplyExact(32, roster)), Math.addExact(128, Math.multiplyExact(64, roster)), 0, 0,
+                Math.addExact(4096, Math.multiplyExact(256, roster)), 4,
+                Math.addExact(128, Math.multiplyExact(32, roster)), Math.multiplyExact(16, roster)));
+        return Map.copyOf(bounds);
     }
 
     static byte[] helperBytes(HelperManifest helper) {

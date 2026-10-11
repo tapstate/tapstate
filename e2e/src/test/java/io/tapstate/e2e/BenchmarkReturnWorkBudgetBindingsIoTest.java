@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import java.io.ByteArrayOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -157,6 +158,88 @@ class BenchmarkReturnWorkBudgetBindingsIoTest {
         }
     }
 
+    @Test void zero_length_limited_read_has_one_owned_entry_and_no_underlying_request_then_uses_the_fixed_buffer_bound() throws Exception {
+        var reads = new AtomicInteger(); var lastLength = new AtomicInteger();
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "controlled-limited-zero")) {
+            var reader = new BenchmarkReturnWorkBudgetBindingsIo(path -> { throw new AssertionError("file open is outside this control"); });
+            var original = new ByteArrayInputStream(new byte[8193]) {
+                @Override public synchronized int read(byte[] buffer, int off, int length) {
+                    reads.incrementAndGet(); lastLength.set(length); return super.read(buffer, off, length);
+                }
+            };
+            try (var limited = reader.limitedStream(original, 8193)) {
+                assertThat(limited.read(new byte[0], 0, 0)).isZero();
+                assertThat(reads).hasValue(0);
+                var entered = row(scope.snapshot(), "DOCUMENT_READ");
+                assertThat(entered).containsEntry("attempts", 1L).containsEntry("completedAttempts", 1L)
+                        .containsEntry("issuedRequests", 0L).containsEntry("failedAttempts", 0L);
+                assertThat(((Map<?, ?>) entered.get("actual")).get("calls")).isEqualTo(1L);
+                assertThat(limited.read(new byte[8193], 0, 8193)).isEqualTo(8192);
+                assertThat(reads).hasValue(1); assertThat(lastLength).hasValue(8192);
+                assertThat(actual(scope.snapshot(), "DOCUMENT_READ", "requests")).isEqualTo(1);
+            }
+            assertThat(actual(scope.snapshot(), "DOCUMENT_READ", "requests")).isEqualTo(2);
+            assertThat(scope.snapshot()).containsEntry("pendingOperations", 0L);
+        }
+    }
+
+    @Test void owned_limited_read_and_separate_read_close_services_keep_exact_failure_counts_and_primary() throws Exception {
+        var read = new IOException("controlled limited read failure"); var close = new IOException("controlled limited close failure");
+        var reads = new AtomicInteger(); var closes = new AtomicInteger();
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "controlled-limited-failure")) {
+            var reader = new BenchmarkReturnWorkBudgetBindingsIo(path -> { throw new AssertionError("file open is outside this control"); });
+            var underlying = new InputStream() {
+                @Override public int read() throws IOException { reads.incrementAndGet(); throw read; }
+                @Override public void close() throws IOException { closes.incrementAndGet(); throw close; }
+            };
+            Throwable failure = catchThrowable(() -> { try (var limited = reader.limitedStream(underlying, 1)) { limited.read(); } });
+            assertThat(failure).isSameAs(read); assertThat(failure.getSuppressed()).containsExactly(close);
+            assertThat(reads).hasValue(1); assertThat(closes).hasValue(1); assertThat(scope.primaryCause()).isSameAs(read);
+            var receipt = scope.snapshot(); var entered = row(receipt, "DOCUMENT_READ");
+            assertThat(entered).containsEntry("attempts", 3L).containsEntry("completedAttempts", 3L)
+                    .containsEntry("failedAttempts", 3L).containsEntry("issuedRequests", 2L)
+                    .containsEntry("completedRequests", 2L).containsEntry("failedRequests", 2L);
+            assertThat(receipt).containsEntry("state", "UNKNOWN").containsEntry("pendingOperations", 0L);
+        }
+    }
+
+    @Test void standalone_authentication_has_its_own_complete_or_failed_install_entry() throws Exception {
+        var fixture = fixture(false, false);
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "controlled-install-success")) {
+            fixture.authenticate();
+            assertThat(row(scope.snapshot(), "INSTALL_BINDINGS")).containsEntry("attempts", 1L)
+                    .containsEntry("completedAttempts", 1L).containsEntry("failedAttempts", 0L).containsEntry("issuedRequests", 0L);
+        }
+        var primary = new IOException("controlled authentication open failure");
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "controlled-install-failure")) {
+            Throwable failure = catchThrowable(() -> fixture.authenticate(path -> { throw primary; }));
+            assertThat(failure).isSameAs(primary); assertThat(scope.primaryCause()).isSameAs(primary);
+            assertThat(row(scope.snapshot(), "INSTALL_BINDINGS")).containsEntry("attempts", 1L)
+                    .containsEntry("completedAttempts", 1L).containsEntry("failedAttempts", 1L).containsEntry("issuedRequests", 0L);
+            assertThat(scope.snapshot()).containsEntry("pendingOperations", 0L);
+        }
+    }
+
+    @Test void local_source_upper_counts_request_predicate_and_material_allowances_separately_from_the_codec() {
+        var upper = BenchmarkReturnWorkBudgetBindingsIo.localIoUpper();
+        assertThat(upper.keySet()).containsExactlyInAnyOrder(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ,
+                BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, BenchmarkReturnWorkBudget.Activity.COPY,
+                BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS);
+        var document = upper.get(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ);
+        long boundedOwnedVisits = 4096 + 1024 + 8192;
+        long explicitPathEntryAndReadApiLower = 6 + 12 + 6;
+        assertThat(document.requests()).isGreaterThanOrEqualTo(boundedOwnedVisits + explicitPathEntryAndReadApiLower);
+        assertThat(document.calls()).isGreaterThanOrEqualTo(boundedOwnedVisits);
+        assertThat(document.bytes()).isGreaterThanOrEqualTo(8192 + 2 * (4096 + 1024));
+        var fingerprint = upper.get(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT);
+        assertThat(fingerprint.requests()).isGreaterThanOrEqualTo(3); assertThat(fingerprint.bytes()).isGreaterThanOrEqualTo(32 + 64);
+        assertThat(upper.get(BenchmarkReturnWorkBudget.Activity.COPY).bytes()).isEqualTo(8192);
+        long roster = BenchmarkReturnWorkBudgetProfile.FileRole.values().length + SourceRole.values().length
+                + 512 + 1024 + JdkRole.values().length + 1024 + 32;
+        assertThat(upper.get(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS).requests()).isGreaterThanOrEqualTo(64 * roster);
+        assertThatThrownBy(upper::clear).isInstanceOf(UnsupportedOperationException.class);
+    }
+
     /** Owned byte fixtures are never loaded or executed as classes or JDK artifacts. */
     private Fixture fixture(boolean foreign, boolean inflated) throws Exception {
         Path parent = Files.createTempDirectory(temporary, "binding-io-").toRealPath();
@@ -250,8 +333,11 @@ class BenchmarkReturnWorkBudgetBindingsIoTest {
         return new BenchmarkReturnWorkBudget.Definition("controlled-io", "a".repeat(64), Map.of(), upper, Set.of());
     }
     private static long actual(Map<String, Object> receipt, String activity, String unit) {
-        Map<?, ?> activities = (Map<?, ?>) receipt.get("activities"); Map<?, ?> row = (Map<?, ?>) activities.get(activity);
-        return ((Number) ((Map<?, ?>) row.get("actual")).get(unit)).longValue();
+        return ((Number) ((Map<?, ?>) row(receipt, activity).get("actual")).get(unit)).longValue();
+    }
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> row(Map<String, Object> receipt, String activity) {
+        return (Map<String, Object>) ((Map<?, ?>) receipt.get("activities")).get(activity);
     }
     private record Fixture(Path sourceRoot, Path application, List<FileFact> files, HelperManifest helper, JdkManifest jdk) {
         Path firstSource() { return sourceRoot.resolve(helper.sources().getFirst().path()); }
