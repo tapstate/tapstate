@@ -82,6 +82,7 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
                         () -> files.count(targetAddress, TABLE) >= SEEDED_ROWS,
                         () -> "rows at target = " + files.count(targetAddress, TABLE));
 
+                String clusterId = control.clusterStatus().clusterId();
                 String driver = Await.answered("the cluster to name the member driving the pipeline",
                         () -> control.pipelineControllerOf(PIPELINE));
                 String killed = TwoMemberCluster.NODE_A.equals(driver) ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
@@ -103,12 +104,26 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
 
                     long rowsAtTheKill = files.count(targetAddress, TABLE);
                     files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
-                    Await.until("a change made after the kill to reach the target while the store would still be "
-                                    + "holding the record the killed member left open", WITHIN_THE_HOLD,
-                            () -> files.count(targetAddress, TABLE) > rowsAtTheKill,
-                            () -> "rows at target = " + files.count(targetAddress, TABLE) + ", was " + rowsAtTheKill
-                                    + " when " + killed + " was killed; the pipeline is " + survivor.state(PIPELINE)
-                                    + " under execution " + survivor.executionGenerationOf(PIPELINE));
+                    try {
+                        Await.until("a change made after the kill to reach the target while the store would still be "
+                                        + "holding the record the killed member left open", WITHIN_THE_HOLD,
+                                () -> files.count(targetAddress, TABLE) > rowsAtTheKill,
+                                () -> "rows at target = " + files.count(targetAddress, TABLE) + ", was " + rowsAtTheKill
+                                        + " when " + killed + " was killed; the pipeline is " + survivor.state(PIPELINE)
+                                        + " under execution " + survivor.executionGenerationOf(PIPELINE));
+                    } catch (RuntimeException | AssertionError failure) {
+                        try {
+                            Path scene = Path.of(System.getProperty("tapstate.e2e.build-directory", "target"))
+                                    .resolve("failure-scenes").resolve("held-transaction")
+                                    .resolve(clusterId + "-" + java.util.UUID.randomUUID());
+                            Files.createDirectories(scene);
+                            Files.writeString(scene.resolve("store-facts.json"), held.diagnostics(clusterId, PIPELINE).toJson());
+                            failure.addSuppressed(new AssertionError("Held-transaction facts retained at " + scene));
+                        } catch (RuntimeException | IOException unavailable) {
+                            failure.addSuppressed(unavailable);
+                        }
+                        throw failure;
+                    }
                     assertThat(held.stillHeld())
                             .as("because what the killed member left open was ended when it left, well before the "
                                     + "store would have given up on it by itself")

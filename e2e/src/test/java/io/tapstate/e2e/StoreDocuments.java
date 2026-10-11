@@ -10,10 +10,13 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -189,7 +192,56 @@ final class StoreDocuments implements AutoCloseable {
             named.close();
             throw failure;
         }
+        org.bson.BsonDocument identity = session.getServerSession().getIdentifier();
         return new HeldOpen() {
+            @Override
+            public Document diagnostics(String clusterId, String pipelineId) {
+                try (MongoClient observer = MongoClients.create(MongoClientSettings.builder()
+                        .applyConnectionString(connection).timeout(2, java.util.concurrent.TimeUnit.SECONDS)
+                        .applyToClusterSettings(settings -> settings.serverSelectionTimeout(1, java.util.concurrent.TimeUnit.SECONDS))
+                        .applyToSocketSettings(settings -> settings.connectTimeout(1, java.util.concurrent.TimeUnit.SECONDS)
+                                .readTimeout(2, java.util.concurrent.TimeUnit.SECONDS)).build())) {
+                    Document result = new Document("heldApplicationName", applicationName)
+                            .append("heldSession", Document.parse(identity.toJson()))
+                            .append("pipeline", pipelineId).append("chain", miningChainId).append("clusterId", clusterId);
+                    List<Document> held = observer.getDatabase("admin").aggregate(List.of(
+                            new Document("$currentOp", new Document("allUsers", false).append("idleSessions", true)),
+                            new Document("$match", new Document("appName", applicationName)
+                                    .append("lsid.id", identity.getBinary("id"))),
+                            new Document("$project", new Document("appName", 1).append("lsid", 1).append("transaction", 1)
+                                    .append("active", 1).append("type", 1).append("observedAt", "$$NOW"))))
+                            .into(new ArrayList<>());
+                    result.append("exactHeldSession", held);
+                    result.append("transactionLifetimeLimitSeconds", observer.getDatabase("admin")
+                            .runCommand(new Document("getParameter", 1).append("transactionLifetimeLimitSeconds", 1))
+                            .get("transactionLifetimeLimitSeconds"));
+                    MongoDatabase observed = observer.getDatabase(database.getName());
+                    for (var collection : List.of(SystemCollections.WORKLOAD_CLAIMS, SystemCollections.CLUSTER_MEMBERSHIP,
+                            SystemCollections.CLUSTER_EXECUTION_PROFILES, SystemCollections.CLUSTER_NODE_REGISTRY,
+                            SystemCollections.CLUSTER_RECOVERY_QUEUE, SystemCollections.CLUSTER_CAPACITY_OCCUPANCY)) {
+                        Document filter = collection == SystemCollections.CLUSTER_MEMBERSHIP
+                                || collection == SystemCollections.CLUSTER_EXECUTION_PROFILES
+                                        ? new Document("_id", clusterId) : new Document("clusterId", clusterId);
+                        List<Document> stages = new ArrayList<>(List.of(new Document("$match", filter),
+                                new Document("$set", new Document("observedAt", "$$NOW"))));
+                        if (collection == SystemCollections.CLUSTER_NODE_REGISTRY) {
+                            stages.add(new Document("$unset", "controlUrl"));
+                        }
+                        List<Document> facts = collection.on(observed).aggregate(stages).into(new ArrayList<>());
+                        result.append(collection.name(), facts);
+                    }
+                    result.append("SRS_META", SystemCollections.SRS_META.on(observed)
+                            .find(new Document("_id", miningChainId)).first());
+                    for (var collection : List.of(SystemCollections.PIPELINE_STATE, SystemCollections.PIPELINE_DESIRED,
+                            SystemCollections.PIPELINE_OBSERVATION)) {
+                        result.append(collection.name(), collection.on(observed)
+                                .aggregate(List.of(new Document("$match", new Document("_id", pipelineId)),
+                                        new Document("$set", new Document("observedAt", "$$NOW")))).first());
+                    }
+                    return result;
+                }
+            }
+
             @Override
             public boolean stillHeld() {
                 try {
@@ -227,6 +279,9 @@ final class StoreDocuments implements AutoCloseable {
 
     /** A write left open at the store; see {@link #holdChainOpenAs}. */
     interface HeldOpen extends AutoCloseable {
+
+        /** Read-only exact-session evidence and current run-scoped store facts, before fixture cleanup. */
+        Document diagnostics(String clusterId, String pipelineId);
 
         /**
          * Whether the store is still holding it - asked by writing inside it again, which the store refuses once

@@ -3,6 +3,11 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -10,12 +15,16 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
+import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -176,16 +185,26 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
                 // still RUNNING -- the run is dead and nobody has written it down yet -- so waiting on it
                 // returns at once and witnesses nothing. Only a generation nobody can lower says a new
                 // run was taken under this claim.
-                Await.until("the pair to take the pipeline over, which waits out the lease the stranded "
-                                + "holder never released", TAKEOVER,
-                        () -> survivor.executionGenerationOf(PIPELINE)
-                                .filter(taken -> taken == generationBefore + 1).isPresent()
-                                && survivor.state(PIPELINE)
-                                .filter(PipelineState.RUNNING::equals).isPresent(),
-                        () -> "the majority reports " + survivor.state(PIPELINE) + " at execution "
-                                + survivor.executionGenerationOf(PIPELINE) + " (was " + generationBefore
-                                + " before the cut), captures owned by "
-                                + survivor.captureOwnersOf(PIPELINE).values());
+                try {
+                    Await.until("the pair to take the pipeline over, which waits out the lease the stranded "
+                                    + "holder never released", TAKEOVER,
+                            () -> survivor.executionGenerationOf(PIPELINE)
+                                    .filter(taken -> taken == generationBefore + 1).isPresent()
+                                    && survivor.state(PIPELINE)
+                                    .filter(PipelineState.RUNNING::equals).isPresent(),
+                            () -> "the majority reports " + survivor.state(PIPELINE) + " at execution "
+                                    + survivor.executionGenerationOf(PIPELINE) + " (was " + generationBefore
+                                    + " before the cut), captures owned by "
+                                    + survivor.captureOwnersOf(PIPELINE).values());
+                } catch (AssertionError failure) {
+                    try {
+                        retainTakeoverFailure(failure, cluster, store, driver, majority, generationBefore);
+                    } catch (RuntimeException | Error unavailable) {
+                        failure.addSuppressed(new AssertionError("Passive takeover diagnosis was unavailable: "
+                                + unavailable.getClass().getName()));
+                    }
+                    throw failure;
+                }
 
                 long rowsAtTheTakeover = files.count(targetAddress, TABLE);
                 files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
@@ -303,6 +322,154 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
                 }
             }
         }
+    }
+
+    /** Failure-only observations remain bounded and never replace the assertion that called them. */
+    private static void retainTakeoverFailure(AssertionError failure, PartitionableCluster cluster, String storeUri,
+            String stranded, List<String> survivors, long originalExecutionGeneration) {
+        Duration readBound = Duration.ofSeconds(2);
+        Map<String, Object> facts = new LinkedHashMap<>();
+        facts.put("capturedAt", Instant.now());
+        facts.put("clusterId", cluster.clusterId());
+        facts.put("pipelineId", PIPELINE);
+        facts.put("strandedNode", stranded);
+        facts.put("survivingNodes", survivors);
+        facts.put("originalExecutionGeneration", originalExecutionGeneration);
+        for (String node : survivors) {
+            facts.put("typed:" + node, passiveRead(() -> cluster.member(node).clusterStatus(readBound)));
+        }
+        facts.put("typed:stranded", passiveRead(() -> cluster.member(stranded).clusterStatus(readBound)));
+        List<NativeMemberWitness.JobRequest> jobs = new ArrayList<>();
+        try {
+            ConnectionString connection = new ConnectionString(storeUri);
+            MongoClientSettings settings = MongoClientSettings.builder().applyConnectionString(connection)
+                    .timeout(2, TimeUnit.SECONDS)
+                    .applyToClusterSettings(value -> value.serverSelectionTimeout(1, TimeUnit.SECONDS))
+                    .applyToSocketSettings(value -> value.connectTimeout(1, TimeUnit.SECONDS).readTimeout(2, TimeUnit.SECONDS))
+                    .build();
+            try (var mongo = MongoClients.create(settings)) {
+                MongoDatabase store = mongo.getDatabase(connection.getDatabase()).withTimeout(2, TimeUnit.SECONDS);
+                Document clusterScope = new Document("clusterId", cluster.clusterId());
+                Document pipelineScope = new Document("_id", PIPELINE);
+                facts.put("membership", passiveRows(store, SystemCollections.CLUSTER_MEMBERSHIP,
+                        new Document("_id", cluster.clusterId()), null));
+                facts.put("profile", passiveRows(store, SystemCollections.CLUSTER_EXECUTION_PROFILES,
+                        new Document("_id", cluster.clusterId()), null));
+                facts.put("nodeRegistry", passiveRows(store, SystemCollections.CLUSTER_NODE_REGISTRY, clusterScope, null));
+                facts.put("claims", passiveRows(store, SystemCollections.WORKLOAD_CLAIMS, clusterScope, null));
+                facts.put("desired", passiveRows(store, SystemCollections.PIPELINE_DESIRED, pipelineScope, null));
+                facts.put("checkpoint", passiveRows(store, SystemCollections.PIPELINE_STATE, pipelineScope, null));
+                facts.put("observation", passiveRows(store, SystemCollections.PIPELINE_OBSERVATION, pipelineScope, null));
+                facts.put("artifactIdentities", passiveRows(store, SystemCollections.ARTIFACTS,
+                        new Document("_id", new Document("$in", List.of(PIPELINE, SOURCE_ID, TARGET_ID))),
+                        new Document("_id", 1).append("kind", 1).append("incarnation", 1).append("contentHash", 1)));
+                facts.put("queue", passiveRows(store, SystemCollections.CLUSTER_RECOVERY_QUEUE,
+                        new Document(clusterScope).append("pipelineId", PIPELINE), null));
+                Document capacity = passiveRows(store, SystemCollections.CLUSTER_CAPACITY_OCCUPANCY,
+                        new Document(clusterScope).append("pipelineId", PIPELINE), null);
+                facts.put("capacity", capacity);
+                if (capacity.get("documents") instanceof List<?> receipts) {
+                    for (Object receipt : receipts) {
+                        if (!(receipt instanceof Document row)) {
+                            facts.put("nativeRequestUnavailable", "The capacity reading contained an unknown receipt type");
+                            continue;
+                        }
+                        if (row.get("nativeJobId") == null) { continue; }
+                        try {
+                            Document claim = row.get("pipelineClaim", Document.class);
+                            long cg = positive(claim, "claimGeneration");
+                            long eg = positive(claim, "executionGeneration");
+                            long pg = positive(claim, "profileGeneration");
+                            String job = row.getString("nativeJobId");
+                            if (!PIPELINE.equals(row.getString("pipelineId")) || job == null || job.isBlank()
+                                    || positive(row, "executionGeneration") != eg
+                                    || positive(row.get("profile", Document.class), "generation") != pg) {
+                                throw new AssertionError("The submitted capacity receipt has inconsistent execution identity");
+                            }
+                            jobs.add(new NativeMemberWitness.JobRequest(PIPELINE, job, cg, eg, pg));
+                        } catch (RuntimeException | AssertionError unavailable) {
+                            facts.put("nativeRequestUnavailable:" + row.get("_id"), unavailable.getClass().getName());
+                        }
+                    }
+                } else {
+                    facts.put("nativeRequestUnavailable", "The submitted capacity receipts could not be read");
+                }
+            }
+        } catch (RuntimeException | AssertionError unavailable) {
+            facts.put("mongoUnavailable", unavailable.getClass().getName());
+        }
+        facts.put("nativeRequests", jobs);
+        for (String node : survivors) {
+            try (NativeMemberWitness nativeReader = NativeMemberWitness.connect(cluster, node, readBound)) {
+                facts.put("nativeSubmittedJobs:" + node, passiveRead(() -> nativeReader.submittedJobs(readBound)));
+                facts.put("nativeProjection:" + node, passiveRead(() -> nativeReader.projectionReading(jobs, readBound)));
+            } catch (RuntimeException | AssertionError unavailable) {
+                facts.put("nativeUnavailable:" + node, unavailable.getClass().getName());
+            }
+        }
+        try {
+            Path scene = Path.of(System.getProperty("tapstate.e2e.build-directory", "target"))
+                    .resolve("failure-scenes").resolve("partition-takeover").resolve(cluster.clusterId());
+            Files.createDirectories(scene);
+            var json = new tools.jackson.databind.ObjectMapper();
+            String snapshot = json.writeValueAsString(redactPassive(json.convertValue(facts, Object.class)))
+                    .replaceAll("[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s\"']+", "<address elided>");
+            Files.writeString(scene.resolve("takeover-failure.json"), snapshot);
+            failure.addSuppressed(new AssertionError("Passive takeover facts retained at " + scene));
+        } catch (IOException | RuntimeException unavailable) {
+            failure.addSuppressed(new AssertionError("Passive takeover facts could not be retained: "
+                    + unavailable.getClass().getName()));
+        }
+    }
+
+    private static Object passiveRead(Supplier<?> reading) {
+        try { return reading.get(); }
+        catch (RuntimeException | AssertionError unavailable) {
+            return Map.of("readUnavailable", unavailable.getClass().getName());
+        }
+    }
+
+    private static Document passiveRows(MongoDatabase store, SystemCollections collection, Document scope, Document fields) {
+        Document reading = new Document("collection", collection.collectionName()).append("scope", scope);
+        try {
+            List<Document> stages = new ArrayList<>();
+            stages.add(new Document("$match", scope));
+            if (fields != null) { stages.add(new Document("$project", fields)); }
+            stages.add(new Document("$addFields", new Document("diagnosticMongoNow", "$$NOW")
+                    .append("leaseRemainingMillis", new Document("$subtract", List.of("$leaseUntil", "$$NOW")))
+                    .append("retiredAuthorizationRemainingMillis", new Document("$subtract", List.of("$retiredAuthorizationUntil", "$$NOW")))
+                    .append("deadlineRemainingMillis", new Document("$subtract", List.of("$deadline", "$$NOW")))));
+            reading.append("documents", collection.on(store).aggregate(stages)
+                    .maxTime(2, TimeUnit.SECONDS).into(new ArrayList<>()));
+        } catch (RuntimeException unavailable) {
+            reading.append("readUnavailable", unavailable.getClass().getName());
+        }
+        return reading;
+    }
+
+    private static long positive(Document document, String name) {
+        if (document == null || !(document.get(name) instanceof Number number) || number.longValue() < 1) {
+            throw new AssertionError("The observed receipt has no positive " + name);
+        }
+        return number.longValue();
+    }
+
+    private static Object redactPassive(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> redacted = new LinkedHashMap<>();
+            map.forEach((key, entry) -> {
+                String name = String.valueOf(key);
+                String normalized = name.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z]", "");
+                redacted.put(name, normalized.contains("password") || normalized.contains("credential")
+                        || normalized.contains("secret") || normalized.contains("config") || normalized.endsWith("uri")
+                        || normalized.endsWith("url") || normalized.equals("authorization") || normalized.equals("apikey")
+                        || normalized.equals("accesstoken") || normalized.equals("refreshtoken")
+                                ? "<redacted>" : redactPassive(entry));
+            });
+            return redacted;
+        }
+        if (value instanceof List<?> list) { return list.stream().map(ThreeMemberNetworkPartitionFailsClosedIT::redactPassive).toList(); }
+        return value;
     }
 
     /**
