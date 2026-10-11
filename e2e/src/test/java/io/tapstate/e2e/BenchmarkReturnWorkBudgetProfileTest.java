@@ -15,6 +15,41 @@ class BenchmarkReturnWorkBudgetProfileTest {
     private static final BenchmarkReturnWorkBudgetProfile.WorkloadInput ORIGINAL =
             BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless");
 
+    @Test void actual_source_association_rows_fit_the_registered_shared_support_bound() {
+        var original = BenchmarkWorkloadDefinitions.steadyPilot("stateless");
+        var measured = original.phase("cdc-update");
+        var target = measured.targets().getFirst();
+        var phase = new BenchmarkWorkloadDefinitions.Phase(measured.id(), measured.stage(), true, 2,
+                List.of("UPDATE bench_stateless_orders SET qty = qty + 1 WHERE id BETWEEN 2 AND 2 AND id % 2 = 0"),
+                1, measured.batchInterval(), measured.expectedLogicalCoverage(), measured.targets());
+        var phases = new ArrayList<>(original.phases());
+        phases.set(phases.indexOf(measured), phase);
+        var control = new BenchmarkWorkloadDefinitions.Workload(original.id(), original.seed(), original.rows(),
+                original.database(), original.pipelineIds(), original.sourceChains(), original.setupSql(), phases);
+        var call = new BenchmarkWriteReturnAssembly.FullCall(1, 1, 2, 2000, 2100, 2200, true, 1,
+                0, 2, 0, 0, List.of(), "", "controlled ordinary acknowledged call",
+                "pdk.state." + target.pipelineId() + ".sink", "stream", target.table(), List.of("item_index", "id"),
+                List.of(new BenchmarkWriteReturnLedger.Row(2, List.of(0, 2)),
+                        new BenchmarkWriteReturnLedger.Row(2, List.of(1, 2))));
+        var definition = BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, files(false))).requireDefinition();
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition, "shared-source-association")) {
+            var associated = BenchmarkWriteReturnExpectations.associate(control, phase,
+                    List.of(new BenchmarkForkEnvironment.BatchResult(0, 1000, 1100)), List.of(call));
+            assertThat(associated).extracting(BenchmarkWriteReturnExpectations.Association::key).containsExactly("2:0", "2:1");
+            var snapshot = scope.snapshot();
+            assertThat(snapshot).containsEntry("state", "OPEN").containsEntry("structuralWorkBudgetQualified", false);
+            @SuppressWarnings("unchecked")
+            var activities = (Map<String, Object>) snapshot.get("activities");
+            @SuppressWarnings("unchecked")
+            var shared = (Map<String, Object>) activities.get("SHARED_SUPPORT");
+            assertThat(shared).containsEntry("attempts", 2L).containsEntry("completedAttempts", 2L)
+                    .containsEntry("actualCountComplete", true);
+            @SuppressWarnings("unchecked")
+            var actual = (Map<String, Object>) shared.get("actual");
+            assertThat(actual).containsEntry("records", 2L);
+        }
+    }
+
     @Test void registered_scalars_cover_every_source_row_with_a_finite_report_plan_without_method_credit() {
         var prepared = BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, files(false)));
         assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.CLOCK_REQUEST))

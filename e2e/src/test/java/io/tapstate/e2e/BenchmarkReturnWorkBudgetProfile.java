@@ -238,7 +238,9 @@ final class BenchmarkReturnWorkBudgetProfile {
         put(upper, BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL, 1, 1, 0, 0, materialBytes, 1, Math.max(guards, materialNodes), 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, 1, 8, 0, 0,
                 Math.max(output.encodedUpperBytes(), materialBytes), 1, materialNodes, 0);
-        put(upper, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, 1, 1, 0, 0, materialBytes, 1, materialNodes, 0);
+        // Source association enters one records(1) operation per registered origin; fixture
+        // requests and SQL batch visits share this activity and contribute zero records.
+        put(upper, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, 1, 1, 1, 0, materialBytes, 1, materialNodes, 0);
         if (inputs.flags().rootCpu()) {
             put(upper, BenchmarkReturnWorkBudget.Activity.ROOT_CPU, 1, 1, 0, 0, materialBytes, 2, materialNodes, 0);
         }
@@ -259,7 +261,8 @@ final class BenchmarkReturnWorkBudgetProfile {
     }
     private static String sourceLocation(BenchmarkReturnWorkBudget.Activity activity) {
         return switch (activity) {
-            case INSTALL_BINDINGS, SHARED_SUPPORT, ACK_POLL, NATIVE_STATUS_POLL -> "BenchmarkForkEnvironment/RealBenchmarkForkDriver fixture and poll call sites";
+            case INSTALL_BINDINGS, ACK_POLL, NATIVE_STATUS_POLL -> "BenchmarkForkEnvironment/RealBenchmarkForkDriver fixture and poll call sites";
+            case SHARED_SUPPORT -> "BenchmarkForkEnvironment fixture and SQL paths; BenchmarkWriteReturnExpectations registered-origin visits";
             case INPUT_FINGERPRINT, RUNTIME_READ, REGISTRATION_READ, PROCESS_INFO, RSS_PROCESS, GC_ROSTER -> "BenchmarkOwnedProcessReceipt/BenchmarkProcessProbe source service and material paths";
             case TARGET_STREAM, TABLE_STREAM, STREAM_READ, STREAM_ACCEPT, STREAM_BARRIER, DOCUMENT_READ -> "BenchmarkMongoDeliveryObserver/BenchmarkTableTerminalObserver/BenchmarkTableCaptureSet source loops";
             case REPORT_SERIALIZE, REPORT_WRITE, REPORT_CLOSE, FAILURE_RETENTION, BOOKKEEPING, CLEANUP -> "BenchmarkReturnWorkBudget/RealBenchmarkForkDriverIT lifecycle and reporter paths";
