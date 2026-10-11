@@ -205,7 +205,11 @@ final class ClusterMembershipController implements AutoCloseable {
         }
         gate.install(current);
         if (joinsOnly(current.activeNodeIds(), visible) && gate.canCommit(visible)) {
+            // A refused join can leave this profile current or lose a revision race.
+            // The stored membership still decides the full committed majority.
             store.compareAndSetProfile(nodeSession, current.revision(), visible)
+                    .or(() -> store.read(clusterId)
+                            .filter(latest -> latest.profileGeneration() == generation))
                     .ifPresentOrElse(gate::install, gate::failClosed);
         } else {
             gate.canCommit(visible);

@@ -3,14 +3,17 @@ package io.tapstate.app;
 import com.hazelcast.cluster.Cluster;
 import com.hazelcast.cluster.Member;
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterExecutionProfile;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.spi.store.ClusterNativeObservation;
 import io.tapstate.spi.store.ClusterProfileStore;
 import io.tapstate.spi.store.ExecutionProfile;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import java.net.InetAddress;
@@ -164,6 +167,121 @@ class ClusterNativeViewPublicationTest {
         }
     }
 
+    @Test void aRefusedJoinKeepsTheActuallyRereadCompatibleMembershipRenewable() {
+        Fixture fixture = new Fixture();
+        try (ClusterMembershipController controller = fixture.controller()) {
+            fixture.awaitFirstAttempt();
+            fixture.showJoiningMember();
+            ClusterMembership admitted = new ClusterMembership(CLUSTER, 7,
+                    Set.of("a", "b", "c"), PROFILE.generation());
+            when(fixture.membership.read(CLUSTER)).thenReturn(Optional.of(admitted));
+            when(fixture.membership.compareAndSetProfile(PUBLISHER, 7, Set.of("a", "b", "c", "d")))
+                    .thenReturn(Optional.empty());
+            clearInvocations(fixture.membership, fixture.profiles);
+
+            controller.reconcile();
+
+            assertThat(fixture.gate.committed()).isEqualTo(admitted);
+            assertThat(fixture.gate.businessEligible()).isTrue();
+            assertThat(fixture.gate.submissionEligible(fixture.visible.get()))
+                    .as("a still uncommitted joining member cannot enter a new submission")
+                    .isFalse();
+            assertThat(fixture.claims.renew(fixture.capture, fixture.captureTtl)).contains(fixture.capture);
+            verify(fixture.captureStore).renew(same(fixture.capture), eq(fixture.captureTtl));
+            verify(fixture.membership).compareAndSetProfile(PUBLISHER, 7, Set.of("a", "b", "c", "d"));
+            verify(fixture.profiles).recordNativeView(same(PUBLISHER), eq(7L), any(), eq(INTERVAL.multipliedBy(3)));
+            assertThat(fixture.last.get().membersByNode()).containsOnlyKeys("a", "b", "c", "d");
+        }
+    }
+
+    @Test void aCompetingJoinUsesTheActuallyRereadRevisionForBusinessAndNativePublication() {
+        Fixture fixture = new Fixture();
+        try (ClusterMembershipController controller = fixture.controller()) {
+            fixture.awaitFirstAttempt();
+            fixture.showJoiningMember();
+            ClusterMembership admitted = new ClusterMembership(CLUSTER, 7,
+                    Set.of("a", "b", "c"), PROFILE.generation());
+            ClusterMembership latest = new ClusterMembership(CLUSTER, 8,
+                    Set.of("a", "b", "c", "d"), PROFILE.generation());
+            when(fixture.membership.read(CLUSTER)).thenReturn(Optional.of(admitted), Optional.of(latest));
+            when(fixture.membership.compareAndSetProfile(PUBLISHER, 7, Set.of("a", "b", "c", "d")))
+                    .thenReturn(Optional.empty());
+            clearInvocations(fixture.membership, fixture.profiles);
+
+            controller.reconcile();
+
+            assertThat(fixture.gate.committed()).isEqualTo(latest);
+            assertThat(fixture.gate.businessEligible()).isTrue();
+            assertThat(fixture.claims.renew(fixture.capture, fixture.captureTtl)).contains(fixture.capture);
+            verify(fixture.captureStore).renew(same(fixture.capture), eq(fixture.captureTtl));
+            verify(fixture.profiles).recordNativeView(same(PUBLISHER), eq(8L), any(), eq(INTERVAL.multipliedBy(3)));
+            verify(fixture.profiles, never()).recordNativeView(any(), eq(7L), any(), any());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "different-profile", "unavailable"})
+    void aRefusedJoinWithNoCompatibleRereadRemainsFailClosed(String outcome) {
+        Fixture fixture = new Fixture();
+        try (ClusterMembershipController controller = fixture.controller()) {
+            fixture.awaitFirstAttempt();
+            fixture.showJoiningMember();
+            ClusterMembership admitted = new ClusterMembership(CLUSTER, 7,
+                    Set.of("a", "b", "c"), PROFILE.generation());
+            switch (outcome) {
+                case "missing" -> when(fixture.membership.read(CLUSTER))
+                        .thenReturn(Optional.of(admitted), Optional.empty());
+                case "different-profile" -> when(fixture.membership.read(CLUSTER))
+                        .thenReturn(Optional.of(admitted), Optional.of(new ClusterMembership(CLUSTER, 8,
+                                Set.of("a", "b", "c", "d"), PROFILE.generation() + 1)));
+                case "unavailable" -> when(fixture.membership.read(CLUSTER))
+                        .thenReturn(Optional.of(admitted))
+                        .thenThrow(new TapstateException(IoError.STORE_UNAVAILABLE,
+                                Map.of("detail", "membership-reread-unavailable"), null));
+                default -> throw new AssertionError(outcome);
+            }
+            when(fixture.membership.compareAndSetProfile(PUBLISHER, 7, Set.of("a", "b", "c", "d")))
+                    .thenReturn(Optional.empty());
+            fixture.last.set(null);
+            clearInvocations(fixture.membership, fixture.profiles);
+
+            controller.reconcile();
+
+            assertThat(fixture.gate.committed()).isNull();
+            assertThat(fixture.gate.businessEligible()).isFalse();
+            assertThat(fixture.claims.renew(fixture.capture, fixture.captureTtl)).isEmpty();
+            verify(fixture.captureStore, never()).renew(any(), any());
+            assertThat(fixture.last.get()).isNull();
+            verify(fixture.profiles, never()).recordNativeView(any(), anyLong(), any(), any());
+        }
+    }
+
+    @Test void aRefusedJoinCannotKeepTheSmallerDenominatorWhenTheRereadAlreadyHasEightMembers() {
+        Fixture fixture = new Fixture();
+        try (ClusterMembershipController controller = fixture.controller()) {
+            fixture.awaitFirstAttempt();
+            fixture.showJoiningMember();
+            ClusterMembership admitted = new ClusterMembership(CLUSTER, 7,
+                    Set.of("a", "b", "c"), PROFILE.generation());
+            ClusterMembership latest = new ClusterMembership(CLUSTER, 9,
+                    Set.of("a", "b", "c", "d", "e", "f", "g", "h"), PROFILE.generation());
+            when(fixture.membership.read(CLUSTER)).thenReturn(Optional.of(admitted), Optional.of(latest));
+            when(fixture.membership.compareAndSetProfile(PUBLISHER, 7, Set.of("a", "b", "c", "d")))
+                    .thenReturn(Optional.empty());
+            clearInvocations(fixture.membership, fixture.profiles);
+
+            controller.reconcile();
+
+            assertThat(fixture.gate.committed()).isEqualTo(latest);
+            assertThat(fixture.gate.visibleNodeIds()).containsExactlyInAnyOrder("a", "b", "c", "d");
+            assertThat(fixture.gate.businessEligible()).isFalse();
+            assertThat(fixture.claims.renew(fixture.capture, fixture.captureTtl)).isEmpty();
+            verify(fixture.captureStore, never()).renew(any(), any());
+            verify(fixture.profiles).recordNativeView(same(PUBLISHER), eq(9L), any(), eq(INTERVAL.multipliedBy(3)));
+            assertThat(fixture.last.get().membersByNode()).containsOnlyKeys("a", "b", "c", "d");
+        }
+    }
+
     private static final class Fixture {
         final Member a = nativeMember("a", "boot-a", uuid("a"), address("a"), true);
         final Member b = nativeMember("b", "boot-b", uuid("b"), address("b"), false);
@@ -173,6 +291,12 @@ class ClusterNativeViewPublicationTest {
         final ClusterProfileStore profiles = mock(ClusterProfileStore.class);
         final HazelcastInstance member = mock(HazelcastInstance.class);
         final ClusterMembershipGate gate;
+        final Duration captureTtl = Duration.ofSeconds(30);
+        final WorkloadClaim capture = new WorkloadClaim(
+                new WorkloadClaimKey(CLUSTER, WorkloadClaimType.CAPTURE, "capture-a"), PUBLISHER.owner(),
+                5, 0, 7, Instant.now().plus(captureTtl), 0, 0, Set.of(), 0, false, PROFILE.generation());
+        final WorkloadClaimStore captureStore = mock(WorkloadClaimStore.class);
+        final ClusterWorkloadClaims claims;
         final AtomicInteger samples = new AtomicInteger();
         final AtomicReference<ClusterNativeObservation> last = new AtomicReference<>();
         volatile boolean publicationAccepted = true;
@@ -196,6 +320,13 @@ class ClusterNativeViewPublicationTest {
             properties.setBootstrapMinMembers(3);
             gate = new ClusterMembershipGate(properties);
             gate.bindProfile(PROFILE.generation(), PROFILE.profile().hash());
+            claims = new ClusterWorkloadClaims(captureStore, gate);
+            when(captureStore.renew(same(capture), eq(captureTtl))).thenReturn(Optional.of(capture));
+        }
+
+        void showJoiningMember() {
+            Member d = nativeMember("d", "boot-d", uuid("d"), address("d"), false);
+            visible.set(Set.of(a, b, c, d));
         }
 
         ClusterMembershipController controller() {
