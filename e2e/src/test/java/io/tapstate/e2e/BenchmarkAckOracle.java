@@ -52,11 +52,14 @@ final class BenchmarkAckOracle {
         }
 
         boolean covers(TerminalEvent terminal) {
+            return BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.TABLE_CONFIRMATION, () -> {
             return terminal != null && terminal.logicalId().equals(terminalLogicalId)
                     && marker.markerId().equals(terminalLogicalId)
                     && terminal.sourcePosition().equals(sourceTerminalToken)
-                    && BenchmarkTableAckGate.covers(binding, marker, Document.parse(confirmedConsumerCanonicalJson));
-        }
+                    && BenchmarkTableAckGate.covers(binding, marker, BenchmarkReturnBridgeSourceWork.parsedCursor(confirmedConsumerCanonicalJson));
+
+            });
+    }
     }
 
     record SourceChain(String id, List<TerminalEvent> sourceTerminals, String authoritativeTargetAck,
@@ -84,11 +87,19 @@ final class BenchmarkAckOracle {
     }
 
     static void verify(List<Fork> forks) {
+        BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.ACK_VERIFY, () -> {
+        BenchmarkReturnBridgeSourceWork.oracleMaterial(forks, null);
         verifyAgainst(forks, null);
+
+        return null; });
     }
 
     static void verify(List<Fork> forks, Map<String, String> frozenTerminals) {
+        BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.ACK_VERIFY, () -> {
+        BenchmarkReturnBridgeSourceWork.oracleMaterial(forks, frozenTerminals);
         verifyAgainst(forks, Map.copyOf(frozenTerminals));
+
+        return null; });
     }
 
     private static void verifyAgainst(List<Fork> forks, Map<String, String> frozenTerminals) {

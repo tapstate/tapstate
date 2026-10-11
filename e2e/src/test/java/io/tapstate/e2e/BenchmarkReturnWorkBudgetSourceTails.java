@@ -163,7 +163,8 @@ final class BenchmarkReturnWorkBudgetSourceTails {
                 .plus(BenchmarkReturnWorkBudgetReportPlan.returnCatalogueUpper(2))
                 .plus(BenchmarkReturnComponentSourceWork.trustedCacheUpper())
                 .plus(BenchmarkReturnComponentSourceWork.authorityInitializationUpper())
-                .plus(BenchmarkReturnWorkBudgetRun.nativeClassPacketRosterFactoryUpper());
+                .plus(BenchmarkReturnWorkBudgetRun.nativeClassPacketRosterFactoryUpper())
+                .plus(BenchmarkReturnBridgeSourceWork.addedPreScopeUpper());
         var evidence = metadata("FACTORY_SOURCE_UPPER_ONLY", upper, List.of(
                 "SEVEN_ORIGINAL_SELECTED_96000_CONSTRUCTS", "ONE_ALL_COPY_STATELESS_STATEFUL_12000_INITIALIZER",
                 "SETUP_SQL_ROW_TEMPLATES_500_BATCHES_AND_UPDATE_RANGES100", "ORIGINAL_FOUR_OR_SIX_PHASE_COVERAGE_AND_TARGET_CHECKSUM_TRAVERSALS",
@@ -176,6 +177,8 @@ final class BenchmarkReturnWorkBudgetSourceTails {
         evidence.put("nestedComparatorKeyExtractionsUpper", comparatorVisits);
         evidence.put("nativeClassPacketRosterFactories", 1);
         evidence.put("nativeClassPacketRosterFactoryUpper", BenchmarkReturnWorkBudgetRun.nativeClassPacketRosterFactoryUpper().evidence());
+        evidence.put("returnBridgeTableConstructions", 2);
+        evidence.put("returnBridgeAddedPreScopeUpper", BenchmarkReturnBridgeSourceWork.addedPreScopeUpper().evidence());
         evidence.put("sourceStepsIdentity", "SEVEN_SELECTED_PLUS_SINGLE_BOUNDED_ALL_V1");
         evidence.put("returnComponentTableConstructions", 2);
         evidence.put("captureMaterialTableConstructions", 2);

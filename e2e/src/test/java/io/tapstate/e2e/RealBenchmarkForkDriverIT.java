@@ -86,7 +86,8 @@ class RealBenchmarkForkDriverIT {
         try (var work = BenchmarkReturnWorkBudgetRun.open(workloadId)) {
             try {
                 if (work != null) { work.observeRootOrigins(); }
-                runRegistered(workloadId, work);
+                var returnBridge = BenchmarkReturnForkBridge.open(workloadId, work);
+                runRegistered(workloadId, work, returnBridge);
                 if (work != null) { System.out.println("benchmark-return-work-final=" + JsonWriter.write(work.finish())); }
             } catch (Exception | Error failure) {
                 if (work != null) { work.failed(failure); }
@@ -95,8 +96,11 @@ class RealBenchmarkForkDriverIT {
         }
     }
 
-    private static void runRegistered(String workloadId, BenchmarkReturnWorkBudgetRun work) throws Exception {
-        boolean rootCpuDiagnostics = requireRootCpuRunServices(workloadId, RealBenchmarkForkDriverIT::requireBenchmarkServices);
+    private static void runRegistered(String workloadId, BenchmarkReturnWorkBudgetRun work,
+                                      BenchmarkReturnForkBridge returnBridge) throws Exception {
+        boolean rootCpuDiagnostics;
+        if (returnBridge == null) rootCpuDiagnostics = requireRootCpuRunServices(workloadId, RealBenchmarkForkDriverIT::requireBenchmarkServices);
+        else { requireBenchmarkServices(); rootCpuDiagnostics = false; }
         boolean nominalReturnDiagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY);
         Path forkOutput = forkOutput();
         PipelineBenchmarkComparison.Arm arm = PipelineBenchmarkComparison.Arm.valueOf(
@@ -113,7 +117,11 @@ class RealBenchmarkForkDriverIT {
                 BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY, BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
                 "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
                 "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean);
-        var collectorCalibration = System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY) == null
+        RealBenchmarkForkDriver.CollectorCalibration collectorCalibration = null;
+        boolean methodControl = false, costStages = false, nativeCounterDomain = returnBridge != null;
+        String nativeLibrary = returnBridge == null ? null : System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY);
+        if (returnBridge == null) {
+        collectorCalibration = System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY) == null
                 ? null : RealBenchmarkForkDriver.collectorCalibration(
                         System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY), workloadId, arm,
                         writeReturnDiagnostics, Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
@@ -123,19 +131,19 @@ class RealBenchmarkForkDriverIT {
                                 || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null
                                 || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_COST_STAGES_PROPERTY) != null
                                 || System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY) != null);
-        boolean methodControl = RealBenchmarkForkDriver.admitWriteReturnMethodProtocol(
+        methodControl = RealBenchmarkForkDriver.admitWriteReturnMethodProtocol(
                 System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY), writeReturnDiagnostics,
                 Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
                 conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
                         || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                         || forkOutput == null);
-        boolean costStages = RealBenchmarkForkDriver.writeReturnCostStages(
+        costStages = RealBenchmarkForkDriver.writeReturnCostStages(
                 System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_COST_STAGES_PROPERTY), writeReturnDiagnostics,
                 Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
                 conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
                         || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                         || forkOutput == null || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
-        String nativeLibrary = RealBenchmarkForkDriver.nativeClockLibrary(
+        nativeLibrary = RealBenchmarkForkDriver.nativeClockLibrary(
                 System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY), writeReturnDiagnostics,
                 Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
                 conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
@@ -144,11 +152,12 @@ class RealBenchmarkForkDriverIT {
                         || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                         || forkOutput == null || costStages
                         || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
-        boolean nativeCounterDomain = RealBenchmarkForkDriver.nativeCounterDomain(
+        nativeCounterDomain = RealBenchmarkForkDriver.nativeCounterDomain(
                 System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY), nativeLibrary, writeReturnDiagnostics,
                 Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
                 conflictingReturnDiagnostics || jvmDiagnostics || costStages
                         || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
+        }
         if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
                 || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
                 || conflictingReturnDiagnostics)) {
@@ -228,17 +237,24 @@ class RealBenchmarkForkDriverIT {
             }
             BenchmarkDualGcDiagnostics.Session dualGc = dualGcDiagnostics
                     ? BenchmarkDualGcDiagnostics.open() : null;
-            RealBenchmarkForkDriver driver = collectorCalibration != null
+            final String selectedNativeLibrary = nativeLibrary;
+            final var selectedCollectorCalibration = collectorCalibration;
+            final boolean selectedMethodControl = methodControl, selectedCostStages = costStages;
+            RealBenchmarkForkDriver driver = returnBridge != null
                     ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
                             RealProcessServer.start(store, operator, jar, "127.0.0.1", port -> List.of(),
-                                    work == null ? collectorCalibrationArguments(collectorCalibration, nativeLibrary)
-                                            : returnArguments(false, false, nativeLibrary, work.producerInput())), null))
+                                    returnArguments(false, false, selectedNativeLibrary, work.producerInput())), null), returnBridge)
+                    : collectorCalibration != null
+                    ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
+                            RealProcessServer.start(store, operator, jar, "127.0.0.1", port -> List.of(),
+                                    work == null ? collectorCalibrationArguments(selectedCollectorCalibration, selectedNativeLibrary)
+                                            : returnArguments(false, false, selectedNativeLibrary, work.producerInput())), null))
                     : writeReturnDiagnostics && jvmDiagnostics
                     ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::startWithWriteReturns)
                     : writeReturnDiagnostics
                     ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
                             RealProcessServer.start(store, operator, jar, "127.0.0.1",
-                                    port -> List.of(), returnArguments(methodControl, costStages, nativeLibrary)), null))
+                                    port -> List.of(), returnArguments(selectedMethodControl, selectedCostStages, selectedNativeLibrary)), null))
                     : dualGc != null
                     ? new RealBenchmarkForkDriver(dualGc::start)
                     : jvmDiagnostics ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
@@ -267,6 +283,18 @@ class RealBenchmarkForkDriverIT {
             PipelineBenchmarkHarness.ForkResult result = driver.run(
                     workload, arm,
                     forkNumber, applicationJar);
+            if (returnBridge != null) {
+                BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.IT_REPORT, () -> {
+                BenchmarkAckOracle.verify(List.of(result.correctness()));
+                if (result.returnMethodFork() == null) throw new AssertionError("selected typed return fork was not recorded");
+                var recorded = driver.evidence().getLast();
+                Map<String, Object> measurement = PipelineBenchmarkLiveRunIT.fork(recorded, result, startedAt);
+                if (work == null || forkOutput == null) throw new AssertionError("typed return report has no registered output owner");
+                work.writeReport(forkOutput, Map.of("measurement", measurement));
+                return null;
+                });
+                return;
+            }
             BenchmarkReturnWorkBudgetRun.println("benchmark-source-schedule=" + BenchmarkReturnWorkBudgetRun.json(Map.of(
                     "profile", fullSettlingCalibration ? "FIXED_FULL_CDC_SETTLING_CALIBRATION"
                             : settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
@@ -321,14 +349,14 @@ class RealBenchmarkForkDriverIT {
                                 .get("writeReturnDiagnostics");
                         assertThat(capture).containsEntry("performanceAcceptanceEligible", false)
                                 .containsEntry("samplingCostQualified", false);
-                        if (methodControl || collectorCalibration == RealBenchmarkForkDriver.CollectorCalibration.OFF) {
-                            assertThat(capture).containsEntry("state", collectorCalibration == RealBenchmarkForkDriver.CollectorCalibration.OFF
+                        if (selectedMethodControl || selectedCollectorCalibration == RealBenchmarkForkDriver.CollectorCalibration.OFF) {
+                            assertThat(capture).containsEntry("state", selectedCollectorCalibration == RealBenchmarkForkDriver.CollectorCalibration.OFF
                                             ? "RETURN_COLLECTOR_CALIBRATION_OFF" : "RETURN_METHOD_COST_CONTROL")
                                     .containsEntry("actualProducerEnabled", false)
                                     .containsEntry("actualPeriodicClockEnabled", false);
                             assertThat(capture).doesNotContainKeys("clockSamples", "pagesBase64", "fullRows", "fixedCohortRows");
                             assertThat((Map<?, ?>) capture.get("p99LatencyNanos")).isEqualTo(Map.of(
-                                    "state", "UNAVAILABLE", "reason", collectorCalibration == RealBenchmarkForkDriver.CollectorCalibration.OFF
+                                    "state", "UNAVAILABLE", "reason", selectedCollectorCalibration == RealBenchmarkForkDriver.CollectorCalibration.OFF
                                             ? "RETURN_COLLECTOR_CALIBRATION_DISABLED_PRODUCER" : "RETURN_METHOD_COST_CONTROL_DISABLED_PRODUCER"));
                         } else {
                             assertThat(capture).containsEntry("clockSamplingMode", returnClockMode.name());
@@ -340,11 +368,11 @@ class RealBenchmarkForkDriverIT {
                                 }
                             }
                         }
-                        if (costStages) {
+                        if (selectedCostStages) {
                             assertThat(((Map<?, ?>) capture.get("producerCostStages")).get("state"))
                                     .isEqualTo("RECORDED");
                         } else { assertThat(capture).doesNotContainKey("producerCostStages"); }
-                        if (!methodControl && collectorCalibration != RealBenchmarkForkDriver.CollectorCalibration.OFF
+                        if (!selectedMethodControl && selectedCollectorCalibration != RealBenchmarkForkDriver.CollectorCalibration.OFF
                                 && returnClockMode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) {
                             assertThat((List<?>) capture.get("clockSamples")).hasSize(2);
                             assertThat((Map<?, ?>) capture.get("p99LatencyNanos")).isEqualTo(Map.of(
@@ -422,18 +450,18 @@ class RealBenchmarkForkDriverIT {
                 }
                 if (writeReturnDiagnostics) {
                     output.put("writeReturnDiagnostics", true);
-                    output.put("writeReturnMethodControl", methodControl);
+                    output.put("writeReturnMethodControl", selectedMethodControl);
                     output.put("writeReturnClockSamplingMode", returnClockMode.name());
                     output.put("writeReturnPerformanceAcceptanceEligible", false);
-                    if (costStages) { output.put("writeReturnCostStages", true); }
-                    if (nativeLibrary != null) { output.put("nativeClockDiagnostic", true); }
+                    if (selectedCostStages) { output.put("writeReturnCostStages", true); }
+                    if (selectedNativeLibrary != null) { output.put("nativeClockDiagnostic", true); }
                     if (nativeCounterDomain) { output.put("nativeCounterDomainDiagnostic", true); }
                     if (nominalReturnDiagnostics) {
                         output.put("nominalReturnEnclosureDiagnostic", true);
                         output.put("nominalReturnPerformanceAcceptanceEligible", false);
                     }
-                    if (collectorCalibration != null) {
-                        output.put("returnCollectorCalibration", collectorCalibration.name());
+                    if (selectedCollectorCalibration != null) {
+                        output.put("returnCollectorCalibration", selectedCollectorCalibration.name());
                         output.put("returnCollectorCalibrationAcceptanceEligible", false);
                     }
                     output.put("retainedLegacyMeasurementEndpoint", "OPERATION_DATE_AND_OBSERVER_DIAGNOSTICS");

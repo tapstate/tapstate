@@ -372,6 +372,7 @@ class PipelineBenchmarkLiveRunIT {
 
     static Map<String, Object> fork(RealBenchmarkForkDriver.Evidence evidence,
             PipelineBenchmarkHarness.ForkResult result, Instant startedAt) {
+        if (result.returnMethodFork() != null) return returnFork(evidence, result, startedAt);
         PipelineBenchmarkComparison.Fork performance = result.measurement();
         BenchmarkAckOracle.Fork correctness = result.correctness();
         BenchmarkAckOracle.verify(List.of(correctness), PipelineBenchmarkHarness.expectedTerminals(evidence.workload()));
@@ -416,6 +417,51 @@ class PipelineBenchmarkLiveRunIT {
                 "checksum", evidence.checksum(),
                 "correctnessChecksum", correctness.checksum(),
                 "errorTotal", evidence.errorTotal());
+    }
+
+    private static Map<String, Object> returnFork(RealBenchmarkForkDriver.Evidence evidence,
+            PipelineBenchmarkHarness.ForkResult result, Instant startedAt) {
+        return BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.LIVE_REPORT, () -> {
+        var time = result.returnMethodFork();
+        if (time == null) throw new AssertionError("typed return report has no original private fork");
+        BenchmarkAckOracle.Fork correctness = result.correctness();
+        BenchmarkAckOracle.verify(List.of(correctness), PipelineBenchmarkHarness.expectedTerminals(evidence.workload()));
+        BenchmarkResourceSampler.Summary resources = evidence.resources();
+        BenchmarkMongoCommandSampler.Summary commands = evidence.mongoCommands();
+        return object(
+                "id", evidence.forkId(), "workload", evidence.workload().id(),
+                "seed", evidence.workload().seed(), "arm", evidence.arm().name(),
+                "applicationJar", evidence.applicationJar().toString(),
+                "runtimeEvidence", evidence.runtimeEvidence(),
+                "startedAt", startedAt.toString(), "completedAt", Instant.now().toString(),
+                "measurementMethod", BenchmarkReturnMethodAdmission.METHOD,
+                "returnMethodFork", time.evidence(),
+                "legacyScalarMeasurement", object("state", "UNAVAILABLE", "reason", "TYPED_RETURN_INTERVAL_RETAINED"),
+                "resources", object("cpuNanos", resources.cpuNanos(),
+                        "gcCollectionMillis", resources.gcCollectionMillis(),
+                        "peakHeapBytes", resources.peakHeapBytes(),
+                        "peakRssBytes", resources.peakRssBytes(),
+                        "sampleCount", resources.sampleCount()),
+                "mongoCommands", object("byCommand", new TreeMap<>(commands.byCommand()),
+                        "byFamily", namedCounts(commands.byFamily()),
+                        "elapsedMillis", commands.elapsedMillis()),
+                "measuredPhaseWindows", evidence.phases().stream()
+                        .map(PipelineBenchmarkLiveRunIT::phaseEvidence).toList(),
+                "declaredSourceCoverage", evidence.declaredSourceCoverage(),
+                "observedTargetCoverage", evidence.observedTargetCoverage(),
+                "logicalCoverage", correctness.logicalCoverage(),
+                "terminalMetaReceipts", evidence.terminalMetaReceipts(),
+                "sourceChains", correctness.chains().stream().map(chain -> object(
+                        "id", chain.id(), "authoritativeTargetAck", chain.authoritativeTargetAck(),
+                        "ackProofKind", chain.tableConfirmation() == null ? "SOURCE_TOKEN" : "TABLE_ORDER",
+                        "tableConfirmation", tableConfirmation(chain.tableConfirmation()),
+                        "sourceTerminals", chain.sourceTerminals().stream().map(event -> object(
+                                "logicalId", event.logicalId(),
+                                "sourcePosition", event.sourcePosition())).toList())).toList(),
+                "checksum", evidence.checksum(),
+                "correctnessChecksum", correctness.checksum(),
+                "errorTotal", evidence.errorTotal());
+        });
     }
 
     static Map<String, Object> tableConfirmation(BenchmarkAckOracle.TableConfirmationProof proof) {
@@ -517,7 +563,9 @@ class PipelineBenchmarkLiveRunIT {
                 "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),
                 "throughputRecordsPerSecond", phase.confirmationTiming().isPresent()
                         ? phase.recordsOutPerSecond() : null,
-                "throughputMethod", phase.steadyOutputProfile() ? BenchmarkTargetClock.OPERATION_DATE_MEASUREMENT_METHOD : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
+                "throughputMethod", phase.targetClockEvidence().containsKey("returnMethodPhase")
+                        ? BenchmarkReturnMethodAdmission.METHOD : phase.steadyOutputProfile()
+                        ? BenchmarkTargetClock.OPERATION_DATE_MEASUREMENT_METHOD : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
                 "operationDateTimeEvidence", BenchmarkTargetClock.operationDateTimeEvidence(),
                 "steadyStateEstablished", phase.steadyOutputEstablished(),
                 "steadyOutputRule", "COMMON_ACTIVE_INTERVAL_TEN_PROGRESS_BINS_HALF_TREND_AT_MOST_5_PERCENT",

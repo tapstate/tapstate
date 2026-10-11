@@ -68,7 +68,9 @@ final class BenchmarkReturnWorkBudgetBindings {
         RETURN_METHOD_ADMISSION("BenchmarkReturnMethodAdmission"),
         RETURN_COMPONENT_SOURCE_WORK("BenchmarkReturnComponentSourceWork"),
         NATIVE_SOURCE_AUTHORITY("BenchmarkNativeSourceAuthority"),
-        SHARED_MYSQL("SharedMySql"), RETURN_CAPTURE_MATERIAL_BOUNDS("BenchmarkReturnCaptureMaterialBounds");
+        SHARED_MYSQL("SharedMySql"), RETURN_CAPTURE_MATERIAL_BOUNDS("BenchmarkReturnCaptureMaterialBounds"),
+        RETURN_FORK_BRIDGE("BenchmarkReturnForkBridge"), RETURN_HARNESS("PipelineBenchmarkReturnHarness"),
+        RETURN_BRIDGE_SOURCE_WORK("BenchmarkReturnBridgeSourceWork"), TABLE_ACK_GATE("BenchmarkTableAckGate");
 
         private final String binaryName, sourcePath, module;
         SourceRole(String name) {

@@ -9,7 +9,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkReturnWorkBudgetSourceTailsTest {
     @Test
-    void factory_upper_includes_seven_original_constructs_three_initializer_workloads_and_four_support_tables() {
+    void factory_upper_includes_original_constructs_initializers_and_fixed_support_recipes() {
         var workload = BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless");
         var upper = BenchmarkReturnWorkBudgetSourceTails.factoryUpper(workload);
         var evidence = BenchmarkReturnWorkBudgetSourceTails.factoryEvidence(workload);
@@ -17,9 +17,10 @@ class BenchmarkReturnWorkBudgetSourceTailsTest {
                 .containsEntry("actualCompletionObserved", false).containsEntry("futureLifetimeCountBoundClaimed", false);
         // openFromProperties inspects once and open revalidates once before activation.
         // Both inspections build the shared and cleanup tables.
-        // Four new table/catalogue entries, one private cache and one readless initializer add
-        // plus two scoped-material tables to the previous fourteen. This is a fixed source tail, not observed completion.
-        assertThat(upper.calls()).isEqualTo(23);
+        // Eight bridge entries add two tables, two parent projections, one BSON initializer,
+        // protocol selection and its child, plus the property prelude to the prior23-call tail.
+        // This is a fixed source tail, not observed completion or another workload factory.
+        assertThat(upper.calls()).isEqualTo(31);
         assertThat(evidence).containsEntry("returnComponentTableConstructions", 2)
                 .containsEntry("returnComponentCatalogueConstructions", 2)
                 .containsEntry("privateAuthenticatedProfileCacheConstructions", 1)

@@ -17,7 +17,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     private static final int OUTER_DEPTH = 12;
     private static final int SOURCE_KEY_BYTES = 4 * SOURCE_LEAF_CHARS;
     private static final int MAX_LEAF = Math.max(SOURCE_KEY_BYTES, base64(PAGE_BYTES));
-    static final int RETURN_COMPONENT_CATALOGUE_ROWS = 16, CATALOGUE_ROWS = 64;
+    static final int RETURN_COMPONENT_CATALOGUE_ROWS = 19, CATALOGUE_ROWS = 64;
 
     record Component(String id, String sourceBranch, long rows, long nodesPerRow, long stringsPerRow,
                      int leafUtf8Upper, int localDepthUpper, String boundBasis) {
@@ -265,9 +265,9 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 32L * (128 + 512) + CATALOGUE_ROWS * (9L * 128 + 3L * 512),
                 512, 6, "PRIOR64_SOURCE_DESCRIPTOR_MAPS_ID_BRANCH_BASIS512_WITH_FIXED_NUMERIC_FIELDS");
         add(parts, "RETURN_COMPONENT_FACTORY_TAIL_EVIDENCE", "SourceTails.factoryEvidence/preScopeSourceTail",
-                1, mapNodes(35) + 7L * mapNodes(8) + 7,
-                35L * (128 + 512) + 6L * 512 + 7L * 8 * 128,
-                512, 5, "THIRTYFIVE_FIXED_FIELDS_SEVEN_VECTORS_INCLUDES_SELECTED_GEOMETRY_AND_NATIVE_ROSTER_FACTORY");
+                1, mapNodes(37) + 8L * mapNodes(8) + 8,
+                37L * (128 + 512) + 6L * 512 + 8L * 8 * 128,
+                512, 5, "THIRTYSEVEN_FIXED_FIELDS_EIGHT_VECTORS_INCLUDE_BRIDGE_SOURCE_FACTORY_AND_ORIGINAL_GEOMETRY");
         add(parts, "METHOD_EARLY_ROOT_OBSERVATION_BASIS", "Run.rootClockMetadataBeforeEvidence/rootClockMetadataBeforeBasis",
                 phases, mapNodes(3), 3L * 128 + 2L * 128, 512, 3,
                 "ADDITIONAL_FIXED_EARLY_OR_FRESH_BASIS_FIELD_NATIVE_PAYLOAD_REMAINS_IN_ITS_ORIGINAL_PACKET_ROW");
@@ -276,6 +276,16 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 3, mapNodes(2) + Math.multiplyExact(packets, mapNodes(2)) + phases + 1,
                 2L * 128 + Math.multiplyExact(packets, 2L * 128 + 128 + 5) + Math.multiplyExact(phases, 128),
                 128, 5, "THREE_BOUNDED_REPORT_PROJECTIONS_TWO_PACKETS_PER_ORIGINAL_MEASURED_PHASE_KEYS128_CUT5");
+        add(parts, "TYPED_RETURN_FORK_CARRIER", "BenchmarkReturnForkBridge.Fork.evidence",
+                1, mapNodes(48) + mapNodes(3) + 3L * mapNodes(2) + 7 + 4096,
+                48L * (128 + 512) + 2L * 160 + 128 + 6L * 128 + 9L * 128 + 65536,
+                8192, 16, "EXACT_CURRENT_FORK_FIELDS_DIRECTED_DECIMAL160_FOUR_INTERVAL_MAPS_PHASEIDS6_ADMISSION_METADATA");
+        add(parts, "RETURN_SERIAL_HELLO_RAW", "RealBenchmarkForkDriver.returnMethodPhase.serialHelloRaw",
+                phases * 6000, mapNodes(9), 9L * 128 + 4L * 65536 + 4L * 24 + 7L * 32,
+                65536, 4, "ORIGINAL_SIX_THOUSAND_SERIAL_READINGS_WITH_NINE_FIXED_FIELDS_NO_NEW_READS");
+        add(parts, "RETURN_BRIDGE_FACTORY_TAIL", "BenchmarkReturnWorkBudgetSourceTails.factoryEvidence",
+                1, mapNodes(2) + mapNodes(8), 2L * 128 + 8L * 128, 128, 4,
+                "TWO_ADDED_FACTORY_FIELDS_ONE_EIGHT_UNIT_VECTOR_NO_WORKLOAD_FACTORY_CHANGE");
         require(parts.size() <= CATALOGUE_ROWS, "return report catalogue exceeds its prior descriptor roster");
     }
 

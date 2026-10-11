@@ -202,6 +202,13 @@ final class BenchmarkReturnMethodAdmission {
         return checkedAdmit(acquired.requireActiveFacts(), BenchmarkNativeSourceAuthority.instance(), false);
     }
 
+    /** The closed acquisition validates actual bytes, origins, normal outcome and complete source work first. */
+    static AdmittedMethod admitCompleted(BenchmarkReturnExternalAcquirer.AcquiredCompletion acquired) {
+        require(acquired != null && BenchmarkReturnWorkBudget.current() == null
+                && BenchmarkReturnWorkBudgetRun.current() == null, "COMPLETED_ACTUAL_ACQUISITION_MISSING");
+        return checkedAdmit(acquired.completedPreflight(), BenchmarkNativeSourceAuthority.instance(), false);
+    }
+
     /** Pure component controls cannot issue a production-selection token. */
     static AdmittedMethod admitForControl(Preflight input, IndependentSemanticReview review) {
         return checkedAdmit(input, review, true);

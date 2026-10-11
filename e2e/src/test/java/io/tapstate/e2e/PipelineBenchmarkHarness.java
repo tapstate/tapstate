@@ -27,10 +27,16 @@ final class PipelineBenchmarkHarness {
                        PipelineBenchmarkComparison.Arm arm, int armFork, Path applicationJar) throws Exception;
     }
 
-    record ForkResult(PipelineBenchmarkComparison.Fork measurement, BenchmarkAckOracle.Fork correctness) {
+    record ForkResult(PipelineBenchmarkComparison.Fork measurement, BenchmarkAckOracle.Fork correctness,
+                      BenchmarkReturnForkBridge.Fork returnMethodFork) {
+        ForkResult(PipelineBenchmarkComparison.Fork measurement, BenchmarkAckOracle.Fork correctness) {
+            this(measurement, correctness, null);
+        }
         ForkResult {
-            Objects.requireNonNull(measurement, "measurement");
             Objects.requireNonNull(correctness, "correctness");
+            if (returnMethodFork == null) Objects.requireNonNull(measurement, "measurement");
+            else if (measurement != null || returnMethodFork.correctness() != correctness)
+                throw new AssertionError("typed return fork cannot substitute an unrelated scalar or oracle");
         }
     }
 
@@ -74,6 +80,7 @@ final class PipelineBenchmarkHarness {
                 int armFork = arm == PipelineBenchmarkComparison.Arm.A ? ++baselineFork : ++candidateFork;
                 ForkResult result = driver.run(workload, arm, armFork,
                         arm == PipelineBenchmarkComparison.Arm.A ? baseline : candidate);
+                if (result.returnMethodFork() != null) throw new AssertionError("typed return fork requires the separate interval harness");
                 if (result.measurement().arm() != arm) {
                     throw new AssertionError(workload.id() + " fork " + armFork + " reported the wrong arm");
                 }

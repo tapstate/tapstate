@@ -55,7 +55,7 @@ class BenchmarkReturnComponentCatalogueTest {
                     BenchmarkReturnWorkBudget.Activity.ASSOCIATION, BenchmarkReturnWorkBudget.Activity.COPY,
                     BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW, BenchmarkReturnWorkBudget.Activity.FAILURE_RETENTION);
             var row = activity(scope.snapshot(), "INSTALL_BINDINGS");
-            assertThat(row).containsEntry("attempts", 2L).containsEntry("completedAttempts", 2L)
+            assertThat(row).containsEntry("attempts", 3L).containsEntry("completedAttempts", 3L)
                     .containsEntry("issuedRequests", 0L).containsEntry("failedAttempts", 0L);
             @SuppressWarnings("unchecked") var observed = (Map<String, Object>) row.get("actual");
             assertThat(observed).containsEntry("records", 0L).containsEntry("bytes", 0L);

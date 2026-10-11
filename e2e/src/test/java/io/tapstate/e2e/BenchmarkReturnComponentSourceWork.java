@@ -65,6 +65,8 @@ final class BenchmarkReturnComponentSourceWork {
         out.merge(BenchmarkReturnWorkBudget.Activity.COPY, pooledCopyUpper(), BenchmarkReturnComponentSourceWork::maximum);
         BenchmarkReturnCaptureMaterialBounds.upper().forEach((activity, bound) ->
                 out.merge(activity, bound, BenchmarkReturnComponentSourceWork::maximum));
+        BenchmarkReturnBridgeSourceWork.additions().forEach((activity, bound) ->
+                out.merge(activity, bound, BenchmarkReturnComponentSourceWork::maximum));
         out.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
                 BenchmarkReturnWorkBudgetRun.nativeClassPacketAfterExitUpper(), BenchmarkReturnComponentSourceWork::maximum);
         var vectors = new LinkedHashMap<String, Object>();
@@ -141,7 +143,7 @@ final class BenchmarkReturnComponentSourceWork {
                     0, 0, 4L * (512 + 36 + 20), 4, 16 + 4 + 6 + 512 + 36 + 20, 32);
             case AUTHORITY_EVIDENCE -> row(128, 0, 0, 8192, 4, 64, 48);
             case COMPARISON_INPUT -> row(128, 0, 0, 16384, 2, 64, 32);
-            case COMPONENT_FACTORY -> maximum(factoryUpper(1), BenchmarkReturnWorkBudgetReportPlan.returnCatalogueUpper(1));
+            case COMPONENT_FACTORY -> maximum(factoryUpper(1).plus(bridgeProjectionUpper()), BenchmarkReturnWorkBudgetReportPlan.returnCatalogueUpper(1));
             // Exact entered Run body: expected ROOT map <=1024, observed ROOT <=512, runtime
             // tuple (128/4096/128 text), writer equality and original one cold ASCII reply <=8192.
             // The real native metadata and structural recipe children keep separate actual entries.
@@ -193,6 +195,12 @@ final class BenchmarkReturnComponentSourceWork {
         long scalarSlots = add(mul(kinds, FORMULA_SLOTS + 8L * UNITS), mul(2, actors), kinds, 32, mul(12, fields));
         return new BenchmarkReturnWorkBudget.Work(1, requests, kinds, 0, mul(8, scalarSlots),
                 4, add(mul(2, scalarSlots), fields), add(scalarSlots, fields)).times(entries);
+    }
+
+    static BenchmarkReturnWorkBudget.Work bridgeProjectionUpper() {
+        // The child table supplies five actor maxima. Parent performs one forEach, five merge
+        // calls and five eight-vector maxima;24 APIs/vector plus16 parent APIs per row.
+        return new BenchmarkReturnWorkBudget.Work(1, 32 + 5L * (16 + 24), 5, 0, 5L * 16 * 8, 2, 5L * 32, 5L * 24);
     }
 
     /** The reused private profile token adds one bounded canonical recipe/cache construction. */

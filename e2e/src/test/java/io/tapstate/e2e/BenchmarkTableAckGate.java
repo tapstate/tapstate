@@ -26,8 +26,12 @@ final class BenchmarkTableAckGate {
         @Override public Document fence() { return copy(fence); }
     }
 
-    private static Document copy(Document source) {
-        return source == null ? null : Document.parse(source.toJson(CANONICAL));
+    static Document copy(Document source) {
+        return BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.FENCE_COPY, () -> {
+        BenchmarkReturnBridgeSourceWork.cursorMaterial(source);
+        return source == null ? null : BenchmarkReturnBridgeSourceWork.parsedCursor(BenchmarkReturnBridgeSourceWork.encodedFence(source, CANONICAL));
+
+        });
     }
 
     static Binding bind(String physicalChain, String pipeline, String source, String table, Document cursor) {
@@ -42,6 +46,8 @@ final class BenchmarkTableAckGate {
     }
 
     static boolean covers(Binding binding, BenchmarkTableTerminalObserver.Point point, Document cursor) {
+        return BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.TABLE_COVER, () -> {
+        BenchmarkReturnBridgeSourceWork.tableMaterial(binding, point, cursor, binding == null ? null : binding.fence);
         requireBinding(binding, cursor);
         String expectedRing = io.tapstate.runtime.srs.SrsRingbuffer.ringName(binding.physicalChain(), binding.table());
         if (!expectedRing.equals(point.ring()) || point.epoch() < 1 || point.seq() < 0) {
@@ -73,6 +79,8 @@ final class BenchmarkTableAckGate {
         Document table = confirmed == null ? null : document(confirmed, binding.table());
         Document done = document(cursor, "perTableRingDone");
         return confirmed(table, point) && reached(done, binding.table(), point.seq());
+
+        });
     }
 
     static void requireBinding(Binding binding, Document cursor) {

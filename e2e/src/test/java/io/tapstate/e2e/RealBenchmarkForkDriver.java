@@ -311,11 +311,13 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
 
     private final List<Evidence> evidence = new ArrayList<>();
     private final BenchmarkForkEnvironment.BootLauncher launcher;
+    private final BenchmarkReturnForkBridge returnBridge;
 
     RealBenchmarkForkDriver() { this(BenchmarkForkEnvironment.OwnedBoot::plain); }
 
-    RealBenchmarkForkDriver(BenchmarkForkEnvironment.BootLauncher launcher) {
-        this.launcher = Objects.requireNonNull(launcher);
+    RealBenchmarkForkDriver(BenchmarkForkEnvironment.BootLauncher launcher) { this(launcher, null); }
+    RealBenchmarkForkDriver(BenchmarkForkEnvironment.BootLauncher launcher, BenchmarkReturnForkBridge returnBridge) {
+        this.launcher = Objects.requireNonNull(launcher); this.returnBridge = returnBridge;
     }
 
     List<Evidence> evidence() {
@@ -608,6 +610,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             PipelineBenchmarkComparison.Arm arm, int armFork, Path applicationJar) throws Exception {
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(arm, "arm");
+        if (returnBridge != null) returnBridge.bindDriver(workload, arm, armFork, applicationJar);
         boolean workBudgetRequested = workBudgetDiagnostics(System.getProperty(WORK_BUDGET_DIAGNOSTICS_PROPERTY),
                 "true".equals(System.getProperty(NOMINAL_RETURN_DIAGNOSTICS_PROPERTY)));
         if (workBudgetRequested) {
@@ -617,6 +620,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         }
         var clockMode = writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile());
+        if (returnBridge == null) {
         String calibrationValue = System.getProperty(RETURN_COLLECTOR_CALIBRATION_PROPERTY);
         CollectorCalibration admittedCalibration = null;
         if (calibrationValue != null) {
@@ -674,6 +678,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.paced-calibration")
                         || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.cdc-settling-calibration")
                         || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration"));
+        }
         if (armFork < 1 || applicationJar == null) {
             throw new IllegalArgumentException("a positive fork number and application JAR are required");
         }
@@ -754,7 +759,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                             workload.phases().size())) {
                         if (phase.measured()) {
                             PhaseWindow window = runMeasuredPhase(workload, fork, phase,
-                                    captures, positionCoverage, targets, tables, returnCounters, acknowledgedBoundaryAt);
+                                    captures, positionCoverage, targets, tables, returnCounters, acknowledgedBoundaryAt, returnBridge);
                             measured.add(window.measurement());
                             allDurations.addAll(window.deliveryDurations());
                             resourceWindows.add(window.resources());
@@ -799,6 +804,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 BenchmarkAckOracle.Fork correctness = new BenchmarkAckOracle.Fork(
                         forkId, chains, logicalCoverage, checksum, errorTotal);
                 BenchmarkAckOracle.verify(List.of(correctness));
+                PipelineBenchmarkComparison.Fork performance = null;
+                BenchmarkReturnForkBridge.Fork returnMethodFork = null;
+                if (returnBridge != null) {
+                    returnMethodFork = returnBridge.finish(correctness, resources.peakHeapBytes(), resources.peakRssBytes());
+                } else {
                 long completed = measured.stream().mapToLong(MeasuredPhase::acknowledgedOutputs).sum();
                 long duration = measured.stream().mapToLong(MeasuredPhase::deliveryWindowNanos).sum();
                 if (completed != allDurations.size() || duration <= 0) {
@@ -813,8 +823,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     throughput = windowEvents * 1_000_000_000.0 / duration;
                 } else { throughput = completed * 1_000_000_000.0 / duration; }
                 long[] latencies = allDurations.stream().mapToLong(Long::longValue).toArray();
-                PipelineBenchmarkComparison.Fork performance = new PipelineBenchmarkComparison.Fork(
+                performance = new PipelineBenchmarkComparison.Fork(
                         arm, throughput, latencies, resources.peakHeapBytes(), resources.peakRssBytes());
+                }
                 List<Map<String, Object>> receipts = new ArrayList<>();
                 receipts.addAll(tableReceipts);
                 // All measured ACK, resource and command windows have already closed.
@@ -839,7 +850,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal, receipts,
                         fork.finishTelemetryCapture(), ownedReceipt);
                 evidence.add(run);
-                result = new PipelineBenchmarkHarness.ForkResult(performance, correctness);
+                result = new PipelineBenchmarkHarness.ForkResult(performance, correctness, returnMethodFork);
             }
         } catch (Exception | Error failure) {
             primary = failure;
@@ -867,13 +878,13 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
             CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
             TargetWatchSet targets, BenchmarkTableCaptureSet tables, BenchmarkNativeQueueProbe returnCounters,
-            long acknowledgedBoundaryAt) throws Exception {
+            long acknowledgedBoundaryAt, BenchmarkReturnForkBridge returnBridge) throws Exception {
         var rootCpu = openRootCpuDiagnostics(Boolean.getBoolean(ROOT_CPU_DIAGNOSTICS_PROPERTY), () ->
                 BenchmarkRootCpuEnvelope.open(java.util.Set.of("MEASURED_COMMON_COLLECTION"), java.util.Set.of(
                         "CAPTURE_TAIL", "SAMPLER_NATIVE_TAIL", "ORACLE_ASSOCIATION_TAIL")));
         try {
             return runMeasuredPhase(workload, fork, phase, captures, positionCoverage, targets, tables,
-                    returnCounters, acknowledgedBoundaryAt, rootCpu);
+                    returnCounters, acknowledgedBoundaryAt, rootCpu, returnBridge);
         } catch (Exception | Error failure) {
             if (rootCpu != null) {
                 try {
@@ -899,7 +910,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
             CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
             TargetWatchSet targets, BenchmarkTableCaptureSet tables, BenchmarkNativeQueueProbe returnCounters,
-            long acknowledgedBoundaryAt, BenchmarkRootCpuEnvelope rootCpu) throws Exception {
+            long acknowledgedBoundaryAt, BenchmarkRootCpuEnvelope rootCpu, BenchmarkReturnForkBridge returnBridge) throws Exception {
         boolean compilationDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics");
         if (compilationDiagnostics && !workload.pilotProfile()) {
             throw new AssertionError("compilation diagnostics require the declared steady pilot profile");
@@ -1381,7 +1392,24 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             }
             clockProof.put("writeReturnDiagnostics", Map.copyOf(disabled));
         }
-        if (writeReturns != null) {
+        if (returnBridge != null) {
+            final var enteredInterior = interiorClockReadings;
+            final var enteredBefore = nativeClockBefore;
+            final var enteredAfter = nativeClockAfter;
+            final var enteredReturns = writeReturns;
+            BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.DRIVER_PHASE, () -> {
+            if (enteredInterior.size() > BenchmarkTargetClock.MAX_INTERIOR_SAMPLES - 2)
+                throw new AssertionError("complete serial hello roster exceeds original phase prior");
+            var hello = new ArrayList<BenchmarkTargetClock.Reading>();
+            hello.add(targetClockBefore); hello.addAll(enteredInterior); hello.add(targetClocksAfter.getFirst());
+            var methodPhase = returnBridge.phase(phase, issued.batches(), enteredReturns, enteredBefore, enteredAfter, hello);
+            var methodEvidence = new LinkedHashMap<String, Object>(methodPhase.evidence());
+            methodEvidence.put("serialHelloRaw", hello.stream().map(BenchmarkTargetClock.Reading::evidence).toList());
+            methodEvidence.put("resourceBounds", BenchmarkReturnResourceBounds.evidence(resources, methodPhase.deliveries()));
+            clockProof.put("returnMethodPhase", Map.copyOf(methodEvidence));
+            return null;
+            });
+        } else if (writeReturns != null) {
             try {
                 BenchmarkReturnPointClock nativeReturnClock = null;
                 if (Boolean.getBoolean(NATIVE_COUNTER_DOMAIN_PROPERTY) || collectorCalibration == CollectorCalibration.ON) {
@@ -1510,7 +1538,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
                 BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(operationStreams), operationStreams);
-        BenchmarkSteadyOutputWindow.commonIntervalMillis(operationStreams);
+        if (returnBridge == null) BenchmarkSteadyOutputWindow.commonIntervalMillis(operationStreams);
         // Cached operation dates have no established mapping error; retain the full measured resource samples.
         Optional<BenchmarkTargetClock.LocalWindow> resourceWindow = Optional.empty();
         if (workload.pilotProfile()) {
@@ -1527,7 +1555,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     Map.entry("cohortOperationStreams", operationStreams),
                     Map.entry("performanceAcceptanceEligible", false))));
         }
-        List<Long> deliveryDurations = cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList();
+        List<Long> deliveryDurations = returnBridge == null
+                ? cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList() : List.of();
         if (rootCpu != null) {
             clockProof.put("rootCpuDiagnostics", finishRootCpuDiagnostics(rootCpu, oracleCpuTail));
             clockProof.put("rootCpuDiagnosticScope", Map.of(
@@ -1544,7 +1573,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return new PhaseWindow(new MeasuredPhase(phase.id(), measuredCount,
                 firstIssued, issued.sourceCompletedAtNanos(), completedAckAt, expectedSourceChanges,
                 deliveries.size(), reportedRecordsOut, issued.clockAnchor(), issued.batches(), resources,
-                Optional.of(timing), Optional.of(timeline), workload.pilotProfile(), resourceWindow, targetClockEvidence),
+                Optional.of(timing), Optional.of(timeline), workload.pilotProfile() && returnBridge == null, resourceWindow, targetClockEvidence),
                 deliveryDurations,
                 resources, commands);
     }

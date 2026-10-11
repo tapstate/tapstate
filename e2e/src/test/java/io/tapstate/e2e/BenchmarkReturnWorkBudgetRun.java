@@ -313,9 +313,22 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
 
     private static String collectorMode() {
         String calibration = System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY);
+        String method = System.getProperty(BenchmarkReturnForkBridge.PROPERTY);
+        if (method != null) return accountedReturnCollectorMode(method, calibration,
+                System.getProperty("tapstate.e2e.benchmark-smoke.arm", "A"),
+                System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY));
         if (calibration == null && "A".equals(System.getProperty("tapstate.e2e.benchmark-smoke.arm", "A"))
                 && "true".equals(System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY))) { return "ON"; }
         return calibration;
+    }
+
+    static String accountedReturnCollectorMode(String method, String calibration, String arm, String nativeDomain) {
+        return BenchmarkReturnBridgeSourceWork.entered(BenchmarkReturnBridgeSourceWork.Kind.PROTOCOL_MODE, () -> {
+        require(BenchmarkReturnForkBridge.selected(method) && calibration == null
+                && ("A".equals(arm) || "B".equals(arm)) && "true".equals(nativeDomain),
+                "explicit return method requires the original enabled native collector for either arm");
+        return "ON";
+        });
     }
 
     private static ProducerWriterBinding producerWriterFromProperties() {
