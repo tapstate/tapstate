@@ -280,6 +280,76 @@ class CiCaseEvidenceTest {
         }
     }
 
+    @Test
+    void beforeAllRecordsDistinctPredicatesWithoutRevealingConfiguredPaths() throws Exception {
+        String property = "tapstate.e2e.connectors-dir";
+        String previous = System.getProperty(property);
+        try {
+            System.clearProperty(property);
+            String absent = CiCaseEvidence.gateInputs();
+            System.setProperty(property, "  ");
+            String blank = CiCaseEvidence.gateInputs();
+            System.setProperty(property, "/private/credential-path-sentinel");
+            String named = CiCaseEvidence.gateInputs();
+            assertThat(absent).contains("\"tapstate.e2e.connectors-dir\":{\"present\":false,\"nonblank\":false");
+            assertThat(blank).contains("\"tapstate.e2e.connectors-dir\":{\"present\":true,\"nonblank\":false");
+            assertThat(named).contains("\"tapstate.e2e.connectors-dir\":{\"present\":true,\"nonblank\":true")
+                    .doesNotContain("credential-path-sentinel");
+            AtomicInteger calls = new AtomicInteger();
+            Method method = method("dynamicFixture");
+            Captured result = capture(true, () -> observer.interceptBeforeAllMethod(() -> {
+                calls.incrementAndGet(); return null;
+            }, invocation(method, List.of()), context(method, "before all", "[class:fixture]")));
+            assertThat(result.failure()).isNull();
+            assertThat(calls).hasValue(1);
+            assertThat(result.output()).contains(CiCaseEvidence.CLASS_MARKER, "\"phase\":\"start\"", "\"phase\":\"finish\"", "\"status\":\"executed\"")
+                    .doesNotContain("credential-path-sentinel");
+        } finally {
+            if (previous == null) System.clearProperty(property); else System.setProperty(property, previous);
+        }
+    }
+
+    @Test
+    void beforeAllAbortsKeepTheOriginalExceptionAndHashOnlyTheReason() throws Exception {
+        TestAbortedException original = new TestAbortedException("private-reason-sentinel");
+        AtomicInteger calls = new AtomicInteger();
+        Method method = method("dynamicFixture");
+        Captured result = capture(true, () -> observer.interceptBeforeAllMethod(() -> {
+            calls.incrementAndGet(); throw original;
+        }, invocation(method, List.of()), context(method, "before all", "[class:fixture]")));
+        assertThat(result.failure()).isSameAs(original);
+        assertThat(calls).hasValue(1);
+        assertThat(result.output()).contains("\"status\":\"aborted\"", "\"reason_digest\":")
+                .doesNotContain("private-reason-sentinel");
+    }
+
+    @Test
+    void beforeAllObservationErrorsNeverReplaceTheOriginalOutcome() throws Exception {
+        Method method = method("dynamicFixture");
+        AtomicInteger calls = new AtomicInteger();
+        IllegalStateException original = new IllegalStateException("original failure");
+        ExtensionContext broken = (ExtensionContext) Proxy.newProxyInstance(ExtensionContext.class.getClassLoader(),
+                new Class<?>[] {ExtensionContext.class}, (proxy, called, arguments) -> { throw new AssertionError("metadata failure"); });
+        Captured result = capture(true, () -> observer.interceptBeforeAllMethod(() -> {
+            calls.incrementAndGet(); throw original;
+        }, invocation(method, List.of()), broken));
+        assertThat(result.failure()).isSameAs(original);
+        assertThat(calls).hasValue(1);
+        assertThat(result.output()).contains("\"stable\":false", "class-observation-unavailable", "\"status\":\"failed\"");
+    }
+
+    @Test
+    void disabledBeforeAllObservationAddsNoReceiptsOrContextAccess() throws Exception {
+        Method method = method("dynamicFixture");
+        AtomicInteger calls = new AtomicInteger();
+        Captured result = capture(false, () -> observer.interceptBeforeAllMethod(() -> {
+            calls.incrementAndGet(); return null;
+        }, invocation(method, List.of()), null));
+        assertThat(result.failure()).isNull();
+        assertThat(calls).hasValue(1);
+        assertThat(result.output()).isEmpty();
+    }
+
     private static Method method(String name, Class<?>... arguments) throws NoSuchMethodException {
         return CiCaseEvidenceTest.class.getDeclaredMethod(name, arguments);
     }
@@ -322,11 +392,13 @@ class CiCaseEvidenceTest {
 
     private static Captured capture(boolean enabled, Operation operation) {
         String previous = System.getProperty(CiCaseEvidence.ENABLED);
+        String previousDirectory = System.getProperty(CiCaseEvidence.CLASS_DIRECTORY);
         PrintStream output = System.out;
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         Throwable failure = null;
         try (PrintStream stream = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
             System.setProperty(CiCaseEvidence.ENABLED, Boolean.toString(enabled));
+            System.clearProperty(CiCaseEvidence.CLASS_DIRECTORY);
             System.setOut(stream);
             try {
                 operation.run();
@@ -335,6 +407,8 @@ class CiCaseEvidenceTest {
             }
         } finally {
             System.setOut(output);
+            if (previousDirectory == null) System.clearProperty(CiCaseEvidence.CLASS_DIRECTORY);
+            else System.setProperty(CiCaseEvidence.CLASS_DIRECTORY, previousDirectory);
             if (previous == null) {
                 System.clearProperty(CiCaseEvidence.ENABLED);
             } else {

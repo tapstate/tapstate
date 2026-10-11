@@ -145,6 +145,31 @@ with tempfile.TemporaryDirectory() as tmp:
     assert receipt['enabled'] is True and receipt['providers']==['io.tapstate.testsupport.CiCaseEvidence']
     assert receipt['build_inputs_sha256']==hashlib.sha256((root/'build-inputs.json').read_bytes()).hexdigest()
     assert {(s['module'],s['kind']) for s in receipt['checked_scopes']}=={('arch-tests','unit'),('core','unit'),('e2e','unit')}
+    # Class-abort metadata has one fresh task-owned directory, never a reusable sink.
+    gate_dir=root/'class-gates'
+    gated=opted+['--class-gate-dir',str(gate_dir)]
+    reject_observer(run_command+['--class-gate-dir',str(gate_dir)], 'requires --case-evidence')
+    reject_observer(opted+['--class-gate-dir','class-gates'], 'must be absolute')
+    reject_observer(opted+['--class-gate-dir',str(root/'foreign-gates')], 'declared build input sibling')
+    gate_dir.mkdir(); (gate_dir/'retained.jsonl').write_text('foreign retained metadata')
+    reject_observer(gated,'must be fresh')
+    assert (gate_dir/'retained.jsonl').read_text()=='foreign retained metadata'
+    (gate_dir/'retained.jsonl').unlink(); gate_dir.rmdir()
+    with tempfile.TemporaryDirectory() as gate_outside:
+        sentinel=pathlib.Path(gate_outside)/'retained'; sentinel.write_text('outside metadata')
+        gate_dir.symlink_to(gate_outside,target_is_directory=True)
+        reject_observer(gated,'unsafe observer ledger path')
+        assert sentinel.read_text()=='outside metadata'
+        gate_dir.unlink()
+    subprocess.run(gated,check=True,env=environment,capture_output=True)
+    gated_args=(root/'mvn-args').read_text().splitlines()
+    gate_flag='-Dtapstate.ci.class-gate-dir='+str(gate_dir.resolve())
+    assert gated_args.count(gate_flag)==1 and gate_dir.is_dir()
+    assert [a for a in gated_args if a not in extra+[gate_flag]]==args
+    gated_receipt=json.loads((root/'target/ci-shards/run-rest.json').read_text())['case_observer']
+    assert gated_receipt['class_gate_ledger_enabled'] is True
+    reject_observer(gated,'must be fresh')
+    gate_dir.rmdir()
     # Maven resolves the language aggregator as a nonarchive POM alongside its real JARs.
     aggregator=root/'m2/org/graalvm/polyglot/js-community/24.1.2/js-community-24.1.2.pom'
     aggregator.parent.mkdir(parents=True)

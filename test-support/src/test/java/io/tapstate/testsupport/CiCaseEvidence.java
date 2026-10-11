@@ -18,6 +18,9 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -61,6 +64,99 @@ public final class CiCaseEvidence implements InvocationInterceptor {
             "java.util.ImmutableCollections$Map1", "java.util.ImmutableCollections$MapN",
             "java.util.Collections$EmptyMap", "java.util.Collections$SingletonMap");
     private static final Pattern REPETITION = Pattern.compile("\\[test-template-invocation:#(\\d+)]$");
+
+    static final String CLASS_DIRECTORY = "tapstate.ci.class-gate-dir";
+    static final String CLASS_MARKER = "tapstate.ci-class-gate=";
+    private static final List<String> GATE_PROPERTIES = List.of(
+            "tapstate.e2e.connectors-dir", "tapstate.e2e.upgrade-lane", "tapstate.pdk.it.postgres-jar",
+            "tapstate.pdk.it.mysql-jar", "tapstate.pdk.it.oracle-jar", "tapstate.pdk.it.sqlserver-jar");
+    private static final List<String> GATE_ENVIRONMENTS = List.of(
+            "TAPSTATE_TEST_NATIVE_CLI", "TAPSTATE_ATLAS_TEST_URI", "TAPSTATE_ATLAS_STANDARD_URI");
+
+    @Override
+    public void interceptBeforeAllMethod(Invocation<Void> invocation,
+            ReflectiveInvocationContext<Method> invocationContext, ExtensionContext context) throws Throwable {
+        if (!Boolean.getBoolean(ENABLED)) {
+            invocation.proceed();
+            return;
+        }
+        String record;
+        try {
+            Method method = invocationContext.getExecutable();
+            record = "\"schema\":1,\"class\":" + quote(context.getTestClass().orElse(method.getDeclaringClass()).getName())
+                    + ",\"method\":" + quote(method.getName()) + ",\"declaring_class\":" + quote(method.getDeclaringClass().getName())
+                    + ",\"unique_id\":" + quote(context.getUniqueId()) + ",\"stable\":true"
+                    + ",\"source_sha\":" + optional(System.getenv("GITHUB_SHA"))
+                    + ",\"run_id\":" + optional(System.getenv("GITHUB_RUN_ID"))
+                    + ",\"run_attempt\":" + optional(System.getenv("GITHUB_RUN_ATTEMPT"))
+                    + ",\"gate_inputs\":" + gateInputs();
+        } catch (Throwable failedObservation) {
+            record = "\"schema\":1,\"stable\":false,\"reason\":\"class-observation-unavailable\"";
+        }
+        emitWithPrefix(CLASS_MARKER, record, "start", null, null);
+        try {
+            invocation.proceed();
+        } catch (Throwable original) {
+            String reason = null;
+            if (original.getClass() == TestAbortedException.class) {
+                try { reason = hash(quote(original.getMessage())); } catch (Throwable unavailable) { }
+            }
+            emitWithPrefix(CLASS_MARKER, record, "finish", original instanceof TestAbortedException ? "aborted" : "failed", reason);
+            throw original;
+        }
+        emitWithPrefix(CLASS_MARKER, record, "finish", "executed", null);
+    }
+
+    static String gateInputs() {
+        List<String> properties = new ArrayList<>();
+        for (String name : GATE_PROPERTIES) {
+            properties.add(quote(name) + ":" + flags(System.getProperty(name)));
+        }
+        List<String> environments = new ArrayList<>();
+        for (String name : GATE_ENVIRONMENTS) {
+            environments.add(quote(name) + ":" + flags(System.getenv(name)));
+        }
+        return "{\"properties\":{" + String.join(",", properties) + "},\"environment\":{" + String.join(",", environments) + "}}";
+    }
+
+    private static String flags(String value) {
+        return "{\"present\":" + (value != null) + ",\"nonblank\":" + (value != null && !value.isBlank())
+                + ",\"boolean_true\":" + "true".equalsIgnoreCase(value) + "}";
+    }
+
+    private static String optional(String value) {
+        return value == null ? "null" : quote(value);
+    }
+
+    private static void emitWithPrefix(String prefix, String record, String phase, String status, String reason) {
+        try {
+            String line = "{" + record + ",\"phase\":" + quote(phase)
+                    + (status == null ? "" : ",\"status\":" + quote(status))
+                    + (reason == null ? "" : ",\"reason_digest\":" + quote(reason)) + "}";
+            // The optional directory is pre-created and checked by the worker. No
+            // resource is activated here; a failed append means missing evidence.
+            String configured = System.getProperty(CLASS_DIRECTORY);
+            if (configured != null) {
+                try {
+                    Path directory = Path.of(configured);
+                    if (directory.isAbsolute() && Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+                        Path file = directory.resolve("before-all-" + ProcessHandle.current().pid() + ".jsonl");
+                        if (!Files.isSymbolicLink(file)) {
+                            synchronized (CiCaseEvidence.class) {
+                                Files.writeString(file, line + "\n", StandardCharsets.UTF_8,
+                                        StandardOpenOption.CREATE, StandardOpenOption.APPEND, LinkOption.NOFOLLOW_LINKS);
+                            }
+                        }
+                    }
+                } catch (Throwable unavailableFile) {
+                    // Original invocation and exception handling remain authoritative.
+                }
+            }
+            System.out.println(prefix + line);
+        } catch (Throwable unavailableOutput) {
+            // Observation failure cannot replace the original invocation outcome.
+        }
+    }
 
     @Override
     public void interceptTestMethod(Invocation<Void> invocation,
@@ -161,7 +257,8 @@ public final class CiCaseEvidence implements InvocationInterceptor {
                 + ",\"argument_descriptors\":[" + String.join(",", descriptors) + "]"
                 + ",\"first_string_digest\":" + (firstString == null ? "null" : quote(firstString))
                 + ",\"stable\":" + stable + ",\"identity_kind\":" + quote(kind)
-                + ",\"repetition\":" + (repetition == null ? "null" : repetition);
+                + ",\"repetition\":" + (repetition == null ? "null" : repetition)
+                + ",\"gate_inputs\":" + gateInputs();
     }
 
     private static Integer repetition(Method method, List<Object> arguments, ExtensionContext context, String kind) {

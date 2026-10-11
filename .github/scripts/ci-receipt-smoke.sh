@@ -79,6 +79,37 @@ with tempfile.TemporaryDirectory() as tmp:
     classbytes = b'\xca\xfe\xba\xbe\x00\x00\x00\x41\x00\x01\x10\x01'
     check(m.class_access_flags(classbytes) == 0x1001, 'actual synthetic access flags do not depend on observed XML')
     rejected(lambda: m.class_access_flags(classbytes[:-1]), 'truncated class access metadata rejects')
+    # Only whitelisted coordinate/type producer facts escape a dependency model.
+    repository=root/'repository'; repository.mkdir()
+    parent='example/parent/1/parent-1.pom'
+    child='example/child/1/child-1.pom'
+    binary='example/child/1/child-1.jar'
+    def model_file(relative, content):
+        path=repository/relative; path.parent.mkdir(parents=True,exist_ok=True); path.write_text(content); return path
+    model_file(parent,'<project><modelVersion>4.0.0</modelVersion><groupId>example</groupId><artifactId>parent</artifactId><version>1</version><packaging>pom</packaging></project>')
+    model_file(child,'<project><modelVersion>4.0.0</modelVersion><parent><groupId>example</groupId><artifactId>parent</artifactId><version>1</version></parent><artifactId>child</artifactId><properties><credential>private-model-sentinel</credential></properties><url>https://private-model-sentinel.invalid</url></project>')
+    with zipfile.ZipFile(repository/binary,'w') as archive:
+        archive.writestr('META-INF/maven/example/child/pom.properties','groupId=example\nartifactId=child\nversion=1\n')
+    hashes={name:m.digest(repository/name) for name in (parent,child,binary)}
+    models,producers=m.dependency_models(repository,hashes)
+    check(models[child]['gav']==['example','child','1'] and models[child]['parent']['sha256']==hashes[parent], 'literal inherited coordinates bind their parent bytes')
+    check(producers[binary]['producer_identity_verified'] and producers[binary]['producer_identity_source']=='embedded-pom-properties', 'embedded Maven producer identity is verified')
+    check('private-model-sentinel' not in json.dumps([models,producers]), 'arbitrary properties and URLs are never emitted')
+    check(not models[child]['effective_dependency_model_proven'] and not producers[binary]['runtime_realm_proven'], 'model coordinates never pretend to establish effective dependencies or runtime realms')
+    with zipfile.ZipFile(repository/binary,'w') as archive:
+        archive.writestr('META-INF/MANIFEST.MF','Manifest-Version: 1.0\r\nImplementation-Title: child\r\nImplementation-Version: 1\r\n\r\n')
+    hashes[binary]=m.digest(repository/binary); models,producers=m.dependency_models(repository,hashes)
+    check(producers[binary]['producer_identity_verified'] and not producers[binary]['pom_properties_present'] and producers[binary]['producer_identity_source']=='embedded-implementation-manifest', 'manifest evidence verifies a producer without inventing pom.properties')
+    with zipfile.ZipFile(repository/binary,'w') as archive:
+        archive.writestr('META-INF/MANIFEST.MF','Implementation-Title: child\nImplementation-Version: 2\n')
+    hashes[binary]=m.digest(repository/binary); models,producers=m.dependency_models(repository,hashes)
+    check(not producers[binary]['producer_identity_verified'], 'wrong embedded producer version does not verify')
+    missing_parent={name:checksum for name,checksum in hashes.items() if name!=parent}
+    models,producers=m.dependency_models(repository,missing_parent)
+    check(not models[child]['coordinate_type_verified'] and not producers, 'parent outside actual byte snapshot remains unknown')
+    model_file(child,'<project><groupId>example</groupId><artifactId>child</artifactId><version>${revision}</version></project>'); hashes[child]=m.digest(repository/child)
+    models,producers=m.dependency_models(repository,hashes)
+    check(not models[child]['coordinate_type_verified'], 'unresolved coordinate expressions remain unknown')
     # First-attempt provenance is validated independently of successful conclusion.
     original_api = m.api
     m.api = lambda endpoint: {'id': 10, 'run_attempt': 1, 'status': 'in_progress', 'repository': {'full_name': 'example/project'}}

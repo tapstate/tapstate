@@ -444,6 +444,7 @@ def nonarchive_classpath_pom(scope, relative, path):
 def case_observer(args, root, plan, modules):
     if not args.case_evidence:
         require(args.build_inputs is None, '--build-inputs requires --case-evidence')
+        require(args.class_gate_dir is None, '--class-gate-dir requires --case-evidence')
         return dict(enabled=False, providers=[])
     require(args.build_inputs is not None, '--case-evidence requires --build-inputs')
     started = time.monotonic_ns()
@@ -539,7 +540,15 @@ def case_observer(args, root, plan, modules):
             require(active_providers[kind] == {OBSERVER},
                     'unexpected extension provider in actual selected test classpath: ' + module + '/' + kind)
             scopes.append(dict(module=module, kind=kind, dependency_excludes=sorted(exclusions[kind])))
+    if args.class_gate_dir:
+        requested = Path(args.class_gate_dir)
+        require(requested.is_absolute(), 'class gate ledger directory must be absolute')
+        require(requested.absolute() == manifest_path.absolute().parent / 'class-gates',
+                'class gate ledger directory must be the declared build input sibling')
+        directory = owned_path(manifest_path.resolve().parent, 'class-gates', 'observer ledger')
+        require(not directory.exists(), 'class gate ledger directory must be fresh')
     return dict(enabled=True, providers=[OBSERVER], checked_scopes=scopes,
+                class_gate_ledger_enabled=bool(args.class_gate_dir),
                 build_inputs_sha256=file_digest(manifest_path), observer_files=observer_hashes,
                 audit_elapsed_ns=time.monotonic_ns()-started)
 
@@ -557,6 +566,9 @@ def run_shard(args, root, plan):
     # evidence and this shard's freshness receipt are reset in the owned checkout.
     with phase_timing('reset-test-evidence', 'run', plan, shard['id']) as reset:
         reset_test_evidence(root, shard)
+        if args.class_gate_dir:
+            # This fresh metadata directory belongs to the same declared input capture.
+            owned_path(Path(args.build_inputs).resolve().parent, 'class-gates', 'observer ledger').mkdir()
     receipt = dict(schema=1, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
                    shard_id=shard['id'], invocation_id=uuid.uuid4().hex,
                    status='running', reset=reset, case_observer=observer, **execution_identity())
@@ -569,6 +581,8 @@ def run_shard(args, root, plan):
     if args.case_evidence:
         command += ['-Dmaven.test.additionalClasspath=' + str(root / 'test-support/target/test-classes'),
                     '-Djunit.jupiter.extensions.autodetection.enabled=true', '-Dtapstate.ci.case-evidence=true']
+        if args.class_gate_dir:
+            command += ['-Dtapstate.ci.class-gate-dir=' + str(Path(args.class_gate_dir).resolve())]
     # Selectors span several modules. Exact admission below catches any missing class;
     # Maven must permit the modules in which a selector has no local match.
     command += ['-Dsurefire.failIfNoSpecifiedTests=false', '-Dfailsafe.failIfNoSpecifiedTests=false']
@@ -789,6 +803,7 @@ def main():
             command.add_argument('--repo-local', required=True)
             command.add_argument('--case-evidence', action='store_true', help='enable the passive built case observer')
             command.add_argument('--build-inputs', help='current pre-test resolved classpaths required by the observer')
+            command.add_argument('--class-gate-dir', help='fresh metadata directory beside the declared input capture')
         if name == 'pack':
             command.add_argument('--output', required=True)
         if name == 'verify':

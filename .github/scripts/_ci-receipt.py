@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
 
@@ -120,6 +121,85 @@ def git(root, *args):
     return command(['git', '-C', str(root), *args]).strip()
 
 
+def dependency_models(repository, hashes):
+    """Record literal coordinate/type facts; never evaluate POM expressions or URLs."""
+    models, producers = {}, {}
+    literal = lambda value: isinstance(value, str) and bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+-]*', value))
+    for relative, checksum in hashes.items():
+        if not relative.endswith('.pom'):
+            continue
+        path = repository / relative
+        try:
+            require(path.stat().st_size <= 2 * 1024 * 1024, 'POM exceeds metadata bound')
+            raw = path.read_bytes()
+            require(hashlib.sha256(raw).hexdigest() == checksum, 'POM bytes changed during metadata capture')
+            require(b'<!DOCTYPE' not in raw and b'<!ENTITY' not in raw, 'POM entities are not metadata')
+            model = ET.fromstring(raw)
+            for node in model.iter():
+                node.tag = node.tag.rsplit('}', 1)[-1]
+            require(model.tag == 'project', 'not a project model')
+            parent = model.find('parent')
+            parent_gav = ([parent.findtext(field) for field in ('groupId', 'artifactId', 'version')]
+                          if parent is not None else None)
+            gav = [model.findtext('groupId') or (parent_gav[0] if parent_gav else None),
+                   model.findtext('artifactId'),
+                   model.findtext('version') or (parent_gav[2] if parent_gav else None)]
+            require(all(literal(value) for value in gav), 'nonliteral model coordinates')
+            expected = '/'.join([gav[0].replace('.', '/'), gav[1], gav[2], gav[1] + '-' + gav[2] + '.pom'])
+            require(expected == relative, 'model coordinates differ from repository path')
+            packaging = model.findtext('packaging') or 'jar'
+            require(literal(packaging), 'nonliteral model type')
+            parent_fact = None
+            if parent_gav:
+                require(all(literal(value) for value in parent_gav), 'nonliteral parent coordinates')
+                parent_path = '/'.join([parent_gav[0].replace('.', '/'), parent_gav[1], parent_gav[2], parent_gav[1] + '-' + parent_gav[2] + '.pom'])
+                require(parent_path in hashes, 'parent bytes are outside the repository snapshot')
+                parent_fact = dict(gav=parent_gav, path=parent_path, sha256=hashes[parent_path])
+            models[relative] = dict(gav=gav, packaging=packaging, sha256=checksum, parent=parent_fact,
+                                    coordinate_type_verified=True, effective_dependency_model_proven=False)
+        except (ValueError, OSError, ET.ParseError):
+            models[relative] = dict(sha256=checksum, coordinate_type_verified=False,
+                                    effective_dependency_model_proven=False)
+    for relative, checksum in hashes.items():
+        if not relative.endswith('.jar'):
+            continue
+        pom_path = relative[:-4] + '.pom'
+        model = models.get(pom_path)
+        if not model or not model.get('coordinate_type_verified'):
+            continue
+        gav = model['gav']
+        fact = dict(gav=gav, sha256=checksum, pom_path=pom_path, pom_sha256=hashes[pom_path],
+                    archive_type_verified=False, producer_identity_verified=False,
+                    producer_identity_source=None, pom_properties_present=False,
+                    runtime_realm_proven=False)
+        try:
+            require(digest(repository / relative) == checksum, 'JAR bytes changed during metadata capture')
+            with zipfile.ZipFile(repository / relative) as archive:
+                fact['archive_type_verified'] = True
+                fact['own_class_count'] = sum(item.filename.endswith('.class') and (item.filename.startswith('io/tapstate/') or re.match(r'META-INF/versions/[0-9]+/io/tapstate/', item.filename) is not None) for item in archive.infolist())
+                for item in archive.infolist():
+                    if not item.filename.startswith('META-INF/maven/') or not item.filename.endswith('/pom.properties'):
+                        continue
+                    require(item.file_size <= 65536, 'embedded coordinate facts exceed bound')
+                    fact['pom_properties_present'] = True
+                    properties = dict(match.groups() for line in archive.read(item).decode('utf-8').splitlines()
+                                      if (match := re.fullmatch(r'(groupId|artifactId|version)\s*=\s*(.*)', line)))
+                    if [properties.get(field) for field in ('groupId', 'artifactId', 'version')] == gav:
+                        fact.update(producer_identity_verified=True, producer_identity_source='embedded-pom-properties')
+                if not fact['producer_identity_verified'] and 'META-INF/MANIFEST.MF' in archive.namelist():
+                    info = archive.getinfo('META-INF/MANIFEST.MF')
+                    require(info.file_size <= 65536, 'producer manifest exceeds bound')
+                    manifest = archive.read(info).decode('utf-8').replace('\r\n', '\n')
+                    manifest = re.sub(r'\n ', '', manifest)
+                    attributes = dict(line.split(': ', 1) for line in manifest.splitlines() if ': ' in line)
+                    if attributes.get('Implementation-Title') == gav[1] and attributes.get('Implementation-Version') == gav[2]:
+                        fact.update(producer_identity_verified=True, producer_identity_source='embedded-implementation-manifest')
+        except (ValueError, OSError, UnicodeError, zipfile.BadZipFile):
+            fact.update(archive_type_verified=False, producer_identity_verified=False, producer_identity_source=None)
+        producers[relative] = fact
+    return models, producers
+
+
 def inputs(args):
     root = Path(args.root).resolve()
     require(Path(git(root, 'rev-parse', '--show-toplevel')).resolve() == root, 'input root must be the actual product checkout')
@@ -200,6 +280,7 @@ def inputs(args):
         if not relative.startswith('io/tapstate/') and path.suffix in ('.jar', '.pom'):
             dependencies[relative] = digest(path)
     require(dependencies, 'no resolved dependency byte evidence')
+    models, producers = dependency_models(Path(args.repo_local).resolve(), dependencies)
     source_files = {}
     for name in git(root, 'ls-files').splitlines():
         source_files[name] = digest(shards.owned_path(root, name))
@@ -213,6 +294,7 @@ def inputs(args):
              'production_class_access_flags': class_flags, 'jacoco_version': shards.pom(root / 'pom.xml').findtext('properties/plugin.jacoco.version'),
              'test_files': test_files, 'test_class_ids': test_ids,
              'packaged_outputs': outputs, 'dependency_repository_files': dependencies,
+             'dependency_coordinate_models': models, 'dependency_producer_facts': producers,
              'dependency_scope': 'conservative available JAR/POM byte binding plus independently resolved ordered test classpaths',
              'resolved_test_classpaths': classpaths,
              'toolchain': {'java': java.stderr,

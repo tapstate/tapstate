@@ -4,7 +4,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export EVIDENCE_TOOL="$here/ci-evidence.sh" EVIDENCE_MODULE="$here/_ci-evidence.py"
 python3 - <<'PY'
-import copy, hashlib, importlib.util, json, os, pathlib, shutil, struct, subprocess, sys, tempfile, tarfile
+import copy, hashlib, importlib.util, json, os, pathlib, shutil, struct, subprocess, sys, tempfile, tarfile, zipfile
 import xml.etree.ElementTree as ET
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('evidence', os.environ['EVIDENCE_MODULE'])
@@ -34,7 +34,7 @@ class CoreTest extends Base {
   // @Test void commentIsNotACase() {}
   @Test void two() {}
   @Test void injected(@TempDir Path directory) {}
-  @ParameterizedTest @ValueSource(strings = {"first", "second"}) void values(String value) {}
+  @ParameterizedTest @NullAndEmptySource @ValueSource(strings = {"first", "second"}) void values(String value) {}
   @Nested class Inner { @Test void nested() {} }
 }''')
     put(source,'core/src/test/java/sample/Base.java','package sample; abstract class Base { @Test void inherited() {} }')
@@ -47,7 +47,7 @@ class PublishedExamplesIT {
     for example in ('alpha','beta'): put(source,'e2e/examples/'+example+'/case.e2e.yml','setup:\n  connectors: [e2e_file]\n')
     inventory = root/'inventory.json'
     run(['inventory','--root',str(source),'--lane','ci','--output',str(inventory)])
-    inv = json.loads(inventory.read_text()); assert inv['complete'] and len(inv['cases']) == 11
+    inv = json.loads(inventory.read_text()); assert inv['complete'] and len(inv['cases']) == 13
     assert {m['method'] for m in inv['methods']} == {'one','two','values','nested','thePublishedExampleRuns','inherited','injected'}
     def suite(classname, cases, module, kind='unit'):
         element = ET.Element('testsuite', name=classname, tests=str(len(cases)), failures='0', errors='0', skipped=str(sum(c.find('skipped') is not None for c in cases)))
@@ -59,7 +59,7 @@ class PublishedExamplesIT {
         if skipped: ET.SubElement(element,'skipped',type='fixture',message=skipped)
         return element
     value_method = next(m for m in inv['methods'] if m['method']=='values')
-    value_cases = [case('sample.CoreTest','values(String)['+str(n+1)+']') for n in range(2)]
+    value_cases = [case('sample.CoreTest','values(String)['+str(n+1)+']') for n in range(len(value_method['parameters']))]
     for n,element in enumerate(value_cases):
         marker=dict(schema=1,phase='start',unique_id='value-'+str(n),stable=True,**{'class':'sample.CoreTest'},method='values',argument_digest=value_method['argument_digests'][n])
         ET.SubElement(element,'system-out').text='tapstate.ci-case='+json.dumps(marker)+'\n'+'tapstate.ci-case='+json.dumps(marker|dict(phase='finish',status='executed'))+'\n'
@@ -74,6 +74,18 @@ class PublishedExamplesIT {
         observe(after)
         run(['compare','--inventory',str(inventory),'--before',str(before),'--after',str(after),'--output',str(comparison)],success,reason)
     observe(before); compare()
+    assert len(value_method['parameters'])==4 and len(set(value_method['argument_digests']))==4
+    null_digest=evidence.argument_digest([['null']]);empty_digest=evidence.argument_digest([['java.lang.String','']])
+    assert null_digest in value_method['argument_digests'] and empty_digest in value_method['argument_digests']
+    omitted=json.loads(inventory.read_text())
+    omitted_method=next(method for method in omitted['methods'] if method['method']=='values')
+    omitted_method['parameters']=omitted_method['parameters'][:2];omitted_method['argument_digests']=omitted_method['argument_digests'][:2]
+    omitted['cases']=[record for record in omitted['cases'] if record['method']!='values' or record['parameter'] in omitted_method['parameters']]
+    omitted_inventory=save('omitted-null-empty.json',omitted)
+    omitted_observation=root/'omitted-observation.json'
+    run(['reports','--root',str(reports),'--lane','ci','--inventory',str(omitted_inventory),'--output',str(omitted_observation)])
+    assert not json.loads(omitted_observation.read_text())['complete']
+    run(['compare','--inventory',str(omitted_inventory),'--before',str(omitted_observation),'--after',str(omitted_observation),'--output',str(comparison)],False,'unresolved identities')
     baseline_reports = root/'pristine'; shutil.copytree(reports,baseline_reports)
     def reset(): shutil.rmtree(reports); shutil.copytree(baseline_reports,reports)
     def edit(path, action):
@@ -105,6 +117,65 @@ class PublishedExamplesIT {
     split = ET.Element('testsuite',name='sample.PublishedExamplesIT',tests='2',failures='0',errors='0',skipped='0'); split.extend(children[2:])
     put(reports,'split/e2e/target/failsafe-reports/TEST-sample.PublishedExamplesIT.xml',ET.tostring(split,encoding='unicode'))
     compare(); reset()
+    # A zero outer suite is only a wrapper when every independent family identity
+    # is actually present once in the nested reports. Missing an inner or outer
+    # case cannot borrow the wrapper exemption.
+    outer_tree=ET.parse(core).getroot(); nested_tree=ET.parse(nested).getroot()
+    outer_cases=list(outer_tree.findall('testcase'))
+    nested_tree.extend(outer_cases);nested_tree.set('tests',str(len(nested_tree.findall('testcase'))));nested_tree.set('skipped',str(sum(c.find('skipped') is not None for c in nested_tree.findall('testcase'))))
+    nested.write_text(ET.tostring(nested_tree,encoding='unicode'))
+    for element in outer_cases:outer_tree.remove(element)
+    outer_tree.set('tests','0');outer_tree.set('skipped','0');core.write_text(ET.tostring(outer_tree,encoding='unicode'))
+    compare()
+    edit(nested,lambda element:element.remove(element.findall('testcase')[-1]));compare(False,'unresolved identities');reset()
+    # A real class-level abort needs original source predicates, compiled bytes,
+    # and fresh paired callback receipts. It contributes N/A, never XML execution.
+    gate_source=root/'gate-source';gate_reports=root/'gate-reports';gate_dir=root/'class-gates'
+    put(gate_source,'pom.xml','<project><modules><module>core</module></modules></project>')
+    put(gate_source,'core/pom.xml',(source/'core/pom.xml').read_text())
+    gate_reason='no -Dtapstate.e2e.connectors-dir: skipping a witness that needs real connector jars'
+    put(gate_source,'core/src/test/java/sample/GateTest.java','package sample; class GateTest { @BeforeAll static void prepare() { RealConnectorGate.require("mysql"); } @Test void first() {} @Test void second() {} }')
+    put(gate_source,'core/src/test/java/sample/RealConnectorGate.java','package sample; class RealConnectorGate { static void require(String id) { Assumptions.abort("'+gate_reason+'"); } }')
+    put(gate_source,'core/src/test/java/sample/ConnectorJars.java','package sample; class ConnectorJars { boolean named() { return configured != null && !configured.isBlank(); } }')
+    gate_inventory=root/'gate-inventory.json';run(['inventory','--root',str(gate_source),'--lane','ci','--output',str(gate_inventory)])
+    gate_inv=json.loads(gate_inventory.read_text());gate_inv['source_sha']='a'*40;gate_inventory.write_text(json.dumps(gate_inv))
+    gate_input=save('gate-inputs.json',dict(schema=1,phase='pre-test-after-install',source_sha='a'*40,run_id=123,run_attempt=1,source_files=gate_inv['sources']|{'test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java':'c'*64},test_files={'core/target/test-classes/sample/GateTest.class':'b'*64,'test-support/target/test-classes/io/tapstate/testsupport/CiCaseEvidence.class':'d'*64}))
+    put(gate_reports,'core/target/surefire-reports/TEST-sample.GateTest.xml','<testsuite name="sample.GateTest" tests="0" failures="0" errors="0" skipped="0"/>')
+    absent=dict(present=False,nonblank=False,boolean_true=False)
+    gate_record=dict(schema=1,stable=True,**{'class':'sample.GateTest'},declaring_class='sample.GateTest',method='prepare',unique_id='class-gate',source_sha='a'*40,run_id='123',run_attempt='1',gate_inputs=dict(properties={'tapstate.e2e.connectors-dir':absent},environment={}))
+    gate_ledger=put(gate_dir,'before-all-123.jsonl',json.dumps(gate_record|dict(phase='start'))+'\n'+json.dumps(gate_record|dict(phase='finish',status='aborted',reason_digest=evidence.digest(json.dumps(gate_reason).encode())))+'\n')
+    gate_observation=root/'gate-observation.json'
+    gate_command=['reports','--root',str(gate_reports),'--lane','ci','--inventory',str(gate_inventory),'--class-gates',str(gate_dir),'--inputs',str(gate_input),'--output',str(gate_observation)]
+    run(gate_command);gate_baseline=json.loads(gate_observation.read_text())
+    assert gate_baseline['complete'] and gate_baseline['actual_xml_case_count']==0 and len(gate_baseline['cases'])==0 and gate_baseline['source_not_applicable_count']==2 and len(gate_baseline['class_gate_files'])==1
+    gate_before=save('gate-before.json',gate_baseline)
+    gate_compare=['compare','--inventory',str(gate_inventory),'--before',str(gate_before),'--after',str(gate_observation),'--output',str(root/'gate-comparison.json')]
+    run(gate_compare)
+    # Identical ordinary-PR N/A cannot authorize changing the original helper's
+    # available/nightly path. Freeze its full bytes independently of the abort.
+    for filename in ('RealConnectorGate.java','ConnectorJars.java'):
+        revised=copy.deepcopy(gate_inv);helper='core/src/test/java/sample/'+filename
+        revised['sources'][helper]=hashlib.sha256((gate_source/helper).read_bytes()+b'\n// changed available path\n').hexdigest()
+        changed_inventory=save('changed-gate-helper-inventory.json',revised)
+        unchanged_na=copy.deepcopy(gate_baseline);unchanged_na['source_inventory_sha256']=hashlib.sha256(changed_inventory.read_bytes()).hexdigest()
+        changed_observation=save('changed-gate-helper-observation.json',unchanged_na)
+        run(['compare','--inventory',str(gate_inventory),'--candidate-inventory',str(changed_inventory),'--before',str(gate_before),'--after',str(changed_observation),'--output',str(root/'changed-gate-helper-comparison.json')],False,'original class gate helper source hash changed')
+    original_ledger=gate_ledger.read_text()
+    for change,reason in [(('source_sha','e'*40),'old or foreign'),(('run_attempt','2'),'old or foreign')]:
+        key,value=change;rows=[json.loads(line) for line in original_ledger.splitlines()]
+        for row in rows:row[key]=value
+        gate_ledger.write_text('\n'.join(json.dumps(row) for row in rows)+'\n');run(gate_command,False,reason)
+    gate_ledger.write_text(original_ledger+original_ledger);run(gate_command,False,'duplicate class gate phase')
+    gate_ledger.write_text(original_ledger.splitlines()[0]+'\n');run(gate_command,False,'missing or duplicate')
+    rows=[json.loads(line) for line in original_ledger.splitlines()];rows[1]['reason_digest']='0'*64
+    gate_ledger.write_text('\n'.join(json.dumps(row) for row in rows)+'\n');run(gate_command);assert not json.loads(gate_observation.read_text())['complete'];run(gate_compare,False,'unresolved identities')
+    rows=[json.loads(line) for line in original_ledger.splitlines()]
+    for row in rows:row['gate_inputs']['properties']['tapstate.e2e.connectors-dir']=dict(present=True,nonblank=True,boolean_true=False)
+    gate_ledger.write_text('\n'.join(json.dumps(row) for row in rows)+'\n');run(gate_command);assert not json.loads(gate_observation.read_text())['complete'];run(gate_compare,False,'unresolved identities')
+    gate_ledger.write_text(original_ledger);run(gate_command)
+    forged_gate=json.loads(gate_observation.read_text());forged_gate['source_not_applicable'][0]['evidence']['compiled_class_sha256']='invalid';gate_observation.write_text(json.dumps(forged_gate));run(gate_compare,False,'bytecode/reason binding')
+    gate_observation.write_text(json.dumps(gate_baseline));public_gate=root/'gate-hashes.json';run(['export-hashes','--input',str(gate_observation),'--output',str(public_gate)])
+    exported=json.loads(public_gate.read_text());assert exported['actual_xml_case_count']==0 and exported['source_not_applicable_count']==2 and len(exported['cases'])==2 and gate_reason not in public_gate.read_text() and str(gate_dir) not in public_gate.read_text()
     # New regression controls are explicit additions, never replacements for originals.
     core_source=source/'core/src/test/java/sample/CoreTest.java'; old_source=core_source.read_text()
     core_source.write_text(old_source.replace('@Test void two() {}','@Test void two() {} @Test void newControl() {}'))
@@ -235,6 +306,48 @@ class PublishedExamplesIT {
     run(['compare-coverage','--before',str(root/'coverage-before.json'),'--after',str(root/'coverage.json'),'--output',str(root/'coverage-diff.json')],False,'branches decreased')
     xml.write_text(xml.read_text().replace('cb="0"','cb="1"')); cov()
     run(['compare-coverage','--before',str(root/'coverage-before.json'),'--after',str(root/'coverage.json'),'--output',str(root/'coverage-diff.json')])
+    # Identical line/branch counts cannot hide swapping one covered production probe.
+    baseline_probe=copy.deepcopy(json.loads((root/'coverage-before.json').read_text()))
+    before_record=baseline_probe['executions']['core/target/jacoco.exec']['classes'][0]
+    before_record['probes']=3;before_record['covered_probes']=[0,1]
+    probe_before=save('probe-before.json',baseline_probe)
+    swapped=copy.deepcopy(baseline_probe);swapped['executions']['core/target/jacoco.exec']['classes'][0]['covered_probes']=[0,2]
+    probe_after=save('probe-after.json',swapped)
+    probe_compare=['compare-coverage','--before',str(probe_before),'--after',str(probe_after),'--output',str(root/'probe-difference.json')]
+    run(probe_compare,False,'probe hits decreased')
+    superset=copy.deepcopy(baseline_probe);superset['executions']['core/target/jacoco.exec']['classes'][0]['covered_probes']=[0,1,2]
+    save('probe-after.json',superset);run(probe_compare)
+    # New unused/plugin cache entries remain visible, never an unproven complete D.
+    post_growth=input_snapshot|dict(phase='post-test-before-pack',dependency_repository_files={'org/apache/maven/surefire/surefire-junit-platform/3.5.2/surefire-junit-platform-3.5.2.jar':'f'*64})
+    save('coverage-post.json',post_growth)
+    run(['coverage','--root',str(coverage_root),'--binding',str(binding),'--inputs',str(input_file),'--test-inputs',str(post_file),'--output',str(root/'growth-coverage.json')])
+    growth=json.loads((root/'growth-coverage.json').read_text());assert not growth['complete'] and list(growth['dependency_repository_growth'].values())[0]['classification']=='surefire-provider'
+    # Byte-bound producer facts remove only the cache-growth uncertainty.
+    receipt_spec=importlib.util.spec_from_file_location('growth_receipt',pathlib.Path(os.environ['EVIDENCE_MODULE']).with_name('_ci-receipt.py'))
+    receipt_module=importlib.util.module_from_spec(receipt_spec);receipt_spec.loader.exec_module(receipt_module)
+    repository=root/'model-repository'
+    provider='org/apache/maven/surefire/surefire-junit-platform/3.5.2/surefire-junit-platform-3.5.2'
+    parent='org/apache/maven/surefire/surefire-providers/3.5.2/surefire-providers-3.5.2.pom'
+    put(repository,parent,'<project><groupId>org.apache.maven.surefire</groupId><artifactId>surefire-providers</artifactId><version>3.5.2</version><packaging>pom</packaging></project>')
+    put(repository,provider+'.pom','<project><parent><groupId>org.apache.maven.surefire</groupId><artifactId>surefire-providers</artifactId><version>3.5.2</version></parent><artifactId>surefire-junit-platform</artifactId></project>')
+    provider_jar=repository/(provider+'.jar')
+    with zipfile.ZipFile(provider_jar,'w') as archive:
+        archive.writestr('META-INF/MANIFEST.MF','Implementation-Title: surefire-junit-platform\nImplementation-Version: 3.5.2\n')
+    hashes={name:receipt_module.digest(repository/name) for name in (parent,provider+'.pom',provider+'.jar')}
+    models,producers=receipt_module.dependency_models(repository,hashes)
+    bound_growth=post_growth|dict(dependency_repository_files=hashes,dependency_coordinate_models=models,dependency_producer_facts=producers)
+    save('coverage-post.json',bound_growth)
+    growth_command=['coverage','--root',str(coverage_root),'--binding',str(binding),'--inputs',str(input_file),'--test-inputs',str(post_file),'--output',str(root/'growth-coverage.json')]
+    run(growth_command);verified_growth=json.loads((root/'growth-coverage.json').read_text())
+    assert verified_growth['complete'] and all(fact['coordinate_type_producer_verified'] and not fact['runtime_realm_proven'] and not fact['effective_dependency_model_proven'] for fact in verified_growth['dependency_repository_growth'].values())
+    broken=copy.deepcopy(bound_growth);broken['dependency_coordinate_models'][provider+'.pom']['parent']['sha256']='0'*64
+    save('coverage-post.json',broken);run(growth_command,False,'parent bytes or coordinates differ')
+    broken=copy.deepcopy(bound_growth);broken['dependency_producer_facts'][provider+'.jar']['sha256']='0'*64
+    save('coverage-post.json',broken);run(growth_command,False,'producer model/bytes differ')
+    broken=copy.deepcopy(bound_growth);broken['dependency_producer_facts'][provider+'.jar']['own_class_count']=1
+    save('coverage-post.json',broken);run(growth_command);assert not json.loads((root/'growth-coverage.json').read_text())['complete']
+    broken=copy.deepcopy(bound_growth);broken['dependency_coordinate_models'][provider+'.pom']['packaging']='pom'
+    save('coverage-post.json',broken);run(growth_command,False,'non-JAR model type')
     gate_record = dict(id='ci:build:dispatch',required=True,applicable=True,applicability='workflow_dispatch',contract_sha256='f'*64,scope='always',conclusion='success')
     gates_before=save('gates-before.json',dict(schema=1,gates=[gate_record])); gates_after=save('gates-after.json',dict(schema=1,gates=[gate_record]))
     def gate(success=True,reason=None):run(['gates','--baseline',str(gates_before),'--candidate',str(gates_after),'--output',str(root/'gates-diff.json')],success,reason)

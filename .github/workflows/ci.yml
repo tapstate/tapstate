@@ -92,12 +92,12 @@ jobs:
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
-        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json"
+        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --class-gate-dir "$RUNNER_TEMP/ci-inputs/class-gates"
       - name: Record the observed test identity hashes
         if: always()
         run: |
           if [ -f "$RUNNER_TEMP/resolved-inventory.json" ] && \
-             .github/scripts/ci-evidence.sh reports --root . --lane ci --inventory "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/observations.json"; then
+             .github/scripts/ci-evidence.sh reports --root . --lane ci --inventory "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/observations.json" --class-gates "$RUNNER_TEMP/ci-inputs/class-gates" --inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json"; then
             .github/scripts/ci-evidence.sh export-hashes --input "$RUNNER_TEMP/observations.json" --output "$RUNNER_TEMP/ci-inputs/observed-case-hashes.json"
           else
             mkdir -p "$RUNNER_TEMP/ci-inputs"

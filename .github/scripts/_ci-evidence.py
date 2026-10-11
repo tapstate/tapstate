@@ -538,6 +538,58 @@ def inherited_declarations(root, source, sources, stack=None):
     return own
 
 
+def before_all_contracts(root, source, sources):
+    text, clean = source.read_text(), masked(source.read_text())
+    callbacks = []
+    package = re.search(r'\bpackage\s+([\w.]+)\s*;', clean)
+    classname = (package.group(1) + '.' if package else '') + source.stem
+    for annotation in re.finditer(r'@(?:org\.junit\.jupiter\.api\.)?BeforeAll\b', clean):
+        header = re.search(r'\b(?:void|[\w.]+)\s+(\w+)\s*\(', clean[annotation.end():annotation.end() + 500])
+        if header is None:
+            continue
+        opening = annotation.end() + header.end() - 1
+        parameters_end = close_at(clean, opening)
+        body_start = clean.find('{', parameters_end)
+        require(body_start >= 0, 'BeforeAll source body is missing')
+        body_end = close_at(clean, body_start, '{', '}')
+        body, body_clean = text[body_start + 1:body_end], clean[body_start + 1:body_end]
+        policy = None
+        for gate, predicate, property_name in [('RealConnectorGate', 'nonblank-false', 'tapstate.e2e.connectors-dir'),
+                                               ('UpgradeLaneGate', 'boolean-true-false', 'tapstate.e2e.upgrade-lane')]:
+            call = re.search(r'\b' + gate + r'\s*\.\s*require\s*\(', body_clean)
+            if call is None:
+                continue
+            require(body_clean[:call.start()].count('{') == body_clean[:call.start()].count('}'), 'conditional class gate requires an explicit contract')
+            helper = source.parent / (gate + '.java')
+            require(helper.is_file(), 'class source gate is missing')
+            helper_text = helper.read_text()
+            reason = ('no -Dtapstate.e2e.connectors-dir: skipping a witness that needs real connector jars' if gate == 'RealConnectorGate' else
+                      'no -Dtapstate.e2e.upgrade-lane: skipping a witness that upgrades from a published release')
+            require(reason in helper_text if gate == 'RealConnectorGate' else 'skipping a witness that upgrades from a published release' in helper_text,
+                    'class source gate reason changed')
+            sources[helper.relative_to(root).as_posix()] = digest(helper.read_bytes())
+            if gate == 'RealConnectorGate':
+                naming = source.parent / 'ConnectorJars.java'
+                require(naming.is_file() and 'configured != null && !configured.isBlank()' in naming.read_text(), 'connector naming predicate changed')
+                sources[naming.relative_to(root).as_posix()] = digest(naming.read_bytes())
+            policy = dict(kind=gate, predicate=predicate, input_kind='properties', inputs=[property_name], reason_digest=digest(json.dumps(reason, ensure_ascii=False).encode()))
+            break
+        if policy is None and source.stem == 'PostgresResumeOffsetTest' and 'configured != null || directory != null' in body:
+            policy = dict(kind='postgres-jar-absence', predicate='all-present-false', input_kind='properties',
+                          inputs=['tapstate.pdk.it.postgres-jar', 'tapstate.e2e.connectors-dir'],
+                          reason_digest=digest(json.dumps('Assumption failed: no real PostgreSQL connector jar supplied').encode()))
+        atlas = re.search(r'(?:Assumptions\.)?assumeTrue\(System\.getenv\("(TAPSTATE_ATLAS_(?:TEST|STANDARD)_URI)"\) != null,\s*("[^"\\]+")\)', body)
+        if atlas:
+            if policy:
+                callbacks.append(dict(**{'class': classname}, method=header.group(1), source=source.relative_to(root).as_posix(), source_sha256=digest(source.read_bytes()), body_sha256=digest(body.encode()), policy=policy))
+            policy = dict(kind='atlas-uri-absence', predicate='all-present-false', input_kind='environment', inputs=[atlas.group(1)],
+                          reason_digest=digest(json.dumps('Assumption failed: ' + json.loads(atlas.group(2))).encode()))
+        if policy:
+            callbacks.append(dict(**{'class': classname}, method=header.group(1), source=source.relative_to(root).as_posix(),
+                                  source_sha256=digest(source.read_bytes()), body_sha256=digest(body.encode()), policy=policy))
+    return callbacks
+
+
 def published_policy(root, source, examples, sources, mode):
     synthetic_source = source.parent / 'E2eConnectorJar.java'
     require(synthetic_source.is_file(), 'published synthetic connector identity source is missing')
@@ -592,7 +644,11 @@ def source_parameters(root, source, declaration, sources):
     if 'ParameterizedTest' not in annotations:
         declaration['argument_digests'] = [argument_digest([])]
         return [''], 'method'
+    primary_sources = [name for name in ('ValueSource', 'CsvSource', 'EnumSource', 'MethodSource', 'ArgumentsSource', 'ArgumentsSources', 'CsvFileSource') if name in annotations]
+    require(len(primary_sources) <= 1, 'multiple primary parameter sources require independent composite enumeration')
+    require(not any(name in annotations for name in ('ArgumentsSource', 'ArgumentsSources', 'CsvFileSource')), 'custom parameter source requires independent enumeration')
     values = []
+    declaration['argument_digests'] = []
     if 'ValueSource' in annotations:
         match = re.fullmatch(r'\s*(\w+)\s*=\s*([\s\S]+)', annotations['ValueSource'])
         require(match is not None, 'unsupported ValueSource form')
@@ -634,19 +690,21 @@ def source_parameters(root, source, declaration, sources):
         arguments = static_provider_arguments(root, source, declaration, sources)
         values = arguments
         declaration['argument_digests'] = [argument_digest(with_injected(args, declaration)) for args in arguments]
+    elif any(name in annotations for name in ('NullSource', 'EmptySource', 'NullAndEmptySource')):
+        pass
     else:
         providers = annotations.get('MethodSource', annotations.get('ArgumentsSource', 'unknown'))
         raise ValueError('computed parameter provider requires an independent parameter contract: ' + providers)
-    if 'NullSource' in annotations:
+    if 'NullSource' in annotations or 'NullAndEmptySource' in annotations:
         values.append(['null'])
-        declaration['argument_digests'].append(argument_digest([['null']]))
-    if 'EmptySource' in annotations:
+        declaration['argument_digests'].append(argument_digest(with_injected([['null']], declaration)))
+    if 'EmptySource' in annotations or 'NullAndEmptySource' in annotations:
         require(declaration['parameter_types'] == ['String'], 'non-string EmptySource requires an independent parameter contract')
         values.append(['empty'])
-        declaration['argument_digests'].append(argument_digest([['java.lang.String', '']]))
+        declaration['argument_digests'].append(argument_digest(with_injected([['java.lang.String', '']], declaration)))
     require(values, 'empty parameter source')
     encoded = [json.dumps(value, separators=(',', ':'), ensure_ascii=True) for value in values]
-    require(len(encoded) == len(set(encoded)), 'duplicate stable parameter values require explicit occurrence identities')
+    require(len(encoded) == len(set(encoded)) and len(declaration['argument_digests']) == len(set(declaration['argument_digests'])), 'duplicate stable parameter values require explicit occurrence identities')
     return encoded, 'argument-marker'
 
 
@@ -689,7 +747,7 @@ def inventory(args):
     root = Path(args.root).resolve()
     require(bool(args.source_archive) == bool(args.source_receipt), 'source archive and receipt must be supplied together')
     authenticated_sha = archive_source_sha(root, args.source_archive, args.source_receipt) if args.source_archive else None
-    methods, unresolved, sources = [], [], {}
+    methods, unresolved, sources, class_contracts = [], [], {}, []
     overrides = load(args.parameters) if args.parameters else {}
     used = set()
     for module, bound_it in source_modules(root):
@@ -712,6 +770,7 @@ def inventory(args):
             prefix = package.group(1) + '.' if package else ''
             relative = source.relative_to(root).as_posix()
             sources[relative] = digest(source.read_bytes())
+            class_contracts.extend(dict(lane=args.lane, module=module, kind=kind, **contract) for kind in kinds for contract in before_all_contracts(root, source, sources))
             try:
                 declared = inherited_declarations(root, source, sources)
             except ValueError as error:
@@ -766,7 +825,7 @@ def inventory(args):
     if authenticated_sha:
         origin.update(source_archive_sha256=digest(Path(args.source_archive).read_bytes()), source_receipt_sha256=digest(Path(args.source_receipt).read_bytes()))
     value = dict(schema=SCHEMA, type='source-inventory', lane=args.lane, source_sha=authenticated_sha or checkout_sha, source_origin=origin, original_product_sources=product_sources, sources=sources,
-                 methods=methods, cases=sorted(cases, key=identity), unresolved=unresolved, complete=not unresolved)
+                 methods=methods, class_contracts=class_contracts, cases=sorted(cases, key=identity), unresolved=unresolved, complete=not unresolved)
     output(args.output, value)
     print(json.dumps(dict(methods=len(methods), stable_cases=len(cases), unresolved=len(unresolved), complete=value['complete']), sort_keys=True))
 
@@ -819,6 +878,79 @@ def runtime_pair(encoded, classname, method, skipped, allow_opaque=False):
             finish.get('status') == ('aborted' if skipped else 'executed')):
         return None
     return start
+
+
+def class_gate_records(directory, binding, inputs):
+    require(type(inputs.get('schema')) is int and inputs['schema'] == 1 and inputs.get('phase') == 'pre-test-after-install', 'class gate inputs are not a prepared pre-test snapshot')
+    require(isinstance(binding.get('source_sha'), str) and re.fullmatch(r'[0-9a-f]{40}', binding['source_sha']) and str(binding.get('run_id', '')).isdigit() and str(binding.get('attempt', '')).isdigit(), 'invalid class gate run binding')
+    directory = Path(directory)
+    require(directory.is_dir() and not directory.is_symlink(), 'class gate ledger directory is missing or a symlink')
+    require(binding.get('source_sha') == inputs.get('source_sha') and str(binding.get('run_id')) == str(inputs.get('run_id')) and str(binding.get('attempt')) == str(inputs.get('run_attempt')), 'class gate input origin differs')
+    records = []
+    for path in sorted(directory.glob('*')):
+        require(path.is_file() and not path.is_symlink() and re.fullmatch(r'before-all-\d+\.jsonl', path.name), 'unexpected class gate ledger member')
+        for line in path.read_text().splitlines():
+            value = json.loads(line)
+            require(type(value.get('schema')) is int and value['schema'] == 1 and type(value.get('stable')) is bool and value['stable'], 'incomplete class gate observation')
+            require(value.get('source_sha') == binding['source_sha'] and str(value.get('run_id')) == str(binding['run_id']) and str(value.get('run_attempt')) == str(binding['attempt']), 'old or foreign class gate origin')
+            require(all(isinstance(value.get(field), str) and value[field] for field in ('class', 'method', 'declaring_class', 'unique_id')), 'unnamed class gate observation')
+            require(value.get('phase') in ('start', 'finish'), 'invalid class gate phase')
+            for category in ('properties', 'environment'):
+                flags = value.get('gate_inputs', {}).get(category)
+                require(isinstance(flags, dict) and all(isinstance(entry, dict) and set(entry) == {'present', 'nonblank', 'boolean_true'} and all(type(flag) is bool for flag in entry.values()) for entry in flags.values()), 'invalid class gate predicate flags')
+            require(all((entry['present'] or not entry['nonblank']) and (entry['nonblank'] or not entry['boolean_true']) for category in ('properties', 'environment') for entry in value['gate_inputs'][category].values()), 'contradictory class gate predicate flags')
+            records.append(value)
+    groups = {}
+    for value in records:
+        group = (value['class'], value['declaring_class'], value['method'], value['unique_id'])
+        groups.setdefault(group, []).append(value)
+    paired = []
+    for group, values in groups.items():
+        starts = [value for value in values if value['phase'] == 'start']; finishes = [value for value in values if value['phase'] == 'finish']
+        require(len(starts) == len(finishes) == 1 and len(values) == 2, 'missing or duplicate class gate phase')
+        start, finish = starts[0], finishes[0]
+        require(all(start.get(field) == finish.get(field) for field in ('class', 'method', 'declaring_class', 'unique_id', 'source_sha', 'run_id', 'run_attempt', 'gate_inputs')) and finish.get('status') in ('executed', 'aborted', 'failed'), 'class gate phases differ')
+        paired.append(finish)
+    return paired
+
+
+def class_not_applicable(inv, snapshot_suites, actual_cases, records, inputs):
+    result, unknown = [], []
+    for suite in snapshot_suites:
+        if suite['count']:
+            continue
+        family = [case for case in inv['cases'] if case['module'] == suite['module'] and case['kind'] == suite['kind'] and (case['class'] == suite['class'] or case['class'].startswith(suite['class'] + '$'))]
+        observed = Counter(identity(case) for case in actual_cases if case.get('parameter') is not None)
+        expected = [case for case in family if observed[identity(case)] != 1]
+        if not expected:
+            continue
+        if any(observed[identity(case)] for case in family):
+            unknown.append(dict(**{'class': suite['class']}, reason='zero-case family wrapper still has missing or duplicate source identities'))
+            continue
+        applicable = [contract for contract in inv.get('class_contracts', []) if contract['module'] == suite['module'] and contract['kind'] == suite['kind'] and contract['class'] == suite['class']]
+        accepted = None
+        for contract in applicable:
+            metadata = [record for record in records if record['class'] == contract['class'] and record['method'] == contract['method'] and record['declaring_class'] == contract['class']]
+            require(len(metadata) <= 1, 'duplicate class applicability callback')
+            if not metadata:
+                continue
+            record, policy = metadata[0], contract['policy']
+            if record['status'] != 'aborted' or record.get('reason_digest') != policy['reason_digest']:
+                continue
+            source_path = contract['source']; class_path = contract['module'] + '/target/test-classes/' + contract['class'].replace('.', '/') + '.class'
+            require(inputs.get('source_files', {}).get(source_path) == contract['source_sha256'] and inputs.get('test_files', {}).get(class_path), 'class applicability source/compiled bytecode is not bound')
+            flags = record['gate_inputs'][policy['input_kind']]
+            require(all(name in flags for name in policy['inputs']), 'class gate predicates are missing')
+            attribute = 'present' if policy['predicate'] == 'all-present-false' else 'nonblank' if policy['predicate'] == 'nonblank-false' else 'boolean_true'
+            if all(flags[name][attribute] is False for name in policy['inputs']):
+                accepted = dict(contract_sha256=digest(json.dumps(contract, sort_keys=True).encode()), source_sha256=contract['source_sha256'], compiled_class_sha256=inputs['test_files'][class_path], reason_digest=policy['reason_digest'], gate_inputs=record['gate_inputs'], callback=contract['method'])
+                break
+        if accepted is None:
+            unknown.append(dict(**{'class': suite['class']}, reason='zero-case class requires verified original source gate and current callback evidence'))
+        else:
+            for case in expected:
+                result.append(dict(**case, reported=None, status='not_applicable', skip=dict(type='source-before-all-gate', reason=accepted['reason_digest'], raw={}), evidence=accepted, report=suite['path'], report_sha256=None))
+    return result, unknown
 
 
 def reports(args):
@@ -930,15 +1062,60 @@ def reports(args):
         require(not path.is_symlink(), 'symlink witness ledger')
         ledgers.extend(path.read_text().splitlines())
         files[path.relative_to(root).as_posix()] = digest(path.read_bytes())
+    source_not_applicable = []
+    class_records = []
+    run_binding, inputs_sha256, class_files = None, None, {}
+    if args.class_gates:
+        require(args.inputs, 'class gate ledgers require prepared run/source/test bytecode inputs')
+        inputs = load(args.inputs)
+        run_binding = load(args.binding) if args.binding else dict(source_sha=inputs.get('source_sha'), run_id=inputs.get('run_id'), attempt=inputs.get('run_attempt'))
+        require((inv.get('provider_probe', {}).get('actual_source_sha') or inv.get('source_sha')) == inputs.get('source_sha'), 'class gate source inventory origin differs from prepared input source')
+        observer_source = 'test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java'
+        observer_class = 'test-support/target/test-classes/io/tapstate/testsupport/CiCaseEvidence.class'
+        require(inputs.get('source_files', {}).get(observer_source) and inputs.get('test_files', {}).get(observer_class), 'class gate observer source/compiled bytes are not prepared')
+        inputs_sha256 = digest(Path(args.inputs).read_bytes())
+        class_records = class_gate_records(args.class_gates, run_binding, inputs)
+        class_files = {path.name: digest(path.read_bytes()) for path in sorted(Path(args.class_gates).glob('*'))}
+        source_not_applicable, class_unknown = class_not_applicable(inv, suites, cases, class_records, inputs)
+        unknown.extend(class_unknown)
+    else:
+        _, class_unknown = class_not_applicable(inv, suites, cases, [], {})
+        unknown.extend(class_unknown)
     value = dict(schema=SCHEMA, type='test-observation', lane=args.lane, source_inventory_sha256=digest(Path(args.inventory).read_bytes()),
-                 cases=cases, suites=suites, ledger=ledgers, files=files, unresolved=unknown, complete=inv['complete'] and not unknown)
+                 cases=cases, suites=suites, class_gate_records=class_records, class_gate_files=class_files, input_binding=run_binding, inputs_sha256=inputs_sha256, source_not_applicable=source_not_applicable, source_not_applicable_count=len(source_not_applicable), actual_xml_case_count=len(cases), ledger=ledgers, files=files, unresolved=unknown, complete=inv['complete'] and not unknown)
     output(args.output, value)
-    print(json.dumps(dict(cases=len(cases), unresolved=len(unknown), complete=value['complete']), sort_keys=True))
+    print(json.dumps(dict(cases=len(cases), source_not_applicable=len(source_not_applicable), unresolved=len(unknown), complete=value['complete']), sort_keys=True))
 
 
 def counter_difference(expected, actual):
     return dict(missing=[(list(k) if isinstance(k, tuple) else [k]) + [v] for k, v in sorted((expected - actual).items())],
                 extra=[(list(k) if isinstance(k, tuple) else [k]) + [v] for k, v in sorted((actual - expected).items())])
+
+
+def validate_not_applicable(snapshot, inventory):
+    contracts = {digest(json.dumps(contract, sort_keys=True).encode()): contract for contract in inventory.get('class_contracts', [])}
+    failures = []
+    for case in snapshot.get('source_not_applicable', []):
+        proof = case.get('evidence', {})
+        contract = contracts.get(proof.get('contract_sha256'))
+        if not contract or case.get('status') != 'not_applicable' or case.get('class', '').split('$', 1)[0] != contract['class']:
+            failures.append('class not-applicable identity/source contract differs')
+            continue
+        policy = contract['policy']
+        if (proof.get('source_sha256') != contract['source_sha256'] or proof.get('reason_digest') != policy['reason_digest'] or
+                proof.get('callback') != contract['method'] or not re.fullmatch(r'[0-9a-f]{64}', proof.get('compiled_class_sha256', ''))):
+            failures.append('class not-applicable source/bytecode/reason binding differs')
+            continue
+        attribute = {'all-present-false': 'present', 'nonblank-false': 'nonblank', 'boolean-true-false': 'boolean_true'}.get(policy['predicate'])
+        flags = proof.get('gate_inputs', {}).get(policy['input_kind'], {})
+        if attribute is None or not all(type(flags.get(name, {}).get(attribute)) is bool and flags[name][attribute] is False for name in policy['inputs']):
+            failures.append('class not-applicable source predicate is not proved')
+        records = [record for record in snapshot.get('class_gate_records', []) if record.get('class') == contract['class'] and record.get('method') == contract['method'] and record.get('declaring_class') == contract['class']]
+        if len(records) != 1 or records[0].get('status') != 'aborted' or records[0].get('reason_digest') != policy['reason_digest'] or records[0].get('gate_inputs') != proof.get('gate_inputs'):
+            failures.append('class not-applicable actual callback evidence differs')
+        if not snapshot.get('inputs_sha256') or not snapshot.get('input_binding') or not snapshot.get('class_gate_files'):
+            failures.append('class not-applicable prepared input/ledger binding is missing')
+    return failures
 
 
 def compare_tests(args):
@@ -952,6 +1129,19 @@ def compare_tests(args):
     original_policies = {method_key(method): method['published_policy'] for method in inv['methods'] if method.get('published_policy')}
     candidate_policies = {method_key(method): method['published_policy'] for method in candidate['methods'] if method.get('published_policy')}
     failures = []
+    original_contracts = {(contract['module'], contract['kind'], contract['class'], contract['method'], contract['policy']['kind']): contract for contract in inv.get('class_contracts', [])}
+    candidate_contracts = {(contract['module'], contract['kind'], contract['class'], contract['method'], contract['policy']['kind']): contract for contract in candidate.get('class_contracts', [])}
+    if any(candidate_contracts.get(key) != value for key, value in original_contracts.items()):
+        failures.append('original class applicability source contract changed')
+    original_helpers = set()
+    for contract in original_contracts.values():
+        directory = str(Path(contract['source']).parent)
+        if contract['policy']['kind'] == 'RealConnectorGate':
+            original_helpers.update(directory + '/' + filename for filename in ('RealConnectorGate.java', 'ConnectorJars.java'))
+        elif contract['policy']['kind'] == 'UpgradeLaneGate':
+            original_helpers.add(directory + '/UpgradeLaneGate.java')
+    if any(not inv.get('sources', {}).get(path) or candidate.get('sources', {}).get(path) != inv['sources'][path] for path in original_helpers):
+        failures.append('original class gate helper source hash changed or missing')
     for method, policy in original_policies.items():
         other = candidate_policies.get(method)
         if other is None or any(policy.get(field) != other.get(field) for field in ('gate_sha256', 'synthetic_source_sha256', 'published_source_sha256')):
@@ -972,7 +1162,9 @@ def compare_tests(args):
     require(all(v == 1 for v in expected.values()), 'source inventory has duplicate case identities')
     comparisons = {}
     for label, snapshot in [('before', before), ('after', after)]:
-        actual = Counter(identity(c) for c in snapshot['cases'] if c['parameter'] is not None)
+        failures.extend(label + ' ' + failure for failure in validate_not_applicable(snapshot, inv if label == 'before' else candidate))
+        all_states = snapshot['cases'] + snapshot.get('source_not_applicable', [])
+        actual = Counter(identity(c) for c in all_states if c['parameter'] is not None)
         target_cases = expected if label == 'before' else final_expected
         target_inventory = inv if label == 'before' else candidate
         comparisons[label] = counter_difference(target_cases, actual)
@@ -981,7 +1173,7 @@ def compare_tests(args):
         class_counts = Counter((s['module'], s['kind'], s['class']) for s in snapshot['suites'])
         if any(count != 1 and not classname.endswith('.PublishedExamplesIT') for (_, _, classname), count in class_counts.items()):
             failures.append(label + ' contains duplicate report suites')
-        emitted = Counter(method_key(case) for case in snapshot['cases'])
+        emitted = Counter(method_key(case) for case in all_states)
         for record in target_inventory['methods']:
             if not emitted[method_key(record)]:
                 failures.append(label + ' source method executed zero cases: ' + record['class'] + '#' + record['method'])
@@ -1001,8 +1193,8 @@ def compare_tests(args):
             expected_ledger = Counter(published_identity for published_identity, policy in policies.items() if policy['expected_status'] == 'executed')
             if Counter(snapshot['ledger']) != expected_ledger:
                 failures.append(label + ' published ledger multiset differs from source applicable executed specs and tiers')
-    skip_before = {identity(c): skip_identity(c['skip']) for c in before['cases'] if c['parameter'] is not None}
-    skip_after = {identity(c): skip_identity(c['skip']) for c in after['cases'] if c['parameter'] is not None and identity(c) in expected}
+    skip_before = {identity(c): (c['status'], skip_identity(c['skip'])) for c in before['cases'] + before.get('source_not_applicable', []) if c['parameter'] is not None}
+    skip_after = {identity(c): (c['status'], skip_identity(c['skip'])) for c in after['cases'] + after.get('source_not_applicable', []) if c['parameter'] is not None and identity(c) in expected}
     if skip_before != skip_after:
         failures.append('per-case skip status or reason changed')
     value = dict(schema=SCHEMA, type='test-comparison', complete=not failures, failures=failures, differences=comparisons,
@@ -1111,6 +1303,47 @@ def class_access_flags(content):
     return int.from_bytes(content[position:position + 2], 'big')
 
 
+def cached_artifact_facts(name, snapshot):
+    """Verify coordinate/type/parent facts, without guessing a Maven runtime realm."""
+    hashes = snapshot['dependency_repository_files']
+    models = snapshot.get('dependency_coordinate_models', {})
+    producers = snapshot.get('dependency_producer_facts', {})
+    model_path = name if name.endswith('.pom') else name[:-4] + '.pom'
+    seen = set()
+    while model_path:
+        if model_path in seen or len(seen) >= 64:
+            return False
+        seen.add(model_path)
+        model = models.get(model_path, {})
+        if model.get('coordinate_type_verified') is not True:
+            return False
+        require(not Path(model_path).is_absolute() and '..' not in Path(model_path).parts and '\\' not in model_path, 'unsafe cached model path')
+        parts = Path(model_path).parts
+        expected = ['.'.join(parts[:-3]), parts[-3], parts[-2]] if len(parts) >= 4 else []
+        require(model.get('gav') == expected and len(expected) == 3 and parts[-1] == expected[1] + '-' + expected[2] + '.pom', 'cached model coordinates differ from artifact path')
+        require(model.get('sha256') == hashes.get(model_path) and re.fullmatch(r'[0-9a-f]{64}', model.get('sha256', '')), 'cached model bytes differ from dependency snapshot')
+        require(isinstance(model.get('packaging'), str) and re.fullmatch(r'[A-Za-z0-9_.+-]+', model['packaging']), 'cached model type is invalid')
+        parent = model.get('parent')
+        if parent is None:
+            break
+        require(isinstance(parent, dict) and isinstance(parent.get('path'), str), 'invalid cached model parent')
+        parent_model = models.get(parent['path'], {})
+        require(parent.get('gav') == parent_model.get('gav') and parent.get('sha256') == hashes.get(parent['path']), 'cached model parent bytes or coordinates differ')
+        model_path = parent['path']
+    if name.endswith('.jar'):
+        producer = producers.get(name, {})
+        model_path = name[:-4] + '.pom'
+        if producer.get('archive_type_verified') is not True or producer.get('producer_identity_verified') is not True:
+            return False
+        require(models[model_path]['packaging'] == 'jar', 'cached provider JAR has a non-JAR model type')
+        require(producer.get('gav') == models[model_path]['gav'] and producer.get('sha256') == hashes[name] and producer.get('pom_path') == model_path and producer.get('pom_sha256') == hashes.get(model_path), 'cached JAR producer model/bytes differ')
+        require(producer.get('producer_identity_source') in ('embedded-pom-properties', 'embedded-implementation-manifest') and type(producer.get('pom_properties_present')) is bool, 'unsupported cached JAR producer evidence')
+        require(type(producer.get('own_class_count')) is int and producer['own_class_count'] >= 0, 'cached JAR own-class count is missing')
+        if producer['own_class_count']:
+            return False
+    return True
+
+
 def coverage(args):
     root = Path(args.root).resolve()
     binding = load(args.binding)
@@ -1127,6 +1360,8 @@ def coverage(args):
     found_reports = {path.relative_to(root).as_posix() for path in root.rglob('jacoco.xml')}
     require(found_reports == set(required_reports), 'coverage XML path set differs from declared production modules')
     production, test_classes, expected_names, production_modules = {}, {}, {}, {}
+    repository_growth = {}
+    dependency_unknown = []
     observed_sha = current_sha(Path(args.production_root).resolve() if args.production_root else root)
     require(observed_sha is None or observed_sha == binding['source_sha'], 'coverage source SHA differs from production checkout')
     production_root = Path(args.production_root).resolve() if args.production_root else root
@@ -1140,8 +1375,22 @@ def coverage(args):
         if args.test_inputs:
             post = load(args.test_inputs)
             require(type(post.get('schema')) is int and post['schema'] == 1 and post.get('phase') == 'post-test-before-pack' and post.get('source_sha') == binding['source_sha'] and str(post.get('run_id')) == str(binding['run_id']) and str(post.get('run_attempt')) == str(binding['attempt']), 'post-test bytecode input origin differs')
-            for field in ('production_files', 'production_class_ids', 'production_class_access_flags', 'dependency_repository_files', 'resolved_test_classpaths', 'jacoco_version'):
+            for field in ('production_files', 'production_class_ids', 'production_class_access_flags', 'resolved_test_classpaths', 'jacoco_version'):
                 require(post.get(field) == inputs.get(field), 'production/dependency bytes changed during tests: ' + field)
+            before_repository, after_repository = inputs.get('dependency_repository_files'), post.get('dependency_repository_files')
+            require(isinstance(before_repository, dict) and isinstance(after_repository, dict), 'dependency repository snapshot is missing')
+            require(all(after_repository.get(name) == checksum for name, checksum in before_repository.items()), 'existing dependency repository bytes changed or disappeared')
+            for name in sorted(after_repository.keys() - before_repository.keys()):
+                require(not Path(name).is_absolute() and '..' not in Path(name).parts and re.fullmatch(r'[0-9a-f]{64}', after_repository[name]), 'malformed new dependency repository entry')
+                family = ('surefire-provider' if re.fullmatch(r'org/apache/maven/surefire/(?:common-java5|surefire-junit-platform|surefire-providers)/[^/]+/[^/]+\.(?:jar|pom)', name) else
+                          'junit-platform-provider' if re.fullmatch(r'org/junit/platform/junit-platform-(?:commons|engine|launcher)/[^/]+/[^/]+\.(?:jar|pom)', name) else
+                          'opentest4j-provider' if re.fullmatch(r'org/opentest4j/opentest4j/[^/]+/[^/]+\.(?:jar|pom)', name) else 'unclassified')
+                verified = cached_artifact_facts(name, post) if family != 'unclassified' else False
+                repository_growth[name] = dict(sha256=after_repository[name], classification=family,
+                                               coordinate_type_producer_verified=verified,
+                                               effective_dependency_model_proven=False, runtime_realm_proven=False)
+                if not verified:
+                    dependency_unknown.append('new tool/cache dependency needs byte-bound coordinate/type/producer facts: ' + name)
             test_metadata = post
         else:
             test_metadata = inputs
@@ -1210,7 +1459,7 @@ def coverage(args):
             if record['name'] in expected_names:
                 require(record['class_id'] in expected_names[record['name']], 'JaCoCo class ID differs from production: ' + record['name'])
         executions[relative] = dict(sha256=digest(path.read_bytes()), size=path.stat().st_size, **parsed)
-    hits, reports_found, unresolved = [], [], []
+    hits, reports_found, unresolved = [], [], list(dependency_unknown)
     session_keys = {(s['id'], s['start_ms'], s['end_ms']) for data in executions.values() for s in data['sessions']}
     for path in sorted(root.rglob('jacoco.xml')):
         require(not path.is_symlink(), 'symlink coverage report')
@@ -1231,9 +1480,22 @@ def coverage(args):
                         hits.append([report_path, package.get('name'), source.get('name'), int(line.get('nr')),
                                      int(line.get('ci', '0')), int(line.get('cb', '0'))])
     value = dict(schema=SCHEMA, type='coverage-observation', binding=binding, production=production, test_classes=test_classes, executions=executions,
-                 reports=reports_found, covered_lines_branches=hits, unresolved=unresolved, complete=bool(reports_found) and not unresolved)
+                 reports=reports_found, covered_lines_branches=hits, dependency_repository_growth=repository_growth, dependency_growth_accounting='all additions retained; download and verification cost remains inside original steps', unresolved=unresolved, complete=bool(reports_found) and not unresolved)
     output(args.output, value)
     print(json.dumps(dict(exec_files=len(executions), production_classes=len(production), coverage_xml=len(reports_found), complete=value['complete']), sort_keys=True))
+
+
+def production_probe_sets(snapshot):
+    result = {}
+    for execution in snapshot['executions'].values():
+        for record in execution['classes']:
+            matching = [entry for name, entry in snapshot['production'].items() if name.endswith('/' + record['name']) and entry['class_id'] == record['class_id']]
+            if matching:
+                key = record['name'] + ':' + record['class_id']
+                item = result.setdefault(key, dict(probes=record['probes'], covered=set()))
+                require(item['probes'] == record['probes'], 'same production class has inconsistent probe layouts')
+                item['covered'].update(record['covered_probes'])
+    return result
 
 
 def compare_coverage(args):
@@ -1248,7 +1510,18 @@ def compare_coverage(args):
     reduced = [list(k) for k, v in original.items() if k not in candidate or any(b < a for a, b in zip(v, candidate[k]))]
     if reduced:
         failures.append('original covered instructions or branches decreased; repeated controls must explain nondeterminism')
-    output(args.output, dict(schema=SCHEMA, type='coverage-comparison', complete=not failures, failures=failures, reductions=reduced))
+    before_probes, after_probes = production_probe_sets(before), production_probe_sets(after)
+    probe_reductions = {}
+    for name, entry in before_probes.items():
+        candidate_entry = after_probes.get(name)
+        missing = entry['covered'] - (candidate_entry['covered'] if candidate_entry else set())
+        if candidate_entry and candidate_entry['probes'] != entry['probes']:
+            failures.append('production probe layout changed: ' + name)
+        if missing:
+            probe_reductions[name] = sorted(missing)
+    if probe_reductions:
+        failures.append('original production probe hits decreased; repeated controls must explain nondeterminism')
+    output(args.output, dict(schema=SCHEMA, type='coverage-comparison', complete=not failures, failures=failures, reductions=reduced, production_probe_reductions=probe_reductions))
     require(not failures, '; '.join(failures))
 
 
@@ -1466,7 +1739,7 @@ def export_hashes(args):
     require(value.get('schema') == SCHEMA and value.get('type') in ('source-inventory', 'test-observation'), 'unsupported evidence hash export')
     method_index = {method_key(method): method for method in value.get('methods', [])}
     cases = []
-    for record in value['cases']:
+    for record in value['cases'] + value.get('source_not_applicable', []):
         require(record.get('parameter') is not None, 'unresolved case cannot be exported as an expected identity')
         row = {field: record[field] for field in ('lane', 'module', 'kind', 'class', 'method')}
         row.update(case_digest=case_hash(record), parameter_digest=digest(record['parameter'].encode()))
@@ -1490,6 +1763,9 @@ def export_hashes(args):
                 row['execution_contract'] = dict(expected_status='requires-entry-contract', applicable=None)
         if value['type'] == 'test-observation':
             row.update(status=record['status'], skip=(None if record['skip'] is None else dict(type=record['skip']['type'], reason_sha256=digest(record['skip']['reason'].encode()))))
+            if record['status'] == 'not_applicable':
+                row['source_gate_evidence'] = {field: record['evidence'][field] for field in ('contract_sha256', 'source_sha256', 'compiled_class_sha256', 'reason_digest', 'callback')}
+                row['source_gate_evidence']['predicate_flags_sha256'] = digest(json.dumps(record['evidence']['gate_inputs'], sort_keys=True, separators=(',', ':')).encode())
         cases.append(row)
     methods = []
     for method in value.get('methods', []):
@@ -1506,7 +1782,7 @@ def export_hashes(args):
                   source_origin=({field: value['source_origin'][field] for field in ('kind', 'source_sha', 'source_archive_sha256', 'source_receipt_sha256') if field in value['source_origin']} if value.get('source_origin') else None), actual_source_sha=value.get('provider_probe', {}).get('actual_source_sha'),
                   original_source_sha=value.get('provider_probe', {}).get('original_source_sha'),
                   provider_probe_sha256=digest(json.dumps(value.get('provider_probe'), sort_keys=True, separators=(',', ':')).encode()),
-                  ledger_digests=[digest(entry.encode()) for entry in value.get('ledger', [])], methods=methods, cases=cases, case_count=len(cases), unresolved_count=len(value.get('unresolved', [])), ability_proven=False)
+                  input_binding=value.get('input_binding'), inputs_sha256=value.get('inputs_sha256'), class_gate_files=value.get('class_gate_files', {}), actual_xml_case_count=value.get('actual_xml_case_count'), source_not_applicable_count=value.get('source_not_applicable_count'), ledger_digests=[digest(entry.encode()) for entry in value.get('ledger', [])], methods=methods, cases=cases, case_count=len(cases), unresolved_count=len(value.get('unresolved', [])), ability_proven=False)
     output(args.output, public)
 
 
@@ -1542,6 +1818,9 @@ def main():
     rep.add_argument('--root', default='.')
     rep.add_argument('--lane', required=True)
     rep.add_argument('--inventory', required=True)
+    rep.add_argument('--class-gates', help='Explicit task-owned hash-only BeforeAll ledger directory')
+    rep.add_argument('--binding', help='Actual run/attempt/source binding for class gate receipts')
+    rep.add_argument('--inputs', help='Verified prepared source/test bytecode hashes for class applicability')
     rep.add_argument('--output', required=True)
     comp = sub.add_parser('compare')
     comp.add_argument('--inventory', required=True)
