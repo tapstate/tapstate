@@ -20,8 +20,8 @@ import java.util.TreeMap;
  *
  * @param index                 the processor's index within this execution of its vertex, across the cluster
  * @param localIndex            its actual native local index, or null when no matching context was read
- * @param memberUuid            the engine identity of the member running it
- * @param nodeId                that member's stable id, or null when it carries no Tapstate identity
+ * @param memberUuid            the raw member identity reported by the measured processor
+ * @param nodeId                the qualified native node, or the raw metric member's stable id when no context was joined
  * @param backlog               the rows waiting in the queues into it at the last reading, or null when
  *                              nothing has been read
  * @param frontierGaps          how far each chain's bound runs ahead of the position this writer's frontier

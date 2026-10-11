@@ -200,6 +200,175 @@ class ClusterPipelineTopologyServiceTest {
         assertThat(vertex.computedLocal()).isNull();
     }
 
+    private static final String UUID_B_CURRENT = "8b0a1e6e-0000-4000-8000-0000000000bb";
+    private static final String METRIC_EXECUTION = "0000-0000-0000-002b";
+
+    @Test
+    void aCurrentNativeSlotQualifiesACachedMetricIdentityWithoutRewritingTheReading() {
+        var contexts = List.of(scopedContext("serve", 0, "node-a", "boot-a1", UUID_A),
+                scopedContext("serve", 1, "node-b", "boot-b1", UUID_B_CURRENT));
+        var pipeline = projected(scopedRun(contexts, List.of(new LivePipelineVertex("serve", List.of(
+                new LivePipelineProcessor(0, UUID_A, true, 5L, Map.of(), Map.of()),
+                new LivePipelineProcessor(1, UUID_B, true, 9L, Map.of("shop", 12L), Map.of()))))),
+                currentMembers());
+
+        assertThat(pipeline.measuredFrom()).containsExactlyInAnyOrder(UUID_A, UUID_B);
+        assertThat(pipeline.awaitingRebalance()).isEmpty();
+        assertThat(pipeline.vertices().get(0).effective()).isEqualTo(2);
+        assertThat(pipeline.vertices().get(0).processors()).extracting(ClusterProcessorView::memberUuid,
+                ClusterProcessorView::nodeId, ClusterProcessorView::localIndex, ClusterProcessorView::backlog)
+                .containsExactly(tuple(UUID_A, "node-a", 0, 5L), tuple(UUID_B, "node-b", 0, 9L));
+        assertThat(pipeline.vertices().get(0).processors().get(1).context()).isEqualTo(contexts.get(1));
+        assertThat(pipeline.vertices().get(0).processors().get(1).frontierGaps()).containsExactly(Map.entry("shop", 12L));
+    }
+
+    @Test
+    void aMeasuredStandInWithAQualifiedNativeSlotParticipatesWithoutAddingAWorker() {
+        var contexts = List.of(scopedContext("source", 1, "node-b", "boot-b1", UUID_B_CURRENT),
+                scopedContext("source", 0, "node-a", "boot-a1", UUID_A));
+        var pipeline = projected(scopedRun(contexts, List.of(new LivePipelineVertex("source", List.of(
+                new LivePipelineProcessor(1, UUID_B, true), new LivePipelineProcessor(0, UUID_A, false))))),
+                currentMembers());
+
+        assertThat(pipeline.awaitingRebalance()).isEmpty();
+        assertThat(pipeline.vertices().get(0).effective()).isEqualTo(1);
+        assertThat(pipeline.vertices().get(0).processors()).singleElement().satisfies(processor -> {
+            assertThat(processor.memberUuid()).isEqualTo(UUID_B);
+            assertThat(processor.context()).isEqualTo(contexts.get(0));
+        });
+    }
+
+    @Test
+    void nativeContextsWithoutMeasuredSlotsCannotFillInSparseMetrics() {
+        var measuredContext = new io.tapstate.core.lifecycle.ProcessorRuntimeContext("orders", "serve", "42", "43",
+                3, 7, 2, "node-b", "boot-b1", UUID_B_CURRENT, "node-b:5701", 1, 1, 4, 3, 6, 2, MEASURED);
+        var unmeasuredContext = new io.tapstate.core.lifecycle.ProcessorRuntimeContext("orders", "serve", "42", "43",
+                3, 7, 2, "node-a", "boot-a1", UUID_A, "node-a:5701", 0, 0, 0, 3, 6, 2, MEASURED);
+        var pipeline = projected(scopedRun(List.of(unmeasuredContext, measuredContext),
+                List.of(new LivePipelineVertex("serve", List.of(new LivePipelineProcessor(4, UUID_B, true))))), currentMembers());
+
+        assertThat(pipeline.vertices().get(0).effective()).isEqualTo(1);
+        assertThat(pipeline.vertices().get(0).processors()).singleElement().satisfies(processor -> {
+            assertThat(processor.index()).isEqualTo(4);
+            assertThat(processor.localIndex()).isEqualTo(1);
+        });
+        assertThat(pipeline.awaitingRebalance()).containsExactly("node-a");
+    }
+
+    @Test
+    void anAbsentScopeOrAmbiguousSlotCannotAliasAMetricMember() {
+        var context = scopedContext("serve", 1, "node-b", "boot-b1", UUID_B_CURRENT);
+        var vertices = List.of(new LivePipelineVertex("serve", List.of(new LivePipelineProcessor(1, UUID_B, true))));
+        for (LivePipelineRun run : List.of(
+                new LivePipelineRun("orders", METRIC_EXECUTION, MEASURED, Set.of(UUID_B), vertices, List.of(context)),
+                scopedRun(List.of(), vertices), scopedRun(List.of(context, context), vertices),
+                scopedRun(List.of(context), List.of(new LivePipelineVertex("serve", List.of(
+                        new LivePipelineProcessor(1, UUID_B, true), new LivePipelineProcessor(1, UUID_B, true))))))) {
+            assertNoAlias(projected(run, currentMembers()));
+        }
+    }
+
+    @Test
+    void foreignOrOlderExecutionFactsCannotQualifyACachedMetricIdentity() {
+        var baseline = scopedContext("serve", 1, "node-b", "boot-b1", UUID_B_CURRENT);
+        var vertices = List.of(new LivePipelineVertex("serve", List.of(new LivePipelineProcessor(1, UUID_B, true))));
+        for (var foreign : List.of(
+                changedScope(baseline, "other", "42", "43", 3, 7, 2),
+                changedScope(baseline, "orders", "41", "43", 3, 7, 2),
+                changedScope(baseline, "orders", "42", "41", 3, 7, 2),
+                changedScope(baseline, "orders", "42", "43", 2, 7, 2),
+                changedScope(baseline, "orders", "42", "43", 3, 6, 2),
+                changedScope(baseline, "orders", "42", "43", 3, 7, 1))) {
+            assertNoAlias(projected(scopedRun(List.of(foreign), vertices), currentMembers()));
+        }
+        assertNoAlias(projected(scopedRun(List.of(baseline, changedScope(baseline, "orders", "42", "41", 3, 7, 2)),
+                vertices), currentMembers()));
+    }
+
+    @Test
+    void aNewBootOrUnjoinedMemberCannotBorrowTheOldExecutionSlot() {
+        var run = scopedRun(List.of(scopedContext("serve", 1, "node-b", "boot-b1", UUID_B_CURRENT)),
+                List.of(new LivePipelineVertex("serve", List.of(new LivePipelineProcessor(1, UUID_B, true)))));
+        assertNoAlias(projected(run, List.of(currentMember("node-a", "boot-a1", UUID_A, true),
+                currentMember("node-b", "boot-b2", UUID_B_CURRENT, true))));
+        assertNoAlias(projected(run, List.of(currentMember("node-a", "boot-a1", UUID_A, true),
+                currentMember("node-b", "boot-b1", UUID_B_CURRENT, false))));
+        var rawBelongsToAnotherCurrentMember = scopedRun(run.processorContexts(), List.of(new LivePipelineVertex("serve",
+                List.of(new LivePipelineProcessor(1, UUID_A, true)))));
+        assertThat(projected(rawBelongsToAnotherCurrentMember, currentMembers()).vertices().get(0)
+                .processors().get(0).context()).isNull();
+    }
+
+    @Test
+    void aCurrentUnregisteredMetricPeerCannotAliasAQualifiedNativeNode() {
+        String unknownUuid = "8b0a1e6e-0000-4000-8000-0000000000ff";
+        var run = scopedRun(List.of(scopedContext("serve", 1, "node-b", "boot-b1", UUID_B_CURRENT)),
+                List.of(new LivePipelineVertex("serve", List.of(new LivePipelineProcessor(1, unknownUuid, true)))));
+        var members = new java.util.ArrayList<>(currentMembers());
+        members.add(new ClusterMemberView(null, unknownUuid, "foreign-boot", "foreign:5701", null,
+                ClusterMemberState.INCOMPATIBLE));
+        var processor = projected(run, members).vertices().get(0).processors().get(0);
+        assertThat(processor.memberUuid()).isEqualTo(unknownUuid);
+        assertThat(processor.context()).isNull();
+        assertThat(processor.nodeId()).isNull();
+        assertThat(processor.localIndex()).isNull();
+    }
+
+    private ClusterPipelineView projected(LivePipelineRun run, List<ClusterMemberView> members) {
+        var key = new WorkloadClaimKey(CLUSTER, WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var profile = new io.tapstate.spi.store.ClusterExecutionProfile(CLUSTER, 2,
+                new io.tapstate.spi.store.ExecutionProfile(1, Map.of("runtime", "actual")));
+        var claim = new WorkloadClaim(key, new WorkloadOwner("node-b", "boot-b1"), 4, 7, 9, MEASURED.plusSeconds(8),
+                7, 3, Set.of("node-a", "node-b"), 0, false, 2, profile, 8L, "inc", "rev",
+                Map.of("node-a", new io.tapstate.spi.store.ClusterExecutionMember("node-a", "boot-a1", UUID_A),
+                        "node-b", new io.tapstate.spi.store.ClusterExecutionMember("node-b", "boot-b1", UUID_B_CURRENT)));
+        claims.byKey.put(key, new WorkloadClaimReading(claim, Duration.ofSeconds(8)));
+        return new ClusterPipelineTopologyService(() -> List.of(run), PipelineCaptures.none(), claims,
+                desired("orders"), CLUSTER).pipelines(members).get(0);
+    }
+
+    private static void assertNoAlias(ClusterPipelineView pipeline) {
+        assertThat(pipeline.vertices().get(0).processors()).allSatisfy(processor -> {
+            assertThat(processor.context()).isNull();
+            assertThat(processor.localIndex()).isNull();
+            assertThat(processor.nodeId()).isNull();
+        });
+        assertThat(pipeline.awaitingRebalance()).contains("node-b");
+    }
+
+    private static LivePipelineRun scopedRun(List<io.tapstate.core.lifecycle.ProcessorRuntimeContext> contexts,
+            List<LivePipelineVertex> vertices) {
+        return new LivePipelineRun("orders", METRIC_EXECUTION, MEASURED, Set.of(UUID_A, UUID_B), vertices)
+                .withNativeExecution(new LivePipelineRun.NativeExecution("42", "43", METRIC_EXECUTION, 3, 7, 2), contexts);
+    }
+
+    private static io.tapstate.core.lifecycle.ProcessorRuntimeContext scopedContext(String vertex, int index,
+            String nodeId, String bootId, String uuid) {
+        return new io.tapstate.core.lifecycle.ProcessorRuntimeContext("orders", vertex, "42", "43", 3, 7, 2,
+                nodeId, bootId, uuid, nodeId + ":5701", nodeId.equals("node-a") ? 0 : 1, 0, index, 1, 2, 2, MEASURED);
+    }
+
+    private static io.tapstate.core.lifecycle.ProcessorRuntimeContext changedScope(
+            io.tapstate.core.lifecycle.ProcessorRuntimeContext context, String pipeline, String job, String runtime,
+            long claim, long execution, long profile) {
+        return new io.tapstate.core.lifecycle.ProcessorRuntimeContext(pipeline, context.vertex(), job, runtime,
+                claim, execution, profile, context.nodeId(), context.bootId(), context.memberUuid(), context.memberAddress(),
+                context.memberIndex(), context.localProcessorIndex(), context.globalProcessorIndex(), context.localParallelism(),
+                context.totalParallelism(), context.memberCount(), context.initializedAt());
+    }
+
+    private static List<ClusterMemberView> currentMembers() {
+        return List.of(currentMember("node-a", "boot-a1", UUID_A, true),
+                currentMember("node-b", "boot-b1", UUID_B_CURRENT, true));
+    }
+
+    private static ClusterMemberView currentMember(String node, String boot, String uuid, boolean joined) {
+        String hash = new io.tapstate.spi.store.ExecutionProfile(1, Map.of("runtime", "actual")).hash();
+        return new ClusterMemberView(node, uuid, boot, node + ":5701", "https://" + node + ".example",
+                ClusterMemberState.ACTIVE, 2L, hash, boot, MEASURED.plusSeconds(8), 8000L, true, joined,
+                MEASURED, true, uuid, node + ":5701");
+    }
+
     /** One working processor of {@code name}, on the second member. */
     private static LivePipelineVertex working(String name) {
         return new LivePipelineVertex(name, List.of(new LivePipelineProcessor(0, UUID_B, true)));

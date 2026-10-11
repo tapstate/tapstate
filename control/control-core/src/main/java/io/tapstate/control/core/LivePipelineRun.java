@@ -31,7 +31,8 @@ public record LivePipelineRun(
         Instant measuredAt,
         Set<String> measuredFrom,
         List<LivePipelineVertex> vertices,
-        List<ProcessorRuntimeContext> processorContexts) {
+        List<ProcessorRuntimeContext> processorContexts,
+        NativeExecution nativeExecution) {
 
     public LivePipelineRun {
         pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
@@ -41,11 +42,42 @@ public record LivePipelineRun(
     }
 
     public LivePipelineRun(String pipelineId, String executionId, Instant measuredAt, Set<String> measuredFrom,
+            List<LivePipelineVertex> vertices, List<ProcessorRuntimeContext> processorContexts) {
+        this(pipelineId, executionId, measuredAt, measuredFrom, vertices, processorContexts, null);
+    }
+
+    public LivePipelineRun(String pipelineId, String executionId, Instant measuredAt, Set<String> measuredFrom,
             List<LivePipelineVertex> vertices) {
         this(pipelineId, executionId, measuredAt, measuredFrom, vertices, List.of());
     }
 
     public LivePipelineRun withProcessorContexts(List<ProcessorRuntimeContext> contexts) {
-        return new LivePipelineRun(pipelineId, executionId, measuredAt, measuredFrom, vertices, contexts);
+        return new LivePipelineRun(pipelineId, executionId, measuredAt, measuredFrom, vertices, contexts, nativeExecution);
+    }
+
+    /** Native facts qualified against the actual job, configuration, and measured execution. */
+    public LivePipelineRun withNativeExecution(NativeExecution scope, List<ProcessorRuntimeContext> contexts) {
+        return new LivePipelineRun(pipelineId, executionId, measuredAt, measuredFrom, vertices, contexts, scope);
+    }
+
+    /** Internal read-port scope; raw metric identities remain separate from initialized native identities. */
+    public record NativeExecution(String jobId, String runtimeExecutionId, String measuredExecutionId,
+            long claimGeneration, long executionGeneration, long profileGeneration) {
+        public NativeExecution {
+            Objects.requireNonNull(jobId, "jobId");
+            Objects.requireNonNull(runtimeExecutionId, "runtimeExecutionId");
+            Objects.requireNonNull(measuredExecutionId, "measuredExecutionId");
+            if (jobId.isBlank() || runtimeExecutionId.isBlank() || measuredExecutionId.isBlank()
+                    || claimGeneration < 1 || executionGeneration < 1 || profileGeneration < 1) {
+                throw new IllegalArgumentException("native execution scope is incomplete");
+            }
+        }
+
+        public boolean matches(ProcessorRuntimeContext context) {
+            return jobId.equals(context.jobId()) && runtimeExecutionId.equals(context.runtimeExecutionId())
+                    && claimGeneration == context.claimGeneration()
+                    && executionGeneration == context.executionGeneration()
+                    && profileGeneration == context.profileGeneration();
+        }
     }
 }
