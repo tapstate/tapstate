@@ -2,7 +2,6 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
-import com.mongodb.MongoWriteException;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
@@ -28,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CyclicBarrier;
@@ -258,9 +258,10 @@ class MongoConnectorRegistryIT {
 
             assertThat(failure).isInstanceOf(TapstateException.class);
             assertThat(((TapstateException) failure).code()).isEqualTo(IoError.STORE_UNAVAILABLE);
-            assertThat(failure.getCause()).isInstanceOf(MongoWriteException.class);
-            MongoWriteException driver = (MongoWriteException) failure.getCause();
-            assertThat(driver.getError().getMessage()).contains("injected_other_unique");
+            assertThat(failure.getCause()).isNull();
+            assertThat(((TapstateException) failure).args()).containsExactlyEntriesOf(
+                    Map.of("detail", "MongoWriteException code=11000"));
+            assertThat(failure.toString()).doesNotContain("injected_other_unique");
             assertThat(registry.artifact(retained.registration().contentHash()).orElseThrow())
                     .isEqualTo(jar("retained-bytes"));
             assertThat(registry.list()).containsExactly(retained.registration());

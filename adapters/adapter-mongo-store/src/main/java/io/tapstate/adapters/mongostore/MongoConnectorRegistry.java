@@ -2,6 +2,7 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoWriteException;
+import com.mongodb.MongoException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.MongoCursor;
@@ -23,7 +24,7 @@ import org.bson.Document;
 import org.bson.types.ObjectId;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -167,10 +168,59 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
             if (file == null) {
                 return Optional.empty();
             }
-            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-            artifacts.downloadToStream(file.getObjectId(), bytes);
-            return Optional.of(bytes.toByteArray());
+            ExactArtifactBytes bytes = new ExactArtifactBytes(contentHash, file.getLength());
+            try {
+                artifacts.downloadToStream(file.getObjectId(), bytes);
+            } catch (MongoException failure) {
+                // The driver wraps stream failures; restore only this sink's exact own rejection.
+                if (bytes.writeFailure != null && failure.getCause() == bytes.writeFailure) throw bytes.writeFailure;
+                throw failure;
+            }
+            return Optional.of(bytes.complete());
         });
+    }
+
+    /** One exact allocation avoids both geometric expansion and a second full-size return copy. */
+    private static final class ExactArtifactBytes extends OutputStream {
+        private final String contentHash;
+        private final byte[] bytes;
+        private int position;
+        private RuntimeException writeFailure;
+
+        private ExactArtifactBytes(String contentHash, long length) {
+            // Stay within the conservative Java array bound, including the VM header reserve.
+            if (length < 0 || length > Integer.MAX_VALUE - 8L) throw unreadable(contentHash, "artifact");
+            this.contentHash = contentHash;
+            this.bytes = new byte[(int) length];
+        }
+
+        @Override
+        public void write(int value) {
+            if (position == bytes.length) throw reject(unreadable(contentHash, "artifact"));
+            bytes[position++] = (byte) value;
+        }
+
+        @Override
+        public void write(byte[] source, int offset, int length) {
+            try {
+                Objects.checkFromIndexSize(offset, length, source.length);
+            } catch (RuntimeException failure) {
+                throw reject(failure);
+            }
+            if (length > bytes.length - position) throw reject(unreadable(contentHash, "artifact"));
+            System.arraycopy(source, offset, bytes, position, length);
+            position += length;
+        }
+
+        private RuntimeException reject(RuntimeException failure) {
+            writeFailure = failure;
+            return failure;
+        }
+
+        private byte[] complete() {
+            if (position != bytes.length) throw unreadable(contentHash, "artifact");
+            return bytes;
+        }
     }
 
     /** The identity carried in a stored artifact's GridFS metadata (the content hash is the filename). */
