@@ -70,25 +70,31 @@ public enum ConnectorError implements TapstateErrorCode {
     CLASS_NOT_FOUND("connector.class-not-found", Set.of("connector", "class")),
 
     /**
+     * A connector artifact's archive or spec resource could not be read. {@code artifact} names the
+     * unreadable artifact, since introspection may fail before its connector id is known.
+     */
+    ARTIFACT_UNREADABLE("connector.artifact-unreadable", Set.of(Parameters.ARTIFACT)),
+
+    /**
      * A registered artifact carries no connector entry class — no class it contains is annotated as a
      * connector. {@code artifact} names the artifact that was scanned. Self-scan raises this before a
      * connector id is known, so it is keyed by the artifact rather than by an id.
      */
-    NO_CONNECTOR_CLASS("connector.no-connector-class", Set.of("artifact")),
+    NO_CONNECTOR_CLASS("connector.no-connector-class", Set.of(Parameters.ARTIFACT)),
 
     /**
      * A registered artifact carries more than one unrelated connector entry class, so which connector
      * it registers is ambiguous (variants that subclass a shared base are not: the most-derived wins).
      * {@code artifact} names the artifact; {@code classes} lists the competing entry classes.
      */
-    AMBIGUOUS_CONNECTOR_CLASS("connector.ambiguous-connector-class", Set.of("artifact", "classes")),
+    AMBIGUOUS_CONNECTOR_CLASS("connector.ambiguous-connector-class", Set.of(Parameters.ARTIFACT, "classes")),
 
     /**
      * A connector's {@code @TapConnectorClass} annotation names a spec resource the artifact does not
      * contain. {@code artifact} names the artifact; {@code spec} is the resource path the annotation
      * named.
      */
-    SPEC_NOT_FOUND("connector.spec-not-found", Set.of("artifact", "spec")),
+    SPEC_NOT_FOUND("connector.spec-not-found", Set.of(Parameters.ARTIFACT, "spec")),
 
     /**
      * A connector's spec resource does not yield the connector's identity — it is not valid JSON, or
@@ -96,7 +102,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * refused. {@code artifact} names the artifact; {@code spec} is the spec resource path;
      * {@code detail} says what was wrong with it.
      */
-    SPEC_INVALID("connector.spec-invalid", Set.of("artifact", "spec", "detail")),
+    SPEC_INVALID("connector.spec-invalid", Set.of(Parameters.ARTIFACT, "spec", "detail")),
 
     /**
      * A connection config value cannot be converted to the type the connector's own connection form
@@ -270,6 +276,13 @@ public enum ConnectorError implements TapstateErrorCode {
      * must not leave a pipeline that can neither keep its state nor let go of it.
      */
     RELEASE_FAILED("connector.release-failed", Set.of("connector", "detail", "resources"));
+
+    static final class Parameters {
+        static final String ARTIFACT = "artifact";
+
+        private Parameters() {
+        }
+    }
 
     private final String code;
     private final Set<String> placeholders;

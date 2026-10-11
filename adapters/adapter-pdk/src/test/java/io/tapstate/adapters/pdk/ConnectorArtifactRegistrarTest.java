@@ -119,6 +119,23 @@ class ConnectorArtifactRegistrarTest {
     }
 
     @Test
+    void refusesNonZipArtifactBytesWithACodedConnectorError() {
+        byte[] artifact = "<html><body>Download failed</body></html>".getBytes(UTF_8);
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        ConnectorArtifactRegistrar registrar = registrarOver(registry);
+
+        assertThatThrownBy(() -> registrar.register(artifact, RegistrationSource.REGISTER))
+                .as("an unreadable upload must reach the connector-domain HTTP 400 mapping")
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).startsWith("connector.");
+                    assertThat(error.args()).containsKey("artifact");
+                    assertThat(error.args().get("artifact")).asString()
+                            .contains("tapstate-connector-").endsWith(".jar");
+                });
+        assertThat(registry.list()).isEmpty();
+    }
+
+    @Test
     void refusesADifferentArtifactUnderAnAlreadyRegisteredId(@TempDir Path dir) {
         // Same bytes re-registering is a no-op (idempotent by hash); a DIFFERENT artifact claiming an
         // already-registered id is a conflict — selecting among versions is out of scope, so it is
