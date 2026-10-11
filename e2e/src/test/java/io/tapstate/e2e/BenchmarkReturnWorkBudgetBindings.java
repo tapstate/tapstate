@@ -62,7 +62,8 @@ final class BenchmarkReturnWorkBudgetBindings {
         JSON_WRITER("JsonWriter", "core-common"), JSON_READER("JsonReader", "core-common"), JNI_SOURCE,
         SHARED_SOURCE_WORK("BenchmarkSharedSupportSourceWork"), SHARED_POSTGRES("SharedPostgres"), SHARED_MONGO("SharedMongo"),
         REAL_PROCESS_SERVER("RealProcessServer"), SERVER_HANDLE("ServerHandle"),
-        DOCKER_GATE("DockerGate", "test-support");
+        DOCKER_GATE("DockerGate", "test-support"),
+        RETURN_INTERVAL_COMPARISON("BenchmarkReturnIntervalComparison");
 
         private final String binaryName, sourcePath, module;
         SourceRole(String name) {
