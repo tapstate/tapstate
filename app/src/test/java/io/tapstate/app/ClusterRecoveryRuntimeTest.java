@@ -246,6 +246,66 @@ class ClusterRecoveryRuntimeTest {
         assertNoNativeSubmission();
     }
 
+    @Test void aFreshRecoveryPermitWaitsForCurrentNativeJoinProofBeforeAllocatingItsSuccessor() {
+        List<ClusterNodeReading> oldRegistry = registeredNodes;
+        Map<String, ClusterExecutionMember> nativeAfterMerge = new HashMap<>(ORIGINAL_MEMBERS);
+        ClusterExecutionMember oldMember = ORIGINAL_MEMBERS.get("c");
+        nativeAfterMerge.put("c", new ClusterExecutionMember("c", oldMember.bootId(), "00000000-0000-4000-8000-000000000009"));
+        useLiveMembers(nativeAfterMerge);
+        assertThat(registeredNodes).isSameAs(oldRegistry);
+        WorkloadClaim base = claim(8);
+        WorkloadClaim previous = new WorkloadClaim(base.key(), base.owner(), 2, 8, 7, base.leaseUntil(),
+                8, 1, NODES, 0, false, 2, new ClusterExecutionProfile("cluster", 1, profile.profile()),
+                6L, "inc", "old", ORIGINAL_MEMBERS);
+        RecoveryPermitStart pending = recoveryPermitStart(previous, () -> {
+            Map<String, ClusterExecutionMember> registryMembers = registeredNodes.stream().collect(java.util.stream.Collectors.toMap(
+                    row -> row.registration().nodeSession().key().resourceId(), row -> new ClusterExecutionMember(
+                            row.registration().nodeSession().key().resourceId(), row.registration().nodeSession().owner().bootId(),
+                            row.registration().memberUuid())));
+            WorkloadClaim advanced = allocatedClaim(9, registryMembers);
+            return new WorkloadClaim(advanced.key(), previous.owner(), previous.claimGeneration(), advanced.executionGeneration(),
+                    advanced.topologyRevision(), previous.leaseUntil(), advanced.contextExecutionGeneration(), previous.claimGeneration(),
+                    advanced.executionNodeIds(), 0, false, advanced.profileGeneration(), advanced.executionProfile(),
+                    advanced.executionTopologyRevision(), advanced.executionIncarnation(), advanced.executionRevision(), advanced.executionMembers());
+        });
+        ClusterRecoveryItem unallocated = pending.item().get();
+        assertThat(unallocated.permit()).isNotNull();
+        assertThat(unallocated.permit().transferredExecutionGeneration()).isZero();
+        assertThat(unallocated.attempt()).isZero();
+        assertThat(unallocated.successor()).isNull();
+        assertThat(runtime.prepare("p", pending.planned(), ownership)).isTrue();
+
+        assertThat(runtime.begin("p", pending.planned(), ownership).allowed())
+                .as("the fresh recovery path must not allocate from the former UUID's joined registry")
+                .isFalse();
+
+        assertThat(pending.held().get()).isSameAs(previous);
+        assertThat(pending.item().get()).isSameAs(unallocated);
+        assertThat(pending.held().get().executionGeneration()).isEqualTo(8);
+        assertThat(pending.item().get().attempt()).isZero();
+        assertThat(pending.item().get().permit().transferredExecutionGeneration()).isZero();
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+        assertNoNativeSubmission();
+
+        registeredNodes = nodeReadings(nativeAfterMerge);
+        PipelineActuationOwnership.Execution issued = runtime.begin("p", pending.planned(), ownership);
+
+        assertThat(issued.allowed()).isTrue();
+        assertThat(issued.fence().claimGeneration()).isEqualTo(previous.claimGeneration());
+        assertThat(issued.fence().executionGeneration()).isEqualTo(9);
+        assertThat(pending.held().get().executionMembers()).isEqualTo(nativeAfterMerge);
+        assertThat(pending.item().get().attempt()).isEqualTo(1);
+        assertThat(pending.item().get().permit().transferredExecutionGeneration()).isEqualTo(9);
+        assertThat(pending.item().get().successor().pipelineClaim()).isEqualTo(WorkloadClaimFence.from(pending.held().get()));
+        verify(store.clusterRecovery(), times(1)).advanceExecution(
+                eq(new ClusterRecoveryFence(unallocated.event().key(), unallocated.itemRevision(), unallocated.event().intentFingerprint(),
+                        unallocated.targetProfile(), unallocated.executionFrontier(), unallocated.permit().recoveryClaim())),
+                eq(previous), eq(NODES), eq(Set.of("s")));
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+        assertNoNativeSubmission();
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {
             "missing", "foreign", "unleased", "unjoined", "profile-generation", "profile-hash", "address"})
@@ -947,6 +1007,17 @@ class ClusterRecoveryRuntimeTest {
     }
 
     private PendingStart recoveryPendingStart(WorkloadClaim previous, WorkloadClaim allocated) {
+        RecoveryPermitStart pending = recoveryPermitStart(previous, () -> allocated);
+        assertThat(runtime.prepare("p", pending.planned(), ownership)).isTrue();
+        assertThat(runtime.begin("p", pending.planned(), ownership).fence().executionGeneration()).isEqualTo(9);
+        return new PendingStart(pending.planned(), pending.held());
+    }
+
+    private record RecoveryPermitStart(DagSource.PlannedStart planned,
+            java.util.concurrent.atomic.AtomicReference<WorkloadClaim> held,
+            java.util.concurrent.atomic.AtomicReference<ClusterRecoveryItem> item) {}
+
+    private RecoveryPermitStart recoveryPermitStart(WorkloadClaim previous, java.util.function.Supplier<WorkloadClaim> allocation) {
         var held = new java.util.concurrent.atomic.AtomicReference<>(previous);
         when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
         bindIssuerToCurrentClaim(held);
@@ -961,15 +1032,13 @@ class ClusterRecoveryRuntimeTest {
         var item = new java.util.concurrent.atomic.AtomicReference<>(permitted);
         when(store.clusterRecovery().read(any())).thenAnswer(call -> Optional.of(item.get()));
         when(store.clusterRecovery().advanceExecution(any(), eq(previous), eq(NODES), eq(Set.of("s")))).thenAnswer(call -> {
+            WorkloadClaim allocated = allocation.get();
             ClusterRecoveryItem issued = item.get().advanced(new ClusterRecoverySuccessor(WorkloadClaimFence.from(allocated), profile,
                     NODES, Set.of("s"), NOW, null, null, Map.of(), null), NOW);
             item.set(issued);
             return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, issued, allocated);
         });
-        DagSource.PlannedStart planned = plan(List.of());
-        assertThat(runtime.prepare("p", planned, ownership)).isTrue();
-        assertThat(runtime.begin("p", planned, ownership).fence().executionGeneration()).isEqualTo(9);
-        return new PendingStart(planned, held);
+        return new RecoveryPermitStart(plan(List.of()), held, item);
     }
 
     private void bindIssuerToCurrentClaim(java.util.concurrent.atomic.AtomicReference<WorkloadClaim> held) {
