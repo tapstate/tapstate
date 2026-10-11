@@ -143,11 +143,25 @@ final class BenchmarkReturnWorkBudget {
             if (text.length() > MAX_MATERIAL_LEAF_CHARACTERS) { throw new AssertionError("returned text exceeds its local consumption bound"); }
             materialBytes(totals, Math.multiplyExact(4L, text.length())); return;
         }
+        if (value instanceof org.bson.BsonString text) {
+            material(scope, text.getValue(), depth + 1, totals); return;
+        }
+        if (value instanceof org.bson.BsonBinary binary) {
+            material(scope, binary.getData(), depth + 1, totals); return;
+        }
+        if (value instanceof org.bson.BsonArray array) {
+            material(scope, array.getValues(), depth + 1, totals); return;
+        }
         if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long
                 || value instanceof Float || value instanceof Double || value instanceof Boolean || value instanceof java.time.Instant
                 || value instanceof org.bson.types.ObjectId || value instanceof org.bson.BsonTimestamp
                 || value instanceof org.bson.BsonObjectId || value instanceof org.bson.BsonInt32
                 || value instanceof org.bson.BsonInt64 || value instanceof org.bson.BsonBoolean) {
+            materialBytes(totals, 128); return;
+        }
+        if (value instanceof org.bson.BsonNull || value instanceof org.bson.BsonDouble
+                || value instanceof org.bson.BsonDateTime || value instanceof org.bson.BsonDecimal128
+                || value instanceof org.bson.BsonMinKey || value instanceof org.bson.BsonMaxKey) {
             materialBytes(totals, 128); return;
         }
         if (value instanceof javax.management.Attribute attribute) {

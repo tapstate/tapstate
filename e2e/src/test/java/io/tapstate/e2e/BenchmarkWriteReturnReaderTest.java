@@ -25,6 +25,23 @@ class BenchmarkWriteReturnReaderTest {
     private static final String COST_FLAG = "-Dtapstate.benchmark.write-return-cost-stages=";
     private static final String NATIVE_FLAG = "-Dtapstate.benchmark.native-clock-library=";
 
+    @Test void final_arming_uses_one_existing_connection_call_without_a_clock_or_counter_getter() {
+        var invocations = new AtomicInteger();
+        MBeanServerConnection connection = (MBeanServerConnection) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{MBeanServerConnection.class}, (proxy, method, arguments) -> {
+                    assertThat(method.getName()).isEqualTo("invoke");
+                    assertThat(arguments[1]).isEqualTo("armWorkBudgetFinalReceipt");
+                    assertThat((Object[]) arguments[2]).containsExactly("/private/tmp/controlled-producer-budget.json", "controlled-nonce");
+                    assertThat((String[]) arguments[3]).containsExactly("java.lang.String", "java.lang.String");
+                    invocations.incrementAndGet(); return true;
+                });
+        var reader = new BenchmarkWriteReturnReader(OWNER, connection, () -> true,
+                () -> { throw new AssertionError("arming added an unrelated clock read"); });
+        assertThat(reader.armWorkBudgetFinalReceipt(java.nio.file.Path.of("/private/tmp/controlled-producer-budget.json"), "controlled-nonce"))
+                .isTrue();
+        assertThat(invocations).hasValue(1);
+    }
+
     @Test void clock_roles_account_for_existing_requests_without_adding_points_or_getters() {
         try (var property = new ClockLedgerProperty("true")) {
             var fixture = new ClockFixture(); var reader = fixture.reader();

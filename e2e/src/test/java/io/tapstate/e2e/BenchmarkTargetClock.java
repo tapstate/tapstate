@@ -79,6 +79,14 @@ final class BenchmarkTargetClock {
                     || topology.get("processId") == null || !(hello.get("primary") instanceof String primary)) {
                 throw new AssertionError("actual target primary clock provenance is incomplete");
             }
+            var work = BenchmarkReturnWorkBudget.current();
+            if (work != null) {
+                BenchmarkReturnWorkBudget.requireLocalMaterial(work, BenchmarkReturnWorkBudget.Activity.HELLO_READ, primary);
+                if (!(topology.get("processId") instanceof org.bson.types.ObjectId)) {
+                    throw new AssertionError("target clock process identity has no bounded original ObjectId shape");
+                }
+                BenchmarkReturnWorkBudget.requireLocalMaterial(work, BenchmarkReturnWorkBudget.Activity.HELLO_READ, topology.get("processId"));
+            }
             return new Reading(primary, topology.get("processId").toString(), date.getTime(), began, ended, utcBefore, utcAfter);
     }
 

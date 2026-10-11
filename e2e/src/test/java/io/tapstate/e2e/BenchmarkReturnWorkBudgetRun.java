@@ -1,0 +1,362 @@
+package io.tapstate.e2e;
+
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.EnumMap;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+/** Binds a source profile to registered files before services and to the original child after exit. */
+final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
+    static final String PREFIX = "tapstate.e2e.benchmark.write-return-work-budget-registration.";
+    private static final AtomicReference<BenchmarkReturnWorkBudgetRun> ACTIVE = new AtomicReference<>();
+    private final BenchmarkReturnWorkBudgetProfile.Prepared profile;
+    private final BenchmarkReturnWorkBudget.Definition definition;
+    private final BenchmarkReturnWorkBudget.Scope scope;
+    private final Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths;
+    private final Path output, producerBody;
+    private final String nonce;
+    private final BenchmarkReturnWorkBudgetDefinitions.ProducerInput producerInput;
+    private final BenchmarkWorkloadDefinitions.Workload canonicalWorkload;
+    private BenchmarkReturnWorkBudgetProducerSeal.Registration producerRegistration;
+    private Map<String, Object> producerEvidence = Map.of("state", "NOT_BOUND");
+    private final java.util.ArrayList<Capture> captures = new java.util.ArrayList<>();
+    private boolean finished;
+    record Capture(long epoch, String window, long calls, long rows) { }
+    private BenchmarkReturnWorkBudgetAdmission.Runtime rootRuntime;
+
+    private BenchmarkReturnWorkBudgetRun(BenchmarkReturnWorkBudgetProfile.Prepared profile,
+            Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths, Path output, Path body, String nonce) {
+        this.profile = profile;
+        definition = profile.requireDefinition();
+        canonicalWorkload = BenchmarkWorkloadDefinitions.steadyPilot(profile.inputs().workload().id());
+        this.paths = Map.copyOf(paths); this.output = output; producerBody = body; this.nonce = nonce;
+        long unlimited = Long.MAX_VALUE;
+        producerInput = new BenchmarkReturnWorkBudgetDefinitions.ProducerInput(profile.inputs().runId(),
+                profile.inputs().inputSha256(), new BenchmarkReturnWorkBudget.Work(unlimited, unlimited, unlimited,
+                unlimited, unlimited, unlimited, unlimited, unlimited),
+                BenchmarkReturnWorkBudget.MAX_CONNECTOR_INPUT_BYTES, 128, 2093056);
+        scope = BenchmarkReturnWorkBudget.activate(definition, profile.inputs().runId());
+    }
+
+    static BenchmarkReturnWorkBudgetRun current() { return ACTIVE.get(); }
+
+    static void println(String value) {
+        var run = current();
+        if (run == null) { System.out.println(value); return; }
+        run.requireActive();
+        require(value != null && value.length() <= Math.addExact(run.profile.fieldsRegisteredOutputPlan().encodedUpperBytes(), 4096),
+                "controlled stdout exceeds its prior report and prefix material bound");
+        run.scope.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.bytes(Math.multiplyExact(4L, value.length())));
+        BenchmarkReturnWorkBudget.opaqueRequest(run.scope, BenchmarkReturnWorkBudget.Activity.REPORT_WRITE,
+                () -> { System.out.println(value); return null; });
+    }
+
+    static void printf(String format, Object... values) {
+        var run = current();
+        if (run == null) { System.out.printf(format, values); return; }
+        run.requireActive();
+        require(format != null && format.length() <= 1024 && values != null && values.length <= 32,
+                "controlled formatter exceeds its fixed argument or format bound");
+        run.scope.add(BenchmarkReturnWorkBudget.Activity.BOOKKEEPING,
+                new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 4L * format.length(), 1, values.length, 0));
+        BenchmarkReturnWorkBudget.opaqueRequest(run.scope, BenchmarkReturnWorkBudget.Activity.REPORT_WRITE,
+                () -> { System.out.printf(format, values); return null; });
+    }
+
+    static String json(Object value) {
+        var run = current();
+        if (run == null) { return io.tapstate.core.common.JsonWriter.write(value); }
+        run.requireActive();
+        var plan = run.profile.fieldsRegisteredOutputPlan();
+        var ticket = run.scope.begin(BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, BenchmarkReturnWorkBudget.Work.call());
+        try {
+            var frozen = BenchmarkReturnWorkBudgetDefinitions.freezeOutputTree(value, plan);
+            run.scope.add(BenchmarkReturnWorkBudget.Activity.COPY, new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0,
+                    frozen.work().transientUtf8CopyUpperBytes(), 1, frozen.work().nodes(), 0));
+            run.scope.issued(ticket);
+            String encoded = io.tapstate.core.common.JsonWriter.write(frozen.value());
+            long utf8Upper = Math.multiplyExact(4L, encoded.length());
+            run.scope.complete(ticket, BenchmarkReturnWorkBudget.Work.bytes(utf8Upper), null);
+            return encoded;
+        } catch (RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(ticket, failure); throw failure; }
+    }
+
+    static BenchmarkReturnWorkBudgetRun open(String workload) throws IOException {
+        String requested = System.getProperty(RealBenchmarkForkDriver.WORK_BUDGET_DIAGNOSTICS_PROPERTY);
+        if (requested == null) { return null; }
+        RealBenchmarkForkDriver.workBudgetDiagnostics(requested,
+                "true".equals(System.getProperty(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY)));
+        var files = new java.util.ArrayList<BenchmarkReturnWorkBudgetProfile.FileInput>();
+        var paths = new EnumMap<BenchmarkReturnWorkBudgetProfile.FileRole, Path>(BenchmarkReturnWorkBudgetProfile.FileRole.class);
+        boolean cpu = "true".equals(System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY));
+        for (var role : BenchmarkReturnWorkBudgetProfile.FileRole.values()) {
+            if (role == BenchmarkReturnWorkBudgetProfile.FileRole.ROOT_CPU_PROVIDER_LIBRARY && !cpu) { continue; }
+            String field = PREFIX + "file." + role.name() + ".";
+            Path path = absolute(scalar(field + "path", 4096));
+            long size;
+            try { size = Long.parseLong(scalar(field + "bytes", 20)); }
+            catch (NumberFormatException malformed) { throw new AssertionError("registered file byte scalar is malformed", malformed); }
+            files.add(new BenchmarkReturnWorkBudgetProfile.FileInput(role, scalar(field + "sha256", 64), size));
+            paths.put(role, path);
+        }
+        var conflicts = new java.util.LinkedHashSet<String>();
+        for (String key : List.of("tapstate.e2e.benchmark.load-diagnostics", "tapstate.e2e.benchmark.compilation-diagnostics",
+                "tapstate.e2e.benchmark.thread-point-diagnostics", "tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics",
+                "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
+                "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration", BenchmarkDualGcDiagnostics.ENABLED_PROPERTY,
+                BenchmarkWitnessReadGate.PROPERTY, BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY,
+                BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
+                RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY, RealBenchmarkForkDriver.WRITE_RETURN_COST_STAGES_PROPERTY)) {
+            if (System.getProperty(key) != null) { conflicts.add(key); }
+        }
+        var flags = new BenchmarkReturnWorkBudgetProfile.Flags(System.getProperty("tapstate.e2e.benchmark-smoke.arm", "A"),
+                System.getProperty("tapstate.e2e.benchmark-smoke.capture-mode", "PLAIN"),
+                RealBenchmarkForkDriver.writeReturnClockMode(System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
+                        Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY),
+                        Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")).name(),
+                System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY),
+                Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"),
+                System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY) != null,
+                Boolean.getBoolean(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY),
+                System.getProperty("tapstate.e2e.benchmark-smoke.fork-output") != null, cpu, conflicts);
+        var inputs = new BenchmarkReturnWorkBudgetProfile.Inputs(scalar(PREFIX + "runId", 128),
+                scalar(PREFIX + "inputSha256", 64), BenchmarkReturnWorkBudgetProfile.WorkloadInput.original(workload), files, flags);
+        return open(BenchmarkReturnWorkBudgetProfile.inspect(inputs), paths,
+                absolute(scalar("tapstate.e2e.benchmark-smoke.fork-output", 4096)),
+                absolute(scalar(PREFIX + "producerBody", 4096)), scalar(PREFIX + "nonce", 64));
+    }
+
+    static BenchmarkReturnWorkBudgetRun open(BenchmarkReturnWorkBudgetProfile.Prepared profile,
+            Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths, Path output, Path body, String nonce) throws IOException {
+        require(profile != null && paths != null && paths.keySet().equals(profile.inputs().files().stream()
+                .map(BenchmarkReturnWorkBudgetProfile.FileInput::role).collect(java.util.stream.Collectors.toSet())),
+                "registered file path roster differs");
+        require(profile.equals(BenchmarkReturnWorkBudgetProfile.inspect(profile.inputs())),
+                "supplied profile differs from its source factory");
+        require(output != null && body != null && !output.equals(body) && !Path.of(body + ".seal").equals(output),
+                "registered output and seal paths overlap");
+        absolute(output.toString()); absolute(body.toString());
+        require(nonce != null && !nonce.isEmpty() && nonce.length() <= 64
+                && nonce.chars().allMatch(c -> c >= 32 && c <= 126), "registered nonce differs");
+        require(ACTIVE.get() == null, "another source profile is active");
+        var run = new BenchmarkReturnWorkBudgetRun(profile, paths, output, body, nonce);
+        if (!ACTIVE.compareAndSet(null, run)) { run.scope.close(); throw new AssertionError("another source profile is active"); }
+        try {
+            run.bindFiles();
+            return run;
+        } catch (IOException | RuntimeException | Error failure) {
+            run.scope.failed(failure); run.close(); throw failure;
+        }
+    }
+
+    private void bindFiles() throws IOException {
+        long start = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ,
+                () -> ManagementFactory.getRuntimeMXBean().getStartTime());
+        long pid = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO,
+                () -> ProcessHandle.current().pid());
+        scope.bindRoot(pid, start);
+        rootRuntime = new BenchmarkReturnWorkBudgetAdmission.Runtime(profile.inputs().runId(), pid, start);
+        for (var file : profile.inputs().files()) {
+            String hash = fingerprint(paths.get(file.role()), file.bytes());
+            require(hash.equals(file.sha256()), "actual registered file digest differs: " + file.role());
+        }
+        for (Path target : List.of(output, producerBody, Path.of(producerBody + ".seal"))) {
+            Path parent = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                    () -> target.getParent().toRealPath());
+            require(target.getParent().equals(parent), "output parent is not canonical");
+            require(!BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                    () -> Files.exists(target, LinkOption.NOFOLLOW_LINKS)), "registered output already exists");
+        }
+        require(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).equals(
+                absolute(scalar("tapstate.e2e.benchmark-smoke.jar", 4096))), "actual application path differs");
+        require(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.NATIVE_LIBRARY).equals(
+                absolute(scalar(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY, 4096))), "actual native library path differs");
+    }
+
+    private String fingerprint(Path path, long priorBytes) throws IOException {
+        require(path.equals(absolute(path.toString())), "registered input path is not normalized");
+        require(BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                () -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)), "registered input is not a regular owned file");
+        MessageDigest digest;
+        try { digest = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                () -> MessageDigest.getInstance("SHA-256")); }
+        catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        var input = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                () -> FileChannel.open(path, StandardOpenOption.READ));
+        Throwable primary = null;
+        try {
+            var buffer = ByteBuffer.allocate(8192);
+            long count = 0;
+            while (true) {
+                buffer.clear(); buffer.limit((int) Math.min(buffer.capacity(), Math.addExact(priorBytes - count, 1)));
+                int read = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        () -> input.read(buffer));
+                if (read < 0) { break; }
+                require(read > 0, "registered file read made no progress");
+                count = Math.addExact(count, read); require(count <= priorBytes, "registered input exceeds its prior byte scalar");
+                buffer.flip();
+                BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        () -> { digest.update(buffer); return null; });
+                scope.add(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                        new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, read, 1, read, 0));
+            }
+            require(count == priorBytes, "registered input byte length differs");
+            byte[] hash = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT, digest::digest);
+            return HexFormat.of().formatHex(hash);
+        } catch (IOException | RuntimeException | Error failure) { primary = failure; throw failure; }
+        finally {
+            try { BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                    () -> { input.close(); return null; }); }
+            catch (IOException | RuntimeException | Error failure) {
+                if (primary == null) { throw failure; }
+                if (failure != primary) { primary.addSuppressed(failure); }
+            }
+        }
+    }
+
+    BenchmarkReturnWorkBudgetDefinitions.ProducerInput producerInput() { return producerInput; }
+
+    void requireActive() {
+        require(ACTIVE.get() == this && BenchmarkReturnWorkBudget.current() == scope && !finished,
+                "trusted source profile is not active");
+    }
+
+    void requireDriver(BenchmarkWorkloadDefinitions.Workload workload, PipelineBenchmarkComparison.Arm arm,
+                       int fork, Path application) {
+        requireActive();
+        require(workload != null && arm != null && application != null
+                        && workload.equals(canonicalWorkload)
+                        && arm.name().equals(profile.inputs().flags().arm())
+                        && application.equals(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR))
+                        && fork == Integer.parseInt(System.getProperty("tapstate.e2e.benchmark-smoke.fork", "1")),
+                "actual driver workload, arm, fork or application differs from its registered source profile");
+    }
+
+    void registerProducer(BenchmarkWriteReturnReader reader, Map<String, Object> registration) {
+        requireActive();
+        require(registration != null && "RECORDED_ENABLED".equals(registration.get("state"))
+                && registration.get("pid") instanceof Long && registration.get("jvmStartTimeMillis") instanceof Long,
+                "existing owned producer registration is incomplete");
+        var identity = new BenchmarkCausalClock.Identity((Long) registration.get("pid"), (Long) registration.get("jvmStartTimeMillis"));
+        if (producerRegistration != null) {
+            require(producerRegistration.runtime().equals(identity), "producer identity changed between phases");
+            return;
+        }
+        String appHash = profile.inputs().files().stream().filter(file -> file.role() == BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR)
+                .findFirst().orElseThrow().sha256();
+        producerRegistration = new BenchmarkReturnWorkBudgetProducerSeal.Registration(profile.inputs().runId(), identity,
+                profile.inputs().inputSha256(), nonce, appHash);
+        require(reader.armWorkBudgetFinalReceipt(producerBody, nonce), "owned producer refused its once-only final receipt");
+    }
+
+    void afterExit(BenchmarkOwnedProcessReceipt actual) throws IOException {
+        requireActive(); require(producerRegistration != null, "producer final receipt was never armed");
+        var bound = BenchmarkReturnWorkBudgetProducerSeal.verifyAfterExit(producerBody, producerRegistration, actual);
+        var arithmetic = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(bound.body());
+        reconcileCaptures(bound.body(), captures);
+        var facts = new LinkedHashMap<String, Object>();
+        facts.put("state", "POST_EXIT_BYTES_AND_SOURCE_ARITHMETIC_BOUND"); facts.put("body", bound.body());
+        facts.put("bodySha256", bound.bodySha256()); facts.put("companionSha256", bound.companionSha256());
+        facts.put("allocation", arithmetic); facts.put("captureCountPairing", "MATCHED_ORIGINAL_FULL_WIRE_RECEIPTS");
+        facts.put("runtimeCoverageQualified", false);
+        facts.put("structuralWorkBudgetQualified", false); facts.put("wholeMethodCostQualified", false);
+        producerEvidence = Map.copyOf(facts);
+    }
+
+    void captured(BenchmarkWriteReturnCapture.Result result, Map<String, Object> retained) {
+        requireActive(); require(result != null && result.summary() != null && retained != null
+                && retained.get("epoch") instanceof Long && captures.size() < 16, "original capture evidence is missing or over its cap");
+        long rows = 0;
+        for (var call : result.calls()) { rows = Math.addExact(rows, call.totalRows()); }
+        require(rows == result.summary().reportedRecords() && result.calls().size() == result.summary().completedCalls(),
+                "original wire capture rows or calls differ");
+        captures.add(new Capture((Long) retained.get("epoch"), result.summary().window(), result.calls().size(), rows));
+        scope.add(BenchmarkReturnWorkBudget.Activity.ASSOCIATION,
+                new BenchmarkReturnWorkBudget.Work(1, 0, result.calls().size(), 0, 0, 1, result.calls().size(), 0));
+    }
+
+    static void reconcileCaptures(Map<String, Object> body, List<Capture> captures) {
+        require(body != null && captures != null && !captures.isEmpty() && captures.size() <= 16
+                && body.get("epochs") instanceof List<?> epochs && epochs.size() == captures.size(), "producer epoch roster differs");
+        long rows = 0, calls = 0;
+        for (int i = 0; i < captures.size(); i++) {
+            var capture = captures.get(i);
+            require(capture.epoch() > 0 && capture.calls() > 0 && capture.rows() > 0 && capture.window() != null
+                    && capture.window().length() <= 512, "original capture scalar is outside its source bound");
+            require(((List<?>) body.get("epochs")).get(i) instanceof Map<?, ?> epoch
+                    && number(epoch.get("epoch")) == capture.epoch()
+                    && java.util.Base64.getEncoder().encodeToString(capture.window().getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                            .equals(epoch.get("windowBase64")), "producer epoch or window differs from the original wire capture");
+            rows = Math.addExact(rows, capture.rows()); calls = Math.addExact(calls, capture.calls());
+        }
+        require(number(body.get("inputRowsAttempted")) == rows && body.get("activities") instanceof Map<?, ?>,
+                "producer active input rows differ from the complete wire receipts");
+        Map<?, ?> actors = (Map<?, ?>) body.get("activities");
+        require(actorInvocations(actors, "IDENTITY_ROW") == rows && actorInvocations(actors, "ACTIVE_BEGIN") == calls
+                && actorInvocations(actors, "RETURN_OBSERVATION") == calls && actorInvocations(actors, "COMPLETE") == calls,
+                "producer active rows or return calls differ from the complete wire receipts");
+    }
+
+    private static long actorInvocations(Map<?, ?> actors, String actor) {
+        require(actors.get(actor) instanceof Map<?, ?>, "producer activity pairing is missing");
+        return number(((Map<?, ?>) actors.get(actor)).get("invocations"));
+    }
+    private static long number(Object value) {
+        require(value instanceof Long || value instanceof Integer, "producer pairing scalar is malformed");
+        long number = ((Number) value).longValue(); require(number >= 0, "producer pairing scalar is negative"); return number;
+    }
+
+    void writeReport(Path actualPath, Map<String, Object> report) throws Exception {
+        requireActive(); require(output.equals(actualPath), "actual report path differs");
+        var tree = new LinkedHashMap<String, Object>(report);
+        tree.put("returnWorkBudgetProfile", profile.inputRegistrationInfo()); tree.put("returnWorkBudgetProducer", producerEvidence);
+        tree.put("returnWorkBudgetPrefix", scope.snapshot());
+        var plan = profile.fieldsRegisteredOutputPlan();
+        var frozen = BenchmarkReturnWorkBudgetDefinitions.freezeOutputTree(tree, plan);
+        scope.add(BenchmarkReturnWorkBudget.Activity.COPY, new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0,
+                frozen.work().transientUtf8CopyUpperBytes(), 1, frozen.work().nodes(), 0));
+        var prepared = scope.prepareOutput("FULL_FORK_REPORT", new BenchmarkReturnWorkBudget.TreePlan(plan.nodeUpper(),
+                plan.stringUtf8Upper(), plan.encodedUpperBytes(), plan.depthUpper()), frozen.value(), plan.sha256());
+        scope.writeOutput(prepared, bytes -> Files.write(output, bytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE));
+        BenchmarkReturnWorkBudgetAdmission.verifyOutputFile(output, prepared, plan, scope.snapshot());
+    }
+
+    Map<String, Object> finish() {
+        requireActive();
+        Map<String, Object> receipt = scope.finish();
+        BenchmarkReturnWorkBudgetAdmission.verifyCounters(definition, rootRuntime, receipt);
+        finished = true;
+        return receipt;
+    }
+
+    void failed(Throwable failure) { scope.failed(failure); }
+
+    @Override public void close() {
+        scope.close(); ACTIVE.compareAndSet(this, null);
+    }
+
+    private static String scalar(String key, int limit) {
+        String value = System.getProperty(key);
+        require(value != null && !value.isBlank() && value.length() <= limit
+                && value.chars().allMatch(c -> c >= 32 && c <= 126), "registered scalar is missing or exceeds its source cap: " + key);
+        return value;
+    }
+    private static Path absolute(String raw) {
+        Path path = Path.of(raw);
+        require(path.isAbsolute() && path.getFileName() != null && path.equals(path.normalize()), "registered path is not absolute and normalized");
+        return path;
+    }
+    private static void require(boolean value, String reason) { if (!value) { throw new AssertionError("return work run " + reason); } }
+}

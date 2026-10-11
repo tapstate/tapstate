@@ -176,8 +176,9 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
             if (event.getResumeToken() == null || event.getClusterTime() == null) {
                 throw new AssertionError("table marker event has no stream provenance");
             }
-            String resume = event.getResumeToken().toJson();
-            BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, "RESUME_TOKEN_BSON_PRIOR_SHAPE_NOT_BOUND");
+            BenchmarkReturnWorkBudget.requireLocalMaterial(workScope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, event.getResumeToken());
+            String resume = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE,
+                    () -> event.getResumeToken().toJson());
             if (resume.length() > 4096) { throw new AssertionError("table marker resume token exceeded its bound"); }
             provenance.put(marker.id(), Map.of("resumeToken", resume, "clusterTime", event.getClusterTime().toString(),
                     "operation", event.getOperationTypeString(), "operationTimeRecordBytes", bytes,

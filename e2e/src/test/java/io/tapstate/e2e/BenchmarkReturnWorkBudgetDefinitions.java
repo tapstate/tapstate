@@ -44,6 +44,44 @@ final class BenchmarkReturnWorkBudgetDefinitions {
     record CheckedTree(long nodes, long stringUtf8Bytes, long primitiveElements, long transientUtf8CopyUpperBytes) { }
     record FrozenTree(Object value, CheckedTree work) { }
 
+    /** Bound the lexical material before the recursive decoder allocates a nested tree. */
+    static void requireJsonShape(String raw, int byteUpper, int depthUpper, int nodeUpper, int leafUpper) {
+        require(raw != null && raw.length() <= byteUpper, "JSON exceeds its prior character bound");
+        long bytes = 0;
+        int depth = 0, nodes = 0, leaf = 0, scalar = 0;
+        boolean quoted = false, escaped = false, inScalar = false;
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            int utf8Upper = c <= 127 ? 1 : c <= 2047 ? 2
+                    : Character.isHighSurrogate(c) && i + 1 < raw.length() && Character.isLowSurrogate(raw.charAt(i + 1)) ? 4
+                    : Character.isLowSurrogate(c) && i > 0 && Character.isHighSurrogate(raw.charAt(i - 1)) ? 0 : 3;
+            bytes = Math.addExact(bytes, utf8Upper);
+            require(bytes <= byteUpper, "JSON exceeds its prior UTF-8 bound");
+            if (quoted) {
+                if (escaped) { escaped = false; }
+                else if (c == '\\') { escaped = true; }
+                else if (c == '"') { quoted = false; continue; }
+                require(++leaf <= leafUpper, "JSON string exceeds its prior leaf bound");
+                continue;
+            }
+            if (c == '"') {
+                quoted = true; leaf = 0; inScalar = false;
+                require(++nodes <= nodeUpper, "JSON exceeds its prior node bound");
+            } else if (c == '{' || c == '[') {
+                inScalar = false;
+                require(++depth <= depthUpper && ++nodes <= nodeUpper, "JSON exceeds its prior shape bound");
+            } else if (c == '}' || c == ']') {
+                inScalar = false; require(--depth >= 0, "JSON shape is malformed");
+            } else if (c == ',' || c == ':' || Character.isWhitespace(c)) {
+                inScalar = false;
+            } else {
+                if (!inScalar) { require(++nodes <= nodeUpper, "JSON exceeds its prior node bound"); scalar = 0; inScalar = true; }
+                require(++scalar <= 32, "JSON scalar exceeds its prior numeric or literal bound");
+            }
+        }
+        require(!quoted && !escaped && depth == 0, "JSON shape is incomplete");
+    }
+
     record ProducerInput(String runId, String inputSha256, BenchmarkReturnWorkBudget.Work independentlyRegisteredUpper,
                          long connectorHashBytes, int runtimeArguments, long runtimeArgumentBytes) {
         ProducerInput {

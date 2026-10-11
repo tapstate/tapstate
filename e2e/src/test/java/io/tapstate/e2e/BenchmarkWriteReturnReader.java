@@ -99,6 +99,25 @@ final class BenchmarkWriteReturnReader {
         return runtimeRead(expectedEnabled, false, null, null);
     }
 
+    /** Arms the cold final receipt through the existing connection; no clock or counter getter is added. */
+    boolean armWorkBudgetFinalReceipt(java.nio.file.Path body, String nonce) {
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.PRODUCER_TRANSPORT,
+                BenchmarkReturnWorkBudget.Work.call());
+        try {
+            requireAlive();
+            BenchmarkReturnWorkBudget.issued(work);
+            Object accepted = connection.invoke(name, "armWorkBudgetFinalReceipt", new Object[]{body.toString(), nonce},
+                    new String[]{"java.lang.String", "java.lang.String"});
+            BenchmarkReturnWorkBudget.returned(work, accepted);
+            requireAlive();
+            if (!(accepted instanceof Boolean value)) { throw new AssertionError("owned work-budget arming response is malformed"); }
+            return value;
+        } catch (java.io.IOException | javax.management.JMException unavailable) {
+            BenchmarkReturnWorkBudget.failed(work, unavailable);
+            throw new AssertionError("owned work-budget final receipt cannot be armed", unavailable);
+        } catch (RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
+    }
+
     /** Called by capture only after successful stop and complete original page validation. */
     Map<String, Object> costStages(long epoch, String window, long completedCalls) {
         var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.SUMMARY_RPC, BenchmarkReturnWorkBudget.Work.call());

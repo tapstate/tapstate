@@ -37,7 +37,21 @@ class BenchmarkReturnWorkBudgetEntryTest {
             System.setProperty(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY, "true");
             assertThatThrownBy(() -> new RealBenchmarkForkDriver().run(BenchmarkWorkloadDefinitions.steadyPilot("stateless"),
                     PipelineBenchmarkComparison.Arm.B, 1, null)).isInstanceOf(AssertionError.class)
-                    .hasMessageContaining("scope before fixture access");
+                    .hasMessageContaining("trusted source/profile run before fixture access");
+        }
+    }
+
+    @Test void an_arbitrary_complete_ledger_cannot_supply_the_trusted_entry_registration() {
+        try (var properties = new Properties()) {
+            System.setProperty(PROPERTY, "true");
+            System.setProperty(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY, "true");
+            var excluded = java.util.EnumSet.allOf(BenchmarkReturnWorkBudget.Activity.class);
+            var definition = new BenchmarkReturnWorkBudget.Definition("controlled-untrusted", "a".repeat(64), Map.of(), excluded);
+            try (var ledger = BenchmarkReturnWorkBudget.activate(definition, "controlled-untrusted")) {
+                assertThatThrownBy(() -> new RealBenchmarkForkDriver().run(BenchmarkWorkloadDefinitions.steadyPilot("stateless"),
+                        PipelineBenchmarkComparison.Arm.B, 1, null)).isInstanceOf(AssertionError.class)
+                        .hasMessageContaining("trusted source/profile run before fixture access");
+            }
         }
     }
 

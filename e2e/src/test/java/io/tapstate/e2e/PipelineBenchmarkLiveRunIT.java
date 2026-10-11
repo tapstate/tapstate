@@ -420,6 +420,13 @@ class PipelineBenchmarkLiveRunIT {
 
     static Map<String, Object> tableConfirmation(BenchmarkAckOracle.TableConfirmationProof proof) {
         if (proof == null) { return object("state", "NOT_RECORDED"); }
+        var scope = BenchmarkReturnWorkBudget.current();
+        if (scope != null) {
+            BenchmarkReturnWorkBudgetDefinitions.requireJsonShape(proof.confirmedConsumerCanonicalJson(), 65536, 16, 4096, 65536);
+            scope.add(BenchmarkReturnWorkBudget.Activity.RAW_RECHECK,
+                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, proof.confirmedConsumerCanonicalJson().length(),
+                            1, proof.confirmedConsumerCanonicalJson().length(), 0));
+        }
         return object("terminalLogicalId", proof.terminalLogicalId(), "sourceTerminalToken", proof.sourceTerminalToken(),
                 "ring", proof.marker().ring(), "epoch", proof.marker().epoch(), "seq", proof.marker().seq(),
                 "actualMarkerSourceToken", proof.marker().sourceToken(),

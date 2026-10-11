@@ -366,6 +366,9 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             List<GarbageCollectorMXBean> collectors =
                     BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.GC_ROSTER,
                             () -> ManagementFactory.getPlatformMXBeans(connection, GarbageCollectorMXBean.class));
+            if (workScope != null && collectors.size() > BenchmarkReturnWorkBudget.MAX_MATERIAL_NODES) {
+                throw new AssertionError("owned GC roster exceeds its prior observer node bound");
+            }
             BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.GC_ROSTER, BenchmarkReturnWorkBudget.Work.pass(collectors.size()));
             if (collectors.isEmpty()) {
                 return OptionalLong.empty();

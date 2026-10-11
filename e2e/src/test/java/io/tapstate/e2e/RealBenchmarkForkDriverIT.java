@@ -83,6 +83,18 @@ class RealBenchmarkForkDriverIT {
     }
 
     private static void run(String workloadId) throws Exception {
+        try (var work = BenchmarkReturnWorkBudgetRun.open(workloadId)) {
+            try {
+                runRegistered(workloadId, work);
+                if (work != null) { System.out.println("benchmark-return-work-final=" + JsonWriter.write(work.finish())); }
+            } catch (Exception | Error failure) {
+                if (work != null) { work.failed(failure); }
+                throw failure;
+            }
+        }
+    }
+
+    private static void runRegistered(String workloadId, BenchmarkReturnWorkBudgetRun work) throws Exception {
         boolean rootCpuDiagnostics = requireRootCpuRunServices(workloadId, RealBenchmarkForkDriverIT::requireBenchmarkServices);
         boolean nominalReturnDiagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY);
         Path forkOutput = forkOutput();
@@ -218,7 +230,8 @@ class RealBenchmarkForkDriverIT {
             RealBenchmarkForkDriver driver = collectorCalibration != null
                     ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
                             RealProcessServer.start(store, operator, jar, "127.0.0.1", port -> List.of(),
-                                    collectorCalibrationArguments(collectorCalibration, nativeLibrary)), null))
+                                    work == null ? collectorCalibrationArguments(collectorCalibration, nativeLibrary)
+                                            : returnArguments(false, false, nativeLibrary, work.producerInput())), null))
                     : writeReturnDiagnostics && jvmDiagnostics
                     ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::startWithWriteReturns)
                     : writeReturnDiagnostics
@@ -253,7 +266,7 @@ class RealBenchmarkForkDriverIT {
             PipelineBenchmarkHarness.ForkResult result = driver.run(
                     workload, arm,
                     forkNumber, applicationJar);
-            System.out.println("benchmark-source-schedule=" + JsonWriter.write(Map.of(
+            BenchmarkReturnWorkBudgetRun.println("benchmark-source-schedule=" + BenchmarkReturnWorkBudgetRun.json(Map.of(
                     "profile", fullSettlingCalibration ? "FIXED_FULL_CDC_SETTLING_CALIBRATION"
                             : settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
                             : pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE",
@@ -345,7 +358,7 @@ class RealBenchmarkForkDriverIT {
                                 new AssertionError("the actual source batch issue clock is unavailable"))).sum();
                 assertThat(sourceIssueNanos).as("source issue time must be measured independently of target ACK")
                         .isPositive();
-                System.out.printf("benchmark-real-fork acceptanceEvaluated=false id=%s jar=%s throughput=%s"
+                BenchmarkReturnWorkBudgetRun.printf("benchmark-real-fork acceptanceEvaluated=false id=%s jar=%s throughput=%s"
                                 + " sourceIssueRate=%s acked=%s reportedOut=%s"
                                 + " samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
                         evidence.forkId(), evidence.applicationJar(), result.measurement().recordsOutPerSecond(),
@@ -358,9 +371,9 @@ class RealBenchmarkForkDriverIT {
                         evidence.observedTargetCoverage().size(), evidence.checksum());
                 assertThat(evidence.telemetry().isPresent())
                         .isEqualTo(mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN);
-                System.out.println("benchmark-real-telemetry mode=" + mode + " evidence="
-                        + JsonWriter.write(PipelineBenchmarkLiveRunIT.telemetryEvidence(evidence.telemetry())));
-                System.out.println("benchmark-real-table-confirmations=" + JsonWriter.write(Map.of(
+                BenchmarkReturnWorkBudgetRun.println("benchmark-real-telemetry mode=" + mode + " evidence="
+                        + BenchmarkReturnWorkBudgetRun.json(PipelineBenchmarkLiveRunIT.telemetryEvidence(evidence.telemetry())));
+                BenchmarkReturnWorkBudgetRun.println("benchmark-real-table-confirmations=" + BenchmarkReturnWorkBudgetRun.json(Map.of(
                         "receipts", evidence.terminalMetaReceipts(), "sourceProofs", result.correctness().chains().stream()
                                 .map(chain -> PipelineBenchmarkLiveRunIT.tableConfirmation(chain.tableConfirmation())).toList())));
                 evidence.phases().forEach(phase -> {
@@ -368,7 +381,7 @@ class RealBenchmarkForkDriverIT {
                     BenchmarkResourceSampler.SamplingDiagnostics sampling = phase.resources().sampling()
                             .orElseThrow(() -> new AssertionError("a diagnostic phase needs sampling attempts"));
                     assertThat(phase.sourceBatches()).as("the retained source issue batches").isNotEmpty();
-                    System.out.printf("benchmark-real-phase acceptanceEvaluated=false fork=%s phase=%s"
+                    BenchmarkReturnWorkBudgetRun.printf("benchmark-real-phase acceptanceEvaluated=false fork=%s phase=%s"
                                     + " anchorUtc=%s anchorBeforeNanos=%d anchorAfterNanos=%d"
                                     + " firstIssueUtcEarliest=%s firstIssueUtcLatest=%s"
                                     + " firstIssuedAtNanos=%d sourceCompletedAtNanos=%d completedAckAtNanos=%d"
@@ -377,12 +390,12 @@ class RealBenchmarkForkDriverIT {
                             anchor.earliestUtc(phase.firstIssuedAtNanos()), anchor.latestUtc(phase.firstIssuedAtNanos()),
                             phase.firstIssuedAtNanos(), phase.sourceCompletedAtNanos(), phase.completedAckAtNanos(),
                             phase.sourceBatches(), sampling);
-                    System.out.println("benchmark-real-confirmation-timing="
-                            + JsonWriter.write(Map.of("fork", evidence.forkId(), "phase", phase.id(),
+                    BenchmarkReturnWorkBudgetRun.println("benchmark-real-confirmation-timing="
+                            + BenchmarkReturnWorkBudgetRun.json(Map.of("fork", evidence.forkId(), "phase", phase.id(),
                                     "timing", PipelineBenchmarkLiveRunIT.phaseEvidence(phase).get("confirmationTiming"))));
                     if (pilot) {
-                        System.out.println("benchmark-real-pilot-phase="
-                                + JsonWriter.write(Map.of("fork", evidence.forkId(), "rows", workload.rows(),
+                        BenchmarkReturnWorkBudgetRun.println("benchmark-real-pilot-phase="
+                                + BenchmarkReturnWorkBudgetRun.json(Map.of("fork", evidence.forkId(), "rows", workload.rows(),
                                         "phase", PipelineBenchmarkLiveRunIT.phaseEvidence(phase))));
                     }
                 });
@@ -432,10 +445,14 @@ class RealBenchmarkForkDriverIT {
                     output.put("targetWitnessDeferred", true);
                     output.put("localDeliveryLatencyPerformanceEligible", false);
                 }
-                String json = JsonWriter.write(output);
-                Files.writeString(forkOutput, json + "\n", StandardCharsets.UTF_8,
-                        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
-                System.out.println("benchmark-real-fork-output=" + forkOutput);
+                if (work == null) {
+                    String json = BenchmarkReturnWorkBudgetRun.json(output);
+                    Files.writeString(forkOutput, json + "\n", StandardCharsets.UTF_8,
+                            StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+                } else {
+                    work.writeReport(forkOutput, output);
+                }
+                BenchmarkReturnWorkBudgetRun.println("benchmark-real-fork-output=" + forkOutput);
             }
             Map<String, Object> runtime = driver.evidence().getFirst().runtimeEvidence();
             assertThat(runtime.get("status"))
@@ -449,8 +466,10 @@ class RealBenchmarkForkDriverIT {
         boolean nominal = requireNominalReturnAdmission(workload);
         boolean work = RealBenchmarkForkDriver.workBudgetDiagnostics(
                 System.getProperty(RealBenchmarkForkDriver.WORK_BUDGET_DIAGNOSTICS_PROPERTY), nominal);
-        if (work && BenchmarkReturnWorkBudget.current() == null) {
-            throw new AssertionError("return work-budget diagnostics require a registered source/profile scope before service access");
+        if (work) {
+            var run = BenchmarkReturnWorkBudgetRun.current();
+            if (run == null) { throw new AssertionError("return work-budget diagnostics require a trusted source/profile run before service access"); }
+            run.requireActive();
         }
         if (enabled || nominal) { services.run(); }
         return enabled;
