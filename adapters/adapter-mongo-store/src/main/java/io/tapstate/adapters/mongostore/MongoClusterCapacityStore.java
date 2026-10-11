@@ -781,7 +781,10 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
                     live.add(node.getString("ownerNodeId"));
                 }
             }
-            if (committedNodes.isEmpty() || live.size() < committedNodes.size() / 2 + 1) {
+            int requiredMembers = "PROCESS_FAILURE_ONLY".equals(profile.profile().attributes().get("haProfile"))
+                    && "2".equals(profile.profile().attributes().get("bootstrapMinMembers"))
+                    ? 1 : committedNodes.size() / 2 + 1;
+            if (committedNodes.isEmpty() || live.size() < requiredMembers) {
                 return Context.refused(Outcome.WAITING_QUORUM);
             }
             committedRevision = ClusterRecoveryDocuments.number(committed, "revision");

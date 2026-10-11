@@ -893,6 +893,91 @@ class ClusterRecoveryStoreIT {
     }
 
     @Test
+    void anExplicitProcessFailureOnlyProfileRestoresOneSurvivorThroughTheRealIssuer() {
+        Map<String, String> inputs = Map.of("build", "one", "threads", "4",
+                "haProfile", "PROCESS_FAILURE_ONLY", "bootstrapMinMembers", "2");
+        ExecutionProfile proposed = new ExecutionProfile(1, inputs);
+        try (Fixture fixture = new Fixture(Duration.ofMinutes(1), false, Duration.ofMinutes(1),
+                proposed, List.of("a", "b"))) {
+            assertThat(fixture.profile.profile()).isEqualTo(proposed);
+            Document stored = fixture.profileDocuments.find(new Document("_id", "east")).first();
+            assertThat(stored.getString("hash")).isEqualTo(proposed.hash());
+            assertThat(stored.get("attributes", Document.class)).isEqualTo(new Document(inputs));
+            Pipeline pipeline = fixture.retiredPolicyFailure("process-policy");
+            assertThat(fixture.nodeDocuments.countDocuments(new Document("clusterId", "east")
+                    .append("joined", true))).isEqualTo(2);
+            assertThat(fixture.claims.find(MongoClusterProfileStore.liveClaims("east", WorkloadClaimType.NODE_SESSION))
+                    .into(new ArrayList<Document>())).singleElement().satisfies(node -> {
+                        assertThat(node.getString("ownerNodeId")).isEqualTo("a");
+                        assertThat(node.getString("ownerBootId")).isEqualTo("boot-a");
+                        assertThat(node.get("profileGeneration", Number.class).longValue()).isEqualTo(fixture.profile.generation());
+                    });
+            assertThat(fixture.memberDocuments.find(new Document("_id", "east")).first()
+                    .getList("activeNodeIds", String.class)).containsExactly("a", "b");
+            long originalGeneration = pipeline.claim().executionGeneration();
+            assertThat(pipeline.claim().executionMembers().keySet()).containsExactlyInAnyOrder("a", "b");
+            var enqueued = fixture.enqueue(pipeline);
+            assertThat(enqueued.outcome()).as("the explicit process-failure-only profile admits its exact single survivor")
+                    .isEqualTo(ClusterRecoveryMutation.APPLIED);
+            var permit = fixture.permit(enqueued.item(), Map.of("a", demand(1)), LIMITS);
+            assertThat(permit.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(permit.item().attempt()).isZero();
+            assertThat(permit.item().executionFrontier()).isEqualTo(originalGeneration);
+            var advanced = fixture.store.advanceExecution(fixture.fence(permit.item()), pipeline.claim(), Set.of("a"));
+            assertThat(advanced.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(advanced.advancedPipelineClaim().executionGeneration()).isEqualTo(originalGeneration + 1);
+            assertThat(advanced.advancedPipelineClaim().executionMembers()).hasSize(1)
+                    .containsKey("a").doesNotContainKey("b");
+            assertThat(advanced.advancedPipelineClaim().executionMembers().get("a").bootId()).isEqualTo("boot-a");
+            assertThat(advanced.advancedPipelineClaim().executionMembers().get("a").memberUuid()).isEqualTo("uuid-a");
+            assertThat(advanced.item().attempt()).isEqualTo(1);
+            assertThat(advanced.item().executionAliases()).containsExactlyInAnyOrder(originalGeneration, originalGeneration + 1);
+            assertThat(advanced.item().successor().executionNodeIds()).containsExactly("a");
+            var duplicate = fixture.store.advanceExecution(fixture.fence(advanced.item()),
+                    advanced.advancedPipelineClaim(), Set.of("a"));
+            assertThat(duplicate.outcome()).isNotEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                    .isEqualTo(originalGeneration + 1);
+        }
+    }
+
+    @Test
+    void productionMissingUnknownAndInconsistentProfilesKeepTheCommittedMajority() {
+        List<Map<String, String>> policies = List.of(
+                Map.of("haProfile", "PRODUCTION_HA", "bootstrapMinMembers", "3"),
+                Map.of("bootstrapMinMembers", "2"),
+                Map.of("haProfile", "UNKNOWN", "bootstrapMinMembers", "2"),
+                Map.of("haProfile", "PROCESS_FAILURE_ONLY", "bootstrapMinMembers", "3"));
+        for (int index = 0; index < policies.size(); index++) {
+            Map<String, String> inputs = new java.util.TreeMap<>(Map.of("build", "one", "threads", "4"));
+            inputs.putAll(policies.get(index));
+            List<String> members = index == 0 ? List.of("a", "b", "c") : List.of("a", "b");
+            ExecutionProfile proposed = new ExecutionProfile(1, inputs);
+            try (Fixture fixture = new Fixture(Duration.ofMinutes(1), false, Duration.ofMinutes(1), proposed, members)) {
+                assertThat(fixture.profile.profile()).isEqualTo(proposed);
+                Document stored = fixture.profileDocuments.find(new Document("_id", "east")).first();
+                assertThat(stored.getString("hash")).isEqualTo(proposed.hash());
+                assertThat(stored.get("attributes", Document.class)).isEqualTo(new Document(inputs));
+                Pipeline pipeline = fixture.retiredPolicyFailure("closed-policy-" + index);
+                assertThat(fixture.claims.countDocuments(MongoClusterProfileStore.liveClaims("east", WorkloadClaimType.NODE_SESSION)))
+                        .isEqualTo(1);
+                assertThat(fixture.memberDocuments.find(new Document("_id", "east")).first()
+                        .getList("activeNodeIds", String.class)).containsExactlyElementsOf(members);
+                long frontier = pipeline.claim().executionGeneration();
+                long reservations = fixture.occupancy.countDocuments();
+                var refused = fixture.enqueue(pipeline);
+                assertThat(refused.outcome()).as("unqualified single-survivor policy %s", policies.get(index))
+                        .isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+                assertThat(refused.item()).isNull();
+                assertThat(fixture.queue.countDocuments()).isZero();
+                assertThat(fixture.occupancy.countDocuments()).isEqualTo(reservations);
+                assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                        .isEqualTo(frontier);
+            }
+        }
+    }
+
+    @Test
     void belowCommittedMajorityDoesNotGrantAPermitOrSpendAnAttempt() {
         try (Fixture fixture = new Fixture()) {
             ClusterRecoveryItem item = fixture.enqueue(fixture.pipeline("orders", true, List.of(SourceRef.bare("crm")),
@@ -2097,6 +2182,7 @@ class ClusterRecoveryStoreIT {
         private final MongoDesiredStore desired = new MongoDesiredStore(desiredDocuments);
         private final MongoStateStore states = new MongoStateStore(stateDocuments);
         private final WorkloadClaim nodeB;
+        private final List<WorkloadClaim> initialSessions;
         private final ClusterExecutionProfile profile;
         private final WorkloadClaim capture;
         private final long captureEpoch;
@@ -2111,9 +2197,14 @@ class ClusterRecoveryStoreIT {
         }
 
         private Fixture(Duration sessionTtl, boolean releaseThird, Duration thirdSessionTtl) {
-            ExecutionProfile proposed = new ExecutionProfile(1, Map.of("build", "one", "threads", "4"));
+            this(sessionTtl, releaseThird, thirdSessionTtl,
+                    new ExecutionProfile(1, Map.of("build", "one", "threads", "4")), List.of("a", "b", "c"));
+        }
+
+        private Fixture(Duration sessionTtl, boolean releaseThird, Duration thirdSessionTtl,
+                ExecutionProfile proposed, List<String> initialMembers) {
             List<WorkloadClaim> members = new ArrayList<>();
-            for (String node : List.of("a", "b", "c")) {
+            for (String node : initialMembers) {
                 WorkloadClaim claim = profiles.reserve("east", new WorkloadOwner(node, "boot-" + node),
                         URI.create("http://" + node + ":8080"), proposed,
                         node.equals("c") ? thirdSessionTtl : sessionTtl).node().registration().nodeSession();
@@ -2121,9 +2212,10 @@ class ClusterRecoveryStoreIT {
                 members.add(claim);
             }
             nodeB = members.get(1);
+            initialSessions = List.copyOf(members);
             profile = profiles.profile("east").orElseThrow();
             memberDocuments.insertOne(new Document("_id", "east").append("profileGeneration", profile.generation())
-                    .append("revision", 2L).append("activeNodeIds", List.of("a", "b", "c")));
+                    .append("revision", 2L).append("activeNodeIds", List.copyOf(initialMembers)));
             if (releaseThird) workloads.release(members.get(2));
             recovery = workloads.acquire(recoveryKey(), members.getFirst().owner(), 2, sessionTtl).claim();
             capture = workloads.acquire(new WorkloadClaimKey("east", WorkloadClaimType.CAPTURE, "capture-crm"),
@@ -2134,6 +2226,46 @@ class ClusterRecoveryStoreIT {
             captureEpoch = meta.openEpoch("capture-crm");
             assertThat(meta.publishCaptureTables("capture-crm", captureEpoch, List.of("orders"))).isTrue();
             meta.advanceCaptureCheckpoint("capture-crm", new ChainPosition(new SourceOrder(captureEpoch, 7), "resume-7"), List.of("orders"));
+        }
+
+        private Pipeline retiredPolicyFailure(String id) {
+            Set<String> originalMembers = initialSessions.stream().map(session -> session.key().resourceId())
+                    .collect(java.util.stream.Collectors.toSet());
+            Map<String, ClusterCapacityDemand> originalDemand = new java.util.TreeMap<>();
+            originalMembers.forEach(node -> originalDemand.put(node, demand(1)));
+            Pipeline pipeline = pipeline(id, false, List.of(SourceRef.bare("crm")), true,
+                    nodeB.owner(), Duration.ofSeconds(6));
+            var reserved = capacity.reserve(pipeline.claim(), profile, pipeline.key().incarnation(),
+                    pipeline.intentFingerprint(), originalDemand, LIMITS, PERMIT_TTL);
+            assertThat(reserved.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            var allocated = capacity.advanceExecution(reserved.reservation(), pipeline.claim(), originalMembers);
+            assertThat(allocated.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            WorkloadClaim original = allocated.advancedPipelineClaim();
+            assertThat(original.executionMembers().keySet()).containsExactlyInAnyOrderElementsOf(originalMembers);
+            assertThat(original.executionProfile()).isEqualTo(profile);
+            assertThat(original.executionIncarnation()).isEqualTo(pipeline.key().incarnation());
+            assertThat(original.executionRevision()).isEqualTo(artifacts.identity(id).orElseThrow().contentHash());
+            assertThat(capacity.submitted(allocated.reservation(), WorkloadClaimFence.from(original), "1").outcome())
+                    .isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            running(id);
+            assertThat(workloads.recordExecutionFailure(original, true)).isPresent();
+            var checkpoint = states.read(id).orElseThrow();
+            assertThat(states.compareAndSwap(id, checkpoint.epoch(), StateJson.of(PipelineState.FAILED), checkpoint.touchTime()))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+            for (WorkloadClaim session : initialSessions) {
+                if (!"a".equals(session.key().resourceId())) {
+                    assertThat(workloads.release(session)).isTrue();
+                }
+            }
+            WorkloadClaim current = workloads.acquire(original.key(), recovery.owner(), 2, TTL).claim();
+            assertThat(current.owner()).isEqualTo(recovery.owner());
+            assertThat(current.executionGeneration()).isEqualTo(original.executionGeneration());
+            assertThat(current.executionMembers()).isEqualTo(original.executionMembers());
+            awaitRetirement(current.key());
+            boolean retired = profiles.transaction(session -> workloads.provesRetired(session, WorkloadClaimFence.from(original)));
+            assertThat(retired).isTrue();
+            assertThat(workloads.read(current.key()).orElseThrow().leased()).isTrue();
+            return new Pipeline(pipeline.key(), current, event(pipeline, original), pipeline.intentFingerprint());
         }
 
         private MongoCollection<Document> collection(String name) {
