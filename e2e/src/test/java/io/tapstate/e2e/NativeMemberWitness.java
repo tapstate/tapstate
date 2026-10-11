@@ -7,6 +7,7 @@ import com.hazelcast.client.config.RoutingMode;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.runtime.engine.NativeExecutionStartup;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -91,6 +92,84 @@ final class NativeMemberWitness implements AutoCloseable {
             throw failedObservation("interrupted while reading native submitted jobs", interrupted);
         }
     }
+
+    /** Bounded passive reads of known submitted jobs and an already-present initialization map. */
+    NativeProjectionReading projectionReading(List<JobRequest> requested, Duration bound) {
+        requireRunning();
+        long waitMillis = bound.toMillis();
+        if (waitMillis <= 0) { throw new IllegalArgumentException("the native projection read bound must be positive"); }
+        List<JobRequest> exact = List.copyOf(requested);
+        var pending = observations.submit(() -> {
+            requireRunning();
+            var startup = client.getDistributedObjects().stream()
+                    .filter(candidate -> candidate instanceof IMap<?, ?> && candidate.getName().equals(NativeExecutionStartup.MAP_NAME))
+                    .findFirst().orElse(null);
+            List<NativeTuple> members = members().stream().map(member -> new NativeTuple(member.nodeId(), member.bootId(),
+                    member.uuid(), member.lite(), member.profileGeneration(), member.profileHash())).toList();
+            List<JobReading> jobs = new java.util.ArrayList<>();
+            for (JobRequest request : exact) {
+                var job = client.getJet().getJob(Long.parseUnsignedLong(request.jobId()));
+                Object stored = startup == null ? null : ((IMap<?, ?>) startup).get(request.pipeline());
+                var evidence = stored instanceof NativeExecutionStartup.Evidence value ? value : null;
+                if (job == null) {
+                    jobs.add(new JobReading(request, null, null, null, null, null, null, false, List.of(), evidence));
+                    continue;
+                }
+                Long claim = argument(job, NativeExecutionStartup.CLAIM_ARGUMENT);
+                Long execution = argument(job, NativeExecutionStartup.EXECUTION_ARGUMENT);
+                Long profile = argument(job, NativeExecutionStartup.PROFILE_ARGUMENT);
+                List<MetricReading> readings = new java.util.ArrayList<>();
+                var metrics = job.getMetrics();
+                for (String metric : new TreeSet<>(metrics.metrics())) {
+                    for (var measurement : metrics.get(metric)) {
+                        Map<String, String> tags = new java.util.LinkedHashMap<>();
+                        for (String tag : List.of(com.hazelcast.jet.core.metrics.MetricTags.VERTEX,
+                                com.hazelcast.jet.core.metrics.MetricTags.PROCESSOR,
+                                com.hazelcast.jet.core.metrics.MetricTags.MEMBER,
+                                com.hazelcast.jet.core.metrics.MetricTags.EXECUTION,
+                                com.hazelcast.jet.core.metrics.MetricTags.PROCESSOR_TYPE)) {
+                            String value = measurement.tag(tag);
+                            if (value != null) { tags.put(tag, value); }
+                        }
+                        readings.add(new MetricReading(metric, measurement.value(), measurement.timestamp(), Map.copyOf(tags)));
+                    }
+                }
+                jobs.add(new JobReading(request, Long.toUnsignedString(job.getId()), job.getName(), job.getStatus().name(),
+                        claim, execution, profile, request.jobId().equals(Long.toUnsignedString(job.getId()))
+                                && request.pipeline().equals(job.getName())
+                                && java.util.Objects.equals(claim, request.claimGeneration())
+                                && java.util.Objects.equals(execution, request.executionGeneration())
+                                && java.util.Objects.equals(profile, request.profileGeneration()), List.copyOf(readings), evidence));
+            }
+            requireRunning();
+            return new NativeProjectionReading(java.time.Instant.now(), members, startup != null, List.copyOf(jobs));
+        });
+        try { return pending.get(waitMillis, TimeUnit.MILLISECONDS); }
+        catch (TimeoutException unavailable) {
+            pending.cancel(true);
+            throw new AssertionError("the passive native projection read did not answer within its bound", unavailable);
+        } catch (ExecutionException unavailable) {
+            throw new AssertionError("the passive native projection facts could not be read", unavailable.getCause());
+        } catch (InterruptedException interrupted) {
+            pending.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while reading passive native projection facts", interrupted);
+        }
+    }
+
+    private static Long argument(com.hazelcast.jet.Job job, String key) {
+        Object value = job.getConfig().getArgument(key);
+        return value instanceof Number number ? number.longValue() : null;
+    }
+
+    record JobRequest(String pipeline, String jobId, long claimGeneration, long executionGeneration, long profileGeneration) { }
+    record NativeTuple(String nodeId, String bootId, String memberUuid, boolean lite, String profileGeneration, String profileHash) { }
+    record MetricReading(String name, long value, long timestamp, Map<String, String> tags) { }
+    record JobReading(JobRequest expected, String actualJobId, String actualName, String status,
+            Long claimGeneration, Long executionGeneration, Long profileGeneration, boolean scopeMatches,
+            List<MetricReading> metrics, NativeExecutionStartup.Evidence initialization) { }
+    record NativeProjectionReading(java.time.Instant readAt, List<NativeTuple> members,
+            boolean startupMapPresent, List<JobReading> jobs) { }
 
     private AssertionError failedObservation(String detail, Throwable cause) {
         AssertionError unknown = new AssertionError(detail, cause);
