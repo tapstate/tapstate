@@ -62,6 +62,16 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
 
     static BenchmarkReturnWorkBudgetRun current() { return ACTIVE.get(); }
 
+    /** Only a registered run and its captured scope select the extended owned cold getter. */
+    static String coldProducerApplication(BenchmarkReturnWorkBudget.Scope captured, BenchmarkCausalClock.Identity identity) {
+        var run = current();
+        if (run == null || captured == null || captured != run.scope) { return null; }
+        run.requireActive();
+        require(run.producerRegistration != null && run.producerRegistration.runtime().equals(identity),
+                "cold origin getter requires the registered owned producer");
+        return run.paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).toString();
+    }
+
     static void println(String value) {
         var run = current();
         if (run == null) { System.out.println(value); return; }
@@ -361,8 +371,67 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
             Map<?, ?> snapshot = map(metadata.get(boundary));
             require(expected.equals(map(snapshot.get("classHashes"))), "actual cold class hashes differ from authenticated application entries");
         }
+        var origins = consumeProducerOrigins(nativeEvidence.get("producerOrigins"), nativeEvidence.get("raw"));
         producerClassMetadata.add(Map.of("pid", producerRegistration.runtime().pid(),
-                "jvmStartTimeMillis", producerRegistration.runtime().jvmStartTimeMillis(), "classHashes", Map.copyOf(expected)));
+                "jvmStartTimeMillis", producerRegistration.runtime().jvmStartTimeMillis(), "classHashes", Map.copyOf(expected),
+                "producerOrigins", origins.evidence()));
+        var bindings = new LinkedHashMap<String, Object>(bindingEvidence);
+        bindings.put("actualProducerOrigins", List.copyOf(producerClassMetadata));
+        require(bindings.get("gaps") instanceof List<?> existing && existing.size() <= 8, "binding gap roster differs");
+        bindings.put("gaps", ((List<?>) bindings.get("gaps")).stream()
+                .filter(gap -> !"PRODUCER_LOADED_ORIGINS_BEYOND_CLOCK_NOT_OBSERVED".equals(gap)).toList());
+        bindingEvidence = Map.copyOf(bindings);
+    }
+
+    private BenchmarkReturnProducerOrigins.Parsed consumeProducerOrigins(Object value, Object nativeRaw) {
+        Map<?, ?> evidence = map(value);
+        require(evidence.get("rawParts") instanceof List<?> parts && parts.size() == 34,
+                "actual producer origin raw roster is missing");
+        var raw = new String[34];
+        for (int i = 0; i < raw.length; i++) {
+            Object part = ((List<?>) evidence.get("rawParts")).get(i);
+            require(part instanceof String, "actual producer origin raw part is not text"); raw[i] = (String) part;
+        }
+        var parsed = BenchmarkReturnProducerOrigins.parse(raw, producerRegistration.runtime(),
+                paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).toString());
+        require(parsed.nativeRaw().equals(nativeRaw), "producer origin native part differs from the original cold read");
+        require("RECORDED_UNQUALIFIED".equals(parsed.header().state()), "actual producer origin packet is incomplete");
+        require(jdkManifest.javaHome().equals(parsed.header().top().javaHome())
+                && jdkManifest.javaVersion().equals(parsed.header().top().javaVersion()), "actual producer origin JDK differs");
+        var expected = new java.util.HashMap<String, Origin>();
+        require(authenticated.origins().size() <= 2 * MAX_CLASSES, "authenticated origin roster exceeds its prior bound");
+        for (var origin : authenticated.origins()) if (origin.owner() == Owner.PRODUCER) {
+            require(expected.put(origin.binaryName(), origin) == null, "authenticated producer origin is duplicated");
+        }
+        require(expected.size() == BenchmarkReturnProducerOrigins.ORIGINS, "authenticated producer origin roster differs");
+        for (var part : parsed.typedParts()) {
+            var origin = expected.remove(part.binaryName());
+            require(origin != null && part.kind() == BenchmarkReturnProducerOrigins.Kind.BOOT_NESTED
+                    && origin.container().equals(part.outer())
+                    && origin.entry().equals(part.module() + "!/" + part.entry())
+                    && origin.classBytes().sha256().equals(part.sha256())
+                    && origin.classBytes().bytes() == part.bytes(),
+                    "actual producer origin differs from authenticated application entries");
+        }
+        require(expected.isEmpty(), "authenticated producer origin was not observed");
+        return parsed;
+    }
+
+    /** Bounded maps and equality work around the separately ticketed packet decoder. */
+    static BenchmarkReturnWorkBudget.Work producerOriginBindingUpper() {
+        long origins = 2L * MAX_CLASSES, parts = 34;
+        long text = Math.addExact(Math.multiplyExact(origins, 256), Math.multiplyExact(parts, 4096 + 2L * 1024 + 512 + 128 + 256 + 64));
+        return new BenchmarkReturnWorkBudget.Work(Math.addExact(128, Math.multiplyExact(16, origins + parts)),
+                Math.addExact(128, Math.multiplyExact(32, text)), parts, 0,
+                Math.addExact(Math.multiplyExact(64, origins + parts), Math.multiplyExact(8, parts)), 8,
+                Math.addExact(origins, Math.multiplyExact(8, parts)), Math.addExact(origins, parts));
+    }
+
+    /** The ASCII transport guard consumes the fixed packet once before copying or decoding. */
+    static BenchmarkReturnWorkBudget.Work coldPacketTransportUpper() {
+        long bytes = 2080768;
+        return new BenchmarkReturnWorkBudget.Work(1, Math.addExact(128 + 16L * 34, Math.multiplyExact(3, bytes)),
+                0, 0, bytes, 1, bytes + 35, 0);
     }
     private static Map<?, ?> map(Object value) { require(value instanceof Map<?, ?>, "actual class metadata object is missing"); return (Map<?, ?>) value; }
     private static long number(Map<?, ?> value, String field) {

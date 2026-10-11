@@ -12,7 +12,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     private static final int SOURCE_PACKET_NODES = 4096, SOURCE_PACKET_DEPTH = 16;
     private static final int SOURCE_LEAF_CHARS = 65536, SOURCE_PACKET_BYTES = 2 * 1024 * 1024;
     private static final int OWNED_RECEIPT_BYTES = 2 * 1024 * 1024, OWNED_RECEIPT_DEPTH = 8;
-    private static final int PRODUCER_ACTORS = 47, ROOT_ACTORS = 57, PENDING = 128;
+    private static final int PRODUCER_ACTORS = 48, ROOT_ACTORS = 57, PENDING = 128;
     private static final int WRITERS = 4;
     private static final int OUTER_DEPTH = 12;
     private static final int SOURCE_KEY_BYTES = 4 * SOURCE_LEAF_CHARS;
@@ -110,6 +110,12 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         add(parts, "NATIVE_METADATA_AND_REGISTRATIONS", "targetClockQualification.nativeClockBefore/nativeClockAfter/registrationBefore/After",
                 8, SOURCE_PACKET_NODES, SOURCE_PACKET_BYTES, MAX_LEAF, SOURCE_PACKET_DEPTH,
                 "TWO_COLD_READS_FOUR_ROOT_OWNED_RAW_PARSED_PACKET_FORMS");
+        add(parts, "PRODUCER_COLD_ORIGIN_PACKETS", "nativeClockBefore/nativeClockAfter/producerClassMetadata",
+                6, SOURCE_PACKET_NODES, 2L * 2080768 + 8192, 64512, 8,
+                "TWO_COLD_READS_TWO_DIRECT_AND_TWO_NESTED_POST_EXIT_BINDINGS_PLAIN_RAW34_AND_TYPED32_PRIOR_PART_CAPS");
+        add(parts, "ROOT_CLASS_ORIGIN_PACKETS", "actualInputBindings.actualRootOrigins/producer.actualRootOrigins",
+                2, 128L + 512L * mapNodes(7), 32768L + 512L * (7L * 128 + 256 + 4096 + 1024 + 64 + 256),
+                4096, 5, "FIXED_512_NAMED_CLASSES_SEVEN_ROW_FIELDS_ASCII_PATH4096_ENTRY1024_NAME256_SHA64_HEADER128_NODES");
         add(parts, "NATIVE_BASELINE_CHECKPOINTS", "BenchmarkNativeCounterBaseline.evidence.before/after",
                 2L * (1 + 2 + 1), mapNodes(10) + 2L * 4096 + 128 + 1,
                 PAGE_BYTES + 10L * 64 + 4L * 512, 512, 5,
@@ -123,8 +129,8 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         add(parts, "ROOT_CPU_ENVELOPE", "targetClockQualification.rootCpuDiagnostics/rootCpuDiagnosticScope",
                 1, 4096, 4096, 4096, 8, "THREE_CUTOFFS_FOUR_OPERATIONS_FIXED_FOUR_KIB_TRANSPORT");
         add(parts, "PRODUCER_WORK_BODY_AND_EVALUATION", "producer post-exit body/BenchmarkReturnWorkBudgetProducerAllocations",
-                2, 2L * PRODUCER_ACTORS * mapNodes(4) + 2L * 47 + 16L * mapNodes(2) + 4L * mapNodes(8),
-                PAGE_BYTES, PAGE_BYTES, 8, "TRUSTED_47_ACTIVITY_ROSTER_16_EPOCHS_BOUNDED_SEAL_BODY");
+                2, 2L * PRODUCER_ACTORS * mapNodes(4) + 2L * PRODUCER_ACTORS + 16L * mapNodes(2) + 4L * mapNodes(8),
+                PAGE_BYTES, PAGE_BYTES, 8, "TRUSTED_48_ACTIVITY_ROSTER_16_EPOCHS_BOUNDED_SEAL_BODY");
         add(parts, "ROOT_WORK_SELF_AND_CLOSED_SEAL", "BenchmarkReturnWorkBudget.Scope.snapshot/finish/output self evidence",
                 2, 1024L + 128L * ROOT_ACTORS + 8L * PENDING,
                 4096L + 1024L * ROOT_ACTORS + 128L * PENDING, MAX_LEAF, 8,

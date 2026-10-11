@@ -14,7 +14,7 @@ class BenchmarkReturnWorkBudgetProducerAllocationsTest {
         Map<String, Object> result = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(body());
         assertThat(result).containsEntry("state", "SOURCE_UPPER_RECOMPUTED_DIAGNOSTIC")
                 .containsEntry("sourceDefinitionMatched", true).containsEntry("countPairingComplete", true);
-        assertThat(result.get("recomputedSourceUpper")).isEqualTo(vector(3, 597368, 0, 0, 442044, 854, 1012972, 947500));
+        assertThat(result.get("recomputedSourceUpper")).isEqualTo(vector(3, 598308, 0, 0, 442364, 865, 1015252, 949780));
         for (String key : List.of("sourceCoverageVerified", "classArtifactBindingVerified", "callerCeilingsAuthoritative",
                 "futureInvocationBoundClaimed", "wholeMethodCostQualified", "costAcceptanceEligible", "performanceAcceptanceEligible", "formalPerformance")) {
             assertThat(result.get(key)).isEqualTo(false);
@@ -22,10 +22,22 @@ class BenchmarkReturnWorkBudgetProducerAllocationsTest {
     }
 
     @Test
+    void all_cold_origin_invocations_use_the_independent_source_vector() {
+        var body = body(); rows(body).put("COLD_ORIGINS", row(32, 32, 0, 0));
+        body.put("sourceUpper", vector(532217891, 520015364, 32, 0, 422494332, 214369, 802946772, 532348436));
+        var result = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(body);
+        assertThat(result.get("recomputedSourceUpper")).isEqualTo(body.get("sourceUpper"));
+        assertThat(result).containsEntry("countPairingComplete", true).containsEntry("wholeMethodCostQualified", false);
+        rows(body).put("COLD_ORIGINS", row(31, 31, 0, 0));
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProducerAllocations.evaluate(body))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("independent source sum");
+    }
+
+    @Test
     void explicit_bookkeeping_actor_and_separate_mutations_are_both_in_the_source_sum() {
         var body = body();
         rows(body).put("BOOKKEEPING", row(1, 1, 0, 0));
-        body.put("sourceUpper", vector(4, 597684, 0, 0, 445304, 860, 1014504, 949032));
+        body.put("sourceUpper", vector(4, 598624, 0, 0, 445624, 871, 1016784, 951312));
         Map<String, Object> result = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(body);
         assertThat(result.get("recomputedSourceUpper")).isEqualTo(body.get("sourceUpper"));
         assertThat(result).containsEntry("bookkeepingInvocations", 1L);
@@ -34,14 +46,14 @@ class BenchmarkReturnWorkBudgetProducerAllocationsTest {
     @Test
     void a_tampered_scalar_upper_cannot_replace_the_trusted_source_table() {
         var body = body();
-        body.put("sourceUpper", vector(3, 597369, 0, 0, 442044, 854, 1012972, 947500));
+        body.put("sourceUpper", vector(3, 598309, 0, 0, 442364, 865, 1015252, 949780));
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProducerAllocations.evaluate(body))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("independent source sum");
     }
 
     @Test
     void a_tampered_tail_allocation_or_source_hash_is_refused() {
-        var tail = body(); tail.put("sourceSealTailUpper", vector(1, 200359, 0, 0, 307712, 832, 749296, 683824));
+        var tail = body(); tail.put("sourceSealTailUpper", vector(1, 201047, 0, 0, 308032, 843, 751576, 686104));
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProducerAllocations.evaluate(tail))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("tail allocation");
         var hash = body(); hash.put("sourceFormulaSha256", "a".repeat(64));
@@ -135,7 +147,7 @@ class BenchmarkReturnWorkBudgetProducerAllocationsTest {
     void mutable_input_changes_cannot_change_the_retained_immutable_evaluation() {
         var body = body(); Map<String, Object> actual = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(body);
         rows(body).put("CONFIG", row(0, 0, 0, 0)); body.put("sourceUpper", vector(0, 0, 0, 0, 0, 0, 0, 0));
-        assertThat(actual.get("recomputedSourceUpper")).isEqualTo(vector(3, 597368, 0, 0, 442044, 854, 1012972, 947500));
+        assertThat(actual.get("recomputedSourceUpper")).isEqualTo(vector(3, 598308, 0, 0, 442364, 865, 1015252, 949780));
         assertThatThrownBy(() -> actual.put("wholeMethodCostQualified", true)).isInstanceOf(UnsupportedOperationException.class);
         @SuppressWarnings("unchecked") Map<String, Object> retained = (Map<String, Object>) actual.get("activityBasis");
         assertThatThrownBy(() -> retained.put("FOREIGN", row(0, 0, 0, 0))).isInstanceOf(UnsupportedOperationException.class);
@@ -145,7 +157,7 @@ class BenchmarkReturnWorkBudgetProducerAllocationsTest {
         var body = new LinkedHashMap<String, Object>();
         body.put("schemaVersion", 1); body.put("enabled", true);
         body.put("definitionId", "WRITE_RETURN_PRODUCER_WORK_V1");
-        body.put("sourceFormulaSha256", "66db340eda98ee81382063031665532e1348d93ff0e5de90a67a39b674d9bada");
+        body.put("sourceFormulaSha256", "5248e6d4304d26ccfd6744b0b05cc6206cd7de0d31b3bb057a9b4569b19776cb");
         body.put("inputSha256", "a".repeat(64)); body.put("runId", "owned"); body.put("pid", 17L);
         body.put("jvmStartTimeMillis", 23L); body.put("stage", "SHUTDOWN_HOOK"); body.put("lifecycle", "SHUTDOWN_HOOK");
         body.put("generation", 1L); body.put("nonceSha256", "b".repeat(64)); body.put("state", "RECORDED_STRUCTURAL_DIAGNOSTIC");
@@ -154,7 +166,7 @@ class BenchmarkReturnWorkBudgetProducerAllocationsTest {
         body.put("materialLimits", Map.of("connectorHashBytes", 134217728L, "runtimeArguments", 128L,
                 "runtimeArgumentBytes", 2093056L, "primaryKeys", 2L));
         body.put("actualMaterial", vector(0, 0, 0, 0, 0, 0, 0, 0));
-        body.put("sourceUpper", vector(3, 597368, 0, 0, 442044, 854, 1012972, 947500));
+        body.put("sourceUpper", vector(3, 598308, 0, 0, 442364, 865, 1015252, 949780));
         body.put("inputRowsAttempted", 0L); body.put("sourceUpperIsActualWork", false); body.put("limitsIndependentlyVerified", false);
         var rows = new LinkedHashMap<String, Object>();
         for (String actor : List.of("CONFIG", "INSTALL", "WRITER_INSTALL", "WRITER_ROSTER", "WRITER_CLOSE_ATTEMPT", "WRITER_CLOSE",
@@ -163,11 +175,11 @@ class BenchmarkReturnWorkBudgetProducerAllocationsTest {
                 "PUBLICATION", "COST_AGGREGATION", "CLOCK_READ", "CLOCK_INITIALIZATION", "CLOCK_METADATA", "SCOPE_INSTALL",
                 "SCOPE_CACHE_ENTRY", "SCOPE_BEFORE", "SCOPE_AFTER", "TRANSACTION_WRAPPER", "HASH_READ", "HASH_MATERIAL", "ARGUMENT",
                 "ARGUMENT_MATERIAL", "MBEAN_SCALAR", "MBEAN_START", "MBEAN_STOP", "MBEAN_PAGE", "PAGE_FRAME_VISIT", "MBEAN_COST",
-                "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER", "FINAL_WAIT_ITERATION", "BOOKKEEPING")) rows.put(actor, row(0, 0, 0, 0));
+                "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER", "FINAL_WAIT_ITERATION", "BOOKKEEPING", "COLD_ORIGINS")) rows.put(actor, row(0, 0, 0, 0));
         rows.put("CONFIG", row(1, 1, 0, 0)); body.put("activities", rows);
         body.put("bookkeepingInvocations", 1L); body.put("epochs", List.of()); body.put("pending", 0L); body.put("openWriters", 0L);
         body.put("omitted", 0L); body.put("overflow", false); body.put("overBudget", false); body.put("gaps", List.of());
-        body.put("lateMutations", 0L); body.put("sourceSealTailUpper", vector(1, 200360, 0, 0, 307712, 832, 749296, 683824));
+        body.put("lateMutations", 0L); body.put("sourceSealTailUpper", vector(1, 201048, 0, 0, 308032, 843, 751576, 686104));
         body.put("sealTailIncludedInSourceUpper", true); body.put("actualSealTailInCompanion", true);
         body.put("processExitObserved", false); body.put("crashDurabilityQualified", false);
         body.put("opaqueScope", "REQUESTS_AND_BOUNDED_MATERIAL_ONLY");

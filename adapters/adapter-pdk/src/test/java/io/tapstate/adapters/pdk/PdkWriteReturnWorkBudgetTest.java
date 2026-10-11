@@ -35,6 +35,49 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PdkWriteReturnWorkBudgetTest {
     @Test
+    void appended_cold_origin_activity_extends_the_actual_report_and_retains_old_ordinals() throws Exception {
+        var budget = budget();
+        try (var span = budget.enter(PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS)) { span.success(); }
+        Map<String, Object> actual = evidence(budget);
+        assertThat(((Map<?, ?>) actual.get("activities"))).hasSize(48);
+        assertThat(((Map<?, ?>) actual.get("activities")).containsKey("COLD_ORIGINS")).isTrue();
+        assertThat(PdkWriteReturnWorkBudget.Activity.BOOKKEEPING.ordinal()).isEqualTo(46);
+        assertThat(PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS.ordinal()).isEqualTo(47);
+        Shape shape = new Shape(); shape.visit(actual);
+        // Each appended activity contributes one map, its four counters and one root activity key.
+        assertThat(staticLong("REPORT_MAPS")).isEqualTo(1 + 4 + 1 + 1 + 48 + 16);
+        assertThat(staticLong("REPORT_ENTRIES")).isEqualTo(47 + 4 * 8 + 4 + 48 * 5 + 16 * 2);
+        assertThat(staticLong("REPORT_NODES")).isEqualTo(1 + 355 + 16 + 32);
+        assertThat(shape.maps).isLessThanOrEqualTo(staticLong("REPORT_MAPS"));
+        assertThat(shape.entries).isLessThanOrEqualTo(staticLong("REPORT_ENTRIES"));
+        assertThat(count(actual, "COLD_ORIGINS", "completed")).isEqualTo(1);
+        assertThat(PdkWriteReturnWorkBudget.SOURCE_FORMULA_SHA256)
+                .isEqualTo("5248e6d4304d26ccfd6744b0b05cc6206cd7de0d31b3bb057a9b4569b19776cb")
+                .isNotEqualTo("66db340eda98ee81382063031665532e1348d93ff0e5de90a67a39b674d9bada");
+    }
+
+    @Test
+    void cold_source_bound_and_failed_attempts_are_independent_of_observed_class_bytes() {
+        var budget = budget();
+        try (var span = budget.enter(PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS)) {
+            budget.material(4, 21); span.success();
+        }
+        try (var failed = budget.enter(PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS)) { }
+        Map<String, Object> actual = evidence(budget);
+        assertThat(count(actual, "COLD_ORIGINS", "invocations")).isEqualTo(2);
+        assertThat(count(actual, "COLD_ORIGINS", "completed")).isEqualTo(1);
+        assertThat(count(actual, "COLD_ORIGINS", "failed")).isEqualTo(1);
+        assertThat(count(actual, "COLD_ORIGINS", "pending")).isZero();
+        assertThat(vector(actual, "actualMaterial", "bytes")).isEqualTo(21);
+        assertThat(vector(actual, "sourceUpper", "bytes")).isGreaterThanOrEqualTo(
+                Math.multiplyExact(2, PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS.upper[4]));
+        assertThat(actual).containsEntry("state", "UNKNOWN").containsEntry("sourceUpperIsActualWork", false)
+                .containsEntry("structuralBudgetQualified", false).containsEntry("wholeMethodCostQualified", false);
+        long[] copy = PdkReturnOrigins.perClassUpper(); copy[4] = 0;
+        assertThat(PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS.upper[4]).isPositive();
+    }
+
+    @Test
     void actual_serializer_collection_requests_fit_both_report_and_final_tail_allocations() throws Exception {
         Map<String, Object> tree = evidence(budget());
         AtomicLong requests = new AtomicLong();

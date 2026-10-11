@@ -27,7 +27,7 @@ final class BenchmarkReturnWorkBudgetBindings {
         LOCAL_SOURCE_WORK("BenchmarkReturnLocalSourceWork"),
         ROOT_BINDINGS("BenchmarkReturnWorkBudgetBindings"), ROOT_SEAL("BenchmarkReturnWorkBudgetProducerSeal"),
         BINDINGS_IO("BenchmarkReturnWorkBudgetBindingsIo"), MANIFEST_READER("BenchmarkReturnBindingsManifestReader"),
-        ROOT_ORIGINS("BenchmarkReturnRootOrigins"),
+        ROOT_ORIGINS("BenchmarkReturnRootOrigins"), PRODUCER_ORIGIN_READER("BenchmarkReturnProducerOrigins"),
         ROOT_ALLOCATIONS("BenchmarkReturnWorkBudgetProducerAllocations"), ROOT_CLOCK_WORK("BenchmarkReturnRootClockWork"),
         ROOT_SOURCE_TAILS("BenchmarkReturnWorkBudgetSourceTails"), ROOT_CPU("BenchmarkRootCpuEnvelope"),
         NATIVE_QUEUE("BenchmarkNativeQueueProbe"), NATIVE_BASELINE("BenchmarkNativeCounterBaseline"),
@@ -57,7 +57,8 @@ final class BenchmarkReturnWorkBudgetBindings {
         PDK_BUDGET("PdkWriteReturnWorkBudget", "adapter-pdk"), PDK_PROBE("PdkWriteReturnProbe", "adapter-pdk"),
         PDK_BEAN("PdkWriteReturnProbeMBean", "adapter-pdk"), PDK_SCOPE("PdkMongoWriteScope", "adapter-pdk"),
         PDK_CLOCK("PdkBenchmarkClock", "adapter-pdk"), PDK_WRITER("PdkSinkWriter", "adapter-pdk"),
-        JSON_WRITER("JsonWriter", "core-common"), JNI_SOURCE;
+        PDK_ORIGINS("PdkReturnOrigins", "adapter-pdk"),
+        JSON_WRITER("JsonWriter", "core-common"), JSON_READER("JsonReader", "core-common"), JNI_SOURCE;
 
         private final String binaryName, sourcePath, module;
         SourceRole(String name) {

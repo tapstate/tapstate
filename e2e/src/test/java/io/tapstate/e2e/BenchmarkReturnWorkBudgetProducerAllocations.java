@@ -8,7 +8,7 @@ import java.util.Set;
 /** Independent arithmetic for one frozen producer definition; runtime coverage is verified separately. */
 final class BenchmarkReturnWorkBudgetProducerAllocations {
     static final String DEFINITION_ID = "WRITE_RETURN_PRODUCER_WORK_V1";
-    static final String FORMULA_SHA256 = "66db340eda98ee81382063031665532e1348d93ff0e5de90a67a39b674d9bada";
+    static final String FORMULA_SHA256 = "5248e6d4304d26ccfd6744b0b05cc6206cd7de0d31b3bb057a9b4569b19776cb";
     static final List<String> UNITS = List.of("calls", "requests", "records", "frames", "bytes", "passes", "elements", "updates");
     private static final List<String> FLAGS = List.of("structuralBudgetQualified", "accountingErrorBoundQualified",
             "wholeMethodCostQualified", "collectionCostUpperBoundQualified", "samplingCostQualified",
@@ -29,7 +29,7 @@ final class BenchmarkReturnWorkBudgetProducerAllocations {
             "COST_AGGREGATION", "CLOCK_READ", "CLOCK_INITIALIZATION", "CLOCK_METADATA", "SCOPE_INSTALL",
             "SCOPE_CACHE_ENTRY", "SCOPE_BEFORE", "SCOPE_AFTER", "TRANSACTION_WRAPPER", "HASH_READ", "HASH_MATERIAL",
             "ARGUMENT", "ARGUMENT_MATERIAL", "MBEAN_SCALAR", "MBEAN_START", "MBEAN_STOP", "MBEAN_PAGE",
-            "PAGE_FRAME_VISIT", "MBEAN_COST", "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER", "FINAL_WAIT_ITERATION", "BOOKKEEPING");
+            "PAGE_FRAME_VISIT", "MBEAN_COST", "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER", "FINAL_WAIT_ITERATION", "BOOKKEEPING", "COLD_ORIGINS");
     private static final Set<String> ROW_FIELDS = Set.of("invocations", "completed", "failed", "pending");
     private static final List<String> MATERIAL_FIELDS = List.of("connectorHashBytes", "runtimeArguments", "runtimeArgumentBytes", "primaryKeys");
     private static final List<String> EPOCH_FIELDS = List.of("epoch", "windowBase64");
@@ -61,6 +61,22 @@ final class BenchmarkReturnWorkBudgetProducerAllocations {
     private static final long CLOCK_REQUESTS = add(2053, 1024, mul(2, add(CLOCK_HASH_BYTES, 5)));
     private static final long CLOCK_TRANSFER = add(mul(4, CLOCK_MATERIAL), 65536);
     private static final long CLOCK_ELEMENTS = add(mul(8, CLOCK_MATERIAL), 65536);
+    // Fixed cold roster, shape and material caps; no receipt maxima or producer limit is used.
+    private static final long COLD_CLASSES = 32, COLD_CLASS_BYTES = 1048576, COLD_PACKET_BYTES = 2080768;
+    private static final long COLD_NODES = add(128, mul(COLD_CLASSES, 96));
+    private static final long COLD_ENTRIES = add(18, 18, 8, mul(COLD_CLASSES, add(15, 18)));
+    private static final long COLD_TEXT = add(8192, mul(COLD_CLASSES, 64512));
+    private static final long COLD_LOCAL_TEXT = add(2L * 18448, 2L * 4096, 2L * 1024, 2L * 256,
+            512, 128, chars(BenchmarkReturnProducerOrigins.NAMES));
+    private static final long COLD_JSON_REQUESTS = add(2, mul(5, COLD_CLASSES + 3), mul(7, COLD_ENTRIES),
+            mul(3, add(COLD_ENTRIES, COLD_NODES)), mul(3, COLD_TEXT), mul(2, COLD_NODES), 4, mul(3, 8));
+    private static final long COLD_PROVIDER_REQUESTS = add(128, mul(2, COLD_CLASS_BYTES + 1));
+    private static final BenchmarkReturnWorkBudget.Work COLD_ORIGINS = work(
+            add(1, mul(16, COLD_NODES), mul(8, COLD_TEXT)),
+            add(COLD_PROVIDER_REQUESTS, mul(32, COLD_LOCAL_TEXT), COLD_JSON_REQUESTS, mul(3, COLD_PACKET_BYTES), mul(16, COLD_NODES)),
+            1, 0, add(mul(4, add(COLD_CLASS_BYTES + 1, COLD_PACKET_BYTES)), mul(128, COLD_NODES), mul(COLD_CLASSES, 8192)),
+            add(16, mul(8, COLD_CLASSES), mul(2, COLD_NODES)), mul(8, add(COLD_CLASS_BYTES + 1, COLD_PACKET_BYTES, COLD_NODES)),
+            mul(8, add(COLD_TEXT, COLD_NODES)));
     private static final long BOOK_REQUESTS = add(3, UNITS.size(), 3, 2, 2, mul(2, UNITS.size()),
             2, 6, 2, mul(2, REASON_CHARS), 8, 8);
     private static final long BOOK_BYTES = add(8, mul(2, 4), mul(4, WINDOW_BYTES), WINDOW_BYTES, WINDOW_BASE64);
@@ -191,6 +207,7 @@ final class BenchmarkReturnWorkBudgetProducerAllocations {
         table.put("FINAL_OWNER", work(1, 32, 0, 0, 4096, 4, 512, 64));
         table.put("FINAL_WAIT_ITERATION", work(1, 4, 0, 0, 0, 2, 32, 16));
         table.put("BOOKKEEPING", BOOKKEEPING);
+        table.put("COLD_ORIGINS", COLD_ORIGINS);
         require(table.keySet().equals(Set.copyOf(ACTORS)), "trusted source table is incomplete");
         return Map.copyOf(table);
     }

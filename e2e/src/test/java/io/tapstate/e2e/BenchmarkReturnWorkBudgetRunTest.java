@@ -243,9 +243,32 @@ class BenchmarkReturnWorkBudgetRunTest {
                 var changed = new LinkedHashMap<>(hashes); changed.put("PdkBenchmarkClock", "f".repeat(64));
                 assertThatThrownBy(() -> run.recordNativeClassMetadata(nativePacket(18, 99, changed)))
                         .isInstanceOf(AssertionError.class).hasMessageContaining("actual cold class hashes differ");
-                run.recordNativeClassMetadata(nativePacket(18, 99, hashes));
-                run.recordNativeClassMetadata(nativePacket(18, 99, hashes));
+                var complete = new LinkedHashMap<>(nativePacket(18, 99, hashes));
+                complete.put("producerOrigins", producerPacket(fixture, 18, 99));
+                assertThat(BenchmarkReturnWorkBudgetRun.coldProducerApplication(BenchmarkReturnWorkBudget.current(),
+                        new BenchmarkCausalClock.Identity(18, 99))).isEqualTo(fixture.application().toString());
+                assertThat(BenchmarkReturnWorkBudgetRun.coldProducerApplication(null, new BenchmarkCausalClock.Identity(18, 99))).isNull();
+                assertThatThrownBy(() -> BenchmarkReturnWorkBudgetRun.coldProducerApplication(BenchmarkReturnWorkBudget.current(),
+                        new BenchmarkCausalClock.Identity(19, 99))).isInstanceOf(AssertionError.class)
+                        .hasMessageContaining("registered owned producer");
                 assertThatThrownBy(() -> run.recordNativeClassMetadata(nativePacket(18, 99, hashes)))
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("actual class metadata object is missing");
+                var wrongParts = new ArrayList<>((List<String>) producerPacket(fixture, 18, 99).get("rawParts"));
+                String writerHash = fixture.helper().classes().stream().filter(item -> item.role() == SourceRole.PDK_WRITER)
+                        .findFirst().orElseThrow().blob().sha256();
+                wrongParts.set(27, wrongParts.get(27).replace(writerHash, "f".repeat(64)));
+                complete.put("producerOrigins", Map.of("rawParts", List.copyOf(wrongParts)));
+                assertThatThrownBy(() -> run.recordNativeClassMetadata(complete)).isInstanceOf(AssertionError.class)
+                        .hasMessageContaining("actual producer origin differs from authenticated application entries");
+                wrongParts.set(0, "{\"changed\":true}");
+                complete.put("producerOrigins", Map.of("rawParts", List.copyOf(wrongParts)));
+                assertThatThrownBy(() -> run.recordNativeClassMetadata(complete)).isInstanceOf(AssertionError.class)
+                        .hasMessageContaining("native part differs from the original cold read");
+                complete.put("producerOrigins", producerPacket(fixture, 18, 99));
+                run.recordNativeClassMetadata(complete);
+                run.recordNativeClassMetadata(complete);
+                assertThat(((List<?>) run.bindingEvidence().get("gaps")).contains("ACTUAL_LOADED_ROOT_CLASS_ORIGINS_NOT_OBSERVED")).isTrue();
+                assertThatThrownBy(() -> run.recordNativeClassMetadata(complete))
                         .isInstanceOf(AssertionError.class).hasMessageContaining("before/after bound");
                 assertThat(requests.get()).isEqualTo(1);
                 assertThat(BenchmarkReturnWorkBudget.current().snapshot()).containsEntry("state", "UNKNOWN");
@@ -259,8 +282,114 @@ class BenchmarkReturnWorkBudgetRunTest {
 
     private static Map<String, Object> nativePacket(long pid, long start, Map<String, Object> hashes) {
         var snapshot = Map.of("classHashes", Map.copyOf(hashes));
-        return Map.of("state", "NATIVE_RECORDED", "ownedMetadata", Map.of("pid", pid,
+        return Map.of("state", "NATIVE_RECORDED", "raw", "{}", "ownedMetadata", Map.of("pid", pid,
                 "jvmStartTimeMillis", start, "before", snapshot, "after", snapshot));
+    }
+
+    @Test void trusted_cold_packet_uses_one_getter_and_preserves_original_clock_brackets() throws Exception {
+        coldGetterControl(false);
+    }
+
+    @Test void bounded_ascii_cold_packet_exceeding_the_generic_four_byte_estimate_keeps_an_exact_open_ledger() throws Exception {
+        coldGetterControl(true);
+    }
+
+    private void coldGetterControl(boolean large) throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("cold-getter"); configure(fixture);
+            try (var run = fixture.open()) {
+                var owner = new BenchmarkCausalClock.Identity(18, 99);
+                String library = fixture.paths().get(BenchmarkReturnWorkBudgetProfile.FileRole.NATIVE_LIBRARY).toString();
+                var packet = ((List<?>) producerPacket(fixture, 18, 99).get("rawParts")).toArray(String[]::new);
+                if (large) makeLargePartialPacket(packet);
+                packet[0] = BenchmarkNativeClockEvidenceTest.metadata(owner).replace(BenchmarkNativeClockEvidenceTest.LIBRARY, library);
+                var operations = new ArrayList<String>(); var clock = new java.util.concurrent.atomic.AtomicLong(100);
+                var connection = (javax.management.MBeanServerConnection) java.lang.reflect.Proxy.newProxyInstance(
+                        getClass().getClassLoader(), new Class<?>[]{javax.management.MBeanServerConnection.class},
+                        (proxy, method, arguments) -> {
+                            if (method.getName().equals("invoke")) {
+                                assertThat(arguments[1]).isEqualTo("armWorkBudgetFinalReceipt"); operations.add("arm"); return true;
+                            }
+                            if (method.getName().equals("getAttributes")) {
+                                assertThat((String[]) arguments[1]).containsExactly("Pid", "StartTime", "InputArguments");
+                                operations.add("runtime"); var attributes = new javax.management.AttributeList();
+                                attributes.add(new javax.management.Attribute("Pid", 18L));
+                                attributes.add(new javax.management.Attribute("StartTime", 99L));
+                                attributes.add(new javax.management.Attribute("InputArguments", new String[]{
+                                        "-Dtapstate.benchmark.write-return=true", "-Dtapstate.benchmark.native-clock-library=" + library}));
+                                return attributes;
+                            }
+                            assertThat(method.getName()).isEqualTo("getAttribute");
+                            assertThat(arguments[1]).isEqualTo("ColdMetadata"); operations.add("cold"); return packet;
+                        });
+                var reader = new BenchmarkWriteReturnReader(owner, connection, () -> true, clock::incrementAndGet);
+                run.registerProducer(reader, Map.of("state", "RECORDED_ENABLED", "pid", 18L, "jvmStartTimeMillis", 99L));
+                var result = reader.nativeClockEvidence(library, BenchmarkNativeClockEvidenceTest.metadata(
+                        BenchmarkNativeClockEvidenceTest.rootOwner()).replace(BenchmarkNativeClockEvidenceTest.LIBRARY, library));
+                assertThat(result).containsEntry("state", "NATIVE_RECORDED").containsEntry("raw", packet[0]);
+                assertThat(result.get("clockMetadataRead")).isEqualTo(Map.of("startedAtNanos", 103L, "completedAtNanos", 104L));
+                assertThat(operations).containsExactly("arm", "runtime", "cold", "runtime"); assertThat(clock).hasValue(106);
+                Map<?, ?> origins = (Map<?, ?>) result.get("producerOrigins");
+                assertThat(origins.get("rawParts")).isEqualTo(List.of(packet));
+                if (large) assertThat(origins.get("state")).isEqualTo("UNKNOWN");
+                BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> assertThat(origins.get(flag)).isEqualTo(false));
+                Map<?, ?> activities = (Map<?, ?>) BenchmarkReturnWorkBudget.current().snapshot().get("activities");
+                assertThat(((Map<?, ?>) activities.get("DECODE")).get("completedAttempts")).isEqualTo(3L);
+                assertThat(BenchmarkReturnWorkBudget.current().snapshot()).containsEntry("state", "OPEN");
+            }
+            assertInactive();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void makeLargePartialPacket(String[] packet) {
+        long characters = 0;
+        for (int i = 2; i < packet.length; i++) {
+            var part = new LinkedHashMap<>((Map<String, Object>) io.tapstate.core.common.JsonReader.parse(packet[i]));
+            part.put("state", "UNKNOWN"); part.put("reason", "ORIGIN_READ_REFUSED"); part.put("failureType", IOException.class.getName());
+            part.put("codeSource", "file:/" + "a".repeat(18000)); part.put("resource", "file:/" + "b".repeat(18000));
+            part.put("sha256", null); part.put("bytes", 0L);
+            packet[i] = io.tapstate.core.common.JsonWriter.write(part); characters = Math.addExact(characters, packet[i].length());
+        }
+        var header = new LinkedHashMap<>((Map<String, Object>) io.tapstate.core.common.JsonReader.parse(packet[1]));
+        header.put("state", "UNKNOWN"); header.put("reason", "ORIGIN_READ_REFUSED"); header.put("failureType", IOException.class.getName());
+        header.put("completedClassCount", 0); header.put("classBytesConsumed", 0); header.put("classBytesHashed", 0);
+        packet[1] = io.tapstate.core.common.JsonWriter.write(header);
+        assertThat(characters).isGreaterThan(524288).isLessThan(2080768);
+    }
+
+    private static Map<String, Object> producerPacket(Fixture fixture, long pid, long start) throws Exception {
+        var runtime = Map.of("pid", pid, "jvmStartTimeMillis", start,
+                "javaHome", fixture.jdk().javaHome(), "javaVersion", fixture.jdk().javaVersion());
+        var raw = new String[34]; raw[0] = "{}"; long bytes = 0;
+        for (int i = 0; i < BenchmarkReturnProducerOrigins.NAMES.size(); i++) {
+            String binary = BenchmarkReturnProducerOrigins.NAMES.get(i);
+            var origin = fixture.helper().origins().stream().filter(item -> item.owner() == Owner.PRODUCER
+                    && item.binaryName().equals(binary)).findFirst().orElseThrow();
+            String module = origin.entry().substring(0, origin.entry().indexOf("!/"));
+            String entry = binary.replace('.', '/') + ".class";
+            String prefix = "jar:nested:" + new java.net.URI(null, null, origin.container(), null).toASCIIString()
+                    + "/!" + module + "!/";
+            var part = new LinkedHashMap<String, Object>();
+            part.put("binaryName", binary); part.put("actualName", binary); part.put("state", "RECORDED");
+            part.put("loaderClass", "org.springframework.boot.loader.launch.LaunchedClassLoader"); part.put("loaderIdentityHashCode", 17);
+            part.put("codeSource", prefix); part.put("resource", prefix + entry); part.put("container", origin.container());
+            part.put("outer", origin.container()); part.put("module", module); part.put("entry", entry);
+            part.put("sha256", origin.classBytes().sha256()); part.put("bytes", origin.classBytes().bytes());
+            part.put("reason", "NONE"); part.put("failureType", "NONE");
+            BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> part.put(flag, false));
+            raw[i + 2] = io.tapstate.core.common.JsonWriter.write(part); bytes = Math.addExact(bytes, origin.classBytes().bytes());
+        }
+        var header = new LinkedHashMap<String, Object>(); header.put("schemaVersion", 1); header.put("state", "RECORDED_UNQUALIFIED");
+        header.putAll(runtime); header.put("beforeRuntime", runtime); header.put("afterRuntime", runtime);
+        header.put("expectedClassCount", 32); header.put("completedClassCount", 32); header.put("serviceRequests", 0);
+        header.put("classBytesConsumed", bytes); header.put("classBytesHashed", bytes); header.put("reason", "NONE");
+        header.put("failureType", "NONE"); header.put("suppressedFailureTypes", List.of());
+        header.put("resolution", "EXACT_NAMES_INITIALIZE_FALSE");
+        header.put("byteScope", "OWN_RESOURCE_CODE_SOURCE_AND_CONTAINER_NOT_VM_INSTRUCTION_BODY");
+        BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> header.put(flag, false));
+        raw[1] = io.tapstate.core.common.JsonWriter.write(header);
+        return Map.of("rawParts", List.of(raw));
     }
 
     @Test void changed_actual_file_length_refuses_and_releases_both_active_references() throws Exception {
@@ -376,29 +505,33 @@ class BenchmarkReturnWorkBudgetRunTest {
             files.add(new BenchmarkReturnWorkBudgetProfile.FileInput(role, sha256(content), content.length));
         }
         var sources = new ArrayList<Source>();
-        for (var role : List.of(SourceRole.ROOT_RUN, SourceRole.PDK_CLOCK)) {
+        var sourceRoles = new java.util.LinkedHashSet<SourceRole>(); sourceRoles.add(SourceRole.ROOT_RUN);
+        for (String binary : BenchmarkReturnProducerOrigins.NAMES) sourceRoles.add(producerRole(binary));
+        for (var role : sourceRoles) {
             byte[] content = ("controlled owned source:" + role.name()).getBytes(StandardCharsets.US_ASCII);
             Path target = sourceRoot.resolve(role.sourcePath()); Files.createDirectories(target.getParent()); Files.write(target, content);
             sources.add(new Source(role, role.sourcePath(), blob(content)));
         }
         var compiled = new ArrayList<CompiledClass>(); var origins = new ArrayList<Origin>();
-        var jarMembers = new LinkedHashMap<String, byte[]>();
-        for (var role : List.of(SourceRole.ROOT_RUN, SourceRole.PDK_CLOCK)) {
-            for (String suffix : role == SourceRole.PDK_CLOCK ? List.of("", "$Clock", "$JniAccess", "$NativeAccess") : List.of("")) {
-                String binary = role.binaryName() + suffix; String member = binary.replace('.', '/') + ".class";
+        var pdkMembers = new LinkedHashMap<String, byte[]>(); var commonMembers = new LinkedHashMap<String, byte[]>();
+        var binaries = new ArrayList<>(BenchmarkReturnProducerOrigins.NAMES); binaries.add(SourceRole.ROOT_RUN.binaryName());
+        for (String binary : binaries) {
+                var role = binary.equals(SourceRole.ROOT_RUN.binaryName()) ? SourceRole.ROOT_RUN : producerRole(binary);
+                String member = binary.replace('.', '/') + ".class";
                 byte[] content = ("controlled class bytes:" + binary).getBytes(StandardCharsets.US_ASCII);
                 compiled.add(new CompiledClass(role, binary, blob(content)));
                 Path classFile = classes.resolve(member); Files.createDirectories(classFile.getParent()); Files.write(classFile, content);
                 origins.add(new Origin(Owner.ROOT, role, binary, classes.toString(), member, blob(content), null));
-                if (role == SourceRole.PDK_CLOCK) jarMembers.put(member, content);
-            }
+                if (role.module().equals("adapter-pdk")) pdkMembers.put(member, content);
+                else if (role.module().equals("core-common")) commonMembers.put(member, content);
         }
-        byte[] nested = zip(jarMembers); byte[] app = zip(Map.of("BOOT-INF/lib/adapter-pdk-controlled.jar", nested));
+        byte[] app = zip(Map.of("BOOT-INF/lib/adapter-pdk-controlled.jar", zip(pdkMembers),
+                "BOOT-INF/lib/core-common-controlled.jar", zip(commonMembers)));
         Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR), app);
         replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR, app);
-        for (var item : compiled) if (item.role() == SourceRole.PDK_CLOCK) origins.add(new Origin(Owner.PRODUCER,
+        for (var item : compiled) if (!item.role().module().equals("e2e")) origins.add(new Origin(Owner.PRODUCER,
                 item.role(), item.binaryName(), paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).toString(),
-                "BOOT-INF/lib/adapter-pdk-controlled.jar!/" + item.binaryName().replace('.', '/') + ".class", item.blob(), sha256(app)));
+                "BOOT-INF/lib/" + item.role().module() + "-controlled.jar!/" + item.binaryName().replace('.', '/') + ".class", item.blob(), sha256(app)));
         var jdkFiles = new ArrayList<JdkFile>();
         for (var role : JdkRole.values()) {
             if (role == JdkRole.CPU_PROVIDER) continue;
@@ -428,6 +561,11 @@ class BenchmarkReturnWorkBudgetRunTest {
         assertThat(profile.requireDefinition().sourceFormulaSha256()).isEqualTo(helper.rootFormulaSha256());
         return new Fixture(workload, profile, Map.copyOf(paths), parent.resolve("fork.json"), parent.resolve("producer.json"),
                 sourceRoot, classes, home, helper, jdk);
+    }
+
+    private static SourceRole producerRole(String binary) {
+        String top = binary.split("\\$", 2)[0];
+        return java.util.Arrays.stream(SourceRole.values()).filter(role -> top.equals(role.binaryName())).findFirst().orElseThrow();
     }
 
     private static BenchmarkReturnWorkBudgetProfile.Inputs inputs(String run, String hash, BenchmarkWorkloadDefinitions.Workload workload,

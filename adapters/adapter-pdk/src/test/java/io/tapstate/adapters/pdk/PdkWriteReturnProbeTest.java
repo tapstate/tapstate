@@ -36,6 +36,77 @@ class PdkWriteReturnProbeTest {
     private static final String NAME = "io.tapstate.benchmark:type=WriteReturn";
 
     @Test
+    void cold_metadata_requires_a_budget_before_any_native_metadata_packet_or_clock_read() {
+        var reads = new AtomicLong();
+        var probe = new PdkWriteReturnProbe(reads::incrementAndGet);
+        assertThatThrownBy(probe::getColdMetadata).isInstanceOf(AssertionError.class).hasMessageContaining("active work-budget");
+        assertThatThrownBy(() -> probe.coldMetadata(() -> {
+            throw new AssertionError("unexpected native metadata read");
+        }, (raw, budget) -> { throw new AssertionError("unexpected origin packet read"); }))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("active work-budget");
+        assertThat(reads).hasValue(0);
+        assertThat(probe.getState()).isEqualTo("IDLE");
+    }
+
+    @Test
+    void one_cold_getter_binds_one_native_metadata_call_and_all_class_contexts_without_a_clock_read() {
+        var clocks = new AtomicLong(); var metadata = new AtomicLong(); var packets = new AtomicLong();
+        var budget = coldBudget(); var probe = new PdkWriteReturnProbe(clocks::incrementAndGet, false, budget);
+        String[] expected = new String[34]; java.util.Arrays.fill(expected, "bounded-control"); expected[0] = "native-control";
+        String[] actual = probe.coldMetadata(() -> { metadata.incrementAndGet(); return "native-control"; }, (raw, owner) -> {
+            packets.incrementAndGet(); assertThat(raw).isEqualTo("native-control"); assertThat(owner).isSameAs(budget);
+            for (int index = 0; index < 32; index++) {
+                try (var span = owner.enter(PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS)) { span.success(); }
+            }
+            return expected;
+        });
+        assertThat(actual).isSameAs(expected); assertThat(metadata).hasValue(1); assertThat(packets).hasValue(1);
+        assertThat(clocks).hasValue(0);
+        var facts = coldFacts(budget);
+        assertThat(coldCount(facts, "CLOCK_METADATA", "invocations")).isEqualTo(1);
+        assertThat(coldCount(facts, "CLOCK_METADATA", "completed")).isEqualTo(1);
+        assertThat(coldCount(facts, "COLD_ORIGINS", "completed")).isEqualTo(32);
+        assertThat(coldCount(facts, "CLOCK_READ", "invocations")).isZero();
+        assertThat(facts).containsEntry("pending", 0L).containsEntry("wholeMethodCostQualified", false)
+                .containsEntry("performanceAcceptanceEligible", false);
+    }
+
+    @Test
+    void failed_cold_packet_keeps_the_exact_primary_and_clears_the_metadata_context() {
+        var metadata = new AtomicLong(); var budget = coldBudget();
+        var probe = new PdkWriteReturnProbe(() -> { throw new AssertionError("unexpected clock read"); }, false, budget);
+        var primary = new IllegalStateException("controlled cold packet failure");
+        Throwable failure = org.assertj.core.api.Assertions.catchThrowable(() -> probe.coldMetadata(
+                () -> { metadata.incrementAndGet(); return "native-control"; }, (raw, owner) -> {
+                    try (var failed = owner.enter(PdkWriteReturnWorkBudget.Activity.COLD_ORIGINS)) { throw primary; }
+                }));
+        assertThat(failure).isSameAs(primary); assertThat(metadata).hasValue(1);
+        var facts = coldFacts(budget);
+        assertThat(coldCount(facts, "CLOCK_METADATA", "failed")).isEqualTo(1);
+        assertThat(coldCount(facts, "COLD_ORIGINS", "failed")).isEqualTo(1);
+        assertThat(coldCount(facts, "CLOCK_READ", "invocations")).isZero();
+        assertThat(facts).containsEntry("pending", 0L).containsEntry("state", "UNKNOWN");
+    }
+
+    private static PdkWriteReturnWorkBudget coldBudget() {
+        var limits = new java.util.LinkedHashMap<String, Object>();
+        for (String unit : PdkWriteReturnWorkBudget.UNITS) limits.put(unit, Long.MAX_VALUE);
+        var config = Map.of("schemaVersion", 1, "definitionId", PdkWriteReturnWorkBudget.DEFINITION_ID,
+                "sourceFormulaSha256", PdkWriteReturnWorkBudget.SOURCE_FORMULA_SHA256, "inputSha256", "a".repeat(64),
+                "runId", "cold-control", "limits", limits, "materialLimits", Map.of("connectorHashBytes", 134217728,
+                        "runtimeArguments", 128, "runtimeArgumentBytes", 2093056, "primaryKeys", 2));
+        return PdkWriteReturnWorkBudget.testing(java.util.Base64.getEncoder().encodeToString(
+                io.tapstate.core.common.JsonWriter.write(config).getBytes(StandardCharsets.UTF_8)), 17, 23);
+    }
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> coldFacts(PdkWriteReturnWorkBudget budget) {
+        return (Map<String, Object>) io.tapstate.core.common.JsonReader.parse(budget.snapshot());
+    }
+    private static long coldCount(Map<String, Object> facts, String actor, String field) {
+        return ((Number) ((Map<?, ?>) ((Map<?, ?>) facts.get("activities")).get(actor)).get(field)).longValue();
+    }
+
+    @Test
     void callbacks_do_not_complete_the_call_and_all_flush_counts_survive(@TempDir Path dir) throws Exception {
         withEnabledProbe(() -> {
             PdkConnector connector = connector(dir);

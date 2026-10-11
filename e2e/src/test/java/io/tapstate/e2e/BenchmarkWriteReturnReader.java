@@ -188,12 +188,17 @@ final class BenchmarkWriteReturnReader {
             retained.put("expectedRootPid", rootIdentity.pid()); retained.put("expectedRootJvmStartTimeMillis", rootIdentity.jvmStartTimeMillis());
             RuntimeRead before = runtimeRead(true, false, retained, "beforeRuntimeRead", expectedLibraryPath);
             requireAlive();
+            String producerApplication = BenchmarkReturnWorkBudgetRun.coldProducerApplication(workScope, identity);
             long started = clock.getAsLong(); retained.put("clockMetadataRead", Map.of("startedAtNanos", started));
             var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, BenchmarkReturnWorkBudget.Work.call());
             Object value;
-            try { BenchmarkReturnWorkBudget.issued(work); value = connection.getAttribute(name, "ClockMetadata"); BenchmarkReturnWorkBudget.returned(work, value); }
+            try { BenchmarkReturnWorkBudget.issued(work); value = connection.getAttribute(name,
+                    producerApplication == null ? "ClockMetadata" : "ColdMetadata");
+                if (producerApplication == null) BenchmarkReturnWorkBudget.returned(work, value);
+                else BenchmarkReturnWorkBudget.done(work, coldPacketMaterial(value)); }
             catch (java.io.IOException | javax.management.JMException | RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
-            String raw = value instanceof String text ? text : null;
+            String raw = producerApplication == null ? (value instanceof String text ? text : null)
+                    : boundedNativePart(value);
             retained.putAll(BenchmarkWriteReturnCostStages.rawEvidence(raw));
             if (value != null && raw == null) { retained.put("responseType", value.getClass().getName()); }
             long completed = clock.getAsLong(); retained.put("clockMetadataRead", bracket(started, completed));
@@ -203,6 +208,12 @@ final class BenchmarkWriteReturnReader {
             if (Math.subtractExact(started, before.completedAtNanos()) < 0 || Math.subtractExact(completed, started) < 0
                     || Math.subtractExact(after.startedAtNanos(), completed) < 0) {
                 throw new AssertionError("native clock root reads are not serial");
+            }
+            if (producerApplication != null) {
+                try { retained.put("producerOrigins", BenchmarkReturnProducerOrigins.parse(value, identity, producerApplication).evidence()); }
+                catch (BenchmarkReturnProducerOrigins.Refusal refused) {
+                    retained.put("producerOrigins", refused.retainedEvidence()); throw refused;
+                }
             }
             var owned = BenchmarkNativeClockEvidence.parse(raw, identity, expectedLibraryPath);
             retained.put("ownedMetadata", owned);
@@ -220,6 +231,29 @@ final class BenchmarkWriteReturnReader {
             BenchmarkReturnWorkBudget.failed(metadataMethod, refusal);
             throw new NativeClockRefusal(refusal, retained);
         }
+    }
+
+    private static String boundedNativePart(Object value) {
+        if (!(value instanceof String[] parts) || parts.length != 34 || parts[0] == null || parts[0].length() > 8192) {
+            return null;
+        }
+        return parts[0];
+    }
+
+    private static BenchmarkReturnWorkBudget.Work coldPacketMaterial(Object value) {
+        if (!(value instanceof String[] parts) || parts.length != 34) throw new AssertionError("cold packet part roster differs");
+        long bytes = 0;
+        for (int part = 0; part < parts.length; part++) {
+            String text = parts[part]; int cap = part < 2 ? 8192 : 64512;
+            if (text == null || text.isEmpty() || text.length() > cap) throw new AssertionError("cold packet text exceeds prior part bound");
+            bytes = Math.addExact(bytes, text.length());
+            if (bytes > 2080768) throw new AssertionError("cold packet exceeds prior total bound");
+            for (int i = 0; i < text.length(); i++) {
+                char character = text.charAt(i);
+                if (character < 32 || character > 126) throw new AssertionError("cold packet is not printable ASCII");
+            }
+        }
+        return new BenchmarkReturnWorkBudget.Work(0, 0, 0, 0, bytes, 1, Math.addExact(bytes, 35), 0);
     }
 
     static final class NativeClockRefusal extends AssertionError {

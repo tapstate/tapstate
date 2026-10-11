@@ -6,6 +6,7 @@ public interface PdkWriteReturnProbeMBean {
     long getJvmStartTimeMillis();
     long getNanoTime();
     String getClockMetadata();
+    String[] getColdMetadata();
     String getWindow();
     String getState();
     long getCompletedCalls();

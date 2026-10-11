@@ -16,7 +16,7 @@ import java.util.Map;
 
 /** Binds a producer shutdown body to its companion after the original owned process has exited. */
 final class BenchmarkReturnWorkBudgetProducerSeal {
-    static final String FORMULA_SHA256 = "66db340eda98ee81382063031665532e1348d93ff0e5de90a67a39b674d9bada";
+    static final String FORMULA_SHA256 = "5248e6d4304d26ccfd6744b0b05cc6206cd7de0d31b3bb057a9b4569b19776cb";
     static final int MAX_BODY_BYTES = 65536;
     static final int COMPANION_BYTES = 256;
     static final java.util.Set<String> ACTIVITY_NAMES = java.util.Set.of("CONFIG", "INSTALL", "WRITER_INSTALL", "WRITER_ROSTER",
@@ -26,7 +26,7 @@ final class BenchmarkReturnWorkBudgetProducerSeal {
             "CLOCK_INITIALIZATION", "CLOCK_METADATA", "SCOPE_INSTALL", "SCOPE_CACHE_ENTRY", "SCOPE_BEFORE", "SCOPE_AFTER",
             "TRANSACTION_WRAPPER", "HASH_READ", "HASH_MATERIAL", "ARGUMENT", "ARGUMENT_MATERIAL", "MBEAN_SCALAR", "MBEAN_START",
             "MBEAN_STOP", "MBEAN_PAGE", "PAGE_FRAME_VISIT", "MBEAN_COST", "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER",
-            "FINAL_WAIT_ITERATION", "BOOKKEEPING");
+            "FINAL_WAIT_ITERATION", "BOOKKEEPING", "COLD_ORIGINS");
     private BenchmarkReturnWorkBudgetProducerSeal() { }
 
     record Registration(String runId, BenchmarkCausalClock.Identity runtime, String inputSha256, String nonce,

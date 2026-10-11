@@ -72,7 +72,7 @@ final class PdkWriteReturnWorkBudget {
             "COST_AGGREGATION", "CLOCK_READ", "CLOCK_INITIALIZATION", "CLOCK_METADATA", "SCOPE_INSTALL",
             "SCOPE_CACHE_ENTRY", "SCOPE_BEFORE", "SCOPE_AFTER", "TRANSACTION_WRAPPER", "HASH_READ", "HASH_MATERIAL",
             "ARGUMENT", "ARGUMENT_MATERIAL", "MBEAN_SCALAR", "MBEAN_START", "MBEAN_STOP", "MBEAN_PAGE",
-            "PAGE_FRAME_VISIT", "MBEAN_COST", "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER", "FINAL_WAIT_ITERATION", "BOOKKEEPING");
+            "PAGE_FRAME_VISIT", "MBEAN_COST", "MBEAN_BUDGET", "ARM", "SHUTDOWN", "FINAL_OWNER", "FINAL_WAIT_ITERATION", "BOOKKEEPING", "COLD_ORIGINS");
     static final List<String> ACTIVITY_FIELDS = List.of("invocations", "completed", "failed", "pending");
     static final List<String> MATERIAL_FIELDS = List.of("connectorHashBytes", "runtimeArguments", "runtimeArgumentBytes", "primaryKeys");
     static final List<String> EPOCH_FIELDS = List.of("epoch", "windowBase64");
@@ -176,7 +176,9 @@ final class PdkWriteReturnWorkBudget {
         SHUTDOWN(1, 16, 0, 0, 4096, 4, 512, 64),
         FINAL_OWNER(1, 32, 0, 0, 4096, 4, 512, 64),
         FINAL_WAIT_ITERATION(1, 4, 0, 0, 0, 2, 32, 16),
-        BOOKKEEPING(1, BOOKKEEPING_REQUESTS, 0, 0, BOOKKEEPING_BYTES, 6, BOOKKEEPING_ELEMENTS_UPDATES, BOOKKEEPING_ELEMENTS_UPDATES);
+        BOOKKEEPING(1, BOOKKEEPING_REQUESTS, 0, 0, BOOKKEEPING_BYTES, 6, BOOKKEEPING_ELEMENTS_UPDATES, BOOKKEEPING_ELEMENTS_UPDATES),
+        // Per-class source allocation is independent of caller limits and observed material.
+        COLD_ORIGINS(PdkReturnOrigins.perClassUpper());
 
         final long[] upper;
         Activity(long... upper) { this.upper = upper; }
@@ -571,6 +573,7 @@ final class PdkWriteReturnWorkBudget {
 
     private static String formula() {
         var result = new StringBuilder("WRITE_RETURN_PRODUCER_WORK_V1;units=calls,requests,records,frames,bytes,passes,elements,updates;opaque=requests;actual=basis;upper=checked-allocation;native-copy-requests=2053;native-copy-bytes=16593;hash-material=16MiB+4*256KiB+5*8192;hash-requests=2*(hash-material+5)+2053+1024;clock-transfer=4*(hash-material+16593)+65536;clock-elements-updates=8*(hash-material+16593)+65536;key-shape=2;frame=65536;call-rows=1024;error-entries=512;epochs=16;gaps=32;reason=128;config-depth=4;config-tokens=64;config-string=1024;config-number=20;seal=256;request-unit=explicit-JDK-provider-and-boxing-invocations;json-map=5+7*entries;json-list=4+3*elements;json-string=3+3*chars;json-scalar=2;ascii=2+2*chars;");
+        result.append("cold-origins=32;native-part=8192;header-part=8192;origin-part=64512;packet=2080768;class-material=1048576;source=per-class-fixed-roster-api-hash-json;");
         result.append("rootFields=").append(String.join(",", ROOT_FIELDS)).append(';');
         result.append("activityNames=").append(String.join(",", ACTIVITY_NAMES)).append(';');
         result.append("report=").append(REPORT_MAPS).append(',').append(REPORT_LISTS).append(',')

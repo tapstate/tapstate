@@ -551,6 +551,21 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
             String result = PdkBenchmarkClock.metadata(); span.success(); return result;
         }
     }
+    @Override public String[] getColdMetadata() {
+        if (workBudget == null) throw new AssertionError("cold metadata requires an active work-budget ledger");
+        return coldMetadata(PdkBenchmarkClock::metadata, PdkReturnOrigins::packet);
+    }
+
+    /** Cold test seam preserves the single native metadata call and the existing clock supplier. */
+    String[] coldMetadata(java.util.function.Supplier<String> metadata,
+                          java.util.function.BiFunction<String, PdkWriteReturnWorkBudget, String[]> origins) {
+        if (workBudget == null) throw new AssertionError("cold metadata requires an active work-budget ledger");
+        try (var span = workBudget.enter(PdkWriteReturnWorkBudget.Activity.CLOCK_METADATA)) {
+            String nativeRaw = metadata.get();
+            String[] result = origins.apply(nativeRaw, workBudget);
+            span.success(); return result;
+        }
+    }
     @Override public synchronized String getWindow() { return workBudget == null ? window : scalar(() -> window); }
     @Override public synchronized String getState() { return workBudget == null ? state : scalar(() -> state); }
     @Override public synchronized long getCompletedCalls() { return workBudget == null ? completedCalls : scalar(() -> completedCalls); }
