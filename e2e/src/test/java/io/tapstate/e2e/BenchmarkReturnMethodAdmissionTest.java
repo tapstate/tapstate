@@ -171,6 +171,66 @@ class BenchmarkReturnMethodAdmissionTest {
         assertThat(empty.summary().completedCalls()).isZero();
     }
 
+    @Test void privately_verified_phase_feeds_original_common_counts_and_all_latency_rows_to_pooling() throws Exception {
+        var admitted = control(); var fixture = fixture();
+        var owner = fixture.result().samples().getFirst().identity();
+        var bound = BenchmarkReturnMethodAdmission.verifyPhase(admitted, phase(fixture, cold(owner), cold(owner)));
+        assertThat(bound.commonWindow()).containsEntry("state", "PASS");
+        var metric = bound.intervalMetrics();
+        assertThat(metric.id()).isEqualTo(fixture.phase().id());
+        assertThat(metric.completedLower()).isEqualTo(bound.commonWindow().get("completedRowsLower"));
+        assertThat(metric.completedUpper()).isEqualTo(bound.commonWindow().get("completedRowsUpper"));
+        assertThat(metric.durationLower()).isEqualTo(bound.commonWindow().get("durationNanosLower"));
+        assertThat(metric.durationUpper()).isEqualTo(bound.commonWindow().get("durationNanosUpper"));
+        assertThat(metric.latencies()).containsExactlyElementsOf(bound.deliveries().stream()
+                .map(BenchmarkReturnTimeBounds.Delivery::latency).toList());
+        assertThat(metric.latencies()).hasSize(48000);
+        assertThatThrownBy(metric.latencies()::clear).isInstanceOf(UnsupportedOperationException.class);
+        var pooled = BenchmarkReturnIntervalMetrics.aggregate(List.of(metric));
+        assertThat(pooled.fullCohortRows()).isEqualTo(48000);
+        assertThat(pooled.p99()).isEqualTo(BenchmarkReturnTimeBounds.p99(metric.latencies()));
+        assertThatThrownBy(admitted::requireProductionAuthority).hasMessageContaining("CONTROL_REVIEW");
+        for (String flag : BenchmarkReturnProducerOrigins.FLAGS) assertThat(bound.evidence()).containsEntry(flag, false);
+    }
+
+    @Test void an_unqualified_original_common_window_cannot_feed_interval_metrics_or_pooling() throws Exception {
+        var admitted = control(); var original = fixture(); var result = original.result();
+        // Controlled times preserve serial ties and complete raw/key populations while removing a steady interval.
+        // This is a refusal control, never a runtime/native measurement or a replacement original fork.
+        var calls = result.calls().stream().map(call -> {
+            boolean compressed = call.sequence() >= 20 && call.sequence() <= 75;
+            long at = 4_000_000_000L;
+            return new BenchmarkWriteReturnAssembly.FullCall(call.sequence(), call.writer(), call.totalRows(),
+                    compressed ? at : call.beganNanos(), compressed ? at : call.lastCallbackExitNanos(),
+                    compressed ? at : call.observedNanos(), call.returnedNormally(), call.callbackCount(),
+                    call.inserted(), call.modified(), call.removed(), call.errors(), call.errorDetails(),
+                    call.failureType(), call.scope(), call.writerIdentity(), call.stream(), call.target(), call.keyFields(), call.rows());
+        }).toList();
+        var pages = new ArrayList<String>();
+        for (String encoded : result.pagesBase64()) {
+            byte[] raw = java.util.Base64.getDecoder().decode(encoded);
+            var page = java.nio.ByteBuffer.wrap(raw); page.position(28);
+            int text = Short.toUnsignedInt(page.getShort()); page.position(page.position() + text);
+            text = Short.toUnsignedInt(page.getShort()); page.position(page.position() + text);
+            while (page.hasRemaining()) {
+                int length = page.getInt(), at = page.position(); long sequence = page.getLong(at);
+                var call = calls.get(Math.toIntExact(sequence - 1));
+                page.putLong(at + 24, call.beganNanos()); page.putLong(at + 32, call.lastCallbackExitNanos());
+                page.putLong(at + 40, call.observedNanos()); page.position(at + length);
+            }
+            pages.add(java.util.Base64.getEncoder().encodeToString(raw));
+        }
+        var changed = new BenchmarkWriteReturnPhaseEvidenceTest.Fixture(original.workload(), original.phase(), original.batches(),
+                new BenchmarkWriteReturnCapture.Result(calls, result.samples(), result.summary(), pages));
+        var owner = result.samples().getFirst().identity();
+        var bound = BenchmarkReturnMethodAdmission.verifyPhase(admitted, phase(changed, cold(owner), cold(owner)));
+        assertThat(bound.deliveries()).hasSize(48000);
+        assertThat(bound.commonWindow()).containsEntry("state", "UNQUALIFIED");
+        assertThatThrownBy(bound::intervalMetrics).isInstanceOf(BenchmarkReturnMethodAdmission.Refusal.class)
+                .hasMessageContaining("RETURN_COMMON_WINDOW_NOT_QUALIFIED");
+        for (String flag : BenchmarkReturnProducerOrigins.FLAGS) assertThat(bound.evidence()).containsEntry(flag, false);
+    }
+
     private static BenchmarkReturnMethodAdmission.AdmittedMethod control() {
         return BenchmarkReturnMethodAdmission.admitForControl(preflight(), inspected -> { });
     }

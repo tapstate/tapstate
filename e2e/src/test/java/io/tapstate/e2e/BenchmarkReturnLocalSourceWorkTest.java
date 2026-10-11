@@ -92,6 +92,19 @@ class BenchmarkReturnLocalSourceWorkTest {
         assertThatThrownBy(() -> new BenchmarkReturnLocalSourceWork.Capacity(96_000, Long.MAX_VALUE, 960)).isInstanceOf(ArithmeticException.class);
     }
 
+    @Test void prior_batch_quotient_refuses_a_bounded_text_roster_before_parser_or_layout() {
+        var workload = BenchmarkWorkloadDefinitions.byId("copy"); var original = workload.phase("cdc-update");
+        var altered = new BenchmarkWorkloadDefinitions.Phase(original.id(), original.stage(), true,
+                original.expectedLogicalOutputChanges(), java.util.Collections.nCopies(961, "SELECT 1"), 1,
+                original.batchInterval(), original.expectedLogicalCoverage(), original.targets());
+        try (var ignored = scope(BenchmarkReturnLocalSourceWork.bounds(ORIGINAL))) {
+            assertThatThrownBy(() -> BenchmarkReturnLocalSourceWork.guardMeasuredAssociationSql(altered))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("prior shape");
+        }
+        assertThat(BenchmarkReturnLocalSourceWork.COLD_TUPLES_PER_STATEMENT)
+                .isEqualTo(BenchmarkReturnLocalSourceWork.MEASURED_SQL_CHARS + 1);
+    }
+
     private static BenchmarkReturnWorkBudget.Scope scope(Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> bounds) {
         var excluded = EnumSet.allOf(BenchmarkReturnWorkBudget.Activity.class); excluded.removeAll(bounds.keySet());
         return BenchmarkReturnWorkBudget.activate(new BenchmarkReturnWorkBudget.Definition("local-control", "a".repeat(64),

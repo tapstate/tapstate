@@ -118,7 +118,7 @@ final class BenchmarkReturnWorkBudgetProfile {
         var upper = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
         var excluded = EnumSet.noneOf(BenchmarkReturnWorkBudget.Activity.class);
         if (!flags.rootCpu()) { excluded.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU); }
-        var reporting = BenchmarkReturnWorkBudgetReportPlan.prepare(inputs.workload(), separateWriter);
+        var reporting = BenchmarkReturnWorkBudgetReportPlan.prepareWithReturnComponents(inputs.workload(), separateWriter);
         Map<String, Object> reportingMetadata = reporting.metadata();
         if (separateWriter) {
             require(reportingMetadata.size() <= 32 && "A_PLAIN_PERIODIC_NOMINAL_SEPARATE_PRODUCER_WRITER".equals(reportingMetadata.get("mode")),
@@ -140,7 +140,7 @@ final class BenchmarkReturnWorkBudgetProfile {
         // A reader entry includes canonical re-encoding. Standalone encoding has its own COPY entry.
         upper.merge(BenchmarkReturnWorkBudget.Activity.DECODE, decode.plus(encode), BenchmarkReturnWorkBudget.Work::plus);
         upper.merge(BenchmarkReturnWorkBudget.Activity.COPY, encode, BenchmarkReturnWorkBudget.Work::plus);
-        require(inputs.workload().setupStatements() == BenchmarkSharedSupportSourceWork.SQL_STATEMENTS
+        require(inputs.workload().setupStatements() == BenchmarkSharedSupportSourceWork.geometry(inputs.workload().id()).setupStatements()
                         && inputs.workload().phases().stream().allMatch(phase -> phase.statementsPerBatch() == 1),
                 "shared fixture source recipe differs from the fixed stateless input");
         upper.merge(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
@@ -163,6 +163,12 @@ final class BenchmarkReturnWorkBudgetProfile {
         upper.merge(BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, coldTransportLocal, BenchmarkReturnWorkBudget.Work::plus);
         var emittedLocal = BenchmarkReturnEmittedRoster.localUpper();
         upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, emittedLocal, BenchmarkReturnWorkBudget.Work::plus);
+        var returnComponents = BenchmarkReturnComponentSourceWork.prepare(new BenchmarkReturnComponentSourceWork.Limits(
+                BenchmarkReturnWorkBudgetBindings.SourceRole.values().length, reporting.plan()));
+        // These are separately entered parent bodies sharing an actor, not extra services executed
+        // inside every old body. Keep the component-wise maximum of both complete per-entry bounds.
+        returnComponents.additions().forEach((activity, bound) -> upper.merge(activity, bound,
+                BenchmarkSharedSupportSourceWork::maximum));
         var gaps = new ArrayList<Gap>();
         for (var activity : BenchmarkReturnWorkBudget.Activity.values()) {
             if (!upper.containsKey(activity) && !excluded.contains(activity)) {
@@ -189,6 +195,7 @@ final class BenchmarkReturnWorkBudgetProfile {
         registration.put("producerOriginBindingSourceUpper", producerBindingLocal.evidence());
         registration.put("producerColdTransportSourceUpper", coldTransportLocal.evidence());
         registration.put("emittedRosterLocalSourceUpper", emittedLocal.evidence());
+        registration.put("returnComponentLocalSourceUpper", returnComponents.sourceEvidence());
         registration.put("terminalSourceTail", BenchmarkReturnWorkBudgetSourceTails.terminalEvidence(reporting.plan()));
         registration.put("structuralWorkBudgetQualified", false); registration.put("wholeMethodCostQualified", false);
         if (inputs.producerWriter() != null) {

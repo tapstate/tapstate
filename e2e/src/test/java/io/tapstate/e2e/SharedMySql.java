@@ -1,6 +1,5 @@
 package io.tapstate.e2e;
 
-import io.tapstate.testsupport.DockerGate;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
@@ -28,12 +27,19 @@ import java.util.Map;
  * read cannot open the binary log without them.
  */
 final class SharedMySql {
-
-    private static final DockerImageName IMAGE = DockerImageName.parse("mysql:8.0");
-
+    private static final DockerImageName IMAGE = image();
     private static MySQLContainer<?> container;
+    private SharedMySql() { }
 
-    private SharedMySql() {
+    @FunctionalInterface interface Connections { Connection open(String uri, String user, String password) throws SQLException; }
+    @FunctionalInterface private interface SqlBody { void accept(Statement statement) throws SQLException; }
+    @FunctionalInterface private interface SqlClose { void close() throws SQLException; }
+
+    private static DockerImageName image() {
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_IMAGE, () -> BenchmarkReturnWorkBudget.opaqueRequest(
+                        BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                        () -> DockerImageName.parse("mysql:8.0")));
     }
 
     /**
@@ -41,15 +47,26 @@ final class SharedMySql {
      * resource spells them - host, port, database, username, password, no one of which is the address.
      */
     static synchronized Map<String, Object> settings(String database) {
-        MySQLContainer<?> server = server();
-        provision(server, database);
-        Map<String, Object> settings = new LinkedHashMap<>();
-        settings.put("host", server.getHost());
-        settings.put("port", server.getMappedPort(MySQLContainer.MYSQL_PORT));
-        settings.put("database", database);
-        settings.put("username", server.getUsername());
-        settings.put("password", server.getPassword());
-        return settings;
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_SETTINGS, () -> {
+                    BenchmarkSharedSupportSourceWork.scalar(database, BenchmarkSharedSupportSourceWork.TEXT);
+                    MySQLContainer<?> server = server();
+                    provision(server, database, DriverManager::getConnection);
+                    var scope = BenchmarkReturnWorkBudget.current();
+                    Object host = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, server::getHost);
+                    BenchmarkSharedSupportSourceWork.local(host);
+                    Object port = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            () -> server.getMappedPort(MySQLContainer.MYSQL_PORT));
+                    Object username = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, server::getUsername);
+                    BenchmarkSharedSupportSourceWork.local(username);
+                    Object password = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, server::getPassword);
+                    BenchmarkSharedSupportSourceWork.local(password);
+                    BenchmarkSharedSupportSourceWork.local(port);
+                    Map<String, Object> settings = new LinkedHashMap<>();
+                    settings.put("host", host); settings.put("port", port); settings.put("database", database);
+                    settings.put("username", username); settings.put("password", password);
+                    return settings;
+                });
     }
 
     /**
@@ -60,47 +77,160 @@ final class SharedMySql {
      * test that already holds the settings.
      */
     static Connection connect(Map<String, Object> settings) throws SQLException {
-        String url = "jdbc:mysql://" + settings.get("host") + ":" + settings.get("port") + "/"
-                + settings.get("database") + "?sslMode=DISABLED&allowPublicKeyRetrieval=true";
-        return DriverManager.getConnection(
-                url, String.valueOf(settings.get("username")), String.valueOf(settings.get("password")));
+        return connect(settings, DriverManager::getConnection);
+    }
+
+    static Connection connect(Map<String, Object> settings, Connections connections) throws SQLException {
+        if (BenchmarkReturnWorkBudget.current() == null) {
+            String url = "jdbc:mysql://" + settings.get("host") + ":" + settings.get("port") + "/"
+                    + settings.get("database") + "?sslMode=DISABLED&allowPublicKeyRetrieval=true";
+            return connections.open(url, String.valueOf(settings.get("username")), String.valueOf(settings.get("password")));
+        }
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_CONNECT, () -> {
+                    Object host = settings.get("host"); BenchmarkSharedSupportSourceWork.local(host);
+                    String hostText = String.valueOf(host);
+                    Object port = settings.get("port"); BenchmarkSharedSupportSourceWork.local(port);
+                    String portText = String.valueOf(port);
+                    Object database = settings.get("database"); BenchmarkSharedSupportSourceWork.local(database);
+                    String url = "jdbc:mysql://" + hostText + ":" + portText + "/" + String.valueOf(database)
+                            + "?sslMode=DISABLED&allowPublicKeyRetrieval=true";
+                    Object username = settings.get("username"); BenchmarkSharedSupportSourceWork.local(username);
+                    String user = String.valueOf(username);
+                    Object password = settings.get("password"); BenchmarkSharedSupportSourceWork.local(password);
+                    String secret = String.valueOf(password);
+                    return BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(),
+                            BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> connections.open(url, user, secret));
+                });
     }
 
     private static MySQLContainer<?> server() {
-        if (container == null) {
-            DockerGate.require();
-            MySQLContainer<?> starting = new MySQLContainer<>(IMAGE);
-            starting.start();
-            grantReplication(starting);
-            container = starting;
-        }
-        return container;
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_SERVER, () -> {
+                    if (container == null) {
+                        BenchmarkSharedSupportSourceWork.dockerGate();
+                        var scope = BenchmarkReturnWorkBudget.current();
+                        MySQLContainer<?> starting = BenchmarkReturnWorkBudget.opaqueRequest(scope,
+                                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> new MySQLContainer<>(IMAGE));
+                        BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                                () -> { starting.start(); return null; });
+                        grantReplication(starting);
+                        container = starting;
+                    }
+                    return container;
+                });
     }
 
-    /** Creates the database and lets the test user work in it; both are idempotent, so a re-ask is free. */
-    private static void provision(MySQLContainer<?> server, String database) {
-        try (Connection root = asRoot(server); Statement statement = root.createStatement()) {
-            statement.execute("CREATE DATABASE IF NOT EXISTS `" + database + "`");
-            statement.execute(
-                    "GRANT ALL PRIVILEGES ON `" + database + "`.* TO '" + server.getUsername() + "'@'%'");
-            statement.execute("FLUSH PRIVILEGES");
-        } catch (SQLException e) {
-            throw new IllegalStateException("cannot provision the database " + database, e);
-        }
+    /** The SQL order and SQLException wrapper are the original fixture contract. */
+    static void provision(MySQLContainer<?> server, String database, Connections connections) {
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_PROVISION, () -> {
+                    BenchmarkSharedSupportSourceWork.scalar(database, BenchmarkSharedSupportSourceWork.TEXT);
+                    try {
+                        rootStatements(server, connections, statement -> {
+                            command(statement, "CREATE DATABASE IF NOT EXISTS `" + database + "`");
+                            String username = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                                    BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, server::getUsername);
+                            BenchmarkSharedSupportSourceWork.local(username);
+                            command(statement, "GRANT ALL PRIVILEGES ON `" + database + "`.* TO '" + username + "'@'%'");
+                            command(statement, "FLUSH PRIVILEGES");
+                        });
+                    } catch (SQLException e) { throw new IllegalStateException("cannot provision the database " + database, e); }
+                    return null;
+                });
     }
 
     /** Binlog CDC needs replication privileges the default test user lacks; they are granted as root. */
     static void grantReplication(MySQLContainer<?> server) {
-        try (Connection root = asRoot(server); Statement statement = root.createStatement()) {
-            statement.execute("GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD, SELECT ON *.* TO '"
-                    + server.getUsername() + "'@'%'");
-            statement.execute("FLUSH PRIVILEGES");
-        } catch (SQLException e) {
-            throw new IllegalStateException("cannot grant replication privileges", e);
-        }
+        grantReplication(server, DriverManager::getConnection);
     }
 
-    private static Connection asRoot(MySQLContainer<?> server) throws SQLException {
-        return DriverManager.getConnection(server.getJdbcUrl(), "root", server.getPassword());
+    static void grantReplication(MySQLContainer<?> server, Connections connections) {
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_GRANT, () -> {
+                    try {
+                        rootStatements(server, connections, statement -> {
+                            String username = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                                    BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, server::getUsername);
+                            BenchmarkSharedSupportSourceWork.local(username);
+                            command(statement, "GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD, SELECT ON *.* TO '" + username + "'@'%'");
+                            command(statement, "FLUSH PRIVILEGES");
+                        });
+                    } catch (SQLException e) { throw new IllegalStateException("cannot grant replication privileges", e); }
+                    return null;
+                });
+    }
+
+    private static Connection asRoot(MySQLContainer<?> server, Connections connections) throws SQLException {
+        return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_ROOT_CONNECT, () -> {
+                    var scope = BenchmarkReturnWorkBudget.current();
+                    String uri = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, server::getJdbcUrl);
+                    BenchmarkSharedSupportSourceWork.local(uri);
+                    String password = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, server::getPassword);
+                    BenchmarkSharedSupportSourceWork.local(password);
+                    return BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            () -> connections.open(uri, "root", password));
+                });
+    }
+
+    private static void command(Statement statement, String sql) throws SQLException {
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_COMMAND, () -> {
+                    // This is derived concatenation of two prior-bounded TEXT scalars and fixed SQL.
+                    BenchmarkSharedSupportSourceWork.scalar(sql, BenchmarkSharedSupportSourceWork.MY_COMMAND_TEXT);
+                    BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                            () -> statement.execute(sql));
+                    return null;
+                });
+    }
+
+    /** Reproduce TWR close order, including the exact primary and all original close suppression. */
+    private static void rootStatements(MySQLContainer<?> server, Connections connections, SqlBody body) throws SQLException {
+        if (BenchmarkReturnWorkBudget.current() == null) {
+            // Keep Java's original TWR semantics, including pathological self-suppression.
+            try (Connection root = asRoot(server, connections); Statement statement = root.createStatement()) {
+                body.accept(statement);
+            }
+            return;
+        }
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.MY_STATEMENTS, () -> {
+                    Connection root = null; Statement statement = null; Throwable primary = null;
+                    try {
+                        root = asRoot(server, connections);
+                        Connection actual = root;
+                        statement = BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(),
+                                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, actual::createStatement);
+                        body.accept(statement);
+                    } catch (SQLException | RuntimeException | Error failure) { primary = failure; throw failure; }
+                    finally {
+                        Throwable ending = primary;
+                        if (statement != null) { Statement actual = statement; ending = closeSql(actual::close, ending); }
+                        if (root != null) { Connection actual = root; ending = closeSql(actual::close, ending); }
+                        if (ending != null && ending != primary) {
+                            if (ending instanceof SQLException failure) throw failure;
+                            if (ending instanceof RuntimeException failure) throw failure;
+                            if (ending instanceof Error failure) throw failure;
+                            throw new AssertionError("owned SQL close returned an unsupported failure", ending);
+                        }
+                    }
+                    return null;
+                });
+    }
+
+    private static Throwable closeSql(SqlClose close, Throwable primary) {
+        try {
+            BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                    BenchmarkSharedSupportSourceWork.Kind.MY_CLOSE, () -> {
+                        BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                                () -> { close.close(); return null; }); return null;
+                    });
+        } catch (SQLException | RuntimeException | Error failure) {
+            if (primary == null) return failure;
+            try { primary.addSuppressed(failure); }
+            catch (IllegalArgumentException selfSuppression) { return selfSuppression; }
+        }
+        return primary;
     }
 }

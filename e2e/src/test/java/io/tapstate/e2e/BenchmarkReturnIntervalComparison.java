@@ -21,8 +21,12 @@ final class BenchmarkReturnIntervalComparison {
 
     record Bounds(BigDecimal lower, BigDecimal upper) {
         Bounds {
+            var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.COMPARISON_INPUT);
+            try {
             scalar(lower); scalar(upper);
             require(lower.signum() >= 0 && lower.compareTo(upper) <= 0, "invalid nonnegative bounds");
+            BenchmarkReturnWorkBudget.done(ticket);
+            } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
         }
         static Bounds point(long value) { return new Bounds(BigDecimal.valueOf(value), BigDecimal.valueOf(value)); }
         static Bounds point(double value) {
@@ -35,9 +39,13 @@ final class BenchmarkReturnIntervalComparison {
     record Fork(PipelineBenchmarkComparison.Arm arm, Bounds throughput, Bounds p99,
                 long completedCohortRows, long peakHeapBytes, long peakRssBytes) {
         Fork {
+            var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.COMPARISON_INPUT);
+            try {
             require(arm != null && throughput != null && p99 != null && completedCohortRows >= 10000
                     && throughput.lower().signum() > 0 && p99.lower().signum() > 0
                     && peakHeapBytes > 0 && peakRssBytes > 0, "fork metric or memory input is incomplete");
+            BenchmarkReturnWorkBudget.done(ticket);
+            } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
         }
     }
 
@@ -46,11 +54,23 @@ final class BenchmarkReturnIntervalComparison {
     record Pair(Summary baseline, Summary candidate) { }
     record Evaluation(Map<PipelineBenchmarkComparison.Workload, Pair> workloads,
                       List<String> failures, List<String> unresolved) {
-        Evaluation { workloads = Map.copyOf(workloads); failures = List.copyOf(failures); unresolved = List.copyOf(unresolved); }
+        Evaluation {
+            var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.COMPARISON_INPUT);
+            try {
+                require(workloads != null && workloads.size() <= 3 && failures != null && failures.size() <= 24
+                        && unresolved != null && unresolved.size() <= 24, "evaluation projection exceeds prior roster");
+                workloads = Map.copyOf(workloads); failures = List.copyOf(failures); unresolved = List.copyOf(unresolved);
+                BenchmarkReturnWorkBudget.done(ticket);
+            } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
+        }
         State state() { return !failures.isEmpty() ? State.FAIL : unresolved.isEmpty() ? State.PASS : State.UNKNOWN; }
     }
 
     static Evaluation evaluateObservabilityCost(Map<PipelineBenchmarkComparison.Workload, List<Fork>> runs) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.COMPARISON,
+                () -> evaluateBounded(runs));
+    }
+    private static Evaluation evaluateBounded(Map<PipelineBenchmarkComparison.Workload, List<Fork>> runs) {
         require(runs != null && runs.keySet().equals(Set.of(PipelineBenchmarkComparison.Workload.values())),
                 "all three workloads are required");
         var summaries = new EnumMap<PipelineBenchmarkComparison.Workload, Pair>(PipelineBenchmarkComparison.Workload.class);
@@ -97,6 +117,10 @@ final class BenchmarkReturnIntervalComparison {
 
     /** The rectangular enclosure retains shared-median uncertainty; it cannot turn uncertainty into PASS. */
     static Statistics statistics(List<Bounds> values) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.REAL_STATISTICS,
+                () -> statisticsBounded(values));
+    }
+    private static Statistics statisticsBounded(List<Bounds> values) {
         require(values != null && values.size() == 5 && values.stream().allMatch(java.util.Objects::nonNull),
                 "exactly five bounded values are required");
         var median = median(values);
@@ -121,6 +145,10 @@ final class BenchmarkReturnIntervalComparison {
     private static boolean point(Bounds value) { return value.lower().compareTo(value.upper()) == 0; }
 
     static Statistics floatingStatistics(List<Bounds> values) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.FLOAT_STATISTICS,
+                () -> floatingStatisticsBounded(values));
+    }
+    private static Statistics floatingStatisticsBounded(List<Bounds> values) {
         require(values != null && values.size() == 5 && values.stream().allMatch(java.util.Objects::nonNull),
                 "exactly five bounded values are required");
         if (values.stream().allMatch(BenchmarkReturnIntervalComparison::point)) {

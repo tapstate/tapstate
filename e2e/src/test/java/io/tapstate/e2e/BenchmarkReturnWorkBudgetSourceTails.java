@@ -77,7 +77,15 @@ final class BenchmarkReturnWorkBudgetSourceTails {
         long bytes = add(mul(4, characters), mul(4, recipeChars));
         var upper = work(FACTORY_CALLS + 3L, requests, records, 0, bytes,
                 add(mul(FACTORY_CALLS, 8), 3 * 8L, targetSortCalls), elements, elements)
-                .plus(BenchmarkSharedSupportSourceWork.factoryUpper());
+                .plus(BenchmarkSharedSupportSourceWork.factoryUpper())
+                // The two existing profile inspections each assemble one new catalogue and one
+                // component table. The reused private token adds one cached-definition pipeline;
+                // the known readless authority has one fixed owned initializer, without IO.
+                .plus(BenchmarkReturnComponentSourceWork.factoryUpper(2))
+                .plus(BenchmarkReturnCaptureMaterialBounds.factoryUpper().times(2))
+                .plus(BenchmarkReturnWorkBudgetReportPlan.returnCatalogueUpper(2))
+                .plus(BenchmarkReturnComponentSourceWork.trustedCacheUpper())
+                .plus(BenchmarkReturnComponentSourceWork.authorityInitializationUpper());
         var evidence = metadata("FACTORY_SOURCE_UPPER_ONLY", upper, List.of(
                 "SEVEN_ORIGINAL_STATELESS_96000_CONSTRUCTS", "ONE_ALL_COPY_STATELESS_STATEFUL_12000_INITIALIZER",
                 "SETUP_SQL_ROW_TEMPLATES_500_BATCHES_AND_UPDATE_RANGES100", "SIX_PHASE_COVERAGE_AND_TARGET_CHECKSUM_TRAVERSALS",
@@ -86,6 +94,16 @@ final class BenchmarkReturnWorkBudgetSourceTails {
         evidence.put("selectedRecordsPerCall", selectedRecords); evidence.put("initializerRecords", initializerRecords);
         evidence.put("fixedFactoryRecipe", "stateless:96000:424242:POSTGRES:6");
         evidence.put("sourceStepsIdentity", "SEVEN_SELECTED_PLUS_SINGLE_BOUNDED_ALL_V1");
+        evidence.put("returnComponentTableConstructions", 2);
+        evidence.put("captureMaterialTableConstructions", 2);
+        evidence.put("captureMaterialFactoryUpper", BenchmarkReturnCaptureMaterialBounds.factoryUpper().times(2).evidence());
+        evidence.put("returnComponentCatalogueConstructions", 2);
+        evidence.put("privateAuthenticatedProfileCacheConstructions", 1);
+        evidence.put("knownReadlessAuthorityInitializers", 1);
+        evidence.put("returnComponentFactoryUpper", BenchmarkReturnComponentSourceWork.factoryUpper(2).evidence());
+        evidence.put("returnComponentCatalogueUpper", BenchmarkReturnWorkBudgetReportPlan.returnCatalogueUpper(2).evidence());
+        evidence.put("privateAuthenticatedProfileCacheUpper", BenchmarkReturnComponentSourceWork.trustedCacheUpper().evidence());
+        evidence.put("knownReadlessAuthorityInitializerUpper", BenchmarkReturnComponentSourceWork.authorityInitializationUpper().evidence());
         return new Tail(upper, evidence);
     }
 

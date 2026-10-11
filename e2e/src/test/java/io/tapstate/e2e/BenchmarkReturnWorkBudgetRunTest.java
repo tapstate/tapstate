@@ -530,6 +530,37 @@ class BenchmarkReturnWorkBudgetRunTest {
         }
     }
 
+    @Test void trusted_preflight_requires_an_actual_active_run_before_any_metadata_request() {
+        assertThat(BenchmarkReturnWorkBudgetRun.current()).isNull();
+        assertThatThrownBy(BenchmarkReturnWorkBudgetRun::acquireTrustedPreflight)
+                .isInstanceOf(AssertionError.class).hasMessageContaining("actual acquired Run");
+    }
+
+    @Test void actual_temp_byte_acquisition_without_loaded_root_origins_cannot_issue_a_trusted_preflight() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("trusted-preflight-missing-roots"); configure(fixture);
+            try (var run = fixture.open()) {
+                var before = BenchmarkReturnWorkBudget.current().snapshot();
+                assertThatThrownBy(BenchmarkReturnWorkBudgetRun::acquireTrustedPreflight)
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("actual root origins");
+                var after = BenchmarkReturnWorkBudget.current().snapshot();
+                assertThat(((Map<?, ?>) after.get("activities")).get("NATIVE_METADATA"))
+                        .isEqualTo(((Map<?, ?>) before.get("activities")).get("NATIVE_METADATA"));
+                assertThat(((Map<?, ?>) after.get("activities")).get("CLOCK_REQUEST"))
+                        .isEqualTo(((Map<?, ?>) before.get("activities")).get("CLOCK_REQUEST"));
+                Map<?, ?> beforeInstall = (Map<?, ?>) ((Map<?, ?>) before.get("activities")).get("INSTALL_BINDINGS");
+                Map<?, ?> afterInstall = (Map<?, ?>) ((Map<?, ?>) after.get("activities")).get("INSTALL_BINDINGS");
+                assertThat((Long) afterInstall.get("attempts")).isEqualTo((Long) beforeInstall.get("attempts") + 1);
+                assertThat((Long) afterInstall.get("failedAttempts")).isEqualTo((Long) beforeInstall.get("failedAttempts") + 1);
+                assertThat(after).containsEntry("pendingOperations", 0L);
+                assertThat(BenchmarkReturnWorkBudget.current().primaryCause()).isInstanceOf(AssertionError.class)
+                        .hasMessageContaining("actual root origins");
+            }
+        }
+        assertThat(BenchmarkReturnWorkBudgetRun.current()).isNull();
+        assertThat(BenchmarkReturnWorkBudget.current()).isNull();
+    }
+
     private Fixture fixture(String name) throws Exception { return fixture(name, false); }
 
     private Fixture fixture(String name, boolean separateWriter) throws Exception {

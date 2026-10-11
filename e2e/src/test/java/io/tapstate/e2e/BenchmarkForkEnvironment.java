@@ -203,6 +203,10 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     static BenchmarkForkEnvironment open(BenchmarkWorkloadDefinitions.Workload workload,
             Path applicationJar, String forkId, BootLauncher launcher, BeforeStart beforeStart) throws Exception {
         var scope = BenchmarkReturnWorkBudget.current();
+        if (scope != null) {
+            BenchmarkSharedSupportSourceWork.originalWorkload(workload);
+            BenchmarkSharedSupportSourceWork.scalar(forkId, BenchmarkSharedSupportSourceWork.NAME);
+        }
         var opening = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(applicationJar, "applicationJar");
@@ -232,7 +236,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             execute(source, workload.setupSql());
             // The view database is product-wide on this replica set. Forks run serially, and the
             // preceding application process is closed before these shared collections are dropped.
-            workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri);
+            resetTargets(workload, externalTargetUri, managedViewsUri, operatorStateUri);
             if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
                 Map<String, Object> identity = SharedMongo.diagnosticIdentity();
                 System.out.println("benchmark-owned-mongo-clock-fixture=" + JsonWriter.write(identity));
@@ -410,12 +414,32 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     void executeOneSourceUpdate(String sql) throws Exception {
         requireOpen();
         Objects.requireNonNull(sql, "sql");
-        try (Statement statement = source.createStatement()) {
-            int affected = statement.executeUpdate(sql);
-            if (affected != 1) {
-                throw new AssertionError("benchmark boundary update affected " + affected + " rows");
+        executeOneSourceUpdate(source, sql);
+    }
+
+    static void executeOneSourceUpdate(Connection source, String sql) throws Exception {
+        if (BenchmarkReturnWorkBudget.current() == null) {
+            try (Statement statement = source.createStatement()) {
+                int affected = statement.executeUpdate(sql);
+                if (affected != 1) throw new AssertionError("benchmark boundary update affected " + affected + " rows");
             }
+            return;
         }
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.SQL_UPDATE, () -> {
+                    BenchmarkSharedSupportSourceWork.scalar(sql, BenchmarkSharedSupportSourceWork.TEXT);
+                    var scope = BenchmarkReturnWorkBudget.current();
+                    Statement statement = BenchmarkReturnWorkBudget.external(scope,
+                            BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, source::createStatement);
+                    Throwable primary = null;
+                    try {
+                        int affected = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                                () -> statement.executeUpdate(sql));
+                        if (affected != 1) throw new AssertionError("benchmark boundary update affected " + affected + " rows");
+                    } catch (Exception | Error failure) { primary = failure; throw failure; }
+                    finally { closeSqlStatement(statement, primary); }
+                    return null;
+                });
     }
 
     /** Recheck the last completed phase after the unmeasured source boundary has been ACKed. */
@@ -437,6 +461,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                 || !workload.phases().get(nextPhase).equals(phase)) {
             throw new IllegalArgumentException("benchmark phases must run in declared order");
         }
+        BenchmarkSharedSupportSourceWork.phaseSql(phase);
         ClockAnchor clockAnchor = ClockAnchor.capture();
         long started = BenchmarkReturnWorkBudget.rootNanoTime();
         long nextBatchStart = started;
@@ -672,11 +697,9 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private static void executeBounded(Connection connection, List<String> sql) throws Exception {
         var scope = BenchmarkReturnWorkBudget.current();
-        if (scope != null && sql.size() > BenchmarkSharedSupportSourceWork.SQL_STATEMENTS) {
-            BenchmarkReturnWorkBudget.gap(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
-                    "SQL_HELPER_EXCEEDS_REGISTERED_STATELESS_SETUP_OR_SINGLE_BATCH_SHAPE");
-            throw new AssertionError("SQL helper exceeds its registered local statement shape");
-        }
+        // Fixed 193/194/581 setup and one/two-statement batches. Reject prior shape before the
+        // first traversal or provider request; scalar guards also precede createStatement.
+        BenchmarkSharedSupportSourceWork.sqlRoster(sql, BenchmarkSharedSupportSourceWork.SQL_STATEMENTS);
         if (sql.isEmpty()) return;
         Statement statement = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, connection::createStatement);
         Throwable primary = null;
@@ -690,14 +713,108 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                         });
             }
         } catch (Exception | Error failure) { primary = failure; throw failure; }
-        finally {
-            try {
-                BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP,
-                        () -> { statement.close(); return null; });
-            } catch (Exception | Error closeFailure) {
-                if (primary == null) throw closeFailure;
-                if (closeFailure != primary) primary.addSuppressed(closeFailure);
-            }
+        finally { closeSqlStatement(statement, primary); }
+    }
+
+    private static void closeSqlStatement(Statement statement, Throwable primary) throws Exception {
+        try {
+            BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                    () -> { statement.close(); return null; });
+        } catch (Exception | Error closeFailure) {
+            if (primary == null) throw closeFailure;
+            if (closeFailure != primary) primary.addSuppressed(closeFailure);
+        }
+    }
+
+    /** The unscoped method keeps the original workload route; only the explicit budget path uses
+     * the same target/state reset sequence with complete child and close accounting. */
+    static void resetTargets(BenchmarkWorkloadDefinitions.Workload workload, String externalTargetUri,
+            String managedViewsUri, String operatorStateUri) {
+        if (BenchmarkReturnWorkBudget.current() == null) {
+            workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri); return;
+        }
+        resetTargetsUsing(workload, externalTargetUri, managedViewsUri, operatorStateUri, MongoClients::create);
+    }
+
+    static void resetTargetsUsing(BenchmarkWorkloadDefinitions.Workload workload, String externalTargetUri,
+            String managedViewsUri, String operatorStateUri,
+            java.util.function.Function<ConnectionString, MongoClient> clients) {
+        if (BenchmarkReturnWorkBudget.current() == null) {
+            workload.resetTargetsUsing(externalTargetUri, managedViewsUri, operatorStateUri, clients); return;
+        }
+        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                BenchmarkSharedSupportSourceWork.Kind.TARGET_RESET, () -> {
+                    BenchmarkSharedSupportSourceWork.originalWorkload(workload);
+                    BenchmarkSharedSupportSourceWork.uri(externalTargetUri);
+                    BenchmarkSharedSupportSourceWork.uri(managedViewsUri);
+                    BenchmarkSharedSupportSourceWork.uri(operatorStateUri);
+                    for (var target : workload.targetResets()) {
+                        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                                BenchmarkSharedSupportSourceWork.Kind.TARGET_RESET_ROW, () -> {
+                                    String uri = target.location() == BenchmarkWorkloadDefinitions.TargetLocation.MANAGED_VIEW
+                                            ? managedViewsUri : externalTargetUri;
+                                    resetTarget(target, uri, clients); return null;
+                                });
+                    }
+                    if (workload.id().equals("stateful")) {
+                        BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                                BenchmarkSharedSupportSourceWork.Kind.STATE_RESET, () -> {
+                                    resetState(operatorStateUri, clients); return null;
+                                });
+                    }
+                    return null;
+                });
+    }
+
+    private static void resetTarget(BenchmarkWorkloadDefinitions.TargetExpectation target, String uri,
+            java.util.function.Function<ConnectionString, MongoClient> clients) {
+        BenchmarkSharedSupportSourceWork.scalar(target.table(), BenchmarkSharedSupportSourceWork.NAME);
+        var scope = BenchmarkReturnWorkBudget.current();
+        ConnectionString address = BenchmarkReturnWorkBudget.opaqueRequest(scope,
+                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> new ConnectionString(uri));
+        String database = Objects.requireNonNull(BenchmarkReturnWorkBudget.opaqueRequest(scope,
+                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, address::getDatabase), "target URI has no database");
+        BenchmarkSharedSupportSourceWork.scalar(database, BenchmarkSharedSupportSourceWork.URI);
+        MongoClient client = BenchmarkReturnWorkBudget.opaqueRequest(scope,
+                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> clients.apply(address));
+        Throwable primary = null;
+        try {
+            var actualDatabase = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    () -> client.getDatabase(database));
+            var collection = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    () -> actualDatabase.getCollection(target.table()));
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    () -> { collection.drop(); return null; });
+        } catch (RuntimeException | Error failure) { primary = failure; throw failure; }
+        finally { closeResetClient(client, primary); }
+    }
+
+    private static void resetState(String uri, java.util.function.Function<ConnectionString, MongoClient> clients) {
+        var scope = BenchmarkReturnWorkBudget.current();
+        ConnectionString address = BenchmarkReturnWorkBudget.opaqueRequest(scope,
+                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> new ConnectionString(uri));
+        String database = Objects.requireNonNull(BenchmarkReturnWorkBudget.opaqueRequest(scope,
+                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, address::getDatabase), "state URI has no database");
+        BenchmarkSharedSupportSourceWork.scalar(database, BenchmarkSharedSupportSourceWork.URI);
+        MongoClient client = BenchmarkReturnWorkBudget.opaqueRequest(scope,
+                BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, () -> clients.apply(address));
+        Throwable primary = null;
+        try {
+            var actualDatabase = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    () -> client.getDatabase(database));
+            BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    () -> { actualDatabase.drop(); return null; });
+        } catch (RuntimeException | Error failure) { primary = failure; throw failure; }
+        finally { closeResetClient(client, primary); }
+    }
+
+    private static void closeResetClient(MongoClient client, Throwable primary) {
+        try {
+            BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CLEANUP,
+                    () -> { client.close(); return null; });
+        } catch (RuntimeException | Error closeFailure) {
+            if (primary == null) throw closeFailure;
+            if (closeFailure != primary) primary.addSuppressed(closeFailure);
         }
     }
 

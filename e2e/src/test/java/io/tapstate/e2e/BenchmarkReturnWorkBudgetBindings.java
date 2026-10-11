@@ -65,7 +65,10 @@ final class BenchmarkReturnWorkBudgetBindings {
         DOCKER_GATE("DockerGate", "test-support"),
         RETURN_INTERVAL_COMPARISON("BenchmarkReturnIntervalComparison"),
         RETURN_INTERVAL_METRICS("BenchmarkReturnIntervalMetrics"),
-        RETURN_METHOD_ADMISSION("BenchmarkReturnMethodAdmission");
+        RETURN_METHOD_ADMISSION("BenchmarkReturnMethodAdmission"),
+        RETURN_COMPONENT_SOURCE_WORK("BenchmarkReturnComponentSourceWork"),
+        NATIVE_SOURCE_AUTHORITY("BenchmarkNativeSourceAuthority"),
+        SHARED_MYSQL("SharedMySql"), RETURN_CAPTURE_MATERIAL_BOUNDS("BenchmarkReturnCaptureMaterialBounds");
 
         private final String binaryName, sourcePath, module;
         SourceRole(String name) {

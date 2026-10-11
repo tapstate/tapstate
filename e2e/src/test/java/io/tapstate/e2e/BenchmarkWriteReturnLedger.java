@@ -47,7 +47,7 @@ final class BenchmarkWriteReturnLedger {
 
     record ErrorDetail(int rowOrdinal, String failureType) { }
     record Row(int kind, List<Integer> keys) {
-        Row { keys = List.copyOf(keys); }
+        Row { BenchmarkReturnCaptureMaterialBounds.rowKeys(keys); keys = BenchmarkReturnCaptureMaterialBounds.copy(keys, 2); }
     }
 
     static Page decode(byte[] bytes) {

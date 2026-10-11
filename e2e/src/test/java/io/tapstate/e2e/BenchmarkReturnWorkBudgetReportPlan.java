@@ -17,6 +17,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     private static final int OUTER_DEPTH = 12;
     private static final int SOURCE_KEY_BYTES = 4 * SOURCE_LEAF_CHARS;
     private static final int MAX_LEAF = Math.max(SOURCE_KEY_BYTES, base64(PAGE_BYTES));
+    static final int RETURN_COMPONENT_CATALOGUE_ROWS = 15, CATALOGUE_ROWS = 64;
 
     record Component(String id, String sourceBranch, long rows, long nodesPerRow, long stringsPerRow,
                      int leafUtf8Upper, int localDepthUpper, String boundBasis) {
@@ -49,6 +50,16 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     }
 
     static Prepared prepare(BenchmarkReturnWorkBudgetProfile.WorkloadInput workload, boolean separateProducerWriter) {
+        return prepare(workload, separateProducerWriter, false);
+    }
+
+    static Prepared prepareWithReturnComponents(BenchmarkReturnWorkBudgetProfile.WorkloadInput workload,
+                                                boolean separateProducerWriter) {
+        return prepare(workload, separateProducerWriter, true);
+    }
+
+    private static Prepared prepare(BenchmarkReturnWorkBudgetProfile.WorkloadInput workload,
+                                    boolean separateProducerWriter, boolean returnComponents) {
         require(workload != null && "stateless".equals(workload.id()) && workload.rows() == 96000 && workload.seed() == 424242,
                 "only the unchanged stateless pilot is registered");
         require(workload.equals(BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless")),
@@ -124,7 +135,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 1, 128L + BenchmarkReturnWorkBudgetBindings.SourceRole.values().length * mapNodes(4) + 512L * mapNodes(7),
                 32768L + BenchmarkReturnWorkBudgetBindings.SourceRole.values().length * (4L * 128 + 128 + 512 + 64)
                         + 512L * (7L * 128 + 128 + 256 + 256 + 64 + 4096 + 1024),
-                4096, 5, "THREE_OWNED_COMPILER_OUTPUTS_ALL_NAMED_SOURCE_ROLES_512_SELECTED_MEMBERS_PRIOR_FIELD_CAPS");
+                4096, 5, "FOUR_OWNED_COMPILER_OUTPUTS_ALL_NAMED_SOURCE_ROLES_512_SELECTED_MEMBERS_PRIOR_FIELD_CAPS");
         add(parts, "NATIVE_BASELINE_CHECKPOINTS", "BenchmarkNativeCounterBaseline.evidence.before/after",
                 2L * (1 + 2 + 1), mapNodes(10) + 2L * 4096 + 128 + 1,
                 PAGE_BYTES + 10L * 64 + 4L * 512, 512, 5,
@@ -158,13 +169,14 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                     3, mapNodes(32), writerStrings, 4096, 3,
                     "THREE_FIXED_PRODUCER_ONLY_TUPLE_MAPS_PRIOR_PATH4096_FIELDS32_NO_OBSERVED_SIZE_CAP");
         }
+        if (returnComponents) { addReturnComponentCatalogue(parts, measuredPhases, phase.batches()); }
         long nodes = 1, strings = 0;
         for (Component part : parts) {
             nodes = Math.addExact(nodes, part.nodes()); strings = Math.addExact(strings, part.strings());
         }
         var plan = new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(nodes,
                 OUTER_DEPTH + SOURCE_PACKET_DEPTH, MAX_LEAF, strings, SOURCE_KEY_BYTES, 64);
-        var metadata = Map.<String, Object>ofEntries(
+        Map<String, Object> metadata = Map.<String, Object>ofEntries(
                 Map.entry("state", "SOURCE_DERIVED_COMPLETE_PILOT_REPORT_ENVELOPE"),
                 Map.entry("scope", "ONE_COMPLETE_FORK_OR_ONE_CONTROLLED_STDOUT_FAILURE_TREE"),
                 Map.entry("mode", separateProducerWriter ? "A_PLAIN_PERIODIC_NOMINAL_SEPARATE_PRODUCER_WRITER" : "B_PLAIN_ON_PERIODIC_NOMINAL"), Map.entry("rows", workload.rows()), Map.entry("seed", workload.seed()),
@@ -178,7 +190,104 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 Map.entry("opaqueStdoutExcluded", "JVM_LOGGING_STACK_TRACES_AND_OPAQUE_SERVICE_OUTPUT"),
                 Map.entry("actualSizeUsedAsPriorBound", false), Map.entry("wholeMethodCostQualified", false),
                 Map.entry("performanceAcceptanceEligible", false));
+        if (returnComponents) {
+            var additional = new java.util.LinkedHashMap<String, Object>(metadata);
+            additional.put("returnComponentsIncluded", true);
+            additional.put("returnComponentProjectionScope",
+                    "ONE_METHOD_AND_AUTHORITY_HEADER_ONE_BOUND_EVIDENCE_AND_COMMON_ACCESSOR_PER_ORIGINAL_MEASURED_PHASE");
+            additional.put("sourceGuardDependencies", List.of(
+                    "CONFIRMED_CONSUMER_JSON_PRIOR_UTF8_65536_DEPTH16_TOKENS4096",
+                    "RESUME_BSON_LOCAL_MATERIAL_BEFORE_TOJSON_NODES4096_DEPTH16_BYTES2097152",
+                    "HELLO_PRIMARY_CHARACTERS65536_AND_ORIGINAL_OBJECTID24_HEX_BEFORE_READING_DTO",
+                    "CONTROLLED_FAILURE_PACKET_PRIOR_PLAN_VALIDATION_BEFORE_JSON_ENCODING",
+                    "METHOD_PHASE_MAX6_SOURCEBATCH960_CLOCK512_RAW_TWO_MIB_BEFORE_COPY_AND_CONSUMPTION",
+                    "ONE_BOUND_EVIDENCE_AND_ONE_COMMONWINDOW_ACCESSOR_PER_ORIGINAL_MEASURED_PHASE"));
+            metadata = Map.copyOf(additional);
+        }
         return new Prepared(plan, parts, metadata);
+    }
+
+    private static void addReturnComponentCatalogue(List<Component> parts, long phases, long batches) {
+        BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.COMPONENT_FACTORY,
+                () -> { addReturnComponentCatalogueBounded(parts, phases, batches); return null; });
+    }
+
+    private static void addReturnComponentCatalogueBounded(List<Component> parts, long phases, long batches) {
+        require(phases > 0 && phases <= 6 && batches >= 0 && batches <= 960,
+                "return component projection scalar roster differs");
+        require(parts != null && parts.size() <= CATALOGUE_ROWS - RETURN_COMPONENT_CATALOGUE_ROWS,
+                "return report prior descriptor roster exceeds its cap");
+        // These are additional representations, even when a legacy report already contains the
+        // original phase/raw/clock/hello data. No spare capacity from an unrelated row is borrowed.
+        add(parts, "METHOD_PHASE_SCAFFOLDS", "BenchmarkReturnMethodAdmission.verifyPhase/PhaseEvidence.recordNominal",
+                phases, mapNodes(64) + 3L * mapNodes(4), 64L * (128 + 512), 8192, 6,
+                "FIXED_PHASE_SUMMARY_INTERVAL_RATE_AND_EIGHTEEN_FALSE_FIELDS");
+        add(parts, "METHOD_SOURCE_BATCH_PROJECTION", "BenchmarkWriteReturnPhaseEvidence.sourceBatches",
+                phases * (batches + 1), mapNodes(3), 3L * 64, 128, 4,
+                "ONE_THREE_NUMERIC_FIELD_MAP_PER_ORIGINAL_BATCH_PLUS_LIST_NODE");
+        add(parts, "METHOD_CLOCK_SAMPLE_PROJECTION", "BenchmarkWriteReturnPhaseEvidence.clockSamples",
+                phases * (CLOCK_SAMPLES + 1L), mapNodes(6), 6L * 64, 128, 4,
+                "ONE_COMPLETE_PERIODIC_SAMPLE_ROSTER_MAX512_PLUS_LIST_NODE");
+        add(parts, "METHOD_RAW_RETURN_PAGES", "BenchmarkWriteReturnPhaseEvidence.pagesBase64",
+                phases, PAGES + 1L, base64Total(RAW_BYTES, PAGES), base64(PAGE_BYTES), 3,
+                "ADDITIONAL_COMPLETE_TWO_MIB_RAW_PAGES_WITH_PRIOR_512_PADDING");
+        add(parts, "METHOD_NOMINAL_MAPPING", "BenchmarkNativeNominalReturnClock.evidence",
+                phases, 4096, 65536, 8192, 16,
+                "OWNED_IMMUTABLE_ROUTE_METADATA_PRIOR_FREEZE4096_NODES_65536_UTF8");
+        add(parts, "METHOD_ADMISSION_HEADERS", "AdmittedMethod.evidence/CostRecipe.evidence",
+                phases + 1, 4096, 65536, 8192, 16,
+                "ONE_ROOT_HEADER_PLUS_ONE_NESTED_HEADER_EACH_PHASE_ROUTE_AND_COST_RECIPE_INCLUDED");
+        long authorityNodes = mapNodes(64) + 6 + 5 + 2 + mapNodes(4);
+        long authorityStrings = 64L * (128 + 512) + 6L * 512 + 4L * (128 + 64) + 5L * 512;
+        add(parts, "METHOD_NATIVE_SOURCE_AUTHORITY", "BenchmarkNativeSourceAuthority.sourceRecipeEvidence",
+                1, authorityNodes, authorityStrings, 512, 4,
+                "FIXED64_FIELD_ENVELOPE_SIX_PATH_FOUR_CLASS_FIVE_OBLIGATION_LITERALS");
+        long commonNodes = mapNodes(40) + 2L * (mapNodes(3) + 2L * 3) + 11 + 10L * mapNodes(3) + 3L * mapNodes(2);
+        long commonStrings = 40L * (128 + 512) + 2L * (3 * 128L + 512) + 10L * 3 * 128 + 3L * 2 * 128;
+        add(parts, "METHOD_COMMON_WINDOW_CERTIFICATES", "BoundPhase.evidence.commonWindowCertificate/BoundPhase.commonWindow",
+                Math.multiplyExact(2, phases), commonNodes, commonStrings, 8192, 6,
+                "TWO_PROJECTIONS_MAX_PER_PHASE_FORTY_FIELDS_TWO_TARGETS_TEN_BINS_THREE_RATIOS");
+        add(parts, "METHOD_SERIAL_HELLO_READINGS", "BenchmarkTargetClock.validateSeries.readings",
+                Math.multiplyExact(phases, 6000), mapNodes(9), 9L * 64 + 4L * 65536 + 4L * 24 + 64,
+                MAX_LEAF, 5,
+                "GUARD_BEFORE_LISTCOPY_AND_PROJECTION_PRIMARY65536_CHARS_PROCESS24_CHARS_NINE_FIELDS");
+        add(parts, "METHOD_SERIAL_HELLO_HEADER", "BenchmarkTargetClock.validateSeries",
+                phases, mapNodes(7) + 1, 7L * (64 + 128), 128, 4,
+                "SEVEN_FIXED_HEADER_FIELDS_READINGS_MATERIAL_COUNTED_SEPARATELY");
+        add(parts, "METHOD_TYPED_REFUSAL", "BenchmarkReturnMethodAdmission.Refusal.retainedEvidence",
+                1, mapNodes(64), 64L * (128 + 256), 512, 4,
+                "FIXED_REASON_AND_EIGHTEEN_FALSE_FLAGS_NO_CAUSE_STACK_OR_ARBITRARY_CALLBACK_BODY");
+        add(parts, "RETURN_COMPONENT_SOURCE_MATRIX", "BenchmarkReturnComponentSourceWork.PreparedBounds.sourceEvidence",
+                1, mapNodes(48) + mapNodes(57) + 61L * mapNodes(8) + mapNodes(7) + mapNodes(6),
+                48L * (128 + 512) + 57L * (128 + 8L * 128) + 4L * 8 * 128 + 7L * 128 + 6L * 128,
+                512, 5, "FIXED_ACTOR_INVENTORY_EIGHT_UNITS_SIX_PLAN_FIELDS_SEVEN_MATERIAL_SCALARS_TWO_POOLED_ROWS");
+        add(parts, "RETURN_COMPONENT_CATALOGUE_METADATA", "ReportPlan.Prepared.metadata.components",
+                1, mapNodes(32) + CATALOGUE_ROWS * mapNodes(9),
+                32L * (128 + 512) + CATALOGUE_ROWS * (9L * 128 + 3L * 512),
+                512, 6, "PRIOR64_SOURCE_DESCRIPTOR_MAPS_ID_BRANCH_BASIS512_WITH_FIXED_NUMERIC_FIELDS");
+        add(parts, "RETURN_COMPONENT_FACTORY_TAIL_EVIDENCE", "SourceTails.factoryEvidence/preScopeSourceTail",
+                1, mapNodes(34) + 6L * mapNodes(8) + 7,
+                34L * (128 + 512) + 6L * 512 + 6L * 8 * 128,
+                512, 5, "FULL_FIXED_FACTORY_DESCRIPTOR_WITH_FOUR_NEW_EIGHT_UNIT_TAILS_AND_ORIGINAL_UPPER");
+        add(parts, "METHOD_EARLY_ROOT_OBSERVATION_BASIS", "Run.rootClockMetadataBeforeEvidence/rootClockMetadataBeforeBasis",
+                phases, mapNodes(3), 3L * 128 + 2L * 128, 512, 3,
+                "ADDITIONAL_FIXED_EARLY_OR_FRESH_BASIS_FIELD_NATIVE_PAYLOAD_REMAINS_IN_ITS_ORIGINAL_PACKET_ROW");
+        require(parts.size() <= CATALOGUE_ROWS, "return report catalogue exceeds its prior descriptor roster");
+    }
+
+    /** Additional owned catalogue construction; original workload validation remains in its old source tail. */
+    static BenchmarkReturnWorkBudget.Work returnCatalogueUpper(long entries) {
+        require(entries >= 0, "return catalogue entry count is negative");
+        long rows = RETURN_COMPONENT_CATALOGUE_ROWS;
+        // Per added row: eight constructor/guard, eight checked arithmetic, eight list/carrier,
+        // eight plan accumulation and sixteen descriptor/boxing APIs. The 64 descriptors include
+        // the original rows when the final immutable catalogue metadata is built.
+        long requests = Math.addExact(64, Math.addExact(Math.multiplyExact(48, rows), Math.multiplyExact(32, CATALOGUE_ROWS)));
+        long scalarSlots = Math.addExact(Math.multiplyExact(24, rows), Math.multiplyExact(18, CATALOGUE_ROWS));
+        long descriptorChars = Math.multiplyExact(CATALOGUE_ROWS, 9L * 128 + 3L * 512);
+        return new BenchmarkReturnWorkBudget.Work(1, requests, rows, 0,
+                Math.addExact(Math.multiplyExact(8, scalarSlots), Math.multiplyExact(4, descriptorChars)), 4,
+                Math.addExact(Math.multiplyExact(2, scalarSlots), descriptorChars), scalarSlots).times(entries);
     }
 
     private static void add(List<Component> parts, String id, String source, long rows, long nodes,

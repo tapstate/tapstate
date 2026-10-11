@@ -47,6 +47,7 @@ final class BenchmarkWriteReturnExpectations {
         require(workload != null && phase != null && sourceBatches != null && calls != null,
                 "input is missing");
         require(phase.measured(), "phase is not measured");
+        BenchmarkReturnLocalSourceWork.guardMeasuredAssociationSql(phase);
         require(phase.expectedLogicalOutputChanges() >= 0 && phase.expectedLogicalOutputChanges() <= MAX_RECORDS,
                 "phase registration exceeds the record bound");
         require(calls.size() <= MAX_FRAMES, "call roster exceeds the frame bound");
@@ -173,7 +174,7 @@ final class BenchmarkWriteReturnExpectations {
     }
 
     private static void boundedText(String value, int maximum, String field) {
-        require(value != null && !value.isBlank() && value.length() <= maximum
+        require(value != null && value.length() <= maximum && !value.isBlank()
                 && value.getBytes(StandardCharsets.UTF_8).length <= maximum, "call " + field + " is invalid");
     }
 

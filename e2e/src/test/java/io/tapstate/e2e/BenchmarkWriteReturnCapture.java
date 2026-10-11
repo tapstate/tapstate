@@ -23,9 +23,18 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
                   List<String> pagesBase64, BenchmarkReturnClockSampler.Mode clockMode,
                   Map<String, Object> costStages) {
         Result {
-            calls = List.copyOf(calls); samples = List.copyOf(samples); pagesBase64 = List.copyOf(pagesBase64);
-            java.util.Objects.requireNonNull(clockMode);
-            costStages = Map.copyOf(costStages);
+            if (BenchmarkReturnWorkBudget.current() == null) {
+                calls = List.copyOf(calls); samples = List.copyOf(samples); pagesBase64 = List.copyOf(pagesBase64);
+                java.util.Objects.requireNonNull(clockMode);
+                costStages = Map.copyOf(costStages);
+            } else {
+                calls = BenchmarkReturnCaptureMaterialBounds.copy(calls, 512);
+                samples = BenchmarkReturnCaptureMaterialBounds.copy(samples, 512);
+                pagesBase64 = BenchmarkReturnCaptureMaterialBounds.copy(pagesBase64, 512);
+                java.util.Objects.requireNonNull(clockMode);
+                costStages = BenchmarkReturnCaptureMaterialBounds.stages(costStages);
+                BenchmarkReturnCaptureMaterialBounds.capture(calls, samples, summary, pagesBase64, costStages);
+            }
         }
         Result(List<BenchmarkWriteReturnAssembly.FullCall> calls, List<BenchmarkCausalClock.Sample> samples,
                 BenchmarkWriteReturnReader.Summary summary, List<String> pagesBase64,

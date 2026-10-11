@@ -23,6 +23,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     static final String PREFIX = "tapstate.e2e.benchmark.write-return-work-budget-registration.";
     private static final AtomicReference<BenchmarkReturnWorkBudgetRun> ACTIVE = new AtomicReference<>();
     private final BenchmarkReturnWorkBudgetProfile.Prepared profile;
+    private final BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile validatedProfile;
     private final BenchmarkReturnWorkBudget.Definition definition;
     private final BenchmarkReturnWorkBudget.Scope scope;
     private final Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths;
@@ -48,9 +49,151 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     private BenchmarkReturnEmittedRoster.Observation emittedRoster;
     private final java.util.ArrayList<Map<String, Object>> producerClassMetadata = new java.util.ArrayList<>();
 
-    private BenchmarkReturnWorkBudgetRun(BenchmarkReturnWorkBudgetProfile.Prepared profile,
+    private TrustedPreflight trustedPreflight;
+    private String earlyRootMetadata;
+    private String earlyRootMetadataPhase;
+
+    /** Issued only from this Run's acquired bytes, observed ROOT origins and actual cold getter. */
+    static final class TrustedPreflight {
+        private final BenchmarkReturnWorkBudgetRun owner;
+        private final BenchmarkReturnMethodAdmission.Preflight facts;
+        private TrustedPreflight(BenchmarkReturnWorkBudgetRun owner, BenchmarkReturnMethodAdmission.Preflight facts) {
+            this.owner = owner; this.facts = facts;
+        }
+        BenchmarkReturnMethodAdmission.Preflight requireActiveFacts() {
+            return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.RUN_TRUSTED_TOKEN,
+                    () -> {
+                        owner.requireActive();
+                        require(owner.trustedPreflight == this && owner.earlyRootMetadata != null,
+                                "trusted preflight was not issued by the active acquired Run");
+                        return facts;
+                    });
+        }
+    }
+
+    static TrustedPreflight acquireTrustedPreflight() {
+        var run = current();
+        require(run != null, "trusted preflight requires an actual acquired Run");
+        return run.acquireTrustedPreflightOnce();
+    }
+
+    private TrustedPreflight acquireTrustedPreflightOnce() {
+        var entry = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.RUN_TRUSTED_ACQUIRE);
+        try {
+        requireActive();
+        require(trustedPreflight == null && earlyRootMetadata == null && producerRegistration == null
+                        && producerClassMetadata.isEmpty() && captures.isEmpty(),
+                "trusted preflight is repeated or follows producer/phase acquisition");
+        require(rootRuntime != null && authenticated != null && helperManifest != null && jdkManifest != null
+                        && emittedRoster != null && !observedRootOrigins.isEmpty(),
+                "trusted preflight requires acquired bytes and actual root origins");
+            require(helperManifest.origins().size() <= 1024 && authenticated.origins().size() <= 1024
+                            && observedRootOrigins.size() <= 512 && authenticated.classes().size() <= 512
+                            && authenticated.sources().size() <= SourceRole.values().length && authenticated.files().size() <= 10,
+                    "trusted preflight input roster exceeds its prior cap");
+            require(java.util.Objects.equals(profile.inputs().producerWriter(), helperManifest.producerWriter())
+                            && java.util.Objects.equals(profile.inputs().producerWriter(), authenticated.producerWriter()),
+                    "trusted preflight producer writer tuple differs");
+            var expected = new java.util.HashMap<String, Origin>();
+            for (var origin : authenticated.origins()) if (origin.owner() == Owner.ROOT) {
+                require(expected.put(origin.binaryName(), origin) == null, "authenticated ROOT origin is duplicated");
+            }
+            var runtime = new BenchmarkReturnWorkBudgetBindings.Runtime(Owner.ROOT, profile.inputs().runId(),
+                    rootRuntime.pid(), rootRuntime.jvmStartTimeMillis(), jdkManifest.javaHome(), jdkManifest.javaVersion());
+            for (var origin : observedRootOrigins) {
+                require(runtime.equals(origin.runtime()) && origin.origin().owner() == Owner.ROOT
+                                && origin.origin().equals(expected.remove(origin.origin().binaryName())),
+                        "actual root origin or original runtime differs from authenticated input");
+            }
+            require(expected.isEmpty(), "actual ROOT origin roster is incomplete");
+            // This is the first existing metadata invocation, moved ahead of configuration/fixtures.
+            // It reads no counter. Its one-time phase reuse is explicitly an early recipe fact.
+            String raw = rootClockMetadata();
+            require(raw != null && raw.length() <= 8192 && raw.chars().allMatch(c -> c >= 32 && c <= 126),
+                    "actual root cold metadata exceeds its prior scalar cap");
+            var facts = new BenchmarkReturnMethodAdmission.Preflight(BenchmarkReturnMethodAdmission.METHOD,
+                    BenchmarkReturnMethodAdmission.structuralRecipe(validatedProfile),
+                    helperManifest, authenticated,
+                    new BenchmarkCausalClock.Identity(rootRuntime.pid(), rootRuntime.jvmStartTimeMillis()),
+                    paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.NATIVE_LIBRARY).toString(), raw);
+            var result = new TrustedPreflight(this, facts);
+            earlyRootMetadata = raw; trustedPreflight = result;
+            BenchmarkReturnWorkBudget.done(entry);
+            return result;
+        } catch (RuntimeException | Error failure) {
+            BenchmarkReturnWorkBudget.failed(entry, failure); throw failure;
+        }
+    }
+
+    /** No getter, clock, JMX or checkpoint is added; the first original phase invocation is consumed. */
+    static String rootClockMetadataBefore(String phaseKey) {
+        var run = current();
+        if (run == null || run.trustedPreflight == null) { return rootClockMetadata(); }
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.RUN_ROOT_BEFORE, () -> {
+        run.requireActive();
+        require(phaseKey != null && !phaseKey.isEmpty() && phaseKey.length() <= 128
+                        && phaseKey.chars().allMatch(c -> c >= 32 && c <= 126), "metadata phase key exceeds its prior cap");
+        if (run.earlyRootMetadataPhase == null) {
+            require(run.earlyRootMetadata != null, "early root metadata is missing");
+            run.earlyRootMetadataPhase = phaseKey;
+            return run.earlyRootMetadata;
+        }
+        require(!run.earlyRootMetadataPhase.equals(phaseKey), "early root metadata cannot be consumed twice for the same phase");
+        // A distinct later phase retains the original fresh getter at its original site.
+        return rootClockMetadata();
+        });
+    }
+
+    static Map<String, Object> rootClockMetadataBeforeEvidence(Map<String, Object> value, String phaseKey) {
+        var run = current();
+        if (run == null || run.trustedPreflight == null) { return value; }
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.RUN_ROOT_WRAPPER, () -> {
+        run.requireActive();
+        BenchmarkReturnComponentSourceWork.guardColdWrapper(value);
+        require(value != null && value.size() <= 128, "cold evidence wrapper exceeds its prior field cap");
+        var annotated = new LinkedHashMap<String, Object>(value);
+        annotated.put("rootBeforeObservationBasis", rootClockMetadataBeforeBasis(phaseKey));
+        return Map.copyOf(annotated);
+        });
+    }
+
+    /** Comparison only: input cannot issue or replace the privately acquired preflight. */
+    static void requireEarlyRootMetadataMatchesAfter(String actualAfterRaw) {
+        var run = current();
+        if (run == null || run.trustedPreflight == null) { return; }
+        BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.RUN_ROOT_COMPARE, () -> {
+        run.requireActive();
+        var facts = run.trustedPreflight.requireActiveFacts();
+        BenchmarkReturnComponentSourceWork.guardNativeJson(facts.actualRootMetadata());
+        BenchmarkReturnComponentSourceWork.guardNativeJson(actualAfterRaw);
+        var before = BenchmarkNativeClockEvidence.parse(facts.actualRootMetadata(), facts.root(), facts.library());
+        var after = BenchmarkNativeClockEvidence.parse(actualAfterRaw, facts.root(), facts.library());
+        require("NATIVE_RECORDED".equals(before.get("state")) && "NATIVE_RECORDED".equals(after.get("state")),
+                "early root recipe or actual post-window provider is UNKNOWN");
+        require(BenchmarkNativeReturnClock.supportedRootSnapshot(before)
+                        .equals(BenchmarkNativeReturnClock.supportedRootSnapshot(after)),
+                "early root recipe differs from actual post-window route");
+        return null;
+        });
+    }
+
+    static String rootClockMetadataBeforeBasis(String phaseKey) {
+        var run = current();
+        if (run == null || run.trustedPreflight == null) { return "ORIGINAL_PHASE_ROOT_METADATA_GETTER"; }
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.RUN_ROOT_BASIS, () -> {
+        require(phaseKey == null || phaseKey.length() <= 128, "metadata basis phase key exceeds its prior cap");
+        return java.util.Objects.equals(run.earlyRootMetadataPhase, phaseKey)
+                ? "EARLY_PREFLIGHT_ROOT_RECIPE_FACT_NOT_A_FRESH_PHASE_OBSERVATION"
+                : "ORIGINAL_PHASE_ROOT_METADATA_GETTER";
+        });
+    }
+
+
+    private BenchmarkReturnWorkBudgetRun(BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile validatedProfile,
             Map<BenchmarkReturnWorkBudgetProfile.FileRole, Path> paths, Path output, Path body, String nonce) {
-        this.profile = profile;
+        this.validatedProfile = validatedProfile;
+        this.profile = validatedProfile.prepared();
+        var profile = this.profile;
         definition = profile.requireDefinition();
         canonicalWorkload = BenchmarkWorkloadDefinitions.steadyPilot(profile.inputs().workload().id());
         this.paths = Map.copyOf(paths); this.output = output; producerBody = body; this.nonce = nonce;
@@ -202,15 +345,15 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         require(profile != null && paths != null && paths.keySet().equals(profile.inputs().files().stream()
                 .map(BenchmarkReturnWorkBudgetProfile.FileInput::role).collect(java.util.stream.Collectors.toSet())),
                 "registered file path roster differs");
-        require(profile.equals(BenchmarkReturnWorkBudgetProfile.inspect(profile.inputs())),
-                "supplied profile differs from its source factory");
+        // Reuse the one existing pre-scope source validation; do not rebuild it in the factory.
+        var validatedProfile = BenchmarkReturnWorkBudgetBindings.authenticate(profile);
         require(output != null && body != null && !output.equals(body) && !Path.of(body + ".seal").equals(output),
                 "registered output and seal paths overlap");
         absolute(output.toString()); absolute(body.toString());
         require(nonce != null && !nonce.isEmpty() && nonce.length() <= 64
                 && nonce.chars().allMatch(c -> c >= 32 && c <= 126), "registered nonce differs");
         require(ACTIVE.get() == null, "another source profile is active");
-        var run = new BenchmarkReturnWorkBudgetRun(profile, paths, output, body, nonce);
+        var run = new BenchmarkReturnWorkBudgetRun(validatedProfile, paths, output, body, nonce);
         if (!ACTIVE.compareAndSet(null, run)) { run.scope.close(); throw new AssertionError("another source profile is active"); }
         try {
             run.bindFiles();

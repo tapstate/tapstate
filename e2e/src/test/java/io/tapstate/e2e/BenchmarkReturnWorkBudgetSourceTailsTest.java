@@ -17,7 +17,13 @@ class BenchmarkReturnWorkBudgetSourceTailsTest {
                 .containsEntry("actualCompletionObserved", false).containsEntry("futureLifetimeCountBoundClaimed", false);
         // openFromProperties inspects once and open revalidates once before activation.
         // Both inspections build the shared and cleanup tables.
-        assertThat(upper.calls()).isEqualTo(14);
+        // Four new table/catalogue entries, one private cache and one readless initializer add
+        // plus two scoped-material tables to the previous fourteen. This is a fixed source tail, not observed completion.
+        assertThat(upper.calls()).isEqualTo(22);
+        assertThat(evidence).containsEntry("returnComponentTableConstructions", 2)
+                .containsEntry("returnComponentCatalogueConstructions", 2)
+                .containsEntry("privateAuthenticatedProfileCacheConstructions", 1)
+                .containsEntry("knownReadlessAuthorityInitializers", 1);
         assertThat(upper.records()).isGreaterThan(7L * 96000);
         assertThat((Long) evidence.get("initializerRecords")).isGreaterThan(3L * 12000);
         assertThat(upper.requests()).isGreaterThan(upper.records());

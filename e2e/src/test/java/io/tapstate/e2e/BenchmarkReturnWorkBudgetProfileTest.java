@@ -30,8 +30,8 @@ class BenchmarkReturnWorkBudgetProfileTest {
         var bPrepared = BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, files(false)));
         assertThat(((Map<?, ?>) bPrepared.inputRegistrationInfo().get("outputPlanSource")).get("mode"))
                 .isEqualTo("B_PLAIN_ON_PERIODIC_NOMINAL");
-        assertThat(prepared.fieldsRegisteredOutputPlan()).isEqualTo(BenchmarkReturnWorkBudgetReportPlan.prepare(ORIGINAL, true).plan());
-        assertThat(bPrepared.fieldsRegisteredOutputPlan()).isEqualTo(BenchmarkReturnWorkBudgetReportPlan.prepare(ORIGINAL, false).plan());
+        assertThat(prepared.fieldsRegisteredOutputPlan()).isEqualTo(BenchmarkReturnWorkBudgetReportPlan.prepareWithReturnComponents(ORIGINAL, true).plan());
+        assertThat(bPrepared.fieldsRegisteredOutputPlan()).isEqualTo(BenchmarkReturnWorkBudgetReportPlan.prepareWithReturnComponents(ORIGINAL, false).plan());
         assertThat(prepared.fieldsRegisteredOutputPlan().nodeUpper()).isGreaterThan(bPrepared.fieldsRegisteredOutputPlan().nodeUpper());
         assertThat(BenchmarkReturnWorkBudget.current()).isNull();
         var b = inputs(ORIGINAL, false, files(false));
@@ -92,7 +92,8 @@ class BenchmarkReturnWorkBudgetProfileTest {
         var prepared = BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, files(false)));
         assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.CLOCK_REQUEST))
                 .isEqualTo(new BenchmarkReturnWorkBudget.Work(1, 1, 0, 0, 496, 0, 10, 0));
-        assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SORT).elements()).isEqualTo(2L * 48_000);
+        // The independently registered pooled sort must cover the full declared material cap.
+        assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SORT).elements()).isEqualTo(2L * 262_144);
         assertThat(prepared.perOperationUpper().get(BenchmarkReturnWorkBudget.Activity.SPAN).elements()).isEqualTo(4L * 48_000);
         // Each byte can be a source character visited by both owned encoding loops. One opaque
         // COPY request alone does not bound those explicit charAt calls.

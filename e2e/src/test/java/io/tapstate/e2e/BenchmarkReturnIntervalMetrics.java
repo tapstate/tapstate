@@ -15,7 +15,9 @@ final class BenchmarkReturnIntervalMetrics {
     record Phase(String id, long completedLower, long completedUpper, long durationLower, long durationUpper,
                  List<BenchmarkCausalClock.Interval> latencies) {
         Phase {
-            require(id != null && !id.isBlank() && id.length() <= 128 && completedLower >= 10000
+            var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.METRIC_PHASE);
+            try {
+            require(id != null && id.length() <= 128 && !id.isBlank() && completedLower >= 10000
                     && completedUpper >= completedLower && completedUpper <= MAX_COHORT_ROWS
                     && durationLower > 0 && durationUpper >= durationLower,
                     "phase count, duration or identity is outside the prior domain");
@@ -23,17 +25,32 @@ final class BenchmarkReturnIntervalMetrics {
                     && completedUpper <= latencies.size(),
                     "phase latency roster exceeds its prior cap");
             // Guard before the immutable copy; negative lower latency endpoints remain evidence.
-            latencies = List.copyOf(latencies);
+            var boundedLatencies = latencies;
+            latencies = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                    BenchmarkReturnWorkBudget.Activity.COPY, () -> List.copyOf(boundedLatencies));
+            BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(latencies.size()));
+            BenchmarkReturnWorkBudget.done(ticket);
+            } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
         }
     }
 
     record Fork(BenchmarkReturnTimeBounds.Rate throughput, BenchmarkCausalClock.Interval p99,
                 long completedLower, long completedUpper, long durationLower, long durationUpper,
                 int fullCohortRows, List<String> phases) {
-        Fork { phases = List.copyOf(phases); }
+        Fork {
+            var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.METRIC_RESULT);
+            try {
+                require(phases != null && phases.size() <= MAX_PHASES, "result phase roster exceeds prior cap");
+                phases = List.copyOf(phases); BenchmarkReturnWorkBudget.done(ticket);
+            } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
+        }
     }
 
     static Fork aggregate(List<Phase> phases) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.METRIC_POOL,
+                () -> aggregateBounded(phases));
+    }
+    private static Fork aggregateBounded(List<Phase> phases) {
         require(phases != null, "bounded measured phases are required");
         int declaredPhases = phases.size();
         require(declaredPhases > 0 && declaredPhases <= MAX_PHASES, "bounded measured phases are required");

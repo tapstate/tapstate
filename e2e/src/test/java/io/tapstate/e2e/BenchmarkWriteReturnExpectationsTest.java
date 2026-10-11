@@ -253,6 +253,39 @@ class BenchmarkWriteReturnExpectationsTest {
         }
     }
 
+    @Test
+    void original_all_three_measured_shapes_associate_under_the_registered_local_source_recipe() {
+        for (String id : List.of("copy", "stateless", "stateful")) {
+            var workload = BenchmarkWorkloadDefinitions.steadyPilot(id);
+            for (var phase : workload.phases()) {
+                if (!phase.measured()) continue;
+                // Build controlled immutable material before activation. It proves association
+                // behavior and source bounds, not actual writer/native/runtime acquisition.
+                Fixture fixture = fixture(workload, phase, 1024);
+                assertThat(phase.sql()).allSatisfy(sql -> assertThat(sql.length()).isLessThanOrEqualTo(
+                        BenchmarkReturnLocalSourceWork.MEASURED_SQL_CHARS));
+                var upper = BenchmarkReturnLocalSourceWork.bounds(new BenchmarkReturnLocalSourceWork.Capacity(
+                        phase.expectedLogicalOutputChanges(), phase.expectedLogicalOutputChanges() / 2, phase.batches().size()),
+                        BenchmarkReturnLocalSourceWork.AssociationRecipe.ORIGINAL_FIXED_ONE_OR_TWO_INTEGER_KEYS_AND_COLD_SQL);
+                var combined = new java.util.EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
+                combined.putAll(upper);
+                combined.put(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, BenchmarkSharedSupportSourceWork.sharedUpper());
+                var excluded = java.util.EnumSet.allOf(BenchmarkReturnWorkBudget.Activity.class); excluded.removeAll(combined.keySet());
+                try (var scope = BenchmarkReturnWorkBudget.activate(new BenchmarkReturnWorkBudget.Definition(
+                        "controlled-all-three-local-source", "a".repeat(64), Map.of(), combined, excluded), id + "/" + phase.id())) {
+                    var rows = associate(fixture);
+                    assertThat(rows).hasSize(Math.toIntExact(phase.expectedLogicalOutputChanges()));
+                    assertThat(rows.stream().filter(BenchmarkWriteReturnExpectations.Association::fixedCohort).count())
+                            .isEqualTo(phase.expectedLogicalOutputChanges() / 2);
+                    assertThat(scope.snapshot()).containsEntry("state", "OPEN").containsEntry("pendingOperations", 0L);
+                    for (String flag : BenchmarkReturnProducerOrigins.FLAGS) {
+                        assertThat(scope.snapshot()).doesNotContainEntry(flag, true);
+                    }
+                }
+            }
+        }
+    }
+
     private record Fixture(BenchmarkWorkloadDefinitions.Workload workload, BenchmarkWorkloadDefinitions.Phase phase,
             List<BenchmarkForkEnvironment.BatchResult> batches, List<BenchmarkWriteReturnAssembly.FullCall> calls) { }
 

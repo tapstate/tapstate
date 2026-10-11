@@ -24,7 +24,15 @@ final class BenchmarkReturnMethodAdmission {
     /** Facts to inspect, never a boolean or digest masquerading as semantic approval. */
     record InspectionRequest(String method, ProviderContract providerContract, List<String> invocationPath,
                              String jniSourceSha256, String jniBinarySha256, Map<String, Object> selectedRootRoute) {
-        InspectionRequest { invocationPath = List.copyOf(invocationPath); selectedRootRoute = freezeMetadata(selectedRootRoute); }
+        InspectionRequest {
+            var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.INSPECTION_COPY);
+            try {
+                if (BenchmarkReturnWorkBudget.current() != null) require(invocationPath != null && invocationPath.size() <= 6,
+                        "INSPECTION_PATH_EXCEEDS_PRIOR_CAP");
+                invocationPath = List.copyOf(invocationPath); selectedRootRoute = freezeMetadata(selectedRootRoute);
+                BenchmarkReturnWorkBudget.done(ticket);
+            } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
+        }
     }
 
     /** Integration must install an independently reviewed source/API authority, not a caller marker. */
@@ -39,6 +47,9 @@ final class BenchmarkReturnMethodAdmission {
         BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile profile() { return profile; }
         Set<String> supportedWorkloads() { return Set.of("stateless"); }
         Map<String, Object> evidence() {
+            return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.METHOD_EVIDENCE, this::evidenceBounded);
+        }
+        private Map<String, Object> evidenceBounded() {
             var out = facts("CACHED_STRUCTURAL_RECIPE_REQUIRING_SEPARATE_COMPLETE_COST_PROOF");
             out.put("definitionId", profile.definition().definitionId());
             out.put("sourceFormulaSha256", profile.definition().sourceFormulaSha256());
@@ -65,6 +76,9 @@ final class BenchmarkReturnMethodAdmission {
         Set<String> supportedWorkloads() { return cost.supportedWorkloads(); }
         void requireProductionAuthority() { require(!controlOnly, "CONTROL_REVIEW_CANNOT_SELECT_FORMAL_METHOD"); }
         Map<String, Object> evidence() {
+            return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.METHOD_EVIDENCE, this::evidenceBounded);
+        }
+        private Map<String, Object> evidenceBounded() {
             var out = facts("SOURCE_RECIPE_ADMITTED_AWAITING_ORIGINAL_FORK_FACTS");
             out.put("method", METHOD); out.put("endpoint", ENDPOINT); out.put("rootPid", root.pid());
             out.put("rootJvmStartTimeMillis", root.jvmStartTimeMillis());
@@ -81,6 +95,10 @@ final class BenchmarkReturnMethodAdmission {
                       Map<String, Object> nativeBefore, Map<String, Object> nativeAfter,
                       List<BenchmarkTargetClock.Reading> serialHello) {
         PhaseFacts {
+            var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.PHASE_FACTS);
+            try {
+            BenchmarkReturnComponentSourceWork.guardCapture(capture);
+            BenchmarkReturnComponentSourceWork.guardPhaseMaterial(sourceBatches, serialHello);
             require(sourceBatches != null && sourceBatches.size() <= 960 && serialHello != null
                     && serialHello.size() <= BenchmarkTargetClock.MAX_INTERIOR_SAMPLES,
                     "PHASE_ROSTER_EXCEEDS_PRIOR_CAP");
@@ -90,6 +108,8 @@ final class BenchmarkReturnMethodAdmission {
                     "CAPTURE_ROSTER_EXCEEDS_PRIOR_CAP_OR_CONFLICTS");
             sourceBatches = List.copyOf(sourceBatches); serialHello = List.copyOf(serialHello);
             nativeBefore = freezeCold(nativeBefore); nativeAfter = freezeCold(nativeAfter);
+            BenchmarkReturnWorkBudget.done(ticket);
+            } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
         }
     }
 
@@ -97,17 +117,46 @@ final class BenchmarkReturnMethodAdmission {
     static final class BoundPhase {
         private final Map<String, Object> evidence;
         private final Map<String, Object> commonWindow;
+        private final String phaseId;
         private final List<BenchmarkReturnTimeBounds.Delivery> deliveries;
-        private BoundPhase(Map<String, Object> evidence, Map<String, Object> commonWindow, List<BenchmarkReturnTimeBounds.Delivery> deliveries,
+        private BoundPhase(String phaseId, Map<String, Object> evidence, Map<String, Object> commonWindow, List<BenchmarkReturnTimeBounds.Delivery> deliveries,
                            BenchmarkReturnWorkBudgetDefinitions.OutputPlan plan) {
+            require(phaseId != null && phaseId.length() <= 128, "ORIGINAL_PHASE_ID_EXCEEDS_PRIOR_CAP");
+            this.phaseId = phaseId;
             require(deliveries != null && deliveries.size() <= 262144, "FULL_COHORT_PROJECTION_EXCEEDS_PRIOR_CAP");
-            this.deliveries = List.copyOf(deliveries);
+            this.deliveries = BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.DELIVERIES_COPY,
+                    () -> List.copyOf(deliveries));
             this.evidence = freeze(evidence, plan); this.commonWindow = freezeMetadata(commonWindow);
         }
         Map<String, Object> evidence() { return evidence; }
         Map<String, Object> commonWindow() { return commonWindow; }
         List<BenchmarkReturnTimeBounds.Delivery> deliveries() { return deliveries; }
+        /** Only this privately verified full population and its fixed common window feed pooling. */
+        BenchmarkReturnIntervalMetrics.Phase intervalMetrics() {
+            return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.METRIC_BRIDGE, () -> {
+                requireSteadyWindow();
+                // Each map is our immutable certificate projection, never a caller-supplied qualification.
+                long cl = certificateLong("completedRowsLower"), cu = certificateLong("completedRowsUpper");
+                long dl = certificateLong("durationNanosLower"), du = certificateLong("durationNanosUpper");
+                require(deliveries.size() <= BenchmarkReturnComponentSourceWork.ROWS, "FULL_COHORT_PROJECTION_EXCEEDS_PRIOR_CAP");
+                var latencies = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
+                        BenchmarkReturnWorkBudget.Activity.COPY,
+                        () -> deliveries.stream().map(BenchmarkReturnTimeBounds.Delivery::latency).toList());
+                BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY,
+                        BenchmarkReturnWorkBudget.Work.pass(deliveries.size()));
+                return new BenchmarkReturnIntervalMetrics.Phase(phaseId, cl, cu, dl, du, latencies);
+            });
+        }
+        private long certificateLong(String field) {
+            Object value = commonWindow.get(field);
+            require(value instanceof Long, "OWNED_COMMON_WINDOW_SCALAR_MISSING");
+            return (Long) value;
+        }
         void requireSteadyWindow() {
+            BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.METHOD_EVIDENCE,
+                    () -> { requireSteadyWindowBounded(); return null; });
+        }
+        private void requireSteadyWindowBounded() {
             require(Boolean.TRUE.equals(commonWindow.get("commonWindowCertificatePassed"))
                     && "PASS".equals(commonWindow.get("state"))
                     && "ALL_CONSERVATIVE_COMMON_WINDOW_RULES_HOLD".equals(commonWindow.get("reason")),
@@ -120,7 +169,8 @@ final class BenchmarkReturnMethodAdmission {
         private Refusal(String reason) { this(reason, null); }
         private Refusal(String reason, Throwable cause) {
             super("return method admission " + reason, cause);
-            var out = facts("UNKNOWN"); out.put("reason", reason); retained = Map.copyOf(out);
+            retained = BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.REFUSAL,
+                    () -> { var out = facts("UNKNOWN"); out.put("reason", reason); return Map.copyOf(out); });
         }
         Map<String, Object> retainedEvidence() { return retained; }
     }
@@ -128,6 +178,10 @@ final class BenchmarkReturnMethodAdmission {
     private BenchmarkReturnMethodAdmission() { }
 
     static CostRecipe structuralRecipe(BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile profile) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.STRUCTURAL_RECIPE,
+                () -> structuralRecipeBounded(profile));
+    }
+    private static CostRecipe structuralRecipeBounded(BenchmarkReturnWorkBudgetBindings.AuthenticatedProfile profile) {
         require(profile != null && profile.prepared() != null, "STRUCTURAL_RECIPE_MISSING");
         var input = profile.prepared().inputs();
         require("stateless".equals(input.workload().id()) && input.workload().rows() == 96000
@@ -142,12 +196,23 @@ final class BenchmarkReturnMethodAdmission {
         return checkedAdmit(input, inspected -> { throw new Refusal("INDEPENDENT_NATIVE_SEMANTIC_REVIEW_NOT_INSTALLED"); }, false);
     }
 
+    /** Production semantic selection is reachable only from an active privately issued acquisition. */
+    static AdmittedMethod admitTrusted(BenchmarkReturnWorkBudgetRun.TrustedPreflight acquired) {
+        require(acquired != null, "TRUSTED_ACTUAL_PREFLIGHT_MISSING");
+        return checkedAdmit(acquired.requireActiveFacts(), BenchmarkNativeSourceAuthority.instance(), false);
+    }
+
     /** Pure component controls cannot issue a production-selection token. */
     static AdmittedMethod admitForControl(Preflight input, IndependentSemanticReview review) {
         return checkedAdmit(input, review, true);
     }
 
     private static AdmittedMethod checkedAdmit(Preflight input, IndependentSemanticReview review, boolean controlOnly) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.PREFLIGHT,
+                () -> checkedAdmitBounded(input, review, controlOnly));
+    }
+    private static AdmittedMethod checkedAdmitBounded(Preflight input, IndependentSemanticReview review, boolean controlOnly) {
+        BenchmarkReturnComponentSourceWork.guardPreflight(input);
         require(input != null && METHOD.equals(input.method()) && input.costRecipe() != null
                 && input.helper() != null && input.authenticatedBytes() != null && input.root() != null,
                 "PREFLIGHT_COMPONENT_MISSING_OR_METHOD_DIFFERS");
@@ -196,15 +261,23 @@ final class BenchmarkReturnMethodAdmission {
             classes.put(name, members.getFirst().blob().sha256());
         }
         require(classes.equals(route.get("classHashes")), "ACTUAL_ROOT_CLOCK_CLASS_BYTES_DIFFER");
-        review.requireInspectedDirectInvocationAndProviderContract(new InspectionRequest(METHOD,
+        BenchmarkReturnComponentSourceWork.semanticBody(review);
+        var inspected = new InspectionRequest(METHOD,
                 ProviderContract.MACH_ABSOLUTE_TIME_NOMINAL_MONOTONIC_EXCLUDING_SLEEP, INVOCATION_PATH,
-                JNI_SOURCE, JNI_BINARY, route));
+                JNI_SOURCE, JNI_BINARY, route);
+        BenchmarkReturnWorkBudget.external(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
+                () -> { review.requireInspectedDirectInvocationAndProviderContract(inspected); return null; });
         return new AdmittedMethod(input, route, controlOnly);
     }
 
     static BoundPhase verifyPhase(AdmittedMethod admitted, PhaseFacts input) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.VERIFY_PHASE,
+                () -> verifyPhaseBounded(admitted, input));
+    }
+    private static BoundPhase verifyPhaseBounded(AdmittedMethod admitted, PhaseFacts input) {
         require(admitted != null && input != null && input.workload() != null && input.phase() != null && input.capture() != null,
                 "ORIGINAL_PHASE_FACTS_MISSING");
+        BenchmarkReturnComponentSourceWork.guardWorkload(input.workload());
         require(admitted.supportedWorkloads().contains(input.workload().id()) && input.workload().rows() == 96000
                 && input.workload().seed() == 424242
                 && BenchmarkReturnWorkBudgetProfile.WorkloadInput.from(input.workload())
@@ -258,7 +331,7 @@ final class BenchmarkReturnMethodAdmission {
         out.put("newConsumerWorkAccounting", "DUPLICATE_RAW_ASSOCIATION_MAPPING_AND_FREEZE_NOT_YET_IN_STRUCTURAL_SOURCE_RECIPE");
         out.put("componentState", "ORIGINAL_FORK_CLOCK_COHORT_FACTS_MATCHED_NO_FORMAL_METRIC_CREDIT");
         BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> out.put(flag, false));
-        return new BoundPhase(out, common, deliveries, admitted.cost.profile().prepared().fieldsRegisteredOutputPlan());
+        return new BoundPhase(input.phase().id(), out, common, deliveries, admitted.cost.profile().prepared().fieldsRegisteredOutputPlan());
     }
 
     private static LinkedHashMap<String, Object> facts(String state) {
@@ -276,7 +349,8 @@ final class BenchmarkReturnMethodAdmission {
     @SuppressWarnings("unchecked") private static Map<String, Object> freeze(Map<String, Object> value,
             BenchmarkReturnWorkBudgetDefinitions.OutputPlan plan) {
         require(value != null, "BOUNDED_FACT_OBJECT_MISSING");
-        return (Map<String, Object>) BenchmarkReturnWorkBudgetDefinitions.freezeOutputTree(value, plan).value();
+        return (Map<String, Object>) BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.TREE_FREEZE,
+                () -> BenchmarkReturnWorkBudgetDefinitions.freezeOutputTree(value, plan).value());
     }
     private static void require(boolean condition, String reason) { if (!condition) throw new Refusal(reason); }
 }

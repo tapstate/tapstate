@@ -997,7 +997,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                      : BenchmarkTargetClockSampler.open(targetClockUris.getFirst())) {
             fork.ownedProcessReceipt().recordJvmRuntime(resourceSampler.runtimeEvidence());
             if (collectorCalibration != null) {
-                String rootRaw = BenchmarkReturnWorkBudgetRun.rootClockMetadata();
+                String rootRaw = BenchmarkReturnWorkBudgetRun.rootClockMetadataBefore(workload.id() + "/" + phase.id());
+                collectorCalibrationEvidence.put("rootBeforeObservationBasis", BenchmarkReturnWorkBudgetRun.rootClockMetadataBeforeBasis(workload.id() + "/" + phase.id()));
                 collectorCalibrationEvidence.put("rootBeforeRaw", BenchmarkWriteReturnCostStages.rawEvidence(rootRaw));
                 collectorCalibrationEvidence.put("rootBefore", supportedRootClockEvidence(rootRaw,
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY)));
@@ -1008,6 +1009,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 }
                 nativeClockBefore = collectorOwnedClockEvidence(collectorCalibration, resourceSampler.writeReturnReader(),
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), rootRaw);
+                nativeClockBefore = BenchmarkReturnWorkBudgetRun.rootClockMetadataBeforeEvidence(nativeClockBefore, workload.id() + "/" + phase.id());
                 if (BenchmarkReturnWorkBudgetRun.current() != null) {
                     BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockBefore);
                 }
@@ -1018,7 +1020,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     workRun.registerProducer(resourceSampler.writeReturnReader(), returnRegistrationBefore);
                 }
                 nativeClockBefore = resourceSampler.writeReturnReader().nativeClockEvidence(
-                        System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), BenchmarkReturnWorkBudgetRun.rootClockMetadata());
+                        System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), BenchmarkReturnWorkBudgetRun.rootClockMetadataBefore(workload.id() + "/" + phase.id()));
+                nativeClockBefore = BenchmarkReturnWorkBudgetRun.rootClockMetadataBeforeEvidence(nativeClockBefore, workload.id() + "/" + phase.id());
                 if (workRun != null) { workRun.recordNativeClassMetadata(nativeClockBefore); }
             }
             if (methodCostProtocol) {
@@ -1132,6 +1135,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     collectorCalibrationEvidence.put("fullPhaseCommands", collectorCommands(commands));
                     collectorCalibrationEvidence.put("fullPhaseScope", "SOURCE_ISSUE_THROUGH_CAPTURE_DRAIN_AND_FINAL_RESOURCE_COMMAND_READS");
                     String rootRaw = BenchmarkReturnWorkBudgetRun.rootClockMetadata();
+                    BenchmarkReturnWorkBudgetRun.requireEarlyRootMetadataMatchesAfter(rootRaw);
                     collectorCalibrationEvidence.put("rootAfterRaw", BenchmarkWriteReturnCostStages.rawEvidence(rootRaw));
                     var rootAfter = supportedRootClockEvidence(rootRaw, System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY));
                     collectorCalibrationEvidence.put("rootAfter", rootAfter);
@@ -1148,8 +1152,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     }
                     collectorCalibrationEvidence.put("state", "INCREMENTAL_RETURN_COLLECTOR_DIAGNOSTIC_ONLY");
                 } else if (System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
+                    String actualAfterRootRaw = BenchmarkReturnWorkBudgetRun.rootClockMetadata();
+                    BenchmarkReturnWorkBudgetRun.requireEarlyRootMetadataMatchesAfter(actualAfterRootRaw);
                     nativeClockAfter = resourceSampler.writeReturnReader().nativeClockEvidence(
-                            System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), BenchmarkReturnWorkBudgetRun.rootClockMetadata());
+                            System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), actualAfterRootRaw);
                     if (BenchmarkReturnWorkBudgetRun.current() != null) {
                         BenchmarkReturnWorkBudgetRun.current().recordNativeClassMetadata(nativeClockAfter);
                     }

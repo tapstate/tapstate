@@ -27,9 +27,10 @@ final class BenchmarkWriteReturnAssembly {
                     String scope, String writerIdentity, String stream, String target, List<String> keyFields,
                     List<BenchmarkWriteReturnLedger.Row> rows) {
         FullCall {
-            errorDetails = List.copyOf(errorDetails);
-            keyFields = List.copyOf(keyFields);
-            rows = List.copyOf(rows);
+            BenchmarkReturnCaptureMaterialBounds.callLists(errorDetails, keyFields, rows);
+            errorDetails = BenchmarkReturnCaptureMaterialBounds.copy(errorDetails, 512);
+            keyFields = BenchmarkReturnCaptureMaterialBounds.copy(keyFields, 2);
+            rows = BenchmarkReturnCaptureMaterialBounds.copy(rows, 1024);
         }
     }
 

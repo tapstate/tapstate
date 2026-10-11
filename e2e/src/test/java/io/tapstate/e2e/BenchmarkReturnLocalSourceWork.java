@@ -17,7 +17,14 @@ final class BenchmarkReturnLocalSourceWork {
                     "original half-cohort and registered source batches are required");
         }
     }
-    enum AssociationRecipe { ORIGINAL_FIXED_UPDATE_TWO_INTEGER_KEYS }
+    enum AssociationRecipe {
+        ORIGINAL_FIXED_UPDATE_TWO_INTEGER_KEYS,
+        ORIGINAL_FIXED_ONE_OR_TWO_INTEGER_KEYS_AND_COLD_SQL
+    }
+    static final int MEASURED_SQL_CHARS = 8192, MEASURED_BATCHES = 960;
+    // Even a caller-supplied bounded SQL string cannot have more tuple/list members than
+    // its prior character count plus one. This is independent of the original100-row batch.
+    static final int COLD_TUPLES_PER_STATEMENT = MEASURED_SQL_CHARS + 1;
 
     private BenchmarkReturnLocalSourceWork() { }
 
@@ -49,7 +56,8 @@ final class BenchmarkReturnLocalSourceWork {
 
     static Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> bounds(Capacity capacity, AssociationRecipe recipe) {
         require(capacity != null, "registered source capacity is missing");
-        require(recipe == AssociationRecipe.ORIGINAL_FIXED_UPDATE_TWO_INTEGER_KEYS,
+        require(recipe == AssociationRecipe.ORIGINAL_FIXED_UPDATE_TWO_INTEGER_KEYS
+                        || recipe == AssociationRecipe.ORIGINAL_FIXED_ONE_OR_TWO_INTEGER_KEYS_AND_COLD_SQL,
                 "SOURCE_GAP_ORIGINAL_EXPECTED_CHANGE_AND_KEY_EXTRACTOR_RECIPE");
         var result = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
         long n = capacity.fullRows(), cohort = capacity.cohortRows(), batches = capacity.sourceBatches();
@@ -81,6 +89,35 @@ final class BenchmarkReturnLocalSourceWork {
                 replayRows, FRAMES, add(mul(128, replayRows), mul(3L * ROUTING_TEXT_BYTES, FRAMES)), 8,
                 associationVisits, add(mul(8, replayRows), expectedVisits, mul(4, FRAMES), batches));
 
+        // Size/length accessors establish the SQL prior before either existing parser route.
+        result.merge(BenchmarkReturnWorkBudget.Activity.ASSOCIATION, new BenchmarkReturnWorkBudget.Work(1,
+                add(32, mul(8, 2L * MEASURED_BATCHES)), 0, 0, mul(16, 2L * MEASURED_BATCHES),
+                1, 2L * MEASURED_BATCHES, 0), BenchmarkReturnWorkBudget.Work::plus);
+
+        if (recipe == AssociationRecipe.ORIGINAL_FIXED_ONE_OR_TWO_INTEGER_KEYS_AND_COLD_SQL) {
+            require(capacity.sourceBatches() <= MEASURED_BATCHES, "original measured SQL batch roster differs");
+            // The unchanged original recipe uses100 rows per statement. The general caller
+            // material upper instead follows the enforced8192-character prior, including any
+            // malformed split/group/range refusal. CDC has at most two statements/batch.
+            // Prefix/substring/split/Matcher groups/parseLong/boxing/list/copy and update plans
+            // are owned source requests; regex/sort provider instructions remain opaque.
+            long statements = mul(2, capacity.sourceBatches());
+            long tupleVisits = mul(statements, COLD_TUPLES_PER_STATEMENT);
+            // The Workload constructor admits positive multiples-of-four below100000.
+            // A generic bounded UPDATE may visit every id before the declared total refuses.
+            long provisionalUpdateRows = mul(mul(statements, 99996), 2);
+            tupleVisits = add(tupleVisits, provisionalUpdateRows);
+            long sourceChars = mul(statements, MEASURED_SQL_CHARS);
+            var cold = new BenchmarkReturnWorkBudget.Work(add(1, tupleVisits, statements),
+                    add(64, mul(32, statements), mul(48, tupleVisits)), tupleVisits, 0,
+                    add(mul(8, sourceChars), mul(128, tupleVisits)), 8,
+                    add(mul(4, sourceChars), mul(8, tupleVisits)), mul(12, tupleVisits));
+            result.merge(BenchmarkReturnWorkBudget.Activity.ASSOCIATION, cold, BenchmarkReturnWorkBudget.Work::plus);
+            // The three existing immutable list copies are separate actual COPY entries.
+            result.put(BenchmarkReturnWorkBudget.Activity.COPY, new BenchmarkReturnWorkBudget.Work(1,
+                    add(32, mul(8, ROWS)), ROWS, 0, mul(16, ROWS), 2, ROWS, ROWS));
+        }
+
         // Causal coverage scans no more than 512 samples. Native/nominal wrappers retain that scan
         // and add checked interval arithmetic; they do not read another clock or transport.
         var mapping = new BenchmarkReturnWorkBudget.Work(add(8, SAMPLES), add(mul(2, SAMPLES), 10),
@@ -103,6 +140,17 @@ final class BenchmarkReturnLocalSourceWork {
                 cohort, 0, add(mul(32, cohort), mul(64, RESOURCE_ATTEMPTS), 4096), 3,
                 add(cohort, mul(2, RESOURCE_ATTEMPTS)), add(64, mul(4, cohort), mul(8, RESOURCE_ATTEMPTS)));
         return Map.copyOf(result);
+    }
+
+    static void guardMeasuredAssociationSql(BenchmarkWorkloadDefinitions.Phase phase) {
+        if (BenchmarkReturnWorkBudget.current() == null) return;
+        require(phase != null && phase.statementsPerBatch() >= 1 && phase.statementsPerBatch() <= 2
+                        && phase.sql().size() <= 2 * MEASURED_BATCHES
+                        && phase.sql().size() % phase.statementsPerBatch() == 0
+                        && phase.sql().size() / phase.statementsPerBatch() <= MEASURED_BATCHES,
+                "measured SQL roster exceeds its original prior shape");
+        for (String sql : phase.sql()) require(sql != null && sql.length() <= MEASURED_SQL_CHARS,
+                "measured SQL exceeds its prior material bound");
     }
 
     static long maximumFrameRows() { return mul(FRAMES, PART_ROWS); }
