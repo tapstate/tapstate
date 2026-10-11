@@ -205,8 +205,8 @@ if docker run -d --name "$SERVER" --network "$NET" \
     sleep 1
   done
   if [ "$http_ready" = 1 ]; then
-    check "host IP and published port serve the packaged Web entry point" curl -fsS "$base_url/" -o "$WORK/root.html"
-    check "host IP and published port serve a deep client route" curl -fsS "$base_url/pipelines/smoke/edit/api" -o "$WORK/deep.html"
+    check "host IP and published port serve the packaged Web entry point" curl -fsS -H 'Accept: text/html' "$base_url/" -o "$WORK/root.html"
+    check "host IP and published port serve a deep client route" curl -fsS -H 'Accept: text/html' "$base_url/pipelines/smoke/edit/api" -o "$WORK/deep.html"
     check "host IP and published port serve a referenced static asset" curl -fsS "$base_url/assets/app.js" -o "$WORK/app.js"
     check "root HTML is the packaged fixture" grep -qF "Tapstate smoke" "$WORK/root.html"
     check "deep route returns the same SPA entry" cmp -s "$WORK/root.html" "$WORK/deep.html"
