@@ -16,4 +16,19 @@ public interface ClusterProfileStore {
 
     /** Records runtime identity only for the exact still-live node session and profile generation. */
     boolean markJoined(WorkloadClaim expectedSession, String memberUuid, String memberAddress);
+
+    /**
+     * Publishes the complete native pool under an exact live node-session and committed revision.
+     * The store allocates its hash, revision and time bounds, clamping freshness to the node lease.
+     * This records a fact below quorum too; it never returns an admission authority or selects peers.
+     */
+    default boolean recordNativeView(WorkloadClaim expectedNodeSession, long expectedTopologyRevision,
+            ClusterNativeObservation observation, Duration observationTtl) {
+        return false;
+    }
+
+    /** Absent evidence remains unknown; a present malformed record is a coded storage diagnostic. */
+    default Optional<ClusterNativeView> nativeView(String clusterId, String publisherNodeId) {
+        return Optional.empty();
+    }
 }

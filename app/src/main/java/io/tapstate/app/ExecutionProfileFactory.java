@@ -17,6 +17,7 @@ import java.util.function.Supplier;
 
 /** Builds the profile lazily, only when a network-discoverable member is admitted. */
 final class ExecutionProfileFactory {
+    static final String PROFILE_PROTOCOL = "2";
     private final HazelcastProperties hazelcast;
     private final ClusterProperties cluster;
     private final ExecutionProfileProperties properties;
@@ -59,6 +60,9 @@ final class ExecutionProfileFactory {
         Map<String, String> inputs = new TreeMap<>();
         inputs.put("productVersion", required(load(version, "product version"), "version"));
         Properties metadata = load(abi, "runtime and PDK ABI");
+        if (!PROFILE_PROTOCOL.equals(required(metadata, "profile-protocol"))) {
+            throw invalid("immutable profile protocol does not match this runtime", null);
+        }
         for (String key : new String[] {"runtime-abi", "profile-protocol", "pdk-api", "pdk-entity",
                 "pdk-errorcode", "pdk-runner", "pdk-common"}) {
             inputs.put(key, required(metadata, key));

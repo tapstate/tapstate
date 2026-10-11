@@ -12,6 +12,9 @@ import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterExecutionProfile;
+import io.tapstate.spi.store.ClusterNativeMember;
+import io.tapstate.spi.store.ClusterNativeObservation;
+import io.tapstate.spi.store.ClusterNativeView;
 import io.tapstate.spi.store.ClusterNodeReading;
 import io.tapstate.spi.store.ClusterNodeRegistration;
 import io.tapstate.spi.store.ClusterNodeReservation;
@@ -19,6 +22,7 @@ import io.tapstate.spi.store.ClusterProfileStore;
 import io.tapstate.spi.store.ExecutionProfile;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -26,6 +30,7 @@ import org.bson.Document;
 
 import java.net.URI;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -46,13 +51,20 @@ public final class MongoClusterProfileStore implements ClusterProfileStore {
     private final MongoCollection<Document> profiles;
     private final MongoCollection<Document> claims;
     private final MongoCollection<Document> registry;
+    private final MongoCollection<Document> membership;
 
     public MongoClusterProfileStore(MongoClient client, MongoCollection<Document> profiles,
             MongoCollection<Document> claims, MongoCollection<Document> registry) {
+        this(client, profiles, claims, registry, null);
+    }
+
+    public MongoClusterProfileStore(MongoClient client, MongoCollection<Document> profiles,
+            MongoCollection<Document> claims, MongoCollection<Document> registry, MongoCollection<Document> membership) {
         this.client = Objects.requireNonNull(client, "client");
         this.profiles = durable(profiles);
         this.claims = durable(claims);
         this.registry = durable(registry);
+        this.membership = membership == null ? null : durable(membership);
     }
 
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {
@@ -145,8 +157,10 @@ public final class MongoClusterProfileStore implements ClusterProfileStore {
             nodeFields.append("joined", false).append("memberUuid", null)
                     .append("memberAddress", null).append("joinedAt", null);
         }
+        Document registryUpdate = new Document("$set", nodeFields);
+        if (!sameSession) { registryUpdate.append("$unset", new Document("nativeView", "")); }
         registry.updateOne(session, new Document("_id", registryId(clusterId, owner.nodeId())),
-                new Document("$set", nodeFields), new UpdateOptions().upsert(true));
+                registryUpdate, new UpdateOptions().upsert(true));
         Document reading = claims.aggregate(session, List.of(new Document("$match", new Document("_id", key)),
                 remaining())).first();
         WorkloadClaim claim = MongoWorkloadClaimStore.readDocument(acquired);
@@ -210,9 +224,198 @@ public final class MongoClusterProfileStore implements ClusterProfileStore {
             Document filter = new Document("_id", registryId(expected.key().clusterId(), expected.owner().nodeId()))
                     .append("bootId", expected.owner().bootId()).append("profileGeneration", expected.profileGeneration());
             Document fields = new Document("joined", true).append("memberUuid", literal(memberUuid))
-                    .append("memberAddress", literal(memberAddress)).append("joinedAt", "$$NOW");
+                    .append("memberAddress", literal(memberAddress)).append("joinedAt", "$$NOW")
+                    .append("nativeView", new Document("$cond", List.of(new Document("$and", List.of(
+                            new Document("$eq", List.of("$memberUuid", literal(memberUuid))),
+                            new Document("$eq", List.of("$memberAddress", literal(memberAddress))))),
+                            "$nativeView", "$$REMOVE")));
             return registry.updateOne(session, filter, List.of(new Document("$set", fields))).getMatchedCount() == 1;
         });
+    }
+
+    @Override
+    public boolean recordNativeView(WorkloadClaim expected, long expectedTopologyRevision,
+            ClusterNativeObservation observation, Duration observationTtl) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(observation, "observation");
+        positive(observationTtl);
+        if (expected.key().type() != WorkloadClaimType.NODE_SESSION || expectedTopologyRevision < 1
+                || !expected.key().resourceId().equals(expected.owner().nodeId())) {
+            throw new IllegalArgumentException("native publication requires its exact node and profile scope");
+        }
+        if (membership == null || !nativeProtocol(observation.profile())
+                || !expected.key().clusterId().equals(observation.profile().clusterId())
+                || expected.profileGeneration() != observation.profile().generation()) { return false; }
+        return transaction(session -> {
+            ClusterExecutionProfile profile = observation.profile();
+            Document stamped = nativeProfileGuard(session, profile);
+            if (stamped == null || committedGuard(session, profile, expectedTopologyRevision) == null) { return false; }
+            Document publisher = claims.findOneAndUpdate(session, WorkloadClaimDocuments.live(WorkloadClaimFence.from(expected)),
+                    new Document("$inc", new Document("nativeViewFenceSerial", 1L)), AFTER);
+            ClusterNativeMember local = observation.membersByNode().get(expected.owner().nodeId());
+            if (publisher == null || local == null || !local.identity().bootId().equals(expected.owner().bootId())) { return false; }
+            for (ClusterNativeMember peer : new java.util.TreeMap<>(observation.membersByNode()).values()) {
+                if (guardNativeMember(session, profile, peer) == null) { return false; }
+            }
+            Document registered = registry.find(session, new Document("_id", registryId(profile.clusterId(), expected.owner().nodeId()))).first();
+            if (registered == null) { return false; }
+            ClusterNativeView previous = registered.containsKey("nativeView") ? ClusterNativeViewDocuments.read(registered) : null;
+            Instant now = stamped.getDate("nativeViewStoreTime").toInstant();
+            Instant deadline = now.plusMillis(observationTtl.toMillis());
+            Instant leaseUntil = nativeDate(publisher, "leaseUntil").toInstant();
+            if (deadline.isAfter(leaseUntil)) { deadline = leaseUntil; }
+            if (!deadline.isAfter(now)) { return false; }
+            ClusterNativeView next = new ClusterNativeView(WorkloadClaimFence.from(expected), profile,
+                    expectedTopologyRevision, previous == null ? 1 : Math.addExact(previous.viewRevision(), 1L),
+                    ClusterNativeViewDocuments.hash(profile, expectedTopologyRevision, observation.membersByNode()),
+                    now, deadline, observation.membersByNode());
+            Document filter = joinedNativeFilter(profile, local);
+            filter.append("nativeView.viewRevision", previous == null ? new Document("$exists", false) : previous.viewRevision());
+            return registry.updateOne(session, filter,
+                    new Document("$set", new Document("nativeView", ClusterNativeViewDocuments.document(next)))).getMatchedCount() == 1;
+        });
+    }
+
+    @Override
+    public Optional<ClusterNativeView> nativeView(String clusterId, String publisherNodeId) {
+        return StoreIo.call(() -> {
+            Document registered = registry.find(new Document("_id", registryId(clusterId, publisherNodeId))).first();
+            return registered == null || !registered.containsKey("nativeView") ? Optional.empty()
+                    : Optional.of(ClusterNativeViewDocuments.read(registered));
+        });
+    }
+
+    /** Common member facts after each publisher and its latest whole-pool view were conditionally touched. */
+    record QualifiedNativeCohort(ClusterExecutionProfile profile, long topologyRevision, String cohortHash,
+            Instant validUntil, Map<String, ClusterNativeMember> membersByNode) {
+        QualifiedNativeCohort { membersByNode = Map.copyOf(membersByNode); }
+        Set<String> nodeIds() { return membersByNode.keySet(); }
+    }
+
+    Optional<QualifiedNativeCohort> guardNativeCohort(ClientSession session, WorkloadClaimFence requester,
+            ClusterExecutionProfile profile, Document exactCommittedMembership) {
+        if (membership == null || !nativeProtocol(profile) || exactCommittedMembership == null
+                || !requester.key().clusterId().equals(profile.clusterId()) || requester.profileGeneration() != profile.generation()
+                || (requester.key().type() != WorkloadClaimType.CLUSTER_RECOVERY
+                        && requester.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
+                || nativeProfileGuard(session, profile) == null) { return Optional.empty(); }
+        Document current = committedGuard(session, profile, number(exactCommittedMembership, "revision"));
+        if (current == null) { return Optional.empty(); }
+        Document currentRequester = claims.findOneAndUpdate(session, WorkloadClaimDocuments.live(requester),
+                new Document("$inc", new Document("nativeViewFenceSerial", 1L)), AFTER);
+        if (currentRequester == null) { return Optional.empty(); }
+        Set<String> committed = nativeCommittedNodes(current);
+        Document owner = registry.find(session, new Document("_id", registryId(profile.clusterId(), requester.owner().nodeId()))).first();
+        if (owner == null || !owner.containsKey("nativeView")) { return Optional.empty(); }
+        ClusterNativeView candidate = ClusterNativeViewDocuments.read(owner);
+        if (!candidate.profile().equals(profile) || candidate.topologyRevision() != number(current, "revision")
+                || !candidate.publisherClaim().owner().equals(requester.owner())
+                || !committed.containsAll(candidate.membersByNode().keySet())) { return Optional.empty(); }
+        int required = "PROCESS_FAILURE_ONLY".equals(profile.profile().attributes().get("haProfile"))
+                && "2".equals(profile.profile().attributes().get("bootstrapMinMembers")) ? 1 : committed.size() / 2 + 1;
+        if (candidate.membersByNode().size() < required) { return Optional.empty(); }
+        Instant deadline = candidate.validUntil();
+        Instant requesterDeadline = nativeDate(currentRequester, "leaseUntil").toInstant();
+        if (requesterDeadline.isBefore(deadline)) { deadline = requesterDeadline; }
+        for (var entry : new java.util.TreeMap<>(candidate.membersByNode()).entrySet()) {
+            Document registered = registry.find(session, new Document("_id", registryId(profile.clusterId(), entry.getKey()))).first();
+            if (registered == null || !registered.containsKey("nativeView")) { return Optional.empty(); }
+            ClusterNativeView peer = ClusterNativeViewDocuments.read(registered);
+            if (!ClusterNativeViewDocuments.sameCohort(candidate, peer)
+                    || !peer.publisherClaim().owner().nodeId().equals(entry.getKey())
+                    || !peer.publisherClaim().owner().bootId().equals(entry.getValue().identity().bootId())) { return Optional.empty(); }
+            Document livePublisher = claims.findOneAndUpdate(session, WorkloadClaimDocuments.live(peer.publisherClaim()),
+                    new Document("$inc", new Document("nativeViewFenceSerial", 1L)), AFTER);
+            if (livePublisher == null) { return Optional.empty(); }
+            Document rawView = registered.get("nativeView", Document.class);
+            Document exactView = joinedNativeFilter(profile, entry.getValue())
+                    .append("nativeView.publisherClaim", rawView.get("publisherClaim"))
+                    .append("nativeView.profile", rawView.get("profile")).append("nativeView.members", rawView.get("members"))
+                    .append("nativeView.schemaVersion", 1).append("nativeView.viewRevision", peer.viewRevision())
+                    .append("nativeView.cohortHash", peer.cohortHash())
+                    .append("nativeView.observedAt", Date.from(peer.observedAt())).append("nativeView.validUntil", Date.from(peer.validUntil()))
+                    .append("$expr", new Document("$gt", List.of("$nativeView.validUntil", "$$NOW")));
+            if (!registrationProfile(registered).equals(profile) || registry.updateOne(session, exactView,
+                    new Document("$inc", new Document("nativeViewFenceSerial", 1L))).getMatchedCount() != 1) { return Optional.empty(); }
+            if (peer.validUntil().isBefore(deadline)) { deadline = peer.validUntil(); }
+            Instant publisherDeadline = nativeDate(livePublisher, "leaseUntil").toInstant();
+            if (publisherDeadline.isBefore(deadline)) { deadline = publisherDeadline; }
+        }
+        QualifiedNativeCohort qualified = new QualifiedNativeCohort(profile, candidate.topologyRevision(), candidate.cohortHash(),
+                deadline, candidate.membersByNode());
+        return conditionTouchNativeDeadline(session, qualified) ? Optional.of(qualified) : Optional.empty();
+    }
+
+    /** Complements the full cohort guard at an admission boundary; it grants no workload authority. */
+    boolean conditionTouchNativeDeadline(ClientSession session, QualifiedNativeCohort qualified) {
+        ClusterExecutionProfile profile = qualified.profile();
+        Document current = new Document("_id", profile.clusterId()).append("generation", profile.generation())
+                .append("hash", profile.profile().hash()).append("$expr",
+                        new Document("$gt", List.of(Date.from(qualified.validUntil()), "$$NOW")));
+        return profiles.updateOne(session, current,
+                new Document("$inc", new Document("nativeViewFenceSerial", 1L))).getMatchedCount() == 1;
+    }
+
+    private Document nativeProfileGuard(ClientSession session, ClusterExecutionProfile expected) {
+        Document stored = profiles.findOneAndUpdate(session,
+                new Document("_id", expected.clusterId()).append("generation", expected.generation()).append("hash", expected.profile().hash()),
+                List.of(new Document("$set", new Document("nativeViewStoreTime", "$$NOW")
+                        .append("nativeViewFenceSerial", new Document("$add", List.of(
+                                new Document("$ifNull", List.of("$nativeViewFenceSerial", 0L)), 1L))))), AFTER);
+        return stored != null && profile(stored).equals(expected) ? stored : null;
+    }
+
+    private Document committedGuard(ClientSession session, ClusterExecutionProfile profile, long revision) {
+        return membership.findOneAndUpdate(session, new Document("_id", profile.clusterId())
+                .append("profileGeneration", profile.generation()).append("revision", revision),
+                new Document("$inc", new Document("nativeViewFenceSerial", 1L)), AFTER);
+    }
+
+    private Document guardNativeMember(ClientSession session, ClusterExecutionProfile profile, ClusterNativeMember member) {
+        var identity = member.identity();
+        Document live = new Document("_id", claimId(profile.clusterId(), identity.nodeId()))
+                .append("clusterId", profile.clusterId()).append("resourceType", WorkloadClaimType.NODE_SESSION.name())
+                .append("resourceId", identity.nodeId()).append("ownerNodeId", identity.nodeId()).append("ownerBootId", identity.bootId())
+                .append("profileGeneration", profile.generation()).append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+        if (claims.findOneAndUpdate(session, live, new Document("$inc", new Document("nativeViewFenceSerial", 1L)), AFTER) == null) { return null; }
+        Document registered = registry.findOneAndUpdate(session, joinedNativeFilter(profile, member),
+                new Document("$inc", new Document("nativeViewFenceSerial", 1L)), AFTER);
+        return registered != null && registrationProfile(registered).equals(profile) ? registered : null;
+    }
+
+    private static Document joinedNativeFilter(ClusterExecutionProfile profile, ClusterNativeMember member) {
+        var identity = member.identity();
+        return new Document("_id", registryId(profile.clusterId(), identity.nodeId())).append("clusterId", profile.clusterId())
+                .append("nodeId", identity.nodeId()).append("bootId", identity.bootId()).append("profileGeneration", profile.generation())
+                .append("hash", profile.profile().hash()).append("joined", true)
+                .append("memberUuid", identity.memberUuid()).append("memberAddress", member.memberAddress());
+    }
+
+    private static ClusterExecutionProfile registrationProfile(Document registered) {
+        return profile(new Document(registered).append("_id", registered.getString("clusterId"))
+                .append("generation", registered.get("profileGeneration")));
+    }
+
+    private static Set<String> nativeCommittedNodes(Document current) {
+        if (!(current.get("activeNodeIds") instanceof List<?> rows) || rows.isEmpty()) {
+            throw unreadable(current, "activeNodeIds", null);
+        }
+        Set<String> nodes = new java.util.HashSet<>();
+        for (Object raw : rows) {
+            if (!(raw instanceof String node) || node.isBlank() || !nodes.add(node)) {
+                throw unreadable(current, "activeNodeIds", null);
+            }
+        }
+        return Set.copyOf(nodes);
+    }
+
+    private static Date nativeDate(Document current, String field) {
+        if (!(current.get(field) instanceof Date date)) { throw unreadable(current, field, null); }
+        return date;
+    }
+
+    private static boolean nativeProtocol(ClusterExecutionProfile profile) {
+        return "2".equals(profile.profile().attributes().get("profile-protocol"));
     }
 
     /** Real shared writes serialize a caller's transaction with session expiry, renewal and profile changes. */

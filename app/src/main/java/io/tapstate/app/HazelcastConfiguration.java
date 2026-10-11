@@ -383,7 +383,8 @@ class HazelcastConfiguration {
             HazelcastInstance member,
             ClusterProperties clusterProperties,
             ClusterMembershipGate membershipGate,
-            ObjectProvider<ClusterMembershipStore> membershipStores) {
+            ObjectProvider<ClusterMembershipStore> membershipStores,
+            ObjectProvider<ClusterProfileStore> profileStores) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return ClusterMembershipController.inactive();
         }
@@ -391,9 +392,13 @@ class HazelcastConfiguration {
         if (store == null) {
             throw new IllegalStateException("cluster member started without its membership store");
         }
+        ClusterProfileStore profiles = profileStores.getIfAvailable();
+        if (profiles == null) {
+            throw new IllegalStateException("cluster member started without its profile store");
+        }
         return new ClusterMembershipController(clusterProperties.getId(), member, store, membershipGate,
                 clusterProperties.getMembershipReconcileInterval(),
-                (io.tapstate.spi.store.WorkloadClaim) member.getUserContext().get(NODE_SESSION_CONTEXT_KEY));
+                (io.tapstate.spi.store.WorkloadClaim) member.getUserContext().get(NODE_SESSION_CONTEXT_KEY), profiles);
     }
 
     /** Test seam retaining the single-member call shape that predates cluster identity configuration. */

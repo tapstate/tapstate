@@ -198,7 +198,8 @@ public final class MongoStorePort implements StorePort {
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
         MongoClusterProfileStore profiles = new MongoClusterProfileStore(connection.client(),
                 SystemCollections.CLUSTER_EXECUTION_PROFILES.on(database),
-                SystemCollections.WORKLOAD_CLAIMS.on(database), SystemCollections.CLUSTER_NODE_REGISTRY.on(database));
+                SystemCollections.WORKLOAD_CLAIMS.on(database), SystemCollections.CLUSTER_NODE_REGISTRY.on(database),
+                SystemCollections.CLUSTER_MEMBERSHIP.on(database));
         this.clusterProfiles = profiles;
         MongoWorkloadClaimStore leases = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database),
                 clusteredClaims ? profiles : null);

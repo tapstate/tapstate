@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ExecutionProfileFactoryTest {
-    private static final String ABI = "runtime-abi=tapstate-runtime-1\nprofile-protocol=1\npdk-api=2.0.8-SNAPSHOT\n"
+    private static final String ABI = "runtime-abi=tapstate-runtime-1\nprofile-protocol=2\npdk-api=2.0.8-SNAPSHOT\n"
             + "pdk-entity=2.0.9-SNAPSHOT\npdk-errorcode=2.8-SNAPSHOT\npdk-runner=2.8-SNAPSHOT\npdk-common=2.8-SNAPSHOT\n";
 
     @Test
@@ -32,6 +32,7 @@ class ExecutionProfileFactoryTest {
         var first = factory(hz, 1_073_741_824L, ABI).create();
         assertThat(first.attributes()).containsEntry("maxHeapBytes", "1073741824")
                 .containsEntry("cooperativeThreads", "4").containsEntry("pdk-api", "2.0.8-SNAPSHOT")
+                .containsEntry("profile-protocol", "2")
                 .doesNotContainKeys("connectorRegistry", "compiledDemand", "activeConnections");
         hz.getJet().setCooperativeThreadCount(8);
         assertThat(factory(hz, 1_073_741_824L, ABI).create().hash()).isNotEqualTo(first.hash());
@@ -53,10 +54,19 @@ class ExecutionProfileFactoryTest {
     }
 
     @Test
+    void anOlderProfileProtocolCannotDescribeThisRuntime() {
+        assertThatThrownBy(() -> factory(new HazelcastProperties(), 1_073_741_824L,
+                ABI.replace("profile-protocol=2", "profile-protocol=1")).create())
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(BootError.EXECUTION_PROFILE_INVALID));
+    }
+
+    @Test
     void packagedMetadataUsesActualFilteredMavenCoordinates() {
         var profile = new ExecutionProfileFactory(new HazelcastProperties(), new ClusterProperties(),
                 new ExecutionProfileProperties(), ParallelismBudget.DEFAULTS, new ClusterCapacityProperties().limits()).create();
-        assertThat(profile.attributes()).containsKeys("productVersion", "runtime-abi", "pdk-api", "systemDataVersion");
+        assertThat(profile.attributes()).containsKeys("productVersion", "runtime-abi", "pdk-api", "systemDataVersion")
+                .containsEntry("profile-protocol", "2");
         assertThat(profile.attributes().values()).allSatisfy(value -> assertThat(value).doesNotContain("${"));
     }
 

@@ -1,6 +1,11 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
+import com.mongodb.event.CommandSucceededEvent;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import io.tapstate.core.event.ChainPosition;
@@ -20,6 +25,9 @@ import io.tapstate.spi.store.ArtifactIdentity;
 import io.tapstate.spi.store.ClusterCapacityReservation;
 import io.tapstate.spi.store.ClusterCapacityStore;
 import io.tapstate.spi.store.ClusterExecutionProfile;
+import io.tapstate.spi.store.ClusterExecutionMember;
+import io.tapstate.spi.store.ClusterNativeMember;
+import io.tapstate.spi.store.ClusterNativeObservation;
 import io.tapstate.spi.store.ClusterRecoveryCause;
 import io.tapstate.spi.store.ClusterRecoveryEvent;
 import io.tapstate.spi.store.ClusterRecoveryFence;
@@ -75,6 +83,446 @@ class ClusterRecoveryStoreIT {
     private static final Map<String, ClusterRecoveryPosition> POSITIONS = Map.of("crm",
             new ClusterRecoveryPosition("crm", "mongo", "capture-crm", ClusterRecoveryPosition.Kind.DURABLE_POSITION,
                     new ChainPosition(new SourceOrder(3, 7), "resume-7"), "capture-majority-read", "srs/crm/3"));
+
+    @Test
+    void aCompleteNativePairCanAdvanceWhileTheAbsentMembersIdentityLeaseRemainsLive() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-pair");
+            assertAllOriginalSessionsLeased(fixture);
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            var enqueued = fixture.enqueue(pipeline);
+            assertThat(enqueued.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            ClusterRecoveryItem waiting = enqueued.item();
+            var granted = fixture.permit(waiting, nativePairDemand(), LIMITS);
+            assertThat(granted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(granted.item().enqueueSequence()).isEqualTo(waiting.enqueueSequence());
+            assertThat(granted.item().attempt()).isZero();
+            assertThat(granted.item().permit().transferredExecutionGeneration()).isZero();
+            assertThat(granted.item().permit().demandByNode()).isEqualTo(nativePairDemand());
+            var advanced = fixture.store.advanceExecution(fixture.fence(granted.item()), pipeline.claim(),
+                    Set.of("b", "c"), Set.of("crm"));
+            assertThat(advanced.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            WorkloadClaim successor = advanced.advancedPipelineClaim();
+            assertThat(successor.executionGeneration()).isEqualTo(pipeline.claim().executionGeneration() + 1);
+            assertThat(successor.executionNodeIds()).containsExactlyInAnyOrder("b", "c");
+            assertThat(successor.executionMembers()).isEqualTo(Map.of(
+                    "b", new ClusterExecutionMember("b", "boot-b", "uuid-b"),
+                    "c", new ClusterExecutionMember("c", "boot-c", "uuid-c")));
+            assertThat(advanced.item().successor().requiredSourceIds()).containsExactly("crm");
+            assertThat(advanced.item().event()).isEqualTo(waiting.event());
+            assertThat(advanced.item().attempt()).isEqualTo(1);
+            assertThat(fixture.store.advanceExecution(fixture.fence(granted.item()), pipeline.claim(),
+                    Set.of("b", "c"), Set.of("crm")).outcome()).isEqualTo(ClusterRecoveryMutation.STALE_ITEM);
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                    .isEqualTo(successor.executionGeneration());
+            assertThat(fixture.memberDocuments.find(new Document("_id", "east")).first().getList("activeNodeIds", String.class))
+                    .containsExactly("a", "b", "c");
+            assertAllOriginalSessionsLeased(fixture);
+            var registeredA = fixture.profiles.nodes("east").stream()
+                    .filter(node -> "a".equals(node.registration().nodeSession().owner().nodeId())).findFirst().orElseThrow();
+            assertThat(registeredA.registration().joined()).isTrue();
+            assertThat(registeredA.registration().memberUuid()).isEqualTo("uuid-a");
+        }
+    }
+
+    @Test
+    void aCallerCannotReserveASubsetOfThePublishedCompleteNativePair() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-subset");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryItem waiting = fixture.enqueue(pipeline).item();
+            var refused = fixture.permit(waiting, Map.of("b", demand(1)), LIMITS);
+            assertThat(refused.outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_PERMIT);
+            assertNoNativeViewAdmission(fixture, pipeline, waiting);
+        }
+    }
+
+    @Test
+    void aSingletonViewCannotUseThreeHealthyIdentityLeasesAsProductionQuorum() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-singleton");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryItem waiting = fixture.enqueue(pipeline).item();
+            fixture.publishNativeViews(Set.of("b"), Duration.ofMinutes(1));
+            assertThat(fixture.permit(waiting, Map.of("b", demand(1)), LIMITS).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+            assertAllOriginalSessionsLeased(fixture);
+            assertNoNativeViewAdmission(fixture, pipeline, waiting);
+        }
+    }
+
+    @Test
+    void missingOrDisagreedNativeViewsCannotReserveANewExecution() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-missing");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryItem waiting = fixture.enqueue(pipeline).item();
+            // An actual join change invalidates the publisher's prior observation.
+            assertThat(fixture.profiles.markJoined(fixture.nodeB, "uuid-b-next", "b:5701")).isTrue();
+            assertThat(fixture.profiles.nativeView("east", "b")).isEmpty();
+            assertThat(fixture.permit(waiting, nativePairDemand(), LIMITS).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+            assertNoNativeViewAdmission(fixture, pipeline, waiting);
+        }
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-disagreed");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryItem waiting = fixture.enqueue(pipeline).item();
+            fixture.publishNativeViews(Set.of("b", "c"), Set.of("b"), Duration.ofMinutes(1));
+            fixture.publishNativeViews(Set.of("c"), Duration.ofMinutes(1));
+            assertThat(fixture.permit(waiting, nativePairDemand(), LIMITS).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+            assertNoNativeViewAdmission(fixture, pipeline, waiting);
+        }
+    }
+
+    @Test
+    void anExpiredViewIsUnknownOnMongoTimeWhileTheOriginalIdentityLeasesRemainLive() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-expired");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryItem waiting = fixture.enqueue(pipeline).item();
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMillis(100));
+            fixture.awaitNativeViewExpiry("b");
+            assertThat(fixture.permit(waiting, nativePairDemand(), LIMITS).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+            assertAllOriginalSessionsLeased(fixture);
+            assertNoNativeViewAdmission(fixture, pipeline, waiting);
+        }
+    }
+
+    @Test
+    void aPreviouslyReservedPairMustRequalifyItsFullViewBeforeTheIssuerAdvances() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-before-issuer");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryItem waiting = fixture.enqueue(pipeline).item();
+            var granted = fixture.permit(waiting, nativePairDemand(), LIMITS);
+            assertThat(granted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            fixture.publishNativeViews(Set.of("b"), Duration.ofMinutes(1));
+            assertThat(fixture.store.advanceExecution(fixture.fence(granted.item()), pipeline.claim(),
+                    Set.of("b", "c"), Set.of("crm")).outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+            ClusterRecoveryItem retained = fixture.store.read(pipeline.key()).orElseThrow();
+            assertThat(retained.itemRevision()).isEqualTo(granted.item().itemRevision());
+            assertThat(retained.permit()).isEqualTo(granted.item().permit());
+            assertThat(retained.attempt()).isZero();
+            assertThat(retained.successor()).isNull();
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                    .isEqualTo(pipeline.claim().executionGeneration());
+        }
+    }
+
+    @Test
+    void aMatchingAllocatedSubmissionRemainsARecordableFactAfterAJoinedTupleChanges() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-before-submission");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryItem waiting = fixture.enqueue(pipeline).item();
+            var granted = fixture.permit(waiting, nativePairDemand(), LIMITS);
+            assertThat(granted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            var advanced = fixture.store.advanceExecution(fixture.fence(granted.item()), pipeline.claim(),
+                    Set.of("b", "c"), Set.of("crm"));
+            assertThat(advanced.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.profiles.markJoined(fixture.nodeB, "uuid-b-next", "b:5701")).isTrue();
+            var submitted = fixture.store.recordSubmission(fixture.fence(advanced.item()),
+                    WorkloadClaimFence.from(advanced.advancedPipelineClaim()), "successor-native-job");
+            assertThat(submitted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            ClusterRecoveryItem retained = fixture.store.read(pipeline.key()).orElseThrow();
+            assertThat(retained.itemRevision()).isEqualTo(advanced.item().itemRevision() + 1);
+            assertThat(retained.successor().nativeJobId()).isEqualTo("successor-native-job");
+            assertThat(retained.successor().startupReceipt()).isNull();
+            assertThat(retained.successor().executionNodeIds()).containsExactlyInAnyOrder("b", "c");
+            assertThat(fixture.occupancy.find(new Document("_id", retained.permit().reservationId())).first()
+                    .get("nativeJobId")).isEqualTo("successor-native-job");
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                    .isEqualTo(advanced.advancedPipelineClaim().executionGeneration());
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionMembers())
+                    .isEqualTo(advanced.advancedPipelineClaim().executionMembers());
+        }
+    }
+
+    @Test
+    void aQualifiedRecoveryPairCannotLendItsViewToAPipelineHolderOutsideThePool() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline original = fixture.nativeViewFailure("outside-view-controller", true, Duration.ofSeconds(3));
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            ClusterRecoveryStore.Result enqueued = fixture.enqueue(original);
+            assertThat(enqueued.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            ClusterRecoveryItem waiting = enqueued.item();
+            WorkloadClaim priorController = original.claim();
+            assertThat(fixture.workloads.release(priorController)).isTrue();
+            WorkloadOwner outsideOwner = fixture.initialSessions.getFirst().owner();
+            WorkloadClaim outsideController = fixture.workloads.acquire(priorController.key(), outsideOwner, 2, TTL).claim();
+            assertThat(outsideController.owner().nodeId()).isEqualTo("a");
+            assertThat(outsideController.claimGeneration()).isGreaterThan(priorController.claimGeneration());
+            assertThat(outsideController.executionGeneration()).isEqualTo(priorController.executionGeneration());
+            assertThat(outsideController.executionMembers()).isEqualTo(priorController.executionMembers());
+            fixture.publishNativeViews(Set.of("a"), Duration.ofMinutes(1));
+            fixture.awaitRetirement(priorController.key());
+            boolean retired = fixture.profiles.transaction(session ->
+                    fixture.workloads.provesRetired(session, WorkloadClaimFence.from(priorController)));
+            assertThat(retired).isTrue();
+            assertThat(fixture.workloads.read(outsideController.key()).orElseThrow().leased()).isTrue();
+            assertAllOriginalSessionsLeased(fixture);
+            var granted = fixture.permit(waiting, nativePairDemand(), LIMITS);
+            assertThat(granted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(granted.item().attempt()).isZero();
+            assertThat(granted.item().permit().demandByNode()).isEqualTo(nativePairDemand());
+            ClusterRecoveryItem admitted = granted.item();
+            var refused = fixture.store.advanceExecution(fixture.fence(admitted), outsideController,
+                    Set.of("b", "c"), Set.of("crm"));
+            assertThat(refused.outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+            ClusterRecoveryItem retained = fixture.store.read(original.key()).orElseThrow();
+            assertThat(retained.itemRevision()).isEqualTo(admitted.itemRevision());
+            assertThat(retained.permit()).isEqualTo(admitted.permit());
+            assertThat(retained.attempt()).isZero();
+            assertThat(retained.successor()).isNull();
+            WorkloadClaim current = fixture.workloads.read(outsideController.key()).orElseThrow().claim();
+            assertThat(WorkloadClaimFence.from(current)).isEqualTo(WorkloadClaimFence.from(outsideController));
+            assertThat(current.executionMembers()).isEqualTo(outsideController.executionMembers());
+            assertThat(fixture.memberDocuments.find(new Document("_id", "east")).first().getList("activeNodeIds", String.class))
+                    .containsExactly("a", "b", "c");
+            assertAllOriginalSessionsLeased(fixture);
+        }
+    }
+
+    @Test
+    void anExpiredNativeViewCannotBurnARefusalAttemptAfterTheActualBudgetRead() throws Exception {
+        assertNativeViewExpiryDuringBudgetRead(true);
+    }
+
+    @Test
+    void anExpiredNativeViewCannotGrantAPermitAfterTheActualBudgetRead() throws Exception {
+        assertNativeViewExpiryDuringBudgetRead(false);
+    }
+
+    @Test
+    void anExpiredNativeViewCannotBeChargedAfterTheCapacityRefusalWasQualified() throws Exception {
+        assertNativeViewExpiryDuringBudgetRead(true, true);
+    }
+
+    private static void assertNativeViewExpiryDuringBudgetRead(boolean overBudget) throws Exception {
+        assertNativeViewExpiryDuringBudgetRead(overBudget, false);
+    }
+
+    private static void assertNativeViewExpiryDuringBudgetRead(boolean overBudget, boolean afterCapacityRefusal) throws Exception {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure(afterCapacityRefusal ? "expired-refusal-save-view"
+                    : overBudget ? "expired-budget-view" : "expired-permit-view");
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            var enqueued = fixture.enqueue(pipeline);
+            assertThat(enqueued.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            ClusterRecoveryItem waiting = enqueued.item();
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofSeconds(3));
+            var observed = fixture.profiles.nativeView("east", "b").orElseThrow();
+            BudgetReadPause pause = new BudgetReadPause(fixture.database, afterCapacityRefusal);
+            MongoClientSettings settings = MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(pause).build();
+            var worker = Executors.newSingleThreadExecutor();
+            try (MongoClient admittingClient = MongoClients.create(settings)) {
+                var admittingDb = admittingClient.getDatabase(fixture.database);
+                MongoClusterProfileStore admittingProfiles = new MongoClusterProfileStore(admittingClient,
+                        admittingDb.getCollection("profiles"), admittingDb.getCollection("claims"),
+                        admittingDb.getCollection("nodes"), admittingDb.getCollection("membership"));
+                MongoWorkloadClaimStore admittingClaims = new MongoWorkloadClaimStore(admittingDb.getCollection("claims"), admittingProfiles);
+                MongoClusterCapacityStore admittingCapacity = new MongoClusterCapacityStore(admittingProfiles, admittingClaims,
+                        admittingDb.getCollection("capacity"), admittingDb.getCollection("claims"), admittingDb.getCollection("profiles"),
+                        admittingDb.getCollection("membership"), admittingDb.getCollection("nodes"), admittingDb.getCollection("desired"),
+                        admittingDb.getCollection("states"), admittingDb.getCollection("artifacts"));
+                MongoClusterRecoveryStore admittingQueue = new MongoClusterRecoveryStore(admittingDb.getCollection("recovery_queue"), admittingCapacity);
+                Map<String, ClusterCapacityDemand> requested = Map.of("b", demand(overBudget ? 21 : 1), "c", demand(overBudget ? 21 : 1));
+                pause.armed.set(true);
+                var pending = worker.submit(() -> admittingQueue.acquirePermit(fixture.fence(waiting), requested,
+                        LIMITS, PERMIT_TTL, BACKOFF, 1));
+                try {
+                    assertThat(pause.budgetRead.await(10, TimeUnit.SECONDS))
+                            .as(afterCapacityRefusal ? "the second successful deadline reply followed the real budget read"
+                                    : "the real budget find completed after full qualification").isTrue();
+                    if (afterCapacityRefusal) {
+                        assertThat(pause.budgetObserved.get()).isTrue();
+                        assertThat(pause.successfulDeadlineResponses.get()).isEqualTo(2);
+                    }
+                    Document expired = new Document("clusterId", "east").append("nodeId", "b")
+                            .append("nativeView.viewRevision", observed.viewRevision())
+                            .append("$expr", new Document("$lte", List.of("$nativeView.validUntil", "$$NOW")));
+                    long bound = System.nanoTime() + TimeUnit.SECONDS.toNanos(8);
+                    while (fixture.nodeDocuments.find(expired).first() == null && System.nanoTime() < bound) { Thread.sleep(25); }
+                    assertThat(fixture.nodeDocuments.find(expired).first()).as("Mongo time expired the unchanged view").isNotNull();
+                    assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().leased()).isTrue();
+                    assertAllOriginalSessionsLeased(fixture);
+                    pause.resume.countDown();
+                    var result = pending.get(10, TimeUnit.SECONDS);
+                    assertThat(pause.listenerFailure.get()).isNull();
+                    assertThat(result.outcome()).as("expired observation returned with durable attempt %s",
+                            fixture.store.read(pipeline.key()).orElseThrow().attempt())
+                            .isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+                    ClusterRecoveryItem retained = fixture.store.read(pipeline.key()).orElseThrow();
+                    assertThat(retained.itemRevision()).isEqualTo(waiting.itemRevision());
+                    assertThat(retained.attempt()).isZero();
+                    assertThat(retained.permit()).isNull();
+                    assertThat(retained.successor()).isNull();
+                    assertThat(fixture.occupancy.countDocuments(new Document("recovery", true))).isZero();
+                    assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                            .isEqualTo(pipeline.claim().executionGeneration());
+                } finally {
+                    pause.resume.countDown();
+                    admittingClient.close();
+                    worker.shutdownNow();
+                    assertThat(worker.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+                }
+            } finally {
+                pause.resume.countDown();
+                worker.shutdownNow();
+            }
+        }
+    }
+
+    /** Holds only the owned driver's real budget or deadline reply; command, result and clock are untouched. */
+    private static final class BudgetReadPause implements CommandListener {
+        private final String database;
+        private final java.util.concurrent.ConcurrentMap<Integer, String> commands = new java.util.concurrent.ConcurrentHashMap<>();
+        private final java.util.concurrent.atomic.AtomicBoolean armed = new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicBoolean paused = new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicBoolean qualified = new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicBoolean budgetObserved = new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicInteger successfulDeadlineResponses = new java.util.concurrent.atomic.AtomicInteger();
+        private final boolean afterCapacityRefusal;
+        private final java.util.concurrent.atomic.AtomicReference<Throwable> listenerFailure = new java.util.concurrent.atomic.AtomicReference<>();
+        private final java.util.concurrent.CountDownLatch budgetRead = new java.util.concurrent.CountDownLatch(1);
+        private final java.util.concurrent.CountDownLatch resume = new java.util.concurrent.CountDownLatch(1);
+
+        private BudgetReadPause(String database, boolean afterCapacityRefusal) {
+            this.database = database;
+            this.afterCapacityRefusal = afterCapacityRefusal;
+        }
+
+        @Override
+        public void commandStarted(CommandStartedEvent event) {
+            if (!armed.get() || !database.equals(event.getDatabaseName())) { return; }
+            var command = event.getCommand();
+            if ("update".equals(event.getCommandName()) && command.getString("update").getValue().equals("profiles")) {
+                for (var update : command.getArray("updates")) {
+                    var filter = update.asDocument().getDocument("q");
+                    if (filter.containsKey("$expr") && filter.getDocument("$expr").containsKey("$gt")) {
+                        var comparison = filter.getDocument("$expr").getArray("$gt");
+                        if (comparison.size() == 2 && comparison.get(0).isDateTime() && comparison.get(1).isString()
+                                && "$$NOW".equals(comparison.get(1).asString().getValue())) {
+                            commands.put(event.getRequestId(), "qualification");
+                        }
+                    }
+                }
+            } else if (qualified.get() && "find".equals(event.getCommandName())
+                    && "capacity".equals(command.getString("find").getValue())) {
+                var filter = command.getDocument("filter");
+                if (filter.containsKey("clusterId") && "east".equals(filter.getString("clusterId").getValue())
+                        && !filter.containsKey("pipelineId")) { commands.put(event.getRequestId(), "budget"); }
+            }
+        }
+
+        @Override
+        public void commandSucceeded(CommandSucceededEvent event) {
+            String phase = commands.remove(event.getRequestId());
+            if ("qualification".equals(phase) && event.getResponse().containsKey("n")
+                    && event.getResponse().getNumber("n").longValue() == 1) {
+                qualified.set(true);
+                int accepted = successfulDeadlineResponses.incrementAndGet();
+                if (afterCapacityRefusal && accepted == 2) {
+                    if (!budgetObserved.get()) {
+                        listenerFailure.set(new AssertionError("the second deadline reply preceded the budget read"));
+                        return;
+                    }
+                    holdReply();
+                }
+            }
+            if ("budget".equals(phase)) {
+                budgetObserved.set(true);
+                if (!afterCapacityRefusal) { holdReply(); }
+            }
+        }
+
+        private void holdReply() {
+            if (!paused.compareAndSet(false, true)) { return; }
+            budgetRead.countDown();
+            try {
+                if (!resume.await(15, TimeUnit.SECONDS)) { listenerFailure.set(new AssertionError("the admission reply was not resumed")); }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                listenerFailure.set(interrupted);
+            }
+        }
+    }
+
+    @Test
+    void aFreshNativePairCannotRetireTheOriginalCachedAuthorityPromise() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.nativeViewFailure("native-old-promise", false);
+            fixture.publishNativeViews(Set.of("b", "c"), Duration.ofMinutes(1));
+            var enqueued = fixture.enqueue(pipeline);
+            assertThat(enqueued.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            ClusterRecoveryItem waiting = enqueued.item();
+            var blocked = fixture.permit(waiting, nativePairDemand(), LIMITS);
+            assertThat(blocked.outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_PERMIT);
+            assertThat(blocked.item().permit()).isNull();
+            assertThat(blocked.item().successor()).isNull();
+            assertThat(blocked.item().attempt()).isZero();
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                    .isEqualTo(pipeline.claim().executionGeneration());
+            var submitted = fixture.capacity.submittedExecution(pipeline.claim()).orElseThrow();
+            assertThat(submitted.authorityRetired()).isFalse();
+            assertThat(blocked.item().nextEligibleAt()).isEqualTo(fixture.claims.find(new Document("_id",
+                    MongoClusterCapacityStore.claimId("east", pipeline.key().pipelineId()))).first()
+                    .getDate("retiredAuthorizationUntil").toInstant());
+            assertAllOriginalSessionsLeased(fixture);
+        }
+    }
+
+    @Test
+    void theCanonicalNativeQualifierRejectsASingletonDespiteThreeLiveIdentityLeases() {
+        try (Fixture fixture = nativeViewFixture()) {
+            Pipeline pipeline = fixture.retiredNativeViewFailure("native-singleton-qualification");
+            fixture.publishNativeViews(Set.of("b"), Duration.ofMinutes(1));
+            boolean qualified = fixture.profiles.transaction(session -> fixture.profiles.guardNativeCohort(session,
+                    WorkloadClaimFence.from(fixture.recovery), fixture.profile,
+                    fixture.memberDocuments.find(session, new Document("_id", "east")).first()).isPresent());
+            assertThat(qualified).isFalse();
+            assertAllOriginalSessionsLeased(fixture);
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                    .isEqualTo(pipeline.claim().executionGeneration());
+            assertThat(fixture.store.read(pipeline.key())).isEmpty();
+            assertThat(fixture.memberDocuments.find(new Document("_id", "east")).first().getList("activeNodeIds", String.class))
+                    .containsExactly("a", "b", "c");
+        }
+    }
+
+    private static Fixture nativeViewFixture() {
+        return new Fixture(TTL, false, TTL, new ExecutionProfile(1, Map.of("build", "one", "threads", "4",
+                "profile-protocol", "2", "haProfile", "PRODUCTION_HA", "bootstrapMinMembers", "3")),
+                List.of("a", "b", "c"), "b");
+    }
+
+    private static Map<String, ClusterCapacityDemand> nativePairDemand() {
+        return Map.of("b", demand(1), "c", demand(1));
+    }
+
+    private static void assertAllOriginalSessionsLeased(Fixture fixture) {
+        assertThat(fixture.profiles.nodes("east")).hasSize(3).allSatisfy(node -> {
+            assertThat(node.leased()).isTrue();
+            assertThat(node.registration().joined()).isTrue();
+        });
+    }
+
+    private static void assertNoNativeViewAdmission(Fixture fixture, Pipeline pipeline, ClusterRecoveryItem waiting) {
+        ClusterRecoveryItem current = fixture.store.read(pipeline.key()).orElseThrow();
+        assertThat(current.itemRevision()).isEqualTo(waiting.itemRevision());
+        assertThat(current.attempt()).isZero();
+        assertThat(current.permit()).isNull();
+        assertThat(current.successor()).isNull();
+        assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration())
+                .isEqualTo(pipeline.claim().executionGeneration());
+        assertThat(fixture.occupancy.find(new Document("pipelineId", pipeline.key().pipelineId())
+                .append("executionGeneration", null)).into(new ArrayList<>())).isEmpty();
+    }
 
     @Test
     void liveReacquisitionMovesTheHorizonWhileRenewalAllowsOneRecoveryAdvance() {
@@ -326,6 +774,8 @@ class ClusterRecoveryStoreIT {
             var allocated = fixture.capacity.advanceExecution(reserved.reservation(), first, LIVE);
             WorkloadClaim next = fixture.retireAndAcquire(allocated.advancedPipelineClaim(), fixture.nodeB.owner(), TTL);
             assertThat(fixture.profiles.markJoined(fixture.nodeB, "uuid-b-new", "b:5701")).isTrue();
+            fixture.rememberNativeMember(fixture.nodeB, "uuid-b-new", "b:5701");
+            fixture.publishNativeViews(LIVE, TTL);
             assertThat(fixture.resume(resume.pending(), next).outcome()).isEqualTo(ClusterCapacityStore.Outcome.STALE_EXECUTION);
             assertThat(fixture.workloads.read(next.key()).orElseThrow().claim().executionMembers())
                     .isEqualTo(allocated.advancedPipelineClaim().executionMembers());
@@ -422,7 +872,7 @@ class ClusterRecoveryStoreIT {
     void anOldProfileResumeMarkerDoesNotSuppressARealColdRestartEvent() throws Exception {
         try (Fixture fixture = new Fixture(Duration.ofSeconds(3))) {
             Resume resume = fixture.resumePipeline("orders", Duration.ofSeconds(3));
-            ExecutionProfile changed = new ExecutionProfile(1, Map.of("build", "two", "threads", "4"));
+            ExecutionProfile changed = new ExecutionProfile(1, Map.of("build", "two", "threads", "4", "profile-protocol", "2"));
             WorkloadOwner newA = new WorkloadOwner("a", "boot-a-next");
             io.tapstate.spi.store.ClusterNodeReservation first;
             long deadline = System.nanoTime() + Duration.ofSeconds(8).toNanos();
@@ -446,6 +896,9 @@ class ClusterRecoveryStoreIT {
             assertThat(fixture.profiles.markJoined(second.node().registration().nodeSession(), "uuid-b-next", "b:5701")).isTrue();
             fixture.memberDocuments.replaceOne(new Document("_id", "east"), new Document("_id", "east")
                     .append("profileGeneration", 2L).append("revision", 3L).append("activeNodeIds", List.of("a", "b")));
+            fixture.rememberNativeMember(first.node().registration().nodeSession(), "uuid-a-next", "a:5701");
+            fixture.rememberNativeMember(second.node().registration().nodeSession(), "uuid-b-next", "b:5701");
+            fixture.publishNativeViews(first.profile(), 3, LIVE, LIVE, TTL);
             fixture.recovery = fixture.workloads.acquire(recoveryKey(), newA, 3, TTL).claim();
             WorkloadClaim current = fixture.workloads.acquire(resume.original().key(), newB, 3, TTL).claim();
             assertThat(current.executionProfile()).isEqualTo(fixture.profile);
@@ -805,7 +1258,7 @@ class ClusterRecoveryStoreIT {
     }
 
     @Test
-    void aKnownNativeCohortWaitsForTheStoredNodeSessionViewWithoutSpendingAnAttempt() throws InterruptedException {
+    void aKnownNativeCohortWaitsForAgreedPeerViewsWithoutSpendingAnAttempt() {
         try (Fixture fixture = new Fixture(TTL, false, Duration.ofSeconds(6))) {
             Set<String> originalNodes = Set.of("a", "b", "c");
             Map<String, ClusterCapacityDemand> originalDemand = Map.of("a", demand(1), "b", demand(1), "c", demand(1));
@@ -847,11 +1300,16 @@ class ClusterRecoveryStoreIT {
                         .isEqualTo(original.executionGeneration());
                 assertThat(fixture.occupancy.countDocuments(new Document("recovery", true))).isZero();
             }
-            long expiryBound = System.nanoTime() + Duration.ofSeconds(8).toNanos();
-            while (fixture.workloads.read(third).orElseThrow().leased()) {
-                if (System.nanoTime() >= expiryBound) throw new AssertionError("the third node session did not expire on Mongo time");
-                Thread.sleep(25);
-            }
+            fixture.publishNativeViews(LIVE, Set.of("a"), TTL);
+            var disagreed = fixture.permit(item, DEMAND, LIMITS);
+            assertThat(disagreed.outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
+            assertThat(disagreed.item()).isEqualTo(item);
+            assertThat(fixture.store.read(pipeline.key())).contains(item);
+            assertThat(disagreed.item().attempt()).isZero();
+            assertThat(disagreed.item().permit()).isNull();
+            assertThat(disagreed.item().successor()).isNull();
+            assertThat(fixture.workloads.read(third).orElseThrow().leased()).isTrue();
+            fixture.publishNativeViews(LIVE, Set.of("b"), TTL);
             for (String node : LIVE) {
                 assertThat(fixture.workloads.read(new WorkloadClaimKey("east", WorkloadClaimType.NODE_SESSION, node))
                         .orElseThrow().leased()).isTrue();
@@ -860,6 +1318,7 @@ class ClusterRecoveryStoreIT {
                     .containsExactlyInAnyOrderElementsOf(originalNodes);
             var granted = fixture.permit(item, DEMAND, LIMITS);
             assertThat(granted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.workloads.read(third).orElseThrow().leased()).isTrue();
             assertThat(granted.item().attempt()).isZero();
             assertThat(granted.item().permit().demandByNode()).isEqualTo(DEMAND);
             assertThat(granted.item().permit().transferredExecutionGeneration()).isZero();
@@ -894,7 +1353,7 @@ class ClusterRecoveryStoreIT {
 
     @Test
     void anExplicitProcessFailureOnlyProfileRestoresOneSurvivorThroughTheRealIssuer() {
-        Map<String, String> inputs = Map.of("build", "one", "threads", "4",
+        Map<String, String> inputs = Map.of("build", "one", "threads", "4", "profile-protocol", "2",
                 "haProfile", "PROCESS_FAILURE_ONLY", "bootstrapMinMembers", "2");
         ExecutionProfile proposed = new ExecutionProfile(1, inputs);
         try (Fixture fixture = new Fixture(Duration.ofMinutes(1), false, Duration.ofMinutes(1),
@@ -949,7 +1408,7 @@ class ClusterRecoveryStoreIT {
                 Map.of("haProfile", "UNKNOWN", "bootstrapMinMembers", "2"),
                 Map.of("haProfile", "PROCESS_FAILURE_ONLY", "bootstrapMinMembers", "3"));
         for (int index = 0; index < policies.size(); index++) {
-            Map<String, String> inputs = new java.util.TreeMap<>(Map.of("build", "one", "threads", "4"));
+            Map<String, String> inputs = new java.util.TreeMap<>(Map.of("build", "one", "threads", "4", "profile-protocol", "2"));
             inputs.putAll(policies.get(index));
             List<String> members = index == 0 ? List.of("a", "b", "c") : List.of("a", "b");
             ExecutionProfile proposed = new ExecutionProfile(1, inputs);
@@ -983,12 +1442,15 @@ class ClusterRecoveryStoreIT {
             ClusterRecoveryItem item = fixture.enqueue(fixture.pipeline("orders", true, List.of(SourceRef.bare("crm")),
                     true, new WorkloadOwner("a", "boot-a"))).item();
             assertThat(fixture.workloads.release(fixture.nodeB)).isTrue();
+            fixture.publishNativeViews(Set.of("a"), TTL);
             assertThat(fixture.permit(item, DEMAND, LIMITS).outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_QUORUM);
             assertThat(fixture.store.read(item.event().key()).orElseThrow()).isEqualTo(item);
             assertThat(fixture.occupancy.countDocuments()).isZero();
             WorkloadClaim restored = fixture.profiles.reserve("east", new WorkloadOwner("b", "boot-b-next"),
                     URI.create("http://b:8080"), fixture.profile.profile(), TTL).node().registration().nodeSession();
-            fixture.profiles.markJoined(restored, "uuid-b-next", "b:5701");
+            assertThat(fixture.profiles.markJoined(restored, "uuid-b-next", "b:5701")).isTrue();
+            fixture.rememberNativeMember(restored, "uuid-b-next", "b:5701");
+            fixture.publishNativeViews(LIVE, TTL);
             assertThat(fixture.permit(item, DEMAND, LIMITS).outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
             assertThat(fixture.store.read(item.event().key()).orElseThrow().attempt()).isZero();
         }
@@ -1034,6 +1496,8 @@ class ClusterRecoveryStoreIT {
             assertThat(recovered.status()).isEqualTo(ClusterRecoveryStatus.RECOVERED);
             assertThat(fixture.store.list("east", 0, 10)).containsExactly(recovered);
             assertThat(fixture.profiles.markJoined(fixture.nodeB, "uuid-b-rejoined", "b:5701")).isTrue();
+            fixture.rememberNativeMember(fixture.nodeB, "uuid-b-rejoined", "b:5701");
+            fixture.publishNativeViews(LIVE, TTL);
             WorkloadClaim successor = fixture.workloads.read(pipeline.claim.key()).orElseThrow().claim();
             ClusterRecoveryEvent next = new ClusterRecoveryEvent(pipeline.key, ClusterRecoveryCause.MEMBER_LOSS,
                     successor.executionGeneration(), successor.executionRevision(), successor.executionTopologyRevision(),
@@ -1157,6 +1621,8 @@ class ClusterRecoveryStoreIT {
             WorkloadClaim inherited = fixture.workloads.acquire(original.key(), new WorkloadOwner("a", "boot-a"), 2, TTL).claim();
             assertThat(inherited.executionMembers()).isEqualTo(original.executionMembers());
             assertThat(fixture.profiles.markJoined(fixture.nodeB, "uuid-b-next", "b:5701")).isTrue();
+            fixture.rememberNativeMember(fixture.nodeB, "uuid-b-next", "b:5701");
+            fixture.publishNativeViews(LIVE, TTL);
             fixture.running("normal");
             ClusterRecoveryEvent loss = new ClusterRecoveryEvent(pipeline.key, ClusterRecoveryCause.MEMBER_LOSS,
                     inherited.executionGeneration(), inherited.executionRevision(), inherited.executionTopologyRevision(),
@@ -1311,7 +1777,7 @@ class ClusterRecoveryStoreIT {
                 Object incompatible = switch (field) {
                     case "executionIncarnation" -> "not-the-submitted-incarnation";
                     case "executionProfile" -> {
-                        ExecutionProfile other = new ExecutionProfile(1, Map.of("build", "other", "threads", "4"));
+                        ExecutionProfile other = new ExecutionProfile(1, Map.of("build", "other", "threads", "4", "profile-protocol", "2"));
                         Document original = fixture.claims.find(new Document("_id", MongoClusterCapacityStore.claimId("east", "read-context")))
                                 .first().get("executionProfile", Document.class);
                         yield new Document(original).append("formatVersion", other.formatVersion())
@@ -1346,6 +1812,7 @@ class ClusterRecoveryStoreIT {
             OrdinaryRestart restart = fixture.ordinaryRestart("read-refreshed", true, Duration.ofSeconds(3), true);
             WorkloadClaim shortLease = fixture.workloads.renew(restart.controller(), Duration.ofSeconds(3)).orElseThrow();
             fixture.memberDocuments.updateOne(new Document("_id", "east"), new Document("$set", new Document("revision", 3L)));
+            fixture.publishNativeViews(fixture.profile, 3, LIVE, LIVE, TTL);
             WorkloadClaim refreshed = fixture.workloads.acquire(shortLease.key(), shortLease.owner(), 3, TTL).claim();
             assertThat(refreshed.claimGeneration()).isEqualTo(restart.controller().claimGeneration());
             assertThat(refreshed.topologyRevision()).isEqualTo(3);
@@ -1504,7 +1971,7 @@ class ClusterRecoveryStoreIT {
                 Object incompatible = switch (field) {
                     case "executionIncarnation" -> "another-incarnation";
                     case "executionProfile" -> {
-                        ExecutionProfile other = new ExecutionProfile(1, Map.of("build", "other", "threads", "4"));
+                        ExecutionProfile other = new ExecutionProfile(1, Map.of("build", "other", "threads", "4", "profile-protocol", "2"));
                         Document original = fixture.claims.find(new Document("_id", MongoClusterCapacityStore.claimId("east", "mismatch")))
                                 .first().get("executionProfile", Document.class);
                         yield new Document(original).append("formatVersion", other.formatVersion())
@@ -1527,6 +1994,7 @@ class ClusterRecoveryStoreIT {
         try (Fixture fixture = new Fixture()) {
             OrdinaryRestart restart = fixture.ordinaryRestart("refreshed", true, Duration.ofSeconds(3), true);
             fixture.memberDocuments.updateOne(new Document("_id", "east"), new Document("$set", new Document("revision", 3L)));
+            fixture.publishNativeViews(fixture.profile, 3, LIVE, LIVE, TTL);
             WorkloadClaim refreshed = fixture.workloads.acquire(restart.controller().key(), restart.controller().owner(), 3, TTL).claim();
             assertThat(refreshed.claimGeneration()).isEqualTo(restart.controller().claimGeneration());
             assertThat(refreshed.executionTopologyRevision()).isEqualTo(2L);
@@ -2173,7 +2641,7 @@ class ClusterRecoveryStoreIT {
         private final MongoCollection<Document> stateDocuments = collection("states");
         private final MongoCollection<Document> artifactDocuments = collection("artifacts");
         private final MongoSrsMetaStore meta = new MongoSrsMetaStore(client, collection("meta"), collection("consumers"), claims);
-        private final MongoClusterProfileStore profiles = new MongoClusterProfileStore(client, profileDocuments, claims, nodeDocuments);
+        private final MongoClusterProfileStore profiles = new MongoClusterProfileStore(client, profileDocuments, claims, nodeDocuments, memberDocuments);
         private final MongoWorkloadClaimStore workloads = new MongoWorkloadClaimStore(claims, profiles);
         private final MongoClusterCapacityStore capacity = new MongoClusterCapacityStore(profiles, workloads, occupancy, claims,
                 profileDocuments, memberDocuments, nodeDocuments, desiredDocuments, stateDocuments, artifactDocuments);
@@ -2183,6 +2651,9 @@ class ClusterRecoveryStoreIT {
         private final MongoStateStore states = new MongoStateStore(stateDocuments);
         private final WorkloadClaim nodeB;
         private final List<WorkloadClaim> initialSessions;
+        private final Map<String, WorkloadClaim> nativeSessions = new java.util.LinkedHashMap<>();
+        private final Map<String, ClusterNativeMember> nativeIdentities = new java.util.LinkedHashMap<>();
+        private long nativeTopologyRevision = 2;
         private final ClusterExecutionProfile profile;
         private final WorkloadClaim capture;
         private final long captureEpoch;
@@ -2198,17 +2669,23 @@ class ClusterRecoveryStoreIT {
 
         private Fixture(Duration sessionTtl, boolean releaseThird, Duration thirdSessionTtl) {
             this(sessionTtl, releaseThird, thirdSessionTtl,
-                    new ExecutionProfile(1, Map.of("build", "one", "threads", "4")), List.of("a", "b", "c"));
+                    new ExecutionProfile(1, Map.of("build", "one", "threads", "4", "profile-protocol", "2")), List.of("a", "b", "c"));
         }
 
         private Fixture(Duration sessionTtl, boolean releaseThird, Duration thirdSessionTtl,
                 ExecutionProfile proposed, List<String> initialMembers) {
+            this(sessionTtl, releaseThird, thirdSessionTtl, proposed, initialMembers, initialMembers.getFirst());
+        }
+
+        private Fixture(Duration sessionTtl, boolean releaseThird, Duration thirdSessionTtl,
+                ExecutionProfile proposed, List<String> initialMembers, String recoveryNode) {
             List<WorkloadClaim> members = new ArrayList<>();
             for (String node : initialMembers) {
                 WorkloadClaim claim = profiles.reserve("east", new WorkloadOwner(node, "boot-" + node),
                         URI.create("http://" + node + ":8080"), proposed,
                         node.equals("c") ? thirdSessionTtl : sessionTtl).node().registration().nodeSession();
-                profiles.markJoined(claim, "uuid-" + node, node + ":5701");
+                assertThat(profiles.markJoined(claim, "uuid-" + node, node + ":5701")).isTrue();
+                rememberNativeMember(claim, "uuid-" + node, node + ":5701");
                 members.add(claim);
             }
             nodeB = members.get(1);
@@ -2216,8 +2693,13 @@ class ClusterRecoveryStoreIT {
             profile = profiles.profile("east").orElseThrow();
             memberDocuments.insertOne(new Document("_id", "east").append("profileGeneration", profile.generation())
                     .append("revision", 2L).append("activeNodeIds", List.copyOf(initialMembers)));
-            if (releaseThird) workloads.release(members.get(2));
-            recovery = workloads.acquire(recoveryKey(), members.getFirst().owner(), 2, sessionTtl).claim();
+            if (releaseThird) assertThat(workloads.release(members.get(2))).isTrue();
+            Set<String> initialNativePool = new java.util.HashSet<>(initialMembers);
+            if (releaseThird) initialNativePool.remove(initialMembers.get(2));
+            publishNativeViews(initialNativePool, TTL);
+            WorkloadOwner recoveryOwner = members.stream().filter(member -> recoveryNode.equals(member.owner().nodeId()))
+                    .findFirst().orElseThrow().owner();
+            recovery = workloads.acquire(recoveryKey(), recoveryOwner, 2, sessionTtl).claim();
             capture = workloads.acquire(new WorkloadClaimKey("east", WorkloadClaimType.CAPTURE, "capture-crm"),
                     members.getFirst().owner(), 2, sessionTtl).claim();
             meta.create("capture-crm", null);
@@ -2228,11 +2710,104 @@ class ClusterRecoveryStoreIT {
             meta.advanceCaptureCheckpoint("capture-crm", new ChainPosition(new SourceOrder(captureEpoch, 7), "resume-7"), List.of("orders"));
         }
 
+        private Pipeline retiredNativeViewFailure(String id) {
+            return nativeViewFailure(id, true);
+        }
+
+        private Pipeline nativeViewFailure(String id, boolean awaitCachedHorizon) {
+            return nativeViewFailure(id, awaitCachedHorizon, TTL);
+        }
+
+        private Pipeline nativeViewFailure(String id, boolean awaitCachedHorizon, Duration controllerTtl) {
+            publishNativeViews(Set.of("a", "b", "c"), Duration.ofMinutes(1));
+            Pipeline pipeline = pipeline(id, false, List.of(SourceRef.bare("crm")), true,
+                    initialSessions.getFirst().owner(), Duration.ofSeconds(6));
+            Map<String, ClusterCapacityDemand> originalDemand = Map.of("a", demand(1), "b", demand(1), "c", demand(1));
+            var reserved = capacity.reserve(pipeline.claim(), profile, pipeline.key().incarnation(),
+                    pipeline.intentFingerprint(), originalDemand, LIMITS, PERMIT_TTL);
+            assertThat(reserved.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            var allocated = capacity.advanceExecution(reserved.reservation(), pipeline.claim(), Set.of("a", "b", "c"));
+            assertThat(allocated.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            WorkloadClaim original = allocated.advancedPipelineClaim();
+            assertThat(original.executionMembers().keySet()).containsExactlyInAnyOrder("a", "b", "c");
+            assertThat(capacity.submitted(allocated.reservation(), WorkloadClaimFence.from(original), "original-native-job").outcome())
+                    .isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            running(id);
+            assertThat(workloads.recordExecutionFailure(original, true)).isPresent();
+            var checkpoint = states.read(id).orElseThrow();
+            assertThat(states.compareAndSwap(id, checkpoint.epoch(), StateJson.of(PipelineState.FAILED), checkpoint.touchTime()))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+            assertThat(workloads.release(original)).isTrue();
+            if (awaitCachedHorizon) {
+                awaitRetirement(original.key());
+            }
+            boolean retired = profiles.transaction(session -> workloads.provesRetired(session, WorkloadClaimFence.from(original)));
+            assertThat(retired).isEqualTo(awaitCachedHorizon);
+            WorkloadClaim current = workloads.acquire(original.key(), nodeB.owner(), 2, controllerTtl).claim();
+            assertThat(current.owner()).isEqualTo(nodeB.owner());
+            assertThat(current.executionGeneration()).isEqualTo(original.executionGeneration());
+            assertThat(current.executionMembers()).isEqualTo(original.executionMembers());
+            var submitted = capacity.submittedExecution(current).orElseThrow();
+            assertThat(submitted.authorityRetired()).isEqualTo(awaitCachedHorizon);
+            assertThat(submitted.reservation().nativeJobId()).isEqualTo("original-native-job");
+            assertThat(submitted.reservation().demandByNode()).isEqualTo(originalDemand);
+            return new Pipeline(pipeline.key(), current, event(pipeline, original), pipeline.intentFingerprint());
+        }
+
+        private void publishNativeViews(Set<String> actualWholePool, Duration ttl) {
+            publishNativeViews(actualWholePool, actualWholePool, ttl);
+        }
+
+        private void publishNativeViews(Set<String> actualWholePool, Set<String> publishers, Duration ttl) {
+            publishNativeViews(profile, nativeTopologyRevision, actualWholePool, publishers, ttl);
+        }
+
+        private void rememberNativeMember(WorkloadClaim session, String memberUuid, String address) {
+            String nodeId = session.owner().nodeId();
+            nativeSessions.put(nodeId, session);
+            nativeIdentities.put(nodeId, new ClusterNativeMember(
+                    new ClusterExecutionMember(nodeId, session.owner().bootId(), memberUuid), address));
+        }
+
+        private void publishNativeViews(ClusterExecutionProfile observedProfile, long topologyRevision,
+                Set<String> actualWholePool, Set<String> publishers, Duration ttl) {
+            Map<String, ClusterNativeMember> observed = new java.util.TreeMap<>();
+            for (String node : actualWholePool) {
+                observed.put(node, java.util.Objects.requireNonNull(nativeIdentities.get(node), "declared native member"));
+            }
+            ClusterNativeObservation sample = new ClusterNativeObservation(observedProfile, observed);
+            for (String publisher : publishers) {
+                WorkloadClaim session = java.util.Objects.requireNonNull(nativeSessions.get(publisher), "declared publisher session");
+                assertThat(profiles.recordNativeView(session, topologyRevision, sample, ttl)).isTrue();
+                assertThat(profiles.nativeView("east", publisher).orElseThrow().membersByNode()).isEqualTo(observed);
+            }
+            nativeTopologyRevision = topologyRevision;
+        }
+
+        private void awaitNativeViewExpiry(String publisher) {
+            long limit = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+            Document expired = new Document("clusterId", "east").append("nodeId", publisher)
+                    .append("nativeView", new Document("$exists", true))
+                    .append("$expr", new Document("$lte", List.of("$nativeView.validUntil", "$$NOW")));
+            while (nodeDocuments.find(expired).maxTime(2, TimeUnit.SECONDS).first() == null) {
+                if (System.nanoTime() >= limit) {
+                    throw new AssertionError("the native observation did not expire on the server clock");
+                }
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while awaiting observation expiry", interrupted);
+                }
+            }
+        }
+
         private Pipeline retiredPolicyFailure(String id) {
             Set<String> originalMembers = initialSessions.stream().map(session -> session.key().resourceId())
                     .collect(java.util.stream.Collectors.toSet());
             Map<String, ClusterCapacityDemand> originalDemand = new java.util.TreeMap<>();
             originalMembers.forEach(node -> originalDemand.put(node, demand(1)));
+            publishNativeViews(originalMembers, TTL);
             Pipeline pipeline = pipeline(id, false, List.of(SourceRef.bare("crm")), true,
                     nodeB.owner(), Duration.ofSeconds(6));
             var reserved = capacity.reserve(pipeline.claim(), profile, pipeline.key().incarnation(),
@@ -2257,6 +2832,7 @@ class ClusterRecoveryStoreIT {
                     assertThat(workloads.release(session)).isTrue();
                 }
             }
+            publishNativeViews(Set.of("a"), TTL);
             WorkloadClaim current = workloads.acquire(original.key(), recovery.owner(), 2, TTL).claim();
             assertThat(current.owner()).isEqualTo(recovery.owner());
             assertThat(current.executionGeneration()).isEqualTo(original.executionGeneration());
@@ -2471,9 +3047,11 @@ class ClusterRecoveryStoreIT {
             WorkloadClaim newMember = profiles.reserve("east", new WorkloadOwner("d", "boot-d"),
                     URI.create("http://d:8080"), profile.profile(), TTL).node().registration().nodeSession();
             assertThat(profiles.markJoined(newMember, "uuid-d", "d:5701")).isTrue();
+            rememberNativeMember(newMember, "uuid-d", "d:5701");
             var committed = memberDocuments.updateOne(new Document("_id", "east").append("revision", 2L),
                     new Document("$set", new Document("revision", 3L).append("activeNodeIds", List.of("a", "b", "c", "d"))));
             assertThat(committed.getModifiedCount()).isEqualTo(1);
+            publishNativeViews(profile, 3, Set.of("a", "b", "d"), Set.of("a", "b", "d"), TTL);
             return workloads.acquire(pipeline.key(), pipeline.owner(), 3, ttl).claim();
         }
 
