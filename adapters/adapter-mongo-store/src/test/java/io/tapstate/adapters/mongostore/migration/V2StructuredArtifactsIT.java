@@ -5,10 +5,13 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.adapters.mongostore.MongoArtifactStore;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringStore;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.testsupport.RequiresDocker;
@@ -236,9 +239,15 @@ class V2StructuredArtifactsIT {
         assertThat(source).isNotNull();
         assertThat(pipeline.getEmbedded(List.of("body", "view", "schema"), Object.class)).isNull();
         assertThat(view.getEmbedded(List.of("body", "schema"), Object.class)).isNull();
-        assertThat(source.getEmbedded(List.of("body", "config", "schema"), String.class))
+        MongoArtifactStore currentStore = new MongoArtifactStore(client, artifacts,
+                new SourceConfigKeyringStore(database).loadExistingCipher());
+        SourceResource migratedSource = (SourceResource) currentStore.get("orders_src").orElseThrow();
+        assertThat(migratedSource.config().get("schema"))
                 .as("schema is connector-owned below config, not a retired view policy")
                 .isEqualTo("public");
+        assertThat(source.get("body", Document.class).get("config"))
+                .as("the later Source-config changeset ran after the structured migration")
+                .isInstanceOf(String.class);
         assertThat(List.of(pipeline, view, source))
                 .allSatisfy(document -> assertThat(document.get("canonical")).isNull());
         // Installed to whatever this build supports: the assertion is that startup ran the whole

@@ -2,6 +2,8 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.AuditGate;
+import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.CurrentUserQueryService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.SourceDraft;
 import io.tapstate.control.core.SourceTableView;
@@ -10,9 +12,12 @@ import io.tapstate.control.core.TokenAdminService;
 import io.tapstate.control.core.TokenService;
 import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import tools.jackson.databind.DeserializationFeature;
+
+import java.util.List;
 
 /**
  * The public assembly entry point for the whole HTTP control face: the path-prefix configuration, Spring
@@ -39,16 +44,27 @@ import tools.jackson.databind.DeserializationFeature;
         PipelineLogsController.class,
         PipelinePositionController.class,
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
-        VersionController.class, AuthController.class, IssuerDiscoveryController.class, TokenController.class,
+        VersionController.class, AuthController.class, CloudAuthController.class, CurrentUserController.class,
+        ClusterContextController.class,
+        IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
+        ViewController.class,
+        SampleSourceController.class, SampleInstallJobController.class,
+        StateStoreController.class,
         ConnectorIconController.class,
         PipelineViewController.class,
         PipelineLayoutController.class,
         PipelineDraftController.class,
+        PipelinePreviewController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {
+
+    @Bean
+    CurrentUserQueryService currentUserQueryService(ObjectProvider<AuthenticationMode> modes) {
+        return new CurrentUserQueryService(modes.getIfAvailable(() -> AuthenticationMode.ON_PREM));
+    }
 
     @Bean
     TokenAdminService tokenAdminService(TokenService tokens, AuditGate auditGate) {
@@ -59,13 +75,20 @@ public class ControlHttpFace {
     JsonMapperBuilderCustomizer sourceJsonContract() {
         return builder -> builder
                 .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-                .addMixIn(SourceView.class, NonNullSourceJson.class)
+                .addMixIn(SourceView.class, SourceScopeJson.class)
                 .addMixIn(SourceTableView.class, NonNullSourceJson.class)
                 .addMixIn(SourceDraft.SourceSrs.class, NonNullSourceJson.class);
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private abstract static class NonNullSourceJson {
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private abstract static class SourceScopeJson {
+        // Null leaves the connection scope open; an empty list explicitly selects no tables.
+        @JsonInclude(JsonInclude.Include.ALWAYS)
+        abstract List<SourceTableView> tables();
     }
 
 }

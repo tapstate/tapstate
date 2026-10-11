@@ -5,6 +5,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
+import com.mongodb.MongoWriteException;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
@@ -224,6 +225,70 @@ class MongoArtifactStoreIT {
     }
 
     @Test
+    void aPrimaryIdCollisionRefusesCreateAndRollsBackBatchSiblings() {
+        withStore((store, collection) -> {
+            Resource source = PARSER.parse(ORDERS);
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
+            Document before = collection.find(new Document("_id", "orders")).first();
+            MongoWriteException duplicate = (MongoWriteException) catchThrowable(() ->
+                    collection.insertOne(new Document("_id", "orders")));
+            assertThat(duplicate.getError().getCode()).isEqualTo(11000);
+            assertThat(duplicate.getError().getDetails()).isEmpty();
+
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            Resource sibling = PARSER.parse(ORDERS.replace("id: orders", "id: new_sibling"));
+            ArtifactBatchWrite refused = store.writeAll(List.of(
+                    ArtifactWrite.createOnly(sibling), ArtifactWrite.createOnly(source)));
+            assertThat(refused.refusedId()).isEqualTo("orders");
+            assertThat(refused.refusal()).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            assertThat(collection.find(new Document("_id", "new_sibling")).first()).isNull();
+            assertThat(collection.find(new Document("_id", "orders")).first()).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aNonIdUniqueCollisionRemainsAStoreFailureForSingleCreate() {
+        withStore((store, collection) -> {
+            collection.createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            Resource source = PARSER.parse(ORDERS);
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
+            Document before = collection.find(new Document("_id", "orders")).first();
+            Resource other = PARSER.parse(ORDERS.replace("id: orders", "id: other_source"));
+            MongoWriteException duplicate = (MongoWriteException) catchThrowable(() ->
+                    collection.insertOne(new Document("_id", "driver_probe").append("kind", "source")));
+            assertThat(duplicate.getError().getCode()).isEqualTo(11000);
+            assertThat(duplicate.getError().getDetails()).isEmpty();
+
+            assertThatThrownBy(() -> store.create(other)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                assertThat(failure.args()).containsExactlyEntriesOf(Map.of("detail", "MongoWriteException code=11000"));
+                assertThat(failure.getCause()).isNull();
+            });
+            assertThat(collection.find(new Document("_id", "other_source")).first()).isNull();
+            assertThat(collection.find(new Document("_id", "orders")).first()).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aNonIdUniqueCollisionRollsBackAnEntireConditionalCreateBatch() {
+        withStore((store, collection) -> {
+            collection.createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            Resource first = PARSER.parse(ORDERS);
+            Resource second = PARSER.parse(ORDERS.replace("id: orders", "id: second_source"));
+
+            assertThatThrownBy(() -> store.writeAll(List.of(
+                    ArtifactWrite.createOnly(first), ArtifactWrite.createOnly(second))))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(failure.args()).containsExactlyEntriesOf(
+                                Map.of("detail", "MongoWriteException code=11000"));
+                        assertThat(failure.getCause()).isNull();
+                    });
+            assertThat(collection.countDocuments()).isZero();
+        });
+    }
+
+    @Test
     void workspaceGuardRefusesAPipelineCreateAfterItsSourceChanged() {
         withStore((store, collection) -> {
             Resource source = PARSER.parse(ORDERS);
@@ -239,8 +304,10 @@ class MongoArtifactStoreIT {
             assertThat(outcome.refusedId()).isEqualTo("orders");
             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
             assertThat(collection.find(new Document("_id", "orders_sync")).first()).isNull();
-            assertThat(storedBody(collection, "orders"))
-                    .isEqualTo(bodyOf(changedSource));
+            assertThat(store.get("orders")).contains(changedSource);
+            assertThat(storedBody(collection, "orders").get("config"))
+                    .isInstanceOf(String.class)
+                    .asString().startsWith("tscfg:1:").doesNotContain("replica");
         });
     }
 
@@ -283,11 +350,11 @@ class MongoArtifactStoreIT {
                             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
                         });
 
-                Map<String, Object> expectedBody = alphaOutcome.appliedSuccessfully()
-                        ? bodyOf(alphaReplacement)
-                        : bodyOf(betaReplacement);
-                assertThat(storedBody(collection, "orders"))
-                        .isEqualTo(expectedBody);
+                Resource winner = alphaOutcome.appliedSuccessfully() ? alphaReplacement : betaReplacement;
+                assertThat(store.get("orders")).contains(winner);
+                assertThat(storedBody(collection, "orders").get("config"))
+                        .isInstanceOf(String.class)
+                        .asString().startsWith("tscfg:1:").doesNotContain("alpha", "beta");
             } catch (Exception error) {
                 throw new AssertionError("concurrent replace test failed", error);
             }
@@ -459,7 +526,7 @@ class MongoArtifactStoreIT {
             MongoDatabase database = client.getDatabase("tapstate");
             MongoCollection<Document> collection = database.getCollection("artifacts");
             collection.drop();
-            MongoArtifactStore store = new MongoArtifactStore(client, collection);
+            MongoArtifactStore store = new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32]));
             store.saveAll(List.of(PARSER.parse(ORDERS), PARSER.parse(ORDERS_SYNC)));
             // Built by the product from the row's own declaration rather than written out here: a test
             // that created its own index would keep passing over a release that ships none.
@@ -498,11 +565,6 @@ class MongoArtifactStoreIT {
         return plain(body);
     }
 
-    /** The body {@code resource} is stored as, to compare against {@link #storedBody}. */
-    private static Map<String, Object> bodyOf(Resource resource) {
-        return plain(WRITER.tree(resource));
-    }
-
     /**
      * The same map with every nested map flattened to one type. A body goes to the driver as plain
      * maps and comes back as {@code Document}s, and {@code Document.equals} answers false to anything
@@ -533,7 +595,7 @@ class MongoArtifactStoreIT {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("artifacts");
             collection.drop();
-            test.run(new MongoArtifactStore(client, collection), collection);
+            test.run(new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32])), collection);
         }
     }
 }

@@ -137,6 +137,33 @@ class StoreBackedDagSourceTest {
                 .isEqualTo(2L);
     }
 
+    @Test
+    void exposesPreviewSourcesReachableThroughInlineTransformsWithoutOpeningConnectors() {
+        FakeStorePort store = new FakeStorePort();
+        SourceResource sourceResource = cdcSource("orders_src", "orders");
+        store.artifacts().save(sourceResource);
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+        Step.Inline filter = Step.inline("filter", FromClause.list(FromRef.literal("orders_src.orders")),
+                new TransformBody.Filter("true"), null);
+        PipelineResource pipeline = new PipelineResource("preview_pipeline", null,
+                List.of(SourceRef.spec("orders_src", true)), List.of(filter),
+                new ViewBlock.Inline("orders_view", FromRef.literal("filter"), "id", null),
+                null, null, null);
+        StoreBackedDagSource dagSource = new StoreBackedDagSource(store, io.tapstate.runtime.engine.nest.NestSettings
+                .defaults(), store.artifacts());
+
+        assertThat(dagSource.previewSourceTables(pipeline)).singleElement().satisfies(table -> {
+            assertThat(table.sourceKey()).isEqualTo("orders_src");
+            assertThat(table.schema().fields()).extracting(io.tapstate.spi.capture.FieldSchema::name)
+                    .containsExactly("id");
+        });
+        assertThat(dagSource.previewInputSourceKeys(pipeline)).containsExactly("orders_src");
+        assertThat(dagSource.previewCompiledJoins(pipeline)).isEmpty();
+        assertThat(dagSource.previewStateMapNames(pipeline)).isEmpty();
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"qualified", "source", "multiple", "regex"})
     void unwindBindsQualifiedReferencesAndEveryMergedSourceKey(String selection) throws Exception {

@@ -113,8 +113,9 @@ public final class TargetConnectorRules {
             boolean cloudDeployment) {
         if (sync == null) return;
         String supported = cloudDeployment
-                ? "mongodb-atlas"
-                : catalog.all().stream().filter(entry -> entry.sink().capable())
+                ? "mongodb, mongodb-atlas"
+                : catalog.all().stream().filter(entry -> entry.sink().capable()
+                        && !"aws-rds-mysql".equals(entry.id()))
                         .map(ConnectorCatalogEntry::id).sorted().collect(Collectors.joining(", "));
         for (int i = 0; i < sync.size(); i++) {
             SyncElement element = sync.get(i);
@@ -126,12 +127,13 @@ public final class TargetConnectorRules {
             } catch (IllegalArgumentException missing) {
                 connector = null;
             }
-            // On-prem deployments may register private connectors outside the bundled catalog. Keep
-            // their target validation in the deployment's hands; cloud remains an explicit Atlas-only
-            // boundary and must refuse connectors that are not known to be Atlas.
-            if (connector == null && !cloudDeployment) continue;
-            if (connector != null && connector.sink().capable()
-                    && (!cloudDeployment || "mongodb-atlas".equals(connector.id()))) continue;
+            // A declared upstream write function does not authorize a source-only preview as a target.
+            // On-prem may register private sinks; cloud targets remain restricted to MongoDB and Atlas.
+            boolean sourceOnly = "aws-rds-mysql".equals(target.connector());
+            if (!sourceOnly && connector == null && !cloudDeployment) continue;
+            if (!sourceOnly && connector != null && connector.sink().capable()
+                    && (!cloudDeployment || "mongodb".equals(connector.id())
+                            || "mongodb-atlas".equals(connector.id()))) continue;
 
             String path = prefix + "[" + i + "].source";
             throw new DslException(DslError.UNSUPPORTED_TARGET_CONNECTOR, path, 0, 0, null,

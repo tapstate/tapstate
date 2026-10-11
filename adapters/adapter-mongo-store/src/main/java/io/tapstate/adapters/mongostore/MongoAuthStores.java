@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.CloudSessionStore;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.TokenStore;
 import io.tapstate.spi.store.UserStore;
@@ -33,6 +34,7 @@ public final class MongoAuthStores {
     private final UserStore users;
     private final TokenStore tokens;
     private final SessionStore sessions;
+    private final CloudSessionStore cloudSessions;
     private final AuditStore audit;
     private final ClusterIdentityStore clusterIdentity;
 
@@ -47,6 +49,7 @@ public final class MongoAuthStores {
         this.users = new MongoUserStore(SystemCollections.USERS.on(database));
         this.tokens = new MongoTokenStore(SystemCollections.TOKENS.on(database));
         this.sessions = new MongoSessionStore(SystemCollections.SESSIONS.on(database));
+        this.cloudSessions = new MongoCloudSessionStore(SystemCollections.SESSIONS.on(database));
         this.audit = new MongoAuditStore(SystemCollections.AUDIT.on(database));
         this.clusterIdentity = new MongoClusterIdentityStore(SystemCollections.CLUSTER_IDENTITY.on(database));
     }
@@ -61,6 +64,11 @@ public final class MongoAuthStores {
 
     public SessionStore sessions() {
         return sessions;
+    }
+
+    /** Minimal managed sessions share the registered collection without changing standalone rows. */
+    public CloudSessionStore cloudSessions() {
+        return cloudSessions;
     }
 
     public AuditStore audit() {

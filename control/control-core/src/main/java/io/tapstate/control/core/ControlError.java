@@ -24,6 +24,9 @@ public enum ControlError implements TapstateErrorCode {
      */
     MALFORMED_REQUEST("control.malformed-request", Set.of("reason")),
 
+    /** A valid preview request could not enter the bounded candidate-compilation pool. */
+    PREVIEW_OVERLOADED("control.preview-overloaded", Set.of()),
+
     /**
      * An audited operation was refused because its mandatory audit record could not be written first;
      * {@code op} is the operation id. No audit, no execute — the operation never ran.
@@ -56,6 +59,18 @@ public enum ControlError implements TapstateErrorCode {
      * failure cannot be used to tell an existing username from an absent one (no user enumeration).
      */
     AUTH_FAILED("control.auth-failed", Set.of()),
+
+    /** The caller reached an authentication flow that the selected deployment mode does not expose. */
+    AUTH_MODE_UNAVAILABLE("control.auth-mode-unavailable", Set.of("mode")),
+
+    /** Managed authentication was reached before its real SDK/validated deployment binding was installed. */
+    CLOUD_AUTH_UNAVAILABLE("control.cloud-auth-unavailable", Set.of()),
+
+    /** A Cloud author attempted to select the deployment-owned Nest state database. */
+    STATE_DATABASE_UNAVAILABLE("control.state-database-unavailable", Set.of()),
+
+    /** The reserved Source plaintext flow has no production authorizer in this release. */
+    SOURCE_CONFIG_REVEAL_UNAVAILABLE("control.source-config-reveal-unavailable", Set.of()),
 
     /**
      * A protected operation was reached with no valid credential — none was presented, or the one

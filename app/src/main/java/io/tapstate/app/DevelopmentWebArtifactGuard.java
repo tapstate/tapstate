@@ -45,10 +45,8 @@ final class DevelopmentWebArtifactGuard implements BeanFactoryPostProcessor, Env
         if (!"local-development".equals(purpose)) {
             throw invalid("unsupported artifact purpose", null);
         }
-        if (!"op".equals(properties.getProperty("profile"))) {
-            throw invalid("this runtime accepts only the OP development Web profile", null);
-        }
-        if (!"true".equals(environment.getProperty("tapstate.local-development.enabled"))) {
+        WebDistribution.developmentProfile(properties);
+        if (!"true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY))) {
             throw new TapstateException(BootError.WEB_DEVELOPMENT_CONFIRMATION_REQUIRED, Map.of(), null);
         }
     }

@@ -70,7 +70,23 @@ class DevelopmentWebArtifactGuardTest {
     }
 
     @Test
-    void doesNotUseConfirmationToAcceptUnsupportedCloudOrUnknownPurpose() {
+    void confirmedLocalCloudUsesOnlyTheExplicitPackagedLocalhostUrl() {
+        String local = "purpose=local-development\nprofile=cloud\nweb.profile=cloud\n"
+                + "cloud.console.url=http://localhost:39175/\n";
+        runner(local).withPropertyValues("tapstate.local-development.enabled=true").run(context -> {
+            assertThat(context.getStartupFailure()).isNull();
+            assertThat(SERVICE_CREATED).isTrue();
+        });
+        runner(local).run(context -> {
+            assertThat(context.getStartupFailure()).isInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) context.getStartupFailure()).code())
+                    .isEqualTo(BootError.WEB_DEVELOPMENT_CONFIRMATION_REQUIRED);
+            assertThat(SERVICE_CREATED).isFalse();
+        });
+    }
+
+    @Test
+    void doesNotUseConfirmationToAcceptIncompleteCloudOrUnknownPurpose() {
         for (String metadata : new String[] {
                 "purpose=local-development\nprofile=cloud\n", "purpose=local-development\n", "purpose=unknown\n",
                 "purpose=\\uZZZZ\n"

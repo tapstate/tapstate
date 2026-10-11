@@ -7,13 +7,16 @@
 # a destination that may contain assets from an earlier build.
 
 set -euo pipefail
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_QUARANTINE_PATH
 
 usage() {
     cat <<'USAGE'
 Usage: scripts/prepare-web-assets.sh --web-root <path> --web-revision <sha> \
+       --web-profile <cloud|onprem> [--cloud-console-url <https-url>] \
        --tapstate-revision <sha> --release-version <version> --output <path>
 
-The web checkout must be clean, checked out at --web-revision, and contain apps/web/dist/index.html.
+Build the clean pinned checkout with scripts/build-web-assets.sh using matching profile and URL inputs.
+Cloud requires an explicit HTTPS Console URL; onprem must not receive one.
 The output directory must not exist; it receives static/ and META-INF/tapstate-web.properties.
 USAGE
 }
@@ -25,14 +28,23 @@ die() {
 
 web_root=""
 web_revision=""
+web_profile=""
+cloud_console_url=""
+cloud_console_url_supplied=false
 tapstate_revision=""
 release_version=""
 output=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --web-root|--web-revision|--web-profile|--cloud-console-url|--tapstate-revision|--release-version|--output)
+            [ $# -ge 2 ] || die "$1 requires a value" ;;
+    esac
+    case "$1" in
         --web-root) web_root="${2:-}"; shift 2 ;;
         --web-revision) web_revision="${2:-}"; shift 2 ;;
+        --web-profile) web_profile="${2:-}"; shift 2 ;;
+        --cloud-console-url) cloud_console_url="${2:-}"; cloud_console_url_supplied=true; shift 2 ;;
         --tapstate-revision) tapstate_revision="${2:-}"; shift 2 ;;
         --release-version) release_version="${2:-}"; shift 2 ;;
         --output) output="${2:-}"; shift 2 ;;
@@ -43,6 +55,15 @@ done
 
 [ -n "$web_root" ] || die "--web-root is required"
 [ -n "$web_revision" ] || die "--web-revision is required"
+[ -n "$web_profile" ] || die "--web-profile is required"
+[[ "$web_profile" = cloud || "$web_profile" = onprem ]] || die "Web profile must be cloud or onprem"
+if [ "$web_profile" = cloud ]; then
+    if [ "$cloud_console_url_supplied" != true ] || [ -z "$cloud_console_url" ]; then
+        die "--cloud-console-url is required for Cloud Web"
+    fi
+elif [ "$cloud_console_url_supplied" = true ]; then
+    die "onprem Web must not receive a Cloud Console URL"
+fi
 [ -n "$tapstate_revision" ] || die "--tapstate-revision is required"
 [ -n "$release_version" ] || die "--release-version is required"
 [ -n "$output" ] || die "--output is required"
@@ -53,7 +74,9 @@ done
 [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
     || die "release version must be a numeric x.y.z version with an optional prerelease suffix"
 [ -d "$web_root" ] || die "web checkout '$web_root' does not exist"
-[ ! -e "$output" ] || die "output '$output' already exists; clean the Maven target directory before staging assets"
+if [ -e "$output" ] || [ -L "$output" ]; then
+    die "output '$output' already exists; clean the Maven target directory before staging assets"
+fi
 
 web_root="$(cd "$web_root" && pwd -P)"
 repo_root="$(git -C "$web_root" rev-parse --show-toplevel 2>/dev/null)" \
@@ -77,37 +100,19 @@ git -C "$web_root" diff --cached --quiet || die "web checkout has staged changes
 [ -n "$(find "$web_root/apps/web/dist" -type f -print -quit)" ] \
     || die "production bundle contains no files"
 
-producer_marker="$web_root/apps/web/dist/tapstate-web-build.json"
-if [ -f "$producer_marker" ]; then
-    python3 - "$producer_marker" <<'PY' || die "Web producer metadata is not release-compatible"
-import json
-import sys
-from urllib.parse import urlsplit
-
-try:
-    marker = json.load(open(sys.argv[1], encoding="utf-8"))
-    if marker.get("purpose") == "local-development":
-        raise ValueError("local-development Web artifacts cannot enter a release")
-    if marker.get("schemaVersion") != 1 or marker.get("purpose") != "release":
-        raise ValueError("unsupported Web producer metadata")
-    if marker.get("profile") not in ("op", "cloud"):
-        raise ValueError("unsupported Web producer profile")
-    if marker["profile"] == "cloud":
-        url = urlsplit(marker.get("cloudConsoleUrl", ""))
-        if url.scheme != "https" or not url.hostname or url.username or url.password or url.fragment:
-            raise ValueError("release Cloud Console URL must use HTTPS without credentials or a fragment")
-        if url.port is not None and not 1 <= url.port <= 65535:
-            raise ValueError("invalid release Cloud Console port")
-    elif "cloudConsoleUrl" in marker:
-        raise ValueError("OP producer metadata must not contain Cloud Console configuration")
-except (ValueError, TypeError, AttributeError) as error:
-    print("prepare-web-assets.sh: " + str(error), file=sys.stderr)
-    sys.exit(2)
-PY
+script_directory="$(cd "$(dirname "$0")" && pwd -P)"
+profile_arguments=(--web-root "$web_root" --web-revision "$web_revision" --web-profile "$web_profile")
+if [ "$web_profile" = cloud ]; then
+    cloud_console_url="$(python3 "$script_directory/web-assets-profile.py" normalize-url --value "$cloud_console_url")" \
+        || die "Cloud Console URL does not satisfy the packaging contract"
+    profile_arguments+=(--cloud-console-url "$cloud_console_url")
 fi
+expected_files_digest="$(python3 "$script_directory/web-assets-profile.py" verify "${profile_arguments[@]}")" \
+    || die "production bundle build attestation does not satisfy the packaging contract"
 
 mkdir -p "$output/static" "$output/META-INF"
 cp -R "$web_root/apps/web/dist/." "$output/static/"
+rm "$output/static/.tapstate-web-build.json"
 
 manifest="$output/META-INF/tapstate-web.files.sha256"
 (
@@ -118,13 +123,18 @@ manifest="$output/META-INF/tapstate-web.files.sha256"
 ) >"$manifest"
 
 files_digest="$(shasum -a 256 "$manifest" | awk '{print $1}')"
+[ "$files_digest" = "$expected_files_digest" ] || die "staged bundle bytes changed after build verification"
 cat >"$output/META-INF/tapstate-web.properties" <<EOF
 repository=tapstate/tapstate-web
 revision=$actual
 files.sha256=$files_digest
 tapstate.revision=$tapstate_revision
 release.version=$release_version
+web.profile=$web_profile
 EOF
+if [ "$web_profile" = cloud ]; then
+    printf 'cloud.console.url=%s\n' "$cloud_console_url" >>"$output/META-INF/tapstate-web.properties"
+fi
 
 test -s "$output/static/index.html" || die "staged index.html is empty"
 test -s "$manifest" || die "staged file manifest is empty"
