@@ -130,17 +130,53 @@ class StageConnectorsTest(unittest.TestCase):
             self.assertIn("--proto-redir", command)
             self.assertNotIn("--insecure", command)
             destination = Path(command[command.index("--output") + 1])
-            destination.write_bytes((self.jars / command[-1].rsplit("/", 1)[-1]).read_bytes())
+            remote = command[-1].rsplit("/", 1)[-1]
+            db2 = next(entry for entry in self.entries if entry["id"] == "db2")
+            expected_remote = (f"db2-connector-{db2['sha256']}.jar"
+                               if destination.name == "db2-connector.jar" else destination.name)
+            self.assertEqual(remote, expected_remote)
+            destination.write_bytes((self.jars / destination.name).read_bytes())
             return SimpleNamespace(returncode=0)
         with patch.object(PREPARE.subprocess, "run", side_effect=response) as downloaded:
             PREPARE.prepare(self.lock, self.staged)
         self.assertEqual(downloaded.call_count, 10)
         self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
 
+    def test_default_public_db2_uses_digest_asset_and_stages_canonical_filename(self) -> None:
+        db2 = next(entry for entry in self.entries if entry["id"] == "db2")
+        seen = []
+        def response(command, **options):
+            destination = Path(command[command.index("--output") + 1])
+            remote = command[-1].rsplit("/", 1)[-1]
+            if destination.name == "db2-connector.jar":
+                self.assertEqual(remote, f"db2-connector-{db2['sha256']}.jar")
+                self.assertEqual(int(command[command.index("--max-filesize") + 1]), db2["bytes"])
+            else:
+                self.assertEqual(remote, destination.name)
+            seen.append(destination.name)
+            destination.write_bytes((self.jars / destination.name).read_bytes())
+            return SimpleNamespace(returncode=0)
+        with patch.object(PREPARE.subprocess, "run", side_effect=response):
+            PREPARE.prepare(self.lock, self.staged)
+        self.assertIn("db2-connector.jar", seen)
+        self.assertEqual((self.staged / "connectors/db2-connector.jar").read_bytes(),
+                         (self.jars / "db2-connector.jar").read_bytes())
+
+    def test_explicit_input_mirror_keeps_friendly_names_and_exact_verification(self) -> None:
+        def response(command, **options):
+            destination = Path(command[command.index("--output") + 1])
+            self.assertEqual(command[-1], "https://mirror.example/" + destination.name)
+            destination.write_bytes((self.jars / destination.name).read_bytes())
+            return SimpleNamespace(returncode=0)
+        with patch.object(PREPARE.subprocess, "run", side_effect=response):
+            PREPARE.prepare(self.lock, self.staged, "https://mirror.example")
+        self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
+
     def test_tampered_public_test_input_fails_without_producing_output(self) -> None:
         def response(command, **options):
-            data = (self.jars / command[-1].rsplit("/", 1)[-1]).read_bytes()
-            Path(command[command.index("--output") + 1]).write_bytes(b"!" + data[1:])
+            destination = Path(command[command.index("--output") + 1])
+            data = (self.jars / destination.name).read_bytes()
+            destination.write_bytes(b"!" + data[1:])
             return SimpleNamespace(returncode=0)
         with patch.object(PREPARE.subprocess, "run", side_effect=response):
             with self.assertRaisesRegex(PREPARE.STAGE.StageError, "bytes differ"):

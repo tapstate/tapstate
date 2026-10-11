@@ -57,6 +57,40 @@ class PublishedConnectorArtifactsTest {
     }
 
     @Test
+    void db2DefaultDownloadUsesTheLockedPublicRevisionAndCanonicalLocalName() throws Exception {
+        URI source = PublishedConnectorArtifacts.artifact("db2", ignored -> null);
+        assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
+                + "connectors-preview/db2-connector-e00ec44e5c8711d90bea6419edf8107ef14ac873bf2838d699333f989ebbf181.jar"));
+        assertThat(PublishedConnectorArtifacts.jarName("db2")).isEqualTo("db2-connector.jar");
+        byte[] bytes = {1, 2, 3};
+        assertThat(PublishedConnectorArtifacts.download("db2", source, (from, expected) -> {
+            assertThat(from).isEqualTo(source);
+            assertThat(expected.bytes()).isEqualTo(32_784_188);
+            assertThat(expected.sha256()).isEqualTo(
+                    "e00ec44e5c8711d90bea6419edf8107ef14ac873bf2838d699333f989ebbf181");
+            return PublishedConnectorArtifacts.Fetched.verified(bytes);
+        })).isEqualTo(bytes);
+    }
+
+    @Test
+    void db2ExplicitMirrorsKeepTheirFriendlyLayoutWithoutPublicFallback() throws Exception {
+        for (Map<String, String> environment : java.util.List.of(
+                Map.of("TAPSTATE_CONNECTORS_URL", "https://mirror.example/connectors"),
+                Map.of("TAPSTATE_BASE_URL", "https://mirror.example/releases"))) {
+            URI source = PublishedConnectorArtifacts.artifact("db2", environment::get);
+            String prefix = environment.containsKey("TAPSTATE_CONNECTORS_URL")
+                    ? "https://mirror.example/connectors/"
+                    : "https://mirror.example/releases/download/connectors-preview/";
+            assertThat(source).isEqualTo(URI.create(prefix + "db2-connector.jar"));
+            assertThatThrownBy(() -> PublishedConnectorArtifacts.download("db2", source, (from, expected) -> {
+                assertThat(from).isEqualTo(source);
+                assertThat(expected.bytes()).isEqualTo(32_784_188);
+                throw new IOException("mirror unavailable");
+            })).isInstanceOf(IOException.class).hasMessage("mirror unavailable");
+        }
+    }
+
+    @Test
     void theHttpFetcherReturnsACompleteSuccessfulBody() throws Exception {
         byte[] jar = completeJar();
         HttpServer server = server(200, jar);

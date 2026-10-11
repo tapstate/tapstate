@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch pinned public Cloud connector inputs for startup tests, without connecting to any database."""
+"""Fetch pinned public Cloud connector inputs without connecting to any database."""
 
 from __future__ import annotations
 
@@ -46,7 +46,10 @@ def prepare(lock: Path, output: Path, base_url: str = PUBLIC_RELEASE) -> None:
         jars = Path(temporary)
         for entry in entries + licenses:
             name = f"{entry['id']}-connector.jar" if "id" in entry else entry["name"]
-            download(f"{base_url.rstrip('/')}/{name}", jars / name, entry["bytes"])
+            # Keep canonical staged names; the public Db2 alias has a separate artifact lifecycle.
+            remote_name = (f"db2-connector-{entry['sha256']}.jar"
+                           if entry.get("id") == "db2" and base_url.rstrip("/") == PUBLIC_RELEASE else name)
+            download(f"{base_url.rstrip('/')}/{remote_name}", jars / name, entry["bytes"])
         STAGE.stage(lock, jars, output)
 
 
