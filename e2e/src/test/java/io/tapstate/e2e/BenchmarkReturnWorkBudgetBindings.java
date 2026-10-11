@@ -63,7 +63,9 @@ final class BenchmarkReturnWorkBudgetBindings {
         SHARED_SOURCE_WORK("BenchmarkSharedSupportSourceWork"), SHARED_POSTGRES("SharedPostgres"), SHARED_MONGO("SharedMongo"),
         REAL_PROCESS_SERVER("RealProcessServer"), SERVER_HANDLE("ServerHandle"),
         DOCKER_GATE("DockerGate", "test-support"),
-        RETURN_INTERVAL_COMPARISON("BenchmarkReturnIntervalComparison");
+        RETURN_INTERVAL_COMPARISON("BenchmarkReturnIntervalComparison"),
+        RETURN_INTERVAL_METRICS("BenchmarkReturnIntervalMetrics"),
+        RETURN_METHOD_ADMISSION("BenchmarkReturnMethodAdmission");
 
         private final String binaryName, sourcePath, module;
         SourceRole(String name) {
