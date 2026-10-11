@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.core.JacksonException;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.SampleSourceCredentialsProvider;
 import io.tapstate.core.common.TapstateException;
@@ -90,6 +91,8 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
                         entry.path("orderLineTable").asText(null), entry.path("customerTable").asText(null)));
             }
             return List.copyOf(definitions);
+        } catch (JacksonException malformedResponse) {
+            return List.of();
         } catch (IOException e) {
             return List.of();
         } catch (InterruptedException e) {
@@ -117,6 +120,8 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
                 config.put("globalPublicationName", "tapstate_sample_pub");
             }
             return config;
+        } catch (JacksonException malformedResponse) {
+            throw unavailable();
         } catch (IOException e) {
             throw unavailable();
         } catch (InterruptedException e) {
