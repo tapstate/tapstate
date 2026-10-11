@@ -288,8 +288,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         }
         try {
             if (log == null) {
-                reader = ringTail.resumeAfter() != null
-                        ? SrsRingReader.resumingAfter(ring, ringTail.resumeAfter(), cursor)
+                Long resumeAfter = ringTail.resumeAfter();
+                if (confirmed != null && confirmed.order() != null && confirmed.order().seq() >= 0L) {
+                    // A resumed job reuses its graph, but its sink may have confirmed more since assembly.
+                    long confirmedSeq = confirmed.order().seq();
+                    resumeAfter = resumeAfter == null ? confirmedSeq : Math.max(resumeAfter, confirmedSeq);
+                }
+                reader = resumeAfter != null
+                        ? SrsRingReader.resumingAfter(ring, resumeAfter, cursor)
                         : SrsRingReader.from(ring, ringTail.start(), cursor);
             } else {
                 reader = ringTail.resumeAfter() != null
