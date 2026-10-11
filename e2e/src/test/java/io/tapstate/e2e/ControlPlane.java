@@ -425,6 +425,21 @@ final class ControlPlane {
         return typed(response.body(), ClusterTopologyView.class);
     }
 
+    /** Uses the same authenticated read transport with an explicit case-scoped request bound. */
+    ClusterTopologyView clusterStatus(Duration bound) {
+        HttpRequest request = HttpRequest.newBuilder(baseUrl.resolve("/api/cluster/status"))
+                .timeout(bound).header("Authorization", "Bearer " + requireCredential()).GET().build();
+        HttpResponse<String> response = send(request);
+        expect(response, 200, "read the typed cluster status within its bound");
+        return typed(response.body(), ClusterTopologyView.class);
+    }
+
+    ClusterRecoveryView clusterRecovery(Duration bound) {
+        ClusterRecoveryView recovery = clusterStatus(bound).recovery();
+        if (recovery == null) throw new AssertionError("cluster status omitted its recovery projection");
+        return recovery;
+    }
+
     /** The core queue/profile/capacity projection, without deriving a recovery state in the harness. */
     ClusterRecoveryView clusterRecovery() {
         ClusterRecoveryView recovery = clusterStatus().recovery();

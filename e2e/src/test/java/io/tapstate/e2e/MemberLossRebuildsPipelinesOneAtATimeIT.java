@@ -118,6 +118,10 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
                     assertThat(owners).hasSize(1);
                     originalCaptures.put(lane.pipeline(), owners.keySet().iterator().next());
                 }
+                var originalCommitted = ClusterProjectionAssertions.committedFacts(store, cluster.clusterId());
+                assertThat(originalCommitted.nodeIds()).containsExactlyInAnyOrderElementsOf(NODES);
+                ClusterProjectionAssertions.assertProjectionFacts(
+                        cluster, NODES.getFirst(), store, PIPELINES, NODES, originalCommitted);
                 assertThat(first.clusterRecovery().items()).isEmpty();
                 assertThat(queueDocuments(store, cluster.clusterId())).isEmpty();
 
@@ -152,10 +156,22 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
 
                     // These rows are new after the failure; no lifecycle command asks a pipeline to recover.
                     for (Lane lane : LANES) {
-                        for (String table : lane.tables()) {
+                        List<String> firstTables = lane.equals(multipleTables)
+                                ? List.of(lane.tables().getFirst()) : lane.tables();
+                        for (String table : firstTables) {
                             database(sourceClient, sourceUris.get(lane.source())).getCollection(table)
                                     .insertOne(row(3, "after-loss-sentinel"));
                         }
+                    }
+                    // The SDK names one offset for a callback. Wait for this table's real token before
+                    // introducing another table's change, so both asserted floors name actual callback ends.
+                    String firstTable = multipleTables.tables().getFirst();
+                    awaitValue(target, firstTable, 3, "after-loss-sentinel");
+                    awaitFloors(surviving, store, multipleTables, reads, List.of(firstTable),
+                            originalFloors.get(multipleTables.pipeline()));
+                    for (String table : multipleTables.tables().subList(1, multipleTables.tables().size())) {
+                        database(sourceClient, sourceUris.get(multipleTables.source())).getCollection(table)
+                                .insertOne(row(3, "after-loss-sentinel"));
                     }
                     Await.until("all three queue steps and all table sentinels to recover", BOUND, () -> {
                         trace.drain(changes);
@@ -189,6 +205,10 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
                             assertThat(observed(reads, lane, "START", requested, readsBeforeLoss))
                                     .as("the lost physical reader restarts the unchanged SDK at its frozen native token").isTrue();
                         }
+                        assertThat(surviving.captureOwnersOf(lane.pipeline()).keySet())
+                                .as("this lane has the same one selected physical source contract")
+                                .containsExactly(originalCaptures.get(lane.pipeline()));
+                        ClusterProjectionAssertions.assertQueueProjection(item, trace.latest.get(lane.pipeline()), store);
                         assertPreparedTables(trace.latest.get(lane.pipeline()), lane);
                         Map<String, Confirmed> after = awaitFloors(surviving, store, lane, reads);
                         assertCaptureCovers(store, lane, after, reads);
@@ -212,6 +232,10 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
                                             .isEqualTo(current.executionGeneration());
                                 });
                     }
+
+                    // The lost native member does not shrink the original committed denominator.
+                    ClusterProjectionAssertions.assertProjectionFacts(
+                            cluster, survivors.getFirst(), store, PIPELINES, survivors, originalCommitted);
 
                     // Closing the real writers makes their journal include all attempts, not only the first arrival.
                     for (Lane lane : LANES) {
@@ -305,18 +329,108 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
     private record Confirmed(String chain, String token, SourceOrder order) {}
 
     private static Map<String, Confirmed> awaitFloors(ControlPlane control, MongoDatabase store, Lane lane, Path reads) {
-        return Await.answered("each table's confirmed native SDK token for " + lane.pipeline(), BOUND, () -> {
-            Map<String, Confirmed> floors = new LinkedHashMap<>();
-            for (String table : lane.tables()) {
-                Confirmed point = confirmed(store, lane, table);
-                if (point == null || !delivered(reads, lane, point.token())
-                        || !control.durablePosition(lane.pipeline(), table).filter(point.token()::equals).isPresent()) {
-                    return Optional.empty();
+        return awaitFloors(control, store, lane, reads, lane.tables(), Map.of());
+    }
+
+    private static Map<String, Confirmed> awaitFloors(ControlPlane control, MongoDatabase store, Lane lane, Path reads,
+            List<String> tables, Map<String, Confirmed> previousFloors) {
+        Map<String, Document> compared = new LinkedHashMap<>();
+        long[] poll = {0};
+        try {
+            return Await.answered("each table's confirmed native SDK token for " + lane.pipeline(), BOUND, () -> {
+                poll[0]++;
+                Map<String, Confirmed> floors = new LinkedHashMap<>();
+                for (String table : tables) {
+                    Confirmed point = confirmed(store, lane, table);
+                    Document input = new Document("poll", poll[0]).append("table", table).append("confirmed", point == null ? null
+                            : new Document("chain", point.chain()).append("token", point.token())
+                                    .append("epoch", point.order().epoch()).append("sequence", point.order().seq()));
+                    compared.put(table, input);
+                    if (point == null) { return Optional.empty(); }
+                    Confirmed previous = previousFloors.get(table);
+                    if (previous != null) {
+                        input.append("previousToken", previous.token());
+                        if (point.token().equals(previous.token())) { return Optional.empty(); }
+                    }
+                    boolean delivered = delivered(reads, lane, point.token());
+                    input.append("deliveryMatched", delivered);
+                    if (!delivered) { return Optional.empty(); }
+                    // This replaces the same metrics request the original durable-position read made.
+                    String metrics = control.metrics(lane.pipeline());
+                    input.append("metricsResponse", metrics);
+                    int separator = metrics.indexOf(' ');
+                    Optional<String> published = ControlPlane.interpretDurablePosition(Integer.parseInt(metrics.substring(0, separator)),
+                            metrics.substring(separator + 1), lane.pipeline(), table);
+                    input.append("publishedToken", published.orElse(null));
+                    if (!published.filter(point.token()::equals).isPresent()) { return Optional.empty(); }
+                    floors.put(table, point);
                 }
-                floors.put(table, point);
+                return Optional.of(floors);
+            });
+        } catch (AssertionError failure) {
+            try {
+                Path retained = retainFloorDiagnostics(store, lane, reads, compared);
+                throw new AssertionError(failure.getMessage() + "; floor diagnostics retained at " + retained, failure);
+            } catch (IOException | RuntimeException diagnosticFailure) {
+                failure.addSuppressed(diagnosticFailure);
+                throw failure;
             }
-            return Optional.of(floors);
-        });
+        }
+    }
+
+    private static Path retainFloorDiagnostics(MongoDatabase store, Lane lane, Path reads,
+            Map<String, Document> compared) throws IOException {
+        Path directory = Path.of(System.getProperty("tapstate.e2e.build-directory", "target"))
+                .resolve("failure-scenes").resolve("member-loss-floors")
+                .resolve(lane.pipeline() + "-" + java.util.UUID.randomUUID());
+        Files.createDirectories(directory);
+        Files.writeString(directory.resolve("predicate-inputs.json"), new Document("pipeline", lane.pipeline())
+                .append("source", lane.source()).append("tables", lane.tables())
+                .append("comparisons", new ArrayList<>(compared.values())).toJson());
+        if (Files.exists(reads)) {
+            Files.copy(reads, directory.resolve("reader-journal.tsv"));
+        } else {
+            Files.writeString(directory.resolve("reader-journal-unavailable.txt"), "The owned reader journal was absent at failure.\n");
+        }
+        String consumerId = SrsConsumerId.of(lane.pipeline(), lane.source()).value();
+        List<Document> consumers = SystemCollections.SRS_CONSUMER_OFFSETS.on(store)
+                .find(new Document("pipelineId", new Document("$in", List.of(consumerId, lane.pipeline())))).into(new ArrayList<>());
+        Files.writeString(directory.resolve("consumers.json"), new Document("documents", consumers).toJson());
+        List<Document> queued = SystemCollections.CLUSTER_RECOVERY_QUEUE.on(store)
+                .find(new Document("pipelineId", lane.pipeline())).into(new ArrayList<>());
+        Files.writeString(directory.resolve("recovery.json"), new Document("documents", queued).toJson());
+        Set<String> chains = new LinkedHashSet<>();
+        Set<String> captures = new LinkedHashSet<>();
+        for (Document consumer : consumers) {
+            if (consumer.getString("miningChainId") != null) { chains.add(consumer.getString("miningChainId")); }
+            Document prepared = consumer.get("preparedSourceStart", Document.class);
+            if (prepared != null && prepared.get("readerClaim") instanceof Document claim && claim.getString("resourceId") != null) {
+                captures.add(claim.getString("resourceId"));
+            }
+        }
+        for (Document item : queued) {
+            Document successor = item.get("successor", Document.class);
+            Document receipt = successor == null ? null : successor.get("startupReceipt", Document.class);
+            if (receipt != null) {
+                for (Document witness : receipt.getList("preparedWitnesses", Document.class, List.of())) {
+                    if (lane.source().equals(witness.getString("sourceId")) && witness.getString("miningChainId") != null) {
+                        chains.add(witness.getString("miningChainId"));
+                    }
+                }
+            }
+        }
+        List<Document> roots = chains.isEmpty() ? List.of() : SystemCollections.SRS_META.on(store)
+                .find(new Document("_id", new Document("$in", List.copyOf(chains)))).into(new ArrayList<>());
+        Files.writeString(directory.resolve("meta.json"), new Document("documents", roots).toJson());
+        List<Document> claims = SystemCollections.WORKLOAD_CLAIMS.on(store).find(new Document("$or", List.of(
+                new Document("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name()).append("resourceId", lane.pipeline()),
+                new Document("resourceType", WorkloadClaimType.CAPTURE.name()).append("resourceId", new Document("$in", List.copyOf(captures))))))
+                .into(new ArrayList<>());
+        Files.writeString(directory.resolve("claims.json"), new Document("documents", claims).toJson());
+        List<Document> observations = SystemCollections.PIPELINE_OBSERVATION.on(store)
+                .find(new Document("_id", lane.pipeline())).into(new ArrayList<>());
+        Files.writeString(directory.resolve("observations.json"), new Document("documents", observations).toJson());
+        return directory;
     }
 
     private static Confirmed confirmed(MongoDatabase store, Lane lane, String table) {

@@ -140,6 +140,8 @@ class AFullClusterRestartRebuildsDesiredPipelinesFromMongoTruthIT {
                 Map<String, ClusterClaimView> previous = new LinkedHashMap<>();
                 for (String pipeline : PIPELINES) {
                     awaitCohort(initial, pipeline);
+                    assertThat(initial.state(pipeline)).as("each original run is healthy before the full stop")
+                            .contains(PipelineState.RUNNING);
                     previous.put(pipeline, claim(initial, pipeline));
                 }
                 Map<String, ClusterMemberFacts> oldBoots = initial.clusterMembers().stream()

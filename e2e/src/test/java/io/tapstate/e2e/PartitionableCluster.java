@@ -430,7 +430,8 @@ final class PartitionableCluster implements AutoCloseable {
         inputs.forEach((key, value) -> {
             if (!(key.startsWith("tapstate.cluster.execution-profile.")
                     || key.equals("tapstate.hz.jet.cooperative-thread-count")
-                    || key.equals("tapstate.execution.cluster-capacity.writers"))) {
+                    || key.equals("tapstate.execution.cluster-capacity.writers")
+                    || key.equals("tapstate.execution.max-connector-instances-per-member"))) {
                 throw new IllegalArgumentException("a profile witness cannot override launch identity: " + key);
             }
             if (value.isBlank()) throw new IllegalArgumentException("a profile input cannot be blank: " + key);
@@ -560,6 +561,8 @@ final class PartitionableCluster implements AutoCloseable {
         if (nodeSessionTtl != null) {
             arguments.add("--tapstate.cluster.node-session-ttl=" + nodeSessionTtl);
             arguments.add("--tapstate.cluster.node-session-renew-interval=" + nodeSessionTtl.dividedBy(3));
+            arguments.add("--tapstate.cluster.workload-claim-ttl=" + nodeSessionTtl);
+            arguments.add("--tapstate.cluster.workload-claim-renew-interval=" + nodeSessionTtl.dividedBy(3));
         }
         return List.copyOf(arguments);
     }
