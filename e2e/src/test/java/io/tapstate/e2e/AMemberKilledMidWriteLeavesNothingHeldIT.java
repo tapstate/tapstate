@@ -97,6 +97,8 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
                         .findFirst()
                         .orElseThrow(() -> new AssertionError("no chain carries " + PIPELINE));
                 ControlPlane survivor = cluster.memberOtherThan(killed);
+                long executionBefore = survivor.executionGenerationOf(PIPELINE)
+                        .orElseThrow(() -> new AssertionError("the running pipeline has no execution generation"));
 
                 try (StoreDocuments.HeldOpen held =
                         documents.holdChainOpenAs(chain, MongoConnection.processTag(killedBoot))) {
@@ -107,7 +109,10 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
                     try {
                         Await.until("a change made after the kill to reach the target while the store would still be "
                                         + "holding the record the killed member left open", WITHIN_THE_HOLD,
-                                () -> files.count(targetAddress, TABLE) > rowsAtTheKill,
+                                () -> files.count(targetAddress, TABLE) > rowsAtTheKill
+                                        && survivor.executionGenerationOf(PIPELINE)
+                                                .filter(execution -> execution == executionBefore + 1).isPresent()
+                                        && survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                                 () -> "rows at target = " + files.count(targetAddress, TABLE) + ", was " + rowsAtTheKill
                                         + " when " + killed + " was killed; the pipeline is " + survivor.state(PIPELINE)
                                         + " under execution " + survivor.executionGenerationOf(PIPELINE));

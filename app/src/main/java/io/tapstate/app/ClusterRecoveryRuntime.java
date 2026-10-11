@@ -636,8 +636,10 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     @Override public void stopped(String pipelineId, WorkloadClaim stoppedClaim, boolean jobOver) {
         if (!active() || !jobOver || stoppedClaim == null) { return; }
         WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
-        boolean failed = stores.state().read(pipelineId)
-                .map(checkpoint -> StateJson.parse(checkpoint.stateJson()) == PipelineState.FAILED).orElse(false);
+        var checkpoint = stores.state().read(pipelineId).orElse(null);
+        if (checkpoint != null && StateJson.parse(checkpoint.stateJson()) == PipelineState.RUNNING
+                && retainUnallocatedRecoveryController(pipelineId, stoppedClaim, current, checkpoint)) { return; }
+        boolean failed = checkpoint != null && StateJson.parse(checkpoint.stateJson()) == PipelineState.FAILED;
         if (failed && sameAuthority(stoppedClaim, current)
                 && current.executionGeneration() > 0
                 && current.contextExecutionGeneration() == current.executionGeneration()
@@ -648,6 +650,61 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
             return;
         }
         retireStopped(pipelineId, stoppedClaim);
+    }
+
+    private boolean retainUnallocatedRecoveryController(String pipelineId, WorkloadClaim stoppedClaim,
+            WorkloadClaim current, io.tapstate.core.lifecycle.CheckpointDoc checkpoint) {
+        if (!sameAuthority(stoppedClaim, current) || !verdictRecorded(current) || !current.failureAfterMemberLoss()
+                || current.claimGeneration() <= current.executionClaimGeneration()
+                || pendingResume(pipelineId).isPresent()) { return false; }
+        DesiredState desired = stores.desired().read(pipelineId).orElse(null);
+        ClusterRecoveryItem item = item(pipelineId).orElse(null);
+        if (!unallocatedMemberLoss(item, current, desired)) { return false; }
+        WorkloadClaimReading before = stores.workloadClaims().read(current.key()).orElse(null);
+        if (!membership.businessEligible() || !sameLiveRecoveryController(current, before)) { return false; }
+        var result = stores.clusterRecovery().resumePermit(fence(item), item.permit().reservationId(),
+                properties.getWorkloadClaimTtl());
+        if (result.outcome() != ClusterRecoveryMutation.APPLIED || result.item() == null
+                || !result.item().event().equals(item.event())
+                || !unallocatedMemberLoss(result.item(), current, desired)
+                || !result.item().permit().reservationId().equals(item.permit().reservationId())) { return false; }
+        var afterCheckpoint = stores.state().read(pipelineId).orElse(null);
+        DesiredState afterDesired = stores.desired().read(pipelineId).orElse(null);
+        WorkloadClaim afterCurrent = actuation.currentClaim(pipelineId).orElse(null);
+        WorkloadClaimReading after = stores.workloadClaims().read(current.key()).orElse(null);
+        // This retains only the stopped controller. The existing issuer still proves retirement and
+        // the exact live claim before allocating or submitting its successor.
+        return membership.businessEligible() && afterCheckpoint != null && afterCheckpoint.epoch() == checkpoint.epoch()
+                && StateJson.parse(afterCheckpoint.stateJson()) == PipelineState.RUNNING
+                && desired.equals(afterDesired) && pendingResume(pipelineId).isEmpty()
+                && afterCurrent != null && WorkloadClaimFence.from(current).equals(WorkloadClaimFence.from(afterCurrent))
+                && PendingPipelineResume.sameExecutionContext(current, afterCurrent)
+                && sameLiveRecoveryController(current, after);
+    }
+
+    private static boolean sameLiveRecoveryController(WorkloadClaim current, WorkloadClaimReading reading) {
+        return reading != null && reading.leased()
+                && WorkloadClaimFence.from(current).equals(WorkloadClaimFence.from(reading.claim()))
+                && PendingPipelineResume.sameExecutionContext(current, reading.claim())
+                && reading.claim().failureClaimGeneration() == current.failureClaimGeneration()
+                && reading.claim().failureAfterMemberLoss();
+    }
+
+    private static boolean unallocatedMemberLoss(ClusterRecoveryItem item, WorkloadClaim current, DesiredState desired) {
+        return item != null && !item.status().terminal() && item.permit() != null && item.successor() == null
+                && item.permit().transferredExecutionGeneration() == 0
+                && item.event().cause() == ClusterRecoveryCause.MEMBER_LOSS
+                && item.executionFrontier() == current.executionGeneration()
+                && item.event().originalExecutionGeneration() == current.executionGeneration()
+                && item.event().key().incarnation().equals(current.executionIncarnation())
+                && Objects.equals(item.event().originalExecutionRevision(), current.executionRevision())
+                && Objects.equals(item.event().sourceTopologyRevision(), current.executionTopologyRevision())
+                && Objects.equals(item.event().sourceProfile(), current.executionProfile())
+                && item.targetProfile().equals(current.executionProfile())
+                && current.profileGeneration() == item.targetProfile().generation()
+                && desired != null && desired.targetState() == PipelineState.RUNNING && !desired.purgeState()
+                && !desired.reassemble() && desired.rebuiltAtStateEpoch() == null
+                && item.event().intentFingerprint().equals(DesiredStateFingerprint.of(desired));
     }
 
     private void retireStopped(String pipelineId, WorkloadClaim stoppedClaim) {
@@ -908,7 +965,9 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
 
     private static boolean verdictRecorded(WorkloadClaim claim) {
         return claim.executionGeneration() > 0 && claim.contextExecutionGeneration() == claim.executionGeneration()
-                && claim.failureClaimGeneration() == claim.executionClaimGeneration() && claim.failureClaimGeneration() > 0;
+                && claim.executionClaimGeneration() > 0 && claim.failureClaimGeneration() > 0
+                && claim.failureClaimGeneration() >= claim.executionClaimGeneration()
+                && claim.failureClaimGeneration() <= claim.claimGeneration();
     }
 
     private static boolean sameAuthority(WorkloadClaim expected, WorkloadClaim actual) {

@@ -784,6 +784,317 @@ class ClusterRecoveryRuntimeTest {
         verify(ownership, never()).recordClassifiedFailure("p", true);
     }
 
+    @Test void theFirstInheritedFailedStopRetiresOnlyAfterTheNewHolderRecordsItsVerdict() {
+        WorkloadClaim original = allocatedClaim(8);
+        WorkloadClaim current = controllerWithVerdict(2, 1, 0, false);
+        var held = new java.util.concurrent.atomic.AtomicReference<>(current);
+        when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
+        when(store.state().read("p")).thenReturn(Optional.of(
+                new io.tapstate.core.lifecycle.CheckpointDoc("p", "FAILED", 2, NOW)));
+        when(ownership.retireStoppedExecution(current)).thenReturn(true);
+        runtime.stopped("p", current, true);
+        verify(ownership, never()).retireStoppedExecution(any());
+
+        useLiveMembers(Map.of("a", ORIGINAL_MEMBERS.get("a"), "c", ORIGINAL_MEMBERS.get("c")));
+        when(engine.nativeRun("p")).thenReturn(Optional.of(
+                new Engine.NativeRun("42", 1, 8, 2, JobStatus.FAILED, Optional.empty())));
+        when(engine.failureOf("p")).thenReturn(Optional.of(new IllegalStateException("native member disconnected")));
+        ClusterCapacityReservation submitted = new ClusterCapacityReservation("original", "cluster", "p", "inc",
+                DesiredStateFingerprint.of(store.desired().read("p").orElseThrow()), profile, WorkloadClaimFence.from(original),
+                Map.of("a", demand, "b", demand, "c", demand), NOW.minusSeconds(60), NOW.minusSeconds(1), 8L, "42");
+        when(capacity.submittedExecution(current)).thenReturn(Optional.of(new ClusterCapacityStore.SubmittedExecution(submitted, true)));
+        doAnswer(call -> { held.set(failed(held.get(), true)); return null; })
+                .when(ownership).recordClassifiedFailure("p", true);
+
+        runtime.afterFailedStop("p");
+
+        assertThat(held.get().executionClaimGeneration()).isEqualTo(1);
+        assertThat(held.get().failureClaimGeneration()).isEqualTo(2);
+        assertThat(held.get().failureAfterMemberLoss()).isTrue();
+        var order = inOrder(ownership);
+        order.verify(ownership).recordClassifiedFailure("p", true);
+        order.verify(ownership).retireStoppedExecution(current);
+        verify(ownership, never()).recordClassifiedFailure("p", false);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+    }
+
+    @Test void aStaleOrFutureFailureGenerationDoesNotRetireTheStoppedExecutionAsClassified() {
+        for (long failureGeneration : List.of(1L, 4L)) {
+            WorkloadClaim current = controllerWithVerdict(3, 2, failureGeneration, true);
+            when(ownership.currentClaim("p")).thenReturn(Optional.of(current));
+            when(store.state().read("p")).thenReturn(Optional.of(
+                    new io.tapstate.core.lifecycle.CheckpointDoc("p", "FAILED", 2, NOW)));
+
+            runtime.stopped("p", current, true);
+            runtime.afterFailedStop("p");
+        }
+
+        verify(ownership, never()).retireStoppedExecution(any());
+        verify(store.clusterRecovery(), never()).recordFailureNote(any(), any(), any(), any());
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+    }
+
+    @Test void anOrdinaryInheritedFailureRemainsStickyAfterTheDiagnosticHolderRecordsIt() {
+        WorkloadClaim original = allocatedClaim(8);
+        WorkloadClaim current = controllerWithVerdict(2, 1, 0, false);
+        var held = new java.util.concurrent.atomic.AtomicReference<>(current);
+        when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
+        when(store.state().read("p")).thenReturn(Optional.of(
+                new io.tapstate.core.lifecycle.CheckpointDoc("p", "FAILED", 2, NOW)));
+        when(ownership.retireStoppedExecution(current)).thenReturn(true);
+        runtime.stopped("p", current, true);
+        var error = new TapstateException(EngineError.ROUTING_KEY_MISSING,
+                Map.of("node", "join", "stream", "s.orders", "columns", "id"), null);
+        when(engine.nativeRun("p")).thenReturn(Optional.of(
+                new Engine.NativeRun("42", 1, 8, 2, JobStatus.FAILED, Optional.empty())));
+        when(engine.failureOf("p")).thenReturn(Optional.of(error));
+        ClusterCapacityReservation submitted = new ClusterCapacityReservation("original", "cluster", "p", "inc",
+                DesiredStateFingerprint.of(store.desired().read("p").orElseThrow()), profile, WorkloadClaimFence.from(original),
+                Map.of("a", demand, "b", demand, "c", demand), NOW.minusSeconds(60), NOW.minusSeconds(1), 8L, "42");
+        when(capacity.submittedExecution(current)).thenReturn(Optional.of(new ClusterCapacityStore.SubmittedExecution(submitted, true)));
+        doAnswer(call -> { held.set(failed(held.get(), false)); return null; })
+                .when(ownership).recordClassifiedFailure("p", false);
+
+        runtime.afterFailedStop("p");
+
+        verify(ownership).retireStoppedExecution(current);
+        assertThat(held.get().failureClaimGeneration()).isEqualTo(2);
+        assertThat(held.get().failureAfterMemberLoss()).isFalse();
+        assertThat(PipelineRecoveryDiscovery.cause(store.desired().read("p").orElseThrow(), PipelineState.FAILED,
+                store.artifacts().identity("p").orElseThrow(), held.get(), profile, false, true)).isEmpty();
+        verify(ownership, never()).recordClassifiedFailure("p", true);
+        verify(store.clusterRecovery(), never()).enqueue(any(), any());
+    }
+
+    private WorkloadClaim controllerWithVerdict(long controllerGeneration, long executionGenerationHolder,
+            long failureGeneration, boolean topologyFailure) {
+        WorkloadClaim original = allocatedClaim(8);
+        return new WorkloadClaim(original.key(), original.owner(), controllerGeneration, original.executionGeneration(),
+                original.topologyRevision(), original.leaseUntil(), original.contextExecutionGeneration(), executionGenerationHolder,
+                original.executionNodeIds(), failureGeneration, topologyFailure, original.profileGeneration(), original.executionProfile(),
+                original.executionTopologyRevision(), original.executionIncarnation(), original.executionRevision(), original.executionMembers());
+    }
+
+    @Test void automaticReassemblyKeepsItsQualifiedUnallocatedRecoveryController() {
+        assertAutomaticRecoveryControllerRetained(2, 1);
+    }
+
+    @Test void anIntermediateDiagnosticHolderVerdictStillRetainsTheSameUnallocatedRecoveryExecution() {
+        assertAutomaticRecoveryControllerRetained(3, 2);
+    }
+
+    private void assertAutomaticRecoveryControllerRetained(long controllerGeneration, long failureGeneration) {
+        RecoveryPermitStart pending = unallocatedMemberLossController(controllerGeneration, failureGeneration);
+        WorkloadClaim controller = pending.held().get();
+
+        runtime.stopped("p", controller, true);
+
+        verify(ownership, never()).retireStoppedExecution(any());
+        verify(store.clusterRecovery()).resumePermit(any(), eq("reserved"), any());
+        assertThat(pending.held().get()).isSameAs(controller);
+        assertThat(pending.item().get().attempt()).isZero();
+        assertThat(pending.item().get().successor()).isNull();
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+
+        assertThat(runtime.prepare("p", pending.planned(), ownership)).isTrue();
+        assertThat(runtime.begin("p", pending.planned(), ownership).fence().executionGeneration()).isEqualTo(9);
+        verify(store.clusterRecovery()).advanceExecution(any(), eq(controller), eq(NODES), eq(Set.of("s")));
+        verify(capacity, never()).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aLocallyBelowQuorumStopCannotRefreshAnUnallocatedRecoveryPermit() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        when(gate.businessEligible()).thenReturn(false);
+
+        runtime.stopped("p", controller, true);
+
+        verify(store.clusterRecovery(), never()).resumePermit(any(), anyString(), any());
+        verify(ownership).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void losingLocalQuorumDuringPermitRefreshCannotRetainTheStoppedController() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        when(store.clusterRecovery().resumePermit(any(), anyString(), any())).thenAnswer(call -> {
+            ClusterRecoveryItem resumed = pending.item().get().permitted(pending.item().get().permit(), NOW);
+            pending.item().set(resumed);
+            when(gate.businessEligible()).thenReturn(false);
+            return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, resumed, null);
+        });
+
+        runtime.stopped("p", controller, true);
+
+        verify(store.clusterRecovery()).resumePermit(any(), eq("reserved"), any());
+        verify(ownership).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void aPipelineLeaseExpiringDuringPermitRefreshCannotRetainTheStoppedController() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        when(store.clusterRecovery().resumePermit(any(), anyString(), any())).thenAnswer(call -> {
+            ClusterRecoveryItem resumed = pending.item().get().permitted(pending.item().get().permit(), NOW);
+            pending.item().set(resumed);
+            when(store.workloadClaims().read(controller.key())).thenReturn(Optional.of(
+                    new WorkloadClaimReading(controller, Duration.ZERO)));
+            return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, resumed, null);
+        });
+
+        runtime.stopped("p", controller, true);
+
+        verify(store.clusterRecovery()).resumePermit(any(), eq("reserved"), any());
+        verify(ownership).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void aSupersedingDesiredIntentDuringPermitRefreshCannotRetainTheStoppedController() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        when(store.clusterRecovery().resumePermit(any(), anyString(), any())).thenAnswer(call -> {
+            ClusterRecoveryItem resumed = pending.item().get().permitted(pending.item().get().permit(), NOW);
+            pending.item().set(resumed);
+            when(store.desired().read("p")).thenReturn(Optional.of(
+                    new DesiredState("p", PipelineState.RUNNING, "b".repeat(64))));
+            when(store.artifacts().identity("p")).thenReturn(Optional.of(new ArtifactIdentity("p", "inc", "b".repeat(64))));
+            return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, resumed, null);
+        });
+
+        runtime.stopped("p", controller, true);
+
+        verify(store.clusterRecovery()).resumePermit(any(), eq("reserved"), any());
+        verify(ownership).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void aCanonicalRecoveryRefusalCannotKeepTheStoppedController() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        when(store.clusterRecovery().resumePermit(any(), anyString(), any())).thenReturn(
+                new ClusterRecoveryStore.Result(ClusterRecoveryMutation.STALE_INTENT, pending.item().get(), null));
+
+        runtime.stopped("p", controller, true);
+
+        verify(ownership).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void anExpiredOrChangedPipelineClaimCannotKeepAnUnallocatedRecoveryController() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        WorkloadClaim changed = new WorkloadClaim(controller.key(), new WorkloadOwner("b", "boot-b"),
+                controller.claimGeneration() + 1, controller.executionGeneration(), controller.topologyRevision(),
+                controller.leaseUntil(), controller.contextExecutionGeneration(), controller.executionClaimGeneration(),
+                controller.executionNodeIds(), controller.failureClaimGeneration(), true, controller.profileGeneration(),
+                controller.executionProfile(), controller.executionTopologyRevision(), controller.executionIncarnation(),
+                controller.executionRevision(), controller.executionMembers());
+        when(store.workloadClaims().read(controller.key())).thenReturn(
+                Optional.of(new WorkloadClaimReading(controller, Duration.ZERO)),
+                Optional.of(new WorkloadClaimReading(changed, Duration.ofSeconds(30))));
+
+        runtime.stopped("p", controller, true);
+        runtime.stopped("p", controller, true);
+
+        verify(ownership, times(2)).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).resumePermit(any(), anyString(), any());
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+    }
+
+    @Test void explicitLifecycleIntentAndAllocatedSuccessorsKeepTheirRetirementProtocol() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        for (PipelineState target : List.of(PipelineState.STOPPED, PipelineState.PAUSED)) {
+            when(store.state().read("p")).thenReturn(Optional.of(
+                    new io.tapstate.core.lifecycle.CheckpointDoc("p", target.name(), 4, NOW)));
+            when(store.desired().read("p")).thenReturn(Optional.of(new DesiredState("p", target, "a".repeat(64))));
+            runtime.stopped("p", controller, true);
+        }
+        when(store.state().read("p")).thenReturn(Optional.of(
+                new io.tapstate.core.lifecycle.CheckpointDoc("p", "RUNNING", 3, NOW)));
+        when(store.desired().read("p")).thenReturn(Optional.of(
+                new DesiredState("p", PipelineState.RUNNING, "a".repeat(64), false, null, true, 2L)));
+        runtime.stopped("p", controller, true);
+
+        DesiredState continued = new DesiredState("p", PipelineState.RUNNING, "a".repeat(64));
+        when(store.desired().read("p")).thenReturn(Optional.of(continued));
+        var explicit = new PendingPipelineResume(3, DesiredStateFingerprint.of(continued), allocatedClaim(8), "42", "43");
+        when(store.state().pendingResume("p")).thenReturn(Optional.of(explicit));
+        runtime.stopped("p", controller, true);
+        when(store.state().pendingResume("p")).thenReturn(Optional.empty());
+        WorkloadClaim successor = inheritedRecoverySuccessor(controller);
+        pending.item().set(pending.item().get().advanced(new ClusterRecoverySuccessor(WorkloadClaimFence.from(successor),
+                profile, NODES, Set.of("s"), NOW, null, null, Map.of(), null), NOW));
+        runtime.stopped("p", controller, true);
+        when(store.clusterRecovery().read(any())).thenReturn(Optional.empty());
+        runtime.stopped("p", controller, true);
+
+        verify(ownership, times(6)).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).resumePermit(any(), anyString(), any());
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+    }
+
+    @Test void aSupersedingStateEpochCannotKeepTheEarlierRecoveryStop() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        when(store.clusterRecovery().resumePermit(any(), anyString(), any())).thenAnswer(call -> {
+            when(store.state().read("p")).thenReturn(Optional.of(
+                    new io.tapstate.core.lifecycle.CheckpointDoc("p", "RUNNING", 5, NOW)));
+            return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, pending.item().get(), null);
+        });
+
+        runtime.stopped("p", controller, true);
+
+        verify(ownership).retireStoppedExecution(controller);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    private RecoveryPermitStart unallocatedMemberLossController() {
+        return unallocatedMemberLossController(2, 1);
+    }
+
+    private RecoveryPermitStart unallocatedMemberLossController(long controllerGeneration, long failureGeneration) {
+        WorkloadClaim original = allocatedClaim(8);
+        WorkloadClaim controller = new WorkloadClaim(original.key(), original.owner(), controllerGeneration, original.executionGeneration(),
+                original.topologyRevision(), original.leaseUntil(), original.contextExecutionGeneration(),
+                original.executionClaimGeneration(), original.executionNodeIds(), failureGeneration, true,
+                original.profileGeneration(), original.executionProfile(), original.executionTopologyRevision(),
+                original.executionIncarnation(), original.executionRevision(), original.executionMembers());
+        RecoveryPermitStart pending = recoveryPermitStart(controller, () -> inheritedRecoverySuccessor(controller));
+        ClusterRecoveryItem old = pending.item().get();
+        var event = new ClusterRecoveryEvent(old.event().key(), ClusterRecoveryCause.MEMBER_LOSS, 8,
+                original.executionRevision(), original.executionTopologyRevision(), profile, profile, 7,
+                old.event().intentFingerprint(), Map.of());
+        pending.item().set(ClusterRecoveryItem.enqueued(event, 1, NOW.minusSeconds(30), 3).permitted(old.permit(), NOW));
+        WorkloadClaimStore claimStore = mock(WorkloadClaimStore.class);
+        when(store.workloadClaims()).thenReturn(claimStore);
+        when(claimStore.read(controller.key())).thenAnswer(call -> Optional.of(
+                new WorkloadClaimReading(pending.held().get(), Duration.ofSeconds(30))));
+        when(store.state().read("p")).thenReturn(Optional.of(
+                new io.tapstate.core.lifecycle.CheckpointDoc("p", "RUNNING", 3, NOW)));
+        when(store.state().pendingResume("p")).thenReturn(Optional.empty());
+        when(store.clusterRecovery().resumePermit(any(), eq("reserved"), any())).thenAnswer(call -> {
+            ClusterRecoveryItem resumed = pending.item().get().permitted(pending.item().get().permit(), NOW);
+            pending.item().set(resumed);
+            return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, resumed, null);
+        });
+        return pending;
+    }
+
+    private WorkloadClaim inheritedRecoverySuccessor(WorkloadClaim controller) {
+        return new WorkloadClaim(controller.key(), controller.owner(), controller.claimGeneration(), 9,
+                controller.topologyRevision(), controller.leaseUntil(), 9, controller.claimGeneration(), NODES,
+                0, false, controller.profileGeneration(), profile, 7L, "inc", "a".repeat(64), ORIGINAL_MEMBERS);
+    }
+
     @Test void aStoppedUnclassifiedExecutionKeepsItsClaimUntilTheExistingDetectionVerdictIsRecorded() {
         WorkloadClaim stopped = claim(8);
         var held = new java.util.concurrent.atomic.AtomicReference<>(stopped);
