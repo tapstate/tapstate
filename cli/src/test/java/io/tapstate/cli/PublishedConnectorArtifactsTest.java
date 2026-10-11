@@ -85,14 +85,14 @@ class PublishedConnectorArtifactsTest {
 
     @Test
     void theHttpFetcherRejectsAnOversizedDeclaredBodyBeforeReadingIt() {
-        HttpServer server = declaredLengthServer(70L * 1024 * 1024, new byte[0]);
+        HttpServer server = declaredLengthServer(257L * 1024 * 1024, new byte[0]);
         try {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
                     expected(completeJar()), source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
-                    .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
+                    .hasMessageContaining("exceeds the 256 MiB connector artifact limit");
         } finally {
             server.stop(0);
         }
@@ -100,16 +100,16 @@ class PublishedConnectorArtifactsTest {
 
     @Test
     void theHttpFetcherBoundsAnOversizedChunkedBody() {
-        HttpServer server = chunkedServer(64L * 1024 * 1024 + 1);
+        HttpServer server = chunkedServer(256L * 1024 * 1024 + 1);
         PublishedConnectorArtifacts.Artifact maximum =
-                new PublishedConnectorArtifacts.Artifact(64L * 1024 * 1024, "unused-after-size-refusal");
+                new PublishedConnectorArtifacts.Artifact(256L * 1024 * 1024, "unused-after-size-refusal");
         try {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
                     maximum, source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
-                    .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
+                    .hasMessageContaining("exceeds the 256 MiB connector artifact limit");
         } finally {
             server.stop(0);
         }
