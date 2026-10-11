@@ -29,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ThreadLocalRandom;
 
 /** Bootstraps, refreshes and rotates the Cluster keyring stored beside encrypted Source configs. */
 public final class SourceConfigKeyringStore {
@@ -48,6 +49,12 @@ public final class SourceConfigKeyringStore {
     private final MongoCollection<Document> artifacts;
     private final SecureRandom random;
     private final MongoClient client;
+    private final AcknowledgementRetryPause acknowledgementRetryPause;
+
+    @FunctionalInterface
+    interface AcknowledgementRetryPause {
+        void pause(int failedAttempt) throws InterruptedException;
+    }
 
     public SourceConfigKeyringStore(MongoDatabase database) {
         this(database, new SecureRandom());
@@ -61,8 +68,19 @@ public final class SourceConfigKeyringStore {
         this(Objects.requireNonNull(client, "client"), database, new SecureRandom());
     }
 
+    SourceConfigKeyringStore(MongoClient client, MongoDatabase database,
+            AcknowledgementRetryPause acknowledgementRetryPause) {
+        this(Objects.requireNonNull(client, "client"), database, new SecureRandom(), acknowledgementRetryPause);
+    }
+
     private SourceConfigKeyringStore(MongoClient client, MongoDatabase database, SecureRandom random) {
+        this(client, database, random, failedAttempt -> Thread.sleep(acknowledgementRetryDelayMillis(failedAttempt)));
+    }
+
+    private SourceConfigKeyringStore(MongoClient client, MongoDatabase database, SecureRandom random,
+            AcknowledgementRetryPause acknowledgementRetryPause) {
         Objects.requireNonNull(database, "database");
+        this.acknowledgementRetryPause = Objects.requireNonNull(acknowledgementRetryPause, "acknowledgementRetryPause");
         this.client = client;
         this.systemMeta = SystemCollections.SYSTEM_META.on(database)
                 .withReadPreference(ReadPreference.primary())
@@ -425,6 +443,15 @@ public final class SourceConfigKeyringStore {
         return stored;
     }
 
+    static long acknowledgementRetryDelayMillis(int failedAttempt) {
+        long lower = switch (failedAttempt) {
+            case 0 -> 50L;
+            case 1 -> 100L;
+            default -> throw new IllegalArgumentException("invalid acknowledgement retry attempt");
+        };
+        return ThreadLocalRandom.current().nextLong(lower, lower * 2 + 1);
+    }
+
     boolean acknowledge(WorkloadClaim session, long epoch, Duration ttl) {
         requireNodeSession(session);
         Objects.requireNonNull(ttl, "ttl");
@@ -437,6 +464,13 @@ public final class SourceConfigKeyringStore {
                 } catch (MongoException error) {
                     if (attempt == 2 || !error.hasErrorLabel("TransientTransactionError")
                             || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
+                    // The failed session has closed; let the competing transaction finish before retrying.
+                    try {
+                        acknowledgementRetryPause.pause(attempt);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw error;
+                    }
                 }
             }
             throw new IllegalStateException("acknowledgement attempts must return or throw");
