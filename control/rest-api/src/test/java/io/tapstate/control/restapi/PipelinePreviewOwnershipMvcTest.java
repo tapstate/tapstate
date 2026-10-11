@@ -68,6 +68,19 @@ class PipelinePreviewOwnershipMvcTest {
     }
 
     @Test
+    void aServletFlushDisconnectCancelsAndClosesTheSessionWithoutAnExtraCompletionClose() throws Exception {
+        try (Fixture fixture = new Fixture(false, true)) {
+            MvcResult result = fixture.perform();
+            assertThat((Throwable) result.getAsyncResult(5_000))
+                    .isInstanceOf(IOException.class).hasCause(fixture.flushFailure);
+            assertThat(fixture.entered.getCount()).as("the first event failed before the probe was read").isEqualTo(1);
+            assertThat(fixture.cancelCalls).hasValue(2);
+            result.getRequest().getAsyncContext().complete();
+            assertThat(fixture.cancelCalls).hasValue(2);
+        }
+    }
+
+    @Test
     void rejectedAsyncSchedulingClosesTheSessionEvenWhenTheResponseBodyNeverRuns() throws Exception {
         try (Fixture fixture = new Fixture(false)) {
             AtomicInteger rejections = new AtomicInteger();
@@ -92,10 +105,15 @@ class PipelinePreviewOwnershipMvcTest {
         private final CountDownLatch release = new CountDownLatch(1);
         private final AtomicInteger opens = new AtomicInteger();
         private final AtomicInteger cancelCalls = new AtomicInteger();
+        private final IOException flushFailure = new IOException("owned servlet flush disconnect");
         private final MockMvc mvc;
         private final String body;
 
         private Fixture(boolean disconnect) throws IOException {
+            this(disconnect, false);
+        }
+
+        private Fixture(boolean disconnect, boolean flushDisconnect) throws IOException {
             Clock clock = Clock.systemUTC();
             var apply = new PipelineApiTest.TestApp().applyService(new PipelineApiTest.FakeArtifactStore(),
                     new AuditGate(new PipelineApiTest.RecordingAuditStore(), clock));
@@ -125,11 +143,18 @@ class PipelinePreviewOwnershipMvcTest {
             }, clock);
             ObjectMapper json = new ObjectMapper();
             var builder = MockMvcBuilders.standaloneSetup(new PipelinePreviewController(previews, json));
-            if (disconnect) {
+            if (disconnect || flushDisconnect) {
                 builder.addFilters((request, response, chain) -> chain.doFilter(request,
                         new HttpServletResponseWrapper((jakarta.servlet.http.HttpServletResponse) response) {
                             @Override
-                            public ServletOutputStream getOutputStream() {
+                            public void flushBuffer() throws IOException {
+                                if (flushDisconnect) throw flushFailure;
+                                super.flushBuffer();
+                            }
+
+                            @Override
+                            public ServletOutputStream getOutputStream() throws IOException {
+                                if (!disconnect) return super.getOutputStream();
                                 return new ServletOutputStream() {
                                     @Override
                                     public boolean isReady() { return true; }
