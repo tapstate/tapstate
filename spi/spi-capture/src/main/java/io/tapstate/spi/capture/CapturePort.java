@@ -22,8 +22,9 @@ import java.util.Optional;
  * <p>How the two reads compose is driven by the pipeline read mode, read as a {@link CapturePlan}:
  * {@code snapshot_and_cdc} runs {@link #snapshot} then {@link #cdc} resuming at the batch's seam,
  * {@code cdc_only} runs {@link #cdc} alone from wherever its caller starts it, {@code snapshot_only}
- * runs {@link #snapshot} alone and its seam goes unused. The two {@link CapturePhase}s classify each
- * yielded event by its op; the caller persists the positions it is handed.
+ * runs a bounded read alone, using {@link SnapshotOnlyCapture} where offered to avoid sampling an unused
+ * seam. The two {@link CapturePhase}s classify each yielded event by its op; the caller persists the
+ * positions it is handed.
  */
 public interface CapturePort {
 

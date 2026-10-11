@@ -30,12 +30,26 @@ public record NestBinding(
         ReplayFloorFactory replayFloor,
         NestStateLedger ledger,
         NestSettings settings,
-        NestClock clock) implements Serializable {
+        NestClock clock,
+        boolean settleMissingReferencesOnComplete) implements Serializable {
+
+    /** Keeps bounded preview runs from omitting every root when a referenced row is absent in the sample. */
+    public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
+            NestSettings settings, boolean settleMissingReferencesOnComplete) {
+        this(tables, stores, deadLetter, ReplayFloorFactory.NONE, NestStateLedger.NONE,
+                settings, NestClock.SYSTEM, settleMissingReferencesOnComplete);
+    }
+
+    /** Existing bindings preserve the live-run behavior when their upstream work completes. */
+    public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
+            ReplayFloorFactory replayFloor, NestStateLedger ledger, NestSettings settings, NestClock clock) {
+        this(tables, stores, deadLetter, replayFloor, ledger, settings, clock, false);
+    }
 
     /** A binding on the system clock, which is what everything but a test runs on. */
     public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
             ReplayFloorFactory replayFloor, NestStateLedger ledger, NestSettings settings) {
-        this(tables, stores, deadLetter, replayFloor, ledger, settings, NestClock.SYSTEM);
+        this(tables, stores, deadLetter, replayFloor, ledger, settings, NestClock.SYSTEM, false);
     }
 
     /**

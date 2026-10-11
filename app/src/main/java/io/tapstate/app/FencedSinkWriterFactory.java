@@ -1,7 +1,9 @@
 package io.tapstate.app;
 
+import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 
@@ -20,6 +22,10 @@ import java.util.concurrent.CompletionStage;
  * <p>Refusing throws rather than dropping the batch silently. The records are not lost — nothing has
  * acknowledged them, and the run that is current re-reads them from the durable position — and a sink that
  * quietly wrote nothing would leave a pipeline reporting healthy over a target that had stopped moving.
+ *
+ * <p>Where the writers write tables prepared before they open, preparing them is held to the run too: a clear
+ * is a write, and a superseded run clearing a table after the current run has started writing into it would
+ * take the current run's rows with it.
  */
 final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
 
@@ -36,7 +42,11 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
     /** {@code factory} held to {@code fence}'s run, or {@code factory} itself where there is none. */
     static SupplierEx<? extends SinkWriter> heldTo(
             SupplierEx<? extends SinkWriter> factory, ExecutionFence fence) {
-        return fence == null ? factory : new FencedSinkWriterFactory(factory, fence);
+        if (fence == null) {
+            return factory;
+        }
+        FencedSinkWriterFactory writers = new FencedSinkWriterFactory(factory, fence);
+        return factory instanceof PreparesTargets targets ? new Preparing(writers, targets, fence) : writers;
     }
 
     @Override
@@ -50,29 +60,62 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
         return new FencedSinkWriter(writer, fence, authorization);
     }
 
-    private record FencedSinkWriter(
-            SinkWriter delegate, ExecutionFence fence, ExecutionAuthorization authorization)
-            implements SinkWriter {
+    /** Writers held to the run, over tables whose preparing is held to it too. */
+    private record Preparing(FencedSinkWriterFactory writers, PreparesTargets targets, ExecutionFence fence)
+            implements SupplierEx<SinkWriter>, PreparesTargets {
+
+        @Override
+        public SinkWriter getEx() throws Exception {
+            return writers.getEx();
+        }
+
+        @Override
+        public void prepareTargets(HazelcastInstance coordinator) {
+            ExecutionAuthorization.of(coordinator).require(fence);
+            targets.prepareTargets(coordinator);
+        }
+    }
+
+    private static final class FencedSinkWriter implements SinkWriter {
+
+        private final SinkWriter delegate;
+        private final ExecutionFence fence;
+        private final ExecutionAuthorization authorization;
+        /**
+         * Set as closing starts, before the delegate is let go. A write still under way then is ended by the
+         * closing - a connector let go under a write fails it - and the run is closing because something
+         * else ended it, which is for whoever drives the run to judge. Filed as the sink's own failure, that
+         * write would outrank the reason the run actually ended: a member leaving would read as the
+         * pipeline's own death, and the pipeline would stay failed instead of being rebuilt.
+         */
+        private volatile boolean closing;
+
+        private FencedSinkWriter(SinkWriter delegate, ExecutionFence fence, ExecutionAuthorization authorization) {
+            this.delegate = delegate;
+            this.fence = fence;
+            this.authorization = authorization;
+        }
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             authorization.require(fence);
             try {
-                return delegate.write(records).whenComplete((ignored, failure) -> {
-                    if (PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
-                        authorization.recordSinkWriteFailure(fence);
-                    }
-                });
+                return delegate.write(records).whenComplete((ignored, failure) -> fileIfTheSinks(failure));
             } catch (RuntimeException failure) {
-                if (PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
-                    authorization.recordSinkWriteFailure(fence);
-                }
+                fileIfTheSinks(failure);
                 throw failure;
+            }
+        }
+
+        private void fileIfTheSinks(Throwable failure) {
+            if (!closing && PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
+                authorization.recordSinkWriteFailure(fence);
             }
         }
 
         @Override
         public void close() {
+            closing = true;
             delegate.close();
         }
     }

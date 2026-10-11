@@ -39,7 +39,9 @@ connector is loaded through the same plugin interface.
 
 ## Connector support boundary
 
-This preview certifies the following database kinds, with certification scoped by direction:
+This preview certifies the following database kinds, with certification scoped by direction.
+The certified `mongodb-atlas` managed id belongs to the MongoDB kind and is described below rather
+than being presented as another database kind:
 
 | Database | Connector kind | Certified use |
 |---|---|---|
@@ -49,11 +51,17 @@ This preview certifies the following database kinds, with certification scoped b
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 
-A `serve.sync` element in the cloud deployment profile installs only onto MongoDB Atlas.
-On-prem deployments may write to any catalog connector marked sink-capable; private connectors
-outside the catalog remain the operator's responsibility. This deployment allowance is not a
-certification claim: this preview certifies MongoDB write support only. Applying a cloud pipeline
-whose sync names another connector is refused; reading through it is unaffected.
+`aws-rds-mysql` is available as a source-only **unverified preview**, outside the certified table.
+Its shaded PDK JAR exposes batch and stream read functions, but no real Amazon RDS for MySQL
+snapshot, binlog CDC, or restart-continuation run has been completed. It is not a write target.
+Real-service validation is tracked in [issue #529](https://github.com/tapstate/tapstate/issues/529).
+
+A `serve.sync` element in cloud mode installs only onto `mongodb` or `mongodb-atlas`.
+On-prem deployments may write to catalog connectors marked sink-capable, except source-only ids
+such as `aws-rds-mysql`. Private connectors outside the catalog remain the operator's responsibility.
+This deployment allowance is not a certification claim: this preview certifies MongoDB write
+support only. Applying a cloud pipeline whose sync names another connector is refused; reading
+through it is unaffected.
 
 Db2 is accepted as a source-only **preview**, outside the certified table: no release lane
 reads a live Db2 database. Snapshot, change capture of inserts, updates and deletes, and
@@ -80,7 +88,11 @@ and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validat
 negative fractions and CDC updates. This is not an exhaustive cross-version or
 all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
 and 16 across these five database kinds, including existing managed variants of MySQL,
-PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
+live-verified individually. The Atlas connector was verified with snapshot and change-stream
+reads, restart continuation, and target writes against a real Atlas deployment in both cloud
+and on-prem runtimes. This verifies the tested deployment and does not establish an exhaustive
+Atlas version or tier compatibility matrix.
 Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
@@ -108,6 +120,16 @@ Tapstate's Apache-2.0 license. The Oracle, SQL Server and Db2 implementations ar
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
+
+The `mongodb-atlas` jar is a separate asset on the same floating release. It is not part of the
+three-database quickstart download; use `register mongodb-atlas` to install the verified bytes
+explicitly. The jar carries bundled third-party license and notice texts under `META-INF/`;
+publishing the binary does not grant a license to the upstream connector source repository.
+
+The `aws-rds-mysql` jar is also a separate, explicit-download asset on that release. Use
+`register aws-rds-mysql` only with the preview limitation above in mind; publishing and
+registering the JAR do not certify snapshot or CDC against a real Amazon RDS instance. It
+bundles MySQL Connector/J 8.0; see the in-JAR license manual and [`NOTICE`](../NOTICE).
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
 miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
@@ -316,12 +338,15 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle, SQL Server and Db2 for an explicit registration. From an
-authenticated CLI session, give `register` the published connector id instead of a local path:
+The same release carries Oracle, SQL Server, Db2, MongoDB Atlas, and the unverified AWS RDS MySQL preview
+for explicit registration. From an authenticated CLI session, give `register` the published
+connector id instead of a local path:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> register oracle
 tapstate(admin@127.0.0.1:8080)> register sqlserver
+tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
+tapstate(admin@127.0.0.1:8080)> register aws-rds-mysql
 tapstate(admin@127.0.0.1:8080)> register db2
 ```
 

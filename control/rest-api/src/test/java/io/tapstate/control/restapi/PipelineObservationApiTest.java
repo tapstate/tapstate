@@ -15,6 +15,8 @@ import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineSnapshot;
 import io.tapstate.control.core.PipelineStatus;
@@ -28,6 +30,8 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -130,6 +134,18 @@ class PipelineObservationApiTest {
 
     private static final Instant COUNTING_SINCE = Instant.parse("2026-07-12T11:00:00Z");
 
+    /**
+     * The plan pl2's run was submitted on, on three members with nothing fencing it: a source held to one
+     * processor for the cluster, and a sink worked out to three per member.
+     */
+    private static final ExecutionPlan PL_POS_PLAN = new ExecutionPlan("pl2", null, null, null,
+            List.of("m1", "m2", "m3"),
+            List.of(new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                            List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
+                    new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9, List.of("rounded-up"),
+                            512, 50L, List.of("route.orders_sink", "orders_sink"))),
+            Instant.parse("2026-07-12T11:30:00Z"));
+
     /** One pipeline publishing its measured facts beside the flat map: a counter with attributes, a gauge, a distribution. */
     private static final Observation PL_FACTS = new Observation("pl4", PipelineState.RUNNING,
             Map.of("records.in", 100L, "recordCount", 98L), Map.of(), Map.of(), null, NOW,
@@ -208,6 +224,34 @@ class PipelineObservationApiTest {
     }
 
     @Test
+    void lifecycleConsumersReadObservedStatesWhileUiTransitionsHaveTheirOwnField() {
+        PipelineState[][] transitions = {
+                {PipelineState.STOPPED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.PAUSED},
+                {PipelineState.PAUSED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.STOPPED}
+        };
+        String[] displays = {"STARTING", "PAUSING", "RESUMING", "STOPPING"};
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        FakeStoppedPipelines lifecycle = context.getBean(FakeStoppedPipelines.class);
+        String token = machineToken(Scope.READ);
+        for (int index = 0; index < transitions.length; index++) {
+            PipelineState observed = transitions[index][0];
+            lifecycle.intent("pl1", transitions[index][1]);
+            observations.save(new Observation("pl1", observed, Map.of(), Map.of(), Map.of(), null, NOW));
+
+            Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+            assertThat(PipelineState.valueOf((String) body.get("state"))).isEqualTo(observed);
+            assertThat(body).containsEntry("displayState", displays[index])
+                    .containsEntry("observedState", observed.name())
+                    .containsEntry("desiredState", transitions[index][1].name());
+        }
+    }
+
+    @Test
     void statusOfAFailedPipelineCarriesTheCodedReasonAndItsRenderedMessage() {
         // The code is the stable machine identity and the params are the variable data; the message is
         // rendered here, where the catalog lives, so every face prints one wording rather than each
@@ -232,6 +276,40 @@ class PipelineObservationApiTest {
 
         // Absent, not present-and-null: a client reading this must not have to tell those apart.
         assertThat(body).doesNotContainKey("failure");
+    }
+
+    @Test
+    void statusCarriesThePlanItsRunWasSubmittedOnAndOmitsWhatTheRunDoesNotHave() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl2/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        Map<String, Object> plan = (Map<String, Object>) body.get("plan");
+        assertThat(plan.get("members")).isEqualTo(List.of("m1", "m2", "m3"));
+        assertThat(plan.get("plannedAt")).isEqualTo("2026-07-12T11:30:00Z");
+        // Nothing fences a run on a single member, so it has no generations to name: absent, not sent as zero.
+        assertThat(plan).doesNotContainKeys("claimGeneration", "executionGeneration", "topologyRevision");
+        List<?> nodes = (List<?>) plan.get("nodes");
+        assertThat(nodes).hasSize(2);
+        assertThat((Map<String, Object>) nodes.get(0)).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "node", "orders_src", "requested", 1, "requestedOrigin", "node-default", "scope", "total-one",
+                "memberCount", 3, "effective", 1, "reasons", List.of("requested-one", "source-reads-not-split"),
+                "batch", Map.of("maxRecords", 1024, "maxWaitMillis", 0)));
+        assertThat((Map<String, Object>) nodes.get(1)).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "node", "orders_sink", "requested", 8, "requestedOrigin", "explicit", "scope", "native",
+                "memberCount", 3, "computedLocal", 3, "effective", 9, "reasons", List.of("rounded-up"),
+                "batch", Map.of("maxRecords", 512, "maxWaitMillis", 50)));
+        // A fourth member joined after the run was planned over three: it waits for a rebalance.
+        assertThat(body.get("awaitingRebalance")).isEqualTo(List.of("m4"));
+    }
+
+    @Test
+    void statusOfAPipelineWhoseRunHasNoPlanRecordedOmitsThePlan() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(body).containsEntry("state", "RUNNING").doesNotContainKeys("plan", "awaitingRebalance");
     }
 
     @Test
@@ -508,8 +586,9 @@ class PipelineObservationApiTest {
     }
 
     @Test
-    void aReadOfAnAppliedPipelineThatHasNotConvergedYetIsNotFoundAsTheTransientWindow() {
+    void aReadOfAnAppliedPipelineThatHasNotConvergedYetRetainsTheUnobservedContract() {
         context.getBean(FakeObservationStore.class).clear();
+        context.getBean(FakeStoppedPipelines.class).intent("pl1", PipelineState.RUNNING);
 
         ApiError body = client().get().uri("/api/pipelines/pl1/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
@@ -520,6 +599,8 @@ class PipelineObservationApiTest {
 
         assertThat(body.code()).isEqualTo("monitor.no-observation");
         assertThat(body.params()).containsEntry("pipeline", "pl1");
+        assertThat(context.getBean(PipelineCatalogService.class).find("pl1").orElseThrow().status().state().name())
+                .isEqualTo("STARTING");
     }
 
     // ---- the interceptor guards a read like any other verb ----
@@ -599,7 +680,17 @@ class PipelineObservationApiTest {
 
         @Bean
         PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations) {
-            return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations);
+            ExecutionPlans plans = pipelineIds -> pipelineIds.contains("pl2") ? Map.of("pl2", PL_POS_PLAN) : Map.of();
+            return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations,
+                    plans, () -> List.of("m1", "m2", "m3", "m4"));
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(PipelineObservationQueryService observations,
+                FakeStoppedPipelines lifecycle) {
+            return new PipelineCatalogService(new ArtifactQueryService(appliedPipelines()),
+                    new PipelineDraftService(new PipelineApiTest.FakePipelineDraftStore()),
+                    lifecycle.desired(), observations);
         }
 
         @Bean
@@ -659,6 +750,11 @@ class PipelineObservationApiTest {
         @Bean
         TokenService tokenService(TokenStore store, TokenSecrets secrets, Clock clock) {
             return new TokenService(store, secrets, clock);
+        }
+
+        @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
         }
 
         @Bean
@@ -923,6 +1019,11 @@ class PipelineObservationApiTest {
     static final class FakeStoppedPipelines {
 
         private final Map<String, PipelineState> actual = new LinkedHashMap<>();
+        private final Map<String, DesiredState> intents = new LinkedHashMap<>();
+
+        void intent(String pipelineId, PipelineState target) {
+            intents.put(pipelineId, new DesiredState(pipelineId, target, "fixture-revision"));
+        }
 
         void running(String pipelineId) {
             actual.put(pipelineId, PipelineState.RUNNING);
@@ -930,6 +1031,7 @@ class PipelineObservationApiTest {
 
         void reset() {
             actual.clear();
+            intents.clear();
         }
 
         DesiredStore desired() {
@@ -941,12 +1043,12 @@ class PipelineObservationApiTest {
 
                 @Override
                 public Optional<DesiredState> read(String pipelineId) {
-                    return Optional.empty();
+                    return Optional.ofNullable(intents.get(pipelineId));
                 }
 
                 @Override
                 public List<String> pipelineIds() {
-                    return List.of();
+                    return List.copyOf(intents.keySet());
                 }
 
                 @Override

@@ -47,8 +47,11 @@ final class PipelineInlining {
             return view;
         }
         ViewResource definition = require(artifacts, use.use(), ViewResource.class, "view");
+        // The definition says how the view runs as well as where it writes; a reference carries neither,
+        // so both come from the definition, and dropping the first here would run the view at its default
+        // width with the artifact saying otherwise.
         return new ViewBlock.Inline(use.id(), use.from(),
-                definition.primaryKey(), definition.storage());
+                definition.primaryKey(), definition.storage(), definition.execution());
     }
 
     private static ServeBlock inlineServe(ServeBlock serve, ArtifactStore artifacts) {

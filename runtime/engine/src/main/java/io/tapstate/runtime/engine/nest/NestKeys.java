@@ -27,6 +27,12 @@ final class NestKeys {
      * document, not an invariant for this to decide.
      */
     static List<Object> valuesOf(Map<String, Object> row, List<String> fields) {
+        return valuesOf(row, fields, null);
+    }
+
+    /** Only request-private preview maps may equate integral decimals with INT64 keys. */
+    static List<Object> valuesOf(Map<String, Object> row, List<String> fields, String namespace) {
+        boolean preview = namespace != null && namespace.startsWith(NestMaps.NAMESPACE_PREFIX + ".preview_");
         List<Object> values = new ArrayList<>(fields.size());
         for (String field : fields) {
             // Unwrapped: a value a connector converted travels in a carrier, and the other side of the
@@ -34,7 +40,7 @@ final class NestKeys {
             // it, so a key built from one matches nothing and nothing reports it: the join runs, the rows
             // arrive, and the document simply never fills in. Two carriers do compare by their parts, so
             // it is the mixed pairing this is here for, not the matched one.
-            values.add(normalized(ConvertedValue.unwrap(row.get(field))));
+            values.add(normalized(ConvertedValue.unwrap(row.get(field)), preview));
         }
         return Collections.unmodifiableList(values);
     }
@@ -51,10 +57,11 @@ final class NestKeys {
      * hands over both. A join key drops the trailing zeros for this reason, so the two key boundaries
      * now answer alike.
      *
-     * <p>Only the scale goes. Kinds stay apart in the state layer as they always were - {@code 1} the
-     * whole number and {@code 1.0} the decimal are still two keys - and nothing here merges them.
+     * <p>Live keys keep their released numeric type and cold-state name. Only transient preview state
+     * equates integral decimals within INT64 with whole-number keys. Its edge routing, lookup and
+     * assembly use the same policy; the row values themselves are never changed.
      */
-    private static Object normalized(Object value) {
+    private static Object normalized(Object value, boolean preview) {
         if (!(value instanceof BigDecimal decimal)) {
             return value;
         }
@@ -62,6 +69,13 @@ final class NestKeys {
         // A stripped whole number carries a negative scale (100 becomes 1E+2), which renders in the
         // state layer as the exponent form. The value is the same either way; this keeps the name the
         // one an operator reading it would expect.
+        if (preview && stripped.scale() <= 0) {
+            try {
+                return stripped.longValueExact();
+            } catch (ArithmeticException outOfRange) {
+                return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
+            }
+        }
         return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
     }
 

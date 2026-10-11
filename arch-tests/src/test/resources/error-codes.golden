@@ -3,6 +3,8 @@
 # Sorted, one <domain>.<symbol> per line. The ErrorCodeGatesTest diffs the scanned codes
 # against this file. Adding a code = append it here in the same change set; renaming or
 # removing one = a breaking change to an external contract (review + major version).
+actuation.connector-differs-across-members
+actuation.connector-unavailable-on-member
 actuation.from-regex-empty
 actuation.from-regex-invalid
 actuation.join-input-not-a-table
@@ -12,8 +14,11 @@ actuation.join-output-schema-source-changed
 actuation.join-source-key-missing
 actuation.join-source-not-declared
 actuation.join-sql-invalid
+actuation.no-safe-parallelism
 actuation.not-a-pipeline
+actuation.parallelism-needs-a-key
 actuation.pipeline-not-found
+actuation.preview-refused
 actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
 actuation.source-table-ambiguous
@@ -21,6 +26,7 @@ actuation.source-table-not-discovered
 actuation.source-table-regex-invalid
 actuation.source-table-selection-empty
 actuation.source-table-spec-unsupported
+actuation.stream-lands-two-ways
 actuation.unwind-parent-key-unresolved
 actuation.view-fed-by-many-tables
 actuation.view-key-missing
@@ -35,6 +41,15 @@ artifact.pipeline-not-stopped
 artifact.precondition-required
 artifact.reclaim-incomplete
 artifact.version-conflict
+boot.cloud-atlas-uri-invalid
+boot.cloud-base-url-invalid
+boot.cloud-config-incomplete
+boot.cloud-connectors-invalid
+boot.cloud-status-config-invalid
+boot.cloud-status-mode-required
+boot.cloud-status-sdk-required
+boot.cloud-store-required
+boot.cloud-view-store-conflict
 boot.cluster-id-invalid
 boot.cluster-id-mismatch
 boot.cluster-id-required
@@ -49,6 +64,9 @@ boot.node-id-in-use
 boot.node-id-required
 boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
+boot.web-console-url-invalid
+boot.web-profile-invalid
+boot.web-profile-mode-mismatch
 boot.workload-claim-renew-interval-invalid
 boot.workload-claim-ttl-invalid
 capture.claim-lost
@@ -151,11 +169,16 @@ connector.test-failed
 connector.write-failed
 control.audit-blocked
 control.auth-failed
+control.auth-mode-unavailable
 control.bootstrap-closed
 control.bootstrap-forbidden
+control.cloud-auth-unavailable
 control.forbidden
 control.malformed-request
+control.preview-overloaded
 control.schema-derivation-incomplete
+control.source-config-reveal-unavailable
+control.state-database-unavailable
 control.unauthenticated
 control.unreachable
 data-browser.connector-not-browsable
@@ -187,6 +210,8 @@ dsl.mode-required-for-read
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported
+dsl.setting-has-no-effect
+dsl.source-read-not-split
 dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
@@ -196,14 +221,18 @@ dsl.unwind-column-already-exists
 dsl.unwind-needs-an-element-key
 dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key
+engine.cluster-refused-the-state
 engine.execution-not-authorized
 engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed
 engine.job-still-ending
 engine.join-dimension-row-displaced
+engine.key-change-on-parallel-node
+engine.membership-changed-before-start
 engine.no-such-job
 engine.out-of-memory
+engine.routing-key-missing
 engine.view-key-missing-from-before-image
 io.document-too-large
 io.document-unreadable
@@ -284,9 +313,13 @@ source.not-found
 source.precondition-required
 source.srs-change-while-running
 source.version-conflict
+store.database-access-failed
 store.invalid-operator-state-database
 store.invalid-uri
 store.not-replica-set
+store.source-config-keyring-invalid
+store.source-config-keyring-not-ready
+store.source-config-keyring-rotation-blocked
 store.tls-ca-unreadable
 store.unreachable
 transform.expression-failed

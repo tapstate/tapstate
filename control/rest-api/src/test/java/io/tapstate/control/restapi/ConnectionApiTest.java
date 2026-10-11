@@ -436,6 +436,11 @@ class ConnectionApiTest {
         }
 
         @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
+        }
+
+        @Bean
         RecordingConnectionProbe connectionProbe() {
             return new RecordingConnectionProbe();
         }

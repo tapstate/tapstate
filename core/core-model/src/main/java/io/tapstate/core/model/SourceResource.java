@@ -31,8 +31,16 @@ public record SourceResource(
         List<TableRef> tables,
         @Doc("Shared Record Store configuration; only valid on cdc sources.")
         Srs srs,
+        @Doc("How this source is read: its target total parallelism (one processor reads a source today, "
+                + "whatever is written) and the batch it hands rows on in.")
+        ExecutionSpec execution,
         @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
         Map<String, Object> experimental) implements Resource {
+
+    public SourceResource(String id, Metadata metadata, String connector, Map<String, Object> config,
+            SourceMode mode, List<TableRef> tables, Srs srs, Map<String, Object> experimental) {
+        this(id, metadata, connector, config, mode, tables, srs, null, experimental);
+    }
 
     public SourceResource {
         Objects.requireNonNull(id, "id");

@@ -9,13 +9,12 @@ import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -44,6 +43,9 @@ class ASlowerSinkHoldsTheResumePositionIT {
     private static final String HELD_TARGET = "held_target";
     private static final String PIPELINE = "two_sink_pipeline";
     private static final String TABLE = "orders";
+    /** Each sink runs one writer, so each writer stands for one sink. */
+    private static final String FAST_WRITER = "serve.fast#0";
+    private static final String HELD_WRITER = "serve.held#0";
 
     @BeforeAll
     static void requireDocker() {
@@ -130,9 +132,14 @@ class ASlowerSinkHoldsTheResumePositionIT {
                                 + ", progress=" + progress(documents, chain)
                                 + ", state=" + control.state(PIPELINE)
                                 + ", logs=" + control.logs(PIPELINE));
-                Progress caughtUp = progress(documents, chain);
-                assertThat(caughtUp.aggregateRingDone())
-                        .isEqualTo(caughtUp.writerRingDone().stream().min(Long::compareTo).orElseThrow());
+                Await.until("the shared resume floor to stand where the slower writer stands", TIMEOUT,
+                        () -> {
+                            Progress caughtUp = progress(documents, chain);
+                            return caughtUp.aggregateRingDone() == Math.min(
+                                    caughtUp.writerAt(FAST_WRITER, initial.aggregateRingDone()),
+                                    caughtUp.writerAt(HELD_WRITER, initial.aggregateRingDone()));
+                        },
+                        () -> progress(documents, chain).toString());
                 assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
             } finally {
                 Files.writeString(signals.resolve("release"), "");
@@ -141,9 +148,8 @@ class ASlowerSinkHoldsTheResumePositionIT {
     }
 
     private static boolean oneWriterIsAhead(Progress progress, long initial) {
-        return progress.writerRingDone().size() == 2
-                && progress.writerRingDone().getFirst() == initial
-                && progress.writerRingDone().getLast() > initial
+        return progress.writerAt(HELD_WRITER, initial) == initial
+                && progress.writerAt(FAST_WRITER, initial) > initial
                 && progress.aggregateRingDone() == initial;
     }
 
@@ -154,26 +160,29 @@ class ASlowerSinkHoldsTheResumePositionIT {
                 && rings.get(TABLE) instanceof Number;
     }
 
-    /** The aggregate and each writer's ring acknowledgement, read from one real consumer record. */
+    /**
+     * The aggregate and how far each writer of the current run is durable on the table, read from one real
+     * consumer record. A writer that has reported nothing yet has no entry.
+     */
     private static Progress progress(StoreDocuments documents, String chain) {
         Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
         if (consumer == null) {
-            return new Progress(-1L, List.of());
+            return new Progress(-1L, Map.of());
         }
         long aggregate = numberIn(consumer.get("perTableRingDone", Document.class), TABLE, -1L);
-        Document writers = consumer.get("sinkWriterProgress", Document.class);
-        List<Long> positions = new ArrayList<>();
-        if (writers != null) {
-            for (Object rawTables : writers.values()) {
-                if (rawTables instanceof Document tables
-                        && tables.get(TABLE) instanceof Document writer
-                        && writer.get("ringDone") instanceof Number position) {
-                    positions.add(position.longValue());
+        Map<String, Long> positions = new TreeMap<>();
+        if (consumer.get("writerRun") instanceof Document run
+                && run.get("progress") instanceof Document byTable
+                && byTable.get(TABLE) instanceof Document writers) {
+            for (Object raw : writers.values()) {
+                if (raw instanceof Document writer
+                        && writer.get("writer") instanceof String id
+                        && writer.get("durableSeq") instanceof Number position) {
+                    positions.put(id, position.longValue());
                 }
             }
         }
-        positions.sort(Comparator.naturalOrder());
-        return new Progress(aggregate, List.copyOf(positions));
+        return new Progress(aggregate, positions);
     }
 
     private static long numberIn(Document document, String field, long absent) {
@@ -225,12 +234,17 @@ class ASlowerSinkHoldsTheResumePositionIT {
                 serve:
                   from: %s
                   sync:
-                    - { id: fast, source: %s }
-                    - { id: held, source: %s }
+                    - { id: fast, source: %s, execution: { parallelism: 1 } }
+                    - { id: held, source: %s, execution: { parallelism: 1 } }
                 """.formatted(PIPELINE, SOURCE, TABLE, FAST_TARGET, HELD_TARGET));
         return resources;
     }
 
-    private record Progress(long aggregateRingDone, List<Long> writerRingDone) {
+    private record Progress(long aggregateRingDone, Map<String, Long> writerRingDone) {
+
+        /** How far {@code writer} is durable on the table, or {@code initial} while it has reported nothing. */
+        long writerAt(String writer, long initial) {
+            return writerRingDone.getOrDefault(writer, initial);
+        }
     }
 }

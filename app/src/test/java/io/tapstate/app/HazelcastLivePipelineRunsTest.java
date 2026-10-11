@@ -5,9 +5,17 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.core.MemberLeftException;
 import com.hazelcast.jet.JetService;
+import com.hazelcast.jet.core.metrics.JobMetrics;
+import com.hazelcast.jet.core.metrics.Measurement;
+import com.hazelcast.jet.core.metrics.MetricNames;
+import com.hazelcast.jet.core.metrics.MetricTags;
 import com.hazelcast.spi.exception.TargetNotMemberException;
 import io.tapstate.control.core.ClusterError;
+import io.tapstate.control.core.LivePipelineProcessor;
+import io.tapstate.control.core.LivePipelineRun;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.runtime.engine.FrontierMetricNames;
+import io.tapstate.runtime.engine.SinkWaitingMetricNames;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -15,6 +23,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -35,6 +44,51 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class HazelcastLivePipelineRunsTest {
 
     private static final Duration BOUND = Duration.ofMillis(200);
+
+    /**
+     * What a processor carries is read from the job's own statistics, under the processor that reported it: the
+     * rows queued into it, which the engine reports for every processor, and a sink writer's frontier readings,
+     * which the writer leaves under a name of its own for each chain. A reading of the vertex as a whole, with no
+     * processor on it, is not taken for one of its processors.
+     */
+    @Test
+    void aProcessorsQueuedRowsAndItsWritersFrontierReadingsAreReadUnderIt() {
+        JobMetrics collected = JobMetrics.of(Map.of(
+                MetricNames.QUEUES_SIZE, List.of(
+                        processorReading(MetricNames.QUEUES_SIZE, 5, "serve.s", "0", "member-a"),
+                        processorReading(MetricNames.QUEUES_SIZE, 9, "serve.s", "1", "member-b")),
+                FrontierMetricNames.gapNameOf("shop"), List.of(
+                        processorReading(FrontierMetricNames.gapNameOf("shop"), 40, "serve.s", "1", "member-b")),
+                FrontierMetricNames.stallNameOf("shop"), List.of(
+                        processorReading(FrontierMetricNames.stallNameOf("shop"), 1200, "serve.s", "1", "member-b")),
+                SinkWaitingMetricNames.queuedNameOf("shop.orders"), List.of(
+                        processorReading(SinkWaitingMetricNames.queuedNameOf("shop.orders"), 30, "serve.s", "1",
+                                "member-b")),
+                SinkWaitingMetricNames.queuedNameOf("shop.customers"), List.of(
+                        processorReading(SinkWaitingMetricNames.queuedNameOf("shop.customers"), 0, "serve.s", "1",
+                                "member-b")),
+                SinkWaitingMetricNames.inFlightNameOf("orders"), List.of(
+                        processorReading(SinkWaitingMetricNames.inFlightNameOf("orders"), 512, "serve.s", "1",
+                                "member-b")),
+                MetricNames.EMITTED_COUNT, List.of(Measurement.of(MetricNames.EMITTED_COUNT, 77, 1_000L,
+                        Map.of(MetricTags.VERTEX, "serve.s", MetricTags.MEMBER, "member-a")))));
+
+        LivePipelineRun run = HazelcastLivePipelineRuns.runOf("orders", collected);
+
+        assertThat(run.vertices()).singleElement().satisfies(vertex -> assertThat(vertex.processors())
+                .containsExactlyInAnyOrder(
+                        new LivePipelineProcessor(0, "member-a", true, 5L, Map.of(), Map.of()),
+                        new LivePipelineProcessor(1, "member-b", true, 9L, Map.of("shop", 40L),
+                                Map.of("shop", 1200L),
+                                // A stream that had rows waiting and has none now reads zero, and is left out.
+                                Map.of("shop.orders", 30L), Map.of("orders", 512L))));
+    }
+
+    private static Measurement processorReading(String metric, long value, String vertex, String processor,
+            String member) {
+        return Measurement.of(metric, value, 1_000L, Map.of(MetricTags.VERTEX, vertex, MetricTags.PROCESSOR, processor,
+                MetricTags.MEMBER, member, MetricTags.PROCESSOR_TYPE, "SinkProcessor", MetricTags.EXECUTION, "exec-1"));
+    }
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)

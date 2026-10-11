@@ -569,6 +569,54 @@ class CaptureOwnershipTest {
     }
 
     /**
+     * A capture's claim is renewed from the moment it is taken, not from the moment its tail is open. Opening
+     * a tail can take longer than a lease -- a source slow to answer, many tables, an overloaded host -- and a
+     * claim nothing renewed meanwhile has run out by the time the tail is open: the tail is then closed again
+     * as fenced out, and the pipeline over it fails although no other member ever wanted the capture.
+     */
+    @Test
+    void aCaptureClaimStaysThisMembersThroughATailThatTakesLongerThanALeaseToOpen() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("q"));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        WorkloadClaimKey capture = captureKey(store, "q");
+        Member a = new Member("node-a", store, claims, TTL, Duration.ofMillis(20), new ArrayList<>());
+        a.whileOpening = () -> {
+            for (int second = 0; second <= TTL.toSeconds(); second += 5) {
+                Instant leasedUntil = claims.read(capture).orElseThrow().claim().leaseUntil();
+                claims.elapse(Duration.ofSeconds(5));
+                awaitRenewalPast(claims, capture, leasedUntil);
+            }
+        };
+
+        a.captures.startCapture("q");
+        try {
+            WorkloadClaimReading held = claims.read(capture).orElseThrow();
+            assertThat(held.claim().owner()).isEqualTo(Member.owner("node-a"));
+            assertThat(held.leased())
+                    .as("the claim is still live once the tail is open, more than a lease after it was taken")
+                    .isTrue();
+            assertThat(a.tailsClosed).as("and the tail it guards was not closed as fenced out").hasValue(0);
+        } finally {
+            a.captures.stopCapture("q", false);
+        }
+    }
+
+    /** Waits, briefly, for a renewal to carry the claim's lease past {@code leasedUntil}; gives up quietly. */
+    private static void awaitRenewalPast(
+            InMemoryWorkloadClaimStore claims, WorkloadClaimKey capture, Instant leasedUntil) {
+        long giveUp = System.nanoTime() + Duration.ofSeconds(1).toNanos();
+        while (System.nanoTime() - giveUp < 0
+                && !claims.read(capture).orElseThrow().claim().leaseUntil().isAfter(leasedUntil)) {
+            try {
+                Thread.sleep(2);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /**
      * A pipeline started while the member holding its capture is still opening the ring attaches as soon
      * as the ring is there.
      */
@@ -1003,6 +1051,8 @@ class CaptureOwnershipTest {
         private final InMemoryStorePort store;
         private final StoreBackedPipelineCaptureCoordinator captures;
         private final AtomicInteger tailsClosed = new AtomicInteger();
+        /** What happens on this member while one of its runs is being opened. */
+        private Runnable whileOpening = () -> { };
 
         Member(String node, InMemoryStorePort store, WorkloadClaimStore claims, Duration ttl,
                 List<String> starts) {
@@ -1027,6 +1077,7 @@ class CaptureOwnershipTest {
         }
 
         private CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough, boolean startTail) {
+            whileOpening.run();
             starts.add(node + " " + spec.pipelineId() + (startTail ? " opened the tail" : " attached"));
             Subscription subscription = startTail ? tailsClosed::incrementAndGet : () -> { };
             if (spec.readMode() == ReadMode.SNAPSHOT_ONLY) {

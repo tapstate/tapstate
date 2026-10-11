@@ -43,6 +43,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
     }
 
     private final FlatMapper<Envelope, Object> flatMapper;
+    private final TransformPort port;
     private final LevelBounds bounds;
     // Times each row through the port, which is this stage's unit of work. Counts for nobody until init
     // says whether there is a job to report into.
@@ -63,7 +64,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
      * still rather than one that runs ahead.
      */
     public TransformProcessor(TransformPort port, LevelBounds bounds) {
-        Objects.requireNonNull(port, "port");
+        this.port = Objects.requireNonNull(port, "port");
         this.bounds = bounds;
         // A port is a pure function over rows and knows nothing about where its input sat, so what the
         // event covered is stamped back onto everything it produced. The whole of it travels, not the
@@ -102,6 +103,11 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
     }
 
+    @Override
+    public void close() {
+        port.close();
+    }
+
     /**
      * A meta-supplier for a DAG vertex that runs this adapter over the port the factory builds. The
      * factory (not a prebuilt port) is what the DAG carries, so the port is constructed on the member
@@ -130,7 +136,30 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
                 // is exactly the lowest of what its edges promised.
                 : () -> new TransformProcessor(portFactory.get(),
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
+        // Its stand-ins on the other members pass its bounds on as it does; see TotalOne.
+        return TotalOne.passingBounds(ProcessorSupplier.of(supplier), vertexName, axes, chainsByOrdinal);
+    }
+
+    /**
+     * A meta-supplier for a vertex that runs the same number of processors on every member, rather than one
+     * for the whole cluster. Every edge into it must route by the key of the rows it carries, so that each
+     * row's changes meet on one processor and keep the order they were read in; the per-member count itself
+     * is set on the vertex, not here.
+     *
+     * <p>Each processor works out its own promise from what reached it, exactly as the single processor
+     * does, and the engine combines the promises of all of them for whatever reads this vertex. Held to
+     * {@code plannedMembers}: see {@link PlannedMembersGuard}.
+     */
+    public static ProcessorMetaSupplier nativeMetaSupplier(String vertexName,
+            SupplierEx<? extends TransformPort> portFactory,
+            ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal, int plannedMembers) {
+        Objects.requireNonNull(vertexName, "vertexName");
+        Objects.requireNonNull(portFactory, "portFactory");
+        SupplierEx<Processor> supplier = axes == null
+                ? () -> new TransformProcessor(portFactory.get())
+                : () -> new TransformProcessor(portFactory.get(),
+                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
+        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(ProcessorSupplier.of(supplier)), plannedMembers);
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */

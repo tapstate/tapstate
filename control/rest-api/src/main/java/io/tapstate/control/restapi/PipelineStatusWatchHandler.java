@@ -40,7 +40,7 @@ final class PipelineStatusWatchHandler extends PollingStreamHandler {
     protected void poll(WebSocketSession session, String pipelineId) {
         PipelineStatus status;
         try {
-            status = observations.status(pipelineId);
+            status = observations.lifecycleStatus(pipelineId);
         } catch (TapstateException coded) {
             if (coded.code() == MonitorError.NO_OBSERVATION) {
                 // Applied but not yet converged: transient, so nothing to stream and keep polling.

@@ -14,6 +14,9 @@ cluster.membership-unreadable:
 actuation.pipeline-not-found:
   message: "No pipeline artifact `{pipeline}` is stored to run."
   solution: "Apply the pipeline before starting it, and check the id for typos."
+actuation.preview-refused:
+  message: "The Pipeline preview was refused: {reason}."
+  solution: "Keep the preview within its bounded sampling and execution guarantees, then try again."
 actuation.not-a-pipeline:
   message: "Resource `{pipeline}` is a `{kind}`, not a pipeline, so it cannot be run."
   solution: "Start a pipeline resource; check the id names a pipeline and not another kind of resource."
@@ -41,6 +44,21 @@ actuation.join-output-schema-source-changed:
 actuation.join-output-schema-engine-changed:
   message: "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and neither the query nor the source columns changed - what changed is how we work them out ({recordedBy} -> {nowBy}). Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}."
   solution: "Please report this - it is a compatibility break on our side that our own release checks should have caught before you ever saw it. To carry on, run `derived-schema {pipeline}` to see what moved, rebuild the target table for the new column types, then `derived-schema {pipeline} --accept`. Read the difference first: a type that narrowed loses data on the next write, which is a deliberate decision and not a formality. Staying on the version you were running is the other way out."
+actuation.no-safe-parallelism:
+  message: "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors across {members} members, and no width within the budgets is available ({candidates})."
+  solution: "Lower execution.parallelism on {node}, or raise the budget named for each candidate in the server's tapstate.execution settings."
+actuation.parallelism-needs-a-key:
+  message: "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors but can only run as one ({reason})."
+  solution: "Set execution.parallelism to 1 on {node}, or leave it out; the node then runs as one processor and keeps every change in order."
+actuation.stream-lands-two-ways:
+  message: "Pipeline {pipeline} cannot start: rows of {stream} reach one sink both through nest {nest} and through {other}, and the two land them in different tables or on different keys."
+  solution: "Send {stream} to that sink one way only, or give nest {nest} the same root key the other way lands {stream} on."
+actuation.connector-unavailable-on-member:
+  message: "Pipeline {pipeline} was not started: member {member} cannot load connector {connector} ({reason})."
+  solution: "Every member loads the connectors a pipeline writes through from the shared connector registry into its own plugins directory. Check that member's access to the store and that its plugins directory is writable, then start the pipeline again."
+actuation.connector-differs-across-members:
+  message: "Pipeline {pipeline} was not started: the members load different artifacts for connector {connector} ({artifacts})."
+  solution: "Check that every member reads the same store; a registration replaced while the pipeline was starting is picked up by starting it again."
 actuation.schema-sync-while-running:
   message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
   solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."
@@ -87,6 +105,42 @@ actuation.from-regex-invalid:
 actuation.from-regex-empty:
   message: "The pipeline `from` regex `{regex}` matches no upstream vertex."
   solution: "Use a regex matching a selected source table or an earlier transform step."
+boot.cloud-atlas-uri-invalid:
+  message: "The managed Cloud metadata URI is not a valid MongoDB connection string."
+  solution: "Set tapstate.cloud.atlas-uri to a mongodb:// or mongodb+srv:// connection string with an explicit database name short enough for the deployment-owned operator and views databases."
+boot.cloud-base-url-invalid:
+  message: "The managed Cloud base URL is not a valid absolute HTTP(S) URL."
+  solution: "Set tapstate.cloud.base-url to the Global Control Plane origin without credentials, a query, or a fragment."
+boot.cloud-config-incomplete:
+  message: "The managed Cloud startup configuration is incomplete."
+  solution: "Set tapstate.cloud.base-url, tapstate.cloud.token, tapstate.cloud.atlas-uri, and tapstate.cloud.cluster-id together, or remove all four, including any CLUSTER_ID alias, for on-prem mode."
+boot.cloud-connectors-invalid:
+  message: "Cloud connector `{connector}` failed its required startup check: {reason}."
+  solution: "Restore the matching release, lock, and licenses; repair the stored artifact or plugin cache if mismatched, then confirm every connector can register and load."
+boot.web-profile-invalid:
+  message: "The packaged Web deployment metadata is invalid: {reason}."
+  solution: "Rebuild the distribution with one supported Web deployment profile and its matching complete Web payload."
+boot.web-profile-mode-mismatch:
+  message: "The packaged Web profile `{profile}` does not match the configured runtime mode `{mode}`."
+  solution: "Use the Cloud distribution with all four Cloud settings, or the on-prem distribution with every Cloud setting and CLUSTER_ID alias removed."
+boot.web-console-url-invalid:
+  message: "The packaged Web Cloud Console URL is invalid."
+  solution: "Rebuild Cloud Web metadata with an absolute ASCII HTTPS Console URL without credentials, a fragment, or control characters; omit this URL from on-prem metadata."
+boot.cloud-store-required:
+  message: "Managed Cloud mode requires its metadata store."
+  solution: "Remove tapstate.store.mongo.enabled=false and supply the assigned Cloud Atlas metadata URI."
+boot.cloud-view-store-conflict:
+  message: "The managed Cloud view store `{store}` conflicts with this deployment configuration."
+  solution: "Preserve the conflicting resource and align the deployment with its assigned view database. All Cluster members must use the same connection settings."
+boot.cloud-status-config-invalid:
+  message: "The Cloud status sender switch is not a valid boolean."
+  solution: "Set SDK_STATUS_SENDER_ENABLED to true or false."
+boot.cloud-status-mode-required:
+  message: "Cloud status reporting cannot be enabled in on-prem mode."
+  solution: "Disable SDK_STATUS_SENDER_ENABLED or provide the complete managed Cloud configuration."
+boot.cloud-status-sdk-required:
+  message: "Cloud status reporting was enabled without its SDK integration."
+  solution: "Install the SDK-backed reporter integration before enabling SDK_STATUS_SENDER_ENABLED."
 boot.cluster-id-required:
   message: "Cluster discovery requires an explicit stable cluster id."
   solution: "Set tapstate.cluster.id to the same stable value on every member."
@@ -330,6 +384,12 @@ dsl.mode-mismatch:
 dsl.illegal-value:
   message: "Value '{value}' at {path} is not allowed; expected {expected}."
   solution: "Use one of the accepted values."
+dsl.setting-has-no-effect:
+  message: "Pipeline {pipeline} sets {setting}, which no longer decides anything; nothing reads it."
+  solution: "Remove {setting} and set {instead} on each node that should run differently. A node that sets nothing runs at its node type's default."
+dsl.source-read-not-split:
+  message: "Source {source} asks to be read by {requested} processors; one processor reads it."
+  solution: "No connector has declared a split read yet, so a source is read by one processor whatever is written. Remove the parallelism, or leave it; nothing else changes."
 dsl.illegal-expression:
   message: "Expression at {path} did not compile: {detail} (expression: {expr})."
   solution: "Fix the CEL expression; only the row envelope fields are in scope."
@@ -426,15 +486,27 @@ role.unsupported:
 store.unreachable:
   message: "Cannot reach the store at {target}."
   solution: "Check the store is running and the connection settings are correct, then restart."
+store.database-access-failed:
+  message: "Cannot verify read/write access to the deployment database {database}."
+  solution: "Check MongoDB connectivity and grant the Cluster user read/write access to its metadata, operator-state, and views databases."
 store.not-replica-set:
-  message: "The store at {target} is not a replica-set."
-  solution: "Start MongoDB as a single-node replica-set; the checkpoint transaction requires one."
+  message: "The store at {target} is not a transaction-capable replica set or sharded cluster."
+  solution: "Use a replica set or sharded cluster; standalone MongoDB cannot host checkpoint transactions."
 store.invalid-operator-state-database:
   message: "The operator-state database name is not valid for this deployment."
   solution: "Set tapstate.store.mongo.operator-state-database to a non-blank name of at most 63 UTF-8 bytes, without a null character, slash, backslash, space, double quote, dot, or dollar sign. Do not use local, config, or the control database named by tapstate.store.mongo.uri."
 store.invalid-uri:
   message: "The store connection string is not a valid MongoDB URI."
   solution: "Check the store URI setting; it must start with mongodb:// or mongodb+srv://."
+store.source-config-keyring-invalid:
+  message: "The metadata store's Source config encryption keyring is missing or invalid."
+  solution: "Restore a complete metadata backup that includes the original keyring. Do not generate a replacement for existing encrypted Source configs."
+store.source-config-keyring-not-ready:
+  message: "This node could not join the current Source config keyring epoch."
+  solution: "Check metadata-store availability and confirm this node still owns its current node session, then restart it."
+store.source-config-keyring-rotation-blocked:
+  message: "The prepared Source config key cannot become active because a live node has not loaded it."
+  solution: "Wait for every current node session to renew, or remove the failed node and wait for its lease to expire, then retry rotation."
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
@@ -582,6 +654,18 @@ control.audit-blocked:
 control.auth-failed:
   message: "Authentication failed: invalid username or password."
   solution: "Check the username and password are correct, then sign in again."
+control.auth-mode-unavailable:
+  message: "The `{mode}` deployment does not expose this authentication flow."
+  solution: "Use the authentication entry point for the selected deployment mode."
+control.cloud-auth-unavailable:
+  message: "Managed Cloud authentication is not available."
+  solution: "Install the SDK exchange/online-validation and trusted deployment bindings, then enter from Cloud again."
+control.state-database-unavailable:
+  message: "Cloud mode does not allow an explicit Nest state.database."
+  solution: "Remove state.database to use the deployment-owned operator-state database. On-prem deployments can still select a database."
+control.source-config-reveal-unavailable:
+  message: "Stored Source configuration cannot be revealed by this release."
+  solution: "Use the normal Source edit flow to replace configuration. A later audited reveal flow requires dedicated permission, recent step-up authentication, and a one-time grant."
 control.bootstrap-closed:
   message: "The initial-admin bootstrap channel is closed because an admin account already exists."
   solution: "Sign in with an existing admin account to create more users."
@@ -594,6 +678,9 @@ control.forbidden:
 control.malformed-request:
   message: "The request is malformed: {reason}."
   solution: "Correct the request body, then send it again."
+control.preview-overloaded:
+  message: "Pipeline preview is at capacity."
+  solution: "Wait for an active preview to finish, then retry."
 control.unauthenticated:
   message: "This operation requires authentication."
   solution: "Sign in with `login` to obtain a session token, or present a machine token with `--token`."
@@ -639,6 +726,18 @@ engine.execution-not-authorized:
 engine.job-still-ending:
   message: "Pipeline {pipeline} could not be started: its previous run was still ending after {seconds}s."
   solution: "Wait for the previous run to finish stopping and start the pipeline again; if it never does, check the member's logs for a processor that is not shutting down."
+engine.routing-key-missing:
+  message: "A change on stream {stream} reached node {node} without its key ({columns}), so it cannot be routed to the processor that holds the other changes of its row."
+  solution: "Make sure every change on {stream} carries {columns} - in the later image, or in the earlier one for a removal - or set execution.parallelism to 1 on {node}."
+engine.key-change-on-parallel-node:
+  message: "An update on stream {stream} changed its row's key at node {node}, which runs on several processors; the change cannot be kept in order with both keys."
+  solution: "Set execution.parallelism to 1 on {node} if rows on {stream} change their key; one processor applies such changes in order."
+engine.cluster-refused-the-state:
+  message: "The cluster refused operations on operator state `{state}` for {seconds}s, so the run stopped."
+  solution: "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
+engine.membership-changed-before-start:
+  message: "Pipeline {pipeline} was planned for {planned} members but started on {actual}; it was stopped before any processor ran."
+  solution: "Nothing to do: the next start works the plan out again for the members present then."
 engine.job-failed:
   message: "Pipeline {pipeline} stopped because its job failed: {cause}."
   solution: "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."

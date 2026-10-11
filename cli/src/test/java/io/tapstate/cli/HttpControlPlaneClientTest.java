@@ -76,7 +76,10 @@ class HttpControlPlaneClientTest {
                    "vertices":[{"name":"serve-orders","requested":null,"effective":2,
                      "computedLocal":null,"executionId":"exec-1",
                      "processors":[{"index":0,"memberUuid":"uuid-a","nodeId":"node-a"},
-                                   {"index":1,"memberUuid":"uuid-b","nodeId":"node-b"}]}]}]}
+                                   {"index":1,"localIndex":0,"memberUuid":"uuid-b","nodeId":"node-b",
+                                    "backlog":12,"frontierGaps":{"shop":40},
+                                    "frontierStalledMillis":{"shop":1200},
+                                    "queuedByStream":{"shop.orders":30},"inFlightByTable":{"orders":512}}]}]}]}
                 """);
         try {
             ClusterMembersOutcome outcome =
@@ -109,9 +112,12 @@ class HttpControlPlaneClientTest {
                             + "take for a parallelism somebody asked for")
                     .isNull();
             assertThat(vertex.processors())
+                    .as("what a processor carries arrives with it, and a processor the server said nothing "
+                            + "of that about arrives with nothing rather than with zeros")
                     .containsExactly(
                             new RemoteProcessor(0, "uuid-a", "node-a"),
-                            new RemoteProcessor(1, "uuid-b", "node-b"));
+                            new RemoteProcessor(1, 0, "uuid-b", "node-b", 12L, Map.of("shop", 40L),
+                                    Map.of("shop", 1200L), Map.of("shop.orders", 30L), Map.of("orders", 512L)));
         } finally {
             server.stop(0);
         }
@@ -1752,6 +1758,26 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void anExplanationWhosePlanCannotBeReadIsNotTakenForOneWithNoPlan() throws Exception {
+        // A plan node without its batch is a plan this client cannot read, not a run with no plan: answering it
+        // as the latter would print an explanation that silently says nothing about how wide the run is.
+        HttpServer server = apiServer("/api/pipelines/pl1/explain", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                        + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                        + "\"evidence\":[],\"cannotSay\":[\"The observation has no time.\"],\"next\":null,"
+                        + "\"plan\":{\"members\":[\"local\"],\"plannedAt\":\"2026-09-20T10:00:00Z\","
+                        + "\"nodes\":[{\"node\":\"orders_sink\",\"requested\":4,\"requestedOrigin\":\"node-default\","
+                        + "\"scope\":\"native\",\"memberCount\":1,\"computedLocal\":4,\"effective\":4,"
+                        + "\"reasons\":[]}]}}", new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().explain(baseOf(server), "tok-abc", "pl1"))
+                    .isInstanceOf(ExplainOutcome.Unreachable.class);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void historySendsEverySelectorAndDecodesTheTypedPage() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/metrics/history", 200,
@@ -1924,6 +1950,25 @@ class HttpControlPlaneClientTest {
     void metricsReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
         assertThat(new HttpControlPlaneClient().metrics(unreachableBase(), "tok", "pl1"))
                 .isInstanceOf(MetricsOutcome.Unreachable.class);
+    }
+
+    @Test
+    void snapshotReadsWhetherEachTableLandedAndLeavesItUnsaidWhereTheServerDoesNotSay() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/snapshot", 200,
+                "{\"pipelineId\":\"pl1\",\"snapshot\":{"
+                        + "\"orders\":{\"rowsDone\":10,\"rowsTotal\":10,\"donePct\":100,\"landed\":true},"
+                        + "\"items\":{\"rowsDone\":4,\"rowsTotal\":9,\"donePct\":44,\"landed\":false},"
+                        + "\"events\":{\"rowsDone\":5,\"rowsTotal\":null,\"donePct\":null}}}",
+                new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().snapshot(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new SnapshotOutcome.Found("pl1", Map.of(
+                            "orders", new RemoteTableSnapshot(10, 10L, 100, true),
+                            "items", new RemoteTableSnapshot(4, 9L, 44, false),
+                            "events", new RemoteTableSnapshot(5, null, null, null))));
+        } finally {
+            server.stop(0);
+        }
     }
 
     @Test

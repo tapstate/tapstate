@@ -24,6 +24,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * A bounded pool of live connector instances, keyed by {@link ConnectionFingerprint}. Opening a
@@ -134,6 +135,10 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
      * limit, in which case it is thrown away instead.
      */
     <R> R call(ConnectionConfig config, PooledCall<T, R> action) {
+        return call(config, action, ignored -> true);
+    }
+
+    <R> R call(ConnectionConfig config, PooledCall<T, R> action, Predicate<T> reusable) {
         Lease lease = acquire(config);
         R result;
         try {
@@ -148,10 +153,18 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
             // The connector reported a failure and is still healthy - a failed query is not a failed
             // connection - so the instance goes back. Treating every failure as poison would reopen a
             // connector for every bad query.
-            release(lease);
+            if (reusable.test(lease.instance)) {
+                release(lease);
+            } else {
+                discard(lease);
+            }
             throw failed;
         }
-        release(lease);
+        if (reusable.test(lease.instance)) {
+            release(lease);
+        } else {
+            discard(lease);
+        }
         return result;
     }
 

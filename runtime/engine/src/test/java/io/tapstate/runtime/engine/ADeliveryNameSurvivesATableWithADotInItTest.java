@@ -2,6 +2,8 @@ package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -55,6 +57,22 @@ class ADeliveryNameSurvivesATableWithADotInItTest {
         assertThat(JetDeliveryGauge.reachedTableOf("outEventTime.sales.orders")).isEqualTo("sales.orders");
         assertThat(JetDeliveryGauge.reachedTableOf("outEventTime.")).isNull();
         assertThat(JetDeliveryGauge.reachedTableOf("recordsOut.i.orders")).isNull();
+    }
+
+    @Test
+    void a_stream_or_table_with_nothing_waiting_any_more_is_set_back_to_zero() {
+        // A run's statistics keep whatever was last set under a name: a writer whose orders queue emptied would
+        // otherwise go on reading as having orders waiting.
+        Map<String, Long> readings = JetDeliveryGauge.waitingReadings(Map.of("sales.customers", 3L),
+                Map.of("sales.orders", 9L), Set.of("sinkQueued.sales.orders", "sinkQueued.sales.customers"));
+
+        assertThat(readings).containsOnly(
+                Map.entry("sinkQueued.sales.orders", 0L),
+                Map.entry("sinkQueued.sales.customers", 3L),
+                Map.entry("sinkInFlight.sales.orders", 9L));
+        assertThat(SinkWaitingMetricNames.streamOfQueued("sinkQueued.sales.orders")).isEqualTo("sales.orders");
+        assertThat(SinkWaitingMetricNames.tableOfInFlight("sinkInFlight.sales.orders")).isEqualTo("sales.orders");
+        assertThat(SinkWaitingMetricNames.streamOfQueued("sinkInFlight.sales.orders")).isNull();
     }
 
     @Test
