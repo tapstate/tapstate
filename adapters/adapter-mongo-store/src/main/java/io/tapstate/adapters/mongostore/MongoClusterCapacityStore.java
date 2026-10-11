@@ -593,7 +593,9 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             if (!fenced(session, current, now)) {
                 return result(Outcome.STALE_CLAIM, expected, null, List.of());
             }
-            occupancy.deleteOne(session, new Document("_id", expected.reservationId()).append("revision", current.get("revision")));
+            if (!retainSubmittedHistory(session, expected)) {
+                occupancy.deleteOne(session, new Document("_id", expected.reservationId()).append("revision", current.get("revision")));
+            }
             return result(Outcome.APPLIED, expected, null, List.of());
         });
     }
@@ -940,8 +942,19 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         if (current == null || !fenced(session, current, now)) {
             return false;
         }
+        if (retainSubmittedHistory(session, expected)) {
+            return true;
+        }
         return occupancy.deleteOne(session, new Document("_id", expected.reservationId())
                 .append("revision", current.get("revision"))).getDeletedCount() == 1;
+    }
+
+    private boolean retainSubmittedHistory(ClientSession session, ClusterCapacityReservation expected) {
+        if (expected.executionGeneration() == null || expected.nativeJobId() == null) {
+            return false;
+        }
+        Document context = claims.find(session, new Document("_id", claimId(expected.clusterId(), expected.pipelineId()))).first();
+        return retiredSubmittedContext(context, List.of(expected));
     }
 
     ClusterCapacityReservation renewRecoveryDeadline(ClientSession session, ClusterCapacityReservation expected, Instant deadline) {

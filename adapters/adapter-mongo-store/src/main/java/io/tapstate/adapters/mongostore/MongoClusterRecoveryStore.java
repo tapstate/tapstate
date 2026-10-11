@@ -265,6 +265,11 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
             if (slots >= maxConcurrentRebuilds) {
                 return result(ClusterRecoveryMutation.WAITING_PERMIT, item);
             }
+            // A known native cohort can converge before the retired node's stored session. Keep the
+            // complete demand frozen and wait for agreement rather than spending a rebuild attempt.
+            if (!demandByNode.isEmpty() && !demandByNode.keySet().equals(context.facts.liveNodes())) {
+                return result(ClusterRecoveryMutation.WAITING_PERMIT, item);
+            }
             WorkloadClaim pipeline = MongoWorkloadClaimStore.readDocument(context.facts.pipeline());
             ClusterCapacityStore.Result reservation = capacity.reserve(session, context.facts,
                     WorkloadClaimFence.from(pipeline), Map.copyOf(demandByNode), limits, ttl, true);
