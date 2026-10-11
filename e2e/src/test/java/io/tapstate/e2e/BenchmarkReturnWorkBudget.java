@@ -86,6 +86,35 @@ final class BenchmarkReturnWorkBudget {
     }
 
     static Scope current() { return ACTIVE.get(); }
+    static long rootNanoTime() {
+        long value;
+        try { value = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime(); }
+        catch (RuntimeException | Error failure) { recordRootClockFailure(current(), failure); throw failure; }
+        add(current(), Activity.CLOCK_REQUEST, Work.request());
+        return value;
+    }
+    static java.util.function.LongSupplier rootClock() {
+        Scope scope = current();
+        return scope == null ? io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime
+                : () -> rootNanoTime(scope, io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime);
+    }
+    /** The original raw read remains first; accounting never requests another clock point. */
+    static long rootNanoTime(Scope scope, java.util.function.LongSupplier original) {
+        long value;
+        try { value = original.getAsLong(); }
+        catch (RuntimeException | Error failure) {
+            recordRootClockFailure(scope, failure);
+            throw failure;
+        }
+        add(scope, Activity.CLOCK_REQUEST, Work.request());
+        return value;
+    }
+    private static void recordRootClockFailure(Scope scope, Throwable failure) {
+        if (scope != null) {
+            Ticket ticket = scope.begin(Activity.CLOCK_REQUEST, Work.request());
+            scope.complete(ticket, Work.zero(), failure);
+        }
+    }
     static Scope activate(Definition definition, String runId) {
         Scope scope = new Scope(definition, runId);
         if (!ACTIVE.compareAndSet(null, scope)) { throw new AssertionError("one root work scope is already active"); }

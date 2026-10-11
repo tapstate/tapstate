@@ -91,6 +91,9 @@ class PdkBenchmarkClockTest {
                 "PdkBenchmarkClock$JniAccess", "PdkBenchmarkClock$NativeAccess");
         for (Object hash : classHashes.values()) { assertThat(hash.toString()).matches("[a-f0-9]{64}"); }
         assertThat(before.get("osFunctionCodePrefixSha256").toString()).matches("[a-f0-9]{64}");
+        assertThat(access.facts).as("construction plus both metadata calls re-read native facts").isEqualTo(3);
+        clock.metadata();
+        assertThat(access.facts).as("another metadata call is not a cached transport read").isEqualTo(4);
         assertThat(access.reads).isZero();
     }
 

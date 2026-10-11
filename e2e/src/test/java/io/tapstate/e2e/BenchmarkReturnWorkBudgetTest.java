@@ -16,6 +16,43 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class BenchmarkReturnWorkBudgetTest {
     private static final String HASH = "a".repeat(64);
 
+    @Test void root_clock_retains_the_original_first_point_and_accounts_one_existing_read_afterwards() {
+        var reads = new AtomicInteger();
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "root-clock")) {
+            long value = BenchmarkReturnWorkBudget.rootNanoTime(scope, () -> {
+                assertThat(row(scope.snapshot(), "CLOCK_REQUEST")).containsEntry("attempts", 0L);
+                reads.incrementAndGet(); return 42L;
+            });
+            assertThat(value).isEqualTo(42); assertThat(reads).hasValue(1);
+            assertThat(row(scope.snapshot(), "CLOCK_REQUEST")).containsEntry("attempts", 1L)
+                    .containsEntry("issuedRequests", 1L).containsEntry("completedRequests", 1L);
+        }
+    }
+
+    @Test void a_failed_original_root_read_is_counted_once_and_preserves_the_exact_primary_without_an_end_read() {
+        var reads = new AtomicInteger(); var primary = new IllegalStateException("controlled root read");
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "root-clock-failure")) {
+            assertThatThrownBy(() -> BenchmarkReturnWorkBudget.rootNanoTime(scope, () -> {
+                reads.incrementAndGet(); throw primary;
+            })).isSameAs(primary);
+            assertThat(reads).hasValue(1); assertThat(scope.primaryCause()).isSameAs(primary);
+            assertThat(row(scope.snapshot(), "CLOCK_REQUEST")).containsEntry("issuedRequests", 1L)
+                    .containsEntry("failedRequests", 1L).containsEntry("failedAttempts", 1L);
+        }
+    }
+
+    @Test void bounded_bson_resume_material_refuses_before_a_json_writer_can_expand_it() {
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "bson-prior")) {
+            var bounded = new org.bson.BsonDocument("token", new org.bson.BsonString("controlled"));
+            BenchmarkReturnWorkBudget.requireLocalMaterial(scope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, bounded);
+            var oversized = new org.bson.BsonDocument("token", new org.bson.BsonBinary(new byte[Math.toIntExact(BenchmarkReturnWorkBudget.MAX_MATERIAL_BYTES + 1)]));
+            assertThatThrownBy(() -> BenchmarkReturnWorkBudget.requireLocalMaterial(scope,
+                    BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE, oversized)).isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("local consumption bound");
+            assertThat(scope.snapshot()).containsEntry("state", "UNKNOWN");
+        }
+    }
+
     @Test void no_active_scope_keeps_original_operations_and_does_not_create_a_worker_or_provider() {
         assertThat(BenchmarkReturnWorkBudget.current()).isNull(); var calls = new AtomicInteger();
         assertThat(BenchmarkReturnWorkBudget.request(null, BenchmarkReturnWorkBudget.Activity.CLOCK_REQUEST,

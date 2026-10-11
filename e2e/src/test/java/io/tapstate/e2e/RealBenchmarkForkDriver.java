@@ -743,7 +743,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     throw new AssertionError("benchmark has no measured phase");
                 }
                 captures.awaitMeasurementBoundary(workload, fork, previousPhase, positionCoverage);
-                long acknowledgedBoundaryAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                long acknowledgedBoundaryAt = BenchmarkReturnWorkBudget.rootNanoTime();
                 awaitFreshObservationAfterBoundary(workload, fork.control());
                 awaitQuiescentRecordsOut(workload, fork.control());
                 try (TargetWatchSet targets = TargetWatchSet.open(
@@ -997,7 +997,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                      : BenchmarkTargetClockSampler.open(targetClockUris.getFirst())) {
             fork.ownedProcessReceipt().recordJvmRuntime(resourceSampler.runtimeEvidence());
             if (collectorCalibration != null) {
-                String rootRaw = io.tapstate.adapters.pdk.PdkBenchmarkClock.metadata();
+                String rootRaw = BenchmarkReturnWorkBudgetRun.rootClockMetadata();
                 collectorCalibrationEvidence.put("rootBeforeRaw", BenchmarkWriteReturnCostStages.rawEvidence(rootRaw));
                 collectorCalibrationEvidence.put("rootBefore", supportedRootClockEvidence(rootRaw,
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY)));
@@ -1010,7 +1010,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), rootRaw);
             } else if (System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
                 nativeClockBefore = resourceSampler.writeReturnReader().nativeClockEvidence(
-                        System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), io.tapstate.adapters.pdk.PdkBenchmarkClock.metadata());
+                        System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), BenchmarkReturnWorkBudgetRun.rootClockMetadata());
             }
             if (methodCostProtocol) {
                 returnRegistrationBefore = resourceSampler.writeReturnReader().registrationEvidence(!methodControl);
@@ -1045,9 +1045,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         if (issued.batches().isEmpty()) {
                             throw new AssertionError("measured phase has no source batches: " + phase.id());
                         }
-                        sourceMarkerWaitStartedAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                        sourceMarkerWaitStartedAt = BenchmarkReturnWorkBudget.rootNanoTime();
                         captures.awaitMeasuredSourceMarkers(workload, phase);
-                        sourceMarkerWaitCompletedAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                        sourceMarkerWaitCompletedAt = BenchmarkReturnWorkBudget.rootNanoTime();
                         completedAckAt = tables.awaitMeasured(workload, phase.id());
                         if (collectorCalibration != null) {
                             collectorCalibrationEvidence.put("fourWriterTableAckAtNanos", completedAckAt);
@@ -1070,7 +1070,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                 if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU,
                                         BenchmarkReturnWorkBudget.Work.pass(1));
                             }
-                            captureDrainStartedAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                            captureDrainStartedAt = BenchmarkReturnWorkBudget.rootNanoTime();
                             collectorCalibrationEvidence.put("captureDrain", Map.of("state", calibrationOff ? "DISABLED" : "IN_PROGRESS",
                                     "startedAtNanos", captureDrainStartedAt));
                         }
@@ -1082,7 +1082,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                             }
                         }
                         if (collectorCalibration != null) {
-                            captureDrainCompletedAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                            captureDrainCompletedAt = BenchmarkReturnWorkBudget.rootNanoTime();
                             collectorCalibrationEvidence.put("cutoffOrder", collectorCutoffOrder(completedAckAt,
                                     collectorResourceCheckpoint.startedAtNanos(), collectorResourceCheckpoint.completedAtNanos(),
                                     collectorCommandCheckpoint.startedAtNanos(), collectorCommandCheckpoint.completedAtNanos(),
@@ -1122,7 +1122,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 if (collectorCalibration != null) {
                     collectorCalibrationEvidence.put("fullPhaseCommands", collectorCommands(commands));
                     collectorCalibrationEvidence.put("fullPhaseScope", "SOURCE_ISSUE_THROUGH_CAPTURE_DRAIN_AND_FINAL_RESOURCE_COMMAND_READS");
-                    String rootRaw = io.tapstate.adapters.pdk.PdkBenchmarkClock.metadata();
+                    String rootRaw = BenchmarkReturnWorkBudgetRun.rootClockMetadata();
                     collectorCalibrationEvidence.put("rootAfterRaw", BenchmarkWriteReturnCostStages.rawEvidence(rootRaw));
                     var rootAfter = supportedRootClockEvidence(rootRaw, System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY));
                     collectorCalibrationEvidence.put("rootAfter", rootAfter);
@@ -1137,7 +1137,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     collectorCalibrationEvidence.put("state", "INCREMENTAL_RETURN_COLLECTOR_DIAGNOSTIC_ONLY");
                 } else if (System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
                     nativeClockAfter = resourceSampler.writeReturnReader().nativeClockEvidence(
-                            System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), io.tapstate.adapters.pdk.PdkBenchmarkClock.metadata());
+                            System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), BenchmarkReturnWorkBudgetRun.rootClockMetadata());
                 }
                 if (methodCostProtocol) {
                     returnRegistrationAfter = resourceSampler.writeReturnReader().registrationEvidence(!methodControl);
@@ -1545,7 +1545,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         var guards = new LinkedHashMap<String, BenchmarkNativeCounterBaseline>();
         workload.pipelineIds().forEach(pipeline -> guards.put(pipeline,
                 new BenchmarkNativeCounterBaseline(acknowledgedAt, PRE_WINDOW_QUIET)));
-        long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
+        long deadline = BenchmarkReturnWorkBudget.rootNanoTime() + ACK_WAIT.toNanos();
         var complete = new java.util.HashSet<String>();
         try {
             while (complete.size() != guards.size()) {
@@ -1558,10 +1558,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     long flat = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
                             BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL, () -> control.recordsOut(entry.getKey())).orElseThrow(() ->
                             new AssertionError("native baseline has no matching flat observation"));
-                    if (entry.getValue().observe(snapshot, flat, io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime())) { complete.add(entry.getKey()); }
+                    if (entry.getValue().observe(snapshot, flat, BenchmarkReturnWorkBudget.rootNanoTime())) { complete.add(entry.getKey()); }
                 }
                 if (complete.size() == guards.size()) { break; }
-                if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() >= deadline) { throw new AssertionError("native baseline publications did not qualify"); }
+                if (BenchmarkReturnWorkBudget.rootNanoTime() >= deadline) { throw new AssertionError("native baseline publications did not qualify"); }
                 TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
             }
         } catch (RuntimeException | Error | InterruptedException failure) {
@@ -1588,15 +1588,15 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     /** Records idempotent replay work as a cost while logical delivery remains the target-change oracle. */
     private static long awaitRecordsOut(BenchmarkWorkloadDefinitions.Workload workload,
             ControlPlane control, long before, long expected) throws InterruptedException {
-        long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
+        long deadline = BenchmarkReturnWorkBudget.rootNanoTime() + ACK_WAIT.toNanos();
         long previous = before;
-        long unchangedSince = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+        long unchangedSince = BenchmarkReturnWorkBudget.rootNanoTime();
         while (true) {
             if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL,
                     BenchmarkReturnWorkBudget.Work.pass(workload.pipelineIds().size()));
             long after = recordsOut(workload, control);
             long delta = after - before;
-            long now = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+            long now = BenchmarkReturnWorkBudget.rootNanoTime();
             if (after < previous) {
                 throw new AssertionError("records.out moved backward during the measured phase");
             }
@@ -1616,15 +1616,15 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
 
     private static void awaitQuiescentRecordsOut(BenchmarkWorkloadDefinitions.Workload workload,
             ControlPlane control) throws InterruptedException {
-        long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
+        long deadline = BenchmarkReturnWorkBudget.rootNanoTime() + ACK_WAIT.toNanos();
         long previous = recordsOut(workload, control);
-        long unchangedSince = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+        long unchangedSince = BenchmarkReturnWorkBudget.rootNanoTime();
         while (true) {
             if (BenchmarkReturnWorkBudget.current() != null) BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL,
                     BenchmarkReturnWorkBudget.Work.pass(workload.pipelineIds().size()));
             TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
             long current = recordsOut(workload, control);
-            long now = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+            long now = BenchmarkReturnWorkBudget.rootNanoTime();
             if (current < previous) {
                 throw new AssertionError("records.out moved backward before the measured window");
             }
@@ -1643,12 +1643,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static void awaitFreshObservationAfterBoundary(
             BenchmarkWorkloadDefinitions.Workload workload, ControlPlane control) throws InterruptedException {
         Instant boundaryCompletedAt = Instant.now();
-        long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
+        long deadline = BenchmarkReturnWorkBudget.rootNanoTime() + ACK_WAIT.toNanos();
         for (String pipelineId : workload.pipelineIds()) {
             while (!BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
                     BenchmarkReturnWorkBudget.Activity.NATIVE_STATUS_POLL,
                     () -> control.statusObservedAt(pipelineId)).isAfter(boundaryCompletedAt)) {
-                if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() >= deadline) {
+                if (BenchmarkReturnWorkBudget.rootNanoTime() >= deadline) {
                     throw new AssertionError("no post-boundary observation for " + pipelineId);
                 }
                 TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
@@ -1944,7 +1944,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 throw new AssertionError("measured phase has no final source marker: " + phase.id());
             }
             Map<BenchmarkWorkloadDefinitions.SourceChain, String> lastAcks = new LinkedHashMap<>();
-            long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
+            long deadline = BenchmarkReturnWorkBudget.rootNanoTime() + ACK_WAIT.toNanos();
             while (true) {
                 pending.entrySet().removeIf(entry -> {
                     Optional<String> ack = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
@@ -1956,9 +1956,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     return ack.filter(value -> positionCoverage.covers(value, entry.getValue())).isPresent();
                 });
                 if (pending.isEmpty()) {
-                    return io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                    return BenchmarkReturnWorkBudget.rootNanoTime();
                 }
-                if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() >= deadline) {
+                if (BenchmarkReturnWorkBudget.rootNanoTime() >= deadline) {
                     AssertionError incomplete = new AssertionError("target ACK did not cover measured source markers: "
                             + pending.entrySet().stream().map(entry -> entry.getKey().id()
                                     + " [source=" + positionCoverage.describe(entry.getValue())
@@ -2030,7 +2030,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         private static String awaitAck(ControlPlane control,
                 BenchmarkWorkloadDefinitions.SourceChain chain, String sourceToken,
                 BenchmarkConnectorPositionCoverage positionCoverage) throws InterruptedException {
-            long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + ACK_WAIT.toNanos();
+            long deadline = BenchmarkReturnWorkBudget.rootNanoTime() + ACK_WAIT.toNanos();
             Optional<String> lastAck = Optional.empty();
             while (true) {
                 Optional<String> ack = BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(),
@@ -2041,7 +2041,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 if (ack.isPresent() && positionCoverage.covers(ack.get(), sourceToken)) {
                     return ack.get();
                 }
-                if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() >= deadline) {
+                if (BenchmarkReturnWorkBudget.rootNanoTime() >= deadline) {
                     throw new AssertionError("target ACK did not cover the source event for " + chain.id()
                             + "; source=" + positionCoverage.describe(sourceToken)
                             + "; lastAck=" + lastAck.map(positionCoverage::describe).orElse("ABSENT"));

@@ -112,13 +112,13 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             throw new AssertionError("owned return probe has no verified resource runtime");
         }
         return new BenchmarkWriteReturnReader(new BenchmarkCausalClock.Identity(ownedPid, start),
-                connection, () -> BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive), io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime);
+                connection, () -> BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive), BenchmarkReturnWorkBudget.rootClock());
     }
 
     /** Retains runtime identity through the existing resource connection before the measured window. */
     Map<String, Object> runtimeEvidence() {
         BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.call());
-        long before = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+        long before = BenchmarkReturnWorkBudget.rootNanoTime();
         boolean aliveBefore = child != null && BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, child::isAlive);
         if (!aliveBefore || connection == null) {
             return Map.of("status", "UNKNOWN", "reason", "OWNED_RUNTIME_UNAVAILABLE", "ownedPid", ownedPid);
@@ -144,7 +144,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             out.put("status", "COMPLETE"); out.put("scope", "EXISTING_OWNED_RESOURCE_JMX_PRE_WINDOW");
             out.put("ownedPid", ownedPid); out.put("actualPid", actualPid); out.put("jvmStartTimeMillis", startMillis);
             out.put("inputArguments", List.copyOf(arguments)); out.put("driverStartNanos", before);
-            out.put("driverEndNanos", io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime()); out.put("capturedAt", java.time.Instant.now().toString());
+            out.put("driverEndNanos", BenchmarkReturnWorkBudget.rootNanoTime()); out.put("capturedAt", java.time.Instant.now().toString());
             out.put("aliveBefore", aliveBefore); out.put("aliveAfter", aliveAfter);
             return Map.copyOf(out);
         } catch (IOException | RuntimeException failure) {

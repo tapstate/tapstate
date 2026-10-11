@@ -88,7 +88,7 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
         this.connection = connection;
         source = this::read;
         checkpointSource = this::readCheckpoint;
-        nanoTime = io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime;
+        nanoTime = BenchmarkReturnWorkBudget.rootClock();
     }
 
     private BenchmarkMongoCommandSampler(Supplier<Snapshot> source, LongSupplier nanoTime) {

@@ -99,9 +99,9 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         }
 
         static ClockAnchor capture() {
-            long before = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+            long before = BenchmarkReturnWorkBudget.rootNanoTime();
             Instant utc = Instant.now();
-            return new ClockAnchor(utc, before, io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime());
+            return new ClockAnchor(utc, before, BenchmarkReturnWorkBudget.rootNanoTime());
         }
 
         long uncertaintyNanos() {
@@ -432,7 +432,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             throw new IllegalArgumentException("benchmark phases must run in declared order");
         }
         ClockAnchor clockAnchor = ClockAnchor.capture();
-        long started = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+        long started = BenchmarkReturnWorkBudget.rootNanoTime();
         long nextBatchStart = started;
         List<BatchResult> batches = new ArrayList<>();
         int batchIndex = 0;
@@ -440,21 +440,21 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
                     new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 1, sql.size(), 0));
             if (paced) {
-                long remaining = nextBatchStart - io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                long remaining = nextBatchStart - BenchmarkReturnWorkBudget.rootNanoTime();
                 if (remaining > 0) {
                     TimeUnit.NANOSECONDS.sleep(remaining);
                 }
             }
-            long issuedAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+            long issuedAt = BenchmarkReturnWorkBudget.rootNanoTime();
             beforeBatch.beforeBatch(phase, batchIndex, issuedAt, sql);
             execute(source, sql);
-            long completedAt = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+            long completedAt = BenchmarkReturnWorkBudget.rootNanoTime();
             batches.add(new BatchResult(batchIndex, issuedAt, completedAt));
             nextBatchStart = issuedAt + phase.batchInterval().toNanos();
             batchIndex++;
         }
         pendingPhase = phase;
-        return new PhaseIssue(phase, started, io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime(), batches, clockAnchor);
+        return new PhaseIssue(phase, started, BenchmarkReturnWorkBudget.rootNanoTime(), batches, clockAnchor);
     }
 
     /** Verifies final target content after the external ACK window has ended. */
@@ -474,7 +474,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             BatchHook beforeBatch) throws Exception {
         PhaseIssue issued = issuePhase(phase, paced, beforeBatch);
         List<TargetResult> targets = completePhase(phase);
-        return new PhaseResult(phase, issued.startedAtNanos(), io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime(), issued.batches(), targets);
+        return new PhaseResult(phase, issued.startedAtNanos(), BenchmarkReturnWorkBudget.rootNanoTime(), issued.batches(), targets);
     }
 
     PhaseResult runPhase(BenchmarkWorkloadDefinitions.Phase phase, boolean paced) throws Exception {
@@ -503,7 +503,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private List<TargetResult> awaitTargets(BenchmarkWorkloadDefinitions.Phase phase) throws Exception {
         Duration budget = targetWait(workload, phase);
-        long started = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+        long started = BenchmarkReturnWorkBudget.rootNanoTime();
         long deadline = started + budget.toNanos();
         int rounds = 0;
         boolean matched = false;
@@ -517,7 +517,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                     matched = true;
                     return latest;
                 }
-                if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() >= deadline) {
+                if (BenchmarkReturnWorkBudget.rootNanoTime() >= deadline) {
                     String timeout = "fork " + forkId + " phase " + phase.id()
                             + " did not reach target count/checksum: " + latest;
                     if (workload.id().equals("stateful")
@@ -538,7 +538,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                 // This is a polling budget between complete reads, not a server command timeout.
                 System.out.println("benchmark-setup-target-wait=" + io.tapstate.core.common.JsonWriter.write(Map.of(
                         "fork", forkId, "phase", phase.id(), "rows", workload.rows(),
-                        "pollingBudgetNanos", budget.toNanos(), "elapsedNanos", io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() - started,
+                        "pollingBudgetNanos", budget.toNanos(), "elapsedNanos", BenchmarkReturnWorkBudget.rootNanoTime() - started,
                         "targetReadRounds", rounds, "matched", matched,
                         "performanceAcceptanceEligible", false)));
             }

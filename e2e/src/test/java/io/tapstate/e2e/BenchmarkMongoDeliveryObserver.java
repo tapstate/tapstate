@@ -200,7 +200,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         if (expected.isEmpty()) {
             throw new IllegalArgumentException("an issued batch must name target changes");
         }
-        if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() - issuedAtNanos < 0) {
+        if (BenchmarkReturnWorkBudget.rootNanoTime() - issuedAtNanos < 0) {
             throw new IllegalArgumentException("source batch issue time is in the future");
         }
         register(phaseId, issuedAtNanos, expected, true);
@@ -299,11 +299,11 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             }
         }
 
-        long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + timeout.toNanos();
+        long deadline = BenchmarkReturnWorkBudget.rootNanoTime() + timeout.toNanos();
         List<Delivery> phaseDeliveries;
         synchronized (lock) {
             while (failure == null && !barrierSeen) {
-                long remaining = deadline - io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                long remaining = deadline - BenchmarkReturnWorkBudget.rootNanoTime();
                 if (remaining <= 0) {
                     throw new AssertionError("target change-stream barrier did not arrive before " + timeout);
                 }
@@ -374,7 +374,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                         return;
                     }
                 }
-                long started = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                long started = BenchmarkReturnWorkBudget.rootNanoTime();
                 if (firstRead) {
                     if (!readGate.beforeFirstTryNext(started)) { return; }
                     firstRead = false;
@@ -382,11 +382,11 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 long schedulingGap = previousIterationEnded == 0 ? 0 : started - previousIterationEnded;
                 ChangeStreamDocument<Document> change = BenchmarkReturnWorkBudget.opaqueRequest(workScope,
                         BenchmarkReturnWorkBudget.Activity.STREAM_READ, cursor::tryNext);
-                long completed = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                long completed = BenchmarkReturnWorkBudget.rootNanoTime();
                 if (change != null) {
                     accept(change, started, completed);
                 }
-                long accepted = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
+                long accepted = BenchmarkReturnWorkBudget.rootNanoTime();
                 previousIterationEnded = accepted;
                 synchronized (lock) {
                     readCalls++; readNanos += completed - started; acceptNanos += accepted - completed;
@@ -533,7 +533,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 }
                 if (clockRejectionEvidence != null && clockRecordingFailure == null) {
                     clockRecordingFailure = recordAcceptedClockEvent(clockRejectionEvidence,
-                            () -> clockEvent(change, key, startedReadNanos, observedAtNanos, io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime()));
+                            () -> clockEvent(change, key, startedReadNanos, observedAtNanos, BenchmarkReturnWorkBudget.rootNanoTime()));
                 }
                 deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration, operationWall));
             }
@@ -640,7 +640,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             } else {
                 evidence = BenchmarkNativeOperationWallEvidence.lookup(snapshot,
                         new BenchmarkNativeOperationWallLookup(client, databaseName + "." + targetCollection),
-                        io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime, original);
+                        BenchmarkReturnWorkBudget.rootClock(), original);
             }
             System.out.println("benchmark-native-operation-wall=" + JsonWriter.write(evidence));
         } catch (RuntimeException | Error recording) {

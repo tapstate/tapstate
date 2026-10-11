@@ -114,7 +114,7 @@ final class BenchmarkRootCpuEnvelope {
             }
         };
         return from(new Identity(pid, start, true, descriptor), source,
-                io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime, commonOperations, tailOperations,
+                BenchmarkReturnWorkBudget.rootClock(), commonOperations, tailOperations,
                 (completion, timeout, unit) -> completion.get(timeout, unit));
     }
 

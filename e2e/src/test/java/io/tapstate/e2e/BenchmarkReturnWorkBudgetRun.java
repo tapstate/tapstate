@@ -93,6 +93,11 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         } catch (RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(ticket, failure); throw failure; }
     }
 
+    static String rootClockMetadata() {
+        return BenchmarkReturnWorkBudget.request(BenchmarkReturnWorkBudget.current(),
+                BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, io.tapstate.adapters.pdk.PdkBenchmarkClock::metadata);
+    }
+
     static BenchmarkReturnWorkBudgetRun open(String workload) throws IOException {
         String requested = System.getProperty(RealBenchmarkForkDriver.WORK_BUDGET_DIAGNOSTICS_PROPERTY);
         if (requested == null) { return null; }

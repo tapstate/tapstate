@@ -74,7 +74,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     static BenchmarkResourceSampler open(long childPid, Duration interval) {
         BenchmarkProcessProbe probe = BenchmarkProcessProbe.open(childPid);
-        return new BenchmarkResourceSampler(probe, probe::sample, interval, io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime,
+        return new BenchmarkResourceSampler(probe, probe::sample, interval, BenchmarkReturnWorkBudget.rootClock(),
                 ScheduledExecutorService::awaitTermination);
     }
 
@@ -95,12 +95,12 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         int retained = Math.toIntExact(budget.toNanos() / interval.toNanos() + 4);
         if (retained < 2 || retained > 4096) { throw new AssertionError("phase resource retention exceeds its declared finite budget"); }
         BenchmarkProcessProbe probe = BenchmarkProcessProbe.open(childPid);
-        return new BenchmarkResourceSampler(probe, probe::sample, interval, io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime,
+        return new BenchmarkResourceSampler(probe, probe::sample, interval, BenchmarkReturnWorkBudget.rootClock(),
                 ScheduledExecutorService::awaitTermination, retained);
     }
 
     static BenchmarkResourceSampler from(Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval) {
-        return from(source, interval, io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime);
+        return from(source, interval, BenchmarkReturnWorkBudget.rootClock());
     }
 
     static BenchmarkResourceSampler from(Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval,

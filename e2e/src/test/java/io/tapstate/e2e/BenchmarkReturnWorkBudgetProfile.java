@@ -124,13 +124,9 @@ final class BenchmarkReturnWorkBudgetProfile {
         registration.put("files", inputs.files().stream().map(file -> Map.of("role", file.role().name(), "sha256", file.sha256(), "bytes", file.bytes())).toList());
         registration.put("rootCpu", flags.rootCpu()); registration.put("outputPlanScope", "FULL_FORK_CONTROLLED_STDOUT_AND_FAILURE_TREES");
         registration.put("outputPlanSource", reporting.metadata());
-        registration.put("preScopeSourceTail", Map.of("state", "SOURCE_UPPER_ONLY",
-                "scope", "SEVEN_FIXED_ORIGINAL_FACTORY_CALLS_BOUNDED_INITIALIZER_AND_SCALAR_RECIPES_NO_FIXTURE_OR_FILE_READ",
-                "upper", preScopeSourceUpper(inputs.workload()).times(7).evidence()));
-        registration.put("terminalSourceTail", Map.of("state", "SOURCE_UPPER_REQUIRING_EXTERNAL_AFTER_RECEIPT",
-                "scope", "INDEPENDENT_COUNTER_VERIFICATION_FINAL_RECEIPT_ENCODING_STDOUT_RETURN_AND_IDEMPOTENT_SCOPE_RELEASE",
-                "outputPlan", Map.of("nodes", reporting.plan().nodeUpper(), "strings", reporting.plan().stringUtf8Upper(),
-                        "encodedUpperBytes", reporting.plan().encodedUpperBytes(), "depth", reporting.plan().depthUpper())));
+        registration.put("preScopeSourceTail", BenchmarkReturnWorkBudgetSourceTails.factoryEvidence(inputs.workload()));
+        registration.put("rootCounterColdSourceTail", BenchmarkReturnRootClockWork.evidence());
+        registration.put("terminalSourceTail", BenchmarkReturnWorkBudgetSourceTails.terminalEvidence(reporting.plan()));
         registration.put("structuralWorkBudgetQualified", false); registration.put("wholeMethodCostQualified", false);
         return new Prepared(inputs, upper, excluded, reporting.plan(), registration, gaps);
     }
@@ -152,7 +148,7 @@ final class BenchmarkReturnWorkBudgetProfile {
         put(upper, BenchmarkReturnWorkBudget.Activity.PAGE_RPC, 1, 1, 0, 0, PAGE_BYTES, 0, 1, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, 1, 1, 0, 0, BenchmarkReturnWorkBudget.MAX_CONNECTOR_INPUT_BYTES, 1,
                 BenchmarkReturnWorkBudget.MAX_CONNECTOR_INPUT_BYTES, 0);
-        put(upper, BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, 1, 1, 0, 0, 4L * 65_536, 0, 1, 0);
+        upper.put(BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, BenchmarkReturnRootClockWork.metadataUpper());
         put(upper, BenchmarkReturnWorkBudget.Activity.RESOURCE_CHECKPOINT, 1, 0, 0, 0, 0, 0, 0, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.RESOURCE_OPEN, 1, 0, 0, 0, 0, 0, 0, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.RESOURCE_READ, 1, 1, 1, 0, 0, 1, 4, 1);
@@ -191,15 +187,6 @@ final class BenchmarkReturnWorkBudgetProfile {
         put(upper, BenchmarkReturnWorkBudget.Activity.PRODUCER_TRANSPORT, 1, 1, 0, 0, 4L * 65_536, 0, 1, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.PRODUCER_FINAL_SEAL, 1, 1, 0, 0, 128, 0, 1, 0);
     }
-    private static BenchmarkReturnWorkBudget.Work preScopeSourceUpper(WorkloadInput workload) {
-        long phaseCount = workload.phases().size(), targets = workload.phases().stream().mapToLong(phase -> phase.targets().size()).sum();
-        long sourceRows = Math.multiplyExact(ROWS, Math.addExact(workload.sourceChains().size(), Math.multiplyExact(2, targets)));
-        long statements = Math.addExact(workload.setupStatements(), workload.phases().stream().mapToLong(PhaseInput::statements).sum());
-        // A row template has six bounded fields; factory checksums traverse each target's row material.
-        long elements = Math.addExact(Math.multiplyExact(6, sourceRows), Math.addExact(Math.multiplyExact(32, statements), Math.multiplyExact(64, phaseCount)));
-        long bytes = Math.multiplyExact(256, elements);
-        return new BenchmarkReturnWorkBudget.Work(1, Math.multiplyExact(16, elements), sourceRows, 0, bytes, 8, elements, elements);
-    }
     private static void knownRootBounds(EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> upper, Inputs inputs,
                                        BenchmarkReturnWorkBudgetDefinitions.OutputPlan output) {
         long materialNodes = BenchmarkReturnWorkBudget.MAX_MATERIAL_NODES;
@@ -230,17 +217,6 @@ final class BenchmarkReturnWorkBudgetProfile {
                             BenchmarkReturnWorkBudget.Activity activity, long calls, long requests, long records, long frames,
                             long bytes, long passes, long elements, long updates) {
         map.put(activity, new BenchmarkReturnWorkBudget.Work(calls, requests, records, frames, bytes, passes, elements, updates));
-    }
-    private static BenchmarkReturnWorkBudgetDefinitions.OutputPlan captureOutputPlan(WorkloadInput workload) {
-        long measured = workload.phases().stream().filter(PhaseInput::measured).count();
-        long sourceBatches = workload.phases().stream().mapToLong(PhaseInput::batches).sum();
-        long rawBase64 = Math.multiplyExact(4, Math.addExact(RAW_BYTES, Math.multiplyExact(2, PAGES)) / 3 + 1);
-        long nodes = Math.addExact(1024, Math.multiplyExact(measured,
-                Math.addExact(Math.multiplyExact(128, FRAMES), Math.addExact(Math.multiplyExact(32, CLOCK_SAMPLES), Math.multiplyExact(64, RESOURCE_ATTEMPTS)))));
-        nodes = Math.addExact(nodes, Math.multiplyExact(32, sourceBatches));
-        long strings = Math.addExact(4096, Math.multiplyExact(measured,
-                Math.addExact(rawBase64, Math.addExact(Math.multiplyExact(8L, 65_536), Math.multiplyExact(1024, FRAMES)))));
-        return new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(nodes, 24, 4 * ((PAGE_BYTES + 2) / 3), strings, 256, 32);
     }
     private static String sourceLocation(BenchmarkReturnWorkBudget.Activity activity) {
         return switch (activity) {
