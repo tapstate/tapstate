@@ -26,8 +26,8 @@ final class PublishedConnectorArtifacts {
     private static final String ENV_CONNECTORS_URL = "TAPSTATE_CONNECTORS_URL";
     private static final String ENV_BASE_URL = "TAPSTATE_BASE_URL";
 
-    /** Current preview artifacts fit below 51 MiB; 64 MiB bounds both declared and chunked responses. */
-    private static final long MAX_ARTIFACT_BYTES = 64L * 1024 * 1024;
+    /** The Db2 preview includes its runtime; 256 MiB bounds declared and chunked responses. */
+    private static final long MAX_ARTIFACT_BYTES = 256L * 1024 * 1024;
     private static final int COPY_BUFFER_BYTES = 8192;
 
     private static final Map<String, Artifact> ARTIFACTS = Map.of(
@@ -45,8 +45,8 @@ final class PublishedConnectorArtifacts {
                     "2d77e8d895f421fab07d776a02eb6afd4fa36a49d1ee6484e7fe908d33dedf3d"),
             "sqlserver", new Artifact(16_232_120,
                     "3254471003dbb5cb6512610efae34bc35f4d4a77c8c02cfbf9fc883659a4c826"),
-            "db2", new Artifact(32_784_188,
-                    "e00ec44e5c8711d90bea6419edf8107ef14ac873bf2838d699333f989ebbf181"));
+            "db2", new Artifact(203_082_147,
+                    "3c7c34e54e110402dca4699ecafce9aa04f719457fccba14e3b759d8e8fdb500"));
 
     /** Exact public ids with a matching {@code <id>-connector.jar} release asset and trusted digest. */
     static final List<String> IDS = List.copyOf(ARTIFACTS.keySet());
@@ -339,7 +339,7 @@ final class PublishedConnectorArtifacts {
     }
 
     private static IOException artifactTooLarge() {
-        return new IOException("response exceeds the 64 MiB connector artifact limit");
+        return new IOException("response exceeds the 256 MiB connector artifact limit");
     }
 
     private static int effectivePort(URI destination) {
