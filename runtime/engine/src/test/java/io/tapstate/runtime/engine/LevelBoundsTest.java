@@ -132,6 +132,19 @@ class LevelBoundsTest {
     }
 
     @Test
+    void aSnapshotHoldBelowAnAlreadySentBoundStillCrashes() {
+        LevelBounds bounds = bounds(Map.of(0, List.of(ORDERS)));
+        byte axis = AXES.axisOf(ORDERS);
+        assertThat(bounds.observe(0, axis, packed(3, 4))).hasValue(packed(3, 4));
+        held.put(ORDERS, SourceOrder.snapshotRow(2));
+
+        assertThatThrownBy(() -> bounds.observe(0, axis, packed(3, 5)))
+                .isInstanceOf(IllegalStateException.class)
+                .isNotInstanceOf(TapstateException.class)
+                .hasMessageContaining(ORDERS);
+    }
+
+    @Test
     void keepsTheBoundItWorkedOutWhenTheOutboxWouldNotTakeIt() {
         LevelBounds bounds = bounds(Map.of(0, List.of(ORDERS)));
         List<Watermark> taken = new ArrayList<>();

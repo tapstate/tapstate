@@ -264,8 +264,12 @@ class AFullClusterRestartRebuildsDesiredPipelinesFromMongoTruthIT {
         assertThat(item.successor().nativeJobId()).isNotBlank();
         assertThat(item.successor().nativeInitializedAt()).isNotNull();
         assertThat(item.successor().sourcesAcceptedAt()).isNotNull();
-        assertThat(control.placedVertices(pipeline).stream().map(ControlPlane.PlacedVertex::executionId)
-                .filter(java.util.Objects::nonNull).collect(Collectors.toSet())).hasSize(1);
+        Set<String> measuredExecutions = Await.answered(pipeline + " to publish its measured native execution", BOUND, () -> {
+            Set<String> reported = control.placedVertices(pipeline).stream().map(ControlPlane.PlacedVertex::executionId)
+                    .filter(java.util.Objects::nonNull).collect(Collectors.toSet());
+            return reported.isEmpty() ? Optional.empty() : Optional.of(reported);
+        });
+        assertThat(measuredExecutions).hasSize(1);
         assertThat(item.successor().acceptedPositions()).isEqualTo(item.successor().requestedPositions());
         assertThat(claim(control, pipeline).executionGeneration()).isEqualTo(previous.executionGeneration() + 1);
         assertThat(claim(control, pipeline).executionMembers().stream().map(ClusterClaimView.Member::nodeId))

@@ -18,6 +18,9 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.FrontierOrders;
+import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -56,6 +59,34 @@ class StoreBackedSinkAckFactoryTest {
 
     private static final String WRITER = "serve.s#0";
     private static final String OTHER_WRITER = "serve.t#0";
+
+    @Test
+    void aHeldNewGenerationSnapshotCannotInventADurableRingCursor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
+        ack.advance("orders", at(0, "w0"));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsEntry("orders", 0L);
+
+        Map<String, SourceOrder> pending = new LinkedHashMap<>();
+        pending.put("orders", SourceOrder.snapshotRow(2));
+        ChainAxes axes = ChainAxes.assign(List.of("orders"));
+        LevelBounds bounds = new LevelBounds(Map.of(0, List.of("orders")), axes, pending::get);
+        long newerSnapshot = FrontierOrders.pack("orders", SourceOrder.snapshotRow(2));
+        bounds.observe(0, axes.axisOf("orders"), newerSnapshot)
+                .ifPresent(packed -> ack.bounded("orders", FrontierOrders.unpack(packed)));
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .as("a held snapshot cannot acknowledge a nonexistent sequence in the preceding generation")
+                .containsExactlyEntriesOf(Map.of("orders", 0L));
+        pending.clear();
+        List<com.hazelcast.jet.core.Watermark> released = new ArrayList<>();
+        assertThat(bounds.release(released::add)).isTrue();
+        assertThat(released).extracting(com.hazelcast.jet.core.Watermark::timestamp).containsExactly(newerSnapshot);
+        released.forEach(mark -> ack.bounded("orders", FrontierOrders.unpack(mark.timestamp())));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsExactlyEntriesOf(Map.of("orders", 0L));
+    }
 
     @Test
     void anUnusedTableMappingDoesNotHoldASingleTableLegacyCheckpoint() {
