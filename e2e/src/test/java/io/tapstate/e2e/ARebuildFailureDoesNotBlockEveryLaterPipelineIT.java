@@ -10,6 +10,7 @@ import com.mongodb.client.model.changestream.OperationType;
 import io.tapstate.adapters.mongostore.MongoArtifactStore;
 import io.tapstate.adapters.mongostore.MongoSrsMetaStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringStore;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.control.core.ClusterClaimView;
 import io.tapstate.control.core.ClusterMemberState;
@@ -76,7 +77,6 @@ class ARebuildFailureDoesNotBlockEveryLaterPipelineIT {
                 MongoClient targets = MongoClients.create(targetUri); MongoClient states = MongoClients.create(storeUri)) {
             MongoDatabase target = database(targets, targetUri);
             MongoDatabase store = database(states, storeUri);
-            MongoArtifactStore artifactTruth = new MongoArtifactStore(states, SystemCollections.ARTIFACTS.on(store));
             MongoSrsMetaStore meta = new MongoSrsMetaStore(states, store.getCollection(MongoStorePort.SRS_META),
                     store.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS), store.getCollection(MongoStorePort.WORKLOAD_CLAIMS));
             for (Lane lane : LANES) database(sources, sourceUris.get(lane.source())).getCollection(lane.table()).insertOne(row(1, "seed"));
@@ -85,6 +85,8 @@ class ARebuildFailureDoesNotBlockEveryLaterPipelineIT {
                             "tapstate.execution.cluster-capacity.writers", "8"))) {
                 ControlPlane control = cluster.member(NODES.getFirst());
                 awaitActive(control, NODES);
+                MongoArtifactStore artifactTruth = new MongoArtifactStore(states, SystemCollections.ARTIFACTS.on(store),
+                        new SourceConfigKeyringStore(store).loadExistingCipher());
                 control.registerConnector(CONNECTOR, observed);
                 control.apply(resources(sourceUris, targetUri));
                 Map<String, ClusterClaimView> originals = new LinkedHashMap<>();

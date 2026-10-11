@@ -92,6 +92,14 @@ interface ControlPlaneClient extends AutoCloseable {
     GetOutcome get(URI baseUrl, String credential, String id);
 
     /**
+     * Reads secret-redacted connection settings from the existing Source API, for probing only.
+     * Generic artifact reads deliberately omit the entire config and cannot supply these settings.
+     */
+    default ConnectionSettingsOutcome connectionSettings(URI baseUrl, String credential, String id) {
+        return new ConnectionSettingsOutcome.Unreachable();
+    }
+
+    /**
      * Removes one artifact by id via {@code DELETE {baseUrl}/api/artifacts/{id}}, authenticated by the
      * bearer {@code credential} and conditioned on {@code expectedContentHash} travelling as a quoted
      * {@code If-Match}: removed on success, a coded rejection carrying the server's named parameters when

@@ -5,6 +5,14 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
+import com.mongodb.MongoWriteException;
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoException;
+import com.mongodb.event.CommandFailedEvent;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
+import com.mongodb.event.CommandSucceededEvent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
@@ -29,10 +37,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -78,7 +90,7 @@ class MongoArtifactStoreIT {
             collection.drop();
             Resource one = PARSER.parse(ORDERS);
             Resource stale = PARSER.parse(ORDERS.replace("localhost", "stale.internal"));
-            MongoArtifactStore store = new MongoArtifactStore(client, collection);
+            MongoArtifactStore store = new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32]));
             store.create(one);
             String initial = store.identity(one.id()).orElseThrow().incarnation();
             CountDownLatch readComplete = new CountDownLatch(1);
@@ -100,7 +112,7 @@ class MongoArtifactStoreIT {
                             throw failure.getCause();
                         }
                     });
-            Future<ArtifactMutation> replacement = worker.submit(() -> new MongoArtifactStore(client, delayed)
+            Future<ArtifactMutation> replacement = worker.submit(() -> new MongoArtifactStore(client, delayed, new SourceConfigCipher(new byte[32]))
                     .replace(one.id(), CanonicalHash.of(one), stale));
             assertThat(readComplete.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
             store.delete(one.id(), CanonicalHash.of(one));
@@ -109,6 +121,259 @@ class MongoArtifactStoreIT {
             assertThat(replacement.get(30, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
             assertThat(store.identity(one.id()).orElseThrow().incarnation()).isNotEqualTo(initial);
             assertThat(store.get(one.id())).contains(one);
+        }
+    }
+
+    @Test
+    void aManagedSourceReplacementCannotRebaseOntoAnIdenticallyRecreatedIncarnationOnRetry() throws Exception {
+        String databaseName = "artifact_managed_incarnation_retry";
+        CountDownLatch originalRead = new CountDownLatch(1);
+        CountDownLatch recreated = new CountDownLatch(1);
+        AtomicInteger snapshotReads = new AtomicInteger();
+        AtomicBoolean snapshotWriteConflict = new AtomicBoolean();
+        Set<Integer> keyringWrites = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        CommandListener observedCommands = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (!databaseName.equals(event.getDatabaseName())) return;
+                var command = event.getCommand();
+                if ("find".equals(event.getCommandName())
+                        && SystemCollections.ARTIFACTS.collectionName().equals(command.getString("find").getValue())
+                        && command.containsKey("autocommit") && !command.getBoolean("autocommit").getValue()
+                        && command.getDocument("filter").containsKey("_id")
+                        && "orders".equals(command.getDocument("filter").getString("_id").getValue())) {
+                    snapshotReads.incrementAndGet();
+                }
+                if ("update".equals(event.getCommandName())
+                        && SystemCollections.SYSTEM_META.collectionName().equals(command.getString("update").getValue())) {
+                    var update = command.getArray("updates").get(0).asDocument().getDocument("u");
+                    if (update.containsKey("$inc") && update.getDocument("$inc").containsKey("sourceWriteFence")) {
+                        keyringWrites.add(event.getRequestId());
+                    }
+                }
+            }
+
+            @Override public void commandFailed(CommandFailedEvent event) {
+                if (!keyringWrites.remove(event.getRequestId()) || !(event.getThrowable() instanceof MongoException failure)) return;
+                int code = failure instanceof MongoWriteException write ? write.getError().getCode() : failure.getCode();
+                if (code == 112) snapshotWriteConflict.set(true);
+            }
+
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                if (!keyringWrites.remove(event.getRequestId())) return;
+                var response = event.getResponse();
+                if (response.containsKey("writeErrors") && response.getArray("writeErrors").stream()
+                        .anyMatch(error -> error.asDocument().getNumber("code").intValue() == 112)) {
+                    snapshotWriteConflict.set(true);
+                }
+            }
+        };
+        MongoClientSettings writerSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(observedCommands).build();
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
+                MongoClient replacing = MongoClients.create(writerSettings)) {
+            var database = client.getDatabase(databaseName);
+            database.drop();
+            var collection = SystemCollections.ARTIFACTS.on(database);
+            SourceConfigKeyringStore keys = new SourceConfigKeyringStore(client, database);
+            keys.loadOrCreateCipher();
+            SourceConfigKeyringHandle baseline = new SourceConfigKeyringHandle(keys);
+            MongoArtifactStore store = new MongoArtifactStore(client, collection, baseline);
+            Resource one = PARSER.parse(ORDERS);
+            Resource stale = PARSER.parse(ORDERS.replace("localhost", "stale.internal"));
+            assertThat(store.create(one)).isEqualTo(ArtifactMutation.CREATED);
+            String initialIncarnation = store.identity(one.id()).orElseThrow().incarnation();
+            SourceConfigKeyringHandle actualWriter = new SourceConfigKeyringHandle(
+                    new SourceConfigKeyringStore(replacing, replacing.getDatabase(databaseName)));
+            AtomicBoolean firstWrite = new AtomicBoolean(true);
+            SourceConfigCipherProvider heldBeforeKeyringTouch = new SourceConfigCipherProvider() {
+                @Override public SourceConfigCipher current() { return actualWriter.current(); }
+                @Override public boolean requiresWriteFence() { return actualWriter.requiresWriteFence(); }
+                @Override public boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
+                    return actualWriter.fenceWrite(scope, keyId);
+                }
+                @Override public SourceConfigCipher refresh() {
+                    SourceConfigCipher loaded = actualWriter.refresh();
+                    if (firstWrite.compareAndSet(true, false)) {
+                        originalRead.countDown();
+                        try {
+                            if (!recreated.await(20, TimeUnit.SECONDS)) throw new AssertionError("the identical recreation did not finish");
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError("the paused Source replacement was interrupted", interrupted);
+                        }
+                    }
+                    return loaded;
+                }
+            };
+            assertThat(heldBeforeKeyringTouch.requiresWriteFence()).isTrue();
+            var worker = Executors.newSingleThreadExecutor();
+            try {
+                Future<ArtifactMutation> replacement = worker.submit(() -> new MongoArtifactStore(replacing,
+                        SystemCollections.ARTIFACTS.on(replacing.getDatabase(databaseName)), heldBeforeKeyringTouch)
+                        .replace(one.id(), CanonicalHash.of(one), stale));
+                assertThat(originalRead.await(20, TimeUnit.SECONDS)).isTrue();
+                assertThat(snapshotReads.get()).isEqualTo(1);
+                assertThat(store.delete(one.id(), CanonicalHash.of(one))).isEqualTo(ArtifactMutation.DELETED);
+                assertThat(store.create(one)).isEqualTo(ArtifactMutation.CREATED);
+                Document recreatedDocument = collection.find(new Document("_id", one.id())).first();
+                String recreatedIncarnation = store.identity(one.id()).orElseThrow().incarnation();
+                assertThat(recreatedIncarnation).isNotEqualTo(initialIncarnation);
+                recreated.countDown();
+                ArtifactMutation result = replacement.get(20, TimeUnit.SECONDS);
+
+                assertThat(snapshotWriteConflict).as("the actual server refused the stale snapshot keyring write").isTrue();
+                assertThat(snapshotReads.get()).as("the managed replacement retried with a fresh transaction").isGreaterThanOrEqualTo(2);
+                assertThat(result).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+                assertThat(collection.find(new Document("_id", one.id())).first()).isEqualTo(recreatedDocument);
+                assertThat(store.identity(one.id()).orElseThrow().incarnation()).isEqualTo(recreatedIncarnation);
+                assertThat(store.get(one.id())).contains(one);
+            } finally {
+                recreated.countDown();
+                worker.shutdownNow();
+                assertThat(worker.awaitTermination(20, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void aManagedSourceRetryPreservesAnOrderedPipelineCreateThenReplace() throws Exception {
+        managedSourceRetryPreservesAnOrderedPipelineBirth(true);
+    }
+
+    @Test
+    void aManagedSourceRetryPreservesAnOrderedAbsentPipelineUpsertThenReplace() throws Exception {
+        managedSourceRetryPreservesAnOrderedPipelineBirth(false);
+    }
+
+    private void managedSourceRetryPreservesAnOrderedPipelineBirth(boolean createOnly) throws Exception {
+        String databaseName = createOnly ? "artifact_create_replace_keyring_retry" : "artifact_upsert_replace_keyring_retry";
+        Resource pipeline = PARSER.parse(ORDERS_SYNC);
+        Resource changedPipeline = PARSER.parse(ORDERS_SYNC + "metadata:\n  description: replaced-before-keyring-retry\n");
+        Resource source = PARSER.parse(ORDERS);
+        Resource independentSource = PARSER.parse(ORDERS.replace("id: orders", "id: independent_source"));
+        CountDownLatch pipelineWritesFinished = new CountDownLatch(1);
+        CountDownLatch independentWriterCommitted = new CountDownLatch(1);
+        AtomicInteger pipelineSnapshotReads = new AtomicInteger();
+        AtomicBoolean snapshotWriteConflict = new AtomicBoolean();
+        List<String> attemptedIncarnations = new java.util.concurrent.CopyOnWriteArrayList<>();
+        Set<Integer> keyringWrites = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        CommandListener observedCommands = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (!databaseName.equals(event.getDatabaseName())) return;
+                var command = event.getCommand();
+                if ("find".equals(event.getCommandName())
+                        && SystemCollections.ARTIFACTS.collectionName().equals(command.getString("find").getValue())
+                        && command.containsKey("autocommit") && !command.getBoolean("autocommit").getValue()
+                        && command.getDocument("filter").containsKey("_id")
+                        && pipeline.id().equals(command.getDocument("filter").getString("_id").getValue())) {
+                    pipelineSnapshotReads.incrementAndGet();
+                }
+                if ("insert".equals(event.getCommandName())
+                        && SystemCollections.ARTIFACTS.collectionName().equals(command.getString("insert").getValue())) {
+                    command.getArray("documents").stream().map(value -> value.asDocument())
+                            .filter(document -> pipeline.id().equals(document.getString("_id").getValue()))
+                            .forEach(document -> attemptedIncarnations.add(document.getString("incarnation").getValue()));
+                }
+                if ("update".equals(event.getCommandName())
+                        && SystemCollections.SYSTEM_META.collectionName().equals(command.getString("update").getValue())) {
+                    var update = command.getArray("updates").get(0).asDocument().getDocument("u");
+                    if (update.containsKey("$inc") && update.getDocument("$inc").containsKey("sourceWriteFence")) {
+                        keyringWrites.add(event.getRequestId());
+                    }
+                }
+            }
+
+            @Override public void commandFailed(CommandFailedEvent event) {
+                if (!keyringWrites.remove(event.getRequestId()) || !(event.getThrowable() instanceof MongoException failure)) return;
+                int code = failure instanceof MongoWriteException write ? write.getError().getCode() : failure.getCode();
+                if (code == 112) snapshotWriteConflict.set(true);
+            }
+
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                if (!keyringWrites.remove(event.getRequestId())) return;
+                var response = event.getResponse();
+                if (response.containsKey("writeErrors") && response.getArray("writeErrors").stream()
+                        .anyMatch(error -> error.asDocument().getNumber("code").intValue() == 112)) {
+                    snapshotWriteConflict.set(true);
+                }
+            }
+        };
+        MongoClientSettings writerSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(observedCommands).build();
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
+                MongoClient writing = MongoClients.create(writerSettings)) {
+            var database = client.getDatabase(databaseName);
+            database.drop();
+            var collection = SystemCollections.ARTIFACTS.on(database);
+            SourceConfigKeyringStore keys = new SourceConfigKeyringStore(client, database);
+            keys.loadOrCreateCipher();
+            MongoArtifactStore baseline = new MongoArtifactStore(client, collection, new SourceConfigKeyringHandle(keys));
+            SourceConfigKeyringHandle actualWriter = new SourceConfigKeyringHandle(
+                    new SourceConfigKeyringStore(writing, writing.getDatabase(databaseName)));
+            AtomicBoolean firstWrite = new AtomicBoolean(true);
+            SourceConfigCipherProvider heldBeforeKeyringTouch = new SourceConfigCipherProvider() {
+                @Override public SourceConfigCipher current() { return actualWriter.current(); }
+                @Override public boolean requiresWriteFence() { return actualWriter.requiresWriteFence(); }
+                @Override public boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
+                    return actualWriter.fenceWrite(scope, keyId);
+                }
+                @Override public SourceConfigCipher refresh() {
+                    SourceConfigCipher loaded = actualWriter.refresh();
+                    if (firstWrite.compareAndSet(true, false)) {
+                        pipelineWritesFinished.countDown();
+                        try {
+                            if (!independentWriterCommitted.await(20, TimeUnit.SECONDS)) {
+                                throw new AssertionError("the independent managed Source did not commit");
+                            }
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError("the mixed artifact batch was interrupted", interrupted);
+                        }
+                    }
+                    return loaded;
+                }
+            };
+            assertThat(heldBeforeKeyringTouch.requiresWriteFence()).isTrue();
+            var worker = Executors.newSingleThreadExecutor();
+            try {
+                ArtifactWrite birth = createOnly ? ArtifactWrite.createOnly(pipeline) : ArtifactWrite.upsert(pipeline);
+                Future<ArtifactBatchWrite> pending = worker.submit(() -> new MongoArtifactStore(writing,
+                        SystemCollections.ARTIFACTS.on(writing.getDatabase(databaseName)), heldBeforeKeyringTouch)
+                        .writeAll(List.of(birth, ArtifactWrite.replaceOnly(changedPipeline, CanonicalHash.of(pipeline)),
+                                ArtifactWrite.upsert(source))));
+                assertThat(pipelineWritesFinished.await(20, TimeUnit.SECONDS)).isTrue();
+                assertThat(attemptedIncarnations).hasSize(1);
+                assertThat(pipelineSnapshotReads.get()).isPositive();
+                assertThat(collection.find(new Document("_id", pipeline.id())).first())
+                        .as("the first attempt's Pipeline birth and replacement are still uncommitted").isNull();
+                assertThat(baseline.create(independentSource)).isEqualTo(ArtifactMutation.CREATED);
+                independentWriterCommitted.countDown();
+                ArtifactBatchWrite result = pending.get(20, TimeUnit.SECONDS);
+
+                assertThat(snapshotWriteConflict).as("the actual server refused the stale snapshot keyring write").isTrue();
+                assertThat(attemptedIncarnations).hasSizeGreaterThanOrEqualTo(2).doesNotHaveDuplicates();
+                assertThat(pipelineSnapshotReads.get()).as("the ordered replacement ran in the actual retry").isGreaterThanOrEqualTo(2);
+                assertThat(result.appliedSuccessfully()).isTrue();
+                assertThat(baseline.get(pipeline.id())).contains(changedPipeline);
+                assertThat(baseline.get(source.id())).contains(source);
+                assertThat(baseline.get(independentSource.id())).contains(independentSource);
+                assertThat(collection.countDocuments(new Document("_id", pipeline.id()))).isEqualTo(1);
+                Document committedPipeline = collection.find(new Document("_id", pipeline.id())).first();
+                assertThat(committedPipeline.getString("incarnation")).isEqualTo(attemptedIncarnations.getLast());
+                assertThat(baseline.identity(pipeline.id()).orElseThrow().incarnation())
+                        .isEqualTo(committedPipeline.getString("incarnation"));
+                assertThat(committedPipeline.getString("contentHash")).isEqualTo(CanonicalHash.of(changedPipeline));
+                Document committedSource = collection.find(new Document("_id", source.id())).first();
+                assertThat(committedSource.get("body", Document.class).get("config"))
+                        .isInstanceOf(String.class).asString().startsWith("tscfg:1:");
+                assertThat(committedSource.getString("incarnation")).isNotBlank();
+            } finally {
+                independentWriterCommitted.countDown();
+                worker.shutdownNow();
+                assertThat(worker.awaitTermination(20, TimeUnit.SECONDS)).isTrue();
+            }
         }
     }
 
@@ -286,6 +551,70 @@ class MongoArtifactStoreIT {
     }
 
     @Test
+    void aPrimaryIdCollisionRefusesCreateAndRollsBackBatchSiblings() {
+        withStore((store, collection) -> {
+            Resource source = PARSER.parse(ORDERS);
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
+            Document before = collection.find(new Document("_id", "orders")).first();
+            MongoWriteException duplicate = (MongoWriteException) catchThrowable(() ->
+                    collection.insertOne(new Document("_id", "orders")));
+            assertThat(duplicate.getError().getCode()).isEqualTo(11000);
+            assertThat(duplicate.getError().getDetails()).isEmpty();
+
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            Resource sibling = PARSER.parse(ORDERS.replace("id: orders", "id: new_sibling"));
+            ArtifactBatchWrite refused = store.writeAll(List.of(
+                    ArtifactWrite.createOnly(sibling), ArtifactWrite.createOnly(source)));
+            assertThat(refused.refusedId()).isEqualTo("orders");
+            assertThat(refused.refusal()).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            assertThat(collection.find(new Document("_id", "new_sibling")).first()).isNull();
+            assertThat(collection.find(new Document("_id", "orders")).first()).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aNonIdUniqueCollisionRemainsAStoreFailureForSingleCreate() {
+        withStore((store, collection) -> {
+            collection.createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            Resource source = PARSER.parse(ORDERS);
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
+            Document before = collection.find(new Document("_id", "orders")).first();
+            Resource other = PARSER.parse(ORDERS.replace("id: orders", "id: other_source"));
+            MongoWriteException duplicate = (MongoWriteException) catchThrowable(() ->
+                    collection.insertOne(new Document("_id", "driver_probe").append("kind", "source")));
+            assertThat(duplicate.getError().getCode()).isEqualTo(11000);
+            assertThat(duplicate.getError().getDetails()).isEmpty();
+
+            assertThatThrownBy(() -> store.create(other)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                assertThat(failure.args()).containsExactlyEntriesOf(Map.of("detail", "MongoWriteException code=11000"));
+                assertThat(failure.getCause()).isNull();
+            });
+            assertThat(collection.find(new Document("_id", "other_source")).first()).isNull();
+            assertThat(collection.find(new Document("_id", "orders")).first()).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aNonIdUniqueCollisionRollsBackAnEntireConditionalCreateBatch() {
+        withStore((store, collection) -> {
+            collection.createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            Resource first = PARSER.parse(ORDERS);
+            Resource second = PARSER.parse(ORDERS.replace("id: orders", "id: second_source"));
+
+            assertThatThrownBy(() -> store.writeAll(List.of(
+                    ArtifactWrite.createOnly(first), ArtifactWrite.createOnly(second))))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(failure.args()).containsExactlyEntriesOf(
+                                Map.of("detail", "MongoWriteException code=11000"));
+                        assertThat(failure.getCause()).isNull();
+                    });
+            assertThat(collection.countDocuments()).isZero();
+        });
+    }
+
+    @Test
     void workspaceGuardRefusesAPipelineCreateAfterItsSourceChanged() {
         withStore((store, collection) -> {
             Resource source = PARSER.parse(ORDERS);
@@ -301,8 +630,10 @@ class MongoArtifactStoreIT {
             assertThat(outcome.refusedId()).isEqualTo("orders");
             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
             assertThat(collection.find(new Document("_id", "orders_sync")).first()).isNull();
-            assertThat(storedBody(collection, "orders"))
-                    .isEqualTo(bodyOf(changedSource));
+            assertThat(store.get("orders")).contains(changedSource);
+            assertThat(storedBody(collection, "orders").get("config"))
+                    .isInstanceOf(String.class)
+                    .asString().startsWith("tscfg:1:").doesNotContain("replica");
         });
     }
 
@@ -345,11 +676,11 @@ class MongoArtifactStoreIT {
                             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
                         });
 
-                Map<String, Object> expectedBody = alphaOutcome.appliedSuccessfully()
-                        ? bodyOf(alphaReplacement)
-                        : bodyOf(betaReplacement);
-                assertThat(storedBody(collection, "orders"))
-                        .isEqualTo(expectedBody);
+                Resource winner = alphaOutcome.appliedSuccessfully() ? alphaReplacement : betaReplacement;
+                assertThat(store.get("orders")).contains(winner);
+                assertThat(storedBody(collection, "orders").get("config"))
+                        .isInstanceOf(String.class)
+                        .asString().startsWith("tscfg:1:").doesNotContain("alpha", "beta");
             } catch (Exception error) {
                 throw new AssertionError("concurrent replace test failed", error);
             }
@@ -521,7 +852,7 @@ class MongoArtifactStoreIT {
             MongoDatabase database = client.getDatabase("tapstate");
             MongoCollection<Document> collection = database.getCollection("artifacts");
             collection.drop();
-            MongoArtifactStore store = new MongoArtifactStore(client, collection);
+            MongoArtifactStore store = new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32]));
             store.saveAll(List.of(PARSER.parse(ORDERS), PARSER.parse(ORDERS_SYNC)));
             // Built by the product from the row's own declaration rather than written out here: a test
             // that created its own index would keep passing over a release that ships none.
@@ -560,11 +891,6 @@ class MongoArtifactStoreIT {
         return plain(body);
     }
 
-    /** The body {@code resource} is stored as, to compare against {@link #storedBody}. */
-    private static Map<String, Object> bodyOf(Resource resource) {
-        return plain(WRITER.tree(resource));
-    }
-
     /**
      * The same map with every nested map flattened to one type. A body goes to the driver as plain
      * maps and comes back as {@code Document}s, and {@code Document.equals} answers false to anything
@@ -595,7 +921,7 @@ class MongoArtifactStoreIT {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("artifacts");
             collection.drop();
-            test.run(new MongoArtifactStore(client, collection), collection);
+            test.run(new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32])), collection);
         }
     }
 }

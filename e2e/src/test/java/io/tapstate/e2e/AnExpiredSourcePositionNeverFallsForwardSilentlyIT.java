@@ -8,6 +8,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoArtifactStore;
 import io.tapstate.adapters.mongostore.MongoSrsMetaStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringStore;
 import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.control.core.ClusterPipelineRecoveryView;
 import io.tapstate.control.core.ClusterRecoveryItemView;
@@ -274,7 +275,8 @@ class AnExpiredSourcePositionNeverFallsForwardSilentlyIT {
     }
 
     private static ArchivedSource archiveDiagnostic(MongoClient state, MongoDatabase store, String originalCapture) {
-        MongoArtifactStore artifacts = new MongoArtifactStore(state, store.getCollection(MongoStorePort.ARTIFACTS));
+        MongoArtifactStore artifacts = new MongoArtifactStore(state, store.getCollection(MongoStorePort.ARTIFACTS),
+                new SourceConfigKeyringStore(store).loadExistingCipher());
         PipelineResource pipeline = (PipelineResource) artifacts.get(EXPIRED).orElseThrow();
         SourceRef.Spec reference = (SourceRef.Spec) pipeline.sources().stream()
                 .filter(ref -> EXPIRED_SOURCE.equals(ref.id())).findFirst().orElseThrow();

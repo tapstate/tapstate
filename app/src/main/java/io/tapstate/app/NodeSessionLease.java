@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import org.slf4j.Logger;
@@ -40,6 +41,7 @@ final class NodeSessionLease implements AutoCloseable {
     private final io.tapstate.spi.store.ClusterProfileStore profiles;
     private final java.util.function.Supplier<JoinedIdentity> nativeIdentity;
     private JoinedIdentity publishedIdentity;
+    private final SourceConfigKeyringSession sourceConfigKeyring;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -54,6 +56,7 @@ final class NodeSessionLease implements AutoCloseable {
         this.profiles = null;
         this.nativeIdentity = null;
         this.publishedIdentity = null;
+        this.sourceConfigKeyring = null;
         this.renewer = null;
         this.closed.set(true);
     }
@@ -105,19 +108,31 @@ final class NodeSessionLease implements AutoCloseable {
             Duration ttl,
             Duration renewInterval,
             Runnable lost) {
-        this(store, initial, askedAt, ttl, renewInterval, lost, null, null, null, false);
+        this(store, initial, askedAt, ttl, renewInterval, null, lost, null, null, null, false);
+    }
+
+    NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl,
+            Duration renewInterval, SourceConfigKeyringSession sourceConfigKeyring, Runnable lost) {
+        this(store, initial, askedAt, ttl, renewInterval, sourceConfigKeyring, lost, null, null, null, false);
     }
 
     NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl,
             Duration renewInterval, Runnable lost, io.tapstate.spi.store.ClusterProfileStore profiles,
             java.util.function.Supplier<JoinedIdentity> nativeIdentity, JoinedIdentity publishedIdentity) {
-        this(store, initial, askedAt, ttl, renewInterval, lost, profiles, nativeIdentity, publishedIdentity, true);
+        this(store, initial, askedAt, ttl, renewInterval, null, lost, profiles, nativeIdentity, publishedIdentity, true);
+    }
+
+    NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl,
+            Duration renewInterval, SourceConfigKeyringSession sourceConfigKeyring, Runnable lost,
+            io.tapstate.spi.store.ClusterProfileStore profiles, java.util.function.Supplier<JoinedIdentity> nativeIdentity,
+            JoinedIdentity publishedIdentity) {
+        this(store, initial, askedAt, ttl, renewInterval, sourceConfigKeyring, lost, profiles, nativeIdentity, publishedIdentity, true);
     }
 
     private NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl,
-            Duration renewInterval, Runnable lost, io.tapstate.spi.store.ClusterProfileStore profiles,
-            java.util.function.Supplier<JoinedIdentity> nativeIdentity, JoinedIdentity publishedIdentity,
-            boolean refreshJoin) {
+            Duration renewInterval, SourceConfigKeyringSession sourceConfigKeyring, Runnable lost,
+            io.tapstate.spi.store.ClusterProfileStore profiles, java.util.function.Supplier<JoinedIdentity> nativeIdentity,
+            JoinedIdentity publishedIdentity, boolean refreshJoin) {
         this.store = Objects.requireNonNull(store, "store");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         this.ttl = Objects.requireNonNull(ttl, "ttl");
@@ -131,6 +146,7 @@ final class NodeSessionLease implements AutoCloseable {
         if (this.publishedIdentity != null && !this.publishedIdentity.names(initial)) {
             throw joinLost();
         }
+        this.sourceConfigKeyring = sourceConfigKeyring;
         Objects.requireNonNull(renewInterval, "renewInterval");
         this.provenUntil = askedAt + ttl.toNanos();
         // Two threads: a renewal the store never answers holds one of them, and the lapse still has to be
@@ -158,9 +174,12 @@ final class NodeSessionLease implements AutoCloseable {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
             if (renewed.isPresent()) {
                 if (closed.get()) return;
-                refreshChangedJoin(expected, renewed.get());
+                WorkloadClaim accepted = renewed.get();
+                refreshChangedJoin(expected, accepted);
                 if (closed.get()) return;
-                current.set(renewed.get());
+                if (sourceConfigKeyring != null) sourceConfigKeyring.acknowledge(accepted, ttl);
+                if (closed.get()) return;
+                current.set(accepted);
                 provenUntil = askedAt + ttl.toNanos();
                 return;
             }
@@ -223,10 +242,19 @@ final class NodeSessionLease implements AutoCloseable {
             return;
         }
         renewer.shutdownNow();
+        WorkloadClaim ending = current.get();
         try {
-            store.release(current.get());
+            store.release(ending);
         } catch (RuntimeException unavailable) {
             LOG.warn("Could not release the node session during shutdown; it will expire by lease.", unavailable);
+        }
+        if (sourceConfigKeyring != null) {
+            try {
+                sourceConfigKeyring.release(ending);
+            } catch (RuntimeException unavailable) {
+                LOG.warn("Could not release the Source config keyring acknowledgement; it will expire by lease.",
+                        unavailable);
+            }
         }
     }
 }

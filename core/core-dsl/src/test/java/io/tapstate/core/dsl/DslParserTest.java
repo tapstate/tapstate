@@ -50,6 +50,26 @@ class DslParserTest {
     }
 
     @Test
+    void retainsWhetherSourceConfigWasOmittedOrExplicitlyEmpty() {
+        String outer = """
+                version: tapstate/v1
+                kind: source
+                id: orders
+                connector: mongodb
+                """;
+
+        DslParser.ParsedResource omitted = parser.parseWithDeclaredFields(outer);
+        DslParser.ParsedResource explicit = parser.parseWithDeclaredFields(outer + "config: {}\n");
+
+        assertThat(omitted.resource()).isInstanceOf(SourceResource.class);
+        assertThat(explicit.resource()).isInstanceOf(SourceResource.class);
+        assertThat(((SourceResource) omitted.resource()).config()).isEmpty();
+        assertThat(((SourceResource) explicit.resource()).config()).isEmpty();
+        assertThat(omitted.declaredFields()).doesNotContain("config");
+        assertThat(explicit.declaredFields()).contains("config");
+    }
+
+    @Test
     void rejectsRelocatedSourceReadOption() {
         // read_mode / start_from moved to pipeline settings; the old source-level option names are
         // rejected as unknown fields rather than silently passed through the free options map.

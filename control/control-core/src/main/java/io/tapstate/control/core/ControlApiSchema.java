@@ -55,6 +55,7 @@ public final class ControlApiSchema {
         bind(refs, "connector.get", "ConnectorGet");
         bind(refs, "source.list", "SourceList");
         bind(refs, "source.get", "SourceGet");
+        bind(refs, "source.reveal-config", "SourceRevealConfig");
         bind(refs, "source.create", "SourceCreate");
         bind(refs, "source.draft", "SourceDraft");
         bind(refs, "connection.test", "ConnectionTest");
@@ -122,6 +123,17 @@ public final class ControlApiSchema {
         pair(defs, "ConnectorGet", object(List.of("id"), Map.of("id", id), false), opaque);
         pair(defs, "SourceList", listRequest, sourceListResult);
         pair(defs, "SourceGet", object(List.of("id"), Map.of("id", id), false), opaque);
+        pair(defs, "SourceRevealConfig", object(
+                List.of("id", "grant"),
+                Map.of(
+                        "id", id,
+                        "grant", string("Short-lived, one-time grant bound to this Source")),
+                false), object(
+                        List.of("id", "config"),
+                        Map.of(
+                                "id", id,
+                                "config", object(List.of(), Map.of(), true)),
+                        false));
 
         Map<String, Object> sourceProperties = new LinkedHashMap<>();
         sourceProperties.put("id", id);

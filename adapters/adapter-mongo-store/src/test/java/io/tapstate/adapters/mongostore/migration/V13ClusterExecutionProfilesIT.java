@@ -20,20 +20,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @RequiresDocker
-class V12ClusterExecutionProfilesIT {
+class V13ClusterExecutionProfilesIT {
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     @Test
     void backfillPreservesCanonicalBytesAndIdentityOnASecondRun() {
         try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            var database = client.getDatabase("v12_incarnations");
+            var database = client.getDatabase("v13_incarnations");
             database.drop();
             var artifacts = SystemCollections.ARTIFACTS.on(database);
             Document legacy = new Document("_id", "orders").append("kind", "pipeline")
                     .append("body", new Document("key", "value")).append("contentHash", "same-hash");
             artifacts.insertOne(legacy);
-            var change = new V12ClusterExecutionProfiles();
+            var change = new V13ClusterExecutionProfiles();
 
             change.up(database, ChangeSet.Fence.HELD);
             Document once = artifacts.find().first();
@@ -50,14 +50,14 @@ class V12ClusterExecutionProfilesIT {
     @Test
     void liveBusinessLeaseRefusesTheColdUpgradeBeforeAnyIncarnationWrite() {
         try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            var database = client.getDatabase("v12_live_legacy");
+            var database = client.getDatabase("v13_live_legacy");
             database.drop();
             var claims = SystemCollections.WORKLOAD_CLAIMS.on(database);
             claims.insertOne(new Document("_id", "legacy-pipeline").append("resourceType", "PIPELINE_ACTUATION")
                     .append("leaseUntil", new Date(Long.MAX_VALUE)));
             var artifacts = SystemCollections.ARTIFACTS.on(database);
             artifacts.insertOne(new Document("_id", "orders").append("contentHash", "same"));
-            var change = new V12ClusterExecutionProfiles();
+            var change = new V13ClusterExecutionProfiles();
 
             assertThatThrownBy(() -> change.up(database, ChangeSet.Fence.HELD))
                     .isInstanceOfSatisfying(TapstateException.class,

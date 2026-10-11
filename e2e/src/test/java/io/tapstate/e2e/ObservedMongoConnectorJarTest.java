@@ -51,6 +51,7 @@ class ObservedMongoConnectorJarTest {
         }
         assertThat(entries.keySet()).containsExactlyInAnyOrder(
                 "io/tapstate/e2e/mongowitness/ObservedMongoConnector.class",
+                "io/tapstate/e2e/mongowitness/ObservedMongoConnector$1.class",
                 "io/tapstate/e2e/mongowitness/WriteTableWitness.class",
                 "observed-mongo-spec.json", "mongo-write-witness-path.txt");
         assertThat(entries.get("observed-mongo-spec.json")).containsExactly(spec);

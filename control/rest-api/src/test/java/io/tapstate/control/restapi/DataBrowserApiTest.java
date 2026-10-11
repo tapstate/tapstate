@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlOperations;
+import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.DataBrowserPreviewReport;
 import io.tapstate.control.core.DataBrowserService;
 import io.tapstate.control.core.DataBrowserStatsReport;
@@ -641,6 +642,11 @@ class DataBrowserApiTest {
         @Bean
         TokenService tokenService(TokenStore store, TokenSecrets secrets, Clock clock) {
             return new TokenService(store, secrets, clock);
+        }
+
+        @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
         }
 
         @Bean

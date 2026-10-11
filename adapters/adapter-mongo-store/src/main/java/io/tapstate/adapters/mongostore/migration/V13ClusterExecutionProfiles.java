@@ -18,10 +18,10 @@ import java.util.Map;
 import java.util.UUID;
 
 /** Introduces profile-aware coordination and durable artifact incarnations after a cold upgrade. */
-public final class V12ClusterExecutionProfiles implements ChangeSet {
+public final class V13ClusterExecutionProfiles implements ChangeSet {
     @Override
     public int version() {
-        return 12;
+        return 13;
     }
 
     @Override

@@ -58,100 +58,117 @@ class AFullStopCanAdvanceTheClusterProfileGenerationIT {
             }
             assertThat(liveSessions(store, cluster.clusterId())).isEqualTo(NODES.size());
             List<Long> generationChanges = new ArrayList<>();
+            AdmissionWitness witness = new AdmissionWitness(store, cluster.clusterId());
 
             try (MongoChangeStreamCursor<ChangeStreamDocument<Document>> changes =
                     SystemCollections.CLUSTER_EXECUTION_PROFILES.on(store).watch()
                             .maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor()) {
-                drain(changes, cluster.clusterId(), generationChanges);
-                cluster.killAll();
-                assertThat(NODES).allSatisfy(node -> assertThat(cluster.isAlive(node)).isFalse());
-                assertThat(liveSessions(store, cluster.clusterId())).isPositive();
-                RealProcessServer early = cluster.launchCandidate(NODES.getFirst(), NEXT);
-                Await.until("a mixed profile to be refused while old node authority remains", BOUND,
-                        () -> !early.isAlive(), () -> "early candidate output:\n" + early.tail());
-                assertThat(early.exitValue()).isNotZero();
-                assertThat(Files.readString(early.output())).contains("boot.execution-profile-incompatible")
-                        .contains(hash).doesNotContain("boot.node-id-in-use");
-                assertThat(liveSessions(store, cluster.clusterId()))
-                        .as("the negative control still lies inside a real old lease window").isPositive();
-                assertThat(profile(store, cluster.clusterId()).get("generation", Number.class).longValue()).isEqualTo(generation);
-                assertThat(profile(store, cluster.clusterId()).getString("hash")).isEqualTo(hash);
-                drain(changes, cluster.clusterId(), generationChanges);
-                assertThat(generationChanges).isEmpty();
+                try {
+                    drain(changes, cluster.clusterId(), generationChanges, witness);
+                    witness.snapshot("before-kill");
+                    cluster.killAll();
+                    witness.snapshot("after-kill");
+                    assertThat(NODES).allSatisfy(node -> assertThat(cluster.isAlive(node)).isFalse());
+                    assertThat(liveSessions(store, cluster.clusterId())).isPositive();
+                    witness.snapshot("before-early-launch");
+                    RealProcessServer early = cluster.launchCandidate(NODES.getFirst(), NEXT);
+                    witness.candidate(early);
+                    witness.snapshot("after-early-launch");
+                    Await.until("a mixed profile to be refused while old node authority remains", BOUND,
+                            () -> {
+                                drain(changes, cluster.clusterId(), generationChanges, witness);
+                                return !early.isAlive();
+                            }, () -> "early candidate output:\n" + early.tail());
+                    witness.snapshot("early-candidate-returned");
+                    assertThat(early.exitValue()).isNotZero();
+                    assertThat(Files.readString(early.output())).contains("boot.execution-profile-incompatible")
+                            .contains(hash).doesNotContain("boot.node-id-in-use");
+                    assertThat(liveSessions(store, cluster.clusterId()))
+                            .as("the negative control still lies inside a real old lease window").isPositive();
+                    assertThat(profile(store, cluster.clusterId()).get("generation", Number.class).longValue()).isEqualTo(generation);
+                    assertThat(profile(store, cluster.clusterId()).getString("hash")).isEqualTo(hash);
+                    drain(changes, cluster.clusterId(), generationChanges, witness);
+                    assertThat(generationChanges).isEmpty();
 
-                Await.until("all old node sessions and their promised authorization horizon to expire on Mongo time", BOUND,
-                        () -> liveSessions(store, cluster.clusterId()) == 0
-                                && SystemCollections.CLUSTER_EXECUTION_PROFILES.on(store).find(new Document("_id", cluster.clusterId())
-                                        .append("$expr", new Document("$lte", List.of("$authorizationUntil", "$$NOW")))).first() != null,
-                        () -> "live sessions=" + liveSessions(store, cluster.clusterId())
-                                + ", profile=" + profile(store, cluster.clusterId()));
-                for (String node : NODES) {
-                    assertThat(nodeSession(store, cluster.clusterId(), node).getString("ownerBootId")).isEqualTo(oldBoots.get(node));
-                }
-                // The existing fixture starts every owned process before any health wait or login.
-                cluster.relaunchAll(NEXT);
-                ControlPlane reopened = cluster.member(NODES.getFirst());
-                awaitActive(reopened);
-                Document current = profile(store, cluster.clusterId());
-                long nextGeneration = current.get("generation", Number.class).longValue();
-                String nextHash = current.getString("hash");
-                assertThat(nextGeneration).isEqualTo(generation + 1);
-                assertThat(nextHash).isNotEqualTo(hash);
-                assertThat(current.get("attributes", Document.class).getString("heapTier")).isEqualTo(NEXT_TIER);
-                Await.until("the profile change stream to carry the actual single CAS advance", BOUND,
-                        () -> {
-                            drain(changes, cluster.clusterId(), generationChanges);
-                            return !generationChanges.isEmpty();
-                        }, () -> "generation mutations=" + generationChanges);
-                drain(changes, cluster.clusterId(), generationChanges);
-                assertThat(generationChanges).containsExactly(nextGeneration);
+                    Await.until("all old node sessions and their promised authorization horizon to expire on Mongo time", BOUND,
+                            () -> liveSessions(store, cluster.clusterId()) == 0
+                                    && SystemCollections.CLUSTER_EXECUTION_PROFILES.on(store).find(new Document("_id", cluster.clusterId())
+                                            .append("$expr", new Document("$lte", List.of("$authorizationUntil", "$$NOW")))).first() != null,
+                            () -> "live sessions=" + liveSessions(store, cluster.clusterId())
+                                    + ", profile=" + profile(store, cluster.clusterId()));
+                    for (String node : NODES) {
+                        assertThat(nodeSession(store, cluster.clusterId(), node).getString("ownerBootId")).isEqualTo(oldBoots.get(node));
+                    }
+                    // The existing fixture starts every owned process before any health wait or login.
+                    cluster.relaunchAll(NEXT);
+                    ControlPlane reopened = cluster.member(NODES.getFirst());
+                    awaitActive(reopened);
+                    Document current = profile(store, cluster.clusterId());
+                    long nextGeneration = current.get("generation", Number.class).longValue();
+                    String nextHash = current.getString("hash");
+                    assertThat(nextGeneration).isEqualTo(generation + 1);
+                    assertThat(nextHash).isNotEqualTo(hash);
+                    assertThat(current.get("attributes", Document.class).getString("heapTier")).isEqualTo(NEXT_TIER);
+                    Await.until("the profile change stream to carry the actual single CAS advance", BOUND,
+                            () -> {
+                                drain(changes, cluster.clusterId(), generationChanges, witness);
+                                return !generationChanges.isEmpty();
+                            }, () -> "generation mutations=" + generationChanges);
+                    drain(changes, cluster.clusterId(), generationChanges, witness);
+                    assertThat(generationChanges).containsExactly(nextGeneration);
 
-                Document committed = SystemCollections.CLUSTER_MEMBERSHIP.on(store).find(new Document("_id", cluster.clusterId())).first();
-                assertThat(committed).isNotNull();
-                assertThat(committed.get("profileGeneration", Number.class).longValue()).isEqualTo(nextGeneration);
-                assertThat(committed.getList("activeNodeIds", String.class)).containsExactlyInAnyOrderElementsOf(NODES);
-                for (String node : NODES) {
-                    ControlPlane control = cluster.member(node);
-                    assertThat(control.clusterStatus().clusterId()).isEqualTo(cluster.clusterId());
-                    assertThat(control.clusterStatus().profileGeneration()).isEqualTo(nextGeneration);
-                    assertThat(control.clusterStatus().profileHash()).isEqualTo(nextHash);
-                    assertThat(control.clusterProfile().generation()).isEqualTo(nextGeneration);
-                    assertThat(control.clusterProfile().hash()).isEqualTo(nextHash);
-                    Document session = nodeSession(store, cluster.clusterId(), node);
-                    assertThat(session.get("profileGeneration", Number.class).longValue()).isEqualTo(nextGeneration);
-                    assertThat(session.getString("ownerBootId")).isNotEqualTo(oldBoots.get(node));
-                    assertThat(session.getString("ownerNodeId")).isEqualTo(node);
-                    Document registry = SystemCollections.CLUSTER_NODE_REGISTRY.on(store)
-                            .find(new Document("clusterId", cluster.clusterId()).append("nodeId", node)).first();
-                    assertThat(registry).isNotNull();
-                    assertThat(registry.get("profileGeneration", Number.class).longValue()).isEqualTo(nextGeneration);
-                    assertThat(registry.getString("hash")).isEqualTo(nextHash);
-                    assertThat(registry.getString("bootId")).isEqualTo(session.getString("ownerBootId"));
-                    assertThat(registry.getBoolean("joined")).isTrue();
-                    List<ClusterMemberView> observed = control.clusterStatus().members().stream()
-                            .filter(member -> member.nodeId().equals(node)).toList();
-                    assertThat(observed).singleElement().satisfies(member -> {
-                        assertThat(member.live()).isTrue();
-                        assertThat(member.sessionLeased()).isTrue();
-                        assertThat(member.sessionBootId()).isEqualTo(session.getString("ownerBootId"));
-                        assertThat(member.bootId()).isEqualTo(session.getString("ownerBootId"));
-                        assertThat(member.profileGeneration()).isEqualTo(nextGeneration);
-                        assertThat(member.profileHash()).isEqualTo(nextHash);
-                        assertThat(member.memberUuid()).isEqualTo(registry.getString("memberUuid"));
-                    });
+                    Document committed = SystemCollections.CLUSTER_MEMBERSHIP.on(store).find(new Document("_id", cluster.clusterId())).first();
+                    assertThat(committed).isNotNull();
+                    assertThat(committed.get("profileGeneration", Number.class).longValue()).isEqualTo(nextGeneration);
+                    assertThat(committed.getList("activeNodeIds", String.class)).containsExactlyInAnyOrderElementsOf(NODES);
+                    for (String node : NODES) {
+                        ControlPlane control = cluster.member(node);
+                        assertThat(control.clusterStatus().clusterId()).isEqualTo(cluster.clusterId());
+                        assertThat(control.clusterStatus().profileGeneration()).isEqualTo(nextGeneration);
+                        assertThat(control.clusterStatus().profileHash()).isEqualTo(nextHash);
+                        assertThat(control.clusterProfile().generation()).isEqualTo(nextGeneration);
+                        assertThat(control.clusterProfile().hash()).isEqualTo(nextHash);
+                        Document session = nodeSession(store, cluster.clusterId(), node);
+                        assertThat(session.get("profileGeneration", Number.class).longValue()).isEqualTo(nextGeneration);
+                        assertThat(session.getString("ownerBootId")).isNotEqualTo(oldBoots.get(node));
+                        assertThat(session.getString("ownerNodeId")).isEqualTo(node);
+                        Document registry = SystemCollections.CLUSTER_NODE_REGISTRY.on(store)
+                                .find(new Document("clusterId", cluster.clusterId()).append("nodeId", node)).first();
+                        assertThat(registry).isNotNull();
+                        assertThat(registry.get("profileGeneration", Number.class).longValue()).isEqualTo(nextGeneration);
+                        assertThat(registry.getString("hash")).isEqualTo(nextHash);
+                        assertThat(registry.getString("bootId")).isEqualTo(session.getString("ownerBootId"));
+                        assertThat(registry.getBoolean("joined")).isTrue();
+                        List<ClusterMemberView> observed = control.clusterStatus().members().stream()
+                                .filter(member -> member.nodeId().equals(node)).toList();
+                        assertThat(observed).singleElement().satisfies(member -> {
+                            assertThat(member.live()).isTrue();
+                            assertThat(member.sessionLeased()).isTrue();
+                            assertThat(member.sessionBootId()).isEqualTo(session.getString("ownerBootId"));
+                            assertThat(member.bootId()).isEqualTo(session.getString("ownerBootId"));
+                            assertThat(member.profileGeneration()).isEqualTo(nextGeneration);
+                            assertThat(member.profileHash()).isEqualTo(nextHash);
+                            assertThat(member.memberUuid()).isEqualTo(registry.getString("memberUuid"));
+                        });
+                    }
+                    assertThat(liveSessions(store, cluster.clusterId())).isEqualTo(NODES.size());
+                    drain(changes, cluster.clusterId(), generationChanges, witness);
+                    assertThat(generationChanges).containsExactly(nextGeneration);
+                } catch (AssertionError | RuntimeException failure) {
+                    witness.snapshot("assertion-failure");
+                    witness.save(failure);
+                    throw failure;
                 }
-                assertThat(liveSessions(store, cluster.clusterId())).isEqualTo(NODES.size());
-                drain(changes, cluster.clusterId(), generationChanges);
-                assertThat(generationChanges).containsExactly(nextGeneration);
             }
         }
     }
 
     /** The exact generation field mutation, rather than an update-lookup of whichever profile is current later. */
     private static void drain(MongoChangeStreamCursor<ChangeStreamDocument<Document>> cursor,
-            String clusterId, List<Long> generations) {
+            String clusterId, List<Long> generations, AdmissionWitness witness) {
         for (ChangeStreamDocument<Document> change; (change = cursor.tryNext()) != null;) {
             if (change.getDocumentKey() == null || !clusterId.equals(change.getDocumentKey().getString("_id").getValue())) continue;
+            witness.event(change);
             if (change.getOperationType() == OperationType.UPDATE) {
                 BsonValue generation = change.getUpdateDescription().getUpdatedFields().get("generation");
                 if (generation != null) {
@@ -161,6 +178,107 @@ class AFullStopCanAdvanceTheClusterProfileGenerationIT {
             } else {
                 throw new AssertionError("an installed immutable profile changed without a generation-field update: "
                         + change.getOperationType());
+            }
+        }
+    }
+
+    /** Passive facts from this owned scene; reads and output never supply an admission decision. */
+    private static final class AdmissionWitness {
+        private final MongoDatabase store;
+        private final String clusterId;
+        private final List<Document> snapshots = new ArrayList<>();
+        private final List<Document> events = new ArrayList<>();
+        private final List<Document> generationEvents = new ArrayList<>();
+        private Document candidate;
+        private int omittedEvents;
+
+        AdmissionWitness(MongoDatabase store, String clusterId) {
+            this.store = store.withReadPreference(com.mongodb.ReadPreference.primary())
+                    .withReadConcern(com.mongodb.ReadConcern.MAJORITY).withTimeout(2, TimeUnit.SECONDS);
+            this.clusterId = clusterId;
+        }
+
+        void candidate(RealProcessServer process) {
+            candidate = new Document("pid", process.pid()).append("nodeId", NODES.getFirst())
+                    .append("requestedHeapTier", NEXT_TIER);
+            var arguments = ProcessHandle.of(process.pid()).flatMap(handle -> handle.info().arguments());
+            if (arguments.isPresent()) {
+                List<String> prefixes = List.of("--tapstate.cluster.execution-profile.heap-tier=",
+                        "--tapstate.cluster.mode=", "--tapstate.cluster.id=", "--tapstate.cluster.node-id=");
+                candidate.append("actualAdmissionArguments", java.util.Arrays.stream(arguments.orElseThrow())
+                        .filter(argument -> prefixes.stream().anyMatch(argument::startsWith)).toList());
+            } else {
+                candidate.append("actualAdmissionArgumentsUnknown", true);
+            }
+        }
+
+        void snapshot(String phase) {
+            Document snapshot = new Document("phase", phase);
+            try {
+                Document fields = new Document("_id", 1).append("generation", 1).append("hash", 1)
+                        .append("authorizationUntil", 1).append("formatVersion", 1)
+                        .append("attributes.heapTier", 1).append("attributes.systemDataVersion", 1)
+                        .append("attributes.profile-protocol", 1).append("writeSerial", 1).append("mongoNow", 1);
+                snapshot.append("profile", SystemCollections.CLUSTER_EXECUTION_PROFILES.on(store).aggregate(List.of(
+                        new Document("$match", new Document("_id", clusterId)),
+                        new Document("$set", new Document("mongoNow", "$$NOW")),
+                        new Document("$project", fields))).maxTime(2, TimeUnit.SECONDS).first());
+            } catch (RuntimeException failed) {
+                snapshot.append("profileUnknown", failed.getClass().getName());
+            }
+            try {
+                Document fields = new Document("_id", 1).append("clusterId", 1).append("resourceType", 1)
+                        .append("resourceId", 1).append("ownerNodeId", 1).append("ownerBootId", 1)
+                        .append("claimGeneration", 1).append("executionGeneration", 1).append("profileGeneration", 1)
+                        .append("topologyRevision", 1).append("leaseUntil", 1).append("retiredAuthorizationUntil", 1)
+                        .append("mongoNow", 1);
+                snapshot.append("nodeSessions", SystemCollections.WORKLOAD_CLAIMS.on(store).aggregate(List.of(
+                        new Document("$match", new Document("clusterId", clusterId)
+                                .append("resourceType", WorkloadClaimType.NODE_SESSION.name())),
+                        new Document("$set", new Document("mongoNow", "$$NOW")),
+                        new Document("$project", fields))).maxTime(2, TimeUnit.SECONDS).into(new ArrayList<>()));
+            } catch (RuntimeException failed) {
+                snapshot.append("nodeSessionsUnknown", failed.getClass().getName());
+            }
+            snapshots.add(snapshot);
+        }
+
+        void event(ChangeStreamDocument<Document> change) {
+            Document updated = new Document();
+            if (change.getUpdateDescription() != null) {
+                Document actual = Document.parse(change.getUpdateDescription().getUpdatedFields().toJson());
+                for (String field : List.of("generation", "hash", "authorizationUntil", "writeSerial")) {
+                    if (actual.containsKey(field)) updated.append(field, actual.get(field));
+                }
+                if (actual.get("attributes") instanceof Document attributes) {
+                    Document fields = new Document();
+                    for (String field : List.of("heapTier", "systemDataVersion", "profile-protocol")) {
+                        if (attributes.containsKey(field)) fields.append(field, attributes.get(field));
+                    }
+                    updated.append("attributes", fields);
+                }
+            }
+            if (updated.isEmpty()) return;
+            Document observed = new Document("operationType", change.getOperationType().name())
+                    .append("clusterTime", change.getClusterTime() == null ? null : change.getClusterTime().toString())
+                    .append("wallTime", change.getWallTime() == null ? null : new java.util.Date(change.getWallTime().getValue()))
+                    .append("updatedFields", updated);
+            if (updated.containsKey("generation")) generationEvents.add(observed);
+            if (events.size() < 128) events.add(observed);
+            else omittedEvents++;
+        }
+
+        void save(Throwable primary) {
+            try {
+                java.nio.file.Path directory = java.nio.file.Path.of("target", "failure-scenes", "profile-admission", clusterId);
+                Files.createDirectories(directory);
+                Files.writeString(directory.resolve("admission-boundary.json"), new Document("clusterId", clusterId)
+                        .append("sessionMillis", SESSION.toMillis()).append("candidate", candidate)
+                        .append("snapshots", snapshots).append("profileEvents", events)
+                        .append("generationEvents", generationEvents).append("omittedProfileEvents", omittedEvents)
+                        .toJson(org.bson.json.JsonWriterSettings.builder().indent(true).build()));
+            } catch (RuntimeException | java.io.IOException failed) {
+                primary.addSuppressed(failed);
             }
         }
     }

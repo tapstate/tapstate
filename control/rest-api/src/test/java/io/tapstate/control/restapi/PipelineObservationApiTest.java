@@ -15,6 +15,8 @@ import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineSnapshot;
 import io.tapstate.control.core.PipelineStatus;
@@ -234,6 +236,34 @@ class PipelineObservationApiTest {
                 .retrieve().toEntity(PipelineStatus.class).getBody();
 
         assertThat(body).isEqualTo(new PipelineStatus("pl1", PipelineState.RUNNING));
+    }
+
+    @Test
+    void lifecycleConsumersReadObservedStatesWhileUiTransitionsHaveTheirOwnField() {
+        PipelineState[][] transitions = {
+                {PipelineState.STOPPED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.PAUSED},
+                {PipelineState.PAUSED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.STOPPED}
+        };
+        String[] displays = {"STARTING", "PAUSING", "RESUMING", "STOPPING"};
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        FakeStoppedPipelines lifecycle = context.getBean(FakeStoppedPipelines.class);
+        String token = machineToken(Scope.READ);
+        for (int index = 0; index < transitions.length; index++) {
+            PipelineState observed = transitions[index][0];
+            lifecycle.intent("pl1", transitions[index][1]);
+            observations.save(new Observation("pl1", observed, Map.of(), Map.of(), Map.of(), null, NOW));
+
+            Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+            assertThat(PipelineState.valueOf((String) body.get("state"))).isEqualTo(observed);
+            assertThat(body).containsEntry("displayState", displays[index])
+                    .containsEntry("observedState", observed.name())
+                    .containsEntry("desiredState", transitions[index][1].name());
+        }
     }
 
     @Test
@@ -571,8 +601,9 @@ class PipelineObservationApiTest {
     }
 
     @Test
-    void aReadOfAnAppliedPipelineThatHasNotConvergedYetIsNotFoundAsTheTransientWindow() {
+    void aReadOfAnAppliedPipelineThatHasNotConvergedYetRetainsTheUnobservedContract() {
         context.getBean(FakeObservationStore.class).clear();
+        context.getBean(FakeStoppedPipelines.class).intent("pl1", PipelineState.RUNNING);
 
         ApiError body = client().get().uri("/api/pipelines/pl1/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
@@ -583,6 +614,8 @@ class PipelineObservationApiTest {
 
         assertThat(body.code()).isEqualTo("monitor.no-observation");
         assertThat(body.params()).containsEntry("pipeline", "pl1");
+        assertThat(context.getBean(PipelineCatalogService.class).find("pl1").orElseThrow().status().state().name())
+                .isEqualTo("STARTING");
     }
 
     // ---- the interceptor guards a read like any other verb ----
@@ -671,6 +704,14 @@ class PipelineObservationApiTest {
         RecoveryTestQueries recoveryTestQueries() { return new RecoveryTestQueries(); }
 
         @Bean
+        PipelineCatalogService pipelineCatalogService(PipelineObservationQueryService observations,
+                FakeStoppedPipelines lifecycle) {
+            return new PipelineCatalogService(new ArtifactQueryService(appliedPipelines()),
+                    new PipelineDraftService(new PipelineApiTest.FakePipelineDraftStore()),
+                    lifecycle.desired(), observations);
+        }
+
+        @Bean
         FakeRateHistoryStore rateHistoryStore() {
             return new FakeRateHistoryStore();
         }
@@ -727,6 +768,11 @@ class PipelineObservationApiTest {
         @Bean
         TokenService tokenService(TokenStore store, TokenSecrets secrets, Clock clock) {
             return new TokenService(store, secrets, clock);
+        }
+
+        @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
         }
 
         @Bean
@@ -991,6 +1037,11 @@ class PipelineObservationApiTest {
     static final class FakeStoppedPipelines {
 
         private final Map<String, PipelineState> actual = new LinkedHashMap<>();
+        private final Map<String, DesiredState> intents = new LinkedHashMap<>();
+
+        void intent(String pipelineId, PipelineState target) {
+            intents.put(pipelineId, new DesiredState(pipelineId, target, "fixture-revision"));
+        }
 
         void running(String pipelineId) {
             actual.put(pipelineId, PipelineState.RUNNING);
@@ -998,6 +1049,7 @@ class PipelineObservationApiTest {
 
         void reset() {
             actual.clear();
+            intents.clear();
         }
 
         DesiredStore desired() {
@@ -1009,12 +1061,12 @@ class PipelineObservationApiTest {
 
                 @Override
                 public Optional<DesiredState> read(String pipelineId) {
-                    return Optional.empty();
+                    return Optional.ofNullable(intents.get(pipelineId));
                 }
 
                 @Override
                 public List<String> pipelineIds() {
-                    return List.of();
+                    return List.copyOf(intents.keySet());
                 }
 
                 @Override

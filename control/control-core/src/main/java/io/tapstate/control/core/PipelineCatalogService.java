@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.TreeSet;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -43,6 +44,22 @@ public final class PipelineCatalogService {
     /** Returns one stable row for every id present in either the authoring store or artifact store. */
     public List<PipelineCatalogItem> list() {
         return list(0, Integer.MAX_VALUE);
+    }
+
+    /** Reads the same merged projection as the catalog for one Pipeline id. */
+    public Optional<PipelineCatalogItem> find(String id) {
+        Objects.requireNonNull(id, "id");
+        ArtifactSummary artifact = artifacts.getResource(id)
+                .filter(stored -> stored.resource() instanceof PipelineResource)
+                .map(stored -> new ArtifactSummary((PipelineResource) stored.resource(), stored.contentHash()))
+                .orElse(null);
+        PipelineDraftSummary draft = drafts.find(id)
+                .map(value -> new PipelineDraftSummary(value.pipelineId(), value.mode(), value.name(),
+                        value.description(), value.revision(), value.baseArtifactHash(),
+                        value.publishedDraftRevision(), value.publishedArtifactHash(), value.createdAt(),
+                        value.updatedAt(), value.updatedBy()))
+                .orElse(null);
+        return artifact == null && draft == null ? Optional.empty() : Optional.of(toItem(id, draft, artifact));
     }
 
     /** Returns only the requested catalog window; per-pipeline status reads happen after this slice. */
@@ -89,6 +106,7 @@ public final class PipelineCatalogService {
             target = null;
         }
         boolean hasArtifact = artifact != null;
+        PipelineCatalogItem.DisplayState state = displayState(target, observed);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
@@ -104,7 +122,8 @@ public final class PipelineCatalogService {
                 artifact == null ? null : artifact.contentHash(),
                 hasArtifact,
                 new PipelineCatalogItem.Status(
-                        displayState(target, observed, hasArtifact),
+                        state,
+                        hasArtifact ? PipelineCatalogItem.UiState.valueOf(state.name()) : PipelineCatalogItem.UiState.DRAFT,
                         target,
                         observed,
                         observation == null ? null : observation.failure(),
@@ -123,7 +142,7 @@ public final class PipelineCatalogService {
     }
 
     private static PipelineCatalogItem.DisplayState displayState(
-            PipelineState desired, PipelineState observed, boolean hasArtifact) {
+            PipelineState desired, PipelineState observed) {
         if (desired == PipelineState.STOPPED && observed != PipelineState.STOPPED) {
             return PipelineCatalogItem.DisplayState.STOPPING;
         }

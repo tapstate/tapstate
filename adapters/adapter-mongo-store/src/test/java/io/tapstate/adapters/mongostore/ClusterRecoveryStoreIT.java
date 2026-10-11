@@ -2646,7 +2646,7 @@ class ClusterRecoveryStoreIT {
         private final MongoClusterCapacityStore capacity = new MongoClusterCapacityStore(profiles, workloads, occupancy, claims,
                 profileDocuments, memberDocuments, nodeDocuments, desiredDocuments, stateDocuments, artifactDocuments);
         private final MongoClusterRecoveryStore store = new MongoClusterRecoveryStore(queue, capacity, meta);
-        private final MongoArtifactStore artifacts = new MongoArtifactStore(client, artifactDocuments);
+        private final MongoArtifactStore artifacts = new MongoArtifactStore(client, artifactDocuments, new SourceConfigCipher(new byte[32]));
         private final MongoDesiredStore desired = new MongoDesiredStore(desiredDocuments);
         private final MongoStateStore states = new MongoStateStore(stateDocuments);
         private final WorkloadClaim nodeB;

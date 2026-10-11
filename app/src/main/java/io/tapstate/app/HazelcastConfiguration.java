@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.MapConfig;
+import com.hazelcast.config.MapStoreConfig;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
@@ -14,10 +15,12 @@ import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.adapters.pdk.SharedSinkConnectors;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
+import io.tapstate.runtime.engine.FiniteEnvelopeSourceProcessor;
 import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinMaps;
@@ -106,6 +109,7 @@ class HazelcastConfiguration {
             @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings,
             ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts,
             ObjectProvider<ClusterProfileStore> clusterProfiles, ExecutionProfileFactory profileFactory) {
         ClusterMemberPreflight.Identity identity =
@@ -113,13 +117,25 @@ class HazelcastConfiguration {
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
+        SourceConfigKeyringSession sourceConfigKeyring = sourceConfigKeyrings.getIfAvailable();
         long sessionAskedAt = System.nanoTime();
         io.tapstate.spi.store.ExecutionProfile proposed = identity == null ? null
                 : profileFactory.create(config, snapshotBuffer == null ? null : snapshotBuffer.capacity());
         if (identity != null) {
-            identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
-                    clusterIdentities.getIfAvailable(), clusterProfiles.getIfAvailable(), proposed, bootId.value());
-            membershipGate.bindProfile(identity.nodeSession().profileGeneration(), proposed.hash());
+            try {
+                identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
+                        clusterIdentities.getIfAvailable(), clusterProfiles.getIfAvailable(), proposed, bootId.value());
+                membershipGate.bindProfile(identity.nodeSession().profileGeneration(), proposed.hash());
+                if (sourceConfigKeyring == null) {
+                    throw new IllegalStateException("cluster member started without its Source config keyring");
+                }
+                sourceConfigKeyring.acknowledge(identity.nodeSession(), clusterProperties.getNodeSessionTtl());
+            } catch (RuntimeException startupFailure) {
+                if (identity.nodeSession() != null) {
+                    releaseReservedSession(claimStore, sourceConfigKeyring, identity.nodeSession(), startupFailure);
+                }
+                throw startupFailure;
+            }
         }
         if (identity != null) {
             identify(config, identity);
@@ -133,8 +149,8 @@ class HazelcastConfiguration {
         try {
             member = startMember(() -> Hazelcast.newHazelcastInstance(config));
         } catch (RuntimeException startupFailure) {
-            if (identity != null && claimStore != null) {
-                claimStore.release(identity.nodeSession());
+            if (identity != null) {
+                releaseReservedSession(claimStore, sourceConfigKeyring, identity.nodeSession(), startupFailure);
             }
             throw startupFailure;
         }
@@ -148,37 +164,35 @@ class HazelcastConfiguration {
                             java.util.Map.of(), null);
                 }
                 member.getUserContext().put(NODE_JOINED_IDENTITY_CONTEXT_KEY, joined);
-            } catch (RuntimeException unprovedJoin) {
-                try {
-                    member.shutdown();
-                    if (claimStore != null) {
-                        claimStore.release(identity.nodeSession());
-                    }
-                } catch (RuntimeException cleanup) {
-                    unprovedJoin.addSuppressed(cleanup);
+                // What the rings and maps of this member will answer when work reaches them. Asked rather
+                // than assumed, because the library caches its answer and recomputes it on its own schedule:
+                // admitting work this member's data plane is still refusing produces a run that reaches
+                // RUNNING and then dies on its first write.
+                membershipGate.observeDataPlane(() -> dataPlaneAdmitsWork(member));
+                member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
+                member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
+                member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
+                member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
+                member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
+                member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
+                member.getUserContext().put(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE,
+                        identity.nodeSession().profileGeneration());
+                member.getUserContext().put(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE, proposed.hash());
+                member.getUserContext().put(
+                        io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
+                        ClusterMembershipGate.PROTECTION_NAME);
+            } catch (RuntimeException | Error unprovedJoin) {
+                try { member.shutdown(); }
+                catch (RuntimeException | Error cleanup) { unprovedJoin.addSuppressed(cleanup); }
+                releaseReservedSession(claimStore, sourceConfigKeyring, identity.nodeSession(), unprovedJoin);
+                if (unprovedJoin instanceof HazelcastException || unprovedJoin instanceof HazelcastInstanceNotActiveException) {
+                    throw new TapstateException(BootError.HAZELCAST_UNAVAILABLE, Map.of(), unprovedJoin);
                 }
                 throw unprovedJoin;
             }
-            // What the rings and maps of this member will answer when work reaches them. Asked rather
-            // than assumed, because the library caches its answer and recomputes it on its own schedule:
-            // admitting work this member's data plane is still refusing produces a run that reaches
-            // RUNNING and then dies on its first write.
-            membershipGate.observeDataPlane(() -> dataPlaneAdmitsWork(member));
-            member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
-            member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
-            member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
-            member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
-            member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
-            member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
-            member.getUserContext().put(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE,
-                    identity.nodeSession().profileGeneration());
-            member.getUserContext().put(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE, proposed.hash());
-            member.getUserContext().put(
-                    io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
-                    ClusterMembershipGate.PROTECTION_NAME);
         }
         return finishPostFormation(member,
-                () -> createNodeSessionLease(member, clusterProperties, workloadClaims, clusterProfiles), () -> {
+                () -> createNodeSessionLease(member, clusterProperties, workloadClaims, clusterProfiles, sourceConfigKeyrings), () -> {
             if (member.getUserContext().get(NODE_SESSION_CONTEXT_KEY) instanceof io.tapstate.spi.store.WorkloadClaim) {
                 StorePort store = storePorts.getIfAvailable();
                 if (store != null) endWhatDepartedMembersLeaveOpen(member, store);
@@ -263,13 +277,20 @@ class HazelcastConfiguration {
             } else if (nestDeadLetterStore != null) {
                 DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
             }
-        }, claimStore, identity == null ? null : identity.nodeSession());
+        }, claimStore, identity == null ? null : identity.nodeSession(), sourceConfigKeyring);
     }
 
     /** Completes formation and releases only a reservation whose renewal owner was never installed. */
     static HazelcastInstance finishPostFormation(HazelcastInstance member, Supplier<NodeSessionLease> startOwner,
             Runnable configure, @Nullable WorkloadClaimStore claimStore,
             @Nullable io.tapstate.spi.store.WorkloadClaim reservedSession) {
+        return finishPostFormation(member, startOwner, configure, claimStore, reservedSession, null);
+    }
+
+    static HazelcastInstance finishPostFormation(HazelcastInstance member, Supplier<NodeSessionLease> startOwner,
+            Runnable configure, @Nullable WorkloadClaimStore claimStore,
+            @Nullable io.tapstate.spi.store.WorkloadClaim reservedSession,
+            @Nullable SourceConfigKeyringSession sourceConfigKeyring) {
         ConcurrentMap<String, Object> userContext = null;
         try {
             userContext = Objects.requireNonNull(member.getUserContext(), "member user context");
@@ -277,13 +298,25 @@ class HazelcastConfiguration {
         } catch (RuntimeException | Error failure) {
             if ((userContext == null || !userContext.containsKey(NODE_SESSION_OWNER_CONTEXT_KEY))
                     && reservedSession != null && claimStore != null) {
-                try { claimStore.release(reservedSession); }
-                catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+                releaseReservedSession(claimStore, sourceConfigKeyring, reservedSession, failure);
             }
             if (failure instanceof HazelcastException || failure instanceof HazelcastInstanceNotActiveException) {
                 throw new TapstateException(BootError.HAZELCAST_UNAVAILABLE, Map.of(), failure);
             }
             throw failure;
+        }
+    }
+
+    private static void releaseReservedSession(@Nullable WorkloadClaimStore claims,
+            @Nullable SourceConfigKeyringSession keyring, io.tapstate.spi.store.WorkloadClaim reserved,
+            Throwable failure) {
+        if (claims != null) {
+            try { claims.release(reserved); }
+            catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+        }
+        if (keyring != null) {
+            try { keyring.release(reserved); }
+            catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
         }
     }
 
@@ -327,7 +360,8 @@ class HazelcastConfiguration {
             HazelcastInstance member,
             ClusterProperties clusterProperties,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
-            ObjectProvider<ClusterProfileStore> clusterProfiles) {
+            ObjectProvider<ClusterProfileStore> clusterProfiles,
+            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings) {
         Object owned = member.getUserContext().get(NODE_SESSION_OWNER_CONTEXT_KEY);
         if (owned instanceof NodeSessionLease lease) return lease;
         if (!(member.getUserContext().get(NODE_SESSION_CONTEXT_KEY) instanceof io.tapstate.spi.store.WorkloadClaim)) {
@@ -337,7 +371,8 @@ class HazelcastConfiguration {
     }
 
     private static NodeSessionLease createNodeSessionLease(HazelcastInstance member, ClusterProperties clusterProperties,
-            ObjectProvider<WorkloadClaimStore> workloadClaims, ObjectProvider<ClusterProfileStore> clusterProfiles) {
+            ObjectProvider<WorkloadClaimStore> workloadClaims, ObjectProvider<ClusterProfileStore> clusterProfiles,
+            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
             return NodeSessionLease.inactive();
@@ -349,9 +384,10 @@ class HazelcastConfiguration {
         if (!(member.getUserContext().get(NODE_SESSION_ASKED_AT_CONTEXT_KEY) instanceof Long askedAt)) {
             throw new IllegalStateException("cluster member started without the time its node session was asked for");
         }
+        SourceConfigKeyringSession keyring = sourceConfigKeyrings == null ? null : sourceConfigKeyrings.getIfAvailable();
         if (claim.profileGeneration() == 0) {
             return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
-                    clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
+                    clusterProperties.getNodeSessionRenewInterval(), keyring, member::shutdown);
         }
         ClusterProfileStore profiles = clusterProfiles == null ? null : clusterProfiles.getIfAvailable();
         if (profiles == null) {
@@ -361,13 +397,18 @@ class HazelcastConfiguration {
             throw new IllegalStateException("cluster member started without its actual joined runtime identity");
         }
         return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
-                clusterProperties.getNodeSessionRenewInterval(), member::shutdown,
+                clusterProperties.getNodeSessionRenewInterval(), keyring, member::shutdown,
                 profiles, () -> localJoinedIdentity(member), joined);
     }
 
     NodeSessionLease nodeSessionLease(HazelcastInstance member, ClusterProperties properties,
             ObjectProvider<WorkloadClaimStore> claims) {
-        return nodeSessionLease(member, properties, claims, null);
+        return nodeSessionLease(member, properties, claims, null, emptyProvider());
+    }
+
+    NodeSessionLease nodeSessionLease(HazelcastInstance member, ClusterProperties properties,
+            ObjectProvider<WorkloadClaimStore> claims, ObjectProvider<ClusterProfileStore> profiles) {
+        return nodeSessionLease(member, properties, claims, profiles, emptyProvider());
     }
 
     private static NodeSessionLease.JoinedIdentity localJoinedIdentity(HazelcastInstance member) {
@@ -409,7 +450,26 @@ class HazelcastConfiguration {
         return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
                 srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
                 nestDeadLetterStore, null, srsLogStore, emptyProvider(), emptyProvider(),
-                new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(), emptyProvider(), emptyProvider(), null);
+                emptyProvider(), new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(),
+                emptyProvider(), emptyProvider(), null);
+    }
+
+    /** Direct member-admission seam retained for focused keyring wiring tests. */
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
+            ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
+            @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
+            @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
+            @Nullable NestDeadLetterStore nestDeadLetterStore,
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
+            ObjectProvider<ClusterIdentityStore> clusterIdentities,
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings,
+            ClusterMembershipGate membershipGate, ObjectProvider<ClusterProfileStore> clusterProfiles,
+            ExecutionProfileFactory profileFactory) {
+        return hazelcastMember(properties, clusterProperties, controlProperties, srsMetaStore,
+                connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings, nestDeadLetterStore,
+                operatorStateStores, srsLogStore, clusterIdentities, workloadClaims, sourceConfigKeyrings,
+                membershipGate, BootId.fresh(), emptyProvider(), clusterProfiles, profileFactory);
     }
 
     private static <T> ObjectProvider<T> emptyProvider() {
@@ -668,6 +728,12 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(JoinUpdate.class)
                 .setImplementation(new JoinUpdateSerializer()));
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(PreviewSampleCache.Entry.class)
+                .setImplementation(new PreviewSampleCache.EntrySerializer()));
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(FiniteEnvelopeSourceProcessor.Sample.class)
+                .setImplementation(new FiniteEnvelopeSourceProcessor.SampleSerializer()));
         RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
@@ -690,6 +756,15 @@ class HazelcastConfiguration {
                     .setFactoryImplementation(new SrsLogRingbufferStoreFactory(srsLogStore)));
         }
         config.addRingBufferConfig(rings);
+        // Preview operator namespaces contain an extra dot before their generated id. DSL resource ids
+        // forbid dots, so these patterns cannot match a user's durable Nest or Join state.
+        config.addMapConfig(previewMapConfig("__preview.*", 300));
+        config.addMapConfig(previewSampleMapConfig());
+        config.addMapConfig(previewMapConfig(
+                PreviewSampleCache.INDEX_MAP_NAME, (int) PreviewSampleCache.INDEX_TTL.toSeconds())
+                .setMaxIdleSeconds(0));
+        config.addMapConfig(previewMapConfig("nest..preview_*", 300));
+        config.addMapConfig(previewMapConfig("join..preview_*", 300));
         // What a nest state map is is NOT declared here, and the omission is load-bearing: it is declared
         // once the member is running, by makeNestCapable. A pattern placed in this static configuration
         // answers for every namespace and shadows the per-pipeline budget added later, which the substrate
@@ -700,6 +775,21 @@ class HazelcastConfiguration {
         // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
         // maps were in until the day one was added.
         return config;
+    }
+
+    private static MapConfig previewMapConfig(String pattern, int ttlSeconds) {
+        return new MapConfig(pattern)
+                .setBackupCount(0)
+                .setAsyncBackupCount(0)
+                .setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setTimeToLiveSeconds(ttlSeconds)
+                .setMaxIdleSeconds(ttlSeconds)
+                .setMapStoreConfig(new MapStoreConfig().setEnabled(false));
+    }
+
+    private static MapConfig previewSampleMapConfig() {
+        return previewMapConfig(PreviewSampleCache.MAP_NAME, (int) PreviewSampleCache.TTL.toSeconds())
+                .setInMemoryFormat(InMemoryFormat.BINARY);
     }
 
     /**

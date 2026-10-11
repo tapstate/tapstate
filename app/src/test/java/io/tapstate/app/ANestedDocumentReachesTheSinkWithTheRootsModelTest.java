@@ -105,6 +105,13 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
         assertThat(bound.get().get(STEP).name())
                 .as("the table assembled documents land in")
                 .isEqualTo(PARENT_TABLE);
+        assertThat(bound.get().get(STEP).fields().stream().map(TargetField::name))
+                .as("the root fields retained by the target model")
+                .containsExactly("id", "name");
+        assertThat(bound.get().get(STEP).fields().stream()
+                .filter(TargetField::primaryKey).map(TargetField::name))
+                .as("the root key the preview materializer uses to identify documents")
+                .containsExactly("id");
     }
 
     /**
@@ -173,7 +180,7 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
                 transforms:
                   - id: order_doc
                     type: nest
-                    from: { o: orders, i: order_items }
+                    from: { o: src_orders.orders, i: src_items.order_items }
                     root:
                       from: o
                       key: [ id ]

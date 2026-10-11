@@ -1,9 +1,10 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.ClusterProfileStore;
 import io.tapstate.spi.store.IoError;
-import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -21,6 +22,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -65,6 +67,36 @@ class NodeSessionLeaseTest {
             assertThat(memberStopped).as("an available renewal preserves this exact boot's authority").isFalse();
         } finally {
             session.close();
+        }
+    }
+
+    @Test
+    void aLiveNodeSessionRenewsAndReleasesItsKeyringAcknowledgement() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        RecordingKeyring keyring = new RecordingKeyring(false);
+        NodeSessionLease lease = new NodeSessionLease(
+                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), keyring,
+                () -> { });
+
+        assertThat(keyring.acknowledged.await(1, TimeUnit.SECONDS)).isTrue();
+        lease.close();
+
+        assertThat(keyring.acknowledgements).hasValueGreaterThanOrEqualTo(1);
+        assertThat(keyring.released.get()).isTrue();
+    }
+
+    @Test
+    void aKeyringEpochRefusalStopsTheMemberEvenWhenTheNodeClaimRenewed() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        RecordingKeyring keyring = new RecordingKeyring(true);
+        CountDownLatch memberStopped = new CountDownLatch(1);
+        NodeSessionLease lease = new NodeSessionLease(
+                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), keyring,
+                memberStopped::countDown);
+        try {
+            assertThat(memberStopped.await(1, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            lease.close();
         }
     }
 
@@ -162,6 +194,44 @@ class NodeSessionLeaseTest {
         } finally {
             session.close();
         }
+    }
+
+    @Test
+    void aProfileRenewalPublishesOnlyAfterBothTheChangedJoinAndKeyringAcknowledgementComplete() throws Exception {
+        WorkloadClaim accepted = acceptedProfileClaim(1);
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.renew(any(), any())).thenReturn(Optional.of(accepted));
+        ClusterProfileStore profiles = mock(ClusterProfileStore.class);
+        when(profiles.markJoined(any(), anyString(), anyString())).thenReturn(true);
+        SourceConfigKeyringSession keyring = mock(SourceConfigKeyringSession.class);
+        CountDownLatch asked = new CountDownLatch(1);
+        CountDownLatch answer = new CountDownLatch(1);
+        doAnswer(call -> {
+            asked.countDown();
+            answer.await();
+            return null;
+        }).when(keyring).acknowledge(same(accepted), any());
+        CountDownLatch stopped = new CountDownLatch(1);
+        NodeSessionLease session = new NodeSessionLease(store, PROFILE_CLAIM, System.nanoTime(),
+                Duration.ofSeconds(5), Duration.ofSeconds(1), keyring, stopped::countDown,
+                profiles, () -> MERGED_JOIN, ORIGINAL_JOIN);
+        try {
+            assertThat(asked.await(1, TimeUnit.SECONDS)).isTrue();
+            assertThat(session.proof().claim()).isSameAs(PROFILE_CLAIM);
+            var order = inOrder(profiles, keyring);
+            order.verify(profiles).markJoined(same(accepted), eq(MERGED_JOIN.memberUuid()), eq(MERGED_JOIN.memberAddress()));
+            order.verify(keyring).acknowledge(same(accepted), eq(Duration.ofSeconds(5)));
+            answer.countDown();
+            long deadline = System.nanoTime() + Duration.ofSeconds(1).toNanos();
+            while (session.proof().claim() != accepted && System.nanoTime() - deadline < 0) Thread.onSpinWait();
+            assertThat(session.proof().claim()).isSameAs(accepted);
+            assertThat(session.proof().live()).isTrue();
+            assertThat(stopped.getCount()).isEqualTo(1);
+        } finally {
+            answer.countDown();
+            session.close();
+        }
+        verify(keyring).release(same(accepted));
     }
 
     private static final WorkloadClaim PROFILE_CLAIM = new WorkloadClaim(
@@ -433,6 +503,33 @@ class NodeSessionLeaseTest {
         @Override
         public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
             return Optional.of(new WorkloadClaimReading(CLAIM, LIVE_LEASE));
+        }
+    }
+
+    private static final class RecordingKeyring implements SourceConfigKeyringSession {
+        private final boolean refuse;
+        private final CountDownLatch acknowledged = new CountDownLatch(1);
+        private final AtomicInteger acknowledgements = new AtomicInteger();
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private RecordingKeyring(boolean refuse) {
+            this.refuse = refuse;
+        }
+
+        @Override
+        public void acknowledge(WorkloadClaim session, Duration ttl) {
+            acknowledgements.incrementAndGet();
+            acknowledged.countDown();
+            if (refuse) {
+                throw new TapstateException(
+                        io.tapstate.adapters.mongostore.StoreError.SOURCE_CONFIG_KEYRING_NOT_READY,
+                        java.util.Map.of(), null);
+            }
+        }
+
+        @Override
+        public void release(WorkloadClaim session) {
+            released.set(true);
         }
     }
 }
