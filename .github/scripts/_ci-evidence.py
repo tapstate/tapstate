@@ -1526,7 +1526,7 @@ def verified_runtime_classes(inputs, post, binding, inputs_sha256):
         require((name, identity) not in admitted, 'duplicate runtime class name/ID')
         refs = record.get('class_references')
         require(isinstance(refs, list) and len(refs) == len(set(refs)) and name in refs and all(
-                isinstance(ref, str) and re.fullmatch(r'(?:\[+(?:[ZBCSIJFD]|L[A-Za-z0-9_$/]+;)|[A-Za-z0-9_$/]+)', ref) for ref in refs),
+                isinstance(ref, str) and re.fullmatch(r'(?:\[+(?:[ZBCSIJFD]|L(?:[A-Za-z0-9_$/]+|(?:[A-Za-z0-9_$/]+/)?(?:package-info|module-info));)|(?:[A-Za-z0-9_$/]+|(?:[A-Za-z0-9_$/]+/)?(?:package-info|module-info)))', ref) for ref in refs),
                 'invalid runtime structural references')
         normalized = {ref.lstrip('[').removeprefix('L').removesuffix(';') if ref.startswith('[') else ref for ref in refs}
         own_references = {ref for ref in normalized if ref.startswith('io/tapstate/')}

@@ -142,6 +142,12 @@ with tempfile.TemporaryDirectory() as tmp:
         name=m.class_structure(data)['name']; path=dumps/(name+'.'+m.crc64(data)+'.class');path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data);return path
     saved_worker=os.environ.get('RUNNER_TEMP');os.environ['RUNNER_TEMP']=str(worker)
     try:
+        package_bytes=bytecode('io/tapstate/fixture/package-info');package_dump=dumps/('io/tapstate/fixture/package-info.'+m.crc64(package_bytes)+'.class');package_dump.parent.mkdir(parents=True);package_dump.write_bytes(package_bytes)
+        known_package=copy.deepcopy(value);package_path='fixture/target/classes/io/tapstate/fixture/package-info.class';known_package['production_class_ids'][package_path]=m.crc64(package_dump.read_bytes());known_package['production_files'][package_path]=m.digest(package_dump)
+        check(not m.runtime_class_metadata(args,known_package)[1], 'compiler package metadata stays known bytecode and never becomes generated')
+        package_dump.unlink()
+        check(m.class_structure(bytecode('module-info'))['name']=='module-info', 'compiler module metadata is recognized')
+        rejected(lambda:m.class_structure(bytecode('io/tapstate/fixture/unsafe-name')), 'arbitrary hyphenated names remain unsafe')
         first=put_dump(bytecode('io/tapstate/GeneratedFixture'))
         capture,rows=m.runtime_class_metadata(args,value)
         check(len(rows)==1 and rows[0]['name']=='io/tapstate/GeneratedFixture' and 'private-runtime-sentinel' not in json.dumps(rows),'runtime structure emits only Class constants')

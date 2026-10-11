@@ -227,7 +227,8 @@ def class_structure(data):
         if not index: return None
         require(index in classes and classes[index] in strings, 'invalid runtime class reference')
         value = strings[classes[index]].decode('utf-8')
-        require(re.fullmatch(r'(?:\[+(?:[ZBCSIJFD]|L[\w$/]+;)|[\w$/]+)', value), 'unsafe runtime class name')
+        internal = r'(?:[\w$/]+|(?:[\w$/]+/)?(?:package-info|module-info))'
+        require(re.fullmatch(r'(?:\[+(?:[ZBCSIJFD]|L' + internal + r';)|' + internal + r')', value), 'unsafe runtime class name')
         return value
     require(position+8 <= len(data), 'truncated runtime class header')
     flags, this, parent, interfaces = (int.from_bytes(data[position+i:position+i+2], 'big') for i in [0,2,4,6])
