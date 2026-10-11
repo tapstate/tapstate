@@ -48,7 +48,7 @@ final class PublishedConnectorArtifacts {
             "db2", new Artifact(32_784_188,
                     "e00ec44e5c8711d90bea6419edf8107ef14ac873bf2838d699333f989ebbf181"));
 
-    /** Exact public ids with trusted artifact lengths and digests. */
+    /** Exact public ids with a matching {@code <id>-connector.jar} release asset and trusted digest. */
     static final List<String> IDS = List.copyOf(ARTIFACTS.keySet());
 
     /** Fetches one complete response body; tests replace the network at this seam. */
@@ -150,12 +150,7 @@ final class PublishedConnectorArtifacts {
         if (!contains(id)) {
             throw new IllegalArgumentException("no published connector asset for " + id);
         }
-        String sourceBase = base(env);
-        // The public friendly Db2 alias now names another artifact; keep this build's verified bytes.
-        String remoteName = "db2".equals(id) && sourceBase.equals(RELEASES + CONNECTORS_PATH + "/")
-                ? "db2-connector-" + ARTIFACTS.get(id).sha256() + ".jar"
-                : jarName(id);
-        return URI.create(sourceBase + remoteName);
+        return URI.create(base(env) + jarName(id));
     }
 
     /** Resolves the shared mirror settings used by both registration and the local development stack. */

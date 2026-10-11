@@ -605,12 +605,21 @@ jobs:
             --output "app/target/app-${{ needs.version.outputs.version }}-boot.jar" \
             --context "$ARTIFACT_CONTEXT"
       - name: stage the exact published connector and license bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/prepare-test-inputs.py \
+          mkdir -p "$RUNNER_TEMP/cloud-jars"
+          gh release download connectors-preview --repo tapstate/tapstate \
+            --pattern '*-connector.jar' \
+            --pattern 'MICROSOFT-MIT-LICENSE.txt' \
+            --pattern 'ORACLE-FREE-USE-TERMS.txt' \
+            --dir "$RUNNER_TEMP/cloud-jars"
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py \
             --lock deploy/cloud/connectors.lock.json \
-            --output "$RUNNER_TEMP/cloud-stage"
+            --jar-dir "$RUNNER_TEMP/cloud-jars" \
+            --stage-dir "$RUNNER_TEMP/cloud-stage"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: build the Cloud OCI archive from the verified server Boot JAR
