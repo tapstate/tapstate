@@ -84,9 +84,10 @@ class ASlowerSinkHoldsTheResumePositionIT {
                 }
                 return Optional.of(documents.miningChainIds().iterator().next());
             });
-            Await.until("the pipeline's initial shared resume position", TIMEOUT,
-                    () -> hasAggregateRingDone(documents, chain),
-                    () -> String.valueOf(documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value())));
+            Await.until("the physical reader and the pipeline's initial shared resume position", TIMEOUT,
+                    () -> readerStarted(readerEntries) && hasAggregateRingDone(documents, chain),
+                    () -> "reader entries=" + directoryEntries(readerEntries) + ", consumer="
+                            + documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value()));
             Progress initial = progress(documents, chain);
 
             try {
@@ -181,6 +182,24 @@ class ASlowerSinkHoldsTheResumePositionIT {
         return progress.writerAt(HELD_WRITER, initial) == initial
                 && progress.writerAt(FAST_WRITER, initial) > initial
                 && progress.aggregateRingDone() == initial;
+    }
+
+    private static boolean readerStarted(Path directory) {
+        try (var entries = Files.list(directory)) {
+            for (Path ledger : entries.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().startsWith("positions-")
+                            && path.getFileName().toString().endsWith(".tsv")).toList()) {
+                for (String line : Files.readAllLines(ledger)) {
+                    String[] fields = line.split("\t", 5);
+                    if (fields.length == 5 && "START".equals(fields[1]) && TABLE.equals(fields[2])) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } catch (java.io.IOException failure) {
+            throw new java.io.UncheckedIOException(failure);
+        }
     }
 
     private static boolean hasAggregateRingDone(StoreDocuments documents, String chain) {
