@@ -628,20 +628,40 @@ class RecoveryPausesBelowQuorumAndResumesTheSameQueueIT {
                 assertUnallocated(store, cluster, lanes, originals, null);
                 return true;
             }
-            Instant server = now(store);
-            Instant first = null;
+            boolean ready = false;
             for (Lane lane : lanes) {
-                Document claim = SystemCollections.WORKLOAD_CLAIMS.on(store).find(
-                        new Document("clusterId", cluster).append("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
-                                .append("resourceId", lane.pipeline())).first();
+                ClusterClaimView original = originals.get(lane.pipeline());
+                Document queued = SystemCollections.CLUSTER_RECOVERY_QUEUE.on(store).find(
+                        new Document("_id", trace.latest.get(lane.pipeline()).get("_id"))).first();
+                assertThat(queued).isNotNull();
+                Document claim = SystemCollections.WORKLOAD_CLAIMS.on(store).aggregate(List.of(
+                        new Document("$match", new Document("clusterId", cluster)
+                                .append("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
+                                .append("resourceId", lane.pipeline())),
+                        new Document("$set", new Document("observedAt", "$$NOW")))).first();
                 assertThat(claim).isNotNull();
-                assertThat(number(claim, "executionGeneration")).isEqualTo(originals.get(lane.pipeline()).executionGeneration());
-                Date promise = number(claim, "claimGeneration") > number(claim, "executionClaimGeneration")
-                        ? claim.getDate("retiredAuthorizationUntil") : claim.getDate("leaseUntil");
+                assertThat(number(claim, "executionGeneration")).isEqualTo(original.executionGeneration());
+                assertThat(number(claim, "contextExecutionGeneration")).isEqualTo(original.executionGeneration());
+                assertThat(number(claim, "executionClaimGeneration")).isEqualTo(original.executionClaimGeneration());
+                assertThat(number(claim, "profileGeneration")).isEqualTo(original.profileGeneration());
+                Document executionProfile = claim.get("executionProfile", Document.class);
+                assertThat(executionProfile).isNotNull();
+                assertThat(number(executionProfile, "generation")).isEqualTo(original.executionProfileGeneration());
+                assertThat(executionProfile.getString("hash")).isEqualTo(original.executionProfileHash());
+                Instant server = claim.getDate("observedAt").toInstant();
+                Date lease = claim.getDate("leaseUntil");
+                assertThat(lease).isNotNull();
+                if (number(claim, "claimGeneration") <= original.executionClaimGeneration()
+                        || !lease.toInstant().isAfter(server)) continue;
+                Date promise = claim.getDate("retiredAuthorizationUntil");
                 assertThat(promise).isNotNull();
-                if (first == null || promise.toInstant().isBefore(first)) first = promise.toInstant();
+                Date eligible = queued.getDate("nextEligibleAt");
+                Instant lead = server.plusMillis(1_000);
+                // A naturally acquired original context must be near its retained promise and queue eligibility.
+                // The store still decides admission; this observation only times the owned schema barrier.
+                ready |= !promise.toInstant().isAfter(lead) && (eligible == null || !eligible.toInstant().isAfter(lead));
             }
-            return !first.isAfter(server.plusMillis(1_000));
+            return ready;
         }, trace::describe);
     }
 
