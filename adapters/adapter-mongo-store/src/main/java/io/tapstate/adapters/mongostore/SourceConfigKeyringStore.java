@@ -431,15 +431,30 @@ public final class SourceConfigKeyringStore {
         if (epoch < 1 || ttl.toMillis() < 1) throw new IllegalArgumentException("invalid keyring lease");
         if (client == null) throw new IllegalStateException("keyring acknowledgement needs the owning store client");
         return StoreIo.call(() -> {
-            for (int attempt = 0; attempt < 3; attempt++) {
+            Duration retryWindow = ttl.compareTo(Duration.ofSeconds(2)) < 0
+                    ? ttl.dividedBy(4) : Duration.ofMillis(500);
+            long started = System.nanoTime();
+            long windowNanos = retryWindow.toNanos();
+            for (int attempt = 0; ; attempt++) {
                 try {
                     return acknowledgeOnce(session, epoch, ttl);
                 } catch (MongoException error) {
-                    if (attempt == 2 || !error.hasErrorLabel("TransientTransactionError")
-                            || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
+                    long remaining = windowNanos - (System.nanoTime() - started);
+                    if (remaining <= 0 || !error.hasErrorLabel("TransientTransactionError")
+                            || error.hasErrorLabel("UnknownTransactionCommitResult")
+                            || Thread.currentThread().isInterrupted()) throw error;
+                    // Give a competing transaction time to commit without extending any lease.
+                    long delay = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                            Math.min(50L, 5L << Math.min(attempt, 4)));
+                    try {
+                        java.util.concurrent.TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw error;
+                    }
+                    if (System.nanoTime() - started >= windowNanos) throw error;
                 }
             }
-            throw new IllegalStateException("acknowledgement attempts must return or throw");
         });
     }
 

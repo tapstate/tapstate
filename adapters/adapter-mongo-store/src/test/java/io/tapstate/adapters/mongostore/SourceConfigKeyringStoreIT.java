@@ -7,12 +7,16 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandFailedEvent;
+import com.mongodb.MongoException;
+import com.mongodb.MongoWriteException;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -37,6 +41,9 @@ import java.util.Date;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -414,6 +421,335 @@ class SourceConfigKeyringStoreIT {
                 .as("an earlier rotator must not downgrade a completed newer rotation")
                 .startsWith("tscfg:1:" + active + ":");
         assertThat(stored.getString("contentHash")).isEqualTo(CanonicalHash.of(source));
+    }
+
+    @Test
+    void aLiveNodeAckSurvivesThreeActualKeyringConflictsWhenThePeerCommits() throws Exception {
+        heldPeerAcknowledgement(true, false);
+    }
+
+    @Test
+    void aPersistentlyHeldPeerRefusesAckWithinABoundWithoutPublishingPartialProof() throws Exception {
+        heldPeerAcknowledgement(false, false);
+    }
+
+    @Test
+    void aLiveNodeAckSurvivesThreeActualNodeTouchConflictsWhenThePeerCommits() throws Exception {
+        heldPeerAcknowledgement(true, true);
+    }
+
+    @Test
+    void aPersistentlyHeldNodeRefusesAckWithinABoundWithoutPublishingPartialProof() throws Exception {
+        heldPeerAcknowledgement(false, true);
+    }
+
+    private void heldPeerAcknowledgement(boolean releaseAfterThirdConflict, boolean holdNode) throws Exception {
+        String name = "keyring_ack_" + (holdNode ? "node_" : "ring_")
+                + (releaseAfterThirdConflict ? "peer_commits" : "peer_remains_held");
+        MongoDatabase database = freshDatabase(name);
+        SourceConfigKeyringStore setup = new SourceConfigKeyringStore(client, database);
+        setup.loadOrCreateCipher();
+        MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
+        Duration ttl = Duration.ofSeconds(30);
+        WorkloadClaim first = nodeSession(claims, "node-a", "boot-a", ttl);
+        WorkloadClaim second = nodeSession(claims, "node-b", "boot-b", ttl);
+        WorkloadClaim heldNode = holdNode ? first : second;
+        long epoch = setup.loadExisting().epoch();
+        CountDownLatch peerOwnsRing = new CountDownLatch(1);
+        CountDownLatch releasePeer = new CountDownLatch(1);
+        CountDownLatch threeRealConflicts = new CountDownLatch(3);
+        AtomicInteger heldRingRequest = new AtomicInteger(-1);
+        AtomicInteger labeledConflicts = new AtomicInteger();
+        List<String> actualErrors = new java.util.concurrent.CopyOnWriteArrayList<>();
+        Set<Integer> contenderRequests = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        CommandListener heldPeer = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (ackContendedWrite(event, name, holdNode)) heldRingRequest.set(event.getRequestId());
+            }
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                if (event.getRequestId() != heldRingRequest.get()) return;
+                if (holdNode) {
+                    assertThat(event.getResponse().get("value")).isInstanceOf(org.bson.BsonDocument.class);
+                } else {
+                    assertThat(event.getResponse().getNumber("nModified").intValue()).isEqualTo(1);
+                }
+                peerOwnsRing.countDown();
+                try {
+                    if (!releasePeer.await(20, TimeUnit.SECONDS)) throw new AssertionError("the peer ACK transaction was not released");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("the peer ACK transaction was interrupted", interrupted);
+                }
+            }
+        };
+        CommandListener observeContender = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (ackContendedWrite(event, name, holdNode)) contenderRequests.add(event.getRequestId());
+            }
+            @Override public void commandFailed(CommandFailedEvent event) {
+                if (!contenderRequests.remove(event.getRequestId()) || !(event.getThrowable() instanceof MongoException failure)) return;
+                int code = failure instanceof MongoWriteException write ? write.getError().getCode() : failure.getCode();
+                observe(code, failure.hasErrorLabel("TransientTransactionError"),
+                        failure.hasErrorLabel("UnknownTransactionCommitResult"));
+            }
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                if (!contenderRequests.remove(event.getRequestId())) return;
+                var reply = event.getResponse();
+                boolean transientError = reply.containsKey("errorLabels") && reply.getArray("errorLabels").stream()
+                        .anyMatch(label -> label.isString() && "TransientTransactionError".equals(label.asString().getValue()));
+                boolean ambiguous = reply.containsKey("errorLabels") && reply.getArray("errorLabels").stream()
+                        .anyMatch(label -> label.isString() && "UnknownTransactionCommitResult".equals(label.asString().getValue()));
+                if (reply.containsKey("writeErrors")) {
+                    reply.getArray("writeErrors").forEach(error -> observe(error.asDocument().getNumber("code").intValue(),
+                            transientError, ambiguous));
+                }
+            }
+            private void observe(int code, boolean transientError, boolean ambiguous) {
+                actualErrors.add("code=" + code + ",transient=" + transientError + ",ambiguous=" + ambiguous);
+                if (code == 112 && transientError && !ambiguous) {
+                    labeledConflicts.incrementAndGet();
+                    threeRealConflicts.countDown();
+                }
+            }
+        };
+        MongoClientSettings peerSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(heldPeer).build();
+        MongoClientSettings contenderSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(observeContender).build();
+        try (MongoClient peerClient = MongoClients.create(peerSettings);
+                MongoClient contenderClient = MongoClients.create(contenderSettings)) {
+            SourceConfigKeyringStore peer = new SourceConfigKeyringStore(peerClient, peerClient.getDatabase(name));
+            SourceConfigKeyringStore contender = new SourceConfigKeyringStore(contenderClient, contenderClient.getDatabase(name));
+            var workers = Executors.newFixedThreadPool(2);
+            try {
+                var winning = workers.submit(() -> peer.acknowledge(heldNode, epoch, ttl));
+                assertThat(peerOwnsRing.await(10, TimeUnit.SECONDS))
+                        .as("the peer actually owns the uncommitted %s write", holdNode ? "NODE" : "KEYRING").isTrue();
+                var losing = workers.submit(() -> {
+                    try {
+                        return new AckOutcome(contender.acknowledge(first, epoch, ttl), null);
+                    } catch (TapstateException coded) {
+                        return new AckOutcome(false, coded);
+                    }
+                });
+                assertThat(threeRealConflicts.await(10, TimeUnit.SECONDS))
+                        .as("three actual code112 transient responses must precede the release; observed=%s", actualErrors).isTrue();
+                if (releaseAfterThirdConflict) {
+                    releasePeer.countDown();
+                    assertThat(winning.get(5, TimeUnit.SECONDS)).isTrue();
+                    AckOutcome result = losing.get(5, TimeUnit.SECONDS);
+                    assertThat(result.failure()).as("bounded peer contention must not fail an otherwise live exact ACK").isNull();
+                    assertThat(result.applied()).isTrue();
+                    assertExactAck(database, first, epoch);
+                    if (!holdNode) assertExactAck(database, second, epoch);
+                } else {
+                    AckOutcome result = losing.get(5, TimeUnit.SECONDS);
+                    assertThat(result.failure()).isNotNull();
+                    assertThat(result.failure().code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                    assertThat(result.applied()).isFalse();
+                    assertThat(acknowledgement(database, first.key().resourceId())).isNull();
+                    assertThat(acknowledgement(database, second.key().resourceId())).isNull();
+                    releasePeer.countDown();
+                    assertThat(winning.get(5, TimeUnit.SECONDS)).isTrue();
+                    assertThat(contender.acknowledge(first, epoch, ttl)).isTrue();
+                    assertExactAck(database, first, epoch);
+                }
+                assertThat(labeledConflicts.get()).isGreaterThanOrEqualTo(3);
+                assertThat(setup.loadExisting().epoch()).isEqualTo(epoch);
+            } finally {
+                releasePeer.countDown();
+                workers.shutdownNow();
+                assertThat(workers.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    private static boolean ackContendedWrite(CommandStartedEvent event, String database, boolean node) {
+        if (!database.equals(event.getDatabaseName())) return false;
+        var command = event.getCommand();
+        if (node) {
+            if (!"findAndModify".equals(event.getCommandName())
+                    || !SystemCollections.WORKLOAD_CLAIMS.collectionName()
+                            .equals(command.getString("findAndModify").getValue())) return false;
+            var update = command.getDocument("update");
+            return update.containsKey("$inc") && update.getDocument("$inc").containsKey("sourceConfigAckFence");
+        }
+        if (!"update".equals(event.getCommandName())
+                || !SystemCollections.SYSTEM_META.collectionName().equals(command.getString("update").getValue())) return false;
+        var update = command.getArray("updates").get(0).asDocument().getDocument("u");
+        return update.containsKey("$inc") && update.getDocument("$inc").containsKey("nodeAckFence");
+    }
+
+    private static void assertExactAck(MongoDatabase database, WorkloadClaim node, long epoch) {
+        Document ack = acknowledgement(database, node.key().resourceId());
+        assertThat(ack).isNotNull();
+        assertThat(ack.getString("bootId")).isEqualTo(node.owner().bootId());
+        assertThat(ack.get("claimGeneration", Number.class).longValue()).isEqualTo(node.claimGeneration());
+        assertThat(ack.get("epoch", Number.class).longValue()).isEqualTo(epoch);
+        Document current = SystemCollections.WORKLOAD_CLAIMS.on(database).find(new Document("_id",
+                new Document("clusterId", node.key().clusterId()).append("resourceType", node.key().type().name())
+                        .append("resourceId", node.key().resourceId()))).first();
+        assertThat(ack.getDate("leaseUntil")).isBeforeOrEqualTo(current.getDate("leaseUntil"));
+    }
+
+    private record AckOutcome(boolean applied, TapstateException failure) {}
+
+    @Test
+    void aRetryingAckCannotOverwriteAReplacementBootProof() throws Exception {
+        retryingAcknowledgementRequalifiesAfterConflict(true);
+    }
+
+    @Test
+    void aRetryingAckCannotPublishAnEpochItDidNotLoad() throws Exception {
+        retryingAcknowledgementRequalifiesAfterConflict(false);
+    }
+
+    private void retryingAcknowledgementRequalifiesAfterConflict(boolean replaceBoot) throws Exception {
+        String name = replaceBoot ? "keyring_ack_retry_replaced_boot" : "keyring_ack_retry_new_epoch";
+        MongoDatabase database = freshDatabase(name);
+        SourceConfigKeyringStore setup = new SourceConfigKeyringStore(client, database);
+        setup.loadOrCreateCipher();
+        MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
+        Duration ttl = Duration.ofSeconds(30);
+        WorkloadClaim original = nodeSession(claims, "node-a", "boot-a", ttl);
+        long originalEpoch = setup.loadExisting().epoch();
+        CountDownLatch peerOwnsNode = new CountDownLatch(1);
+        CountDownLatch releasePeer = new CountDownLatch(1);
+        CountDownLatch threeRealConflicts = new CountDownLatch(3);
+        CountDownLatch nextNodeCommand = new CountDownLatch(1);
+        CountDownLatch resumeStaleRequest = new CountDownLatch(1);
+        AtomicInteger heldRequest = new AtomicInteger(-1);
+        AtomicInteger nodeRequests = new AtomicInteger();
+        AtomicInteger pausedRequest = new AtomicInteger(-1);
+        AtomicInteger staleEpochRequest = new AtomicInteger(-1);
+        AtomicBoolean staleNodeTouched = new AtomicBoolean();
+        AtomicBoolean staleEpochRefused = new AtomicBoolean();
+        Set<Integer> contenderRequests = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        List<String> actualErrors = new java.util.concurrent.CopyOnWriteArrayList<>();
+        CommandListener heldPeer = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (ackContendedWrite(event, name, true)) heldRequest.set(event.getRequestId());
+            }
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                if (event.getRequestId() != heldRequest.get()) return;
+                assertThat(event.getResponse().get("value")).isInstanceOf(org.bson.BsonDocument.class);
+                peerOwnsNode.countDown();
+                awaitAckGate(releasePeer, "the original peer ACK transaction");
+            }
+        };
+        CommandListener observeAndPause = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (ackContendedWrite(event, name, true)) {
+                    contenderRequests.add(event.getRequestId());
+                    if (nodeRequests.incrementAndGet() == 4) {
+                        pausedRequest.set(event.getRequestId());
+                        nextNodeCommand.countDown();
+                        awaitAckGate(resumeStaleRequest, "the stale retry NODE command");
+                    }
+                } else if (ackContendedWrite(event, name, false)) {
+                    staleEpochRequest.set(event.getRequestId());
+                }
+            }
+            @Override public void commandFailed(CommandFailedEvent event) {
+                if (!contenderRequests.remove(event.getRequestId()) || !(event.getThrowable() instanceof MongoException failure)) return;
+                int code = failure instanceof MongoWriteException write ? write.getError().getCode() : failure.getCode();
+                observe(code, failure.hasErrorLabel("TransientTransactionError"),
+                        failure.hasErrorLabel("UnknownTransactionCommitResult"));
+            }
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                var reply = event.getResponse();
+                if (event.getRequestId() == pausedRequest.get()) {
+                    staleNodeTouched.set(reply.get("value") instanceof org.bson.BsonDocument);
+                }
+                if (event.getRequestId() == staleEpochRequest.get()) {
+                    staleEpochRefused.set(reply.getNumber("n").intValue() == 0);
+                }
+                if (!contenderRequests.remove(event.getRequestId())) return;
+                boolean transientError = reply.containsKey("errorLabels") && reply.getArray("errorLabels").stream()
+                        .anyMatch(label -> label.isString() && "TransientTransactionError".equals(label.asString().getValue()));
+                boolean ambiguous = reply.containsKey("errorLabels") && reply.getArray("errorLabels").stream()
+                        .anyMatch(label -> label.isString() && "UnknownTransactionCommitResult".equals(label.asString().getValue()));
+                if (reply.containsKey("writeErrors")) {
+                    reply.getArray("writeErrors").forEach(error -> observe(error.asDocument().getNumber("code").intValue(),
+                            transientError, ambiguous));
+                }
+            }
+            private void observe(int code, boolean transientError, boolean ambiguous) {
+                actualErrors.add("code=" + code + ",transient=" + transientError + ",ambiguous=" + ambiguous);
+                if (code == 112 && transientError && !ambiguous) threeRealConflicts.countDown();
+            }
+        };
+        MongoClientSettings peerSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(heldPeer).build();
+        MongoClientSettings contenderSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(observeAndPause).build();
+        try (MongoClient peerClient = MongoClients.create(peerSettings);
+                MongoClient contenderClient = MongoClients.create(contenderSettings)) {
+            SourceConfigKeyringStore peer = new SourceConfigKeyringStore(peerClient, peerClient.getDatabase(name));
+            SourceConfigKeyringStore contender = new SourceConfigKeyringStore(contenderClient, contenderClient.getDatabase(name));
+            var workers = Executors.newFixedThreadPool(2);
+            try {
+                var winning = workers.submit(() -> peer.acknowledge(original, originalEpoch, ttl));
+                assertThat(peerOwnsNode.await(10, TimeUnit.SECONDS)).isTrue();
+                var stale = workers.submit(() -> contender.acknowledge(original, originalEpoch, ttl));
+                assertThat(threeRealConflicts.await(10, TimeUnit.SECONDS))
+                        .as("the real retry history must precede the change; observed=%s", actualErrors).isTrue();
+                releasePeer.countDown();
+                assertThat(winning.get(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(nextNodeCommand.await(5, TimeUnit.SECONDS))
+                        .as("this is a post-fix control requiring a fourth actual attempt").isTrue();
+                SourceConfigKeyringHandle current = new SourceConfigKeyringHandle(setup);
+                if (replaceBoot) {
+                    assertThat(claims.release(original)).isTrue();
+                    WorkloadClaim replacement = nodeSession(claims, "node-a", "boot-a2", ttl);
+                    assertThat(replacement.claimGeneration()).isGreaterThan(original.claimGeneration());
+                    current.acknowledge(replacement, ttl);
+                    assertExactAck(database, replacement, originalEpoch);
+                } else {
+                    assertThat(current.prepareRotation()).isGreaterThan(originalEpoch);
+                    current.acknowledge(original, ttl);
+                    assertExactAck(database, original, setup.loadExisting().epoch());
+                }
+                Document expectedAck = acknowledgement(database, "node-a");
+                Document expectedNode = SystemCollections.WORKLOAD_CLAIMS.on(database).find(new Document("_id",
+                        new Document("clusterId", original.key().clusterId())
+                                .append("resourceType", original.key().type().name())
+                                .append("resourceId", original.key().resourceId()))).first();
+                long expectedEpoch = setup.loadExisting().epoch();
+                resumeStaleRequest.countDown();
+
+                assertThat(stale.get(5, TimeUnit.SECONDS)).isFalse();
+                assertThat(acknowledgement(database, "node-a")).isEqualTo(expectedAck);
+                assertThat(SystemCollections.WORKLOAD_CLAIMS.on(database).find(new Document("_id", expectedNode.get("_id"))).first())
+                        .as("a refused stale ACK must leave no partial NODE fence increment").isEqualTo(expectedNode);
+                assertThat(setup.loadExisting().epoch()).isEqualTo(expectedEpoch);
+                if (replaceBoot) {
+                    assertThat(staleNodeTouched).isFalse();
+                    assertThat(staleEpochRequest.get()).isEqualTo(-1);
+                } else {
+                    assertThat(staleNodeTouched).as("the exact original NODE was touched inside the refused transaction").isTrue();
+                    assertThat(staleEpochRefused).as("the actual new epoch rejects the stale loaded epoch").isTrue();
+                }
+            } finally {
+                releasePeer.countDown();
+                resumeStaleRequest.countDown();
+                workers.shutdownNow();
+                assertThat(workers.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    private static void awaitAckGate(CountDownLatch gate, String operation) {
+        try {
+            if (!gate.await(20, TimeUnit.SECONDS)) throw new AssertionError(operation + " was not released");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(operation + " was interrupted", interrupted);
+        }
     }
 
     private static SourceConfigCipher load(SourceConfigKeyringStore store, CountDownLatch start) {
