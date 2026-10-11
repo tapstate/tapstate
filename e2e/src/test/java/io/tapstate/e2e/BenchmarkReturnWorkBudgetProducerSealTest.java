@@ -63,7 +63,7 @@ class BenchmarkReturnWorkBudgetProducerSealTest {
         assertThatThrownBy(() -> verify(fixture)).isInstanceOf(AssertionError.class).hasMessageContaining("prior byte bound");
         rewrite(fixture, ("[".repeat(13) + "0" + "]".repeat(13)).getBytes(StandardCharsets.US_ASCII));
         assertThatThrownBy(() -> verify(fixture)).isInstanceOf(AssertionError.class).hasMessageContaining("prior JSON depth");
-        Path linked = directory.resolve("linked.json"); Files.createSymbolicLink(linked, fixture.body());
+        Path linked = directory.toRealPath().resolve("linked.json"); Files.createSymbolicLink(linked, fixture.body());
         assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProducerSeal.verifyFiles(linked.toAbsolutePath(), REGISTERED))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("missing or linked");
         Files.delete(fixture.companion());
