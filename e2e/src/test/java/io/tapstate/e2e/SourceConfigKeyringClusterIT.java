@@ -72,10 +72,16 @@ class SourceConfigKeyringClusterIT {
             assertReleased(database, secondEnding);
             assertThat(stableKeyring(keyring(database))).as("shutdown does not replace or delete keys")
                     .isEqualTo(stableKeyring(keyring));
+            Document retiredProfile = awaitColdProfileAuthorization(database, firstEnding, secondEnding);
+            long previousGeneration = retiredProfile.get("generation", Number.class).longValue();
+            String previousProfileHash = retiredProfile.getString("hash");
             try (TwoMemberCluster restarted = original.restarted()) {
                 assertThat(restarted.awaitBothMembers())
                         .containsExactly(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
                 String clusterId = restarted.first().clusterId();
+                Document replacementProfile = profileAuthorization(database, clusterId);
+                assertThat(replacementProfile.get("generation", Number.class).longValue()).isEqualTo(previousGeneration + 1);
+                assertThat(replacementProfile.getString("hash")).isEqualTo(previousProfileHash);
                 awaitAcknowledgements(database, clusterId, 1, TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
                 assertReplacement(firstEnding.acknowledgement(),
                         acknowledgement(database, clusterId, TwoMemberCluster.NODE_A));
@@ -327,6 +333,57 @@ class SourceConfigKeyringClusterIT {
         assertThat(system.find(new Document("_id", ending.acknowledgement().get("_id"))
                 .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")))).first())
                 .as("shutdown released the matching keyring acknowledgement").isNull();
+    }
+
+    private static Document awaitColdProfileAuthorization(MongoDatabase database, EndingSession... endings) {
+        String clusterId = endings[0].acknowledgement().getString("clusterId");
+        MongoCollection<Document> claims = SystemCollections.WORKLOAD_CLAIMS.on(database);
+        MongoCollection<Document> profiles = SystemCollections.CLUSTER_EXECUTION_PROFILES.on(database);
+        Document former = profileAuthorization(database, clusterId);
+        long generation = former.get("generation", Number.class).longValue();
+        assertThat(generation).isPositive();
+        assertThat(former.getDate("authorizationUntil")).isNotNull();
+        for (EndingSession ending : endings) {
+            assertThat(ending.acknowledgement().getString("clusterId")).isEqualTo(clusterId);
+            assertReleased(database, ending);
+            Document ended = claims.find(new Document("_id", ending.claim().get("_id"))).first();
+            assertThat(ended.get("profileGeneration", Number.class).longValue()).isEqualTo(generation);
+            assertThat(ended.getDate("retiredAuthorizationUntil"))
+                    .as("early release preserves the exact earlier promised node authorization")
+                    .isNotNull().isAfterOrEqualTo(ending.claim().getDate("leaseUntil"));
+            assertThat(former.getDate("authorizationUntil"))
+                    .as("the profile retains every stopped node's cached authorization horizon")
+                    .isAfterOrEqualTo(ended.getDate("retiredAuthorizationUntil"));
+        }
+        Document nodes = new Document("clusterId", clusterId).append("resourceType", WorkloadClaimType.NODE_SESSION.name());
+        assertThat(claims.countDocuments(new Document(nodes)
+                .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")))))
+                .as("all current NODE leases ended before the retained promises are awaited").isZero();
+        Await.until("the stopped cluster's actual promised node authorization to expire on Mongo time", WAIT,
+                () -> claims.countDocuments(new Document(nodes)
+                                .append("$expr", new Document("$or", List.of(
+                                        new Document("$gt", List.of("$leaseUntil", "$$NOW")),
+                                        new Document("$gt", List.of("$retiredAuthorizationUntil", "$$NOW")))))) == 0
+                        && profiles.find(new Document("_id", clusterId).append("generation", generation)
+                                .append("authorizationUntil", new Document("$type", "date"))
+                                .append("$expr", new Document("$lte", List.of("$authorizationUntil", "$$NOW")))).first() != null,
+                () -> "liveNodeLeases=" + claims.countDocuments(new Document(nodes)
+                                .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))
+                        + ", formerGeneration=" + generation + ", authorizationUntil="
+                        + profileAuthorization(database, clusterId).getDate("authorizationUntil"));
+        Document retired = profileAuthorization(database, clusterId);
+        assertThat(retired.get("generation", Number.class).longValue()).isEqualTo(generation);
+        assertThat(retired.getString("hash")).isEqualTo(former.getString("hash"));
+        assertThat(retired.getDate("authorizationUntil")).isEqualTo(former.getDate("authorizationUntil"));
+        return retired;
+    }
+
+    private static Document profileAuthorization(MongoDatabase database, String clusterId) {
+        Document profile = SystemCollections.CLUSTER_EXECUTION_PROFILES.on(database)
+                .find(new Document("_id", clusterId))
+                .projection(new Document("generation", 1).append("hash", 1).append("authorizationUntil", 1)).first();
+        assertThat(profile).isNotNull();
+        return profile;
     }
 
     private static void assertReplacement(Document oldAck, Document currentAck) {
