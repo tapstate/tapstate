@@ -156,11 +156,33 @@ final class BenchmarkReturnWorkBudgetBindings {
     private record OriginKey(Owner owner, String binaryName) { }
     private BenchmarkReturnWorkBudgetBindings() { }
 
+    static final class AuthenticatedProfile {
+        private final BenchmarkReturnWorkBudgetProfile.Prepared prepared;
+        private final BenchmarkReturnWorkBudget.Definition definition;
+        private AuthenticatedProfile(BenchmarkReturnWorkBudgetProfile.Prepared prepared) {
+            this.prepared = prepared; this.definition = prepared.requireDefinition();
+        }
+        BenchmarkReturnWorkBudgetProfile.Prepared prepared() { return prepared; }
+        BenchmarkReturnWorkBudget.Definition definition() { return definition; }
+    }
+
+    /** Authenticate once before consuming a run; later fact comparisons do not rebuild its workload. */
+    static AuthenticatedProfile authenticate(BenchmarkReturnWorkBudgetProfile.Prepared prepared) {
+        require(prepared != null, "binding input missing");
+        require(prepared.equals(BenchmarkReturnWorkBudgetProfile.inspect(prepared.inputs())), "source factory registration differs");
+        return new AuthenticatedProfile(prepared);
+    }
+
     static Map<String, Object> verify(BenchmarkReturnWorkBudgetProfile.Prepared prepared, HelperManifest helper,
             JdkManifest jdk, ActualFacts actual, OwnedRuntimes owners) {
-        require(prepared != null && helper != null && jdk != null && actual != null && owners != null, "binding input missing");
-        require(prepared.equals(BenchmarkReturnWorkBudgetProfile.inspect(prepared.inputs())), "source factory registration differs");
-        var definition = prepared.requireDefinition();
+        return verify(authenticate(prepared), helper, jdk, actual, owners);
+    }
+
+    static Map<String, Object> verify(AuthenticatedProfile authenticated, HelperManifest helper,
+            JdkManifest jdk, ActualFacts actual, OwnedRuntimes owners) {
+        require(authenticated != null && helper != null && jdk != null && actual != null && owners != null, "binding input missing");
+        var prepared = authenticated.prepared();
+        var definition = authenticated.definition();
         var inputs = prepared.inputs();
         require(helper.schemaVersion() == SCHEMA_VERSION && jdk.schemaVersion() == SCHEMA_VERSION, "manifest schema differs");
         require(inputs.runId().equals(helper.runId()) && inputs.runId().equals(jdk.runId()) && inputs.runId().equals(actual.runId())

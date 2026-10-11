@@ -16,6 +16,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkReturnWorkBudgetBindingsTest {
+    @Test void cached_source_authentication_rejects_substituted_bounds_and_still_checks_later_actual_facts() {
+        var fixture = fixture(false, false);
+        var authenticated = BenchmarkReturnWorkBudgetBindings.authenticate(fixture.prepared());
+        assertThat(BenchmarkReturnWorkBudgetBindings.verify(authenticated, fixture.helper(), fixture.jdk(),
+                fixture.actual(), fixture.owners())).containsEntry("state", "REGISTERED_BINDING_FACTS_MATCHED");
+        var bounds = new java.util.EnumMap<>(fixture.prepared().perOperationUpper());
+        bounds.put(BenchmarkReturnWorkBudget.Activity.DECODE, BenchmarkReturnWorkBudget.Work.zero());
+        var replaced = new BenchmarkReturnWorkBudgetProfile.Prepared(fixture.prepared().inputs(), bounds,
+                fixture.prepared().explicitExcludedActivities(), fixture.prepared().fieldsRegisteredOutputPlan(),
+                fixture.prepared().inputRegistrationInfo(), fixture.prepared().gaps());
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetBindings.authenticate(replaced))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("source factory registration differs");
+        var changed = new ArrayList<>(fixture.actual().classes()); var first = changed.getFirst();
+        changed.set(0, new CompiledClass(first.role(), first.binaryName(), blob("changed-after-authentication")));
+        var changedActual = actual(fixture, fixture.actual().files(), fixture.actual().sources(), changed,
+                fixture.actual().origins(), fixture.actual().jdkFiles());
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetBindings.verify(authenticated, fixture.helper(), fixture.jdk(),
+                changedActual, fixture.owners())).isInstanceOf(AssertionError.class).hasMessageContaining("actual compiled class bytes differ");
+    }
+
     @Test void matching_typed_facts_keep_source_compiled_and_runtime_boundaries_explicit() {
         var fixture = fixture(false, false);
         var evidence = fixture.verify();

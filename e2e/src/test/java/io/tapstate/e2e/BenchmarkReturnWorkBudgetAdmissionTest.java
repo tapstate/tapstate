@@ -36,6 +36,8 @@ class BenchmarkReturnWorkBudgetAdmissionTest {
         var upper = verified.upper().get(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT);
         assertThat(actual.requests()).isEqualTo(external.get()).isEqualTo(3);
         assertThat(actual.bytes()).isEqualTo(6); assertThat(upper.bytes()).isEqualTo(12);
+        assertThat(verified.selfUpper().evidence()).isEqualTo(receipt.get("selfSourceUpper"));
+        assertThat(verified.selfUpper().requests()).isPositive();
         assertThat(receipt).containsEntry("structuralWorkBudgetQualified", false)
                 .containsEntry("wholeMethodCostQualified", false).containsEntry("performanceAcceptanceEligible", false);
     }

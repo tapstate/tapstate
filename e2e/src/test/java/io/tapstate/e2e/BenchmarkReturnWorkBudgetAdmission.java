@@ -19,7 +19,8 @@ final class BenchmarkReturnWorkBudgetAdmission {
 
     record Recomputed(Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> actual,
                       Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> upper,
-                      BenchmarkReturnWorkBudget.Work totalActual, BenchmarkReturnWorkBudget.Work totalUpper) {
+                      BenchmarkReturnWorkBudget.Work totalActual, BenchmarkReturnWorkBudget.Work totalUpper,
+                      BenchmarkReturnWorkBudget.Work selfUpper) {
         Recomputed { actual = Map.copyOf(actual); upper = Map.copyOf(upper); }
     }
 
@@ -102,7 +103,7 @@ final class BenchmarkReturnWorkBudgetAdmission {
         for (String flag : Set.of("structuralWorkBudgetQualified", "wholeMethodCostQualified", "causalOverheadQualified")) {
             require(Boolean.FALSE.equals(receipt.get(flag)), "counter receipt claimed a qualification");
         }
-        verifySelf(receipt);
+        var selfUpper = verifySelf(receipt);
         var output = object(receipt.get("output"), "actual output outcome");
         require("WRITE_AND_CLOSE_COMPLETED".equals(output.get("state")), "output has not completed");
         long outputBytes = number(output, "actualBytes"), outputUpper = number(output, "independentUpperBytes");
@@ -153,10 +154,10 @@ final class BenchmarkReturnWorkBudgetAdmission {
         } catch (ArithmeticException overflow) {
             throw new AssertionError("return work admission checked arithmetic overflowed", overflow);
         }
-        return new Recomputed(actual, upper, totalActual, totalUpper);
+        return new Recomputed(actual, upper, totalActual, totalUpper, selfUpper);
     }
 
-    private static void verifySelf(Map<String, Object> receipt) {
+    private static BenchmarkReturnWorkBudget.Work verifySelf(Map<String, Object> receipt) {
         require(Boolean.FALSE.equals(receipt.get("selfOverflow")) && !receipt.containsKey("selfOverflowField")
                         && !receipt.containsKey("selfSourceUpperState")
                         && "SOURCE_ENTRY_VISITS_VECTOR_PASSES_FIXED_RECEIPT_COPY_AND_PRIVATE_COUNTER_TAIL_V1"
@@ -196,6 +197,7 @@ final class BenchmarkReturnWorkBudgetAdmission {
             require("ONE_IDEMPOTENT_RELEASE_CALL_INCLUDING_ATOMIC_SCOPE_CLEAR".equals(release.get("scope"))
                             && work(release.get("upper")).equals(new BenchmarkReturnWorkBudget.Work(1, 1, 0, 0, 0, 1, 4, 4)),
                     "release source tail differs");
+            return expected;
         } catch (ArithmeticException overflow) { throw new AssertionError("return work admission self arithmetic overflowed", overflow); }
     }
 
