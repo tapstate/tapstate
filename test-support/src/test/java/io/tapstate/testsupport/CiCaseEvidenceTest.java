@@ -14,12 +14,17 @@ import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.AbstractList;
+import java.util.AbstractMap;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Set;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -65,6 +70,88 @@ class CiCaseEvidenceTest {
         assertThat(opaque.reason()).isEqualTo("unsupported-type");
         assertThat(opaque.json()).contains("opaque", Opaque.class.getName()).doesNotContain("@");
         assertThat(CiCaseEvidence.canonical(new AccessorTrap("stored-value")).stable()).isTrue();
+    }
+
+    @Test
+    void arbitraryCollectionsAreNotAskedToRunTheirOwnCodeDuringObservation() throws Exception {
+        AtomicInteger collectionCalls = new AtomicInteger();
+        List<Object> list = new AbstractList<>() {
+            @Override
+            public Object get(int index) {
+                collectionCalls.incrementAndGet();
+                throw new AssertionError("custom list get was called");
+            }
+
+            @Override
+            public int size() {
+                collectionCalls.incrementAndGet();
+                throw new AssertionError("custom list size was called");
+            }
+        };
+        Map<String, Object> map = new AbstractMap<>() {
+            @Override
+            public Set<Entry<String, Object>> entrySet() {
+                collectionCalls.incrementAndGet();
+                throw new AssertionError("custom map entrySet was called");
+            }
+        };
+        AtomicInteger invocations = new AtomicInteger();
+        Method method = method("namedFixture", String.class, Object.class);
+        for (Object value : List.of(list, map, Collections.unmodifiableList(list), Collections.unmodifiableMap(map))) {
+            Captured captured = capture(true, () -> observer.interceptTestTemplateMethod(() -> {
+                invocations.incrementAndGet();
+                return null;
+            }, invocation(method, List.of("source-bound-name", value)),
+                    context(method, "case", "[test-template-invocation:#1]")));
+            assertThat(captured.failure()).isNull();
+            assertThat(captured.output()).contains("unsupported-collection-implementation", "\"stable\":false");
+        }
+        assertThat(collectionCalls).hasValue(0);
+        assertThat(invocations).hasValue(4);
+    }
+
+    @Test
+    void metadataErrorsCannotReplaceTheOriginalInvocationOrItsThrowable() throws Exception {
+        Method method = method("fixture", Object.class);
+        ExtensionContext brokenMetadata = (ExtensionContext) Proxy.newProxyInstance(ExtensionContext.class.getClassLoader(),
+                new Class<?>[] {ExtensionContext.class}, (proxy, called, arguments) -> {
+                    throw new AssertionError("metadata reader failed");
+                });
+        AtomicInteger invocations = new AtomicInteger();
+        AssertionError original = new AssertionError("original test failure");
+        Captured captured = capture(true, () -> observer.interceptTestMethod(() -> {
+            invocations.incrementAndGet();
+            throw original;
+        }, invocation(method, List.of("value")), brokenMetadata));
+        assertThat(invocations).hasValue(1);
+        assertThat(captured.failure()).isSameAs(original);
+        assertThat(captured.output()).contains("observation-unavailable", "\"stable\":false", "\"status\":\"failed\"")
+                .doesNotContain("metadata reader failed", "original test failure");
+    }
+
+    @Test
+    void invalidUnicodeIsNotCollapsedIntoAFalseStableUtf8Identity() {
+        CiCaseEvidence.Canonical high = CiCaseEvidence.canonical("\uD800");
+        CiCaseEvidence.Canonical low = CiCaseEvidence.canonical("\uDC00");
+        assertThat(high.stable()).isFalse();
+        assertThat(low.stable()).isFalse();
+        assertThat(high.reason()).isEqualTo("ill-formed-unicode");
+        assertThat(low.reason()).isEqualTo("ill-formed-unicode");
+        assertThat(CiCaseEvidence.canonical("\uD800\uDC00").stable()).isTrue();
+    }
+
+    @Test
+    void hiddenCarriersExposeTheirDeclaredSlotWithoutAddressesOrInvocation() throws Exception {
+        Supplier<String> carrier = () -> {
+            throw new AssertionError("carrier was invoked");
+        };
+        Method method = method("carrierFixture", String.class, Supplier.class);
+        Captured captured = capture(true, () -> observer.interceptTestTemplateMethod(() -> null,
+                invocation(method, List.of("source-bound-name", carrier)),
+                context(method, "case", "[test-template-invocation:#1]")));
+        assertThat(captured.failure()).isNull();
+        assertThat(captured.output()).contains("opaque-generated", "java.util.function.Supplier", "\"stable\":false")
+                .doesNotContain("$$Lambda", "/0x", "carrier was invoked");
     }
 
     @Test
@@ -298,6 +385,9 @@ class CiCaseEvidenceTest {
 
     @RepeatedTest(3)
     private void repeatedFixture() {
+    }
+
+    private void carrierFixture(String label, Supplier<?> carrier) {
     }
 
     private void temporaryFixture(String label, @TempDir Path directory) {

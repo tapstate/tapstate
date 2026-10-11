@@ -34,9 +34,14 @@ with tempfile.TemporaryDirectory() as tmp:
     raw = root / 'XML'
     raw.mkdir()
     (raw / 'TEST-A.xml').write_text('<testsuite/>')
+    nested = raw / 'receipt.json'
+    nested.write_text('original nested receipt')
     m.manifest(root, {'archive_complete': True, 'gaps': []})
     m.verify(argparse.Namespace(directory=str(root)))
     check(True, 'complete raw evidence reads back')
+    nested.write_text('tampered nested receipt')
+    rejected(lambda: m.verify(argparse.Namespace(directory=str(root))), 'nested receipt basename is included in archive hashes')
+    nested.write_text('original nested receipt')
     (raw / 'TEST-A.xml').write_text('<testsuite tests="0"/>')
     rejected(lambda: m.verify(argparse.Namespace(directory=str(root))), 'same file identity with tampered bytes rejects')
     (raw / 'TEST-A.xml').write_text('<testsuite/>')
@@ -71,6 +76,9 @@ with tempfile.TemporaryDirectory() as tmp:
     classfile = b'\xca\xfe\xba\xbe\x00\x00\x00\x41original'
     check(m.crc64(classfile) != m.crc64(classfile + b'changed'), 'changed class bytes have different identity')
     check(m.crc64(b'123456789') == '46a5a9388a5beffe', 'CRC64 known polynomial vector')
+    classbytes = b'\xca\xfe\xba\xbe\x00\x00\x00\x41\x00\x01\x10\x01'
+    check(m.class_access_flags(classbytes) == 0x1001, 'actual synthetic access flags do not depend on observed XML')
+    rejected(lambda: m.class_access_flags(classbytes[:-1]), 'truncated class access metadata rejects')
     # First-attempt provenance is validated independently of successful conclusion.
     original_api = m.api
     m.api = lambda endpoint: {'id': 10, 'run_attempt': 1, 'status': 'in_progress', 'repository': {'full_name': 'example/project'}}

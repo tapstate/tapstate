@@ -36,8 +36,8 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
-def command(args, binary=False):
-    result = subprocess.run(args, capture_output=True, text=not binary)
+def command(args, binary=False, cwd=None):
+    result = subprocess.run(args, capture_output=True, text=not binary, cwd=cwd)
     require(result.returncode == 0, 'command failed: ' + ' '.join(args[:3]))
     return result.stdout
 
@@ -93,12 +93,36 @@ def crc_table():
 CRC_TABLE = crc_table()
 
 
+def class_access_flags(data):
+    require(data[:4] == b'\xca\xfe\xba\xbe' and len(data) >= 12, 'invalid class file')
+    count = int.from_bytes(data[8:10], 'big')
+    position, slot = 10, 1
+    sizes = {3: 4, 4: 4, 5: 8, 6: 8, 7: 2, 8: 2, 9: 4, 10: 4,
+             11: 4, 12: 4, 15: 3, 16: 2, 17: 4, 18: 4, 19: 2, 20: 2}
+    while slot < count:
+        require(position < len(data), 'truncated class constant pool')
+        tag = data[position]
+        position += 1
+        if tag == 1:
+            require(position + 2 <= len(data), 'truncated class string')
+            size = 2 + int.from_bytes(data[position:position + 2], 'big')
+        else:
+            require(tag in sizes, 'unsupported class constant pool tag')
+            size = sizes[tag]
+        position += size
+        require(position <= len(data), 'truncated class constant pool entry')
+        slot += 2 if tag in (5, 6) else 1
+    require(position + 2 <= len(data), 'missing class access flags')
+    return int.from_bytes(data[position:position + 2], 'big')
+
+
 def git(root, *args):
     return command(['git', '-C', str(root), *args]).strip()
 
 
 def inputs(args):
     root = Path(args.root).resolve()
+    require(Path(git(root, 'rev-parse', '--show-toplevel')).resolve() == root, 'input root must be the actual product checkout')
     require(not git(root, 'status', '--porcelain', '--untracked-files=no'), 'tracked source must be clean')
     untracked = git(root, 'ls-files', '--others', '--exclude-standard').splitlines()
     require(not any(name.endswith(('.java', '.py', '.sh', '.xml', '.yml', '.yaml', '.properties'))
@@ -111,10 +135,11 @@ def inputs(args):
     if args.resolve_classpath:
         command(['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()),
                  'dependency:build-classpath', '-DincludeScope=test',
-                 '-Dmdep.outputFile=target/ci-dependency-classpath.txt'])
-    production, class_ids, outputs, classpaths = {}, {}, {}, {}
+                 '-Dmdep.outputFile=target/ci-dependency-classpath.txt'], cwd=root)
+    production, class_ids, test_files, test_ids, outputs, classpaths = {}, {}, {}, {}, {}, {}
+    jar_classes, class_flags = {}, {}
     for module, _ in shards.reactor(root):
-        target = root / module / 'target'
+        target = shards.owned_path(root, (Path(module) / 'target').as_posix())
         classpath = target / 'ci-dependency-classpath.txt'
         if classpath.exists():
             resolved = []
@@ -130,7 +155,21 @@ def inputs(args):
                     identity = 'checkout/' + path.relative_to(root).as_posix()
                 else:
                     raise ValueError('classpath outside the declared checkout/dependency repository')
-                resolved.append({'identity': identity, 'sha256': digest(path), 'size': path.stat().st_size})
+                if identity not in jar_classes:
+                    known = {}
+                    if path.suffix == '.jar':
+                        with zipfile.ZipFile(path) as archive:
+                            for member in archive.infolist():
+                                if member.filename.startswith('io/tapstate/') and member.filename.endswith('.class'):
+                                    require(not member.is_dir() and '..' not in Path(member.filename).parts,
+                                            'unsafe classpath archive member')
+                                    name = member.filename.removesuffix('.class')
+                                    require(name not in known, 'duplicate classpath class')
+                                    bytecode = archive.read(member)
+                                    known[name] = {'class_id': crc64(bytecode), 'sha256': hashlib.sha256(bytecode).hexdigest()}
+                    jar_classes[identity] = known
+                resolved.append({'identity': identity, 'sha256': digest(path), 'size': path.stat().st_size,
+                                 'own_classes': jar_classes[identity]})
             classpaths[module] = resolved
         classes = target / 'classes'
         if classes.exists():
@@ -138,7 +177,16 @@ def inputs(args):
                 relative = path.relative_to(root).as_posix()
                 production[relative] = digest(path)
                 if path.suffix == '.class':
-                    class_ids[relative] = crc64(path.read_bytes())
+                    bytecode = path.read_bytes()
+                    class_ids[relative] = crc64(bytecode)
+                    class_flags[relative] = class_access_flags(bytecode)
+        test_classes = target / 'test-classes'
+        if test_classes.exists():
+            for path in safe_files(test_classes):
+                if path.suffix == '.class':
+                    relative = path.relative_to(root).as_posix()
+                    test_files[relative] = digest(path)
+                    test_ids[relative] = crc64(path.read_bytes())
         if target.exists():
             for path in sorted(target.iterdir()):
                 if path.is_file() and path.name.endswith(('.jar', '.tar.gz', '.zip', '.pom')):
@@ -155,23 +203,28 @@ def inputs(args):
     source_files = {}
     for name in git(root, 'ls-files').splitlines():
         if name.endswith(('.java', '.xml', '.yml', '.yaml', '.json', '.sh', '.py', '.properties')):
-            source_files[name] = digest(root / name)
+            source_files[name] = digest(shards.owned_path(root, name))
+    java = subprocess.run(['java', '-version'], capture_output=True, text=True, cwd=root)
+    require(java.returncode == 0 and java.stderr.strip(), 'Java version evidence unavailable')
     value = {'schema': 1, 'source_sha': git(root, 'rev-parse', 'HEAD'),
              'source_tree': git(root, 'rev-parse', 'HEAD^{tree}'), 'event': os.getenv('GITHUB_EVENT_NAME', 'local'),
              'run_id': os.getenv('GITHUB_RUN_ID', 'local'), 'run_attempt': os.getenv('GITHUB_RUN_ATTEMPT', '1'),
-             'captured_at': datetime.now(timezone.utc).isoformat(), 'phase': 'pre-test-after-install',
+             'captured_at': datetime.now(timezone.utc).isoformat(), 'phase': args.phase,
              'source_files': source_files, 'production_files': production, 'production_class_ids': class_ids,
+             'production_class_access_flags': class_flags, 'jacoco_version': shards.pom(root / 'pom.xml').findtext('properties/plugin.jacoco.version'),
+             'test_files': test_files, 'test_class_ids': test_ids,
              'packaged_outputs': outputs, 'dependency_repository_files': dependencies,
              'dependency_scope': 'conservative available JAR/POM byte binding plus independently resolved ordered test classpaths',
              'resolved_test_classpaths': classpaths,
-             'toolchain': {'java': subprocess.run(['java', '-version'], capture_output=True, text=True).stderr,
+             'toolchain': {'java': java.stderr,
                            'maven': command(['mvn', '--version']), 'os': platform.platform(), 'architecture': platform.machine(),
                            'cpu_count': os.cpu_count()},
              'elapsed_seconds': (time.monotonic_ns() - start) / 1e9}
     if args.resolve_classpath:
-        require(classpaths, 'resolved classpath evidence missing')
+        expected_modules = {t['module'] for t in shards.discover(root)}
+        require(expected_modules <= set(classpaths), 'selected test module classpaths missing: ' + str(sorted(expected_modules - set(classpaths))))
     write(Path(args.output), value)
-    print('CI_PHASE_JSON ' + json.dumps({'schema': 1, 'phase': 'capture-build-inputs', 'event': 'end',
+    print('CI_PHASE_JSON ' + json.dumps({'schema': 1, 'phase': 'capture-build-inputs', 'input_phase': args.phase, 'event': 'end',
                                          'elapsed_seconds': value['elapsed_seconds'], 'status': 'success'}))
 
 
@@ -236,7 +289,7 @@ def zip_members(path):
 
 def manifest(directory, metadata):
     files = {p.relative_to(directory).as_posix(): {'sha256': digest(p), 'size': p.stat().st_size}
-             for p in safe_files(directory) if p.name != 'receipt.json'}
+             for p in safe_files(directory) if p.relative_to(directory).as_posix() != 'receipt.json'}
     write(directory / 'receipt.json', {**metadata, 'files': files})
 
 
@@ -244,7 +297,7 @@ def verify(args):
     directory = Path(args.directory).resolve()
     receipt = json.loads((directory / 'receipt.json').read_text())
     actual = {p.relative_to(directory).as_posix(): {'sha256': digest(p), 'size': p.stat().st_size}
-              for p in safe_files(directory) if p.name != 'receipt.json'}
+              for p in safe_files(directory) if p.relative_to(directory).as_posix() != 'receipt.json'}
     require(actual == receipt['files'], 'archive file set/size/SHA-256 differs')
     for path in directory.rglob('*.zip'):
         zip_members(path)
@@ -351,6 +404,7 @@ def main():
     p.add_argument('--repo-local', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--resolve-classpath', action='store_true')
+    p.add_argument('--phase', choices=['pre-test-after-install', 'post-test-before-pack'], default='pre-test-after-install')
     p = commands.add_parser('resources')
     p.add_argument('--root', default='.')
     p.add_argument('--output', required=True)

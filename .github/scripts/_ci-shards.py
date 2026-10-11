@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import zipfile
 import xml.etree.ElementTree as ET
 
 
@@ -248,9 +249,11 @@ def reset_test_evidence(root, shard):
     for module, _ in reactor(root):
         target = Path(module) / 'target'
         paths += [(target / name, True) for name in ['surefire-reports', 'failsafe-reports']]
-        paths += [(target / name, False) for name in ['jacoco.exec', 'jacoco-it.exec']]
+        paths += [(target / name, False) for name in ['jacoco.exec', 'jacoco-it.exec',
+                    'site/jacoco/jacoco.xml', 'site/jacoco-it/jacoco.xml']]
     paths += [(Path('e2e/target/witness-ledger.txt'), False),
-              (Path('e2e/target/witness-ledgers'), True), (provenance_path(shard), False)]
+              (Path('e2e/target/witness-ledgers'), True), (Path('target/jacoco-reactor.exec'), False),
+              (provenance_path(shard), False)]
     # Preflight the whole set, including absent paths and dangling links. A refusal
     # must not partially reset another module or follow a target link out of checkout.
     owned = [(owned_path(root, path.as_posix()), directory) for path, directory in paths]
@@ -273,6 +276,30 @@ def validate_provenance(value, plan, shard):
             and all(value.get(k) == v for k, v in identity.items()), 'run provenance differs: ' + shard['id'])
     require(value.get('run_attempt') is None or type(value['run_attempt']) is int, 'invalid run attempt type')
     require(value.get('status') == 'success', 'selected verify did not succeed: ' + shard['id'])
+    observer = value.get('case_observer')
+    require(isinstance(observer, dict) and type(observer.get('enabled')) is bool,
+            'invalid case observer provenance')
+    require(observer.get('providers') == ([OBSERVER] if observer['enabled'] else []),
+            'case observer provider set differs')
+    if observer['enabled']:
+        require(isinstance(observer.get('build_inputs_sha256'), str)
+                and re.fullmatch(r'[0-9a-f]{64}', observer['build_inputs_sha256'])
+                and type(observer.get('audit_elapsed_ns')) is int and observer['audit_elapsed_ns'] >= 0,
+                'invalid case observer input or cost binding')
+        hashes = observer.get('observer_files')
+        require(isinstance(hashes, dict) and set(hashes) == set(OBSERVER_FILES)
+                and all(isinstance(h, str) and re.fullmatch(r'[0-9a-f]{64}', h) for h in hashes.values()),
+                'invalid case observer class/service binding')
+        scopes = observer.get('checked_scopes')
+        require(isinstance(scopes, list) and all(isinstance(scope, dict) for scope in scopes),
+                'invalid case observer checked scopes')
+        actual = Counter((scope.get('module'), scope.get('kind')) for scope in scopes)
+        expected = Counter({(t['module'], t['kind']): 1 for t in shard['tests']})
+        require(actual == expected and all(isinstance(scope.get('dependency_excludes'), list)
+                and scope['dependency_excludes'] == sorted(set(scope['dependency_excludes']))
+                and all(isinstance(excluded, str) and re.fullmatch(r'[\w.-]+:[\w.-]+', excluded)
+                        for excluded in scope['dependency_excludes']) for scope in scopes),
+                'case observer checked classpath scopes differ')
     require(re.fullmatch(r'[0-9a-f]{32}', value.get('invocation_id', '')) is not None,
             'invalid run invocation: ' + shard['id'])
     for phase in ['reset', 'verify']:
@@ -314,23 +341,210 @@ def ledger_paths(root, shard):
     return sorted(result)
 
 
+OBSERVER = 'io.tapstate.testsupport.CiCaseEvidence'
+EXTENSION_SERVICE = 'META-INF/services/org.junit.jupiter.api.extension.Extension'
+OBSERVER_PREFIX = 'test-support/target/test-classes/'
+OBSERVER_FILES = [OBSERVER_PREFIX + 'io/tapstate/testsupport/CiCaseEvidence.class',
+                  OBSERVER_PREFIX + 'io/tapstate/testsupport/CiCaseEvidence$Canonical.class',
+                  OBSERVER_PREFIX + EXTENSION_SERVICE]
+
+
+def file_digest(path):
+    result = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def extension_providers(content):
+    require(len(content) <= 65536, 'extension service registry exceeds audit bound')
+    providers = set()
+    for raw in content.decode('utf-8').splitlines():
+        name = raw.split('#', 1)[0].strip()
+        if name:
+            require(re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', name) is not None,
+                    'invalid extension service declaration')
+            providers.add(name)
+    return providers
+
+
+def classpath_exclusions(root, module, kind, inputs):
+    plugin_name = 'maven-surefire-plugin' if kind == 'unit' else 'maven-failsafe-plugin'
+    directories, directory = [root], root
+    for part in safe_path(module).parts:
+        directory = directory / part
+        if directory != root and (directory / 'pom.xml').is_file():
+            directories.append(directory)
+    result = set()
+    for directory in directories:
+        path = directory / 'pom.xml'
+        require(inputs.get('source_files', {}).get(path.relative_to(root).as_posix()) == file_digest(path),
+                'classpath audit POM changed or lacks input binding')
+        tree = pom(path)
+        supported = tree.findall('build/plugins/plugin') + tree.findall('build/pluginManagement/plugins/plugin')
+        for plugin in tree.findall('.//plugin'):
+            if plugin.findtext('artifactId') != plugin_name:
+                continue
+            for config in plugin.findall('.//configuration'):
+                unsupported = ['classpathDependencyScopeExclude', 'additionalClasspathElements',
+                               'additionalClasspathDependencies', 'testClassesDirectory', 'classesDirectory']
+                require(not any(config.find(name) is not None for name in unsupported),
+                        'unsupported effective test classpath customization')
+                excludes = config.find('classpathDependencyExcludes')
+                if excludes is None:
+                    continue
+                require(plugin in supported and config is plugin.find('configuration')
+                        and not excludes.attrib, 'conditional or execution classpath exclusion requires effective model evidence')
+                values = {node.text.strip() for node in excludes.findall('classpathDependencyExclude') if node.text}
+                require(len(values) == len(list(excludes)) and all(re.fullmatch(r'[\w.-]+:[\w.-]+', value) for value in values),
+                        'unsupported classpath dependency exclusion')
+                require(not result or result == values, 'ambiguous inherited classpath exclusions')
+                result = values
+    return result
+
+
+def classpath_coordinate(root, scope, relative, inputs):
+    parts = safe_path(relative).parts
+    if scope == 'repository':
+        require(len(parts) >= 4, 'cannot prove Maven coordinates for classpath exclusion')
+        return '.'.join(parts[:-3]) + ':' + parts[-3]
+    require('/target/' in relative, 'cannot prove checkout coordinates for classpath exclusion')
+    module = relative.split('/target/', 1)[0]
+    path = owned_path(root, module + '/pom.xml', 'classpath')
+    require(path.is_file() and inputs.get('source_files', {}).get(path.relative_to(root).as_posix()) == file_digest(path),
+            'checkout classpath POM lacks input binding')
+    tree = pom(path)
+    group = tree.findtext('groupId') or tree.findtext('parent/groupId')
+    artifact = tree.findtext('artifactId')
+    require(group and artifact, 'cannot prove checkout coordinates for classpath exclusion')
+    return group + ':' + artifact
+
+
+def case_observer(args, root, plan, modules):
+    if not args.case_evidence:
+        require(args.build_inputs is None, '--build-inputs requires --case-evidence')
+        return dict(enabled=False, providers=[])
+    require(args.build_inputs is not None, '--case-evidence requires --build-inputs')
+    started = time.monotonic_ns()
+    observer_files = {name: owned_path(root, name, 'observer') for name in OBSERVER_FILES}
+    require(all(path.is_file() for path in observer_files.values()),
+            'case observer classes and service must be built before selected verify')
+    observer_hashes = {name: file_digest(path) for name, path in observer_files.items()}
+    require(extension_providers(observer_files[OBSERVER_PREFIX + EXTENSION_SERVICE].read_bytes()) == {OBSERVER},
+            'case observer service registration differs')
+    manifest_path = Path(args.build_inputs)
+    require(manifest_path.is_file() and not manifest_path.is_symlink(), 'invalid build inputs file')
+    inputs = read(manifest_path)
+    identity = execution_identity()
+    run_id = identity['run_id'] if identity['execution'] == 'github-actions' else 'local'
+    attempt = identity['run_attempt'] if identity['execution'] == 'github-actions' else 1
+    require(isinstance(inputs, dict) and type(inputs.get('schema')) is int and inputs['schema'] == 1
+            and inputs.get('phase') == 'pre-test-after-install' and inputs.get('source_sha') == plan['source_sha']
+            and inputs.get('run_id') == run_id and str(inputs.get('run_attempt')) == str(attempt),
+            'case observer build inputs source/run/attempt differs')
+    for name, actual_hash in observer_hashes.items():
+        if name.endswith('.class'):
+            require(inputs.get('test_files', {}).get(name) == actual_hash, 'case observer class differs from captured build input')
+    classpaths = inputs.get('resolved_test_classpaths')
+    require(isinstance(classpaths, dict) and set(modules) <= set(classpaths),
+            'case observer requires resolved test classpaths for every selected module')
+    repository = Path(args.repo_local).resolve()
+    inspected, scopes = {}, []
+    shard = selected(plan, args.shard)
+    for module in modules:
+        providers = {OBSERVER}
+        for directory in ['classes', 'test-classes']:
+            relative = (Path(module) / 'target' / directory).as_posix()
+            output = owned_path(root, relative, 'observer')
+            require(directory != 'test-classes' or output.is_dir(), 'missing prepared test classes: ' + module)
+            if output.exists():
+                require(output.is_dir(), 'invalid prepared classes directory')
+                require(not (output / 'module-info.class').exists(), 'module-path observer audit requires effective model evidence')
+                service = owned_path(root, relative + '/' + EXTENSION_SERVICE, 'observer')
+                if service.exists():
+                    require(service.is_file(), 'invalid extension service file')
+                    providers.update(extension_providers(service.read_bytes()))
+                for observer_name in ['CiCaseEvidence.class', 'CiCaseEvidence$Canonical.class']:
+                    candidate = owned_path(root, relative + '/io/tapstate/testsupport/' + observer_name, 'observer')
+                    require(not candidate.exists() or file_digest(candidate) == observer_hashes[
+                                OBSERVER_PREFIX + 'io/tapstate/testsupport/' + observer_name],
+                            'case observer class shadowed in prepared output')
+        require(providers == {OBSERVER}, 'unexpected extension provider in prepared module classes: ' + module)
+        kinds = sorted({test['kind'] for test in shard['tests'] if test['module'] == module})
+        exclusions = {kind: classpath_exclusions(root, module, kind, inputs) for kind in kinds}
+        entries = classpaths[module]
+        require(isinstance(entries, list), 'invalid resolved test classpath')
+        active_providers = {kind: set(providers) for kind in kinds}
+        for entry in entries:
+            require(isinstance(entry, dict) and isinstance(entry.get('identity'), str)
+                    and type(entry.get('size')) is int and entry['size'] >= 0
+                    and isinstance(entry.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', entry['sha256']),
+                    'invalid resolved classpath entry')
+            scope, separator, relative = entry['identity'].partition('/')
+            require(separator and scope in ['repository', 'checkout'] and relative and '\\' not in relative,
+                    'invalid resolved classpath identity')
+            path = owned_path(repository if scope == 'repository' else root, relative, 'classpath')
+            require(path.is_file(), 'missing resolved test classpath file')
+            coordinate = classpath_coordinate(root, scope, relative, inputs) if any(exclusions.values()) else None
+            active = [kind for kind in kinds if coordinate not in exclusions[kind]]
+            if path not in inspected:
+                inspected[path] = [file_digest(path), path.stat().st_size, None]
+            actual_hash, actual_size, jar_providers = inspected[path]
+            require(actual_hash == entry['sha256'] and actual_size == entry['size'],
+                    'resolved test classpath bytes changed after input capture')
+            if active and jar_providers is None:
+                jar_providers = set()
+                with zipfile.ZipFile(path) as archive:
+                    services = [member for member in archive.infolist() if member.filename == EXTENSION_SERVICE]
+                    require(len(services) <= 1, 'duplicate extension service in resolved classpath JAR')
+                    if services:
+                        require(services[0].file_size <= 65536, 'extension service registry exceeds audit bound')
+                        jar_providers = extension_providers(archive.read(services[0]))
+                    for observer_name in ['CiCaseEvidence.class', 'CiCaseEvidence$Canonical.class']:
+                        member = 'io/tapstate/testsupport/' + observer_name
+                        if member in archive.namelist():
+                            require(archive.getinfo(member).file_size == observer_files[OBSERVER_PREFIX + member].stat().st_size,
+                                    'case observer class shadowed in active dependency')
+                            require(hashlib.sha256(archive.read(member)).hexdigest() == observer_hashes[OBSERVER_PREFIX + member],
+                                    'case observer class shadowed in active dependency')
+                inspected[path][2] = jar_providers
+            for kind in active:
+                active_providers[kind].update(jar_providers)
+        for kind in kinds:
+            require(active_providers[kind] == {OBSERVER},
+                    'unexpected extension provider in actual selected test classpath: ' + module + '/' + kind)
+            scopes.append(dict(module=module, kind=kind, dependency_excludes=sorted(exclusions[kind])))
+    return dict(enabled=True, providers=[OBSERVER], checked_scopes=scopes,
+                build_inputs_sha256=file_digest(manifest_path), observer_files=observer_hashes,
+                audit_elapsed_ns=time.monotonic_ns()-started)
+
+
 def run_shard(args, root, plan):
     shard = selected(plan, args.shard)
     require(shard['tests'], 'cannot run empty shard')
     modules = sorted({t['module'] for t in shard['tests']})
+    if args.case_evidence:
+        with phase_timing('audit-case-observer', 'run', plan, shard['id']):
+            observer = case_observer(args, root, plan, modules)
+    else:
+        observer = case_observer(args, root, plan, modules)
     # Retain installed outputs and the original verify hooks; only declared test
     # evidence and this shard's freshness receipt are reset in the owned checkout.
     with phase_timing('reset-test-evidence', 'run', plan, shard['id']) as reset:
         reset_test_evidence(root, shard)
     receipt = dict(schema=1, source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
                    shard_id=shard['id'], invocation_id=uuid.uuid4().hex,
-                   status='running', reset=reset, **execution_identity())
+                   status='running', reset=reset, case_observer=observer, **execution_identity())
     marker = owned_path(root, provenance_path(shard).as_posix())
     write(marker, receipt)
     command = ['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
     for kind, flag in [('unit', 'test'), ('it', 'it.test')]:
         names = sorted({t['class'] for t in shard['tests'] if t['kind'] == kind})
         command.append('-D' + flag + '=' + (','.join(names) if names else '__ci_shard_no_tests__'))
+    if args.case_evidence:
+        command += ['-Dmaven.test.additionalClasspath=' + str(root / 'test-support/target/test-classes'),
+                    '-Djunit.jupiter.extensions.autodetection.enabled=true', '-Dtapstate.ci.case-evidence=true']
     # Selectors span several modules. Exact admission below catches any missing class;
     # Maven must permit the modules in which a selector has no local match.
     command += ['-Dsurefire.failIfNoSpecifiedTests=false', '-Dfailsafe.failIfNoSpecifiedTests=false']
@@ -401,6 +615,11 @@ def pack(args, root, plan):
     require(marker.is_file(), 'missing current run provenance: ' + shard['id'])
     provenance = read(marker)
     validate_provenance(provenance, plan, shard)
+    if provenance['case_observer']['enabled']:
+        require(all(owned_path(root, name, 'observer').is_file()
+                    and file_digest(owned_path(root, name, 'observer')) == digest
+                    for name, digest in provenance['case_observer']['observer_files'].items()),
+                'case observer classes/service changed after selected verify')
     witness_ledgers = ledger_paths(root, shard)
     report_paths, statistics, report_classes = reports(root, shard)
     output = Path(args.output)
@@ -544,6 +763,8 @@ def main():
             command.add_argument('--shard', required=True)
         if name == 'run':
             command.add_argument('--repo-local', required=True)
+            command.add_argument('--case-evidence', action='store_true', help='enable the passive built case observer')
+            command.add_argument('--build-inputs', help='current pre-test resolved classpaths required by the observer')
         if name == 'pack':
             command.add_argument('--output', required=True)
         if name == 'verify':
@@ -568,6 +789,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, KeyError, OSError, ET.ParseError, subprocess.CalledProcessError) as error:
+    except (ValueError, KeyError, OSError, ET.ParseError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
         print('ci-shards: ' + str(error), file=sys.stderr)
         sys.exit(1)

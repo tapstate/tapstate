@@ -81,10 +81,16 @@ jobs:
         run: |
           python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
           echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
+      # Only input hashes and tool versions are shared; raw configuration and credentials are excluded.
+      - name: Record pre-test build inputs
+        run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --resolve-classpath --output "$RUNNER_TEMP/ci-inputs/build-inputs.json"
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
-        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json"
+      - name: Record post-test input hashes
+        if: always()
+        run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --phase post-test-before-pack --output "$RUNNER_TEMP/ci-inputs/post-test-inputs.json"
       - name: Preserve downloaded dependencies
         if: always()
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
@@ -96,6 +102,13 @@ jobs:
         with:
           name: ci-test-results-${{ matrix.shard }}
           path: ${{ runner.temp }}/ci-artifacts/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-inputs-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ci-inputs/
           if-no-files-found: error
           retention-days: 7
       - name: The scene where a shard failed
@@ -182,6 +195,14 @@ jobs:
           merge-multiple: true
       - name: Prepare local artifacts for report generation
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Record the aggregate build inputs
+        run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --resolve-classpath --output "$RUNNER_TEMP/ci-inputs/build-inputs.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-inputs-build
+          path: ${{ runner.temp }}/ci-inputs/build-inputs.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Admit the complete report and coverage set
         run: .github/scripts/ci-aggregate.sh verify --plan "$RUNNER_TEMP/shards.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --restore .
       - name: Every shard job succeeded
@@ -452,6 +473,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: CI evidence and durable receipt controls
+        run: |
+          shellcheck .github/scripts/ci-evidence.sh .github/scripts/ci-evidence-smoke.sh .github/scripts/ci-receipt.sh .github/scripts/ci-receipt-smoke.sh
+          python3 -m py_compile .github/scripts/_ci-evidence.py .github/scripts/_ci-receipt.py
+          bash .github/scripts/ci-evidence-smoke.sh
+          bash .github/scripts/ci-receipt-smoke.sh
       - name: shellcheck the catalog scripts
         # One invocation over all four rather than a line each: a `run: |` block runs under bash -e,
         # so the first script to report anything aborts the step and the ones after it are never

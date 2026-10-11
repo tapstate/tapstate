@@ -4,7 +4,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export SHARD_GATE="$here/ci-shard.sh"
 python3 - <<'PY'
-import json, os, pathlib, shutil, subprocess, tempfile
+import hashlib, json, os, pathlib, shutil, subprocess, tempfile, zipfile
 from collections import Counter
 with tempfile.TemporaryDirectory() as tmp:
     root = pathlib.Path(tmp)
@@ -52,10 +52,11 @@ with tempfile.TemporaryDirectory() as tmp:
     for module in cleanup_modules:
         for phase in ['surefire', 'failsafe']:
             put(module+'/target/'+phase+'-reports/TEST-stale.xml','old XML')
-        for name in ['jacoco.exec', 'jacoco-it.exec']:
+        for name in ['jacoco.exec', 'jacoco-it.exec', 'site/jacoco/jacoco.xml', 'site/jacoco-it/jacoco.xml']:
             put(module+'/target/'+name,'old coverage')
         put(module+'/target/classes/Keep.class','production bytecode')
         put(module+'/target/test-classes/Keep.class','test bytecode')
+    put('target/jacoco-reactor.exec','old merged coverage')
     put('e2e/target/witness-ledger.txt','old ordinary ledger')
     put('e2e/target/witness-ledgers/123.txt','old selected ledger')
     put('bin/mvn', '#!/bin/sh\nprintf "%s\\n" "$@" > "'+str(root/'mvn-args')+'"\n'
@@ -67,6 +68,7 @@ with tempfile.TemporaryDirectory() as tmp:
     run_command=[os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')]
     executed=subprocess.run(run_command,check=True,env=environment,capture_output=True,text=True)
     args=(root/'mvn-args').read_text().splitlines()
+    assert not (root/'target/jacoco-reactor.exec').exists(), 'old merged coverage survived'
     assert not (root/'e2e/target/witness-ledger.txt').exists(), 'old ordinary ledger survived'
     assert not (root/'e2e/target/witness-ledgers').exists(), 'old selected ledger survived'
     assert (root/'core/target/jacoco.exec').read_text()=='new', 'coverage must be from this verify, without append residue'
@@ -74,6 +76,8 @@ with tempfile.TemporaryDirectory() as tmp:
     for module in cleanup_modules:
         assert not list((root/module/'target').glob('*-reports/TEST-stale.xml'))
         assert not (root/module/'target/jacoco-it.exec').exists()
+        assert not (root/module/'target/site/jacoco/jacoco.xml').exists()
+        assert not (root/module/'target/site/jacoco-it/jacoco.xml').exists()
         assert (root/module/'target/classes/Keep.class').read_text()=='production bytecode'
         assert (root/module/'target/test-classes/Keep.class').read_text()=='test bytecode'
     timing=[json.loads(line.split(' ',1)[1]) for line in executed.stdout.splitlines() if line.startswith('CI_PHASE_JSON ')]
@@ -82,6 +86,95 @@ with tempfile.TemporaryDirectory() as tmp:
         assert end['status']=='success' and end['monotonic_ns']>=start['monotonic_ns']
         assert end['elapsed_ns']==end['monotonic_ns']-start['monotonic_ns']
         assert start['source_sha']==end['source_sha']==added['source_sha'] and end['shard_id']=='rest'
+    # Observer activation audits the real declared classpath, not every available cached JAR.
+    assert not any('additionalClasspath' in a or 'autodetection' in a or 'case-evidence' in a for a in args)
+    ordinary=root/'m2/example/ordinary/1/ordinary-1.jar'; ordinary.parent.mkdir(parents=True)
+    service_name='META-INF/services/org.junit.jupiter.api.extension.Extension'
+    observer_prefix='test-support/target/test-classes/'
+    def jar(path,service=None,shadow=False):
+        with zipfile.ZipFile(path,'w') as archive:
+            archive.writestr('sample/Fixture.class','fixture bytecode')
+            if service is not None: archive.writestr(service_name,service)
+            if shadow: archive.writestr('io/tapstate/testsupport/CiCaseEvidence.class','foreign observer bytecode')
+    jar(ordinary)
+    unrelated=root/'m2/example/unrelated/1/unrelated-1.jar'; unrelated.parent.mkdir(parents=True)
+    jar(unrelated,'foreign.CachedExtension\n')
+    classpaths={module:[ordinary] for module in ['arch-tests','core','e2e']}
+    def build_inputs():
+        value=dict(schema=1,phase='pre-test-after-install',source_sha=added['source_sha'],
+                   run_id=os.environ.get('GITHUB_RUN_ID','local'),run_attempt=os.environ.get('GITHUB_RUN_ATTEMPT','1'),
+                   source_files={path.relative_to(root).as_posix():hashlib.sha256(path.read_bytes()).hexdigest()
+                                 for path in root.rglob('pom.xml')},
+                   test_files={path.relative_to(root).as_posix():hashlib.sha256(path.read_bytes()).hexdigest()
+                               for path in root.rglob('*.class') if '/target/test-classes/' in path.as_posix()},
+                   resolved_test_classpaths={module:[dict(identity='repository/'+path.relative_to(root/'m2').as_posix(),
+                       sha256=hashlib.sha256(path.read_bytes()).hexdigest(),size=path.stat().st_size) for path in paths]
+                       for module,paths in classpaths.items()})
+        put('build-inputs.json',json.dumps(value)); return value
+    def reject_observer(command,message):
+        put('e2e/target/failsafe-reports/TEST-observer-sentinel.xml','preserve before audit')
+        put('e2e/target/witness-ledger.txt','preserve ordinary ledger')
+        (root/'mvn-args').unlink(missing_ok=True)
+        result=subprocess.run(command,env=environment,capture_output=True,text=True)
+        assert result.returncode!=0 and message in result.stderr,(message,result.stdout,result.stderr)
+        assert not (root/'mvn-args').exists(), 'observer audit must finish before Maven'
+        assert (root/'e2e/target/failsafe-reports/TEST-observer-sentinel.xml').read_text()=='preserve before audit'
+        assert (root/'e2e/target/witness-ledger.txt').read_text()=='preserve ordinary ledger'
+        assert not any(json.loads(line.split(' ',1)[1])['phase']=='reset-test-evidence'
+                       for line in result.stdout.splitlines() if line.startswith('CI_PHASE_JSON ')), 'observer audit must finish before reset'
+    inputs=build_inputs()
+    input_args=['--build-inputs',str(root/'build-inputs.json')]
+    opted=run_command+['--case-evidence']+input_args
+    reject_observer(run_command+['--case-evidence'],'requires --build-inputs')
+    reject_observer(run_command+input_args,'requires --case-evidence')
+    reject_observer(opted,'must be built')
+    put(observer_prefix+'io/tapstate/testsupport/CiCaseEvidence.class','observer bytecode')
+    put(observer_prefix+'io/tapstate/testsupport/CiCaseEvidence$Canonical.class','canonical bytecode')
+    inputs=build_inputs(); reject_observer(opted,'must be built')
+    put(observer_prefix+service_name,'other.Extension\n')
+    inputs=build_inputs(); reject_observer(opted,'registration differs')
+    put(observer_prefix+service_name,'io.tapstate.testsupport.CiCaseEvidence\n')
+    inputs=build_inputs()
+    subprocess.run(opted,check=True,env=environment,capture_output=True)
+    observed=(root/'mvn-args').read_text().splitlines()
+    extra=['-Dmaven.test.additionalClasspath='+str((root/observer_prefix).resolve()),
+           '-Djunit.jupiter.extensions.autodetection.enabled=true','-Dtapstate.ci.case-evidence=true']
+    assert all(observed.count(flag)==1 for flag in extra)
+    assert [a for a in observed if a not in extra]==args, 'observer must retain the original selectors and verify lifecycle'
+    receipt=json.loads((root/'target/ci-shards/run-rest.json').read_text())['case_observer']
+    assert receipt['enabled'] is True and receipt['providers']==['io.tapstate.testsupport.CiCaseEvidence']
+    assert receipt['build_inputs_sha256']==hashlib.sha256((root/'build-inputs.json').read_bytes()).hexdigest()
+    assert {(s['module'],s['kind']) for s in receipt['checked_scopes']}=={('arch-tests','unit'),('core','unit'),('e2e','unit')}
+    for field,value in [('source_sha','wrong-source'),('run_id','another-run'),('run_attempt','999')]:
+        changed=build_inputs(); changed[field]=value; put('build-inputs.json',json.dumps(changed))
+        reject_observer(opted,'source/run/attempt differs')
+    changed=build_inputs(); changed['resolved_test_classpaths'].pop('core'); put('build-inputs.json',json.dumps(changed))
+    reject_observer(opted,'every selected module')
+    changed=build_inputs(); changed['resolved_test_classpaths']['core'][0]['sha256']='0'*64; put('build-inputs.json',json.dumps(changed))
+    reject_observer(opted,'bytes changed')
+    for directory in ['classes','test-classes']:
+        path='core/target/'+directory+'/'+service_name
+        put(path,'foreign.ProjectExtension\n'); build_inputs()
+        reject_observer(opted,'unexpected extension provider')
+        (root/path).unlink()
+    jar(ordinary,'foreign.ActiveExtension\n'); build_inputs()
+    reject_observer(opted,'unexpected extension provider')
+    jar(ordinary,shadow=True); build_inputs()
+    reject_observer(opted,'shadowed in active dependency')
+    jar(ordinary)
+    # The same foreign MCP provider is inactive for an explicitly excluded IT and active for unit tests.
+    mcp=root/'m2/io/tapstate/mcp-server/1/mcp-server-1.jar'; mcp.parent.mkdir(parents=True)
+    jar(mcp,'foreign.McpExtension\n')
+    saved_pom=(root/'e2e/pom.xml').read_text()
+    exclusion='<configuration><classpathDependencyExcludes><classpathDependencyExclude>io.tapstate:mcp-server</classpathDependencyExclude></classpathDependencyExcludes></configuration>'
+    put('e2e/pom.xml',saved_pom.replace('<artifactId>maven-failsafe-plugin</artifactId>','<artifactId>maven-failsafe-plugin</artifactId>'+exclusion))
+    classpaths['e2e']=[ordinary,mcp]; build_inputs()
+    it_command=opted.copy(); it_command[it_command.index('--shard')+1]='e2e-1'
+    subprocess.run(it_command,check=True,env=environment,capture_output=True)
+    it_receipt=json.loads((root/'target/ci-shards/run-e2e-1.json').read_text())['case_observer']
+    assert it_receipt['checked_scopes']==[dict(module='e2e',kind='it',dependency_excludes=['io.tapstate:mcp-server'])]
+    reject_observer(opted,'e2e/unit')
+    put('e2e/pom.xml',saved_pom); classpaths['e2e']=[ordinary]; build_inputs()
     # Validate every removal first: even a later unsafe path must leave all evidence untouched.
     outside_context=tempfile.TemporaryDirectory()
     outside=pathlib.Path(outside_context.name)

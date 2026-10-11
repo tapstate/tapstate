@@ -4,7 +4,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export EVIDENCE_TOOL="$here/ci-evidence.sh" EVIDENCE_MODULE="$here/_ci-evidence.py"
 python3 - <<'PY'
-import copy, hashlib, importlib.util, json, os, pathlib, shutil, struct, subprocess, sys, tempfile
+import copy, hashlib, importlib.util, json, os, pathlib, shutil, struct, subprocess, sys, tempfile, tarfile
 import xml.etree.ElementTree as ET
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('evidence', os.environ['EVIDENCE_MODULE'])
@@ -61,7 +61,7 @@ class PublishedExamplesIT {
     value_method = next(m for m in inv['methods'] if m['method']=='values')
     value_cases = [case('sample.CoreTest','values(String)['+str(n+1)+']') for n in range(2)]
     for n,element in enumerate(value_cases):
-        marker=dict(phase='start',unique_id='value-'+str(n),stable=True,**{'class':'sample.CoreTest'},method='values',argument_digest=value_method['argument_digests'][n])
+        marker=dict(schema=1,phase='start',unique_id='value-'+str(n),stable=True,**{'class':'sample.CoreTest'},method='values',argument_digest=value_method['argument_digests'][n])
         ET.SubElement(element,'system-out').text='tapstate.ci-case='+json.dumps(marker)+'\n'+'tapstate.ci-case='+json.dumps(marker|dict(phase='finish',status='executed'))+'\n'
     core = suite('sample.CoreTest',[case('sample.CoreTest','one',skipped='original expected skip'),case('sample.CoreTest','two'),*value_cases,case('sample.CoreTest','inherited'),case('sample.CoreTest','injected(Path)')],'core')
     nested = suite('sample.CoreTest$Inner',[case('sample.CoreTest$Inner','nested')],'core')
@@ -85,6 +85,13 @@ class PublishedExamplesIT {
     edit(core,lambda s:(s.findall('testcase')[3].set('name','values(String)[1]'),s.findall('testcase')[3].find('system-out').__setattr__('text',s.findall('testcase')[2].find('system-out').text))); compare(False,'case multiset differs'); reset()
     edit(core,lambda s:s.findall('testcase')[2].find('system-out').__setattr__('text',s.findall('testcase')[2].find('system-out').text.replace(value_method['argument_digests'][0],'0'*64)))
     compare(False,'unresolved identities'); reset()
+    # A finish receipt cannot borrow a valid start while changing its identity/outcome.
+    for field,value in [('schema',True),('stable',False),('method','invented'),('argument_digest','0'*64),('status','aborted')]:
+        def corrupt_finish(element):
+            stream=element.findall('testcase')[2].find('system-out'); lines=stream.text.splitlines(); finish=json.loads(lines[1].split('=',1)[1]); finish[field]=value; lines[1]='tapstate.ci-case='+json.dumps(finish); stream.text='\n'.join(lines)+'\n'
+        edit(core,corrupt_finish); compare(False,'unresolved identities'); reset()
+    put(reports,'core/target/surefire-reports/TEST-sample.ForeignTest.xml','<testsuite name="sample.ForeignTest" tests="0" failures="0" errors="0" skipped="0"/>')
+    run(['reports','--root',str(reports),'--lane','ci','--inventory',str(inventory),'--output',str(after)],False,'outside independent source'); reset()
     # The report and ledger agree on the same omitted tier; the independent source refuses it.
     edit(published,lambda s:s.remove(s.findall('testcase')[-1])); ledger.write_text('\n'.join(expected[:-1])+'\n'); compare(False,'case multiset differs'); reset()
     ledger.write_text(ledger.read_text()+expected[0]+'\n'); compare(False,'ledger multiset differs'); reset()
@@ -165,7 +172,7 @@ class PublishedExamplesIT {
     edit(policy_report,lambda element:[c.find('skipped').__setattr__('text',c.find('skipped').text.replace('sample.Original.frame(Original.java:12)','sample.Observer.frame(Observer.java:99)')) for c in element.findall('testcase') if c.find('skipped') is not None])
     policy_compare(); reset_policy()
     # Coverage provenance is checked inside the binary execution format, not file existence.
-    coverage_root = root/'coverage'; classfile = put(coverage_root,'core/target/classes/sample/Production.class',b'\xca\xfe\xba\xbe\x00\x00\x00\x41'+b'isolated-smoke-bytecode')
+    coverage_root = root/'coverage'; classfile = put(coverage_root,'core/target/classes/sample/Production.class',b'\xca\xfe\xba\xbe\x00\x00\x00\x41\x00\x01\x00\x21'+b'isolated-smoke-bytecode')
     def reference_crc(content):
         value = 0
         for byte in content:
@@ -177,11 +184,23 @@ class PublishedExamplesIT {
     def exec_data(start=1000,end=2000,identifier=class_id):
         return b'\x01\xc0\xc0\x10\x07\x10'+utf('current-session')+struct.pack('>QQ',start,end)+b'\x11'+bytes.fromhex(identifier)+utf('sample/Production')+b'\x02\x03'
     execfile = put(coverage_root,'core/target/jacoco.exec',exec_data())
-    xml = put(coverage_root,'core/target/site/jacoco/jacoco.xml','<report name="current"><sessioninfo id="current-session" start="1000" dump="2000"/><package name="sample"><sourcefile name="Production.java"><line nr="1" ci="2" cb="1"/></sourcefile></package></report>')
-    binding = save('binding.json',dict(run_id=123,attempt=1,source_sha='a'*40,started_ms=1000,completed_ms=2000,required_exec=['core/target/jacoco.exec']))
+    xml = put(coverage_root,'core/target/site/jacoco/jacoco.xml','<report name="current"><sessioninfo id="current-session" start="1000" dump="2000"/><package name="sample"><class name="sample/Production"/><sourcefile name="Production.java"><line nr="1" ci="2" cb="1"/></sourcefile></package></report>')
+    binding = save('binding.json',dict(run_id=123,attempt=1,source_sha='a'*40,started_ms=1000,completed_ms=2000,required_exec=['core/target/jacoco.exec'],required_reports=['core/target/site/jacoco/jacoco.xml'],required_report_classes={'core/target/site/jacoco/jacoco.xml':['sample/Production']}))
     def cov(expected=True,reason=None,destination='coverage.json'):
         run(['coverage','--root',str(coverage_root),'--binding',str(binding),'--output',str(root/destination)],expected,reason)
     cov(); shutil.copyfile(root/'coverage.json',root/'coverage-before.json')
+    saved_xml=xml.read_text(); xml.unlink(); cov(False,'XML path set differs'); xml.write_text(saved_xml)
+    xml.write_text(saved_xml.replace('<class name="sample/Production"/>','')); cov(False,'production class set differs'); xml.write_text(saved_xml)
+    unknown_own=exec_data().replace(utf('sample/Production'),utf('io/tapstate/foreign/Injected'))
+    execfile.write_bytes(unknown_own); cov(False,'undeclared own bytecode'); execfile.write_bytes(exec_data())
+    source_file='core/target/classes/sample/Production.class'
+    input_snapshot=dict(schema=1,source_sha='a'*40,run_id=123,run_attempt=1,phase='pre-test-after-install',production_files={source_file:hashlib.sha256(classfile.read_bytes()).hexdigest()},production_class_ids={source_file:class_id},production_class_access_flags={source_file:33},jacoco_version='0.8.13',test_files={},test_class_ids={},resolved_test_classpaths={'core':[]},dependency_repository_files={})
+    input_file=save('coverage-inputs.json',input_snapshot)
+    run(['coverage','--root',str(coverage_root),'--binding',str(binding),'--inputs',str(input_file),'--output',str(root/'coverage-from-inputs.json')])
+    post_file=save('coverage-post.json',input_snapshot|dict(phase='post-test-before-pack'))
+    run(['coverage','--root',str(coverage_root),'--binding',str(binding),'--inputs',str(input_file),'--test-inputs',str(post_file),'--output',str(root/'coverage-from-inputs.json')])
+    save('coverage-post.json',input_snapshot|dict(phase='post-test-before-pack',production_files={source_file:'0'*64}))
+    run(['coverage','--root',str(coverage_root),'--binding',str(binding),'--inputs',str(input_file),'--test-inputs',str(post_file),'--output',str(root/'coverage-from-inputs.json')],False,'changed during tests')
     execfile.write_bytes(exec_data(start=900)); cov(False,'stale or out-of-run'); execfile.write_bytes(exec_data())
     execfile.write_bytes(exec_data(identifier='0'*16)); cov(False,'class ID differs'); execfile.write_bytes(exec_data())
     execfile.write_bytes(exec_data()+exec_data(start=900)); cov(False,'stale or out-of-run'); execfile.write_bytes(exec_data())
@@ -194,13 +213,33 @@ class PublishedExamplesIT {
     run(['compare-coverage','--before',str(root/'coverage-before.json'),'--after',str(root/'coverage.json'),'--output',str(root/'coverage-diff.json')],False,'branches decreased')
     xml.write_text(xml.read_text().replace('cb="0"','cb="1"')); cov()
     run(['compare-coverage','--before',str(root/'coverage-before.json'),'--after',str(root/'coverage.json'),'--output',str(root/'coverage-diff.json')])
-    gate_record = dict(id='ci:build:dispatch',required=True,applicable=True,applicability='workflow_dispatch',contract_sha256='f'*64,conclusion='success')
-    gates_before=save('gates-before.json',dict(gates=[gate_record])); gates_after=save('gates-after.json',dict(gates=[gate_record]))
+    gate_record = dict(id='ci:build:dispatch',required=True,applicable=True,applicability='workflow_dispatch',contract_sha256='f'*64,scope='always',conclusion='success')
+    gates_before=save('gates-before.json',dict(schema=1,gates=[gate_record])); gates_after=save('gates-after.json',dict(schema=1,gates=[gate_record]))
     def gate(success=True,reason=None):run(['gates','--baseline',str(gates_before),'--candidate',str(gates_after),'--output',str(root/'gates-diff.json')],success,reason)
     gate()
-    for mutation,reason in [(dict(conclusion='skipped'),'unsuccessful'),(dict(required=False),'contract changed'),(dict(contract_sha256='e'*64),'contract changed'),(dict(applicable=False),'contract changed')]:
-        save('gates-after.json',dict(gates=[gate_record|mutation])); gate(False,reason)
-    save('gates-after.json',dict(gates=[])); gate(False,'instance set changed')
+    for mutation,reason in [(dict(conclusion='skipped'),'unsuccessful'),(dict(required=False),'contract changed'),(dict(contract_sha256='e'*64),'contract changed'),(dict(applicable=False),'cannot be non-applicable')]:
+        save('gates-after.json',dict(schema=1,gates=[gate_record|mutation])); gate(False,reason)
+    save('gates-after.json',dict(schema=1,gates=[])); gate(False,'empty gate contract')
+    # Identical malformed contracts on both sides still must be rejected.
+    for mutation in [dict(applicable=False,conclusion='skipped',applicability={'reason':'unchecked'}),dict(required='true'),dict(scope='made-up'),dict(scope='conditional',applicability={'reason':'unchecked','decision':True})]:
+        save('gates-before.json',dict(schema=1,gates=[gate_record|mutation]));save('gates-after.json',dict(schema=1,gates=[gate_record|mutation]));gate(False)
+    save('gates-before.json',dict(schema=1,gates=[gate_record]));save('gates-after.json',dict(schema=1,gates=[gate_record]))
+    # A source archive nested under another Git checkout cannot inherit its HEAD.
+    parent_repo=root/'ancestor';parent_repo.mkdir()
+    subprocess.run(['git','init','-q',str(parent_repo)],check=True)
+    put(parent_repo,'README','ancestor')
+    subprocess.run(['git','-C',str(parent_repo),'add','README'],check=True)
+    subprocess.run(['git','-C',str(parent_repo),'-c','user.name=Fixture','-c','user.email=fixture@example.com','commit','-qm','fixture'],check=True)
+    extracted=parent_repo/'readback';shutil.copytree(source,extracted)
+    assert evidence.current_sha(extracted) is None
+    archive_dir=root/'source-archive';archive_dir.mkdir();source_tar=archive_dir/'source.tar'
+    with tarfile.open(source_tar,'w',format=tarfile.PAX_FORMAT,pax_headers={'comment':'a'*40}) as tar:tar.add(source,arcname='.')
+    raw_run=put(archive_dir,'run.json',json.dumps(dict(id=123,run_attempt=1,head_sha='a'*40,repository={'full_name':'tapstate/tapstate'})))
+    source_receipt=put(archive_dir,'receipt.json',json.dumps(dict(schema=1,repository='tapstate/tapstate',run_id=123,run_attempt=1,source_sha='a'*40,files={path.name:dict(size=path.stat().st_size,sha256=hashlib.sha256(path.read_bytes()).hexdigest()) for path in [source_tar,raw_run]})))
+    source_command=['inventory','--root',str(extracted),'--lane','ci','--source-archive',str(source_tar),'--source-receipt',str(source_receipt),'--output',str(root/'archived-inventory.json')]
+    run(source_command);assert json.loads((root/'archived-inventory.json').read_text())['source_sha']=='a'*40
+    put(extracted,'core/pom.xml','modified');run(source_command,False,'file set/bytes differs');shutil.copyfile(source/'core/pom.xml',extracted/'core/pom.xml')
+    original_tar=source_tar.read_bytes();source_tar.write_bytes(original_tar+b'tamper');run(source_command,False,'size/hash differs');source_tar.write_bytes(original_tar)
     artifact_root=root/'artifact'; member=put(artifact_root,'raw/test.xml','original bytes')
     origin=dict(run_id=123,attempt=1,source_sha='a'*40)
     artifact_manifest=save('artifact.json',origin|dict(files={'raw/test.xml':hashlib.sha256(member.read_bytes()).hexdigest()}))

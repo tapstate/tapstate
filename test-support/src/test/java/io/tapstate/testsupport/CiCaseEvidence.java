@@ -12,6 +12,7 @@ import org.opentest4j.TestAbortedException;
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.lang.reflect.RecordComponent;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -26,6 +27,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -50,6 +52,14 @@ public final class CiCaseEvidence implements InvocationInterceptor {
     private static final int MAX_NODES = 8192;
     private static final int MAX_ITEMS = 4096;
     private static final int MAX_STRING_LENGTH = 65536;
+    private static final Set<String> BUILTIN_LISTS = Set.of(
+            "java.util.ArrayList", "java.util.LinkedList", "java.util.Arrays$ArrayList",
+            "java.util.ImmutableCollections$List12", "java.util.ImmutableCollections$ListN",
+            "java.util.Collections$EmptyList", "java.util.Collections$SingletonList");
+    private static final Set<String> BUILTIN_MAPS = Set.of(
+            "java.util.HashMap", "java.util.LinkedHashMap", "java.util.TreeMap",
+            "java.util.ImmutableCollections$Map1", "java.util.ImmutableCollections$MapN",
+            "java.util.Collections$EmptyMap", "java.util.Collections$SingletonMap");
     private static final Pattern REPETITION = Pattern.compile("\\[test-template-invocation:#(\\d+)]$");
 
     @Override
@@ -90,7 +100,7 @@ public final class CiCaseEvidence implements InvocationInterceptor {
         String record;
         try {
             record = record(method, arguments, context, kind);
-        } catch (RuntimeException failedObservation) {
+        } catch (Throwable failedObservation) {
             // Evidence collection must not turn an original passing invocation into a failure.
             // Admission rejects the explicit incomplete observation instead.
             record = "\"schema\":1,\"stable\":false,\"reason\":\"observation-unavailable\"";
@@ -109,7 +119,7 @@ public final class CiCaseEvidence implements InvocationInterceptor {
         try {
             System.out.println(MARKER + "{" + record + ",\"phase\":" + quote(phase)
                     + (status == null ? "" : ",\"status\":" + quote(status)) + "}");
-        } catch (RuntimeException unavailableOutput) {
+        } catch (Throwable unavailableOutput) {
             // Missing evidence is rejected by admission; an output failure cannot replace the test.
         }
     }
@@ -117,7 +127,7 @@ public final class CiCaseEvidence implements InvocationInterceptor {
     private static String record(Method method, List<Object> arguments, ExtensionContext context, String kind) {
         List<String> values = new ArrayList<>();
         List<String> descriptors = new ArrayList<>();
-        boolean stable = method != null;
+        boolean stable = method != null && validUnicode(context.getDisplayName());
         String firstString = null;
         for (int i = 0; i < arguments.size(); i++) {
             Object argument = arguments.get(i);
@@ -128,6 +138,8 @@ public final class CiCaseEvidence implements InvocationInterceptor {
             values.add(value.json());
             stable &= value.stable();
             descriptors.add("{\"position\":" + i + ",\"type\":" + quote(type(argument))
+                    + ",\"declared_type\":" + quote(method != null && i < method.getParameterCount()
+                            ? method.getParameterTypes()[i].getName() : "unknown")
                     + ",\"stable\":" + value.stable() + ",\"injected\":" + injected
                     + ",\"digest\":" + quote(hash(value.json()))
                     + (value.reason() == null ? "" : ",\"reason\":" + quote(value.reason())) + "}");
@@ -178,7 +190,31 @@ public final class CiCaseEvidence implements InvocationInterceptor {
     }
 
     static Canonical canonical(Object value) {
-        return canonical(value, new IdentityHashMap<>(), new int[] {0}, 0);
+        try {
+            return canonical(value, new IdentityHashMap<>(), new int[] {0}, 0);
+        } catch (Throwable unavailableObservation) {
+            return opaque(value, "observation-unavailable");
+        }
+    }
+
+    private static boolean builtinCollection(Object value, Set<String> names) {
+        Class<?> type = value.getClass();
+        // Exact bootstrap types exclude user subclasses and wrappers delegating to unknown code.
+        return type.getClassLoader() == null && names.contains(type.getName());
+    }
+
+    private static boolean validUnicode(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char character = text.charAt(i);
+            if (Character.isHighSurrogate(character)) {
+                if (i + 1 >= text.length() || !Character.isLowSurrogate(text.charAt(++i))) {
+                    return false;
+                }
+            } else if (Character.isLowSurrogate(character)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static Canonical canonical(Object value, IdentityHashMap<Object, Boolean> active, int[] nodes, int depth) {
@@ -189,11 +225,15 @@ public final class CiCaseEvidence implements InvocationInterceptor {
             return known("[\"null\"]");
         }
         if (value instanceof String text) {
+            if (!validUnicode(text)) {
+                return opaque(value, "ill-formed-unicode");
+            }
             return text.length() <= MAX_STRING_LENGTH ? known("[\"java.lang.String\"," + quote(text) + "]")
                     : opaque(value, "size-limit");
         }
         if (value instanceof Character character) {
-            return known("[\"java.lang.Character\"," + quote(character.toString()) + "]");
+            return Character.isSurrogate(character) ? opaque(value, "ill-formed-unicode")
+                    : known("[\"java.lang.Character\"," + quote(character.toString()) + "]");
         }
         if (value instanceof Boolean bool) {
             return known("[\"java.lang.Boolean\"," + quote(bool.toString()) + "]");
@@ -223,10 +263,20 @@ public final class CiCaseEvidence implements InvocationInterceptor {
                     + quote(enumeration.name()) + "]");
         }
         if (value instanceof Path path) {
+            String implementation = value.getClass().getName();
+            if (!(implementation.equals("sun.nio.fs.UnixPath") || implementation.equals("sun.nio.fs.WindowsPath")
+                    || implementation.equals("jdk.nio.zipfs.ZipPath"))) {
+                return opaque(value, "unsupported-path-implementation");
+            }
             return known("[\"path\"," + quote(path.normalize().toString().replace('\\', '/')) + "]");
         }
         if (value instanceof RepetitionInfo info) {
             return known("[\"repetition\"," + info.getCurrentRepetition() + "," + info.getTotalRepetitions() + "]");
+        }
+        if (value instanceof List<?> && !builtinCollection(value, BUILTIN_LISTS)
+                || value instanceof Map<?, ?> && !builtinCollection(value, BUILTIN_MAPS)
+                        && !value.getClass().getName().equals("org.bson.Document")) {
+            return opaque(value, "unsupported-collection-implementation");
         }
         boolean compound = value instanceof List<?> || value instanceof Map<?, ?> || value.getClass().isArray()
                 || value.getClass().isRecord();
@@ -306,7 +356,14 @@ public final class CiCaseEvidence implements InvocationInterceptor {
     }
 
     private static String type(Object value) {
-        return value == null ? "null" : value.getClass().getName();
+        if (value == null) {
+            return "null";
+        }
+        Class<?> type = value.getClass();
+        // Hidden lambda and generated proxy names contain allocation ordinals or VM addresses.
+        // Their actual value is already unstable; declared_type binds the reviewed source slot.
+        return type.isHidden() || type.isSynthetic() || Proxy.isProxyClass(type)
+                ? "opaque-generated" : type.getName();
     }
 
     static String hash(String text) {

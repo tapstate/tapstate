@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import tarfile
 import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
@@ -52,6 +53,9 @@ def method_key(record):
 
 
 def current_sha(root):
+    top = subprocess.run(['git', '-C', str(root), 'rev-parse', '--show-toplevel'], text=True, capture_output=True)
+    if top.returncode or Path(top.stdout.strip()).resolve() != Path(root).resolve():
+        return None
     result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True, capture_output=True)
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -635,8 +639,45 @@ def source_parameters(root, source, declaration, sources):
     return encoded, 'argument-marker'
 
 
+def archive_source_sha(root, archive_path, receipt_path):
+    archive, receipt_file = Path(archive_path).resolve(), Path(receipt_path).resolve()
+    receipt = load(receipt_file)
+    require(type(receipt.get('schema')) is int and receipt['schema'] == 1 and receipt.get('repository') == 'tapstate/tapstate', 'source receipt repository/schema differs')
+    require(isinstance(receipt.get('source_sha'), str) and re.fullmatch(r'[0-9a-f]{40}', receipt['source_sha']), 'source receipt commit is invalid')
+    require(archive.is_relative_to(receipt_file.parent), 'source archive is outside its receipt')
+    relative = archive.relative_to(receipt_file.parent).as_posix()
+    declaration = receipt.get('files', {}).get(relative)
+    require(declaration == dict(size=archive.stat().st_size, sha256=digest(archive.read_bytes())), 'source archive size/hash differs from authenticated receipt')
+    raw_run = receipt_file.parent / 'run.json'
+    require(raw_run.is_file(), 'raw source workflow run metadata is missing')
+    run_declaration = receipt.get('files', {}).get('run.json')
+    require(run_declaration == dict(size=raw_run.stat().st_size, sha256=digest(raw_run.read_bytes())), 'raw source run metadata hash differs')
+    run = load(raw_run)
+    require(run.get('head_sha') == receipt['source_sha'] and run.get('id') == receipt.get('run_id') and
+            run.get('run_attempt') == receipt.get('run_attempt') and run.get('repository', {}).get('full_name') == receipt['repository'], 'raw source run origin differs from receipt')
+    declared = {}
+    with tarfile.open(archive) as tar:
+        require(tar.pax_headers.get('comment') == receipt['source_sha'], 'git source archive commit differs from raw run')
+        for member in tar.getmembers():
+            name = Path(member.name.rstrip('/')).as_posix()
+            require(name and not Path(name).is_absolute() and '..' not in Path(name).parts and '.git' not in Path(name).parts, 'unsafe source archive member')
+            if member.isdir():
+                continue
+            require(member.isfile() and name not in declared, 'non-regular or duplicate source archive member')
+            declared[name] = digest(tar.extractfile(member).read())
+    actual = {}
+    for path in root.rglob('*'):
+        require(not path.is_symlink(), 'symlink in extracted source archive')
+        if path.is_file():
+            actual[path.relative_to(root).as_posix()] = digest(path.read_bytes())
+    require(actual == declared, 'extracted source file set/bytes differs from original git archive')
+    return receipt['source_sha']
+
+
 def inventory(args):
     root = Path(args.root).resolve()
+    require(bool(args.source_archive) == bool(args.source_receipt), 'source archive and receipt must be supplied together')
+    authenticated_sha = archive_source_sha(root, args.source_archive, args.source_receipt) if args.source_archive else None
     methods, unresolved, sources = [], [], {}
     overrides = load(args.parameters) if args.parameters else {}
     used = set()
@@ -697,7 +738,9 @@ def inventory(args):
     require(all(n == 1 for n in counts.values()), 'duplicate or overloaded source test declaration requires explicit signature identities')
     cases = [dict((k, m[k]) for k in ('lane', 'module', 'kind', 'class', 'method')) | {'parameter': p}
              for m in methods for p in (m['parameters'] or [])]
-    value = dict(schema=SCHEMA, type='source-inventory', lane=args.lane, source_sha=current_sha(root), sources=sources,
+    checkout_sha = current_sha(root)
+    require(authenticated_sha is None or checkout_sha is None or checkout_sha == authenticated_sha, 'source archive origin differs from checkout')
+    value = dict(schema=SCHEMA, type='source-inventory', lane=args.lane, source_sha=authenticated_sha or checkout_sha, sources=sources,
                  methods=methods, cases=sorted(cases, key=identity), unresolved=unresolved, complete=not unresolved)
     output(args.output, value)
     print(json.dumps(dict(methods=len(methods), stable_cases=len(cases), unresolved=len(unresolved), complete=value['complete']), sort_keys=True))
@@ -730,12 +773,43 @@ def skip_identity(record):
     return None if record is None else dict(type=record['type'], reason=record['reason'])
 
 
+def runtime_pair(encoded, classname, method, skipped, allow_opaque=False):
+    records = [json.loads(value) for value in encoded]
+    require(all(isinstance(value, dict) for value in records), 'invalid runtime identity record')
+    starts = [value for value in records if value.get('phase') == 'start']
+    finishes = [value for value in records if value.get('phase') == 'finish']
+    if len(records) != 2 or len(starts) != 1 or len(finishes) != 1:
+        return None
+    start, finish = starts[0], finishes[0]
+    fields = ('schema', 'class', 'method', 'argument_digest', 'stable', 'unique_id',
+              'display_name_digest', 'identity_kind', 'argument_descriptors', 'first_string_digest', 'repetition')
+    if any(start.get(field) != finish.get(field) for field in fields):
+        return None
+    if not (type(start.get('schema')) is int and start['schema'] == 1 and
+            type(finish.get('schema')) is int and finish['schema'] == 1 and
+            type(start.get('stable')) is bool and type(finish.get('stable')) is bool and (start['stable'] or allow_opaque) and
+            start.get('class') == classname and start.get('method') == method and
+            isinstance(start.get('unique_id'), str) and start['unique_id'] and
+            isinstance(start.get('argument_digest'), str) and re.fullmatch(r'[0-9a-f]{64}', start['argument_digest']) and
+            finish.get('status') == ('aborted' if skipped else 'executed')):
+        return None
+    return start
+
+
 def reports(args):
     root = Path(args.root).resolve()
     inv = load(args.inventory)
     require(inv['type'] == 'source-inventory' and inv['lane'] == args.lane, 'inventory lane differs')
     modules = {m['module'] for m in inv['methods']}
     methods = {method_key(m): m for m in inv['methods']}
+    allowed_suites = set()
+    for declaration in inv['methods']:
+        classname = declaration['class']
+        while True:
+            allowed_suites.add((declaration['module'], declaration['kind'], classname))
+            if '$' not in classname:
+                break
+            classname = classname.rsplit('$', 1)[0]
     cases, unknown, files, suites = [], [], {}, []
     for path in sorted(root.rglob('TEST-*.xml')):
         if path.parent.name not in ('surefire-reports', 'failsafe-reports'):
@@ -745,6 +819,7 @@ def reports(args):
         module, kind = report_module(relative, modules)
         suite = ET.parse(path).getroot()
         require(suite.tag == 'testsuite' and path.name == 'TEST-' + suite.get('name', '') + '.xml', 'report filename or root differs')
+        require((module, kind, suite.get('name')) in allowed_suites, 'report suite is outside independent source declarations: ' + relative)
         actual = suite.findall('testcase')
         require(int(suite.get('tests', '-1')) == len(actual), 'test count differs from testcase records: ' + relative)
         require(int(suite.get('skipped', '0')) == sum(c.find('skipped') is not None for c in actual), 'skip count differs from testcase records')
@@ -754,6 +829,7 @@ def reports(args):
         suites.append(dict(module=module, kind=kind, **{'class': suite.get('name')}, count=len(actual), path=relative))
         for case in actual:
             classname = case.get('classname', suite.get('name'))
+            require(classname.split('$', 1)[0] == suite.get('name', '').split('$', 1)[0], 'testcase classname differs from source-selected report family')
             reported = case.get('name', '')
             method = re.split(r'[\[(]', reported, 1)[0]
             base = dict(lane=args.lane, module=module, kind=kind, **{'class': classname}, method=method)
@@ -767,31 +843,14 @@ def reports(args):
                 unknown.append(dict(**base, reported=reported, reason='report has no independently discovered source method'))
             elif declaration['parameters'] is None:
                 unknown.append(dict(**base, reported=reported, reason='source parameter identities are unresolved'))
-            elif declaration['mapping'] == 'marker':
-                decoded = [json.loads(m) for m in stable_markers]
-                starts = [m for m in decoded if m.get('phase') == 'start']
-                finishes = [m for m in decoded if m.get('phase') == 'finish']
-                if len(starts) == len(finishes) == 1 and starts[0].get('unique_id') == finishes[0].get('unique_id'):
-                    marker = starts[0]
-                    if marker.get('class') == classname and marker.get('method') == method and marker.get('stable') and marker.get('argument_digest') in declaration['parameters']:
-                        parameter = marker['argument_digest']
-                    else:
-                        unknown.append(dict(**base, reported=reported, reason='runtime stable identity differs from independent parameter contract'))
+            elif declaration['mapping'] in ('marker', 'argument-marker'):
+                marker = runtime_pair(stable_markers, classname, method, case.find('skipped') is not None)
+                digests = declaration['parameters'] if declaration['mapping'] == 'marker' else declaration.get('argument_digests') or []
+                if marker is not None and marker['argument_digest'] in digests:
+                    parameter = (marker['argument_digest'] if declaration['mapping'] == 'marker' else
+                                 declaration['parameters'][digests.index(marker['argument_digest'])])
                 else:
-                    unknown.append(dict(**base, reported=reported, reason='case requires exactly one runtime start and finish identity'))
-            elif declaration['mapping'] == 'argument-marker':
-                decoded = [json.loads(m) for m in stable_markers]
-                starts = [m for m in decoded if m.get('phase') == 'start']
-                finishes = [m for m in decoded if m.get('phase') == 'finish']
-                if (len(starts) == len(finishes) == 1 and starts[0].get('stable') and
-                        starts[0].get('class') == classname and starts[0].get('method') == method and
-                        starts[0].get('argument_digest') == finishes[0].get('argument_digest') and
-                        starts[0].get('argument_digest') in (declaration.get('argument_digests') or []) and
-                        starts[0].get('unique_id') == finishes[0].get('unique_id')):
-                    position = declaration['argument_digests'].index(starts[0]['argument_digest'])
-                    parameter = declaration['parameters'][position]
-                else:
-                    unknown.append(dict(**base, reported=reported, reason='runtime arguments do not match independently enumerated source values'))
+                    unknown.append(dict(**base, reported=reported, reason='runtime identity pair does not match independent source values and XML outcome'))
             elif declaration['mapping'] == 'published-marker':
                 if len(markers) == 1:
                     parameter = markers[0]
@@ -818,14 +877,9 @@ def reports(args):
                     unknown.append(dict(**base, reported=reported, reason='invocation cannot be mapped to independent source arguments'))
             if declaration and declaration.get('argument_digests') and declaration['mapping'] == 'ordinal-to-source' and parameter is not None:
                 expected_digest = declaration['argument_digests'][declaration['parameters'].index(parameter)]
-                decoded = [json.loads(m) for m in stable_markers]
-                starts = [m for m in decoded if m.get('phase') == 'start']
-                finishes = [m for m in decoded if m.get('phase') == 'finish']
-                if not (len(starts) == len(finishes) == 1 and starts[0].get('stable') and
-                        starts[0].get('class') == classname and starts[0].get('method') == method and
-                        starts[0].get('argument_digest') == finishes[0].get('argument_digest') == expected_digest and
-                        starts[0].get('unique_id') == finishes[0].get('unique_id')):
-                    unknown.append(dict(**base, reported=reported, reason='runtime arguments do not match independently enumerated source values'))
+                marker = runtime_pair(stable_markers, classname, method, case.find('skipped') is not None)
+                if marker is None or marker['argument_digest'] != expected_digest or marker.get('identity_kind') != 'repeated' or marker.get('repetition') != declaration['parameters'].index(parameter) + 1:
+                    unknown.append(dict(**base, reported=reported, reason='runtime identity pair does not match independent repeated invocation'))
             skipped = case.find('skipped')
             cases.append(dict(**base, parameter=parameter, reported=reported, status='skipped' if skipped is not None else 'executed',
                               skip=skip_record(skipped),
@@ -990,10 +1044,37 @@ def crc64(content):
     return f'{result:016x}'
 
 
+def class_access_flags(content):
+    require(content[:4] == b'\xca\xfe\xba\xbe' and len(content) >= 12, 'invalid compiled class flags input')
+    count, position, slot = int.from_bytes(content[8:10], 'big'), 10, 1
+    while slot < count:
+        require(position < len(content), 'truncated class constant pool')
+        tag = content[position]
+        position += 1
+        if tag == 1:
+            require(position + 2 <= len(content), 'truncated class UTF constant')
+            length = int.from_bytes(content[position:position + 2], 'big')
+            position += 2 + length
+        elif tag in (3, 4, 9, 10, 11, 12, 17, 18):
+            position += 4
+        elif tag in (5, 6):
+            position += 8
+            slot += 1
+        elif tag in (7, 8, 16, 19, 20):
+            position += 2
+        elif tag == 15:
+            position += 3
+        else:
+            raise ValueError('unsupported class constant pool tag')
+        slot += 1
+    require(position + 2 <= len(content), 'truncated compiled class access flags')
+    return int.from_bytes(content[position:position + 2], 'big')
+
+
 def coverage(args):
     root = Path(args.root).resolve()
     binding = load(args.binding)
-    for key in ('run_id', 'attempt', 'source_sha', 'started_ms', 'completed_ms', 'required_exec'):
+    for key in ('run_id', 'attempt', 'source_sha', 'started_ms', 'completed_ms', 'required_exec', 'required_reports', 'required_report_classes'):
         require(key in binding, 'missing coverage run binding: ' + key)
     require(binding['run_id'] and int(binding['attempt']) >= 1 and re.fullmatch(r'[0-9a-f]{40}', binding['source_sha']), 'invalid coverage run binding')
     require(0 < binding['started_ms'] <= binding['completed_ms'], 'invalid coverage run time bounds')
@@ -1001,21 +1082,80 @@ def coverage(args):
     require(declared and len(declared) == len(set(declared)), 'empty or duplicate required exec list')
     found = {p.relative_to(root).as_posix() for p in root.rglob('*.exec')}
     require(found == set(declared), 'coverage exec path set differs from run binding')
-    production, expected_names = {}, {}
+    required_reports = binding['required_reports']
+    require(isinstance(required_reports, list) and required_reports and len(required_reports) == len(set(required_reports)), 'empty or duplicate required coverage report set')
+    found_reports = {path.relative_to(root).as_posix() for path in root.rglob('jacoco.xml')}
+    require(found_reports == set(required_reports), 'coverage XML path set differs from declared production modules')
+    production, test_classes, expected_names, production_modules = {}, {}, {}, {}
     observed_sha = current_sha(Path(args.production_root).resolve() if args.production_root else root)
     require(observed_sha is None or observed_sha == binding['source_sha'], 'coverage source SHA differs from production checkout')
     production_root = Path(args.production_root).resolve() if args.production_root else root
-    for path in sorted(production_root.rglob('*.class')):
-        relative = path.relative_to(production_root).as_posix()
-        if '/target/classes/' not in '/' + relative:
-            continue
-        require(not path.is_symlink(), 'symlink production class')
-        module, classname = relative.split('/target/classes/', 1)
-        key = module + '/' + classname.removesuffix('.class')
-        production[key] = dict(sha256=digest(path.read_bytes()), class_id=crc64(path.read_bytes()))
-        expected_names.setdefault(classname.removesuffix('.class'), set()).add(production[key]['class_id'])
+    if args.inputs:
+        inputs = load(args.inputs)
+        require(type(inputs.get('schema')) is int and inputs['schema'] == 1 and inputs.get('phase') == 'pre-test-after-install', 'invalid coverage build inputs schema/phase')
+        require(inputs.get('source_sha') == binding['source_sha'] and str(inputs.get('run_id')) == str(binding['run_id']) and
+                str(inputs.get('run_attempt')) == str(binding['attempt']), 'coverage build inputs source/run/attempt differs')
+        require(inputs.get('jacoco_version') == '0.8.13', 'unsupported compiled coverage analyzer version')
+        require(isinstance(inputs.get('production_class_access_flags'), dict) and set(inputs['production_class_access_flags']) == set(inputs['production_class_ids']), 'production class access flag set differs')
+        if args.test_inputs:
+            post = load(args.test_inputs)
+            require(type(post.get('schema')) is int and post['schema'] == 1 and post.get('phase') == 'post-test-before-pack' and post.get('source_sha') == binding['source_sha'] and str(post.get('run_id')) == str(binding['run_id']) and str(post.get('run_attempt')) == str(binding['attempt']), 'post-test bytecode input origin differs')
+            for field in ('production_files', 'production_class_ids', 'production_class_access_flags', 'dependency_repository_files', 'resolved_test_classpaths', 'jacoco_version'):
+                require(post.get(field) == inputs.get(field), 'production/dependency bytes changed during tests: ' + field)
+            test_metadata = post
+        else:
+            test_metadata = inputs
+        for segment, id_field, hash_field, destination in [('/target/classes/', 'production_class_ids', 'production_files', production),
+                                                         ('/target/test-classes/', 'test_class_ids', 'test_files', test_classes)]:
+            metadata = inputs if destination is production else test_metadata
+            require(isinstance(metadata.get(id_field), dict) and isinstance(metadata.get(hash_field), dict), 'missing compiled bytecode input metadata')
+            for relative, class_id in metadata[id_field].items():
+                require(not Path(relative).is_absolute() and '..' not in Path(relative).parts and segment in relative and relative.endswith('.class'), 'unsafe compiled bytecode metadata path')
+                file_hash = metadata[hash_field].get(relative)
+                require(isinstance(file_hash, str) and re.fullmatch(r'[0-9a-f]{64}', file_hash) and
+                        isinstance(class_id, str) and re.fullmatch(r'[0-9a-f]{16}', class_id), 'invalid compiled bytecode input hash or class ID')
+                module, classname = relative.split(segment, 1)
+                destination[module + '/' + classname.removesuffix('.class')] = dict(sha256=file_hash, class_id=class_id)
+                expected_names.setdefault(classname.removesuffix('.class'), set()).add(class_id)
+                if destination is production:
+                    flags = inputs['production_class_access_flags'][relative]
+                    require(type(flags) is int and 0 <= flags <= 65535, 'invalid production class access flags')
+                    if not flags & (0x8000 | 0x1000):
+                        production_modules.setdefault(module, set()).add(classname.removesuffix('.class'))
+        for classpath in inputs.get('resolved_test_classpaths', {}).values():
+            for entry in classpath:
+                require(isinstance(entry.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', entry['sha256']) and isinstance(entry.get('own_classes'), dict), 'resolved own dependency bytecode metadata is missing')
+                for name, record in entry['own_classes'].items():
+                    require(name.startswith('io/tapstate/') and isinstance(record, dict) and re.fullmatch(r'[0-9a-f]{16}', record.get('class_id', '')) and re.fullmatch(r'[0-9a-f]{64}', record.get('sha256', '')), 'invalid resolved dependency bytecode metadata')
+                    expected_names.setdefault(name, set()).add(record['class_id'])
+    else:
+        for path in sorted(production_root.rglob('*.class')):
+            relative = path.relative_to(production_root).as_posix()
+            segment = '/target/classes/' if '/target/classes/' in '/' + relative else '/target/test-classes/' if '/target/test-classes/' in '/' + relative else None
+            if segment is None:
+                continue
+            require(not path.is_symlink(), 'symlink production class')
+            module, classname = relative.split(segment, 1)
+            key = module + '/' + classname.removesuffix('.class')
+            destination = production if segment == '/target/classes/' else test_classes
+            destination[key] = dict(sha256=digest(path.read_bytes()), class_id=crc64(path.read_bytes()))
+            expected_names.setdefault(classname.removesuffix('.class'), set()).add(destination[key]['class_id'])
+            if destination is production and not class_access_flags(path.read_bytes()) & (0x8000 | 0x1000):
+                production_modules.setdefault(module, set()).add(classname.removesuffix('.class'))
     require(production, 'production class bytes are required to verify JaCoCo class IDs')
     require(all(len(values) == 1 for values in expected_names.values()), 'conflicting production class IDs')
+    report_classes = binding['required_report_classes']
+    require(isinstance(report_classes, dict) and set(report_classes) == set(required_reports), 'declared coverage report class sets differ')
+    report_modules = {}
+    for report_path, names in report_classes.items():
+        candidates = [module for module in production_modules if ('/' + module + '/target/') in ('/' + report_path)]
+        require(len(candidates) == 1, 'coverage report has no unique production module')
+        module = candidates[0]
+        require(set(names) == production_modules[module], 'declared coverage class set differs from compiled production module')
+        report_modules[report_path] = module
+    require(set(report_modules.values()) == set(production_modules), 'coverage reports omit compiled production modules')
+    for report_path, names in report_classes.items():
+        require(isinstance(names, list) and names and len(names) == len(set(names)) and all(isinstance(name, str) and name in expected_names for name in names), 'coverage report class inventory is missing or foreign')
     executions = {}
     for relative in declared:
         path = root / relative
@@ -1025,6 +1165,8 @@ def coverage(args):
             require(binding['started_ms'] <= session['start_ms'] <= session['end_ms'] <= binding['completed_ms'],
                     'stale or out-of-run coverage session: ' + relative)
         for record in parsed['classes']:
+            if record['name'].startswith('io/tapstate/'):
+                require(record['name'] in expected_names, 'undeclared own bytecode in JaCoCo data: ' + record['name'])
             if record['name'] in expected_names:
                 require(record['class_id'] in expected_names[record['name']], 'JaCoCo class ID differs from production: ' + record['name'])
         executions[relative] = dict(sha256=digest(path.read_bytes()), size=path.stat().st_size, **parsed)
@@ -1035,6 +1177,8 @@ def coverage(args):
         tree = ET.parse(path).getroot()
         require(tree.tag == 'report', 'invalid JaCoCo XML')
         report_path = path.relative_to(root).as_posix()
+        xml_classes = [node.get('name') for node in tree.findall('package/class')]
+        require(len(xml_classes) == len(set(xml_classes)) and set(xml_classes) == set(report_classes[report_path]), 'coverage XML production class set differs: ' + report_path)
         xml_sessions = {(s.get('id'), int(s.get('start', '-1')), int(s.get('dump', '-1'))) for s in tree.findall('sessioninfo')}
         if not xml_sessions:
             unresolved.append('coverage XML lacks session provenance: ' + report_path)
@@ -1046,7 +1190,7 @@ def coverage(args):
                     if int(line.get('ci', '0')) or int(line.get('cb', '0')):
                         hits.append([report_path, package.get('name'), source.get('name'), int(line.get('nr')),
                                      int(line.get('ci', '0')), int(line.get('cb', '0'))])
-    value = dict(schema=SCHEMA, type='coverage-observation', binding=binding, production=production, executions=executions,
+    value = dict(schema=SCHEMA, type='coverage-observation', binding=binding, production=production, test_classes=test_classes, executions=executions,
                  reports=reports_found, covered_lines_branches=hits, unresolved=unresolved, complete=bool(reports_found) and not unresolved)
     output(args.output, value)
     print(json.dumps(dict(exec_files=len(executions), production_classes=len(production), coverage_xml=len(reports_found), complete=value['complete']), sort_keys=True))
@@ -1068,8 +1212,33 @@ def compare_coverage(args):
     require(not failures, '; '.join(failures))
 
 
+def gate_contract(snapshot):
+    require(type(snapshot.get('schema')) is int and snapshot['schema'] == SCHEMA, 'unsupported gate snapshot schema')
+    require(isinstance(snapshot.get('gates'), list) and snapshot['gates'], 'empty gate contract')
+    for gate in snapshot['gates']:
+        require(isinstance(gate, dict) and isinstance(gate.get('id'), str) and gate['id'].strip(), 'invalid gate instance ID')
+        require(type(gate.get('required')) is bool and type(gate.get('applicable')) is bool, 'gate required/applicable must be booleans')
+        require(gate.get('scope') in ('always', 'conditional'), 'invalid gate applicability scope')
+        require(isinstance(gate.get('contract_sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', gate['contract_sha256']), 'gate contract is not frozen')
+        if gate['required'] or gate['scope'] == 'always':
+            require(gate['applicable'], 'required or always gate cannot be non-applicable')
+        if gate['scope'] == 'conditional':
+            basis = gate.get('applicability')
+            require(isinstance(basis, dict), 'conditional gate needs a structured applicability contract')
+            require(type(basis.get('decision')) is bool and basis['decision'] == gate['applicable'], 'gate applicability decision differs')
+            require(isinstance(basis.get('reason'), str) and basis['reason'].strip(), 'gate applicability reason is missing')
+            for field in ('condition_sha256', 'inputs_sha256'):
+                require(isinstance(basis.get(field), str) and re.fullmatch(r'[0-9a-f]{64}', basis[field]), 'gate applicability hash is missing or invalid')
+        if gate['applicable']:
+            require(gate.get('conclusion') == 'success', 'applicable gate is absent, skipped, canceled or unsuccessful')
+        else:
+            require(gate.get('conclusion') in ('not_applicable', 'skipped', None), 'non-applicable gate outcome is inconsistent')
+
+
 def gates(args):
     baseline, candidate = load(args.baseline), load(args.candidate)
+    gate_contract(baseline)
+    gate_contract(candidate)
     expected = {g['id']: g for g in baseline['gates']}
     actual = {g['id']: g for g in candidate['gates']}
     require(expected, 'empty baseline gate contract')
@@ -1126,6 +1295,8 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     inv = sub.add_parser('inventory')
     inv.add_argument('--root', default='.')
+    inv.add_argument('--source-archive', help='Original git source tar authenticated by a durable raw-run receipt')
+    inv.add_argument('--source-receipt', help='Receipt with raw run/source tar hashes and original commit')
     inv.add_argument('--lane', required=True)
     inv.add_argument('--kind', choices=['unit', 'it'], action='append')
     inv.add_argument('--published-connectors', choices=['unknown', 'absent', 'available'], default='unknown', help='Frozen real connector jar availability for this original lane entry')
@@ -1146,6 +1317,8 @@ def main():
     cov = sub.add_parser('coverage')
     cov.add_argument('--root', default='.')
     cov.add_argument('--production-root')
+    cov.add_argument('--test-inputs', help='Verified post-test compiled fixture metadata; production/dependency bytes must stay identical')
+    cov.add_argument('--inputs', help='Verified pre-test production/test class hash metadata from this run')
     cov.add_argument('--binding', required=True)
     cov.add_argument('--output', required=True)
     covcomp = sub.add_parser('compare-coverage')
