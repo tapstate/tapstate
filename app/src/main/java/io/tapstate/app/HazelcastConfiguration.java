@@ -75,6 +75,7 @@ import java.util.regex.Pattern;
 class HazelcastConfiguration {
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
+    static final String NODE_JOINED_IDENTITY_CONTEXT_KEY = "tapstate.cluster.node.joined-identity";
 
     /**
      * When, on the monotonic clock, this member's node session was asked for: no later than the moment
@@ -136,13 +137,14 @@ class HazelcastConfiguration {
         }
         if (identity != null) {
             try {
-                var local = member.getCluster().getLocalMember();
+                NodeSessionLease.JoinedIdentity joined = localJoinedIdentity(member);
                 ClusterProfileStore profiles = clusterProfiles.getIfAvailable();
                 if (profiles == null || !profiles.markJoined(identity.nodeSession(),
-                        local.getUuid().toString(), local.getAddress().toString())) {
+                        joined.memberUuid(), joined.memberAddress())) {
                     throw new io.tapstate.core.common.TapstateException(BootError.PROFILE_SESSION_LOST,
                             java.util.Map.of(), null);
                 }
+                member.getUserContext().put(NODE_JOINED_IDENTITY_CONTEXT_KEY, joined);
             } catch (RuntimeException unprovedJoin) {
                 try {
                     member.shutdown();
@@ -274,7 +276,8 @@ class HazelcastConfiguration {
     NodeSessionLease nodeSessionLease(
             HazelcastInstance member,
             ClusterProperties clusterProperties,
-            ObjectProvider<WorkloadClaimStore> workloadClaims) {
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ObjectProvider<ClusterProfileStore> clusterProfiles) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
             return NodeSessionLease.inactive();
@@ -286,8 +289,32 @@ class HazelcastConfiguration {
         if (!(member.getUserContext().get(NODE_SESSION_ASKED_AT_CONTEXT_KEY) instanceof Long askedAt)) {
             throw new IllegalStateException("cluster member started without the time its node session was asked for");
         }
+        if (claim.profileGeneration() == 0) {
+            return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
+                    clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
+        }
+        ClusterProfileStore profiles = clusterProfiles == null ? null : clusterProfiles.getIfAvailable();
+        if (profiles == null) {
+            throw new TapstateException(BootError.COORDINATION_STORE_REQUIRED, Map.of(), null);
+        }
+        if (!(member.getUserContext().get(NODE_JOINED_IDENTITY_CONTEXT_KEY) instanceof NodeSessionLease.JoinedIdentity joined)) {
+            throw new IllegalStateException("cluster member started without its actual joined runtime identity");
+        }
         return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
-                clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
+                clusterProperties.getNodeSessionRenewInterval(), member::shutdown,
+                profiles, () -> localJoinedIdentity(member), joined);
+    }
+
+    NodeSessionLease nodeSessionLease(HazelcastInstance member, ClusterProperties properties,
+            ObjectProvider<WorkloadClaimStore> claims) {
+        return nodeSessionLease(member, properties, claims, null);
+    }
+
+    private static NodeSessionLease.JoinedIdentity localJoinedIdentity(HazelcastInstance member) {
+        var local = member.getCluster().getLocalMember();
+        return new NodeSessionLease.JoinedIdentity(local.getUuid().toString(), local.getAddress().toString(),
+                local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE), local.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE),
+                local.getAttribute(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE), local.getAttribute(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE));
     }
 
     /** Keeps the local gate aligned with the majority-committed ACTIVE node set. */

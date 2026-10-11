@@ -37,6 +37,9 @@ final class NodeSessionLease implements AutoCloseable {
     private final AtomicReference<WorkloadClaim> current;
     private final Duration ttl;
     private final Runnable lost;
+    private final io.tapstate.spi.store.ClusterProfileStore profiles;
+    private final java.util.function.Supplier<JoinedIdentity> nativeIdentity;
+    private JoinedIdentity publishedIdentity;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -48,6 +51,9 @@ final class NodeSessionLease implements AutoCloseable {
         this.current = null;
         this.ttl = Duration.ZERO;
         this.lost = () -> { };
+        this.profiles = null;
+        this.nativeIdentity = null;
+        this.publishedIdentity = null;
         this.renewer = null;
         this.closed.set(true);
     }
@@ -58,6 +64,27 @@ final class NodeSessionLease implements AutoCloseable {
 
     /** This boot's last proven profile/session and its conservative local authorization bound. */
     record Proof(WorkloadClaim claim, long deadlineNanos, boolean live) { }
+
+    /** Actual local runtime identity, separate from its immutable node-session admission identity. */
+    record JoinedIdentity(String memberUuid, String memberAddress, String nodeId, String bootId,
+            String profileGeneration, String profileHash) {
+        JoinedIdentity {
+            Objects.requireNonNull(memberUuid, "memberUuid");
+            Objects.requireNonNull(memberAddress, "memberAddress");
+            Objects.requireNonNull(nodeId, "nodeId");
+            Objects.requireNonNull(bootId, "bootId");
+            Objects.requireNonNull(profileGeneration, "profileGeneration");
+            Objects.requireNonNull(profileHash, "profileHash");
+        }
+        boolean sameAdmission(JoinedIdentity other) {
+            return nodeId.equals(other.nodeId) && bootId.equals(other.bootId)
+                    && profileGeneration.equals(other.profileGeneration) && profileHash.equals(other.profileHash);
+        }
+        boolean names(WorkloadClaim claim) {
+            return nodeId.equals(claim.owner().nodeId()) && bootId.equals(claim.owner().bootId())
+                    && profileGeneration.equals(Long.toString(claim.profileGeneration()));
+        }
+    }
 
     Proof proof() {
         if (current == null) {
@@ -78,10 +105,32 @@ final class NodeSessionLease implements AutoCloseable {
             Duration ttl,
             Duration renewInterval,
             Runnable lost) {
+        this(store, initial, askedAt, ttl, renewInterval, lost, null, null, null, false);
+    }
+
+    NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl,
+            Duration renewInterval, Runnable lost, io.tapstate.spi.store.ClusterProfileStore profiles,
+            java.util.function.Supplier<JoinedIdentity> nativeIdentity, JoinedIdentity publishedIdentity) {
+        this(store, initial, askedAt, ttl, renewInterval, lost, profiles, nativeIdentity, publishedIdentity, true);
+    }
+
+    private NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl,
+            Duration renewInterval, Runnable lost, io.tapstate.spi.store.ClusterProfileStore profiles,
+            java.util.function.Supplier<JoinedIdentity> nativeIdentity, JoinedIdentity publishedIdentity,
+            boolean refreshJoin) {
         this.store = Objects.requireNonNull(store, "store");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.lost = Objects.requireNonNull(lost, "lost");
+        if (refreshJoin && initial.profileGeneration() > 0 && profiles == null) {
+            throw new io.tapstate.core.common.TapstateException(BootError.COORDINATION_STORE_REQUIRED, java.util.Map.of(), null);
+        }
+        this.profiles = refreshJoin && initial.profileGeneration() > 0 ? profiles : null;
+        this.nativeIdentity = this.profiles == null ? null : Objects.requireNonNull(nativeIdentity, "nativeIdentity");
+        this.publishedIdentity = this.profiles == null ? null : Objects.requireNonNull(publishedIdentity, "publishedIdentity");
+        if (this.publishedIdentity != null && !this.publishedIdentity.names(initial)) {
+            throw joinLost();
+        }
         Objects.requireNonNull(renewInterval, "renewInterval");
         this.provenUntil = askedAt + ttl.toNanos();
         // Two threads: a renewal the store never answers holds one of them, and the lapse still has to be
@@ -108,14 +157,35 @@ final class NodeSessionLease implements AutoCloseable {
         try {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
             if (renewed.isPresent()) {
+                if (closed.get()) return;
+                refreshChangedJoin(expected, renewed.get());
+                if (closed.get()) return;
                 current.set(renewed.get());
                 provenUntil = askedAt + ttl.toNanos();
                 return;
             }
             lose("the stored owner or generation no longer matches", null);
         } catch (RuntimeException unavailable) {
-            lose("the coordination store could not renew the node session", unavailable);
+            lose("the coordination store could not renew the node session or refresh its join proof", unavailable);
         }
+    }
+
+    private void refreshChangedJoin(WorkloadClaim expected, WorkloadClaim accepted) {
+        if (profiles == null) return;
+        if (!io.tapstate.spi.store.WorkloadClaimFence.from(expected).equals(io.tapstate.spi.store.WorkloadClaimFence.from(accepted))) {
+            throw joinLost();
+        }
+        JoinedIdentity actual = nativeIdentity.get();
+        if (!actual.names(accepted) || !publishedIdentity.sameAdmission(actual)) throw joinLost();
+        if (!actual.equals(publishedIdentity)) {
+            if (!profiles.markJoined(accepted, actual.memberUuid(), actual.memberAddress())) throw joinLost();
+            if (!actual.equals(nativeIdentity.get())) throw joinLost();
+            publishedIdentity = actual;
+        }
+    }
+
+    private static io.tapstate.core.common.TapstateException joinLost() {
+        return new io.tapstate.core.common.TapstateException(BootError.PROFILE_SESSION_LOST, java.util.Map.of(), null);
     }
 
     private void loseALapsedSession() {
