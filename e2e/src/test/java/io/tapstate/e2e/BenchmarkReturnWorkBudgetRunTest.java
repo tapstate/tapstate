@@ -27,6 +27,48 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class BenchmarkReturnWorkBudgetRunTest {
     @TempDir Path directory;
 
+    @Test void a_native_domain_run_authenticates_the_separate_writer_and_retains_two_original_producer_packets() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("writer-a", true); configure(fixture);
+            try (var run = fixture.open()) {
+                run.requireActive(); run.requireDriver(fixture.workload(), PipelineBenchmarkComparison.Arm.A, 2, fixture.application());
+                assertThat(run.bindingEvidence()).containsEntry("producerWriterRoute",
+                        "A_PLAIN_PERIODIC_NATIVE_DOMAIN_COLLECTOR_ENABLED_CALIBRATION_ABSENT")
+                        .containsEntry("producerWriter", fixture.helper().producerWriter().evidence()).containsEntry("wholeMethodCostQualified", false);
+                var owner = new BenchmarkCausalClock.Identity(18, 99); var armed = new java.util.concurrent.atomic.AtomicInteger();
+                var connection = (javax.management.MBeanServerConnection) java.lang.reflect.Proxy.newProxyInstance(
+                        getClass().getClassLoader(), new Class<?>[]{javax.management.MBeanServerConnection.class},
+                        (proxy, method, arguments) -> { assertThat(method.getName()).isEqualTo("invoke"); armed.incrementAndGet(); return true; });
+                var reader = new BenchmarkWriteReturnReader(owner, connection, () -> true, () -> 100);
+                run.registerProducer(reader, Map.of("state", "RECORDED_ENABLED", "pid", 18L, "jvmStartTimeMillis", 99L));
+                var hashes = new LinkedHashMap<String, Object>();
+                for (var o : fixture.helper().origins()) if (o.owner() == Owner.PRODUCER && o.role() == SourceRole.PDK_CLOCK)
+                    hashes.put(o.binaryName().substring(o.binaryName().lastIndexOf('.') + 1), o.classBytes().sha256());
+                var packet = new LinkedHashMap<>(nativePacket(18, 99, hashes)); packet.put("producerOrigins", producerPacket(fixture, 18, 99));
+                run.recordNativeClassMetadata(packet); run.recordNativeClassMetadata(packet);
+                assertThat(armed).hasValue(1);
+                assertThat((List<?>) run.bindingEvidence().get("actualProducerOrigins")).hasSize(2);
+                assertThatThrownBy(() -> run.requireDriver(fixture.workload(), PipelineBenchmarkComparison.Arm.B, 2, fixture.application()))
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("actual driver workload, arm, fork or application differs");
+                assertThatThrownBy(run::finish).isInstanceOf(AssertionError.class).hasMessageContaining("root collection is open or refused");
+            }
+            assertInactive();
+        }
+    }
+
+    @Test void a_source_declaration_or_runtime_route_cannot_replace_actual_writer_authentication() throws Exception {
+        try (var saved = new Properties()) {
+            var fixture = fixture("writer-a-refusal", true); configure(fixture);
+            System.setProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY, "ON");
+            assertThatThrownBy(fixture::open).isInstanceOf(AssertionError.class).hasMessageContaining("native domain without collector calibration");
+            assertInactive(); System.clearProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY);
+            var writer = fixture.helper().producerWriter(); Path source = Path.of(writer.sourceRoot()).resolve(writer.source().path());
+            byte[] bytes = Files.readAllBytes(source); bytes[0] ^= 1; Files.write(source, bytes);
+            assertThatThrownBy(fixture::open).isInstanceOf(AssertionError.class).hasMessageContaining("actual byte digest or length differs");
+            assertInactive();
+        }
+    }
+
     @Test void absent_selection_keeps_the_old_entry_inert_without_reading_registration_or_services() throws Exception {
         try (var saved = new Properties()) {
             assertThat(BenchmarkReturnWorkBudgetRun.open("controlled-invalid-workload")).isNull();
@@ -488,7 +530,9 @@ class BenchmarkReturnWorkBudgetRunTest {
         }
     }
 
-    private Fixture fixture(String name) throws Exception {
+    private Fixture fixture(String name) throws Exception { return fixture(name, false); }
+
+    private Fixture fixture(String name, boolean separateWriter) throws Exception {
         // These owned byte fixtures are authenticated material; they are never loaded or executed as runtime code.
         Path parent = Files.createDirectory(directory.resolve(name)).toRealPath();
         Path sourceRoot = Files.createDirectory(parent.resolve("source")).toRealPath();
@@ -525,13 +569,26 @@ class BenchmarkReturnWorkBudgetRunTest {
                 if (role.module().equals("adapter-pdk")) pdkMembers.put(member, content);
                 else if (role.module().equals("core-common")) commonMembers.put(member, content);
         }
+        ProducerWriterBinding writer = null;
+        if (separateWriter) {
+            Path producerRoot = Files.createDirectory(parent.resolve("producer-source")).toRealPath();
+            byte[] source = "controlled separate producer source".getBytes(StandardCharsets.US_ASCII);
+            byte[] content = "controlled separate producer writer class".getBytes(StandardCharsets.US_ASCII);
+            Path sourceFile = producerRoot.resolve(SourceRole.PDK_WRITER.sourcePath()); Files.createDirectories(sourceFile.getParent()); Files.write(sourceFile, source);
+            writer = new ProducerWriterBinding(Owner.PRODUCER, producerRoot.toString(),
+                    new Source(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.sourcePath(), blob(source)),
+                    new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), blob(content)));
+            Path compilerFile = Path.of(writer.compilerPath()); Files.createDirectories(compilerFile.getParent()); Files.write(compilerFile, content);
+            pdkMembers.put(writer.compilerEntry(), content);
+        }
         byte[] app = zip(Map.of("BOOT-INF/lib/adapter-pdk-controlled.jar", zip(pdkMembers),
                 "BOOT-INF/lib/core-common-controlled.jar", zip(commonMembers)));
         Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR), app);
         replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR, app);
         for (var item : compiled) if (!item.role().module().equals("e2e")) origins.add(new Origin(Owner.PRODUCER,
                 item.role(), item.binaryName(), paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR).toString(),
-                "BOOT-INF/lib/" + item.role().module() + "-controlled.jar!/" + item.binaryName().replace('.', '/') + ".class", item.blob(), sha256(app)));
+                "BOOT-INF/lib/" + item.role().module() + "-controlled.jar!/" + item.binaryName().replace('.', '/') + ".class",
+                writer != null && item.role() == SourceRole.PDK_WRITER ? writer.compiled().blob() : item.blob(), sha256(app)));
         var jdkFiles = new ArrayList<JdkFile>();
         for (var role : JdkRole.values()) {
             if (role == JdkRole.CPU_PROVIDER) continue;
@@ -545,19 +602,19 @@ class BenchmarkReturnWorkBudgetRunTest {
         byte[] jdkRaw = BenchmarkReturnWorkBudgetBindingsIo.jdkBytes(jdk);
         Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.JDK_INPUT_MANIFEST), jdkRaw);
         replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.JDK_INPUT_MANIFEST, jdkRaw);
-        var helper = new HelperManifest(1, runId, inputHash, "controlled-build", BenchmarkReturnWorkBudgetProfile.DEFINITION_ID,
+        var helper = new HelperManifest(writer == null ? SCHEMA_VERSION : PRODUCER_WRITER_SCHEMA_VERSION, runId, inputHash, "controlled-build", BenchmarkReturnWorkBudgetProfile.DEFINITION_ID,
                 "0".repeat(64), BenchmarkReturnWorkBudgetProducerAllocations.FORMULA_SHA256, blob("actual-xml".getBytes(StandardCharsets.US_ASCII)),
-                List.of(classes.toString()), sources, compiled, origins);
+                List.of(classes.toString()), sources, compiled, origins, writer);
         byte[] helperRaw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper);
         Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST), helperRaw);
         replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, helperRaw);
-        var inputs = inputs(runId, inputHash, workload, files);
+        var inputs = inputs(runId, inputHash, workload, files, writer);
         var profile = BenchmarkReturnWorkBudgetProfile.inspect(inputs);
         helper = helperFormula(helper, profile.requireDefinition().sourceFormulaSha256());
         helperRaw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper);
         Files.write(paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST), helperRaw);
         replace(files, BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST, helperRaw);
-        profile = BenchmarkReturnWorkBudgetProfile.inspect(inputs(runId, inputHash, workload, files));
+        profile = BenchmarkReturnWorkBudgetProfile.inspect(inputs(runId, inputHash, workload, files, writer));
         assertThat(profile.requireDefinition().sourceFormulaSha256()).isEqualTo(helper.rootFormulaSha256());
         return new Fixture(workload, profile, Map.copyOf(paths), parent.resolve("fork.json"), parent.resolve("producer.json"),
                 sourceRoot, classes, home, helper, jdk);
@@ -570,12 +627,16 @@ class BenchmarkReturnWorkBudgetRunTest {
 
     private static BenchmarkReturnWorkBudgetProfile.Inputs inputs(String run, String hash, BenchmarkWorkloadDefinitions.Workload workload,
             List<BenchmarkReturnWorkBudgetProfile.FileInput> files) {
+        return inputs(run, hash, workload, files, null);
+    }
+    private static BenchmarkReturnWorkBudgetProfile.Inputs inputs(String run, String hash, BenchmarkWorkloadDefinitions.Workload workload,
+            List<BenchmarkReturnWorkBudgetProfile.FileInput> files, ProducerWriterBinding writer) {
         return new BenchmarkReturnWorkBudgetProfile.Inputs(run, hash, BenchmarkReturnWorkBudgetProfile.WorkloadInput.from(workload), files,
-                new BenchmarkReturnWorkBudgetProfile.Flags("B", "PLAIN", "PERIODIC", "ON", true, true, true, true, false, Set.of()));
+                new BenchmarkReturnWorkBudgetProfile.Flags(writer == null ? "B" : "A", "PLAIN", "PERIODIC", "ON", true, true, true, true, false, Set.of()), writer);
     }
     private static HelperManifest helperFormula(HelperManifest h, String formula) {
         return new HelperManifest(h.schemaVersion(), h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(), formula,
-                h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), h.sources(), h.classes(), h.origins());
+                h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), h.sources(), h.classes(), h.origins(), h.producerWriter());
     }
     private static void replace(List<BenchmarkReturnWorkBudgetProfile.FileInput> files, BenchmarkReturnWorkBudgetProfile.FileRole role,
                                 byte[] content) throws Exception {
@@ -588,7 +649,7 @@ class BenchmarkReturnWorkBudgetRunTest {
         var files = new ArrayList<>(fixture.profile().inputs().files()); replace(files, role, raw);
         var in = fixture.profile().inputs();
         var profile = BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(in.runId(), in.inputSha256(),
-                in.workload(), files, in.flags()));
+                in.workload(), files, in.flags(), in.producerWriter()));
         return new Fixture(fixture.workload(), profile, fixture.paths(), fixture.output(), fixture.body(),
                 fixture.sourceRoot(), fixture.classes(), fixture.home(), fixture.helper(), fixture.jdk());
     }
@@ -617,6 +678,10 @@ class BenchmarkReturnWorkBudgetRunTest {
         System.setProperty(BenchmarkReturnWorkBudgetRun.PREFIX + "sourceRoot", fixture.sourceRoot().toString());
         System.setProperty("surefire.test.class.path", fixture.classes().toString());
         System.setProperty("java.home", fixture.home().toString());
+        if (fixture.helper().producerWriter() != null) {
+            System.setProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY, "true");
+            System.clearProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY);
+        }
     }
 
     private static BenchmarkWorkloadDefinitions.Workload changedMeasuredCadence(BenchmarkWorkloadDefinitions.Workload workload) {
@@ -655,6 +720,7 @@ class BenchmarkReturnWorkBudgetRunTest {
                     RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY,
                     "tapstate.e2e.benchmark-smoke.jar", RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY,
                     "tapstate.e2e.benchmark-smoke.fork",
+                    RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY, RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY,
                     BenchmarkReturnWorkBudgetRun.PREFIX + "sourceRoot", "surefire.test.class.path", "java.home",
                     BenchmarkReturnWorkBudgetRun.PREFIX + "file.APP_JAR.path")) {
                 before.put(key, System.getProperty(key)); System.clearProperty(key);

@@ -13,7 +13,7 @@ import java.util.Set;
 
 /** Compares typed registration and independently obtained byte/origin facts without performing IO. */
 final class BenchmarkReturnWorkBudgetBindings {
-    static final int SCHEMA_VERSION = 1, MAX_CLASSES = 512, MAX_CLASSPATH = 512;
+    static final int SCHEMA_VERSION = 1, PRODUCER_WRITER_SCHEMA_VERSION = 2, MAX_CLASSES = 512, MAX_CLASSPATH = 512;
     static final long MAX_MANIFEST_BYTES = 2L * 1024 * 1024, MAX_MEMBER_BYTES = 1024 * 1024;
 
     enum Owner { ROOT, PRODUCER }
@@ -99,6 +99,29 @@ final class BenchmarkReturnWorkBudgetBindings {
     record CompiledClass(SourceRole role, String binaryName, Blob blob) {
         CompiledClass { require(role != null && blob != null, "compiled role or material missing"); text(binaryName, 256); }
     }
+    /** A separate producer writer does not replace the root compiler's writer or any common helper. */
+    record ProducerWriterBinding(Owner owner, String sourceRoot, Source source, CompiledClass compiled) {
+        ProducerWriterBinding {
+            require(owner == Owner.PRODUCER && source != null && compiled != null, "producer writer owner or material differs");
+            absolute(sourceRoot);
+            require(source.role() == SourceRole.PDK_WRITER && source.path().equals(SourceRole.PDK_WRITER.sourcePath())
+                    && compiled.role() == SourceRole.PDK_WRITER && compiled.binaryName().equals(SourceRole.PDK_WRITER.binaryName()),
+                    "producer writer role binary or source path differs");
+            require(source.blob().bytes() <= MAX_MEMBER_BYTES && compiled.blob().bytes() <= MAX_MEMBER_BYTES,
+                    "producer writer exceeds prior member cap");
+            require(Path.of(sourceRoot).resolve(source.path()).toString().length() <= 4096
+                    && Path.of(sourceRoot).resolve("adapters/adapter-pdk/target/classes")
+                    .resolve(compiled.binaryName().replace('.', '/') + ".class").toString().length() <= 4096,
+                    "producer writer derived path exceeds its prior cap");
+        }
+        String compilerEntry() { return compiled.binaryName().replace('.', '/') + ".class"; }
+        String compilerPath() { return Path.of(sourceRoot).resolve("adapters/adapter-pdk/target/classes").resolve(compilerEntry()).toString(); }
+        Map<String, Object> evidence() {
+            return Map.of("owner", owner.name(), "sourceRoot", sourceRoot, "role", source.role().name(), "sourcePath", source.path(),
+                    "sourceSha256", source.blob().sha256(), "sourceBytes", source.blob().bytes(), "binaryName", compiled.binaryName(),
+                    "classSha256", compiled.blob().sha256(), "classBytes", compiled.blob().bytes(), "compilerPath", compilerPath());
+        }
+    }
     record Origin(Owner owner, SourceRole role, String binaryName, String container, String entry,
                   Blob classBytes, String applicationSha256) {
         Origin {
@@ -127,7 +150,14 @@ final class BenchmarkReturnWorkBudgetBindings {
     }
     record HelperManifest(int schemaVersion, String runId, String inputSha256, String buildId,
             String rootDefinitionId, String rootFormulaSha256, String producerFormulaSha256, Blob failsafeXml,
-            List<String> failsafeClasspath, List<Source> sources, List<CompiledClass> classes, List<Origin> origins) {
+            List<String> failsafeClasspath, List<Source> sources, List<CompiledClass> classes, List<Origin> origins,
+            ProducerWriterBinding producerWriter) {
+        HelperManifest(int schemaVersion, String runId, String inputSha256, String buildId,
+                String rootDefinitionId, String rootFormulaSha256, String producerFormulaSha256, Blob failsafeXml,
+                List<String> failsafeClasspath, List<Source> sources, List<CompiledClass> classes, List<Origin> origins) {
+            this(schemaVersion, runId, inputSha256, buildId, rootDefinitionId, rootFormulaSha256, producerFormulaSha256,
+                    failsafeXml, failsafeClasspath, sources, classes, origins, null);
+        }
         HelperManifest {
             text(runId, 128); digest(inputSha256); text(buildId, 128); text(rootDefinitionId, 128);
             digest(rootFormulaSha256); digest(producerFormulaSha256); require(failsafeXml != null, "Failsafe XML fact missing");
@@ -141,7 +171,14 @@ final class BenchmarkReturnWorkBudgetBindings {
     }
     record ActualFacts(String runId, String inputSha256, String buildId, Lifecycle lifecycle, Blob failsafeXml,
             List<String> failsafeClasspath, List<FileFact> files, List<Source> sources, List<CompiledClass> classes,
-            List<ObservedOrigin> origins, List<JdkFile> jdkFiles, Set<String> claimedQualifications) {
+            List<ObservedOrigin> origins, List<JdkFile> jdkFiles, Set<String> claimedQualifications,
+            ProducerWriterBinding producerWriter) {
+        ActualFacts(String runId, String inputSha256, String buildId, Lifecycle lifecycle, Blob failsafeXml,
+                List<String> failsafeClasspath, List<FileFact> files, List<Source> sources, List<CompiledClass> classes,
+                List<ObservedOrigin> origins, List<JdkFile> jdkFiles, Set<String> claimedQualifications) {
+            this(runId, inputSha256, buildId, lifecycle, failsafeXml, failsafeClasspath, files, sources, classes,
+                    origins, jdkFiles, claimedQualifications, null);
+        }
         ActualFacts {
             text(runId, 128); digest(inputSha256); text(buildId, 128);
             require(lifecycle != null && failsafeXml != null && claimedQualifications != null, "actual provenance missing");
@@ -184,7 +221,9 @@ final class BenchmarkReturnWorkBudgetBindings {
         var prepared = authenticated.prepared();
         var definition = authenticated.definition();
         var inputs = prepared.inputs();
-        require(helper.schemaVersion() == SCHEMA_VERSION && jdk.schemaVersion() == SCHEMA_VERSION, "manifest schema differs");
+        require(supportedHelper(helper) && jdk.schemaVersion() == SCHEMA_VERSION, "manifest schema differs");
+        require(java.util.Objects.equals(inputs.producerWriter(), helper.producerWriter())
+                && java.util.Objects.equals(helper.producerWriter(), actual.producerWriter()), "actual producer writer source or compiled binding differs");
         require(inputs.runId().equals(helper.runId()) && inputs.runId().equals(jdk.runId()) && inputs.runId().equals(actual.runId())
                 && inputs.inputSha256().equals(helper.inputSha256()) && inputs.inputSha256().equals(jdk.inputSha256())
                 && inputs.inputSha256().equals(actual.inputSha256()), "registered input or run identity differs");
@@ -203,14 +242,14 @@ final class BenchmarkReturnWorkBudgetBindings {
         require(sources.equals(sources(actual.sources())), "actual source bytes differ");
         var classes = classes(helper.classes());
         require(classes.equals(classes(actual.classes())), "actual compiled class bytes differ");
-        var origins = origins(helper.origins(), classes, files, classpath);
+        var origins = origins(helper.origins(), classes, files, classpath, helper.producerWriter());
         var observed = new ArrayList<Origin>();
         for (var origin : actual.origins()) {
             var expected = origin.origin().owner() == Owner.ROOT ? owners.root() : owners.producer();
             require(origin.runtime().equals(expected), "actual class runtime identity differs");
             observed.add(origin.origin());
         }
-        require(origins.equals(origins(observed, classes, files, classpath)), "actual class origin differs");
+        require(origins.equals(origins(observed, classes, files, classpath, helper.producerWriter())), "actual class origin differs");
         verifyJdk(inputs, jdk, actual, owners, files);
         var evidence = new LinkedHashMap<String, Object>();
         evidence.put("schemaVersion", SCHEMA_VERSION); evidence.put("state", "REGISTERED_BINDING_FACTS_MATCHED");
@@ -224,7 +263,23 @@ final class BenchmarkReturnWorkBudgetBindings {
         BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> evidence.put(flag, false));
         evidence.put("structuralWorkBudgetQualified", false); evidence.put("wholeMethodCostQualified", false);
         evidence.put("causalOverheadQualified", false); evidence.put("runtimeInstructionBytesQualified", false);
+        if (helper.producerWriter() != null) { evidence.put("producerWriter", helper.producerWriter().evidence()); }
         return Collections.unmodifiableMap(evidence);
+    }
+
+    static boolean supportedHelper(HelperManifest helper) {
+        return helper != null && (helper.schemaVersion() == SCHEMA_VERSION && helper.producerWriter() == null
+                || helper.schemaVersion() == PRODUCER_WRITER_SCHEMA_VERSION && helper.producerWriter() != null);
+    }
+
+    static CompiledClass compiledForOwner(Map<String, CompiledClass> classes, Owner owner, String binary,
+            ProducerWriterBinding producerWriter) {
+        var root = classes.get(binary);
+        if (producerWriter != null && owner == Owner.PRODUCER && SourceRole.PDK_WRITER.binaryName().equals(binary)) {
+            require(root != null && root.role() == SourceRole.PDK_WRITER, "root writer compiled fact is missing");
+            return producerWriter.compiled();
+        }
+        return root;
     }
 
     private static Map<BenchmarkReturnWorkBudgetProfile.FileRole, FileFact> fileFacts(
@@ -280,11 +335,11 @@ final class BenchmarkReturnWorkBudgetBindings {
     }
 
     private static Map<OriginKey, Origin> origins(List<Origin> list, Map<String, CompiledClass> classes,
-            Map<BenchmarkReturnWorkBudgetProfile.FileRole, FileFact> files, Set<String> classpath) {
+            Map<BenchmarkReturnWorkBudgetProfile.FileRole, FileFact> files, Set<String> classpath, ProducerWriterBinding producerWriter) {
         var facts = new HashMap<OriginKey, Origin>();
         var application = files.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR);
         for (var origin : list) {
-            var compiled = classes.get(origin.binaryName());
+            var compiled = compiledForOwner(classes, origin.owner(), origin.binaryName(), producerWriter);
             require(compiled != null && compiled.role() == origin.role() && compiled.blob().equals(origin.classBytes())
                     && origin.role().owners().contains(origin.owner()), "class bytes or source owner differs");
             String member = origin.binaryName().replace('.', '/') + ".class";

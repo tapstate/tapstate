@@ -153,16 +153,48 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
                 RealBenchmarkForkDriver.writeReturnClockMode(System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
                         Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY),
                         Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")).name(),
-                System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY),
+                collectorMode(),
                 Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"),
                 System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY) != null,
                 Boolean.getBoolean(RealBenchmarkForkDriver.NOMINAL_RETURN_DIAGNOSTICS_PROPERTY),
                 System.getProperty("tapstate.e2e.benchmark-smoke.fork-output") != null, cpu, conflicts);
         var inputs = new BenchmarkReturnWorkBudgetProfile.Inputs(scalar(PREFIX + "runId", 128),
-                scalar(PREFIX + "inputSha256", 64), BenchmarkReturnWorkBudgetProfile.WorkloadInput.original(workload), files, flags);
+                scalar(PREFIX + "inputSha256", 64), BenchmarkReturnWorkBudgetProfile.WorkloadInput.original(workload), files, flags,
+                producerWriterFromProperties());
         return open(BenchmarkReturnWorkBudgetProfile.inspect(inputs), paths,
                 absolute(scalar("tapstate.e2e.benchmark-smoke.fork-output", 4096)),
                 absolute(scalar(PREFIX + "producerBody", 4096)), scalar(PREFIX + "nonce", 64));
+    }
+
+    private static String collectorMode() {
+        String calibration = System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY);
+        if (calibration == null && "A".equals(System.getProperty("tapstate.e2e.benchmark-smoke.arm", "A"))
+                && "true".equals(System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY))) { return "ON"; }
+        return calibration;
+    }
+
+    private static ProducerWriterBinding producerWriterFromProperties() {
+        String base = PREFIX + "producerWriter.";
+        var keys = List.of("sourceRoot", "source.sha256", "source.bytes", "compiled.sha256", "compiled.bytes");
+        boolean any = false; for (String key : keys) { any |= System.getProperty(base + key) != null; }
+        if (!any) { return null; }
+        try {
+            return new ProducerWriterBinding(Owner.PRODUCER, scalar(base + "sourceRoot", 4096),
+                    new Source(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.sourcePath(),
+                            new Blob(scalar(base + "source.sha256", 64), Long.parseLong(scalar(base + "source.bytes", 20)))),
+                    new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(),
+                            new Blob(scalar(base + "compiled.sha256", 64), Long.parseLong(scalar(base + "compiled.bytes", 20)))));
+        } catch (NumberFormatException malformed) { throw new AssertionError("registered producer writer byte scalar is malformed", malformed); }
+    }
+
+    /**
+     * Covers the bounded pre-scope property prelude, recipe append, repeated writer maps and
+     * metadata projection of at most 32 fields; charged to every mandatory install entry.
+     */
+    static BenchmarkReturnWorkBudget.Work producerWriterRegistrationUpper() {
+        long characters = 4L * 4096 + 2L * 512 + 2L * 256 + 4L * 64;
+        return new BenchmarkReturnWorkBudget.Work(256, Math.addExact(256, Math.multiplyExact(16, characters)),
+                2, 0, Math.multiplyExact(8, characters), 8, Math.multiplyExact(8, characters), 256);
     }
 
     static BenchmarkReturnWorkBudgetRun open(BenchmarkReturnWorkBudgetProfile.Prepared profile,
@@ -192,6 +224,13 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     }
 
     private void bindFiles() throws IOException {
+        if (profile.inputs().producerWriter() != null) {
+            require("true".equals(BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ,
+                    () -> System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY)))
+                    && BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ,
+                    () -> System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY)) == null,
+                    "separate producer writer requires the native domain without collector calibration");
+        }
         long start = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ,
                 () -> ManagementFactory.getRuntimeMXBean().getStartTime());
         long pid = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO,
@@ -241,10 +280,12 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         FileFact jdkFile = declared.stream().filter(file -> file.role() == BenchmarkReturnWorkBudgetProfile.FileRole.JDK_INPUT_MANIFEST).findFirst().orElseThrow();
         helperManifest = BenchmarkReturnBindingsManifestReader.readHelper(Path.of(helperFile.path()), helperFile.blob());
         jdkManifest = BenchmarkReturnBindingsManifestReader.readJdk(Path.of(jdkFile.path()), jdkFile.blob());
-        require(helperManifest.schemaVersion() == SCHEMA_VERSION && jdkManifest.schemaVersion() == SCHEMA_VERSION
+        require(supportedHelper(helperManifest) && jdkManifest.schemaVersion() == SCHEMA_VERSION
                         && profile.inputs().runId().equals(helperManifest.runId()) && profile.inputs().runId().equals(jdkManifest.runId())
                         && profile.inputs().inputSha256().equals(helperManifest.inputSha256()) && profile.inputs().inputSha256().equals(jdkManifest.inputSha256()),
                 "manifest run, input or schema differs");
+        require(java.util.Objects.equals(profile.inputs().producerWriter(), helperManifest.producerWriter()),
+                "producer writer declaration differs from independently registered scalars");
         require(definition.definitionId().equals(helperManifest.rootDefinitionId())
                         && definition.sourceFormulaSha256().equals(helperManifest.rootFormulaSha256())
                         && BenchmarkReturnWorkBudgetProducerAllocations.FORMULA_SHA256.equals(helperManifest.producerFormulaSha256()),
@@ -262,6 +303,8 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         require(jdkManifest.files().stream().map(JdkFile::role).collect(java.util.stream.Collectors.toSet()).equals(requiredJdk), "JDK file role roster differs");
         authenticated = BenchmarkReturnWorkBudgetBindingsIo.authenticate(sourceRoot,
                 paths.get(BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR), declared, helperManifest, jdkManifest);
+        require(java.util.Objects.equals(profile.inputs().producerWriter(), authenticated.producerWriter()),
+                "actual producer writer source or compiled bytes were not authenticated");
         var evidence = new LinkedHashMap<String, Object>();
         evidence.put("state", "ACTUAL_DECLARED_BYTES_AND_ROOT_RUNTIME_RECORDED");
         evidence.put("runId", profile.inputs().runId()); evidence.put("inputSha256", profile.inputs().inputSha256());
@@ -276,6 +319,10 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         evidence.put("runtimeOriginAuthenticationQualified", false); evidence.put("emittedMemberCompletenessQualified", false);
         evidence.put("runtimeInstructionBytesQualified", false); evidence.put("structuralWorkBudgetQualified", false);
         evidence.put("wholeMethodCostQualified", false); evidence.put("performanceAcceptanceEligible", false);
+        if (authenticated.producerWriter() != null) {
+            evidence.put("producerWriter", authenticated.producerWriter().evidence());
+            evidence.put("producerWriterRoute", "A_PLAIN_PERIODIC_NATIVE_DOMAIN_COLLECTOR_ENABLED_CALIBRATION_ABSENT");
+        }
         bindingEvidence = Map.copyOf(evidence);
     }
 
@@ -490,6 +537,10 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     void requireActive() {
         require(ACTIVE.get() == this && BenchmarkReturnWorkBudget.current() == scope && !finished,
                 "trusted source profile is not active");
+        if (profile.inputs().producerWriter() != null) {
+            require(authenticated != null && profile.inputs().producerWriter().equals(authenticated.producerWriter()),
+                    "separate producer writer is not authenticated");
+        }
     }
 
     void requireDriver(BenchmarkWorkloadDefinitions.Workload workload, PipelineBenchmarkComparison.Arm arm,

@@ -28,6 +28,60 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 class BenchmarkReturnWorkBudgetBindingsIoTest {
+    @Test void real_separate_writer_source_compiler_and_app_bytes_are_authenticated_without_changing_root_bytes() throws Exception {
+        var fixture = separateWriterFixture(); var expected = fixture.helper().producerWriter();
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "separate-writer-io")) {
+            var result = fixture.authenticate();
+            assertThat(result.producerWriter()).isEqualTo(expected);
+            var root = result.origins().stream().filter(o -> o.owner() == Owner.ROOT && o.role() == SourceRole.PDK_WRITER).findFirst().orElseThrow();
+            var producer = result.origins().stream().filter(o -> o.owner() == Owner.PRODUCER && o.role() == SourceRole.PDK_WRITER).findFirst().orElseThrow();
+            assertThat(producer.classBytes()).isEqualTo(expected.compiled().blob()).isNotEqualTo(root.classBytes());
+            assertThat(result.classes()).contains(new CompiledClass(SourceRole.PDK_WRITER, root.binaryName(), root.classBytes()));
+            assertThat(result.evidence()).containsEntry("schemaVersion", 2).containsEntry("manifestEncoding", "CANONICAL_ASCII_LENGTH_PREFIXED_V2")
+                    .containsEntry("runtimeInstructionBytesQualified", false).containsEntry("wholeMethodCostQualified", false);
+            assertThat(scope.snapshot()).containsEntry("pendingOperations", 0L);
+            assertThat(actual(scope.snapshot(), "CLOCK_REQUEST", "requests")).isZero();
+        }
+    }
+
+    @Test void changed_writer_source_compiler_and_app_entry_cannot_be_repaired_by_declared_role_or_origin() throws Exception {
+        for (boolean source : List.of(false, true)) {
+            var f = separateWriterFixture(); var w = f.helper().producerWriter();
+            Path path = source ? Path.of(w.sourceRoot()).resolve(w.source().path()) : Path.of(w.compilerPath());
+            byte[] bytes = Files.readAllBytes(path); bytes[0] ^= 1; Files.write(path, bytes);
+            assertThatThrownBy(f::authenticate).isInstanceOf(AssertionError.class).hasMessageContaining("actual byte digest or length differs");
+        }
+        var f = separateWriterFixture();
+        byte[] wrongModule = zip(Map.of(SourceRole.PDK_WRITER.binaryName().replace('.', '/') + ".class",
+                "foreign-app-writer".getBytes(java.nio.charset.StandardCharsets.US_ASCII)), false);
+        Files.write(f.application(), zip(Map.of("BOOT-INF/lib/adapter-pdk-control.jar", wrongModule), true));
+        Blob app = blob(Files.readAllBytes(f.application())); var h = f.helper();
+        var origins = h.origins().stream().map(o -> o.owner() == Owner.PRODUCER
+                ? new Origin(o.owner(), o.role(), o.binaryName(), o.container(), o.entry(), o.classBytes(), app.sha256()) : o).toList();
+        var changed = new HelperManifest(h.schemaVersion(), h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(), h.rootFormulaSha256(),
+                h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), h.sources(), h.classes(), origins, h.producerWriter());
+        var exactBytes = rewriteHelper(f, changed, app);
+        assertThatThrownBy(exactBytes::authenticate).isInstanceOf(AssertionError.class).hasMessageContaining("nested class digest or length differs");
+    }
+
+    @Test void separate_writer_canonical_source_and_stream_close_failures_remain_fail_closed_with_original_cause() throws Exception {
+        var f = separateWriterFixture(); var w = f.helper().producerWriter(); Path source = Path.of(w.sourceRoot()).resolve(w.source().path());
+        byte[] bytes = Files.readAllBytes(source); Path elsewhere = temporary.resolve("foreign-writer-source"); Files.write(elsewhere, bytes);
+        Files.delete(source); Files.createSymbolicLink(source, elsewhere);
+        assertThatThrownBy(f::authenticate).isInstanceOf(AssertionError.class).hasMessageContaining("linked file refused");
+        Files.delete(source); Files.write(source, bytes);
+        var primary = new IOException("controlled producer writer read"); var cleanup = new IOException("controlled producer writer close");
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition(), "separate-writer-refusal")) {
+            Throwable failure = catchThrowable(() -> f.authenticate(path -> !path.equals(source) ? Files.newInputStream(path) : new InputStream() {
+                @Override public int read() throws IOException { throw primary; }
+                @Override public int read(byte[] value, int at, int length) throws IOException { throw primary; }
+                @Override public void close() throws IOException { throw cleanup; }
+            }));
+            assertThat(failure).isSameAs(primary); assertThat(primary.getSuppressed()).containsExactly(cleanup);
+            assertThat(scope.primaryCause()).isSameAs(primary);
+            assertThat(scope.snapshot()).containsEntry("state", "UNKNOWN").containsEntry("pendingOperations", 0L);
+        }
+    }
     @TempDir Path temporary;
 
     @Test void actual_source_directory_jar_nested_class_manifest_and_jdk_bytes_are_authenticated_without_runtime_credit() throws Exception {
@@ -303,12 +357,58 @@ class BenchmarkReturnWorkBudgetBindingsIoTest {
     private static Fixture source(Fixture fixture, Source source) throws Exception {
         var h = fixture.helper(); var sources = new ArrayList<>(h.sources()); sources.set(0, source);
         var changed = new HelperManifest(h.schemaVersion(), h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(),
-                h.rootFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), sources, h.classes(), h.origins());
+                h.rootFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), sources, h.classes(), h.origins(), h.producerWriter());
         byte[] bytes = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(changed); var files = new ArrayList<>(fixture.files());
         int index = java.util.stream.IntStream.range(0, files.size()).filter(i -> files.get(i).role() == BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST).findFirst().orElseThrow();
         var original = files.get(index); Files.write(Path.of(original.path()), bytes);
         files.set(index, new FileFact(original.role(), original.path(), blob(bytes)));
         return new Fixture(fixture.sourceRoot(), fixture.application(), files, changed, fixture.jdk());
+    }
+    private Fixture separateWriterFixture() throws Exception {
+        var f = fixture(false, false); var h = f.helper();
+        Path rootClasses = Path.of(h.failsafeClasspath().getFirst()), producerRoot = Files.createDirectory(f.sourceRoot().getParent().resolve("producer-a")).toRealPath();
+        byte[] rootSource = "root-b-writer-source".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        byte[] producerSource = "producer-a-writer-source".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        byte[] rootClass = "root-b-writer-class".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        byte[] producerClass = "producer-a-writer-class".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        String entry = SourceRole.PDK_WRITER.binaryName().replace('.', '/') + ".class";
+        Path sourceB = f.sourceRoot().resolve(SourceRole.PDK_WRITER.sourcePath()), sourceA = producerRoot.resolve(SourceRole.PDK_WRITER.sourcePath());
+        for (Path path : List.of(sourceB, sourceA)) Files.createDirectories(path.getParent());
+        Files.write(sourceB, rootSource); Files.write(sourceA, producerSource);
+        Path rootFile = rootClasses.resolve(entry); Files.createDirectories(rootFile.getParent()); Files.write(rootFile, rootClass);
+        var writer = new ProducerWriterBinding(Owner.PRODUCER, producerRoot.toString(),
+                new Source(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.sourcePath(), blob(producerSource)),
+                new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), blob(producerClass)));
+        Path producerFile = Path.of(writer.compilerPath()); Files.createDirectories(producerFile.getParent()); Files.write(producerFile, producerClass);
+        var sources = new ArrayList<>(h.sources()); sources.add(new Source(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.sourcePath(), blob(rootSource)));
+        var classes = new ArrayList<>(h.classes()); classes.add(new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), blob(rootClass)));
+        byte[] module; try (var outer = new java.util.zip.ZipFile(f.application().toFile())) {
+            try (var input = outer.getInputStream(outer.getEntry("BOOT-INF/lib/adapter-pdk-control.jar"))) { module = input.readAllBytes(); }
+        }
+        var entries = new LinkedHashMap<String, byte[]>();
+        try (var nested = new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(module))) {
+            for (ZipEntry item; (item = nested.getNextEntry()) != null;) { entries.put(item.getName(), nested.readAllBytes()); }
+        }
+        entries.put(entry, producerClass); Files.write(f.application(), zip(Map.of("BOOT-INF/lib/adapter-pdk-control.jar", zip(entries, false)), true));
+        Blob app = blob(Files.readAllBytes(f.application()));
+        var origins = new ArrayList<>(h.origins().stream().map(o -> o.owner() == Owner.PRODUCER
+                ? new Origin(o.owner(), o.role(), o.binaryName(), o.container(), o.entry(), o.classBytes(), app.sha256()) : o).toList());
+        origins.add(new Origin(Owner.ROOT, SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), rootClasses.toString(), entry, blob(rootClass), null));
+        origins.add(new Origin(Owner.PRODUCER, SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), f.application().toString(),
+                "BOOT-INF/lib/adapter-pdk-control.jar!/" + entry, blob(producerClass), app.sha256()));
+        var changed = new HelperManifest(PRODUCER_WRITER_SCHEMA_VERSION, h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(),
+                h.rootFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), sources, classes, origins, writer);
+        return rewriteHelper(f, changed, app);
+    }
+    private static Fixture rewriteHelper(Fixture f, HelperManifest helper, Blob app) throws Exception {
+        byte[] raw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper); var files = new ArrayList<FileFact>();
+        for (var file : f.files()) {
+            if (file.role() == BenchmarkReturnWorkBudgetProfile.FileRole.COMMON_HELPER_MANIFEST) {
+                Files.write(Path.of(file.path()), raw); files.add(new FileFact(file.role(), file.path(), blob(raw)));
+            } else if (file.role() == BenchmarkReturnWorkBudgetProfile.FileRole.APP_JAR) files.add(new FileFact(file.role(), file.path(), app));
+            else files.add(file);
+        }
+        return new Fixture(f.sourceRoot(), f.application(), files, helper, f.jdk());
     }
     private static byte[] zip(Map<String, byte[]> entries, boolean stored) throws IOException {
         var buffer = new ByteArrayOutputStream();

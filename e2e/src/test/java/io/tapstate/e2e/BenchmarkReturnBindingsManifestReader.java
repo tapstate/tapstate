@@ -23,6 +23,7 @@ final class BenchmarkReturnBindingsManifestReader {
     private static final Owner[] OWNERS = Owner.values();
     private static final JdkRole[] JDK = JdkRole.values();
     private static final int MAX_FIELDS = 14 + MAX_CLASSPATH + 4 * SOURCES.length + 4 * MAX_CLASSES + 16 * MAX_CLASSES;
+    private static final int WRITER_FIELDS = 11, MAX_WRITER_FIELDS = MAX_FIELDS + WRITER_FIELDS;
     private static final int BUFFER = 8192;
     @FunctionalInterface interface Streams { InputStream open(Path path) throws IOException; }
     private static final Streams FILES = path -> Files.newInputStream(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
@@ -57,8 +58,12 @@ final class BenchmarkReturnBindingsManifestReader {
     }
 
     private static HelperManifest helper(Cursor c) {
-        require(c.field(32, false).equals("HELPER_BINDINGS_V1"), "helper header or field order differs");
-        int schema = c.count(1); require(schema == SCHEMA_VERSION, "helper schema differs");
+        String header = c.field(32, false);
+        require(header.equals("HELPER_BINDINGS_V1") || header.equals("HELPER_BINDINGS_V2"), "helper header or field order differs");
+        int schema = c.count(PRODUCER_WRITER_SCHEMA_VERSION);
+        require(header.equals("HELPER_BINDINGS_V1") && schema == SCHEMA_VERSION
+                || header.equals("HELPER_BINDINGS_V2") && schema == PRODUCER_WRITER_SCHEMA_VERSION,
+                "helper header or field order differs");
         String run = c.field(128, false), input = c.digest(), build = c.field(128, false), definition = c.field(128, false);
         String root = c.digest(), producer = c.digest(); Blob xml = c.blob(Long.MAX_VALUE - 1);
         int count = c.count(MAX_CLASSPATH); var classpath = new ArrayList<String>(count); var paths = new HashSet<String>();
@@ -77,18 +82,27 @@ final class BenchmarkReturnBindingsManifestReader {
             Blob blob = c.blob(MAX_MEMBER_BYTES); require(!members.containsKey(binary), "compiled member repeated");
             var compiled = new CompiledClass(role, binary, blob); members.put(binary, compiled); classes.add(compiled);
         }
+        ProducerWriterBinding producerWriter = null;
+        if (schema == PRODUCER_WRITER_SCHEMA_VERSION) {
+            require(c.count(1) == 1, "producer writer tuple is missing");
+            Owner owner = c.owner(); String sourceRoot = c.field(4096, false); absolute(sourceRoot);
+            var source = new Source(c.source(), c.field(512, false), c.blob(MAX_MEMBER_BYTES));
+            var compiled = new CompiledClass(c.source(), c.field(256, false), c.blob(MAX_MEMBER_BYTES));
+            producerWriter = new ProducerWriterBinding(owner, sourceRoot, source, compiled);
+            require(members.containsKey(SourceRole.PDK_WRITER.binaryName()), "root writer compiled fact is missing");
+        }
         count = c.count(2 * MAX_CLASSES); var origins = new ArrayList<Origin>(count); var originKeys = new HashSet<String>();
         for (int i = 0; i < count; i++) {
             Owner owner = c.owner(); SourceRole role = c.source(); String binary = c.field(256, false); binary(role, binary);
             String container = c.field(4096, false); absolute(container); String entry = c.field(1024, false);
             Blob blob = c.blob(MAX_MEMBER_BYTES); String app = c.field(64, true); if (!app.isEmpty()) { digest(app); }
-            var compiled = members.get(binary);
+            var compiled = compiledForOwner(members, owner, binary, producerWriter);
             require(compiled != null && compiled.role() == role && compiled.blob().equals(blob) && role.owners().contains(owner), "origin source owner or compiled bytes differ");
             require(originKeys.add(owner.name() + ":" + binary), "owned origin repeated");
             require(owner == Owner.ROOT ? app.isEmpty() : !app.isEmpty(), "origin application digest kind differs");
             origins.add(new Origin(owner, role, binary, container, entry, blob, app.isEmpty() ? null : app));
         }
-        return new HelperManifest(schema, run, input, build, definition, root, producer, xml, classpath, sources, classes, origins);
+        return new HelperManifest(schema, run, input, build, definition, root, producer, xml, classpath, sources, classes, origins, producerWriter);
     }
 
     private static JdkManifest jdk(Cursor c) {
@@ -108,7 +122,7 @@ final class BenchmarkReturnBindingsManifestReader {
         final byte[] raw; int at, fields;
         Cursor(byte[] raw) { this.raw = raw; }
         String field(int maximum, boolean empty) {
-            require(++fields <= MAX_FIELDS && at < raw.length, "field roster missing or exceeds cap");
+            require(++fields <= MAX_WRITER_FIELDS && at < raw.length, "field roster missing or exceeds cap");
             int first = at, length = 0, digits = 0;
             while (at < raw.length && raw[at] >= '0' && raw[at] <= '9') {
                 require(++digits <= 4, "field length prefix exceeds bound");
@@ -207,8 +221,12 @@ final class BenchmarkReturnBindingsManifestReader {
                 Math.addExact(Math.multiplyExact(4, byteCap), Math.multiplyExact(16, fieldCap)), Math.multiplyExact(8, fieldCap));
     }
     static int maximumFields() { return MAX_FIELDS; }
+    static int maximumFields(int schema) {
+        require(schema == SCHEMA_VERSION || schema == PRODUCER_WRITER_SCHEMA_VERSION, "helper schema differs");
+        return schema == SCHEMA_VERSION ? MAX_FIELDS : MAX_WRITER_FIELDS;
+    }
     private static void limits(long bytes, long fields) {
-        require(bytes > 0 && bytes <= MAX_MANIFEST_BYTES && fields > 0 && fields <= MAX_FIELDS, "independent source work caps differ");
+        require(bytes > 0 && bytes <= MAX_MANIFEST_BYTES && fields > 0 && fields <= MAX_WRITER_FIELDS, "independent source work caps differ");
     }
     private static void absolute(String value) { Path path = Path.of(value); require(path.isAbsolute() && path.equals(path.normalize()), "typed path is not absolute and normalized"); }
     private static void binary(SourceRole role, String value) {

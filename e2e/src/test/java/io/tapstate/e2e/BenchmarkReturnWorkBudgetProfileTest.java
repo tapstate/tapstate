@@ -15,6 +15,40 @@ class BenchmarkReturnWorkBudgetProfileTest {
     private static final BenchmarkReturnWorkBudgetProfile.WorkloadInput ORIGINAL =
             BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless");
 
+    @Test void a_profile_requires_the_fixed_producer_writer_declaration_and_retains_the_distinct_native_route() {
+        var flags = new BenchmarkReturnWorkBudgetProfile.Flags("A", "PLAIN", "PERIODIC", "ON", true, true, true, true, false, Set.of());
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(
+                "control-a", HASH, ORIGINAL, files(false), flags))).isInstanceOf(AssertionError.class).hasMessageContaining("unsupported profile mode");
+        var writer = producerWriter(HASH); var prepared = BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(
+                "control-a", HASH, ORIGINAL, files(false), flags, writer));
+        assertThat(prepared.inputRegistrationInfo()).containsEntry("registeredProducerRoute",
+                "A_PLAIN_PERIODIC_NATIVE_DOMAIN_COLLECTOR_ENABLED_CALIBRATION_ABSENT")
+                .containsEntry("producerWriter", writer.evidence()).containsEntry("wholeMethodCostQualified", false);
+        assertThat(prepared.requireDefinition()).isNotNull();
+        var reporting = (Map<?, ?>) prepared.inputRegistrationInfo().get("outputPlanSource");
+        assertThat(reporting.get("mode")).isEqualTo("A_PLAIN_PERIODIC_NATIVE_DOMAIN_CALIBRATION_ABSENT_NOMINAL");
+        var bPrepared = BenchmarkReturnWorkBudgetProfile.inspect(inputs(ORIGINAL, false, files(false)));
+        assertThat(((Map<?, ?>) bPrepared.inputRegistrationInfo().get("outputPlanSource")).get("mode"))
+                .isEqualTo("B_PLAIN_ON_PERIODIC_NOMINAL");
+        assertThat(prepared.fieldsRegisteredOutputPlan()).isEqualTo(bPrepared.fieldsRegisteredOutputPlan());
+        assertThat(BenchmarkReturnWorkBudget.current()).isNull();
+        var b = inputs(ORIGINAL, false, files(false));
+        assertThatThrownBy(() -> BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(
+                b.runId(), b.inputSha256(), b.workload(), b.files(), b.flags(), writer)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("unsupported profile mode");
+    }
+
+    @Test void registered_producer_source_and_compiled_bytes_change_the_recipe_even_when_input_sha_is_borrowed() {
+        var flags = new BenchmarkReturnWorkBudgetProfile.Flags("A", "PLAIN", "PERIODIC", "ON", true, true, true, true, false, Set.of());
+        var first = BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(
+                "control-a", HASH, ORIGINAL, files(false), flags, producerWriter(HASH)));
+        var changed = BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(
+                "control-a", HASH, ORIGINAL, files(false), flags, producerWriter("b".repeat(64))));
+        assertThat(first.perOperationUpper()).isEqualTo(changed.perOperationUpper());
+        assertThat(first.requireDefinition().sourceFormulaSha256()).isNotEqualTo(changed.requireDefinition().sourceFormulaSha256());
+        assertThat(first.inputRegistrationInfo()).containsKey("producerWriterRegistrationSourceUpper");
+    }
+
     @Test void actual_source_association_rows_fit_the_registered_shared_support_bound() {
         var original = BenchmarkWorkloadDefinitions.steadyPilot("stateless");
         var measured = original.phase("cdc-update");
@@ -164,5 +198,12 @@ class BenchmarkReturnWorkBudgetProfileTest {
         return Arrays.stream(BenchmarkReturnWorkBudgetProfile.FileRole.values())
                 .filter(role -> cpu || role != BenchmarkReturnWorkBudgetProfile.FileRole.ROOT_CPU_PROVIDER_LIBRARY)
                 .map(role -> new BenchmarkReturnWorkBudgetProfile.FileInput(role, HASH, 1024 * 1024)).toList();
+    }
+    private static BenchmarkReturnWorkBudgetBindings.ProducerWriterBinding producerWriter(String sha) {
+        var role = BenchmarkReturnWorkBudgetBindings.SourceRole.PDK_WRITER;
+        return new BenchmarkReturnWorkBudgetBindings.ProducerWriterBinding(BenchmarkReturnWorkBudgetBindings.Owner.PRODUCER,
+                "/controlled/producer-a", new BenchmarkReturnWorkBudgetBindings.Source(role, role.sourcePath(),
+                new BenchmarkReturnWorkBudgetBindings.Blob(sha, 128)), new BenchmarkReturnWorkBudgetBindings.CompiledClass(role,
+                role.binaryName(), new BenchmarkReturnWorkBudgetBindings.Blob(sha, 256)));
     }
 }

@@ -25,6 +25,39 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 class BenchmarkReturnBindingsManifestReaderTest {
     @TempDir Path temporary;
 
+    @Test void canonical_v2_roundtrip_keeps_root_writer_and_separate_producer_writer_bytes_distinct() throws Exception {
+        var helper = separateWriterHelper(); byte[] bytes = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper); var file = file(bytes);
+        var decoded = BenchmarkReturnBindingsManifestReader.readHelper(file.path(), file.blob());
+        assertThat(decoded).isEqualTo(helper); assertThat(BenchmarkReturnWorkBudgetBindingsIo.helperBytes(decoded)).containsExactly(bytes);
+        assertThat(decoded.schemaVersion()).isEqualTo(PRODUCER_WRITER_SCHEMA_VERSION);
+        assertThat(decoded.producerWriter()).isEqualTo(helper.producerWriter());
+        var root = decoded.origins().stream().filter(o -> o.owner() == Owner.ROOT && o.role() == SourceRole.PDK_WRITER).findFirst().orElseThrow();
+        var producer = decoded.origins().stream().filter(o -> o.owner() == Owner.PRODUCER).findFirst().orElseThrow();
+        assertThat(root.classBytes()).isNotEqualTo(producer.classBytes());
+        assertThat(producer.classBytes()).isEqualTo(decoded.producerWriter().compiled().blob());
+        assertThat(BenchmarkReturnBindingsManifestReader.maximumFields(1)).isEqualTo(BenchmarkReturnBindingsManifestReader.maximumFields());
+        assertThat(BenchmarkReturnBindingsManifestReader.maximumFields(2)).isGreaterThan(BenchmarkReturnBindingsManifestReader.maximumFields());
+    }
+
+    @Test void v2_missing_duplicate_or_foreign_writer_fields_refuse_before_an_origin_can_override_root_bytes() throws Exception {
+        var helper = separateWriterHelper(); var values = fields(BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper));
+        int at = values.indexOf(helper.producerWriter().sourceRoot());
+        var absent = new ArrayList<>(values); absent.set(at - 2, "0"); refuse(absent, "producer writer tuple is missing");
+        var repeated = new ArrayList<>(values); repeated.set(at - 2, "2"); refuse(repeated, "numeric value exceeds prior cap");
+        var owner = new ArrayList<>(values); owner.set(at - 1, "ROOT"); refuse(owner, "producer writer owner");
+        var role = new ArrayList<>(values); role.set(at + 1, "PDK_PROBE"); refuse(role, "role binary or source path differs");
+        var path = new ArrayList<>(values); path.set(at + 2, "../PdkSinkWriter.java"); refuse(path, "role binary or source path differs");
+        var member = new ArrayList<>(values); member.set(at + 6, SourceRole.PDK_WRITER.binaryName() + "$Unregistered");
+        refuse(member, "role binary or source path differs");
+        var excessive = new ArrayList<>(values); excessive.set(at + 4, Long.toString(MAX_MEMBER_BYTES + 1));
+        refuse(excessive, "numeric value exceeds prior cap");
+        var substituted = new ArrayList<>(values);
+        for (int i = at + 9; i < substituted.size() - 6; i++) if (substituted.get(i).equals("ROOT") && substituted.get(i + 1).equals("PDK_WRITER")) {
+            substituted.set(i + 5, helper.producerWriter().compiled().blob().sha256()); break;
+        }
+        refuse(substituted, "origin source owner or compiled bytes differ");
+    }
+
     @Test void original_file_roundtrip_preserves_every_typed_role_blob_order_and_nullable_application_digest() throws Exception {
         var helper = helper(); byte[] raw = BenchmarkReturnWorkBudgetBindingsIo.helperBytes(helper); var file = file(raw);
         var decoded = BenchmarkReturnBindingsManifestReader.readHelper(file.path(), file.blob());
@@ -192,6 +225,20 @@ class BenchmarkReturnBindingsManifestReaderTest {
                 List.of(new Source(SourceRole.ROOT_BUDGET, SourceRole.ROOT_BUDGET.sourcePath(), blob)),
                 List.of(new CompiledClass(SourceRole.ROOT_BUDGET, binary, blob)),
                 List.of(new Origin(Owner.ROOT, SourceRole.ROOT_BUDGET, binary, "/controlled/classes", binary.replace('.', '/') + ".class", blob, null)));
+    }
+    private static HelperManifest separateWriterHelper() {
+        var h = helper(); var root = new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), new Blob("b".repeat(64), 23));
+        var writer = new ProducerWriterBinding(Owner.PRODUCER, "/controlled/producer-a",
+                new Source(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.sourcePath(), new Blob("c".repeat(64), 41)),
+                new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), new Blob("d".repeat(64), 31)));
+        var sources = new ArrayList<>(h.sources()); sources.add(new Source(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.sourcePath(), new Blob("e".repeat(64), 37)));
+        var classes = new ArrayList<>(h.classes()); classes.add(root); var origins = new ArrayList<>(h.origins());
+        String entry = root.binaryName().replace('.', '/') + ".class";
+        origins.add(new Origin(Owner.ROOT, SourceRole.PDK_WRITER, root.binaryName(), "/controlled/classes", entry, root.blob(), null));
+        origins.add(new Origin(Owner.PRODUCER, SourceRole.PDK_WRITER, root.binaryName(), "/controlled/app.jar",
+                "BOOT-INF/lib/adapter-pdk-control.jar!/" + entry, writer.compiled().blob(), "f".repeat(64)));
+        return new HelperManifest(PRODUCER_WRITER_SCHEMA_VERSION, h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(),
+                h.rootFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), sources, classes, origins, writer);
     }
     private static JdkManifest jdk() {
         String home = "/controlled/jdk"; var files = new ArrayList<JdkFile>();

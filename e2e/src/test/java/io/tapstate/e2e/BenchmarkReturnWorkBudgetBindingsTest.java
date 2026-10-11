@@ -16,6 +16,64 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkReturnWorkBudgetBindingsTest {
+    @Test void separate_producer_writer_preserves_root_b_bytes_and_common_helpers_without_qualification() {
+        var original = fixture(false, false); var a = withProducerWriter(original);
+        var evidence = a.verify();
+        assertThat(evidence).containsEntry("state", "REGISTERED_BINDING_FACTS_MATCHED")
+                .containsEntry("wholeMethodCostQualified", false).containsEntry("runtimeInstructionBytesQualified", false);
+        for (String flag : BenchmarkNativeClockEvidence.FLAGS) assertThat(evidence).containsEntry(flag, false);
+        var root = a.actual().origins().stream().map(ObservedOrigin::origin)
+                .filter(o -> o.owner() == Owner.ROOT && o.role() == SourceRole.PDK_WRITER).findFirst().orElseThrow();
+        var producer = a.actual().origins().stream().map(ObservedOrigin::origin)
+                .filter(o -> o.owner() == Owner.PRODUCER && o.role() == SourceRole.PDK_WRITER).findFirst().orElseThrow();
+        assertThat(root.classBytes()).isEqualTo(original.helper().classes().stream()
+                .filter(c -> c.role() == SourceRole.PDK_WRITER).findFirst().orElseThrow().blob());
+        assertThat(producer.classBytes()).isEqualTo(a.helper().producerWriter().compiled().blob()).isNotEqualTo(root.classBytes());
+    }
+
+    @Test void producer_writer_tuple_has_one_fixed_owner_role_binary_path_and_prior_member_cap() {
+        var writer = withProducerWriter(fixture(false, false)).helper().producerWriter();
+        assertThatThrownBy(() -> new ProducerWriterBinding(Owner.ROOT, writer.sourceRoot(), writer.source(), writer.compiled()))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("producer writer owner");
+        assertThatThrownBy(() -> new ProducerWriterBinding(Owner.PRODUCER, writer.sourceRoot(),
+                new Source(SourceRole.PDK_PROBE, SourceRole.PDK_PROBE.sourcePath(), writer.source().blob()), writer.compiled()))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("role binary or source path");
+        assertThatThrownBy(() -> new ProducerWriterBinding(Owner.PRODUCER, writer.sourceRoot(), writer.source(),
+                new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName() + "$Foreign", writer.compiled().blob())))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("role binary or source path");
+        assertThatThrownBy(() -> new ProducerWriterBinding(Owner.PRODUCER, writer.sourceRoot(),
+                new Source(SourceRole.PDK_WRITER, "../writer.java", writer.source().blob()), writer.compiled()))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("role binary or source path");
+        for (boolean source : List.of(false, true)) {
+            var excessive = new Blob(writer.source().blob().sha256(), MAX_MEMBER_BYTES + 1);
+            assertThatThrownBy(() -> new ProducerWriterBinding(Owner.PRODUCER, writer.sourceRoot(),
+                    source ? new Source(SourceRole.PDK_WRITER, writer.source().path(), excessive) : writer.source(),
+                    source ? writer.compiled() : new CompiledClass(SourceRole.PDK_WRITER, writer.compiled().binaryName(), excessive)))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("prior member cap");
+        }
+    }
+
+    @Test void producer_writer_registration_requires_matching_actual_source_and_does_not_override_root_or_common_origins() {
+        var f = withProducerWriter(fixture(false, false)); var a = f.actual(); var w = f.helper().producerWriter();
+        var changedSource = new ProducerWriterBinding(Owner.PRODUCER, w.sourceRoot(),
+                new Source(SourceRole.PDK_WRITER, w.source().path(), blob("changed-a-source")), w.compiled());
+        var changed = new ActualFacts(a.runId(), a.inputSha256(), a.buildId(), a.lifecycle(), a.failsafeXml(), a.failsafeClasspath(),
+                a.files(), a.sources(), a.classes(), a.origins(), a.jdkFiles(), Set.of(), changedSource);
+        assertThatThrownBy(() -> f.withActual(changed).verify()).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("actual producer writer source or compiled binding differs");
+        for (boolean rootWriter : List.of(true, false)) {
+            var origins = new ArrayList<>(a.origins());
+            int at = java.util.stream.IntStream.range(0, origins.size()).filter(i -> rootWriter
+                    ? origins.get(i).origin().owner() == Owner.ROOT && origins.get(i).origin().role() == SourceRole.PDK_WRITER
+                    : origins.get(i).origin().owner() == Owner.PRODUCER && origins.get(i).origin().role() == SourceRole.PDK_PROBE)
+                    .findFirst().orElseThrow();
+            var old = origins.get(at); var o = old.origin();
+            origins.set(at, new ObservedOrigin(new Origin(o.owner(), o.role(), o.binaryName(), o.container(), o.entry(),
+                    w.compiled().blob(), o.applicationSha256()), old.runtime()));
+            assertThatThrownBy(() -> f.withActual(actual(f, a.files(), a.sources(), a.classes(), origins, a.jdkFiles())).verify())
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("class bytes or source owner differs");
+        }
+    }
     @Test void cached_source_authentication_rejects_substituted_bounds_and_still_checks_later_actual_facts() {
         var fixture = fixture(false, false);
         var authenticated = BenchmarkReturnWorkBudgetBindings.authenticate(fixture.prepared());
@@ -261,12 +319,32 @@ class BenchmarkReturnWorkBudgetBindingsTest {
 
     private static HelperManifest helper(Fixture f, List<Source> sources, List<CompiledClass> classes, List<Origin> origins) {
         var h = f.helper(); return new HelperManifest(h.schemaVersion(), h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(),
-                h.rootFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), sources, classes, origins);
+                h.rootFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(), sources, classes, origins, h.producerWriter());
     }
     private static ActualFacts actual(Fixture f, List<FileFact> files, List<Source> sources, List<CompiledClass> classes,
             List<ObservedOrigin> origins, List<JdkFile> jdk) {
         var a = f.actual(); return new ActualFacts(a.runId(), a.inputSha256(), a.buildId(), a.lifecycle(), a.failsafeXml(),
-                a.failsafeClasspath(), files, sources, classes, origins, jdk, a.claimedQualifications());
+                a.failsafeClasspath(), files, sources, classes, origins, jdk, a.claimedQualifications(), a.producerWriter());
+    }
+    private static Fixture withProducerWriter(Fixture f) {
+        var h = f.helper(); var a = f.actual();
+        var writer = new ProducerWriterBinding(Owner.PRODUCER, "/controlled/source-a",
+                new Source(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.sourcePath(), blob("source-a-writer")),
+                new CompiledClass(SourceRole.PDK_WRITER, SourceRole.PDK_WRITER.binaryName(), blob("compiled-a-writer")));
+        var prior = f.prepared().inputs(); var flags = prior.flags();
+        var profile = BenchmarkReturnWorkBudgetProfile.inspect(new BenchmarkReturnWorkBudgetProfile.Inputs(prior.runId(), prior.inputSha256(),
+                prior.workload(), prior.files(), new BenchmarkReturnWorkBudgetProfile.Flags("A", flags.captureMode(), flags.clockMode(),
+                        flags.collectorMode(), flags.steadyPilot(), flags.nativeLibrary(), flags.nominalEnclosure(), flags.explicitOutput(),
+                        flags.rootCpu(), flags.otherControls()), writer));
+        var origins = h.origins().stream().map(o -> o.owner() == Owner.PRODUCER && o.role() == SourceRole.PDK_WRITER
+                ? new Origin(o.owner(), o.role(), o.binaryName(), o.container(), o.entry(), writer.compiled().blob(), o.applicationSha256()) : o).toList();
+        var helper = new HelperManifest(PRODUCER_WRITER_SCHEMA_VERSION, h.runId(), h.inputSha256(), h.buildId(), h.rootDefinitionId(),
+                profile.requireDefinition().sourceFormulaSha256(), h.producerFormulaSha256(), h.failsafeXml(), h.failsafeClasspath(),
+                h.sources(), h.classes(), origins, writer);
+        var observed = origins.stream().map(o -> new ObservedOrigin(o, o.owner() == Owner.ROOT ? f.owners().root() : f.owners().producer())).toList();
+        var actual = new ActualFacts(a.runId(), a.inputSha256(), a.buildId(), a.lifecycle(), a.failsafeXml(), a.failsafeClasspath(), a.files(),
+                a.sources(), a.classes(), observed, a.jdkFiles(), Set.of(), writer);
+        return new Fixture(profile, helper, f.jdk(), actual, f.owners());
     }
     private static Blob blob(String value) {
         byte[] bytes = value.getBytes(StandardCharsets.US_ASCII);

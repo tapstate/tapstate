@@ -52,7 +52,11 @@ final class BenchmarkReturnWorkBudgetProfile {
                  boolean explicitOutput, boolean rootCpu, Set<String> otherControls) {
         Flags { otherControls = Set.copyOf(otherControls); }
     }
-    record Inputs(String runId, String inputSha256, WorkloadInput workload, List<FileInput> files, Flags flags) {
+    record Inputs(String runId, String inputSha256, WorkloadInput workload, List<FileInput> files, Flags flags,
+                  BenchmarkReturnWorkBudgetBindings.ProducerWriterBinding producerWriter) {
+        Inputs(String runId, String inputSha256, WorkloadInput workload, List<FileInput> files, Flags flags) {
+            this(runId, inputSha256, workload, files, flags, null);
+        }
         Inputs { text(runId, 128); digest(inputSha256); require(workload != null && flags != null, "profile scalar inputs are missing"); files = List.copyOf(files); }
     }
     record Gap(String id, String sourceLocation) {
@@ -88,7 +92,9 @@ final class BenchmarkReturnWorkBudgetProfile {
     static Prepared inspect(Inputs inputs) {
         require(inputs != null, "profile scalar inputs are missing");
         var flags = inputs.flags();
-        require("B".equals(flags.arm()) && "PLAIN".equals(flags.captureMode()) && "PERIODIC".equals(flags.clockMode())
+        boolean separateWriter = "A".equals(flags.arm()) && "stateless".equals(inputs.workload().id()) && inputs.producerWriter() != null;
+        require(("B".equals(flags.arm()) && inputs.producerWriter() == null || separateWriter)
+                        && "PLAIN".equals(flags.captureMode()) && "PERIODIC".equals(flags.clockMode())
                         && "ON".equals(flags.collectorMode()) && flags.steadyPilot() && flags.nativeLibrary()
                         && flags.nominalEnclosure() && flags.explicitOutput() && flags.otherControls().isEmpty(),
                 "unsupported profile mode or conflicting control");
@@ -113,13 +119,22 @@ final class BenchmarkReturnWorkBudgetProfile {
         var excluded = EnumSet.noneOf(BenchmarkReturnWorkBudget.Activity.class);
         if (!flags.rootCpu()) { excluded.add(BenchmarkReturnWorkBudget.Activity.ROOT_CPU); }
         var reporting = BenchmarkReturnWorkBudgetReportPlan.prepare(inputs.workload());
+        Map<String, Object> reportingMetadata = reporting.metadata();
+        if (separateWriter) {
+            require(reportingMetadata.size() <= 32 && "B_PLAIN_ON_PERIODIC_NOMINAL".equals(reportingMetadata.get("mode")),
+                    "source reporting metadata mode or fixed roster differs");
+            var projected = new LinkedHashMap<>(reportingMetadata);
+            projected.put("mode", "A_PLAIN_PERIODIC_NATIVE_DOMAIN_CALIBRATION_ABSENT_NOMINAL");
+            reportingMetadata = Map.copyOf(projected);
+        }
         knownComponentBounds(upper, inputs, reporting.plan());
         knownRootBounds(upper, inputs, reporting.plan());
         var measured = inputs.workload().phases().stream().filter(PhaseInput::measured).findFirst().orElseThrow();
         upper.putAll(BenchmarkReturnLocalSourceWork.bounds(new BenchmarkReturnLocalSourceWork.Capacity(
                 measured.logicalOutputs(), measured.logicalOutputs() / 2, measured.batches())));
         long manifestBytes = Math.max(files.get(FileRole.COMMON_HELPER_MANIFEST).bytes(), files.get(FileRole.JDK_INPUT_MANIFEST).bytes());
-        int manifestFields = BenchmarkReturnBindingsManifestReader.maximumFields();
+        int manifestFields = BenchmarkReturnBindingsManifestReader.maximumFields(inputs.producerWriter() == null
+                ? BenchmarkReturnWorkBudgetBindings.SCHEMA_VERSION : BenchmarkReturnWorkBudgetBindings.PRODUCER_WRITER_SCHEMA_VERSION);
         var decode = BenchmarkReturnBindingsManifestReader.decodingWorkUpper(manifestBytes, manifestFields);
         var encode = BenchmarkReturnBindingsManifestReader.encodingWorkUpper(manifestBytes, manifestFields);
         // A reader entry includes canonical re-encoding. Standalone encoding has its own COPY entry.
@@ -127,6 +142,8 @@ final class BenchmarkReturnWorkBudgetProfile {
         upper.merge(BenchmarkReturnWorkBudget.Activity.COPY, encode, BenchmarkReturnWorkBudget.Work::plus);
         var localRegistration = BenchmarkReturnLocalSourceWork.registrationLocalUpper();
         upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, localRegistration, BenchmarkReturnWorkBudget.Work::plus);
+        var writerRegistration = BenchmarkReturnWorkBudgetRun.producerWriterRegistrationUpper();
+        upper.merge(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, writerRegistration, BenchmarkReturnWorkBudget.Work::plus);
         var localIo = BenchmarkReturnWorkBudgetBindingsIo.localIoUpper();
         localIo.forEach((activity, bound) -> upper.merge(activity, bound, BenchmarkReturnWorkBudget.Work::plus));
         var rootOriginLocal = BenchmarkReturnRootOrigins.localUpper();
@@ -151,12 +168,13 @@ final class BenchmarkReturnWorkBudgetProfile {
         registration.put("workload", inputs.workload().id()); registration.put("rows", ROWS); registration.put("seed", SEED);
         registration.put("files", inputs.files().stream().map(file -> Map.of("role", file.role().name(), "sha256", file.sha256(), "bytes", file.bytes())).toList());
         registration.put("rootCpu", flags.rootCpu()); registration.put("outputPlanScope", "FULL_FORK_CONTROLLED_STDOUT_AND_FAILURE_TREES");
-        registration.put("outputPlanSource", reporting.metadata());
+        registration.put("outputPlanSource", reportingMetadata);
         registration.put("preScopeSourceTail", BenchmarkReturnWorkBudgetSourceTails.factoryEvidence(inputs.workload()));
         registration.put("rootCounterColdSourceTail", BenchmarkReturnRootClockWork.evidence());
         registration.put("manifestCodecSourceUpper", Map.of("priorByteCap", manifestBytes, "priorFieldCap", manifestFields,
                 "decoder", decode.evidence(), "encoder", encode.evidence(), "opaqueProviderInstructionsExcluded", true));
         registration.put("registrationLocalSourceUpper", localRegistration.evidence());
+        registration.put("producerWriterRegistrationSourceUpper", writerRegistration.evidence());
         registration.put("bindingIoLocalSourceUpper", localIo.entrySet().stream().collect(java.util.stream.Collectors.toMap(
                 entry -> entry.getKey().name(), entry -> entry.getValue().evidence())));
         registration.put("rootOriginLocalSourceUpper", rootOriginLocal.evidence());
@@ -166,6 +184,10 @@ final class BenchmarkReturnWorkBudgetProfile {
         registration.put("emittedRosterLocalSourceUpper", emittedLocal.evidence());
         registration.put("terminalSourceTail", BenchmarkReturnWorkBudgetSourceTails.terminalEvidence(reporting.plan()));
         registration.put("structuralWorkBudgetQualified", false); registration.put("wholeMethodCostQualified", false);
+        if (inputs.producerWriter() != null) {
+            registration.put("producerWriter", inputs.producerWriter().evidence());
+            registration.put("registeredProducerRoute", "A_PLAIN_PERIODIC_NATIVE_DOMAIN_COLLECTOR_ENABLED_CALIBRATION_ABSENT");
+        }
         return new Prepared(inputs, upper, excluded, reporting.plan(), registration, gaps);
     }
 
@@ -273,6 +295,13 @@ final class BenchmarkReturnWorkBudgetProfile {
     }
     private static String recipeDigest(Inputs inputs, Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> upper) {
         var source = new StringBuilder(DEFINITION_ID).append(':').append(inputs.inputSha256()).append(':').append(ROWS).append(':').append(SEED);
+        if (inputs.producerWriter() != null) {
+            var writer = inputs.producerWriter();
+            source.append(':').append(writer.owner().name()).append(':').append(writer.sourceRoot())
+                    .append(':').append(writer.source().path()).append(':').append(writer.source().blob().sha256())
+                    .append(':').append(writer.source().blob().bytes()).append(':').append(writer.compiled().binaryName())
+                    .append(':').append(writer.compiled().blob().sha256()).append(':').append(writer.compiled().blob().bytes());
+        }
         for (var activity : BenchmarkReturnWorkBudget.Activity.values()) {
             source.append(':').append(activity.name()); var work = upper.get(activity);
             if (work == null) { source.append(":EXCLUDED"); }

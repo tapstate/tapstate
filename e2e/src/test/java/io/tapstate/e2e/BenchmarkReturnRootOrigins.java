@@ -97,7 +97,7 @@ final class BenchmarkReturnRootOrigins {
         var first = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS,
                 BenchmarkReturnWorkBudget.Work.call());
         try {
-            require(helper != null && helper.schemaVersion() == SCHEMA_VERSION && expectedRoot != null
+            require(supportedHelper(helper) && expectedRoot != null
                     && expectedRoot.owner() == Owner.ROOT && helper.runId().equals(expectedRoot.runId()), "root registration differs");
             require(actualClasspath != null && !actualClasspath.isEmpty() && actualClasspath.size() <= MAX_CLASSPATH
                     && actualClasspath.equals(helper.failsafeClasspath()), "actual classpath differs or exceeds its cap");

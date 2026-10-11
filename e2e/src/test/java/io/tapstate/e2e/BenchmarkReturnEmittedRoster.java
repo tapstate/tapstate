@@ -68,7 +68,7 @@ final class BenchmarkReturnEmittedRoster {
     private Observation run(Path root, HelperManifest helper) throws IOException {
         var ticket = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
         try {
-            require(streams != null && walks != null && helper != null && helper.schemaVersion() == 1, "input or schema missing");
+            require(streams != null && walks != null && supportedHelper(helper), "input or schema missing");
             canonical(root); require(request(() -> Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)), "source root is not a directory");
             var declaredSources = javaSources(helper.sources());
             var bySource = new HashMap<String, SourceRole>();
@@ -122,7 +122,7 @@ final class BenchmarkReturnEmittedRoster {
         }
     }
     static void verify(HelperManifest helper, Observation observed) {
-        require(helper != null && helper.schemaVersion() == 1 && observed != null, "registered or observed source roster missing or schema differs");
+        require(supportedHelper(helper) && observed != null, "registered or observed source roster missing or schema differs");
         require(javaSources(helper.sources()).equals(javaSources(observed.sources())), "actual Java source role or digest differs");
         var declared = new HashMap<String, CompiledClass>();
         for (var item : helper.classes()) require(declared.put(item.binaryName(), item) == null, "declared compiled member repeats");

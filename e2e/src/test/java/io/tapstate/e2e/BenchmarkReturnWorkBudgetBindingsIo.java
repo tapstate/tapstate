@@ -33,7 +33,11 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
     private static final Streams FILES = path -> Files.newInputStream(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
 
     record Result(List<FileFact> files, List<Source> sources, List<CompiledClass> classes,
-                  List<Origin> origins, List<JdkFile> jdkFiles, Map<String, Object> evidence) {
+                  List<Origin> origins, List<JdkFile> jdkFiles, Map<String, Object> evidence, ProducerWriterBinding producerWriter) {
+        Result(List<FileFact> files, List<Source> sources, List<CompiledClass> classes,
+                List<Origin> origins, List<JdkFile> jdkFiles, Map<String, Object> evidence) {
+            this(files, sources, classes, origins, jdkFiles, evidence, null);
+        }
         Result {
             files = List.copyOf(files); sources = List.copyOf(sources); classes = List.copyOf(classes);
             origins = List.copyOf(origins); jdkFiles = List.copyOf(jdkFiles);
@@ -75,7 +79,7 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
     private Result read(Path sourceRoot, Path application, List<FileFact> declared, HelperManifest helper, JdkManifest jdk) throws IOException {
         require(helper != null && jdk != null && declared != null && declared.size() <= BenchmarkReturnWorkBudgetProfile.FileRole.values().length,
                 "declared inputs missing or exceed roster cap");
-        require(helper.schemaVersion() == SCHEMA_VERSION && jdk.schemaVersion() == SCHEMA_VERSION
+        require(supportedHelper(helper) && jdk.schemaVersion() == SCHEMA_VERSION
                 && helper.runId().equals(jdk.runId()) && helper.inputSha256().equals(jdk.inputSha256()), "manifest identity or schema differs");
         Path root = directory(sourceRoot);
         var fileMap = new EnumMap<BenchmarkReturnWorkBudgetProfile.FileRole, FileFact>(BenchmarkReturnWorkBudgetProfile.FileRole.class);
@@ -102,6 +106,17 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
             Path path = root.resolve(source.path()).normalize(); require(path.startsWith(root), "source escapes registered root");
             actualSources.add(new Source(source.role(), source.path(), file(path, source.blob(), MAX_MEMBER_BYTES)));
         }
+        ProducerWriterBinding actualWriter = null;
+        if (helper.producerWriter() != null) {
+            var declaredWriter = helper.producerWriter(); Path writerRoot = directory(Path.of(declaredWriter.sourceRoot()));
+            require(!writerRoot.equals(root), "separate producer writer source root equals the root source tree");
+            var source = declaredWriter.source(); var compiledWriter = declaredWriter.compiled();
+            Blob actualSource = file(writerRoot.resolve(source.path()), source.blob(), MAX_MEMBER_BYTES);
+            Blob actualCompiled = file(Path.of(declaredWriter.compilerPath()), compiledWriter.blob(), MAX_MEMBER_BYTES);
+            actualWriter = new ProducerWriterBinding(Owner.PRODUCER, writerRoot.toString(),
+                    new Source(SourceRole.PDK_WRITER, source.path(), actualSource),
+                    new CompiledClass(SourceRole.PDK_WRITER, compiledWriter.binaryName(), actualCompiled));
+        }
         var compiled = new HashMap<String, CompiledClass>();
         for (var item : helper.classes()) {
             require(compiled.put(item.binaryName(), item) == null, "compiled member repeated");
@@ -112,7 +127,7 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
         var originKeys = new HashSet<String>(); var origins = new ArrayList<Origin>();
         var modules = new LinkedHashMap<String, List<Origin>>();
         for (var origin : helper.origins()) {
-            var item = compiled.get(origin.binaryName());
+            var item = compiledForOwner(compiled, origin.owner(), origin.binaryName(), helper.producerWriter());
             require(item != null && item.role() == origin.role() && item.blob().equals(origin.classBytes())
                     && origin.role().owners().contains(origin.owner()), "declared class source owner differs");
             require(originKeys.add(origin.owner().name() + ":" + origin.binaryName()), "declared owned origin repeated");
@@ -153,15 +168,16 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
             jdkFiles.add(new JdkFile(file.role(), file.path(), file(Path.of(file.path()), file.blob(), file.blob().bytes())));
         }
         var evidence = new LinkedHashMap<String, Object>();
-        evidence.put("schemaVersion", 1); evidence.put("state", "DECLARED_BYTE_FACTS_AUTHENTICATED");
-        evidence.put("manifestEncoding", "CANONICAL_ASCII_LENGTH_PREFIXED_V1"); evidence.put("requests", requests);
+        evidence.put("schemaVersion", helper.schemaVersion()); evidence.put("state", "DECLARED_BYTE_FACTS_AUTHENTICATED");
+        evidence.put("manifestEncoding", "CANONICAL_ASCII_LENGTH_PREFIXED_V" + helper.schemaVersion()); evidence.put("requests", requests);
         evidence.put("consumedBytes", consumedBytes); evidence.put("hashedBytes", hashBytes); evidence.put("zipEntries", zipEntries);
         evidence.put("scope", "DECLARED_SOURCE_CLASS_APPLICATION_ENTRY_JDK_AND_MANIFEST_BYTES_ONLY");
         evidence.put("runtimeOriginAuthenticationQualified", false); evidence.put("emittedMemberCompletenessQualified", false);
         evidence.put("runtimeInstructionBytesQualified", false); evidence.put("structuralWorkBudgetQualified", false);
         evidence.put("wholeMethodCostQualified", false); evidence.put("causalOverheadQualified", false);
         BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> evidence.put(flag, false));
-        return new Result(actualFiles, actualSources, helper.classes(), origins, jdkFiles, evidence);
+        if (actualWriter != null) { evidence.put("producerWriter", actualWriter.evidence()); }
+        return new Result(actualFiles, actualSources, helper.classes(), origins, jdkFiles, evidence, actualWriter);
     }
 
     private Blob file(Path path, Blob prior, long cap) throws IOException {
@@ -360,7 +376,7 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
         long predicates = Math.addExact(paths, Math.addExact(names, buffer));
         long roster = Math.addExact(BenchmarkReturnWorkBudgetProfile.FileRole.values().length, SourceRole.values().length);
         roster = Math.addExact(roster, Math.addExact(MAX_CLASSES, Math.multiplyExact(2L, MAX_CLASSES)));
-        roster = Math.addExact(roster, Math.addExact(JdkRole.values().length, Math.addExact(Math.multiplyExact(2L, MAX_CLASSES), 32)));
+        roster = Math.addExact(roster, Math.addExact(JdkRole.values().length, Math.addExact(Math.multiplyExact(2L, MAX_CLASSES), 35)));
         var bounds = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
         // The scalar branch allowance is separate from bounded caller-owned predicate/character visits.
         bounds.put(BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, new BenchmarkReturnWorkBudget.Work(
@@ -378,14 +394,19 @@ final class BenchmarkReturnWorkBudgetBindingsIo {
     }
 
     static byte[] helperBytes(HelperManifest helper) {
-        require(helper != null && helper.schemaVersion() == SCHEMA_VERSION, "helper schema differs"); var fields = new ArrayList<String>();
-        fields.add("HELPER_BINDINGS_V1"); fields.add(Integer.toString(helper.schemaVersion())); fields.add(helper.runId()); fields.add(helper.inputSha256());
+        require(supportedHelper(helper), "helper schema differs"); var fields = new ArrayList<String>();
+        fields.add("HELPER_BINDINGS_V" + helper.schemaVersion()); fields.add(Integer.toString(helper.schemaVersion())); fields.add(helper.runId()); fields.add(helper.inputSha256());
         fields.add(helper.buildId()); fields.add(helper.rootDefinitionId()); fields.add(helper.rootFormulaSha256()); fields.add(helper.producerFormulaSha256()); blobFields(fields, helper.failsafeXml());
         fields.add(Integer.toString(helper.failsafeClasspath().size())); fields.addAll(helper.failsafeClasspath());
         fields.add(Integer.toString(helper.sources().size()));
         for (var source : helper.sources()) { fields.add(source.role().name()); fields.add(source.path()); blobFields(fields, source.blob()); }
         fields.add(Integer.toString(helper.classes().size()));
         for (var item : helper.classes()) { fields.add(item.role().name()); fields.add(item.binaryName()); blobFields(fields, item.blob()); }
+        if (helper.producerWriter() != null) {
+            var writer = helper.producerWriter(); fields.add("1"); fields.add(writer.owner().name()); fields.add(writer.sourceRoot());
+            fields.add(writer.source().role().name()); fields.add(writer.source().path()); blobFields(fields, writer.source().blob());
+            fields.add(writer.compiled().role().name()); fields.add(writer.compiled().binaryName()); blobFields(fields, writer.compiled().blob());
+        }
         fields.add(Integer.toString(helper.origins().size()));
         for (var origin : helper.origins()) {
             fields.add(origin.owner().name()); fields.add(origin.role().name()); fields.add(origin.binaryName()); fields.add(origin.container()); fields.add(origin.entry());
