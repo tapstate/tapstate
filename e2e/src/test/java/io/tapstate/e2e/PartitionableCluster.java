@@ -46,6 +46,11 @@ final class PartitionableCluster implements AutoCloseable {
     /** All required bootstrap processes are launched before this readiness budget starts. */
     private static final Duration HEALTH_BUDGET = Duration.ofSeconds(120);
 
+    // These owned JVMs discover healed native peers promptly; the actual merge and admission remain required.
+    private static final List<String> MERGE_DISCOVERY_JVM_OPTIONS = List.of(
+            "-Dhazelcast.merge.first.run.delay.seconds=5",
+            "-Dhazelcast.merge.next.run.delay.seconds=5");
+
     /**
      * Ports per member for dialling out. They are used in turn and one still in its close-wait is
      * skipped, so this is far wider than the handful of connections a member of this size holds.
@@ -148,7 +153,7 @@ final class PartitionableCluster implements AutoCloseable {
             }
             for (String nodeId : nodeIds) {
                 servers.put(nodeId,
-                        RealProcessServer.launching(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
+                        RealProcessServer.launchingInJvm(storeUri, "0.0.0.0", MERGE_DISCOVERY_JVM_OPTIONS, launchArguments.get(nodeId)));
             }
         } catch (RuntimeException | Error failure) {
             closeAfterFailure(servers.values(), failure);
@@ -323,7 +328,8 @@ final class PartitionableCluster implements AutoCloseable {
         String known = requireStopped(nodeId);
         servers.get(known).close();
         RealProcessServer replacement =
-                RealProcessServer.start(storeUri, "0.0.0.0", withProfileInputs(launchArguments.get(known), profileInputs));
+                RealProcessServer.startInJvm(storeUri, "0.0.0.0", MERGE_DISCOVERY_JVM_OPTIONS,
+                        withProfileInputs(launchArguments.get(known), profileInputs));
         servers.put(known, replacement);
         remember(known, replacement);
         ControlPlane plane = new ControlPlane(replacement.baseUrl());
@@ -348,7 +354,8 @@ final class PartitionableCluster implements AutoCloseable {
         Map<String, RealProcessServer> launched = new LinkedHashMap<>();
         try {
             for (String node : nodeIds) {
-                RealProcessServer replacement = RealProcessServer.launching(storeUri, "0.0.0.0", arguments.get(node));
+                RealProcessServer replacement = RealProcessServer.launchingInJvm(storeUri, "0.0.0.0",
+                        MERGE_DISCOVERY_JVM_OPTIONS, arguments.get(node));
                 launched.put(node, replacement);
                 servers.put(node, replacement);
                 remember(node, replacement);
@@ -393,7 +400,7 @@ final class PartitionableCluster implements AutoCloseable {
     RealProcessServer launchCandidate(String nodeId, Map<String, String> profileInputs) {
         String known = requireStopped(nodeId);
         servers.get(known).close();
-        RealProcessServer candidate = RealProcessServer.launching(storeUri, "0.0.0.0",
+        RealProcessServer candidate = RealProcessServer.launchingInJvm(storeUri, "0.0.0.0", MERGE_DISCOVERY_JVM_OPTIONS,
                 withProfileInputs(launchArguments.get(known), profileInputs));
         servers.put(known, candidate);
         remember(known, candidate);

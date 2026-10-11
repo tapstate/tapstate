@@ -771,7 +771,15 @@ class RecoveryPausesBelowQuorumAndResumesTheSameQueueIT {
             hold.remaining(WATCH);
             checked(hold, () -> { trace.drain(changes); return true; });
             checked(hold, () -> { assertCommitted(store, cluster.clusterId(), profile); return true; });
-            assertThat(checked(hold, () -> alone.clusterRecovery(READ_BOUND)).quorumReady()).isFalse();
+            ClusterRecoveryView recovery = checked(hold, () -> alone.clusterRecovery(READ_BOUND));
+            assertThat(recovery.quorumReady()).isFalse();
+            assertThat(recovery.items()).extracting(ClusterRecoveryItemView::pipelineId)
+                    .containsExactlyInAnyOrderElementsOf(lanes.stream().map(Lane::pipeline).toList());
+            assertThat(recovery.items()).hasSize(lanes.size()).allSatisfy(item -> {
+                assertThat(item.persistedStatus()).isNotIn("REBUILD_FAILED", "RECOVERED", "CANCELLED");
+                assertThat(item.status()).as("nonterminal recovery item %s reports its below-quorum wait", item.pipelineId())
+                        .isEqualTo("WAITING_QUORUM");
+            });
             nativeReaders.assertInventory(originalJobs, hold);
             assertThat(nativeReaders.singletons()).isTrue();
             assertUnallocated(store, cluster.clusterId(), lanes, originals, hold);

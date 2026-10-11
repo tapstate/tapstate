@@ -228,6 +228,19 @@ final class RealProcessServer implements ServerHandle {
                 jvmOptions, null, port -> List.of()));
     }
 
+    /** Launches a cluster listener with explicit JVM options through the existing owned process path. */
+    static RealProcessServer launchingInJvm(String storeUri, String listenAddress, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
+                jvmOptions, null, extraArguments);
+    }
+
+    /** The same launch, retaining the existing health and failed-start cleanup behavior. */
+    static RealProcessServer startInJvm(String storeUri, String listenAddress, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return healthy(launchingInJvm(storeUri, listenAddress, jvmOptions, extraArguments));
+    }
+
     /**
      * Returns the launch once its health probe answers, and ends it otherwise.
      *
