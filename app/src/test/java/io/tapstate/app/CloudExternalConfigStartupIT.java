@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.testsupport.MongoHandshakeGate;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.client.MongoClients;

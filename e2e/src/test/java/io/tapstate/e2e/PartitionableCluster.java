@@ -396,6 +396,16 @@ final class PartitionableCluster implements AutoCloseable {
         }
     }
 
+    /** Prepares a separately owned candidate without replacing or stopping an original process. */
+    RealProcessServer prepareCandidate(String nodeId, Map<String, String> profileInputs, String candidateStoreUri) {
+        String known = requireKnown(nodeId);
+        if (!servers.get(known).isAlive()) throw new AssertionError("The original process is not alive during candidate preparation");
+        RealProcessServer candidate = RealProcessServer.launchingInJvm(candidateStoreUri, "0.0.0.0", MERGE_DISCOVERY_JVM_OPTIONS,
+                withProfileInputs(launchArguments.get(known), profileInputs));
+        remember(known + "-prepared-candidate", candidate);
+        return candidate;
+    }
+
     /** Starts a stopped candidate without waiting for health, so a pre-join refusal can be observed. */
     RealProcessServer launchCandidate(String nodeId, Map<String, String> profileInputs) {
         String known = requireStopped(nodeId);

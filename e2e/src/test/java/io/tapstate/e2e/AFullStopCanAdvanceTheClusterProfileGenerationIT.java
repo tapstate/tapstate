@@ -3,17 +3,20 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.changestream.OperationType;
+import com.mongodb.connection.ClusterConnectionMode;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.control.core.ClusterMemberState;
 import io.tapstate.control.core.ClusterMemberView;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.testsupport.MongoHandshakeGate;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -65,30 +68,63 @@ class AFullStopCanAdvanceTheClusterProfileGenerationIT {
                             .maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor()) {
                 try {
                     drain(changes, cluster.clusterId(), generationChanges, witness);
-                    witness.snapshot("before-kill");
-                    cluster.killAll();
-                    witness.snapshot("after-kill");
-                    assertThat(NODES).allSatisfy(node -> assertThat(cluster.isAlive(node)).isFalse());
-                    assertThat(liveSessions(store, cluster.clusterId())).isPositive();
-                    witness.snapshot("before-early-launch");
-                    RealProcessServer early = cluster.launchCandidate(NODES.getFirst(), NEXT);
-                    witness.candidate(early);
-                    witness.snapshot("after-early-launch");
-                    Await.until("a mixed profile to be refused while old node authority remains", BOUND,
-                            () -> {
+                    long negativeDeadline = System.nanoTime() + BOUND.toNanos();
+                    ConnectionString upstream = new ConnectionString(uri);
+                    assertThat(upstream.getHosts()).hasSize(1);
+                    assertThat(MongoClientSettings.builder().applyConnectionString(upstream).build()
+                            .getClusterSettings().getMode()).isEqualTo(ClusterConnectionMode.SINGLE);
+                    String host = upstream.getHosts().getFirst();
+                    java.net.URI address = java.net.URI.create("mongodb://" + host);
+                    assertThat(address.getHost()).isIn("localhost", "127.0.0.1");
+                    assertThat(uri).startsWith("mongodb://" + host + "/");
+                    String collection = SystemCollections.CLUSTER_EXECUTION_PROFILES.on(store).getNamespace().getCollectionName();
+                    try (MongoHandshakeGate gate = MongoHandshakeGate.beforeProfileReservation("127.0.0.1", address.getPort(),
+                            upstream.getDatabase(), collection, cluster.clusterId())) {
+                        String candidateUri = "mongodb://127.0.0.1:" + gate.port() + uri.substring(("mongodb://" + host).length());
+                        witness.snapshot("before-early-launch");
+                        try (RealProcessServer early = cluster.prepareCandidate(NODES.getFirst(), NEXT, candidateUri)) {
+                            try {
+                                witness.candidate(early);
+                                witness.snapshot("after-early-launch");
+                                gate.awaitProfileReservation(negativeRemaining(negativeDeadline));
+                                witness.requestBoundary("reservation-request-held", gate);
+                                assertThat(gate.capturedProfileRequests()).isEqualTo(1);
+                                assertThat(gate.forwardedProfileRequests()).isZero();
+                                assertThat(early.isAlive()).isTrue();
+                                assertThat(liveSessions(store, cluster.clusterId())).isEqualTo(NODES.size());
+                                witness.snapshot("before-kill");
+                                cluster.killAll();
+                                witness.requestBoundary("after-kill-before-request-release", gate);
+                                assertThat(NODES).allSatisfy(node -> assertThat(cluster.isAlive(node)).isFalse());
+                                assertThat(gate.forwardedProfileRequests()).isZero();
+                                assertThat(liveSessions(store, cluster.clusterId())).isEqualTo(NODES.size());
+                                assertThat(SystemCollections.CLUSTER_EXECUTION_PROFILES.on(store).find(new Document("_id", cluster.clusterId())
+                                        .append("generation", generation).append("hash", hash)
+                                        .append("$expr", new Document("$gt", List.of("$authorizationUntil", "$$NOW")))).first()).isNotNull();
+                                assertThat(NODES).allSatisfy(node -> assertThat(nodeSession(store, cluster.clusterId(), node)
+                                        .getString("ownerBootId")).isEqualTo(oldBoots.get(node)));
+                                negativeRemaining(negativeDeadline);
+                                gate.release();
+                                Await.until("a mixed profile to be refused while old node authority remains", negativeRemaining(negativeDeadline),
+                                        () -> {
+                                            drain(changes, cluster.clusterId(), generationChanges, witness);
+                                            return !early.isAlive();
+                                        }, () -> "early candidate output:\n" + early.tail());
+                                negativeRemaining(negativeDeadline);
+                                witness.requestBoundary("early-candidate-returned", gate);
+                                assertThat(gate.forwardedProfileRequests()).isPositive();
+                                assertThat(early.exitValue()).isNotZero();
+                                assertThat(Files.readString(early.output())).contains("boot.execution-profile-incompatible")
+                                        .contains(hash).doesNotContain("boot.node-id-in-use");
+                                assertThat(liveSessions(store, cluster.clusterId()))
+                                        .as("the negative control still lies inside a real old lease window").isPositive();
+                                assertThat(profile(store, cluster.clusterId()).get("generation", Number.class).longValue()).isEqualTo(generation);
+                                assertThat(profile(store, cluster.clusterId()).getString("hash")).isEqualTo(hash);
                                 drain(changes, cluster.clusterId(), generationChanges, witness);
-                                return !early.isAlive();
-                            }, () -> "early candidate output:\n" + early.tail());
-                    witness.snapshot("early-candidate-returned");
-                    assertThat(early.exitValue()).isNotZero();
-                    assertThat(Files.readString(early.output())).contains("boot.execution-profile-incompatible")
-                            .contains(hash).doesNotContain("boot.node-id-in-use");
-                    assertThat(liveSessions(store, cluster.clusterId()))
-                            .as("the negative control still lies inside a real old lease window").isPositive();
-                    assertThat(profile(store, cluster.clusterId()).get("generation", Number.class).longValue()).isEqualTo(generation);
-                    assertThat(profile(store, cluster.clusterId()).getString("hash")).isEqualTo(hash);
-                    drain(changes, cluster.clusterId(), generationChanges, witness);
-                    assertThat(generationChanges).isEmpty();
+                                assertThat(generationChanges).isEmpty();
+                            } finally { gate.release(); }
+                        }
+                    }
 
                     Await.until("all old node sessions and their promised authorization horizon to expire on Mongo time", BOUND,
                             () -> liveSessions(store, cluster.clusterId()) == 0
@@ -161,6 +197,12 @@ class AFullStopCanAdvanceTheClusterProfileGenerationIT {
                 }
             }
         }
+    }
+
+    private static Duration negativeRemaining(long deadline) {
+        long remaining = deadline - System.nanoTime();
+        assertThat(remaining).as("preparation and refusal share the original negative-phase budget").isPositive();
+        return Duration.ofNanos(remaining);
     }
 
     /** The exact generation field mutation, rather than an update-lookup of whichever profile is current later. */
@@ -241,6 +283,12 @@ class AFullStopCanAdvanceTheClusterProfileGenerationIT {
                 snapshot.append("nodeSessionsUnknown", failed.getClass().getName());
             }
             snapshots.add(snapshot);
+        }
+
+        void requestBoundary(String phase, MongoHandshakeGate gate) {
+            snapshot(phase);
+            snapshots.getLast().append("capturedProfileRequests", gate.capturedProfileRequests())
+                    .append("forwardedProfileRequests", gate.forwardedProfileRequests());
         }
 
         void event(ChangeStreamDocument<Document> change) {
