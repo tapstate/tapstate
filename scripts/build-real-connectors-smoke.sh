@@ -187,6 +187,12 @@ help_prints_no_shell() {
   fi
 }
 
+# Maven is stubbed, so default cases use a fixture JDK rather than the host's JDK.
+# The JDK selection cases below supply their own versions and selectors.
+JAVA_HOME="$(make_jdk default-jdk17 17.0.12)"
+export JAVA_HOME
+unset TAPSTATE_CONNECTOR_JAVA_HOME
+
 echo "build-real-connectors cases:"
 
 fresh_checkout
