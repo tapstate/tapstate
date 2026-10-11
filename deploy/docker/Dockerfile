@@ -20,7 +20,7 @@
 # the build being verified. Copying into a directory keeps every match, so the step below can refuse
 # anything but exactly one. The stage shares the final base image, so it downloads nothing extra, and
 # none of its layers reach the shipped image.
-FROM eclipse-temurin:21-jre AS boot-jar
+FROM eclipse-temurin:21-jre-noble AS boot-jar
 COPY app/target/app-*-boot.jar /jars/
 RUN set -eu; \
     cd /jars; \
@@ -33,7 +33,9 @@ RUN set -eu; \
     fi; \
     mv "$1" tapstate.jar
 
-FROM eclipse-temurin:21-jre AS runtime-base
+# DB2 11.5 client tools require the libxml2.so.2 ABI. Keep the Ubuntu release
+# explicit: newer releases ship libxml2.so.16 instead.
+FROM eclipse-temurin:21-jre-noble AS runtime-base
 
 # Common OCI self-description. Only the public server target associates its package with the
 # public source repository; the Cloud target retains independent package metadata.
@@ -44,9 +46,11 @@ LABEL org.opencontainers.image.title="Tapstate server" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Tapstate"
 
-# curl serves the container healthcheck and leaves a way to inspect the running server from inside.
+# curl serves the container healthcheck. DB2 client tools need libxml2.so.2;
+# the JNI bridge and the DB2 client share the system C++ runtime. Install these
+# system-wide because DB2 scripts clear LD_LIBRARY_PATH before invoking tools.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends curl libxml2 libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
 
 # A fixed, unprivileged uid: the server needs no root capability, and a numeric id keeps the
