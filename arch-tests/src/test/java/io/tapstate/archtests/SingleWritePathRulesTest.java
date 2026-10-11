@@ -6,15 +6,19 @@ import com.tngtech.archunit.core.domain.JavaMethodCall;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.PendingPipelineResume;
 import io.tapstate.spi.store.StateStore;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * The pipeline lifecycle has a single write path on each side of the desired/actual split, and this
@@ -38,9 +42,30 @@ class SingleWritePathRulesTest {
                 @Override
                 public boolean test(JavaMethodCall call) {
                     return call.getTargetOwner().isAssignableTo(StateStore.class)
-                            && (call.getName().equals("compareAndSwap") || call.getName().equals("create"));
+                            && (call.getName().equals("compareAndSwap") || call.getName().equals("create"))
+                            && !isCanonicalStateCasForwarding(call);
                 }
             };
+
+    /** Only the two canonical CAS overloads may forward within the same store owner. */
+    private static boolean isCanonicalStateCasForwarding(JavaMethodCall call) {
+        if (!call.getOriginOwner().isAssignableTo(StateStore.class)
+                || !call.getOriginOwner().equals(call.getTargetOwner())
+                || !call.getOrigin().getName().equals("compareAndSwap")
+                || !call.getName().equals("compareAndSwap")) {
+            return false;
+        }
+        List<String> origin = call.getOrigin().getRawParameterTypes().stream()
+                .map(type -> type.getName()).toList();
+        List<String> target = call.getTarget().getRawParameterTypes().stream()
+                .map(type -> type.getName()).toList();
+        List<String> plain = List.of(String.class.getName(), long.class.getName(), String.class.getName(),
+                Instant.class.getName());
+        List<String> withResume = List.of(String.class.getName(), long.class.getName(), String.class.getName(),
+                Instant.class.getName(), PendingPipelineResume.class.getName());
+        return (origin.equals(plain) && target.equals(withResume))
+                || (origin.equals(withResume) && target.equals(plain));
+    }
 
     /** A call that runs a system-data changeset: {@code ChangeSet.up}. */
     private static final DescribedPredicate<JavaMethodCall> RUNS_A_CHANGESET =
@@ -77,6 +102,60 @@ class SingleWritePathRulesTest {
     }
 
     @Test
+    void canonicalCasOverloadForwardingIsNotAnIndependentStateWriter() {
+        JavaClasses fixtures = new ClassFileImporter().importClasses(StateStore.class, CanonicalCasForwarder.class);
+        List<JavaMethodCall> calls = fixtures.stream()
+                .flatMap(type -> type.getMethodCallsFromSelf().stream())
+                .filter(call -> call.getName().equals("compareAndSwap"))
+                .toList();
+
+        assertThat(calls).hasSize(2);
+        assertThat(calls).extracting(call -> call.getOrigin().getRawParameterTypes().size())
+                .containsExactlyInAnyOrder(4, 5);
+        assertThat(calls).allSatisfy(call -> {
+            assertThat(isCanonicalStateCasForwarding(call)).isTrue();
+            assertThat(WRITES_ACTUAL_STATE.test(call)).isFalse();
+        });
+    }
+
+    @Test
+    void anExternalCallerAndANonCasStoreMethodStillFailTheWriterRule() {
+        JavaClasses fixtures = new ClassFileImporter().importClasses(
+                RogueStateWriter.class, NonCasStoreWriter.class, StateStore.class);
+        List<JavaMethodCall> writes = stateWrites(fixtures);
+
+        assertThat(writes).hasSize(3);
+        assertThat(writes).extracting(call -> call.getName())
+                .containsExactlyInAnyOrder("compareAndSwap", "create", "compareAndSwap");
+        assertThat(writes).allSatisfy(call -> assertThat(isCanonicalStateCasForwarding(call)).isFalse());
+        Throwable refused = catchThrowable(() -> assertSingleWriter(fixtures, WRITES_ACTUAL_STATE,
+                List.of("io.tapstate.runtime.scheduler.", MIGRATION_PACKAGE), "fixture writers must remain forbidden"));
+        assertThat(refused).isInstanceOf(AssertionError.class)
+                .hasMessageContaining(RogueStateWriter.class.getName())
+                .hasMessageContaining(NonCasStoreWriter.class.getName());
+    }
+
+    @Test
+    void malformedAndCrossOwnerCasForwardsStillFailTheWriterRule() {
+        JavaClasses fixtures = new ClassFileImporter().importClasses(
+                MalformedCasForwarder.class, CrossOwnerCasForwarder.class, StateStore.class);
+        List<JavaMethodCall> writes = stateWrites(fixtures);
+
+        assertThat(writes).hasSize(3);
+        assertThat(writes).allSatisfy(call -> assertThat(isCanonicalStateCasForwarding(call)).isFalse());
+        Throwable refused = catchThrowable(() -> assertSingleWriter(fixtures, WRITES_ACTUAL_STATE,
+                List.of("io.tapstate.runtime.scheduler.", MIGRATION_PACKAGE), "noncanonical forwards must remain forbidden"));
+        assertThat(refused).isInstanceOf(AssertionError.class)
+                .hasMessageContaining(MalformedCasForwarder.class.getName())
+                .hasMessageContaining(CrossOwnerCasForwarder.class.getName());
+    }
+
+    private static List<JavaMethodCall> stateWrites(JavaClasses imported) {
+        return imported.stream().flatMap(type -> type.getMethodCallsFromSelf().stream())
+                .filter(WRITES_ACTUAL_STATE::test).toList();
+    }
+
+    @Test
     @DisplayName("actual pipeline state is written only by the runtime converge loop, or a changeset")
     void actualStateIsWrittenOnlyByTheConvergeLoop() {
         assertSingleWriter(WRITES_ACTUAL_STATE,
@@ -107,7 +186,12 @@ class SingleWritePathRulesTest {
      */
     private static void assertSingleWriter(
             DescribedPredicate<JavaMethodCall> writes, List<String> allowedPrefixes, String because) {
-        List<JavaMethodCall> writeCalls = tapstateClasses.stream()
+        assertSingleWriter(tapstateClasses, writes, allowedPrefixes, because);
+    }
+
+    private static void assertSingleWriter(JavaClasses imported,
+            DescribedPredicate<JavaMethodCall> writes, List<String> allowedPrefixes, String because) {
+        List<JavaMethodCall> writeCalls = imported.stream()
                 .flatMap(type -> type.getMethodCallsFromSelf().stream())
                 .filter(writes::test)
                 .toList();
@@ -117,5 +201,59 @@ class SingleWritePathRulesTest {
         assertThat(writeCalls).allSatisfy(call -> assertThat(allowedPrefixes)
                 .as("%s; no second writer may call it (called from %s)", because, call.getOriginOwner().getName())
                 .anySatisfy(prefix -> assertThat(call.getOriginOwner().getName()).startsWith(prefix)));
+    }
+
+    private abstract static class CanonicalCasForwarder implements StateStore {
+        @Override
+        public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String stateJson, Instant touchTime) {
+            return compareAndSwap(pipelineId, expectedEpoch, stateJson, touchTime, null);
+        }
+
+        @Override
+        public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String stateJson, Instant touchTime,
+                PendingPipelineResume pendingResume) {
+            return new CasOutcome.Fenced(expectedEpoch);
+        }
+    }
+
+    private static final class RogueStateWriter {
+        CasOutcome change(StateStore store, String pipelineId, long expectedEpoch, String stateJson, Instant touchTime) {
+            return store.compareAndSwap(pipelineId, expectedEpoch, stateJson, touchTime);
+        }
+
+        void seed(StateStore store, String pipelineId, String stateJson, Instant touchTime) {
+            store.create(pipelineId, stateJson, touchTime);
+        }
+    }
+
+    private abstract static class NonCasStoreWriter implements StateStore {
+        CasOutcome outsideCas(String pipelineId, long expectedEpoch, String stateJson, Instant touchTime) {
+            return compareAndSwap(pipelineId, expectedEpoch, stateJson, touchTime, null);
+        }
+    }
+
+    private abstract static class MalformedCasForwarder implements StateStore {
+        @Override
+        public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String stateJson, Instant touchTime) {
+            return compareAndSwap(pipelineId, expectedEpoch, stateJson, touchTime, (Object) null);
+        }
+
+        public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String stateJson, Instant touchTime,
+                Object pendingResume) {
+            return compareAndSwap(pipelineId, expectedEpoch, stateJson, touchTime);
+        }
+    }
+
+    private abstract static class CrossOwnerCasForwarder implements StateStore {
+        private final StateStore delegate;
+
+        CrossOwnerCasForwarder(StateStore delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String stateJson, Instant touchTime) {
+            return delegate.compareAndSwap(pipelineId, expectedEpoch, stateJson, touchTime, null);
+        }
     }
 }
