@@ -265,6 +265,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 if (item == null || item.permit() == null) { return Optional.empty(); }
                 if (item.hasAllocatedSuccessor() && item.successor().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(expected))
                         && item.successor().submittedAt() == null) { return Optional.of(expected); }
+                if (!joinedNativeMembersMatch(nodes, admitted.profile())) { return Optional.empty(); }
                 var advanced = stores.clusterRecovery().advanceExecution(fence(item), expected, nodes,
                         admitted.facts().selectedSourceIds()).advancedPipelineClaim();
                 if (advanced != null) { forgetFailure(pipelineId); }
@@ -276,6 +277,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                         && reservation.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(expected))
                         && reservation.nativeJobId() == null ? Optional.ofNullable(adopted == null ? expected : adopted) : Optional.empty();
             }
+            if (!joinedNativeMembersMatch(nodes, admitted.profile())) { return Optional.empty(); }
             ClusterCapacityStore.Result advanced = stores.clusterCapacity().advanceExecution(reservation, expected, nodes);
             if (advanced.reservation() != null) {
                 allocations.put(pipelineId, new Allocation(admitted.facts(), admitted.profile(), admitted.key(),
@@ -954,6 +956,53 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
             if (!requested.isEmpty()) { return Map.copyOf(requested); }
         }
         return item(pipeline).map(value -> value.event().resumePositions()).orElse(Map.of());
+    }
+
+    /** A new allocation requires joined store evidence for the full actual native member set. */
+    private boolean joinedNativeMembersMatch(Set<String> plannedNodes, ClusterExecutionProfile expectedProfile) {
+        ClusterExecutionProfile currentProfile = stores.clusterProfiles().profile(properties.getId()).orElse(null);
+        if (!expectedProfile.equals(currentProfile)) { return false; }
+        Map<String, ClusterExecutionMember> observed = new LinkedHashMap<>();
+        Map<String, String> addresses = new LinkedHashMap<>();
+        Set<String> uuids = new java.util.HashSet<>();
+        for (var peer : member.getCluster().getMembers()) {
+            if (peer.isLiteMember()) { return false; }
+            String node = peer.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE);
+            String boot = peer.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE);
+            var uuid = peer.getUuid();
+            var address = peer.getAddress();
+            if (node == null || node.isBlank() || boot == null || boot.isBlank() || uuid == null || address == null
+                    || !Long.toString(currentProfile.generation()).equals(peer.getAttribute(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE))
+                    || !currentProfile.profile().hash().equals(peer.getAttribute(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE))) {
+                return false;
+            }
+            if (!uuids.add(uuid.toString()) || observed.putIfAbsent(node, new ClusterExecutionMember(node, boot, uuid.toString())) != null) {
+                return false;
+            }
+            addresses.put(node, address.toString());
+        }
+        if (observed.isEmpty() || !observed.keySet().equals(plannedNodes)) { return false; }
+        List<ClusterNodeReading> readings = stores.clusterProfiles().nodes(properties.getId());
+        if (readings == null || readings.stream().anyMatch(Objects::isNull)) { return false; }
+        for (var nativeMember : observed.values()) {
+            List<ClusterNodeReading> matches = readings.stream().filter(reading ->
+                    nativeMember.nodeId().equals(reading.registration().nodeSession().key().resourceId())).toList();
+            if (matches.size() != 1) { return false; }
+            ClusterNodeReading reading = matches.getFirst();
+            ClusterNodeRegistration joined = reading.registration();
+            WorkloadClaim session = joined.nodeSession();
+            if (!reading.leased() || !joined.joined() || !joined.profile().equals(currentProfile)
+                    || session.key().type() != WorkloadClaimType.NODE_SESSION
+                    || !session.key().clusterId().equals(properties.getId())
+                    || !session.owner().nodeId().equals(nativeMember.nodeId())
+                    || !session.owner().bootId().equals(nativeMember.bootId())
+                    || session.profileGeneration() != currentProfile.generation()
+                    || !nativeMember.memberUuid().equals(joined.memberUuid())
+                    || !addresses.get(nativeMember.nodeId()).equals(joined.memberAddress())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private Map<String, ClusterExecutionMember> liveMembers() {

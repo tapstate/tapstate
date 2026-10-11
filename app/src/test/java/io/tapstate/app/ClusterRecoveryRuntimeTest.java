@@ -56,6 +56,7 @@ class ClusterRecoveryRuntimeTest {
     private final ClusterCapacityDemand demand = new ClusterCapacityDemand(1, 0, 1, 2, 4, 5);
     private final WorkloadClaim initial = claim(0);
     private Cluster cluster;
+    private List<ClusterNodeReading> registeredNodes;
     private ClusterRecoveryRuntime runtime;
 
     @BeforeEach void setup() {
@@ -87,6 +88,8 @@ class ClusterRecoveryRuntimeTest {
         when(capacity.recordExecutionSources(any(), any(), anySet())).thenAnswer(call ->
                 new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.APPLIED, call.getArgument(0), null, List.of()));
         when(profiles.profile("cluster")).thenReturn(Optional.of(profile));
+        registeredNodes = nodeReadings(ORIGINAL_MEMBERS);
+        when(profiles.nodes("cluster")).thenAnswer(call -> registeredNodes);
         when(artifacts.identity("p")).thenReturn(Optional.of(new ArtifactIdentity("p", "inc", "a".repeat(64))));
         when(desired.read("p")).thenReturn(Optional.of(new DesiredState("p", PipelineState.RUNNING, "a".repeat(64))));
         when(recovery.read(any())).thenReturn(Optional.empty());
@@ -202,6 +205,98 @@ class ClusterRecoveryRuntimeTest {
         assertThat(runtime.prepare("p", planned, ownership)).isTrue();
         assertThat(runtime.begin("p", planned, ownership).fence().executionGeneration()).isEqualTo(1);
         verify(capacity).advanceExecution(reservation, initial, NODES);
+    }
+
+    @Test void aNewExecutionWaitsForTheCurrentNativeUuidToHaveJoinedStoreProof() {
+        List<ClusterNodeReading> beforeMerge = registeredNodes;
+        Map<String, ClusterExecutionMember> afterMerge = new HashMap<>(ORIGINAL_MEMBERS);
+        var previous = ORIGINAL_MEMBERS.get("c");
+        afterMerge.put("c", new ClusterExecutionMember("c", previous.bootId(), "00000000-0000-4000-8000-000000000009"));
+        useLiveMembers(afterMerge);
+        assertThat(registeredNodes).isSameAs(beforeMerge);
+        assertThat(beforeMerge.stream().filter(row -> row.registration().nodeSession().key().resourceId().equals("c"))
+                .findFirst().orElseThrow().registration().memberUuid()).isEqualTo(previous.memberUuid());
+        ClusterCapacityReservation reserved = reserveOrdinaryForJoinProof();
+        when(capacity.advanceExecution(reserved, initial, NODES)).thenAnswer(call -> {
+            Map<String, ClusterExecutionMember> copiedRegistry = registeredNodes.stream().collect(java.util.stream.Collectors.toMap(
+                    row -> row.registration().nodeSession().key().resourceId(), row -> new ClusterExecutionMember(
+                            row.registration().nodeSession().key().resourceId(), row.registration().nodeSession().owner().bootId(),
+                            row.registration().memberUuid())));
+            WorkloadClaim advanced = allocatedClaim(1, copiedRegistry);
+            return new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.APPLIED, reservation(1L, advanced), advanced, List.of());
+        });
+        DagSource.PlannedStart planned = plan(List.of());
+        assertThat(runtime.prepare("p", planned, ownership)).isTrue();
+
+        assertThat(runtime.begin("p", planned, ownership).allowed())
+                .as("a stable id and boot do not prove that the current native UUID has joined the store")
+                .isFalse();
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+        assertThat(ownership.currentClaim("p").orElseThrow().executionGeneration()).isZero();
+        assertNoNativeSubmission();
+
+        registeredNodes = nodeReadings(afterMerge);
+        PipelineActuationOwnership.Execution issued = runtime.begin("p", planned, ownership);
+
+        assertThat(issued.allowed()).isTrue();
+        assertThat(issued.fence().executionGeneration()).isEqualTo(1);
+        assertThat(ownership.currentClaim("p").orElseThrow().executionMembers()).isEqualTo(afterMerge);
+        verify(capacity, times(1)).advanceExecution(reserved, initial, NODES);
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        assertNoNativeSubmission();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+            "missing", "foreign", "unleased", "unjoined", "profile-generation", "profile-hash", "address"})
+    void anIncompleteOrMismatchedRegistryCannotReachTheIssuer(String mismatch) {
+        var rows = new java.util.ArrayList<>(registeredNodes);
+        ClusterNodeReading old = rows.stream().filter(row -> row.registration().nodeSession().key().resourceId().equals("c"))
+                .findFirst().orElseThrow();
+        rows.remove(old);
+        ClusterNodeRegistration joined = old.registration();
+        WorkloadClaim session = joined.nodeSession();
+        ClusterNodeReading replacement = switch (mismatch) {
+            case "missing" -> null;
+            case "foreign" -> new ClusterNodeReading(new ClusterNodeRegistration(
+                    nodeSession("foreign", "c", session.owner().bootId(), 2),
+                    new ClusterExecutionProfile("foreign", 2, profile.profile()), joined.controlUrl(), true,
+                    joined.memberUuid(), joined.memberAddress(), joined.joinedAt()), old.leaseRemaining());
+            case "unleased" -> new ClusterNodeReading(joined, Duration.ZERO);
+            case "unjoined" -> new ClusterNodeReading(new ClusterNodeRegistration(session, profile, joined.controlUrl(),
+                    false, null, null, null), old.leaseRemaining());
+            case "profile-generation" -> new ClusterNodeReading(new ClusterNodeRegistration(
+                    nodeSession("cluster", "c", session.owner().bootId(), 3),
+                    new ClusterExecutionProfile("cluster", 3, profile.profile()), joined.controlUrl(), true,
+                    joined.memberUuid(), joined.memberAddress(), joined.joinedAt()), old.leaseRemaining());
+            case "profile-hash" -> new ClusterNodeReading(new ClusterNodeRegistration(session,
+                    new ClusterExecutionProfile("cluster", 2, new ExecutionProfile(1, Map.of("runtime", "foreign"))),
+                    joined.controlUrl(), true, joined.memberUuid(), joined.memberAddress(), joined.joinedAt()), old.leaseRemaining());
+            case "address" -> new ClusterNodeReading(new ClusterNodeRegistration(session, profile, joined.controlUrl(), true,
+                    joined.memberUuid(), "different-member-address", joined.joinedAt()), old.leaseRemaining());
+            default -> throw new IllegalStateException("unexpected registry mismatch");
+        };
+        if (replacement != null) { rows.add(replacement); }
+        registeredNodes = List.copyOf(rows);
+        ClusterCapacityReservation reserved = reserveOrdinaryForJoinProof();
+        when(capacity.advanceExecution(reserved, initial, NODES)).thenReturn(
+                new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.WAITING_QUORUM, reserved, null, List.of()));
+        DagSource.PlannedStart planned = plan(List.of());
+        assertThat(runtime.prepare("p", planned, ownership)).isTrue();
+
+        assertThat(runtime.begin("p", planned, ownership).allowed()).isFalse();
+
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        assertThat(ownership.currentClaim("p").orElseThrow().executionGeneration()).isZero();
+        assertNoNativeSubmission();
+    }
+
+    private ClusterCapacityReservation reserveOrdinaryForJoinProof() {
+        ClusterCapacityReservation reserved = reservation(null, initial);
+        when(capacity.reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any())).thenReturn(
+                new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.APPLIED, reserved, null, List.of()));
+        return reserved;
     }
 
     @Test void aPendingOrdinaryAllocationContinuesAfterOnlyAcquisitionTopologyRefresh() {
@@ -909,9 +1004,26 @@ class ClusterRecoveryRuntimeTest {
             when(peer.getAttribute(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE)).thenReturn("2");
             when(peer.getAttribute(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE)).thenReturn(profile.profile().hash());
             when(peer.getUuid()).thenReturn(UUID.fromString(identity.memberUuid()));
+            when(peer.getAddress()).thenReturn(nativeAddress(identity.nodeId()));
             return peer;
         }).collect(java.util.stream.Collectors.toSet());
         when(cluster.getMembers()).thenReturn(peers);
+    }
+
+    private List<ClusterNodeReading> nodeReadings(Map<String, ClusterExecutionMember> identities) {
+        return identities.values().stream().map(identity -> new ClusterNodeReading(new ClusterNodeRegistration(
+                nodeSession("cluster", identity.nodeId(), identity.bootId(), profile.generation()), profile,
+                java.net.URI.create("http://" + identity.nodeId() + ":8080"), true, identity.memberUuid(),
+                nativeAddress(identity.nodeId()).toString(), NOW), Duration.ofSeconds(30))).toList();
+    }
+
+    private static WorkloadClaim nodeSession(String clusterId, String node, String boot, long generation) {
+        return new WorkloadClaim(new WorkloadClaimKey(clusterId, WorkloadClaimType.NODE_SESSION, node),
+                new WorkloadOwner(node, boot), 1, 0, 0, NOW.plusSeconds(60), 0, 0, Set.of(), 0, false, generation);
+    }
+
+    private static com.hazelcast.cluster.Address nativeAddress(String node) {
+        return new com.hazelcast.cluster.Address(java.net.InetAddress.getLoopbackAddress(), 5701 + node.charAt(0) - 'a');
     }
 
     private void assertReincarnatedCohort(TapstateException failure) {
