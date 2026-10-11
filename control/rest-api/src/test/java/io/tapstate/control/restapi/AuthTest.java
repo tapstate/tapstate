@@ -192,6 +192,31 @@ class AuthTest {
     }
 
     @Test
+    void sampleCatalogAndAsyncInstallationUseTheSharedAuthenticationAndScopeBoundary() {
+        for (String route : List.of("/api/sample-sources/catalog", "/api/sample-sources/installations/unknown")) {
+            ApiError anonymous = client().get().uri(route).exchange((request, response) -> {
+                assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                return response.bodyTo(ApiError.class);
+            });
+            assertThat(anonymous.code()).isEqualTo("control.unauthenticated");
+        }
+        String reader = machineToken(Scope.READ);
+        ResponseEntity<String> catalog = client().get().uri("/api/sample-sources/catalog")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + reader).retrieve().toEntity(String.class);
+        assertThat(catalog.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(catalog.getBody()).doesNotContain("password", "token", "config");
+
+        ApiError refused = client().post().uri("/api/sample-sources/installations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + reader).contentType(MediaType.APPLICATION_JSON)
+                .body("{\"ids\":[\"sample_core_banking\"]}").exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(refused.code()).isEqualTo("control.forbidden");
+        assertThat(refused.params()).containsEntry("op", "sample-source.install");
+    }
+
+    @Test
     void anInvalidCredentialIsUnauthorized() {
         ApiError body = client().get().uri("/api/artifacts")
                 .header("Authorization", "Bearer not-a-real-token")
