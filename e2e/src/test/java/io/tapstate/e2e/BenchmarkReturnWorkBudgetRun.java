@@ -41,6 +41,9 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     private BenchmarkReturnWorkBudgetBindingsIo.Result authenticated;
     private Map<String, Object> bindingEvidence = Map.of("state", "NOT_AUTHENTICATED");
     private Map<String, Object> classpathEvidence = Map.of("state", "NOT_READ");
+    private List<String> rootClasspath = List.of();
+    private List<ObservedOrigin> observedRootOrigins = List.of();
+    private Map<String, Object> rootOriginEvidence = Map.of("state", "NOT_OBSERVED");
     private final java.util.ArrayList<Map<String, Object>> producerClassMetadata = new java.util.ArrayList<>();
 
     private BenchmarkReturnWorkBudgetRun(BenchmarkReturnWorkBudgetProfile.Prepared profile,
@@ -236,6 +239,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
                 "manifest source definition differs");
         var actualClasspath = actualClasspath();
         require(helperManifest.failsafeClasspath().equals(actualClasspath), "current actual ordered classpath differs");
+        rootClasspath = actualClasspath;
         String home = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> System.getProperty("java.home"));
         String version = BenchmarkReturnWorkBudget.external(scope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, () -> System.getProperty("java.version"));
         require(home != null && version != null && (version.equals("21") || version.startsWith("21.")), "actual root JDK runtime is unavailable");
@@ -303,6 +307,28 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
     }
 
     Map<String, Object> bindingEvidence() { return bindingEvidence; }
+
+    void observeRootOrigins() throws IOException, ClassNotFoundException {
+        requireActive(); require(authenticated != null && observedRootOrigins.isEmpty(), "root origin observation is missing or repeated");
+        var entry = BenchmarkReturnWorkBudget.begin(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
+        try {
+            var expected = new BenchmarkReturnWorkBudgetBindings.Runtime(Owner.ROOT, profile.inputs().runId(), rootRuntime.pid(), rootRuntime.jvmStartTimeMillis(),
+                    jdkManifest.javaHome(), jdkManifest.javaVersion());
+            var observed = BenchmarkReturnRootOrigins.observeRoot(helperManifest, rootClasspath, expected, scope);
+            long declaredRoots = helperManifest.origins().stream().filter(origin -> origin.owner() == Owner.ROOT).count();
+            require(declaredRoots > 0 && observed.observedOrigins().size() == declaredRoots,
+                    "actual root origin roster differs from authenticated declarations");
+            observedRootOrigins = List.copyOf(observed.observedOrigins()); rootOriginEvidence = observed.evidence();
+            var evidence = new LinkedHashMap<String, Object>(bindingEvidence);
+            evidence.put("actualRootOrigins", rootOriginEvidence);
+            evidence.put("gaps", List.of("PRODUCER_LOADED_ORIGINS_BEYOND_CLOCK_NOT_OBSERVED", "EMITTED_MEMBER_COMPLETENESS_NOT_OBSERVED",
+                    "FRESH_FAILSAFE_XML_LIFECYCLE_NOT_INFERRED_FROM_DECLARED_DIGEST", "VM_TRANSFORMED_INSTRUCTION_BODY_NOT_CLAIMED"));
+            bindingEvidence = Map.copyOf(evidence);
+            BenchmarkReturnWorkBudget.done(entry);
+        } catch (IOException | ClassNotFoundException | RuntimeException | Error failure) {
+            BenchmarkReturnWorkBudget.failed(entry, failure); throw failure;
+        }
+    }
 
     /** Consumes already obtained cold metadata; it never queries the owned process or reads a clock. */
     void recordNativeClassMetadata(Map<String, Object> nativeEvidence) {
@@ -422,6 +448,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
 
     void afterExit(BenchmarkOwnedProcessReceipt actual) throws IOException {
         requireActive(); require(producerRegistration != null, "producer final receipt was never armed");
+        require(!observedRootOrigins.isEmpty(), "actual root class origins were not observed before services");
         require(producerClassMetadata.size() == 2, "actual before/after cold class metadata was not bound");
         var bound = BenchmarkReturnWorkBudgetProducerSeal.verifyAfterExit(producerBody, producerRegistration, actual);
         var arithmetic = BenchmarkReturnWorkBudgetProducerAllocations.evaluate(bound.body());
@@ -431,6 +458,7 @@ final class BenchmarkReturnWorkBudgetRun implements AutoCloseable {
         facts.put("bodySha256", bound.bodySha256()); facts.put("companionSha256", bound.companionSha256());
         facts.put("allocation", arithmetic); facts.put("captureCountPairing", "MATCHED_ORIGINAL_FULL_WIRE_RECEIPTS");
         facts.put("actualInputBindings", bindingEvidence); facts.put("producerClassMetadata", List.copyOf(producerClassMetadata));
+        facts.put("actualRootOrigins", rootOriginEvidence);
         facts.put("runtimeCoverageQualified", false);
         facts.put("structuralWorkBudgetQualified", false); facts.put("wholeMethodCostQualified", false);
         producerEvidence = Map.copyOf(facts);

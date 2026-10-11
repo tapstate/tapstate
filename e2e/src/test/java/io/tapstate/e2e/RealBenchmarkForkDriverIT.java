@@ -85,6 +85,7 @@ class RealBenchmarkForkDriverIT {
     private static void run(String workloadId) throws Exception {
         try (var work = BenchmarkReturnWorkBudgetRun.open(workloadId)) {
             try {
+                if (work != null) { work.observeRootOrigins(); }
                 runRegistered(workloadId, work);
                 if (work != null) { System.out.println("benchmark-return-work-final=" + JsonWriter.write(work.finish())); }
             } catch (Exception | Error failure) {
