@@ -214,6 +214,26 @@ class PipelineDraftServiceTest {
     }
 
     @Test
+    void previewsAndPublishesWizardJavaScriptAndUnwind() {
+        PipelineDraft template = draft(6, "alice", null, null, null, NOW, NOW);
+        PipelineDraft complete = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
+                template.revision(), template.mode(), template.name(), template.description(), null,
+                new PipelineDraft.Wizard(template.wizard().root(), List.of(), List.of(
+                        new PipelineDraft.Transform("script", "js", Map.of("script",
+                                "function process(record, ctx) { return record; }")),
+                        new PipelineDraft.Transform("expand", "unwind", Map.of("path", "items"))),
+                        template.wizard().output()), null, null, null, NOW, NOW, "alice");
+        store.seed(complete);
+
+        assertThat(service.preview("orders", 6).transforms()).extracting(io.tapstate.core.model.Step::id)
+                .containsExactly("script", "expand");
+        assertThat(service.publish("orders", 6, null, "alice").mutation())
+                .isEqualTo(PipelineDraftMutation.PUBLISHED);
+        assertThat(((PipelineResource) store.lastPublication.artifact()).transforms())
+                .extracting(io.tapstate.core.model.Step::id).containsExactly("script", "expand");
+    }
+
+    @Test
     void validationReasonKeepsReferenceLocationAndTarget() {
         assertThat(PipelineDraftService.validationReason(new ValidationDiagnostic(
                 "dsl.missing-reference", Map.of("path", "transforms[0].from", "ref", "missing-table"))))
