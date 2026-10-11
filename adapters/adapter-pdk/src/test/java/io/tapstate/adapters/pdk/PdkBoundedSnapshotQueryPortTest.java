@@ -28,6 +28,22 @@ import org.bson.BsonTimestamp;
 class PdkBoundedSnapshotQueryPortTest {
 
     @Test
+    void reusesAnInitializedConnectorForRepeatedPreviewReads(@TempDir Path dir) {
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.exactTupleQuerySource(dir)),
+                "synthetic.ExactTupleQuery", "2.0.8", null);
+        AtomicInteger resolutions = new AtomicInteger();
+        try (PdkBoundedSnapshotQueryPort port = new PdkBoundedSnapshotQueryPort(connectorId -> {
+            resolutions.incrementAndGet();
+            return ref;
+        })) {
+            assertThat(port.query(request(new AllRows(), 2)).rows()).hasSize(2);
+            assertThat(port.query(request(new AllRows(), 2)).rows()).hasSize(2);
+            assertThat(resolutions).hasValue(1);
+        }
+    }
+
+
+    @Test
     void exactCompositeTuplesAreQueriedSeparatelyAndNeverBecomeIndependentKeySets(@TempDir Path dir) {
         PdkBoundedSnapshotQueryPort port = port(Synthetic.exactTupleQuerySource(dir));
         Selection exact = new ExactTuples(List.of(

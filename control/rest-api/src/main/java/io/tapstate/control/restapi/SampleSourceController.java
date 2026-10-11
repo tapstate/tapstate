@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.SampleSourceService;
+import io.tapstate.control.core.SampleSourceCredentialsProvider;
 import java.util.List;
 import java.util.Objects;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -22,6 +23,12 @@ class SampleSourceController {
         return new SampleList(samples.available());
     }
 
+    @Verb("sample-source.list")
+    @GetMapping("/sample-sources/catalog")
+    Catalog catalog() {
+        return new Catalog(samples.catalog());
+    }
+
     @Verb("sample-source.install")
     @PostMapping("/sample-sources:install")
     SampleSourceService.Installation install() {
@@ -29,4 +36,5 @@ class SampleSourceController {
     }
 
     record SampleList(List<SampleSourceService.Descriptor> sources) { }
+    record Catalog(List<SampleSourceCredentialsProvider.Definition> sources) { }
 }

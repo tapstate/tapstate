@@ -15,6 +15,8 @@ import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineSnapshot;
 import io.tapstate.control.core.PipelineStatus;
@@ -551,23 +553,20 @@ class PipelineObservationApiTest {
 
         // Never applied is permanent: a caller that read this as the transient unconverged window would
         // wait out its whole bound on what is almost always a mistyped id.
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
-        assertThat(body.params()).containsEntry("pipeline", "ghost");
+        assertThat(body.code()).isEqualTo("pipeline.not-found");
+        assertThat(body.params()).containsEntry("id", "ghost");
     }
 
     @Test
-    void aReadOfAnAppliedPipelineThatHasNotConvergedYetIsNotFoundAsTheTransientWindow() {
+    void aReadOfAnAppliedPipelineWithoutObservationHasAnActionableStatus() {
         context.getBean(FakeObservationStore.class).clear();
 
-        ApiError body = client().get().uri("/api/pipelines/pl1/status")
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .exchange((request, response) -> {
-                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-                    return response.bodyTo(ApiError.class);
-                });
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
-        assertThat(body.code()).isEqualTo("monitor.no-observation");
-        assertThat(body.params()).containsEntry("pipeline", "pl1");
+        assertThat(body).containsEntry("pipelineId", "pl1").containsEntry("state", "NEW")
+                .containsEntry("hasArtifact", true);
     }
 
     // ---- the interceptor guards a read like any other verb ----
@@ -650,6 +649,14 @@ class PipelineObservationApiTest {
             ExecutionPlans plans = pipelineIds -> pipelineIds.contains("pl2") ? Map.of("pl2", PL_POS_PLAN) : Map.of();
             return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations,
                     plans, () -> List.of("m1", "m2", "m3", "m4"));
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(PipelineObservationQueryService observations,
+                FakeStoppedPipelines lifecycle) {
+            return new PipelineCatalogService(new ArtifactQueryService(appliedPipelines()),
+                    new PipelineDraftService(new PipelineApiTest.FakePipelineDraftStore()),
+                    lifecycle.desired(), observations);
         }
 
         @Bean

@@ -7,8 +7,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.BiConsumer;
 
-/** Installs the two configured demonstration databases only when a caller chooses the sample. */
+/** Installs selected demonstration databases only when a caller chooses them. */
 public final class SampleSourceService {
     public record Descriptor(String id, String name, String description, String connector) { }
     public record Installation(List<SourceView> added, List<String> existing) { }
@@ -34,10 +35,63 @@ public final class SampleSourceService {
     }
 
     public List<Descriptor> available() {
-        if (!credentialsProvider.available()) return List.of();
+        return catalog().stream().filter(SampleSourceCredentialsProvider.Definition::available)
+                .map(sample -> new Descriptor(sample.id(), sample.name(), sample.description(), sample.connector()))
+                .toList();
+    }
+
+    /** Catalog entries include unavailable future samples without exposing connection settings. */
+    public List<SampleSourceCredentialsProvider.Definition> catalog() {
         List<String> registered = connectors.summaries().stream().map(ConnectorSummary::id).toList();
-        return DESCRIPTORS.stream().allMatch(sample -> registered.contains(sample.connector()))
-                ? DESCRIPTORS : List.of();
+        return credentialsProvider.catalog().stream()
+                .map(item -> new SampleSourceCredentialsProvider.Definition(item.id(), item.name(),
+                        item.description(), item.connector(), item.available() && registered.contains(item.connector()),
+                        item.guidedDemo(), item.rootTable(), item.orderLineTable(), item.customerTable()))
+                .toList();
+    }
+
+    /** Installs one selected sample; the observer reports actual completed boundaries. */
+    public Installation installSelected(String principal, String id, BiConsumer<String, String> progress) {
+        SampleSourceCredentialsProvider.Definition definition = catalog().stream()
+                .filter(item -> item.id().equals(id) && item.available()).findFirst()
+                .orElseThrow(() -> new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "sample source is unavailable"), null));
+        Map<String, Object> config = credentialsProvider.settingsFor(id);
+        progress.accept(id, "TESTING");
+        ConnectionTestReport report = connections.test(id, definition.connector(), config, principal);
+        if (report.outcome() != ConnectionTestReport.Outcome.PASSED) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "sample database connection failed: " + id), null);
+        }
+        SourceView present = sources.list().stream().filter(source -> source.id().equals(id)).findFirst().orElse(null);
+        progress.accept(id, "CREATING");
+        SourceView created = null;
+        if (present != null) {
+            if (present.metadata() == null || !"true".equals(present.metadata().labels().get("sample"))
+                    || !definition.connector().equals(present.connector())) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "sample Source id is already used by another connection"), null);
+            }
+            Map<String, Object> refreshedConfig = new LinkedHashMap<>(present.config());
+            refreshedConfig.putAll(config);
+            List<SourceTableDraft> tables = present.tables() == null ? null : present.tables().stream()
+                    .map(table -> new SourceTableDraft(table.type(), table.name(), table.pattern(),
+                            table.filter(), table.pk(), table.options()))
+                    .toList();
+            SourceInput refreshed = new SourceInput(id, present.metadata(), definition.connector(),
+                    refreshedConfig, present.mode(), tables, present.options(), present.srs(),
+                    present.experimental(), List.of());
+            sources.replace(principal, id, present.contentHash(), refreshed);
+        } else {
+            SourceInput input = new SourceInput(id, new Metadata(Map.of("sample", "true"), definition.name()),
+                    definition.connector(), config, "snapshot", null, null, null, null, null);
+            created = sources.create(principal, input);
+        }
+        progress.accept(id, "DISCOVERING");
+        discovery.discover(id, definition.connector(), config, principal);
+        progress.accept(id, "READY");
+        return new Installation(created == null ? List.of() : List.of(created),
+                created == null ? List.of(id) : List.of());
     }
 
     public Installation install(String principal) {

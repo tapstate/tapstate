@@ -7,6 +7,7 @@ import io.tapstate.spi.capture.BoundedQueryCancellation;
 import io.tapstate.spi.capture.BoundedSnapshotQueryRequest;
 import io.tapstate.spi.capture.BoundedSnapshotQueryResult;
 import io.tapstate.spi.capture.FieldSchema;
+import io.tapstate.spi.store.ConnectionConfig;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.schema.TapField;
@@ -19,6 +20,7 @@ import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
 import io.tapdata.pdk.apis.functions.connector.target.QueryByAdvanceFilterFunction;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -26,12 +28,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /** PDK-backed finite reads for preview. It never falls back to an unbounded batch scan. */
-public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPort {
+public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPort, AutoCloseable {
 
     private final ConnectorProvisioner provisioner;
     private final Clock clock;
+    private final ConnectorInstancePool<PdkConnector> pool;
+    private final ScheduledExecutorService evictions;
 
     public PdkBoundedSnapshotQueryPort(ConnectorProvisioner provisioner) {
         this(provisioner, Clock.systemUTC());
@@ -40,6 +47,42 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
     PdkBoundedSnapshotQueryPort(ConnectorProvisioner provisioner, Clock clock) {
         this.provisioner = Objects.requireNonNull(provisioner, "provisioner");
         this.clock = Objects.requireNonNull(clock, "clock");
+        ConnectorInstancePool.Limits limits = new ConnectorInstancePool.Limits(
+                2, 8, Duration.ofSeconds(2), Duration.ofSeconds(42), Duration.ofMinutes(5));
+        this.pool = new ConnectorInstancePool<>(config -> {
+            PdkConnector connector = PdkConnector.open(
+                    config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
+            try {
+                connector.underLoader(() -> {
+                    connector.connector().init(connector.context());
+                    return null;
+                });
+                return connector;
+            } catch (Throwable failed) {
+                connector.stopQuietly();
+                connector.close();
+                if (failed instanceof Error error) throw error;
+                if (failed instanceof RuntimeException runtime) throw runtime;
+                throw new TapstateException(ConnectorError.DISCOVER_FAILED,
+                        Map.of("connector", config.connectorId(), "detail", "preview connector initialization failed"),
+                        null);
+            }
+        }, connector -> {
+            connector.stopQuietly();
+            connector.close();
+        }, limits, clock);
+        this.evictions = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "preview-connector-eviction");
+            thread.setDaemon(true);
+            return thread;
+        });
+        evictions.scheduleWithFixedDelay(pool::sweep, 150, 150, TimeUnit.SECONDS);
+    }
+
+    @Override
+    public void close() {
+        evictions.shutdownNow();
+        pool.close();
     }
 
     @Override
@@ -59,8 +102,13 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         Objects.requireNonNull(cancellation, "cancellation");
         cancellation.throwIfCancelled();
         ensureBeforeDeadline(request);
-        PdkConnector connector = PdkConnector.open(
-                request.connectorId(), provisioner.resolve(request.connectorId()), request.settings());
+        ConnectionConfig config = new ConnectionConfig(
+                request.sourceId(), request.connectorId(), request.settings());
+        return pool.call(config, connector -> queryWith(connector, request, cancellation), PdkConnector::isAlive);
+    }
+
+    private BoundedSnapshotQueryResult queryWith(PdkConnector connector,
+            BoundedSnapshotQueryRequest request, BoundedQueryCancellation cancellation) {
         BoundedQueryCancellation.Registration stopOnCancel = cancellation.onCancel(connector::stopQuietly);
         try {
             cancellation.throwIfCancelled();
@@ -120,15 +168,12 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                     !request.stableOrder().isEmpty(), queryCount[0], clock.instant());
         } finally {
             stopOnCancel.close();
-            connector.stopQuietly();
-            connector.close();
         }
     }
 
     private TapTable discover(PdkConnector connector, BoundedSnapshotQueryRequest request) {
         try {
             return connector.underLoader(() -> {
-                connector.connector().init(connector.context());
                 List<TapTable> discovered = new ArrayList<>();
                 connector.connector().discoverSchema(connector.context(),
                         List.of(request.table().name()), Integer.MAX_VALUE, discovered::addAll);

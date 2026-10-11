@@ -49,7 +49,7 @@ import java.util.List;
         IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
         ViewController.class,
-        SampleSourceController.class,
+        SampleSourceController.class, SampleInstallJobController.class,
         StateStoreController.class,
         ConnectorIconController.class,
         PipelineViewController.class,

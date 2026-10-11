@@ -460,7 +460,7 @@ final class PreviewSelectionPlanner {
                 int requestedLimit, boolean root) {
             cancellation.throwIfCancelled();
             if (!clock.instant().isBefore(deadline)) {
-                refuse("the preview exceeded its 15 second execution deadline");
+                refuse("the preview exceeded its 45 second execution deadline");
             }
             PreviewSourceTable source = tablesByKey.get(sourceKey);
             if (source == null) {
