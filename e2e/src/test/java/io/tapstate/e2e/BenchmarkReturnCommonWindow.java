@@ -28,6 +28,8 @@ final class BenchmarkReturnCommonWindow {
     static Map<String, Object> evidence(List<BenchmarkReturnTimeBounds.Delivery> completeCohort) {
         require(completeCohort != null && !completeCohort.isEmpty() && completeCohort.size() <= MAX_ROWS,
                 "complete bounded cohort is required");
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW,
+                BenchmarkReturnWorkBudget.Work.pass(completeCohort.size()));
         var calls = new LinkedHashMap<Long, Call>();
         var targets = new LinkedHashMap<String, List<Call>>();
         var keys = new HashSet<TargetKey>();
@@ -69,6 +71,9 @@ final class BenchmarkReturnCommonWindow {
                     "lastBoundsNanos", List.of(lastLower, lastUpper)));
         }
         var out = new LinkedHashMap<String, Object>();
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COMMON_WINDOW,
+                new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 10,
+                        Math.addExact(Math.multiplyExact((long) calls.size(), calls.size()), Math.multiplyExact(10L, calls.size())), 0));
         out.put("performanceAcceptanceEligible", false);
         out.put("samplingCostQualified", false);
         out.put("membershipRule", "ORIGINAL_OPEN_LOWER_CLOSED_UPPER_COMMON_TARGET_INTERVAL");

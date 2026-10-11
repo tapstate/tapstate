@@ -83,6 +83,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     }
 
     private final Object lock = new Object();
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
+    private BenchmarkReturnWorkBudget.Ticket workLifetime;
     private final String targetId;
     private final String targetCollection;
     private final String databaseName;
@@ -136,13 +138,16 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         this.targetId = Objects.requireNonNull(targetId, "target identity");
         this.targetCollection = Objects.requireNonNull(targetCollection, "target collection");
         this.keyOf = Objects.requireNonNull(keyOf, "target key extractor");
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
         this.client = MongoClients.create(address);
+        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.TARGET_STREAM, BenchmarkReturnWorkBudget.Work.request());
         try {
             this.cursor = client.getDatabase(databaseName).watch()
                     .fullDocument(FullDocument.UPDATE_LOOKUP)
                     .maxAwaitTime(CURSOR_MAX_AWAIT.toMillis(), TimeUnit.MILLISECONDS)
                     .cursor();
         } catch (RuntimeException e) {
+            BenchmarkReturnWorkBudget.failed(workLifetime, e);
             client.close();
             throw e;
         }
@@ -284,7 +289,9 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         MongoCollection<Document> barriers = client.getDatabase(databaseName)
                 .getCollection(BARRIER_COLLECTION);
         try {
-            barriers.insertOne(new Document("_id", id));
+            BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_BARRIER, () -> {
+                barriers.insertOne(new Document("_id", id)); return null;
+            });
         } catch (RuntimeException writeFailure) {
             synchronized (lock) {
                 fail("target change-stream barrier write failed", writeFailure);
@@ -325,7 +332,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             barrierSeen = false;
             checkpointing = false;
         }
-        barriers.deleteOne(Filters.eq("_id", id));
+        BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_BARRIER,
+                () -> barriers.deleteOne(Filters.eq("_id", id)));
         return phaseDeliveries;
     }
 
@@ -372,7 +380,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                     firstRead = false;
                 }
                 long schedulingGap = previousIterationEnded == 0 ? 0 : started - previousIterationEnded;
-                ChangeStreamDocument<Document> change = cursor.tryNext();
+                ChangeStreamDocument<Document> change = BenchmarkReturnWorkBudget.opaqueRequest(workScope,
+                        BenchmarkReturnWorkBudget.Activity.STREAM_READ, cursor::tryNext);
                 long completed = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
                 if (change != null) {
                     accept(change, started, completed);
@@ -403,7 +412,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                     fail("target change-stream reader failed", e);
                 }
             }
-        }
+        } finally { BenchmarkReturnWorkBudget.done(workLifetime); }
     }
 
     Map<String, Object> diagnosticReadCosts() {
@@ -415,6 +424,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     }
 
     private void accept(ChangeStreamDocument<Document> change, long startedReadNanos, long observedAtNanos) {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, BenchmarkReturnWorkBudget.Work.records(1));
         MongoNamespace namespace = change.getNamespace();
         if (namespace == null || !databaseName.equals(namespace.getDatabaseName())) {
             return;

@@ -19,10 +19,16 @@ final class BenchmarkReturnTimeBounds {
                               BenchmarkCausalClock.Identity owner, BenchmarkReturnPointClock clock) {
         require(associations != null && associations.size() <= MAX_ROWS && owner != null && clock != null,
                 "bounded source associations and an owned clock are required");
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(associations.size()));
         List<Delivery> deliveries = new ArrayList<>();
+        var workScope = BenchmarkReturnWorkBudget.current();
         for (var row : associations) {
             require(row != null, "source association is missing");
             if (!row.fixedCohort()) { continue; }
+            if (workScope != null) {
+                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RETURN_MAP, new BenchmarkReturnWorkBudget.Work(2, 0, 1, 0, 0, 1, 2, 0));
+                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.SOURCE_MAP, BenchmarkReturnWorkBudget.Work.records(1));
+            }
             try {
                 require(Math.subtractExact(row.callLastCallbackExitNanos(), row.callBeganNanos()) >= 0
                         && Math.subtractExact(row.callObservedNanos(), row.callLastCallbackExitNanos()) >= 0,
@@ -45,6 +51,8 @@ final class BenchmarkReturnTimeBounds {
                 "p99 requires at least 10000 complete deliveries within the record bound");
         List<BenchmarkCausalClock.Interval> values = List.copyOf(latencies);
         int rank = (int) ((99L * values.size() + 99) / 100) - 1;
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.SORT,
+                new BenchmarkReturnWorkBudget.Work(2, 2, 0, 0, 0, 2, Math.multiplyExact(2L, values.size()), 0));
         long lower = values.stream().map(BenchmarkCausalClock.Interval::lowerNanos).sorted().skip(rank).findFirst().orElseThrow();
         long upper = values.stream().map(BenchmarkCausalClock.Interval::upperNanos).sorted().skip(rank).findFirst().orElseThrow();
         return new BenchmarkCausalClock.Interval(lower, upper);
@@ -55,6 +63,8 @@ final class BenchmarkReturnTimeBounds {
         require(returns != null && returns.size() >= 2 && returns.size() <= MAX_ROWS,
                 "return span needs a bounded complete roster");
         List<BenchmarkCausalClock.Interval> values = List.copyOf(returns);
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.SPAN,
+                new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 4, Math.multiplyExact(4L, values.size()), 0));
         long firstLower = values.stream().mapToLong(BenchmarkCausalClock.Interval::lowerNanos).min().orElseThrow();
         long firstUpper = values.stream().mapToLong(BenchmarkCausalClock.Interval::upperNanos).min().orElseThrow();
         long lastLower = values.stream().mapToLong(BenchmarkCausalClock.Interval::lowerNanos).max().orElseThrow();

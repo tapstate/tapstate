@@ -73,6 +73,7 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
     private final LongSupplier nanoTime;
     private final ConnectionString connection;
     private Snapshot beginning;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
     private long startedAtNanos;
     private boolean finished;
     private boolean closed;
@@ -113,6 +114,7 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
     }
 
     static BenchmarkMongoCommandSampler open(String mongoUri) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.request());
         Objects.requireNonNull(mongoUri, "Mongo URI");
         ConnectionString connection = new ConnectionString(mongoUri);
         return new BenchmarkMongoCommandSampler(MongoClients.create(connection), connection);
@@ -238,7 +240,7 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
     }
 
     private Snapshot read() {
-        return read(client);
+        return read(client, workScope);
     }
 
     /** Only this optional client has local read limits; the normal start/finish client is unchanged. */
@@ -246,12 +248,15 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
         MongoClientSettings settings = MongoClientSettings.builder().applyConnectionString(connection)
                 .applyToSocketSettings(socket -> socket.connectTimeout(5, TimeUnit.SECONDS).readTimeout(5, TimeUnit.SECONDS))
                 .applyToClusterSettings(cluster -> cluster.serverSelectionTimeout(5, TimeUnit.SECONDS)).build();
-        try (MongoClient owned = MongoClients.create(settings)) { return read(owned); }
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.request());
+        try (MongoClient owned = MongoClients.create(settings)) { return read(owned, workScope); }
+        finally { BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.call()); }
     }
 
-    private static Snapshot read(MongoClient client) {
+    private static Snapshot read(MongoClient client, BenchmarkReturnWorkBudget.Scope scope) {
         try {
-            Document status = client.getDatabase("admin").runCommand(new Document("serverStatus", 1));
+            Document status = BenchmarkReturnWorkBudget.request(scope, BenchmarkReturnWorkBudget.Activity.COMMAND_READ,
+                    () -> client.getDatabase("admin").runCommand(new Document("serverStatus", 1)));
             return parse(status);
         } catch (RuntimeException failure) {
             throw new AssertionError("Mongo command counters are unavailable", failure);
@@ -345,6 +350,7 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.COMMAND_CLIENT, BenchmarkReturnWorkBudget.Work.call());
         if (!closed) {
             closed = true;
             if (checkpointWorker != null) { checkpointWorker.shutdownNow(); }

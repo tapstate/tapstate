@@ -39,6 +39,8 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     }
 
     private final Access access;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
+    private BenchmarkReturnWorkBudget.Ticket workLifetime;
     private final String window;
     private final BenchmarkReturnClockSampler sampler;
     private final boolean costStageDiagnostics;
@@ -87,11 +89,15 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     static BenchmarkWriteReturnCapture open(Access access, String window,
             BenchmarkReturnClockSampler.Mode mode, boolean costStageDiagnostics) {
         var capture = new BenchmarkWriteReturnCapture(access, window, mode, costStageDiagnostics);
+        capture.workLifetime = BenchmarkReturnWorkBudget.begin(capture.workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
         try {
             capture.sampler.start();
             if (!access.start(window)) { throw new AssertionError("owned return capture start was refused"); }
             capture.captureStarted = true;
-            var initial = BenchmarkWriteReturnLedger.decode(access.page(0));
+            byte[] initialBytes = access.page(0);
+            BenchmarkReturnWorkBudget.add(capture.workScope, BenchmarkReturnWorkBudget.Activity.DECODE,
+                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, initialBytes == null ? 0 : initialBytes.length, 1, 0, 0));
+            var initial = BenchmarkWriteReturnLedger.decode(initialBytes);
             if (!window.equals(initial.window()) || initial.cursor() != 0 || initial.epoch() <= 0) {
                 throw new AssertionError("owned return capture start has no matching epoch");
             }
@@ -148,8 +154,12 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
                     || retainedPageBytes + bytes.length > 2 * 1024 * 1024) {
                 throw new AssertionError("owned return capture page exceeds its retention bound");
             }
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.BASE64,
+                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, bytes.length, 1, bytes.length, 0));
             retainedPages.add(java.util.Base64.getEncoder().encodeToString(bytes));
             retainedPageBytes += bytes.length;
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.DECODE,
+                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, bytes.length, 1, 0, 0));
             var page = BenchmarkWriteReturnLedger.decode(bytes);
             if (page.epoch() != epoch) { throw new AssertionError("owned return capture epoch changed after start"); }
             int headerBytes = 32 + page.window().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
@@ -168,6 +178,8 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         var calls = assembly.finish(summary.completedCalls(), summary.reportedRecords());
         var clock = new BenchmarkCausalClock(samples.getFirst().identity(), samples);
         for (var call : calls) {
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CALL_POINT_CHECK,
+                    new BenchmarkReturnWorkBudget.Work(3, 0, 0, 0, 0, 1, 3, 0));
             clock.map(samples.getFirst().identity(), call.beganNanos());
             clock.map(samples.getFirst().identity(), call.lastCallbackExitNanos());
             clock.map(samples.getFirst().identity(), call.observedNanos());
@@ -185,6 +197,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
 
     /** Keeps already obtained facts after refusal without retrying a remote read or stop. */
     Map<String, Object> retainedEvidence() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.FAILURE_RETENTION, BenchmarkReturnWorkBudget.Work.call());
         Map<String, Object> evidence = Map.of("window", window, "epoch", epoch, "completed", completed,
                 "sampler", sampler.evidence(), "samples", sampler.readings().stream().map(sample -> Map.of(
                         "sequence", sample.sequence(), "pid", sample.identity().pid(),
@@ -234,6 +247,8 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     }
 
     private static Object immutableClockValue(Object value, int depth, int[] nodes) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.FAILURE_RETENTION,
+                new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 0, 1, 1));
         if (depth > 8 || ++nodes[0] > 512) { throw new AssertionError("clock request facts exceed their structural bound"); }
         if (value instanceof Map<?, ?> map) {
             var copy = new java.util.LinkedHashMap<String, Object>();
@@ -261,7 +276,15 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         finally {
             try { sampler.close(); }
             catch (RuntimeException | Error failure) {
-                if (primary != null) { primary.addSuppressed(failure); } else { throw failure; }
+                if (primary != null) { primary.addSuppressed(failure); } else {
+                    BenchmarkReturnWorkBudget.failed(workLifetime, failure);
+                    throw failure;
+                }
+            } finally {
+                if (workLifetime != null && !workLifetime.completed()) {
+                    if (primary != null) { BenchmarkReturnWorkBudget.failed(workLifetime, primary); }
+                    else { BenchmarkReturnWorkBudget.done(workLifetime); }
+                }
             }
         }
     }

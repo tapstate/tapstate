@@ -176,6 +176,7 @@ public final class PdkBenchmarkClock {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] bytes = new byte[8192]; int total = 0;
             for (int size; (size = input.read(bytes)) != -1;) {
+                if (size == 0) { throw new IOException("Native identity stream made no progress"); }
                 if (size > limit - total) { throw new IOException("Native identity bytes exceed their bound"); }
                 total += size; digest.update(bytes, 0, size);
             }

@@ -37,6 +37,7 @@ final class PdkMongoWriteScope {
     private final String unavailable;
     private final Access access;
     private final Transactions transactions;
+    private PdkWriteReturnWorkBudget workBudget;
     private final ThreadOwners threadOwners = new ThreadOwners();
 
     private PdkMongoWriteScope(String unavailable) {
@@ -55,22 +56,40 @@ final class PdkMongoWriteScope {
 
     /** Called only by the explicitly enabled probe, after connector initialization and before writes. */
     static PdkMongoWriteScope enabled(PdkConnector connector) {
+        return enabled(connector, null);
+    }
+
+    static PdkMongoWriteScope enabled(PdkConnector connector, PdkWriteReturnWorkBudget budget) {
+        if (budget == null) return enabledObserved(connector, null);
+        try (var span = budget.enter(PdkWriteReturnWorkBudget.Activity.SCOPE_INSTALL)) {
+            PdkMongoWriteScope result = enabledObserved(connector, budget); span.success(); return result;
+        }
+    }
+
+    private static PdkMongoWriteScope enabledObserved(PdkConnector connector, PdkWriteReturnWorkBudget budget) {
         if (connector == null) return new PdkMongoWriteScope("CONNECTOR_UNAVAILABLE");
         synchronized (INSPECTORS) {
             WeakReference<PdkMongoWriteScope> existing = INSPECTORS.get(connector);
             PdkMongoWriteScope cached = existing == null ? null : existing.get();
-            if (cached != null) return cached;
-            INSPECTORS.entrySet().removeIf(entry -> entry.getValue().get() == null);
+            if (cached != null) {
+                if (cached.workBudget != budget && budget != null) budget.gap("SCOPE_LIFETIME_BINDING_CHANGED");
+                return cached;
+            }
+            INSPECTORS.entrySet().removeIf(entry -> {
+                if (budget != null) budget.observe(PdkWriteReturnWorkBudget.Activity.SCOPE_CACHE_ENTRY);
+                return entry.getValue().get() == null;
+            });
             if (INSPECTORS.size() >= MAX_INSPECTORS) return new PdkMongoWriteScope("INSPECTOR_LIMIT");
             PdkMongoWriteScope created;
             try {
-                Access access = Access.open(connector.connector());
-                created = new PdkMongoWriteScope(access, Transactions.install(connector.functions()));
+                Access access = Access.open(connector.connector(), budget);
+                created = new PdkMongoWriteScope(access, Transactions.install(connector.functions(), budget));
             } catch (UnsupportedShape rejected) {
                 created = new PdkMongoWriteScope(rejected.reason);
             } catch (ReflectiveOperationException | IOException | RuntimeException | LinkageError unavailable) {
                 created = new PdkMongoWriteScope("SCOPE_INSPECTION_UNAVAILABLE");
             }
+            created.workBudget = budget;
             INSPECTORS.put(connector, new WeakReference<>(created));
             return created;
         }
@@ -95,6 +114,13 @@ final class PdkMongoWriteScope {
     }
 
     Call beforeWrite() {
+        if (workBudget == null) return beforeObserved();
+        try (var span = workBudget.enter(PdkWriteReturnWorkBudget.Activity.SCOPE_BEFORE)) {
+            Call result = beforeObserved(); span.success(); return result;
+        }
+    }
+
+    private Call beforeObserved() {
         Thread thread = Thread.currentThread();
         String name = thread.getName();
         String rejection = unavailable;
@@ -114,6 +140,13 @@ final class PdkMongoWriteScope {
 
     /** Bounded ASCII only; no namespace, URI, record, thread name or exception text is published. */
     String afterWrite(Call began) {
+        if (workBudget == null) return afterObserved(began);
+        try (var span = workBudget.enter(PdkWriteReturnWorkBudget.Activity.SCOPE_AFTER)) {
+            String result = afterObserved(began); span.success(); return result;
+        }
+    }
+
+    private String afterObserved(Call began) {
         if (began == null || began.owner != this) return unknown("CALL_TOKEN_MISMATCH");
         if (began.rejection != null) {
             return "DISABLED".equals(began.rejection)
@@ -186,20 +219,33 @@ final class PdkMongoWriteScope {
         private static final Map<ConnectorFunctions, WeakReference<Transactions>> OBSERVERS = new WeakHashMap<>();
         private final ConnectorFunctions functions;
         private final AtomicLong calls = new AtomicLong();
+        private final PdkWriteReturnWorkBudget workBudget;
         private boolean limit;
         private TransactionBeginFunction begin;
         private TransactionCommitFunction commit;
         private TransactionRollbackFunction rollback;
 
-        private Transactions(ConnectorFunctions functions) { this.functions = functions; }
+        private Transactions(ConnectorFunctions functions, PdkWriteReturnWorkBudget budget) {
+            this.functions = functions; this.workBudget = budget;
+        }
 
         static Transactions install(ConnectorFunctions functions) {
+            return install(functions, null);
+        }
+
+        static Transactions install(ConnectorFunctions functions, PdkWriteReturnWorkBudget budget) {
             synchronized (OBSERVERS) {
                 WeakReference<Transactions> reference = OBSERVERS.get(functions);
                 Transactions existing = reference == null ? null : reference.get();
-                if (existing != null) return existing;
-                OBSERVERS.entrySet().removeIf(entry -> entry.getValue().get() == null);
-                Transactions observed = new Transactions(functions);
+                if (existing != null) {
+                    if (existing.workBudget != budget && budget != null) budget.gap("TRANSACTION_LIFETIME_BINDING_CHANGED");
+                    return existing;
+                }
+                OBSERVERS.entrySet().removeIf(entry -> {
+                    if (budget != null) budget.observe(PdkWriteReturnWorkBudget.Activity.SCOPE_CACHE_ENTRY);
+                    return entry.getValue().get() == null;
+                });
+                Transactions observed = new Transactions(functions, budget);
                 if (OBSERVERS.size() >= MAX_INSPECTORS) {
                     observed.limit = true;
                     return observed;
@@ -215,20 +261,38 @@ final class PdkMongoWriteScope {
             TransactionCommitFunction originalCommit = functions.getTransactionCommitFunction();
             TransactionRollbackFunction originalRollback = functions.getTransactionRollbackFunction();
             if (originalBegin != null) {
-                begin = context -> { enter(); originalBegin.begin(context); };
+                begin = context -> {
+                    var span = transaction();
+                    try { enter(); originalBegin.begin(context); if (span != null) span.success(); }
+                    finally { if (span != null) span.close(); }
+                };
                 functions.supportTransactionBeginFunction(begin);
             }
             if (originalCommit != null) {
-                commit = context -> { enter(); originalCommit.commit(context); };
+                commit = context -> {
+                    var span = transaction();
+                    try { enter(); originalCommit.commit(context); if (span != null) span.success(); }
+                    finally { if (span != null) span.close(); }
+                };
                 functions.supportTransactionCommitFunction(commit);
             }
             if (originalRollback != null) {
-                rollback = context -> { enter(); originalRollback.rollback(context); };
+                rollback = context -> {
+                    var span = transaction();
+                    try { enter(); originalRollback.rollback(context); if (span != null) span.success(); }
+                    finally { if (span != null) span.close(); }
+                };
                 functions.supportTransactionRollbackFunction(rollback);
             }
         }
 
-        private void enter() { calls.updateAndGet(value -> value == Long.MAX_VALUE ? value : value + 1); }
+        private void enter() {
+            calls.updateAndGet(value -> value == Long.MAX_VALUE ? value : value + 1);
+        }
+
+        private PdkWriteReturnWorkBudget.Span transaction() {
+            return workBudget == null ? null : workBudget.enter(PdkWriteReturnWorkBudget.Activity.TRANSACTION_WRAPPER);
+        }
 
         String rejection() {
             if (limit) return "TRANSACTION_OBSERVER_LIMIT";
@@ -291,15 +355,13 @@ final class PdkMongoWriteScope {
             journal = concernType.getMethod("getJournal"); timeout = concernType.getMethod("getWTimeout", TimeUnit.class);
         }
 
-        static Access open(Object delegate) throws ReflectiveOperationException, IOException {
+        static Access open(Object delegate, PdkWriteReturnWorkBudget budget) throws ReflectiveOperationException, IOException {
             if (delegate == null || !MONGO_CONNECTOR.equals(delegate.getClass().getName())) {
                 throw new UnsupportedShape("UNSUPPORTED_CONNECTOR");
             }
             Path artifact = artifact(delegate.getClass());
-            if (!PINNED_JAR.equals(fileDigest(artifact))) throw new UnsupportedShape("CONNECTOR_BYTES_UNSUPPORTED");
-            if (ManagementFactory.getRuntimeMXBean().getInputArguments().stream().anyMatch(argument ->
-                    argument.startsWith("-javaagent:") || argument.startsWith("-agentpath:")
-                            || argument.startsWith("-agentlib:"))) {
+            if (!PINNED_JAR.equals(fileDigest(artifact, budget))) throw new UnsupportedShape("CONNECTOR_BYTES_UNSUPPORTED");
+            if (hasAgent(ManagementFactory.getRuntimeMXBean().getInputArguments(), budget)) {
                 throw new UnsupportedShape("TRANSFORMED_CLASSES_UNPROVEN");
             }
             String[] names = { MONGO_CONNECTOR, "io.tapdata.mongodb.entity.MongodbConfig",
@@ -382,13 +444,58 @@ final class PdkMongoWriteScope {
         }
     }
 
-    private static String fileDigest(Path path) throws IOException {
+    private static String fileDigest(Path path, PdkWriteReturnWorkBudget budget) throws IOException {
+        long limit = budget == null ? Long.MAX_VALUE : budget.connectorHashLimit();
+        if (budget != null && (limit < 1 || Files.size(path) > limit)) {
+            budget.gap("CONNECTOR_HASH_MATERIAL_BOUND"); throw new UnsupportedShape("CONNECTOR_BYTES_UNSUPPORTED");
+        }
         MessageDigest digest = digest();
         try (var in = Files.newInputStream(path)) {
             byte[] buffer = new byte[16384];
-            for (int read; (read = in.read(buffer)) != -1;) digest.update(buffer, 0, read);
+            long total = 0;
+            for (;;) {
+                var reading = budget == null ? null : budget.enter(PdkWriteReturnWorkBudget.Activity.HASH_READ);
+                int read;
+                try { read = in.read(buffer); if (reading != null) reading.success(); }
+                finally { if (reading != null) reading.close(); }
+                if (read == -1) break;
+                if (budget != null) {
+                    budget.material(4, read);
+                    budget.observe(PdkWriteReturnWorkBudget.Activity.HASH_MATERIAL, read);
+                }
+                if (read == 0 || read > limit - total) {
+                    if (budget != null) budget.gap("CONNECTOR_HASH_PROGRESS_OR_GROWTH");
+                    throw new IOException("Connector material exceeds its admitted bound");
+                }
+                total += read; digest.update(buffer, 0, read);
+            }
         }
         return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static boolean hasAgent(java.util.List<String> arguments, PdkWriteReturnWorkBudget budget) {
+        if (budget == null) return arguments.stream().anyMatch(argument -> argument.startsWith("-javaagent:")
+                || argument.startsWith("-agentpath:") || argument.startsWith("-agentlib:"));
+        if (arguments == null || arguments.size() > budget.argumentLimit()) {
+            budget.gap("RUNTIME_ARGUMENT_ROSTER_BOUND"); throw new UnsupportedShape("TRANSFORMED_CLASSES_UNPROVEN");
+        }
+        long material = 0;
+        int count = arguments.size();
+        for (int index = 0; index < count; index++) {
+            String argument = arguments.get(index);
+            budget.observe(PdkWriteReturnWorkBudget.Activity.ARGUMENT);
+            if (argument == null || argument.length() > 16384) {
+                budget.gap("RUNTIME_ARGUMENT_MATERIAL_BOUND"); throw new UnsupportedShape("TRANSFORMED_CLASSES_UNPROVEN");
+            }
+            budget.observe(PdkWriteReturnWorkBudget.Activity.ARGUMENT_MATERIAL, argument.length());
+            int bytes = argument.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            if (bytes > budget.argumentBytesLimit() - material) {
+                budget.gap("RUNTIME_ARGUMENT_MATERIAL_BOUND"); throw new UnsupportedShape("TRANSFORMED_CLASSES_UNPROVEN");
+            }
+            material += bytes; budget.material(4, bytes);
+            if (argument.startsWith("-javaagent:") || argument.startsWith("-agentpath:") || argument.startsWith("-agentlib:")) return true;
+        }
+        return false;
     }
 
     private static String sha256(byte[] bytes) { return HexFormat.of().formatHex(digest().digest(bytes)); }

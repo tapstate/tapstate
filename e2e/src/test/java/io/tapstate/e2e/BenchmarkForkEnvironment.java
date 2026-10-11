@@ -30,6 +30,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private static final Duration PIPELINE_WAIT = Duration.ofMinutes(3);
     private static final Duration TARGET_WAIT = Duration.ofMinutes(5);
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
     private static final Duration TARGET_POLL = Duration.ofSeconds(2);
 
     @FunctionalInterface
@@ -193,6 +194,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     /** Allows a diagnostic baseline after setup while the real first START is still pending. */
     static BenchmarkForkEnvironment open(BenchmarkWorkloadDefinitions.Workload workload,
             Path applicationJar, String forkId, BootLauncher launcher, BeforeStart beforeStart) throws Exception {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(applicationJar, "applicationJar");
         if (!Files.isRegularFile(applicationJar) || forkId == null || forkId.isBlank()) {
@@ -414,6 +416,8 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         List<BatchResult> batches = new ArrayList<>();
         int batchIndex = 0;
         for (List<String> sql : phase.batches()) {
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
+                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, 0, 1, sql.size(), 0));
             if (paced) {
                 long remaining = nextBatchStart - io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
                 if (remaining > 0) {
@@ -487,6 +491,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             do {
                 rounds++;
                 latest = phase.targets().stream().map(this::readTarget).toList();
+                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.ACK_POLL, BenchmarkReturnWorkBudget.Work.call());
                 if (latest.stream().allMatch(TargetResult::matches)) {
                     matched = true;
                     return latest;
@@ -609,7 +614,10 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         if (count != expectation.rows()) {
             return new TargetResult(expectation, count, null);
         }
-        List<Document> documents = collection.find().into(new ArrayList<>());
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ, BenchmarkReturnWorkBudget.Work.request());
+        List<Document> documents;
+        try { documents = collection.find().into(new ArrayList<>()); BenchmarkReturnWorkBudget.returned(work, documents); }
+        catch (RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
         try {
             return new TargetResult(expectation, documents.size(),
                     BenchmarkWorkloadDefinitions.checksumOf(expectation, documents));
@@ -637,6 +645,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     @Override
     public void close() throws Exception {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.call());
         if (closed) {
             return;
         }

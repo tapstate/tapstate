@@ -12,6 +12,9 @@ import java.util.function.Supplier;
 /** Owned fixed-cadence hello reads qualify sampled interior clock behavior and record their external cost. */
 final class BenchmarkTargetClockSampler implements AutoCloseable {
     private final Supplier<BenchmarkTargetClock.Reading> source;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
+    private final BenchmarkReturnWorkBudget.Ticket workLifetime = BenchmarkReturnWorkBudget.begin(workScope,
+            BenchmarkReturnWorkBudget.Activity.HELLO_CLIENT, BenchmarkReturnWorkBudget.Work.call());
     private final Runnable closeSource;
     private final ScheduledThreadPoolExecutor worker = (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(1);
     private final List<BenchmarkTargetClock.Reading> readings = new ArrayList<>();
@@ -19,10 +22,12 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
     private boolean closed;
 
     static BenchmarkTargetClockSampler open(String uri) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
         var client = MongoClients.create(uri);
         try {
             var admin = client.getDatabase("admin").withTimeout(1, TimeUnit.SECONDS);
-            admin.runCommand(new org.bson.Document("ping", 1));
+            BenchmarkReturnWorkBudget.request(BenchmarkReturnWorkBudget.Activity.PING_REQUEST,
+                    () -> admin.runCommand(new org.bson.Document("ping", 1)));
             return new BenchmarkTargetClockSampler(() -> BenchmarkTargetClock.read(admin), client::close);
         } catch (RuntimeException | Error failure) { client.close(); throw failure; }
     }
@@ -39,7 +44,7 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
     private void read() {
         synchronized (this) { if (closed || failure != null) { return; } }
         try {
-            var next = source.get();
+            var next = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.HELLO_READ, source::get);
             synchronized (this) {
                 if (readings.size() >= BenchmarkTargetClock.MAX_INTERIOR_SAMPLES) { throw new AssertionError("clock sampling exceeded its bounded trace"); }
                 readings.add(next);
@@ -79,6 +84,10 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
         } catch (InterruptedException interrupted) {
             worker.shutdownNow(); Thread.currentThread().interrupt();
             throw new AssertionError("target clock sampling shutdown was interrupted", interrupted);
-        } finally { closeSource.run(); }
+        } finally {
+            closeSource.run();
+            if (closed) { BenchmarkReturnWorkBudget.done(workLifetime); }
+            else { BenchmarkReturnWorkBudget.gap(workScope, BenchmarkReturnWorkBudget.Activity.HELLO_CLIENT, "WORKER_TERMINATION_NOT_OBSERVED"); }
+        }
     }
 }

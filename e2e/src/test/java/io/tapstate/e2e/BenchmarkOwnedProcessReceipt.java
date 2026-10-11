@@ -78,6 +78,7 @@ final class BenchmarkOwnedProcessReceipt {
     }
 
     static BenchmarkOwnedProcessReceipt capture(RealProcessServer server, Path jar, Map<String, Object> bindings) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.call());
         Objects.requireNonNull(server); Objects.requireNonNull(jar); Objects.requireNonNull(bindings);
         List<String> reasons = new ArrayList<>();
         Path application = jar.toAbsolutePath().normalize();
@@ -180,6 +181,7 @@ final class BenchmarkOwnedProcessReceipt {
 
     /** Called once after every measured/ACK/resource window, immediately before owned cleanup. */
     void verifyBeforeClose() {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.call());
         require(verifiedAt == null && finishedAt == null, "receipt verification occurs once before finish");
         boolean aliveBefore = server.isAlive();
         beforeClose = read(server.pid());
@@ -195,6 +197,7 @@ final class BenchmarkOwnedProcessReceipt {
 
     /** Uses the original owned Process outcome, never the absence of a PID in a lookup. */
     void finishAfterClose() {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.call());
         require(finishedAt == null, "receipt finishes once");
         if (verifiedAt == null) { reasons.add("BEFORE_CLOSE_VERIFICATION_NOT_RECORDED"); }
         ownedAliveAfterClose = server.isAlive();
@@ -215,6 +218,7 @@ final class BenchmarkOwnedProcessReceipt {
     Map<String, Object> evidence() { return finishedEvidence == null ? buildEvidence() : finishedEvidence; }
 
     private Map<String, Object> buildEvidence() {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.BOOKKEEPING, BenchmarkReturnWorkBudget.Work.pass(jvmRuntime.size()));
         Map<String, Object> out = new LinkedHashMap<>();
         List<String> allReasons = new ArrayList<>(reasons);
         if (!"COMPLETE".equals(childEnvironment.get("status"))) { allReasons.add("CHILD_LAUNCH_ENVIRONMENT_UNAVAILABLE"); }
@@ -342,6 +346,8 @@ final class BenchmarkOwnedProcessReceipt {
 
     private static String hashFile(Path path, long size) throws Exception {
         require(size >= 0 && Files.isRegularFile(path), "application must be a sized regular file");
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INPUT_FINGERPRINT,
+                new BenchmarkReturnWorkBudget.Work(1, 1, 0, 0, Math.addExact(size, 1), 1, 0, 0));
         MessageDigest digest = MessageDigest.getInstance("SHA-256"); byte[] buffer = new byte[65536]; long remaining = size;
         try (InputStream input = Files.newInputStream(path)) {
             while (remaining > 0) {

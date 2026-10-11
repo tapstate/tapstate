@@ -31,6 +31,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     private static final long BYTES_PER_KIB = 1_024;
 
     private final long ownedPid;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
     private final ProcessHandle child;
     private final JMXConnector jmx;
     private final MBeanServerConnection connection;
@@ -45,6 +46,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     static BenchmarkProcessProbe open(long pid) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
         if (pid <= 0) {
             throw new IllegalArgumentException("a child JVM PID must be positive");
         }
@@ -95,6 +97,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
 
     /** Retains runtime identity through the existing resource connection before the measured window. */
     Map<String, Object> runtimeEvidence() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.call());
         long before = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
         boolean aliveBefore = child != null && child.isAlive();
         if (!aliveBefore || connection == null) {
@@ -103,11 +106,19 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         try {
             RuntimeMXBean runtime = ManagementFactory.newPlatformMXBeanProxy(
                     connection, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
             long actualPid = runtime.getPid();
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
             long startMillis = runtime.getStartTime();
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
             List<String> arguments = runtime.getInputArguments();
-            Map<String, String> version = Map.of("vmName", runtime.getVmName(), "vmVersion", runtime.getVmVersion(),
-                    "vmVendor", runtime.getVmVendor());
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
+            String vmName = runtime.getVmName();
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
+            String vmVersion = runtime.getVmVersion();
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
+            String vmVendor = runtime.getVmVendor();
+            Map<String, String> version = Map.of("vmName", vmName, "vmVersion", vmVersion, "vmVendor", vmVendor);
             boolean aliveAfter = child.isAlive();
             if (actualPid != ownedPid || startMillis <= 0 || !aliveAfter || arguments.size() > 128
                     || arguments.stream().anyMatch(value -> value.length() > 16384)
@@ -294,6 +305,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     Snapshot sample() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.PROCESS_INFO, BenchmarkReturnWorkBudget.Work.request());
         if (child == null || !child.isAlive()) {
             return unavailable();
         }
@@ -306,6 +318,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     private OptionalLong jmxCpu() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CPU_FALLBACK, BenchmarkReturnWorkBudget.Work.request());
         if (connection == null) {
             return OptionalLong.empty();
         }
@@ -321,6 +334,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     private OptionalLong heapUsed() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.HEAP_READ, BenchmarkReturnWorkBudget.Work.request());
         if (connection == null) {
             return OptionalLong.empty();
         }
@@ -341,11 +355,13 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         try {
             List<GarbageCollectorMXBean> collectors =
                     ManagementFactory.getPlatformMXBeans(connection, GarbageCollectorMXBean.class);
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.GC_ROSTER, BenchmarkReturnWorkBudget.Work.pass(collectors.size()));
             if (collectors.isEmpty()) {
                 return OptionalLong.empty();
             }
             long total = 0;
             for (GarbageCollectorMXBean collector : collectors) {
+                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.GC_READ, BenchmarkReturnWorkBudget.Work.request());
                 long elapsed = collector.getCollectionTime();
                 if (elapsed < 0) {
                     return OptionalLong.empty();
@@ -359,6 +375,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     private OptionalLong rss() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, BenchmarkReturnWorkBudget.Work.request());
         Process command;
         try {
             command = new ProcessBuilder("ps", "-o", "rss=", "-p", Long.toString(child.pid()))
@@ -375,6 +392,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
                 return OptionalLong.empty();
             }
             String output = new String(command.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RSS_PROCESS, BenchmarkReturnWorkBudget.Work.bytes(Math.multiplyExact(4L, output.length())));
             if (!output.matches("[0-9]+")) {
                 return OptionalLong.empty();
             }
@@ -395,6 +413,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
 
     @Override
     public void close() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.request());
         closeQuietly(jmx);
     }
 

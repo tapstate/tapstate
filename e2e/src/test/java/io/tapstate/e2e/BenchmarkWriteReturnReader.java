@@ -26,6 +26,7 @@ final class BenchmarkWriteReturnReader {
     private final ObjectName name;
     private final ObjectName runtimeName;
     private final ClockRequests clockRequests;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
 
     enum ClockRequestRole {
         PERIODIC_CLOCK(512), START_VALIDATION(1), STOP_VALIDATION(1), SUMMARY_VALIDATION(1), PAGE_VALIDATION(514);
@@ -50,6 +51,7 @@ final class BenchmarkWriteReturnReader {
 
     /** A cold registration check uses the existing connection and never reads or controls the probe. */
     Map<String, Object> registrationEvidence(boolean expectedEnabled) {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.REGISTRATION_READ, BenchmarkReturnWorkBudget.Work.call());
         try {
             RuntimeRead before = runtimeRead(expectedEnabled);
             requireAlive();
@@ -142,6 +144,7 @@ final class BenchmarkWriteReturnReader {
 
     /** Cold provenance reads never invoke the probe's counter or measurement controls. */
     Map<String, Object> nativeClockEvidence(String expectedLibraryPath, String actualRootMetadata) {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, BenchmarkReturnWorkBudget.Work.call());
         var retained = new java.util.LinkedHashMap<String, Object>();
         retained.put("state", "UNKNOWN"); retained.put("reason", "NATIVE_CLOCK_READ_REFUSED");
         BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> retained.put(flag, false));
@@ -152,11 +155,15 @@ final class BenchmarkWriteReturnReader {
             if (expectedLibraryPath == null || expectedLibraryPath.isEmpty()) { throw new AssertionError("native clock library path is missing"); }
             var rootIdentity = new BenchmarkCausalClock.Identity(ProcessHandle.current().pid(),
                     java.lang.management.ManagementFactory.getRuntimeMXBean().getStartTime());
+            if (workScope != null) { workScope.bindRoot(rootIdentity.pid(), rootIdentity.jvmStartTimeMillis()); }
             retained.put("expectedRootPid", rootIdentity.pid()); retained.put("expectedRootJvmStartTimeMillis", rootIdentity.jvmStartTimeMillis());
             RuntimeRead before = runtimeRead(true, false, retained, "beforeRuntimeRead", expectedLibraryPath);
             requireAlive();
             long started = clock.getAsLong(); retained.put("clockMetadataRead", Map.of("startedAtNanos", started));
-            Object value = connection.getAttribute(name, "ClockMetadata");
+            var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.NATIVE_METADATA, BenchmarkReturnWorkBudget.Work.request());
+            Object value;
+            try { value = connection.getAttribute(name, "ClockMetadata"); BenchmarkReturnWorkBudget.returned(work, value); }
+            catch (java.io.IOException | javax.management.JMException | RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
             String raw = value instanceof String text ? text : null;
             retained.putAll(BenchmarkWriteReturnCostStages.rawEvidence(raw));
             if (value != null && raw == null) { retained.put("responseType", value.getClass().getName()); }
@@ -202,7 +209,10 @@ final class BenchmarkWriteReturnReader {
         requireAlive();
         long before = clock.getAsLong();
         if (retained != null) { retained.put(evidenceField, Map.of("startedAtNanos", before)); }
-        var attributes = connection.getAttributes(runtimeName, new String[]{"Pid", "StartTime", "InputArguments"});
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.RUNTIME_READ, BenchmarkReturnWorkBudget.Work.request());
+        javax.management.AttributeList attributes;
+        try { attributes = connection.getAttributes(runtimeName, new String[]{"Pid", "StartTime", "InputArguments"}); BenchmarkReturnWorkBudget.returned(work, attributes); }
+        catch (java.io.IOException | javax.management.JMException | RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
         long after = clock.getAsLong();
         if (retained != null) { retained.put(evidenceField, bracket(before, after)); }
         requireAlive();
@@ -273,6 +283,7 @@ final class BenchmarkWriteReturnReader {
 
     /** Validation points remain outside the periodic sample roster. */
     BenchmarkCausalClock.Sample clockSample(long sequence, ClockRequestRole role) {
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.CLOCK_REQUEST, BenchmarkReturnWorkBudget.Work.request());
         ClockRequests.Ticket request = clockRequests == null ? null : clockRequests.begin(role);
         try {
             requireAlive();
@@ -296,17 +307,52 @@ final class BenchmarkWriteReturnReader {
             if (!identity.equals(actual)) { throw new AssertionError("return clock has another owned runtime identity"); }
             var sample = new BenchmarkCausalClock.Sample(sequence, actual, before, after, number(values, "NanoTime"));
             if (request != null) { clockRequests.finished(request, null); }
+            BenchmarkReturnWorkBudget.returned(work, attributes);
             return sample;
         } catch (java.io.IOException | javax.management.JMException unavailable) {
             if (request != null) { clockRequests.finished(request, unavailable); }
+            BenchmarkReturnWorkBudget.failed(work, unavailable);
             throw new AssertionError("owned return clock is unavailable", unavailable);
         } catch (RuntimeException | Error failure) {
             if (request != null) { clockRequests.finished(request, failure); }
+            BenchmarkReturnWorkBudget.failed(work, failure);
             throw failure;
         }
     }
 
     Map<String, Object> clockRequestsEvidence() { return clockRequests == null ? Map.of() : clockRequests.evidence(); }
+
+    String workBudgetEvidence() {
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.PRODUCER_TRANSPORT, BenchmarkReturnWorkBudget.Work.request());
+        try {
+            requireAlive(); Object value = connection.getAttribute(name, "WorkBudget");
+            BenchmarkReturnWorkBudget.returned(work, value); requireAlive();
+            if (!(value instanceof String raw) || raw.length() > 65_536
+                    || !raw.chars().allMatch(c -> c >= 32 && c <= 126)) {
+                throw new AssertionError("producer work receipt is missing or exceeds its ASCII transport bound");
+            }
+            return raw;
+        } catch (java.io.IOException | javax.management.JMException unavailable) {
+            BenchmarkReturnWorkBudget.failed(work, unavailable); throw new AssertionError("producer work receipt is unavailable", unavailable);
+        } catch (RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
+    }
+
+    boolean armWorkBudgetFinalReceipt(String absolutePath, String nonce) {
+        if (absolutePath == null || absolutePath.length() > 1024 || !java.nio.file.Path.of(absolutePath).isAbsolute()
+                || nonce == null || nonce.isBlank() || nonce.length() > 64 || !nonce.chars().allMatch(c -> c >= 32 && c <= 126)) {
+            throw new AssertionError("producer final receipt requires its bounded owned path and nonce");
+        }
+        var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.PRODUCER_FINAL_SEAL, BenchmarkReturnWorkBudget.Work.request());
+        try {
+            requireAlive(); Object value = connection.invoke(name, "armWorkBudgetFinalReceipt",
+                    new Object[]{absolutePath, nonce}, new String[]{String.class.getName(), String.class.getName()});
+            BenchmarkReturnWorkBudget.returned(work, value); requireAlive();
+            if (!(value instanceof Boolean accepted)) { throw new AssertionError("producer final receipt arm has no typed result"); }
+            return accepted;
+        } catch (java.io.IOException | javax.management.JMException unavailable) {
+            BenchmarkReturnWorkBudget.failed(work, unavailable); throw new AssertionError("producer final receipt arm is unavailable", unavailable);
+        } catch (RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
+    }
 
     boolean start(String window) { return control("start", new Object[]{window}, new String[]{String.class.getName()}); }
     boolean stop() { return control("stop", new Object[0], new String[0]); }
@@ -320,7 +366,10 @@ final class BenchmarkWriteReturnReader {
         String[] names = {"Pid", "JvmStartTimeMillis", "Window", "State", "CompletedCalls", "FailedCalls",
                 "ReportedRecords", "OpenCalls", "RetainedBytes"};
         try {
-            var attributes = connection.getAttributes(name, names);
+            var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.SUMMARY_RPC, BenchmarkReturnWorkBudget.Work.request());
+            javax.management.AttributeList attributes;
+            try { attributes = connection.getAttributes(name, names); BenchmarkReturnWorkBudget.returned(work, attributes); }
+            catch (java.io.IOException | javax.management.JMException | RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
             requireAlive();
             Map<String, Object> values = new HashMap<>();
             for (Object entry : attributes) {
@@ -350,7 +399,10 @@ final class BenchmarkWriteReturnReader {
     byte[] page(long completionCursor) {
         clockSample(0, ClockRequestRole.PAGE_VALIDATION);
         try {
-            Object result = connection.invoke(name, "read", new Object[]{completionCursor}, new String[]{"long"});
+            var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.PAGE_RPC, BenchmarkReturnWorkBudget.Work.request());
+            Object result;
+            try { result = connection.invoke(name, "read", new Object[]{completionCursor}, new String[]{"long"}); BenchmarkReturnWorkBudget.returned(work, result); }
+            catch (java.io.IOException | javax.management.JMException | RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
             requireAlive();
             if (!(result instanceof byte[] bytes) || bytes.length < 8 || bytes.length > MAX_PAGE_BYTES) {
                 throw new AssertionError("return receipt page is missing or exceeds its bound");
@@ -364,7 +416,10 @@ final class BenchmarkWriteReturnReader {
     private boolean control(String operation, Object[] arguments, String[] signature) {
         clockSample(0, operation.equals("start") ? ClockRequestRole.START_VALIDATION : ClockRequestRole.STOP_VALIDATION);
         try {
-            Object result = connection.invoke(name, operation, arguments, signature);
+            var work = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.CONTROL_RPC, BenchmarkReturnWorkBudget.Work.request());
+            Object result;
+            try { result = connection.invoke(name, operation, arguments, signature); BenchmarkReturnWorkBudget.returned(work, result); }
+            catch (java.io.IOException | javax.management.JMException | RuntimeException | Error failure) { BenchmarkReturnWorkBudget.failed(work, failure); throw failure; }
             requireAlive();
             if (!(result instanceof Boolean accepted)) { throw new AssertionError("return probe control has no typed result"); }
             return accepted;

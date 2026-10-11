@@ -53,6 +53,7 @@ final class PdkSinkWriter implements SinkWriter {
     private final PdkTargetPreparation preparation;
     private final PdkExternalCallStats externalCalls;
     private final PdkWriteReturnProbe.Writer writeReturnProbe;
+    private final PdkWriteReturnWorkBudget.Actor workBudgetActor;
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
@@ -129,7 +130,11 @@ final class PdkSinkWriter implements SinkWriter {
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
         this.preparation = preparation;
         this.externalCalls = Objects.requireNonNull(externalCalls, "externalCalls");
-        this.writeReturnProbe = PdkWriteReturnProbe.forWriter(connector);
+        var budget = "true".equals(System.getProperty(PdkWriteReturnWorkBudget.PROPERTY))
+                ? PdkWriteReturnWorkBudget.enabled() : null;
+        this.workBudgetActor = budget == null ? null : budget.writer();
+        this.writeReturnProbe = PdkWriteReturnProbe.forWriter(connector, workBudgetActor);
+        if (budget != null && writeReturnProbe == null) budget.gap("RETURN_PROBE_UNAVAILABLE");
     }
 
     /** Prepare selected tables even when their source snapshot contains no rows. */
@@ -206,15 +211,21 @@ final class PdkSinkWriter implements SinkWriter {
                             return null;
                         });
                     } else {
+                        var budgetWrite = workBudgetActor == null ? null : workBudgetActor.write();
+                        try {
                         var receipt = writeReturnProbe.begin(entry.getKey(), table, rows);
                         Throwable failure = null;
                         try {
                             measuredWrite(() -> {
                                 try {
                                     write.writeRecord(connector.context(), rows, table, result -> {
+                                        var budgetCallback = workBudgetActor == null ? null : workBudgetActor.callback();
+                                        try {
                                         if (receipt != null) { receipt.callback(result); }
                                         accepted[0] += accepted(result);
                                         if (receipt != null) { receipt.callbackExited(); }
+                                        if (budgetCallback != null) budgetCallback.success();
+                                        } finally { if (budgetCallback != null) budgetCallback.close(); }
                                     });
                                 } finally {
                                     if (receipt != null) { receipt.observeReturn(); }
@@ -227,6 +238,8 @@ final class PdkSinkWriter implements SinkWriter {
                         } finally {
                             if (receipt != null) { receipt.completed(failure); }
                         }
+                        if (budgetWrite != null) budgetWrite.success();
+                        } finally { if (budgetWrite != null) budgetWrite.close(); }
                     }
                 }
                 return new WriteResult(accepted[0]);
@@ -274,10 +287,13 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public void close() {
+        if (workBudgetActor != null) workBudgetActor.closeAttempt();
         if (closed) {
             return;
         }
         closed = true;
-        letGo.run();
+        boolean success = false;
+        try { letGo.run(); success = true; }
+        finally { if (workBudgetActor != null) workBudgetActor.closed(success); }
     }
 }

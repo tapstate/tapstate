@@ -24,6 +24,8 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     static final int MAX_RETAINED_ATTEMPTS = 256;
 
     private final BenchmarkProcessProbe probe;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
+    private BenchmarkReturnWorkBudget.Ticket workLifetime;
     private final Supplier<BenchmarkProcessProbe.Snapshot> source;
     private final Duration interval;
     private final LongSupplier nanoTime;
@@ -143,6 +145,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     /** A calibration read follows active periodic work without closing or resetting the full window. */
     Checkpoint checkpoint() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_CHECKPOINT, BenchmarkReturnWorkBudget.Work.call());
         var result = new CompletableFuture<Checkpoint>();
         synchronized (lifecycle) {
             if (!started || finished || checkpointRequested) {
@@ -193,6 +196,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     record Checkpoint(Summary summary, long attemptIndex, long startedAtNanos, long completedAtNanos) { }
 
     void start() {
+        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_OPEN, BenchmarkReturnWorkBudget.Work.call());
         synchronized (lifecycle) {
             if (started || finished) {
                 throw new IllegalStateException("resource sampler can start only once");
@@ -272,6 +276,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
                 stopWorker(timeout);
                 throw finishFailure(FailureStage.SHUTDOWN, FailureReason.SHUTDOWN_TIMEOUT, timeout);
             }
+            BenchmarkReturnWorkBudget.done(workLifetime);
         } catch (SamplingFailure alreadyDiagnosed) {
             throwThreadPointInvariant();
             throw alreadyDiagnosed;
@@ -348,6 +353,8 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         if (failure != null) {
             return;
         }
+        var work = BenchmarkReturnWorkBudget.begin(workScope, finalRead ? BenchmarkReturnWorkBudget.Activity.RESOURCE_FINAL
+                : BenchmarkReturnWorkBudget.Activity.RESOURCE_READ, BenchmarkReturnWorkBudget.Work.request());
         long startedAt = nanoTime.getAsLong();
         published = new PublishedDiagnostics(published.completed(),
                 Optional.of(new PendingRead(published.completed().attemptCount() + 1, startedAt, finalRead, checkpointRead)));
@@ -370,6 +377,8 @@ final class BenchmarkResourceSampler implements AutoCloseable {
             // This duration covers the external read itself; bookkeeping and scheduled delay are separate.
             attempts.append(startedAt, nanoTime.getAsLong(), outcome, failureType, sample);
             published = new PublishedDiagnostics(attempts.snapshot(), Optional.empty());
+            if (unavailable != null) { BenchmarkReturnWorkBudget.failed(work, unavailable); }
+            else { BenchmarkReturnWorkBudget.done(work, new BenchmarkReturnWorkBudget.Work(0, 0, 1, 0, 0, 1, 4, 1)); }
         }
         if (unavailable != null) {
             failure = unavailable;
@@ -617,6 +626,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     @Override
     public void close() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.call());
         worker.shutdownNow();
         if (probe != null) {
             probe.close();

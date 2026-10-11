@@ -48,6 +48,8 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
     private long events;
     private long eventBytes;
     private long pollCalls;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
+    private BenchmarkReturnWorkBudget.Ticket workLifetime;
     private long pollNanos;
     private final Map<String, Map<String, Object>> provenance = new LinkedHashMap<>();
 
@@ -76,13 +78,16 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
                                             Filters.eq("fullDocument.after.id.__tapstate_carried", marker.rowId()))),
                             Filters.in("operationType", "replace", "update"))));
         }
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
         client = MongoClients.create(uri);
+        workLifetime = BenchmarkReturnWorkBudget.begin(workScope, BenchmarkReturnWorkBudget.Activity.TABLE_STREAM, BenchmarkReturnWorkBudget.Work.request());
         try {
             cursor = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG)
                     .watch(List.of(Aggregates.match(Filters.or(Filters.or(selected),
                             Filters.in("operationType", "drop", "rename", "dropDatabase", "invalidate")))))
                     .maxAwaitTime(100, TimeUnit.MILLISECONDS).batchSize(16).cursor();
         } catch (RuntimeException | Error startFailure) {
+            BenchmarkReturnWorkBudget.failed(workLifetime, startFailure);
             client.close();
             throw startFailure;
         }
@@ -94,7 +99,8 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
             while (true) {
                 synchronized (this) { if (closed || failure != null) { return; } }
                 long started = System.nanoTime();
-                ChangeStreamDocument<Document> event = cursor.tryNext();
+                ChangeStreamDocument<Document> event = BenchmarkReturnWorkBudget.opaqueRequest(workScope,
+                        BenchmarkReturnWorkBudget.Activity.STREAM_READ, cursor::tryNext);
                 synchronized (this) { pollCalls++; pollNanos += System.nanoTime() - started; }
                 if (event != null) { accept(event); }
             }
@@ -103,10 +109,11 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
                 if (!closed) { failure = new AssertionError("table marker observation failed", observerFailure); }
                 notifyAll();
             }
-        }
+        } finally { BenchmarkReturnWorkBudget.done(workLifetime); }
     }
 
     private synchronized void accept(ChangeStreamDocument<Document> event) {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.STREAM_ACCEPT, BenchmarkReturnWorkBudget.Work.records(1));
         if (++events > 64) { throw new AssertionError("table marker event budget exceeded"); }
         if (List.of("drop", "rename", "dropDatabase", "invalidate").contains(event.getOperationTypeString())) {
             throw new AssertionError("table marker observation stream was invalidated");
@@ -133,6 +140,8 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
             throw new AssertionError("table marker has no operation-time row image");
         }
         int bytes = record.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.REPORT_SERIALIZE,
+                new BenchmarkReturnWorkBudget.Work(1, 1, 1, 0, bytes, 1, 0, 0));
         if (bytes > 65_536 || eventBytes + bytes > 2 * 1024 * 1024) {
             throw new AssertionError("table marker evidence exceeded its retained byte budget");
         }

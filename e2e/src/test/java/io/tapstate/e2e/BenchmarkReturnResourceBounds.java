@@ -22,6 +22,8 @@ final class BenchmarkReturnResourceBounds {
             return unknown("RESOURCE_TRACE_HAS_OMITTED_OR_FAILED_READS");
         }
         var attempts = trace.retainedAttempts();
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS,
+                BenchmarkReturnWorkBudget.Work.pass(attempts.size()));
         if (attempts.size() < 2 || attempts.size() > MAX_ATTEMPTS || trace.attemptCount() != attempts.size()
                 || full.sampleCount() != attempts.size() || trace.retainedAttemptLimit() < attempts.size()
                 || trace.retainedAttemptLimit() > MAX_ATTEMPTS) {
@@ -29,7 +31,9 @@ final class BenchmarkReturnResourceBounds {
         }
         long startLower = Long.MAX_VALUE, startUpper = Long.MAX_VALUE;
         long endLower = Long.MIN_VALUE, endUpper = Long.MIN_VALUE;
+        var workScope = BenchmarkReturnWorkBudget.current();
         for (var delivery : completeCohort) {
+            if (workScope != null) { BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.RESOURCE_BOUNDS, BenchmarkReturnWorkBudget.Work.records(1)); }
             if (delivery == null || delivery.literalReturn() == null) { return unknown("RETURN_WINDOW_UNAVAILABLE"); }
             var returned = delivery.literalReturn();
             startLower = Math.min(startLower, returned.lowerNanos());

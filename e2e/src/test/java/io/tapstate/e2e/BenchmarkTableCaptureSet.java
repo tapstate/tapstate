@@ -16,12 +16,14 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
             long epoch, BenchmarkTableAckGate.Binding binding, Document runIdentity) { }
     private final BenchmarkForkEnvironment fork;
     private final StoreDocuments documents;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
     private final BenchmarkTableTerminalObserver observer;
     private final Map<String, Source> sources;
     private final List<Map<String, Object>> receipts = new ArrayList<>();
 
     static BenchmarkTableCaptureSet open(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkForkEnvironment fork) {
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, BenchmarkReturnWorkBudget.Work.request());
         StoreDocuments documents = StoreDocuments.at(fork.storeUri());
         try {
             Map<String, Source> sources = new LinkedHashMap<>();
@@ -93,7 +95,9 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
                 Duration.ofNanos(deadline - System.nanoTime()), Duration.ofMillis(100), () -> {
             observer.check();
             var association = physical(fork.control().positionRead(chain.pipelineId()), chain);
-            Document root = documents.chain(source.physical());
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.ACK_POLL, BenchmarkReturnWorkBudget.Work.call());
+            Document root = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ,
+                    () -> documents.chain(source.physical()));
             if (!association.chainId().equals(source.physical()) || root == null
                     || !(root.get("epoch") instanceof Long || root.get("epoch") instanceof Integer)
                     || !(root.get("epoch") instanceof Number epoch) || epoch.longValue() != source.epoch()) {
@@ -102,7 +106,8 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
             if (!source.runIdentity().equals(documents.benchmarkRunIdentity(chain.pipelineId()))) {
                 throw new AssertionError("benchmark pipeline artifact or execution identity changed within fork");
             }
-            Document cursor = documents.consumerOffset(source.physical(), source.binding().consumer());
+            Document cursor = BenchmarkReturnWorkBudget.request(workScope, BenchmarkReturnWorkBudget.Activity.DOCUMENT_READ,
+                    () -> documents.consumerOffset(source.physical(), source.binding().consumer()));
             if (BenchmarkTableAckGate.covers(source.binding(), point, cursor)) {
                 var after = physical(fork.control().positionRead(chain.pipelineId()), chain);
                 Document afterRoot = documents.chain(source.physical());
@@ -220,6 +225,7 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
     }
 
     @Override public void close() {
+        BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.call());
         Throwable primary = null;
         try { observer.close(); } catch (RuntimeException | Error failure) { primary = failure; }
         try { documents.close(); } catch (RuntimeException | Error cleanup) {

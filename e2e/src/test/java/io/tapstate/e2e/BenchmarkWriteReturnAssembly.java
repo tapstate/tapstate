@@ -18,6 +18,7 @@ final class BenchmarkWriteReturnAssembly {
     private static final int MAX_FRAMES = 512;
     private static final int MAX_RECORDS = MAX_FRAMES * 512;
     private static final int MAX_WRITERS = 128;
+    private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
     private static final String RECORDED = "RECORDED_SCOPE_UNQUALIFIED";
 
     record FullCall(long sequence, int writer, int totalRows, long beganNanos, long lastCallbackExitNanos, long observedNanos,
@@ -62,6 +63,8 @@ final class BenchmarkWriteReturnAssembly {
         requireOpen();
         try {
             require(bytes != null && bytes.length <= MAX_PAGE_BYTES, "page exceeds its byte bound");
+            BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.DECODE,
+                    new BenchmarkReturnWorkBudget.Work(1, 0, 0, 0, bytes.length, 1, 0, 0));
             int nextRawBytes = Math.addExact(rawBytes, bytes.length);
             require(nextRawBytes <= MAX_RAW_BYTES, "raw ledger exceeds its byte bound");
             var page = BenchmarkWriteReturnLedger.decode(bytes);
@@ -71,7 +74,11 @@ final class BenchmarkWriteReturnAssembly {
             require(!seenPage || page.totalFrames() >= totalFrames, "terminal frame total moved backward");
             require(page.totalFrames() <= MAX_FRAMES, "frame roster exceeds its bound");
             if (!RECORDED.equals(page.state())) { unknownState = true; }
-            for (var part : page.calls()) { addPart(part); }
+            for (var part : page.calls()) {
+                BenchmarkReturnWorkBudget.add(workScope, BenchmarkReturnWorkBudget.Activity.FRAME_VISIT,
+                        new BenchmarkReturnWorkBudget.Work(1, 0, part.rows().size(), 1, 0, 1, part.rows().size(), 0));
+                addPart(part);
+            }
             seenPage = true;
             epoch = page.epoch();
             nextCursor = page.nextCursor();

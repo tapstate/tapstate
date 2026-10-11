@@ -43,6 +43,8 @@ final class BenchmarkWriteReturnExpectations {
         require(phase.expectedLogicalOutputChanges() >= 0 && phase.expectedLogicalOutputChanges() <= MAX_RECORDS,
                 "phase registration exceeds the record bound");
         require(calls.size() <= MAX_FRAMES, "call roster exceeds the frame bound");
+        BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.ASSOCIATION,
+                BenchmarkReturnWorkBudget.Work.records(phase.expectedLogicalOutputChanges()));
         List<BenchmarkForkEnvironment.BatchResult> batches = sourceRoster(phase, sourceBatches);
         List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase);
         Map<String, BenchmarkExpectedChanges.TargetPlan> byTable = new LinkedHashMap<>();
@@ -53,6 +55,7 @@ final class BenchmarkWriteReturnExpectations {
             require(workload.pipelineIds().contains(plan.target().pipelineId()), "target pipeline is unregistered");
             require(plan.batches().size() == batches.size(), "target and source batch rosters differ");
             for (int index = 0; index < batches.size(); index++) {
+                BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT, BenchmarkReturnWorkBudget.Work.pass(1));
                 for (BenchmarkMongoDeliveryObserver.ExpectedChange expected : plan.forBatch(index)) {
                     require(expected.kind() == BenchmarkMongoDeliveryObserver.Kind.UPDATE,
                             "fixed measured registration is not an update");
@@ -71,6 +74,7 @@ final class BenchmarkWriteReturnExpectations {
         List<Association> associated = new ArrayList<>(origins.size());
         int frames = 0;
         for (BenchmarkWriteReturnAssembly.FullCall call : List.copyOf(calls)) {
+            BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.COPY, BenchmarkReturnWorkBudget.Work.pass(call.rows().size()));
             require(call != null && call.sequence() > 0 && sequences.add(call.sequence()),
                     "call sequence is missing or duplicate");
             require(call.writer() > 0 && call.writer() <= MAX_WRITERS, "writer number exceeds its bound");
