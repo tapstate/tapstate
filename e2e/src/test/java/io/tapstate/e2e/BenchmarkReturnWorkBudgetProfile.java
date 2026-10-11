@@ -201,7 +201,8 @@ final class BenchmarkReturnWorkBudgetProfile {
         put(upper, BenchmarkReturnWorkBudget.Activity.COMMAND_READ, 1, 1, 0, 0, materialBytes, 1, nodes, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.HELLO_CLIENT, 1, 0, 0, 0, 0, 0, 0, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.HELLO_READ, 1, 1, 0, 0, materialBytes, 1, nodes, 0);
-        put(upper, BenchmarkReturnWorkBudget.Activity.PING_REQUEST, 1, 1, 0, 0, materialBytes, 1, nodes, 0);
+        // One boxing API, one fixed command constructor and one provider request; the reply is unused.
+        put(upper, BenchmarkReturnWorkBudget.Activity.PING_REQUEST, 1, 3, 0, 0, materialBytes, 1, nodes, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.TARGET_STREAM, 1, 1, 0, 0, 0, 0, 0, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.TABLE_STREAM, 1, 1, 0, 0, 0, 0, 0, 0);
         put(upper, BenchmarkReturnWorkBudget.Activity.STREAM_READ, 1, 1, 0, 0, 0, 0, 0, 0);

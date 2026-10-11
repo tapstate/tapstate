@@ -27,14 +27,19 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
         var client = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> MongoClients.create(uri));
         try {
             var admin = client.getDatabase("admin").withTimeout(1, TimeUnit.SECONDS);
-            BenchmarkReturnWorkBudget.request(BenchmarkReturnWorkBudget.Activity.PING_REQUEST,
-                    () -> admin.runCommand(new org.bson.Document("ping", 1)));
+            ping(admin);
             return new BenchmarkTargetClockSampler(() -> BenchmarkTargetClock.read(admin),
                     () -> BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { client.close(); return null; }));
         } catch (RuntimeException | Error failure) {
             BenchmarkReturnWorkBudget.failure(scope, failure);
             client.close(); throw failure;
         }
+    }
+
+    static void ping(com.mongodb.client.MongoDatabase admin) {
+        // The readiness reply is unused; account for the existing provider request without consuming its material.
+        BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.PING_REQUEST,
+                () -> admin.runCommand(new org.bson.Document("ping", 1)));
     }
 
     BenchmarkTargetClockSampler(Supplier<BenchmarkTargetClock.Reading> source, Runnable closeSource) {
