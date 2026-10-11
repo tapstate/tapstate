@@ -295,13 +295,11 @@ final class ControlPlane {
     }
 
     /**
-     * The node ids this member says are in its cluster, in order.
+     * The stable ids of native members this answering node observes live, in sorted order.
      *
-     * <p>Asked of one member rather than of the cluster, because that is the property worth having: each
-     * of them answers out of the committed membership rather than out of what it happens to have seen,
-     * so two members that have found each other answer the same list and two that have not answer two
-     * lists of one. Sorted, so that comparing two members' answers compares what they hold rather than
-     * the order they happened to write it in.
+     * <p>The topology also retains admitted registry rows for departed and reserved boots. Their presence
+     * in the response does not make them native members; admission state and lease status likewise do not
+     * decide whether a member is visible in this node's native view.
      */
     List<String> clusterMemberNodeIds() {
         HttpResponse<String> response = send(authedGet("/api/cluster/members"));
@@ -384,7 +382,10 @@ final class ControlPlane {
         }
         List<String> nodeIds = new ArrayList<>();
         for (Object member : members) {
-            if (member instanceof Map<?, ?> one && one.get("nodeId") instanceof String nodeId) {
+            if (!(member instanceof Map<?, ?> one) || !(one.get("live") instanceof Boolean live)) {
+                throw new AssertionError("the cluster member carried no native liveness fact: " + member);
+            }
+            if (live && one.get("nodeId") instanceof String nodeId) {
                 nodeIds.add(nodeId);
             }
         }

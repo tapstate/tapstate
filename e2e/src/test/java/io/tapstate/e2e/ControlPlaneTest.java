@@ -392,10 +392,47 @@ class ControlPlaneTest {
                 .hasMessageContaining("would not say why");
     }
 
-    /** A topology answer naming {@code nodeIds}, in the order given. */
+    @Test
+    void excludesHistoricalAndReservedRowsWithoutFilteringLiveAdmissionStates() {
+        String body = JsonWriter.write(Map.of("members", List.of(
+                Map.of("nodeId", "node-a", "memberUuid", "old-a", "state", "LOST", "live", false),
+                Map.of("nodeId", "node-b", "state", "ACTIVE", "live", true),
+                Map.of("nodeId", "node-c", "state", "JOINING", "live", false),
+                Map.of("nodeId", "node-d", "state", "LOST", "live", true),
+                Map.of("nodeId", "node-e", "state", "JOINING", "live", true),
+                Map.of("nodeId", "node-f", "state", "INCOMPATIBLE", "live", true))));
+        assertThat(ControlPlane.interpretClusterMembers(200, body))
+                .contains(List.of("node-b", "node-d", "node-e", "node-f"));
+    }
+
+    @Test
+    void aReadableRegistryWithNoNativeMembersIsAnActualEmptyAnswer() {
+        String body = JsonWriter.write(Map.of("members", List.of(
+                Map.of("nodeId", "node-a", "memberUuid", "old-a", "state", "LOST", "live", false))));
+        assertThat(ControlPlane.interpretClusterMembers(200, body)).contains(List.of());
+    }
+
+    @Test
+    void absentOrMalformedNativeLivenessCannotBecomeAnEmptyMembership() {
+        for (String member : List.of("{\"nodeId\":\"node-a\"}",
+                "{\"nodeId\":\"node-a\",\"live\":null}",
+                "{\"nodeId\":\"node-a\",\"live\":\"false\"}")) {
+            String body = "{\"members\":[" + member + "]}";
+            assertThatThrownBy(() -> ControlPlane.interpretClusterMembers(200, body))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("native liveness fact");
+        }
+    }
+
+    @Test
+    void duplicateLiveStableIdsRemainVisibleToTheMembershipPredicate() {
+        assertThat(ControlPlane.interpretClusterMembers(200, topology("node-a", "node-a")))
+                .contains(List.of("node-a", "node-a"));
+    }
+
+    /** A native membership answer naming {@code nodeIds}, in the order given. */
     private static String topology(String... nodeIds) {
-        List<Map<String, String>> members =
-                java.util.Arrays.stream(nodeIds).map(id -> Map.of("nodeId", id)).toList();
+        List<Map<String, Object>> members =
+                java.util.Arrays.stream(nodeIds).map(id -> Map.<String, Object>of("nodeId", id, "live", true)).toList();
         return JsonWriter.write(Map.of("clusterId", "cluster-a", "members", members));
     }
 

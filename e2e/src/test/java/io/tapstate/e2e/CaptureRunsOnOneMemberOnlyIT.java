@@ -115,6 +115,9 @@ class CaptureRunsOnOneMemberOnlyIT {
                             + "a source nothing ever read is also read no more than once: %s",
                             byOneMemberAlone)
                     .isPositive();
+            assertThat(byOneMemberAlone.deliveries())
+                    .as("the baseline delivered exactly the inserted row, without replaying its snapshot rows: %s", byOneMemberAlone)
+                    .isEqualTo(1);
             assertThat(byOneMemberAlone.snapshots())
                     .describedAs("and it loaded, so that the bound on loads below bounds something: %s",
                             byOneMemberAlone)
@@ -140,6 +143,7 @@ class CaptureRunsOnOneMemberOnlyIT {
                 control.lifecycle(FIRST_PIPELINE, LifecycleVerb.START);
                 awaitRunning(control, FIRST_PIPELINE);
                 awaitTheRowsAtTheTarget(files, firstTarget);
+                deliverANewRowThroughTheExistingTail(files, source, firstTarget, ledger, SEEDED_ROWS + 1);
 
                 Reads onePipeline = settle(ledger);
                 assertThat(onePipeline.readers())
@@ -151,6 +155,9 @@ class CaptureRunsOnOneMemberOnlyIT {
                 assertThat(onePipeline.tails())
                         .describedAs("and one tail was opened on it, not one per member: %s", onePipeline)
                         .isEqualTo(byOneMemberAlone.tails());
+                assertThat(onePipeline.deliveries())
+                        .as("the cluster also delivered exactly one physical CDC batch for the one inserted row")
+                        .isEqualTo(byOneMemberAlone.deliveries());
                 assertThat(onePipeline.snapshots())
                         .describedAs("and it was loaded once. One pipeline owes one load however many "
                                 + "members could have run it: %s", onePipeline)
@@ -183,6 +190,9 @@ class CaptureRunsOnOneMemberOnlyIT {
                                 + "is shared between pipelines rather than owed by each: %s",
                                 twoPipelines)
                         .isEqualTo(byOneMemberAlone.tails());
+                assertThat(twoPipelines.deliveries())
+                        .as("joining the shared capture must not mine the already delivered row again")
+                        .isEqualTo(onePipeline.deliveries());
                 assertThat(twoPipelines.snapshots())
                         .describedAs("and loaded exactly once more, wherever it landed - a load per "
                                 + "pipeline is owed, so one fewer is a pipeline missing the rows that "
@@ -238,10 +248,15 @@ class CaptureRunsOnOneMemberOnlyIT {
                 control.lifecycle(SECOND_PIPELINE, LifecycleVerb.START);
                 awaitRunning(control, SECOND_PIPELINE);
                 awaitTheRowsAtTheTarget(files, secondTarget);
+                deliverANewRowThroughTheExistingTail(files, source, firstTarget, ledger, SEEDED_ROWS + 1);
+                awaitTheRowsAtTheTarget(files, secondTarget, SEEDED_ROWS + 1);
 
                 Reads bothRunning = settle(ledger);
                 assertThat(bothRunning.tails())
                         .as("one server opens one source tail for both running pipelines: %s", bothRunning)
+                        .isEqualTo(1);
+                assertThat(bothRunning.deliveries())
+                        .as("both targets confirmed one new row from one actual source delivery")
                         .isEqualTo(1);
                 assertThat(bothRunning.snapshots())
                         .as("each pipeline still reads its own snapshot: %s", bothRunning)
@@ -253,16 +268,19 @@ class CaptureRunsOnOneMemberOnlyIT {
                         () -> String.valueOf(control.state(FIRST_PIPELINE)));
                 files.cdc(address, TABLE, CdcOp.INSERT, 1);
                 Await.until("the remaining pipeline to keep receiving changes",
-                        () -> files.count(EndpointAddress.uri(secondTarget.toString()), TABLE) >= SEEDED_ROWS + 1,
+                        () -> files.count(EndpointAddress.uri(secondTarget.toString()), TABLE) >= SEEDED_ROWS + 2,
                         () -> "rows at second target = "
                                 + files.count(EndpointAddress.uri(secondTarget.toString()), TABLE));
                 Reads afterStop = settle(ledger);
+                assertThat(afterStop.tails()).as("the remaining consumer retains the same physical reader")
+                        .isEqualTo(bothRunning.tails());
+                assertThat(afterStop.deliveries()).isEqualTo(2);
                 assertThat(afterStop.lines().stream()
                         .filter(line -> line.contains("\ttail\t"))
                         .map(line -> Integer.parseInt(line.split("\t")[3]))
                         .toList())
                         .as("the original tail reads only the new row; a reopened one rereads the whole file")
-                        .containsExactly((int) SEEDED_ROWS, 1);
+                        .containsExactly(1, 1);
             }
         }
     }
@@ -294,6 +312,7 @@ class CaptureRunsOnOneMemberOnlyIT {
             control.lifecycle(BASELINE_PIPELINE, LifecycleVerb.START);
             awaitRunning(control, BASELINE_PIPELINE);
             awaitTheRowsAtTheTarget(files, target);
+            deliverANewRowThroughTheExistingTail(files, source, target, ledger, SEEDED_ROWS + 1);
             return settle(ledger);
         }
     }
@@ -313,34 +332,38 @@ class CaptureRunsOnOneMemberOnlyIT {
      * which is how the earlier form of this case came to assert a number that depended on where the
      * second pipeline landed: it failed 5 times in 28 runs, every one of them on a load that was owed.
      */
-    private record Reads(int readers, int tailers, long snapshots, long tails, List<String> lines) {
+    private record Reads(int readers, int tailers, long snapshots, long tails, long deliveries, List<String> lines) {
 
         private static final String SNAPSHOT = "snapshot";
         private static final String TAIL = "tail";
+        private static final String START = "START";
 
-        /** Parses the ledger the harness's own connector writes: pid, phase, table, rows, tab-separated. */
+        /** Counts SDK reader entries separately from accepted snapshot and CDC delivery batches. */
         static Reads of(List<String> lines) {
             Set<String> readers = new LinkedHashSet<>();
             Set<String> tailers = new LinkedHashSet<>();
             long snapshots = 0;
             long tails = 0;
+            long deliveries = 0;
             for (String line : lines) {
                 String[] fields = line.split("\t");
                 readers.add(fields[0]);
                 if (fields.length > 1 && SNAPSHOT.equals(fields[1])) {
                     snapshots++;
-                } else if (fields.length > 1 && TAIL.equals(fields[1])) {
+                } else if (fields.length > 1 && START.equals(fields[1])) {
                     tailers.add(fields[0]);
                     tails++;
+                } else if (fields.length > 1 && TAIL.equals(fields[1])) {
+                    deliveries++;
                 }
             }
-            return new Reads(readers.size(), tailers.size(), snapshots, tails, List.copyOf(lines));
+            return new Reads(readers.size(), tailers.size(), snapshots, tails, deliveries, List.copyOf(lines));
         }
 
         @Override
         public String toString() {
             return readers + " process(es), " + tailers + " of them tailing, " + snapshots + " load(s), "
-                    + tails + " tail(s) in " + lines.size() + " batch(es): " + lines;
+                    + tails + " tail opening(s), " + deliveries + " CDC delivery batch(es): " + lines;
         }
     }
 
@@ -406,11 +429,23 @@ class CaptureRunsOnOneMemberOnlyIT {
      * <p>Before any counting: "read no more than once" is satisfied by a run that read nothing, and a
      * run that never started reads nothing in exactly the same way a working one reads once.
      */
+    private static void deliverANewRowThroughTheExistingTail(FileEndpoints files, Path source, Path target,
+            Path ledger, long expectedRows) {
+        Await.until("the SDK reader to enter at its frozen source position",
+                () -> Reads.of(ledgerLines(ledger)).tails() > 0, () -> ledgerDump(ledger));
+        files.cdc(EndpointAddress.uri(source.toString()), TABLE, CdcOp.INSERT, 1);
+        awaitTheRowsAtTheTarget(files, target, expectedRows);
+    }
+
     private static void awaitTheRowsAtTheTarget(FileEndpoints files, Path target) {
+        awaitTheRowsAtTheTarget(files, target, SEEDED_ROWS);
+    }
+
+    private static void awaitTheRowsAtTheTarget(FileEndpoints files, Path target, long expectedRows) {
         EndpointAddress address = EndpointAddress.uri(target.toString());
         Await.until(
-                "the seeded rows to reach " + target.getFileName(),
-                () -> files.count(address, TABLE) >= SEEDED_ROWS,
+                expectedRows + " confirmed rows to reach " + target.getFileName(),
+                () -> files.count(address, TABLE) >= expectedRows,
                 () -> "rows at target = " + files.count(address, TABLE));
     }
 
