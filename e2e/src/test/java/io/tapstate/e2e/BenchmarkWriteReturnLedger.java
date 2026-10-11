@@ -19,10 +19,10 @@ final class BenchmarkWriteReturnLedger {
     private static final int VERSION = 3;
     private static final int MAX_PAGE_BYTES = 64 * 1024;
     private static final int MAX_CALL_BYTES = MAX_PAGE_BYTES - 2048 - Integer.BYTES;
-    private static final int MAX_FRAMES = 512;
+    private static final int MAX_FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES;
     private static final int MAX_BATCH_ROWS = 512;
     private static final int MAX_NATIVE_ROWS = 1024;
-    private static final int MAX_RECORDS = MAX_FRAMES * MAX_BATCH_ROWS;
+    private static final int MAX_RECORDS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
     private static final int MAX_WRITERS = 128;
 
     private BenchmarkWriteReturnLedger() { }
@@ -62,6 +62,7 @@ final class BenchmarkWriteReturnLedger {
             require(epoch >= 0 && cursor >= 0 && cursor <= next && next <= total && total <= MAX_FRAMES,
                     "page epoch or completion cursor is invalid");
             require(cursor == total || next > cursor, "page made no completion cursor progress");
+            require(next - cursor <= BenchmarkReturnLocalSourceWork.MAX_PAGE_FRAMES, "page piece roster exceeds its source byte bound");
             String window = text(input, 512, "window");
             String state = text(input, 128, "state");
             require(state.equals("IDLE") || state.equals("RECORDED_SCOPE_UNQUALIFIED")

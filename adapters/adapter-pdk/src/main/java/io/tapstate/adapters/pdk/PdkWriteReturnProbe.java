@@ -33,8 +33,20 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     static final int MAX_LEDGER_BYTES = 2 * 1024 * 1024;
     static final int MAX_BATCH_RECORDS = 512;
     static final int MAX_CALL_RECORDS = 1024;
-    static final int MAX_FRAMES = 512;
-    static final int MAX_RECORDS = MAX_FRAMES * MAX_BATCH_RECORDS;
+    // A V3 stored piece has seven longs, seven ints, one flag, five non-key text
+    // prefixes, one key-count byte/key prefix, a row count, one kind/int row and its length prefix.
+    // Variable text is conservatively allowed zero bytes; every retained piece has at least one row.
+    static final int MIN_STORED_FRAME_BYTES = 7 * Long.BYTES + 7 * Integer.BYTES + 1
+            + 5 * Short.BYTES + 1 + Short.BYTES + Integer.BYTES + 1 + Integer.BYTES + Integer.BYTES;
+    static final int PAGE_PAYLOAD_BYTES = MAX_FRAME_BYTES - 2048;
+    static final int MAX_PAGE_HEADER_BYTES = 32 + 512 + 128;
+    // Greedy adjacent nonempty pages have combined stored payload greater than one page capacity.
+    // Reserve their source-bounded headers within the independent raw two-MiB envelope.
+    static final int MAX_NONEMPTY_PAGES = 2 * (MAX_LEDGER_BYTES / (PAGE_PAYLOAD_BYTES + 1)) + 1;
+    static final int MAX_STORED_BYTES = MAX_LEDGER_BYTES - MAX_NONEMPTY_PAGES * MAX_PAGE_HEADER_BYTES;
+    static final int MAX_FRAMES = MAX_STORED_BYTES / MIN_STORED_FRAME_BYTES;
+    static final int MAX_RECORDS = 262144;
+    private static final int MAX_COST_CALLS = 512;
     static final int MAX_OPEN_CALLS = 128;
     private static PdkWriteReturnProbe installed;
 
@@ -417,7 +429,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
                 if (workBudget != null) workBudget.material(4, payload.length);
             }
             if (frames.size() + payloads.size() > MAX_FRAMES
-                    || retainedBytes + bytesTotal > MAX_LEDGER_BYTES
+                    || retainedBytes + bytesTotal > MAX_STORED_BYTES
                     || retainedRecords + ticket.rows > MAX_RECORDS) {
                 unknown("LEDGER_OVERFLOW"); return;
             }
@@ -486,7 +498,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         void record(Ticket ticket, Throwable failure) {
             try { fullCalls = Math.incrementExact(fullCalls); }
             catch (ArithmeticException overflow) { fail("CALL_COUNT_OVERFLOW"); return; }
-            if (fullCalls > MAX_FRAMES) { fail("CALL_CAPACITY_EXCEEDED"); return; }
+            if (fullCalls > MAX_COST_CALLS) { fail("CALL_CAPACITY_EXCEEDED"); return; }
             if (failure != null) { fail("FAILED_CALL"); }
             if (!ticket.receiptAdmitted || !ticket.returnObserved || !ticket.returnOnBeginThread
                     || ticket.callbacks == 0 || ticket.callbackExits != ticket.callbacks || !ticket.lastCallbackExitObserved

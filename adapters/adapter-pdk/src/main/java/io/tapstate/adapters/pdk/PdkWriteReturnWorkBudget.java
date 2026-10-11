@@ -119,8 +119,10 @@ final class PdkWriteReturnWorkBudget {
     // number/literal paths get twelve calls per input character; JsonWriter's control escape path
     // gets five. The preparse roster has at most 64 tokens/nodes. Startup additionally renders the
     // fixed formula rosters and eight coefficients per activity before digesting the ASCII formula.
+    static final String TRANSPORT_SOURCE = "ledger-raw=2097152;stored=2052128;page-header=672;nonempty-pages=67;min-stored-v3-piece=111;stored-frames=18487;part-rows=512;total-rows=262144;cost-stage-calls=512;admitted-storage-only-not-future-total-calls;";
+    static final long TRANSPORT_SOURCE_CHARS = TRANSPORT_SOURCE.length();
     static final long CONFIG_BOOTSTRAP_REQUESTS = add(mul(8, REPORT_ENTRIES), mul(4, REPORT_KEY_CHARS),
-            mul(4, mul(ACTIVITY_NAMES.size(), UNITS.size())), 8);
+            mul(4, mul(ACTIVITY_NAMES.size(), UNITS.size())), 8, 8);
     static final long CONFIG_REQUESTS = add(mul(6, MAX_INPUT_BYTES), mul(12, MAX_INPUT_BYTES),
             mul(5, MAX_INPUT_BYTES), mul(64, 32), CONFIG_BOOTSTRAP_REQUESTS);
 
@@ -128,7 +130,8 @@ final class PdkWriteReturnWorkBudget {
        material is accounted before traversal/copy, with separate actual material observations.
        The fixed allocations bound this collector's source operations; opaque callees stay requests. */
     enum Activity {
-        CONFIG(1, CONFIG_REQUESTS, 0, 0, MAX_INPUT_BYTES * 8L, 16, MAX_INPUT_BYTES * 16L, MAX_INPUT_BYTES * 16L),
+        CONFIG(1, CONFIG_REQUESTS, 0, 0, MAX_INPUT_BYTES * 8L + TRANSPORT_SOURCE_CHARS * 8L, 16,
+                MAX_INPUT_BYTES * 16L + TRANSPORT_SOURCE_CHARS * 16L, MAX_INPUT_BYTES * 16L + TRANSPORT_SOURCE_CHARS * 16L),
         INSTALL(1, 24, 0, 0, 2048, 4, 256, 64),
         WRITER_INSTALL(1, 16, 0, 0, 2048, 4, 512, 64),
         WRITER_ROSTER(1, 4, 0, 0, 0, 1, 16, 16),
@@ -573,6 +576,7 @@ final class PdkWriteReturnWorkBudget {
 
     private static String formula() {
         var result = new StringBuilder("WRITE_RETURN_PRODUCER_WORK_V1;units=calls,requests,records,frames,bytes,passes,elements,updates;opaque=requests;actual=basis;upper=checked-allocation;native-copy-requests=2053;native-copy-bytes=16593;hash-material=16MiB+4*256KiB+5*8192;hash-requests=2*(hash-material+5)+2053+1024;clock-transfer=4*(hash-material+16593)+65536;clock-elements-updates=8*(hash-material+16593)+65536;key-shape=2;frame=65536;call-rows=1024;error-entries=512;epochs=16;gaps=32;reason=128;config-depth=4;config-tokens=64;config-string=1024;config-number=20;seal=256;request-unit=explicit-JDK-provider-and-boxing-invocations;json-map=5+7*entries;json-list=4+3*elements;json-string=3+3*chars;json-scalar=2;ascii=2+2*chars;");
+        result.append(TRANSPORT_SOURCE);
         result.append("cold-origins=32;native-part=8192;header-part=8192;origin-part=64512;packet=2080768;class-material=1048576;source=per-class-fixed-roster-api-hash-json;");
         result.append("rootFields=").append(String.join(",", ROOT_FIELDS)).append(';');
         result.append("activityNames=").append(String.join(",", ACTIVITY_NAMES)).append(';');

@@ -184,7 +184,7 @@ class BenchmarkWriteReturnAssemblyTest {
     @Test void oversized_pages_frame_rosters_and_raw_receipt_growth_are_rejected_before_closure() throws Exception {
         assertThatThrownBy(() -> new BenchmarkWriteReturnAssembly("window").add(new byte[65_537]))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("page exceeds");
-        assertThatThrownBy(() -> new BenchmarkWriteReturnAssembly("window").add(page(1, 0, 1, 513,
+        assertThatThrownBy(() -> new BenchmarkWriteReturnAssembly("window").add(page(1, 0, 1, 18488,
                 "window", RECORDED, new Fixture()))).isInstanceOf(AssertionError.class);
         var assembly = new BenchmarkWriteReturnAssembly("window");
         boolean refused = false;

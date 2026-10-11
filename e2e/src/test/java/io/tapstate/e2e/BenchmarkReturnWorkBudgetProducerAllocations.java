@@ -8,7 +8,7 @@ import java.util.Set;
 /** Independent arithmetic for one frozen producer definition; runtime coverage is verified separately. */
 final class BenchmarkReturnWorkBudgetProducerAllocations {
     static final String DEFINITION_ID = "WRITE_RETURN_PRODUCER_WORK_V1";
-    static final String FORMULA_SHA256 = "5248e6d4304d26ccfd6744b0b05cc6206cd7de0d31b3bb057a9b4569b19776cb";
+    static final String FORMULA_SHA256 = "5e7e3babad7f8e2bd19f22c8ce0aac1ba5164e72e3867d5957cc568a6bfa4c89";
     static final List<String> UNITS = List.of("calls", "requests", "records", "frames", "bytes", "passes", "elements", "updates");
     private static final List<String> FLAGS = List.of("structuralBudgetQualified", "accountingErrorBoundQualified",
             "wholeMethodCostQualified", "collectionCostUpperBoundQualified", "samplingCostQualified",
@@ -54,8 +54,10 @@ final class BenchmarkReturnWorkBudgetProducerAllocations {
     private static final long REPORT_BYTES = add(mul(2, STRING_CHARS), JSON_CHARS, 64, 32, 64);
     private static final long REPORT_PASSES = add(4, 1, 1, MAPS, 2, ENTRIES, NODES, 1);
     private static final long REPORT_ELEMENTS = mul(8, add(NODES, ENTRIES, STRING_CHARS, JSON_CHARS));
+    private static final String TRANSPORT_SOURCE = "ledger-raw=2097152;stored=2052128;page-header=672;nonempty-pages=67;min-stored-v3-piece=111;stored-frames=18487;part-rows=512;total-rows=262144;cost-stage-calls=512;admitted-storage-only-not-future-total-calls;";
+    private static final long TRANSPORT_SOURCE_CHARS = 210;
     private static final long CONFIG_REQUESTS = add(mul(6, INPUT_BYTES), mul(12, INPUT_BYTES), mul(5, INPUT_BYTES),
-            mul(64, 32), mul(8, ENTRIES), mul(4, KEY_CHARS), mul(4, mul(ACTORS.size(), UNITS.size())), 8);
+            mul(64, 32), mul(8, ENTRIES), mul(4, KEY_CHARS), mul(4, mul(ACTORS.size(), UNITS.size())), 16);
     private static final long CLOCK_HASH_BYTES = add(16L * 1024 * 1024, 4L * 256 * 1024, 5L * 8192);
     private static final long CLOCK_MATERIAL = add(CLOCK_HASH_BYTES, 16593);
     private static final long CLOCK_REQUESTS = add(2053, 1024, mul(2, add(CLOCK_HASH_BYTES, 5)));
@@ -160,7 +162,9 @@ final class BenchmarkReturnWorkBudgetProducerAllocations {
 
     private static Map<String, BenchmarkReturnWorkBudget.Work> table() {
         var table = new LinkedHashMap<String, BenchmarkReturnWorkBudget.Work>();
-        table.put("CONFIG", work(1, CONFIG_REQUESTS, 0, 0, mul(INPUT_BYTES, 8), 16, mul(INPUT_BYTES, 16), mul(INPUT_BYTES, 16)));
+        // Both fixed operands fit in long; compiler folding adds no initializer/provider calls.
+        table.put("CONFIG", work(1, CONFIG_REQUESTS, 0, 0, INPUT_BYTES * 8L + TRANSPORT_SOURCE_CHARS * 8L, 16,
+                INPUT_BYTES * 16L + TRANSPORT_SOURCE_CHARS * 16L, INPUT_BYTES * 16L + TRANSPORT_SOURCE_CHARS * 16L));
         table.put("INSTALL", work(1, 24, 0, 0, 2048, 4, 256, 64));
         table.put("WRITER_INSTALL", work(1, 16, 0, 0, 2048, 4, 512, 64));
         table.put("WRITER_ROSTER", work(1, 4, 0, 0, 0, 1, 16, 16));

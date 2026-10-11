@@ -9,7 +9,7 @@ import java.util.List;
 
 /** Pure pooling of phase interval inputs; the caller must separately prove method and phase acceptance. */
 final class BenchmarkReturnIntervalMetrics {
-    private static final int MAX_PHASES = 6, MAX_COHORT_ROWS = 512 * 512;
+    private static final int MAX_PHASES = 6, MAX_COHORT_ROWS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
     private BenchmarkReturnIntervalMetrics() { }
 
     record Phase(String id, long completedLower, long completedUpper, long durationLower, long durationUpper,

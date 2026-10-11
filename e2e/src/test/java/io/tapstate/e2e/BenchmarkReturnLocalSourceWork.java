@@ -5,7 +5,20 @@ import java.util.Map;
 
 /** Inclusive source bounds per entered local helper; opaque provider instructions are excluded. */
 final class BenchmarkReturnLocalSourceWork {
-    static final int PAGE_BYTES = 65_536, FRAMES = 512, PART_ROWS = 512, CALL_ROWS = 1024;
+    // Stored V3 source lower: fixed85 +five UTF8prefixes10 +keyCount1 +keyPrefix2 +rowCount4 +row5 +storedLength4.
+    static final int RAW_LEDGER_BYTES = 2097152, MIN_STORED_FRAME_BYTES = 85 + 5 * Short.BYTES + 1 + Short.BYTES
+            + Integer.BYTES + 1 + Integer.BYTES + Integer.BYTES;
+    static final int MIN_PAGE_HEADER_BYTES = 32, MAX_PAGE_HEADER_BYTES = 32 + 512 + 128;
+    static final int MAX_STORED_PIECE_BYTES = 65536 - 2048;
+    // Complete-piece packing: adjacent nonempty page payloads sum>A. Initial empty validation is not retained.
+    // These fixed expressions fit in int and are compiler constants; no initializer/provider work is added.
+    static final int HEADER_PAGE_RESERVATION = 2 * (RAW_LEDGER_BYTES / (MAX_STORED_PIECE_BYTES + 1)) + 1;
+    static final int STORED_LEDGER_BYTES = RAW_LEDGER_BYTES - HEADER_PAGE_RESERVATION * MAX_PAGE_HEADER_BYTES;
+    static final int MAX_STORED_FRAMES = STORED_LEDGER_BYTES / MIN_STORED_FRAME_BYTES;
+    static final int MAX_STORED_CALLS = MAX_STORED_FRAMES;
+    static final int MAX_PAGE_FRAMES = (65536 - MIN_PAGE_HEADER_BYTES) / MIN_STORED_FRAME_BYTES;
+    static final int MAX_ROWS = 262144;
+    static final int PAGE_BYTES = 65_536, FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES, PAGE_FRAMES = BenchmarkReturnLocalSourceWork.MAX_PAGE_FRAMES, PART_ROWS = 512, CALL_ROWS = 1024;
     static final int ROWS = 262_144, SAMPLES = 512, RESOURCE_ATTEMPTS = 4096, KEYS = 2;
     static final int ROUTING_TEXT_BYTES = 512;
 
@@ -61,15 +74,15 @@ final class BenchmarkReturnLocalSourceWork {
                 "SOURCE_GAP_ORIGINAL_EXPECTED_CHANGE_AND_KEY_EXTRACTOR_RECIPE");
         var result = new EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
         long n = capacity.fullRows(), cohort = capacity.cohortRows(), batches = capacity.sourceBatches();
-        long text = Math.min(PAGE_BYTES / 2L, add(2, mul(FRAMES, add(7, PART_ROWS))));
-        long errors = Math.min(mul(FRAMES, PART_ROWS), add(PAGE_BYTES / 7L, 1));
-        long pageRows = Math.min(mul(FRAMES, PART_ROWS), add(PAGE_BYTES / 5L, 1));
-        long decodeVisits = add(FRAMES, text, errors, pageRows);
+        long text = Math.min(PAGE_BYTES / 2L, add(2, mul(PAGE_FRAMES, add(7, PART_ROWS))));
+        long errors = Math.min(mul(PAGE_FRAMES, PART_ROWS), add(PAGE_BYTES / 7L, 1));
+        long pageRows = Math.min(mul(PAGE_FRAMES, PART_ROWS), add(PAGE_BYTES / 5L, 1));
+        long decodeVisits = add(PAGE_FRAMES, text, errors, pageRows);
         // Text prefixes/read/UTF-8/ByteBuffer calls, fixed frame fields, details and two-key rows.
         put(result, BenchmarkReturnWorkBudget.Activity.DECODE,
-                add(1, decodeVisits), add(128, mul(16, text), mul(96, FRAMES), mul(8, errors), mul(16, pageRows)),
-                pageRows, FRAMES, add(mul(8, PAGE_BYTES), mul(64, decodeVisits)), 8,
-                add(mul(8, PAGE_BYTES), decodeVisits), add(mul(4, FRAMES), mul(4, pageRows), errors));
+                add(1, decodeVisits), add(128, mul(16, text), mul(96, PAGE_FRAMES), mul(8, errors), mul(16, pageRows)),
+                pageRows, PAGE_FRAMES, add(mul(8, PAGE_BYTES), mul(64, decodeVisits)), 8,
+                add(mul(8, PAGE_BYTES), decodeVisits), add(mul(4, PAGE_FRAMES), mul(4, pageRows), errors));
 
         // One part may finish a full 1024-row call; immutable constructors copy all three lists.
         long frameVisits = add(CALL_ROWS, PART_ROWS, KEYS);
@@ -153,7 +166,7 @@ final class BenchmarkReturnLocalSourceWork {
                 "measured SQL exceeds its prior material bound");
     }
 
-    static long maximumFrameRows() { return mul(FRAMES, PART_ROWS); }
+    static long maximumFrameRows() { return ROWS; }
     private static void put(EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> values,
                             BenchmarkReturnWorkBudget.Activity activity, long calls, long requests, long records, long frames,
                             long bytes, long passes, long elements, long updates) {

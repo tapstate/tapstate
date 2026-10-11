@@ -103,7 +103,7 @@ final class BenchmarkReturnMethodAdmission {
                     && serialHello.size() <= BenchmarkTargetClock.MAX_INTERIOR_SAMPLES,
                     "PHASE_ROSTER_EXCEEDS_PRIOR_CAP");
             require(capture != null && !capture.calls().isEmpty(), "CAPTURE_CALL_ROSTER_EMPTY");
-            require(capture != null && capture.calls().size() <= 512 && capture.samples().size() <= 512
+            require(capture != null && capture.calls().size() <= BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS && capture.samples().size() <= 512
                     && capture.pagesBase64().size() <= 512 && capture.costStages().isEmpty(),
                     "CAPTURE_ROSTER_EXCEEDS_PRIOR_CAP_OR_CONFLICTS");
             sourceBatches = List.copyOf(sourceBatches); serialHello = List.copyOf(serialHello);

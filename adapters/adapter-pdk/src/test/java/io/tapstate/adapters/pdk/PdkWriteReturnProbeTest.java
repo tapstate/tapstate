@@ -534,26 +534,61 @@ class PdkWriteReturnProbeTest {
     }
 
     @Test
-    void frame_overflow_preserves_the_original_pages_and_marks_loss() throws Exception {
+    void byte_overflow_preserves_every_admitted_complete_call_and_the_raw_header_budget() throws Exception {
         var probe = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet);
-        var writer = probe.writer("writer"); probe.start("measured");
-        for (int i = 0; i <= PdkWriteReturnProbe.MAX_FRAMES; i++) {
-            var call = writer.begin("source", table(), List.of(event(i)));
-            call.callback(new WriteListResult<>(1L, 0L, 0L)); call.callbackExited(); call.returned(null);
-        }
-        assertThat(probe.getCompletedCalls()).isEqualTo(PdkWriteReturnProbe.MAX_FRAMES + 1);
-        assertThat(probe.getState()).isEqualTo("UNKNOWN:LEDGER_OVERFLOW");
-        assertThat(probe.getRetainedBytes()).isLessThanOrEqualTo(PdkWriteReturnProbe.MAX_LEDGER_BYTES);
-        int cursor = 0; List<Integer> keys = new ArrayList<>();
+        var writer = probe.writer("writer"); assertThat(probe.start("w".repeat(512))).isTrue();
+        int admitted = 0, completed = 0, storedPerCall = 0;
+        long before;
         do {
-            byte[] bytes = probe.read(cursor);
+            before = probe.getRetainedBytes();
+            var call = writer.begin("source", table(), List.of(event(completed)));
+            call.callback(new WriteListResult<>(1L, 0L, 0L)); call.callbackExited(); call.returned(null); completed++;
+            if (probe.getRetainedBytes() == before) break;
+            admitted++;
+            if (storedPerCall == 0) storedPerCall = Math.toIntExact(probe.getRetainedBytes());
+        } while (completed <= PdkWriteReturnProbe.MAX_FRAMES);
+        assertThat(probe.getCompletedCalls()).isEqualTo(completed);
+        assertThat(completed).isEqualTo(admitted + 1);
+        assertThat(probe.getState()).isEqualTo("UNKNOWN:LEDGER_OVERFLOW");
+        // The controlled frames have equal binary size; the next complete call exceeds bytes,
+        // rather than assuming the source-derived frame envelope is always physically filled.
+        int storedCeiling = 2 * 1024 * 1024 - 67 * 672;
+        assertThat(probe.getRetainedBytes()).isLessThanOrEqualTo(storedCeiling);
+        assertThat(probe.getRetainedBytes() + storedPerCall).isGreaterThan(storedCeiling);
+        int cursor = 0, rawBytes = 0; List<Integer> keys = new ArrayList<>();
+        do {
+            byte[] bytes = probe.read(cursor); rawBytes = Math.addExact(rawBytes, bytes.length);
             assertThat(bytes.length).isLessThanOrEqualTo(PdkWriteReturnProbe.MAX_FRAME_BYTES);
-            var page = decode(bytes);
-            page.frames().forEach(frame -> keys.addAll(frame.keys()));
-            assertThat(page.next()).isGreaterThan(cursor);
-            cursor = page.next();
-        } while (cursor < PdkWriteReturnProbe.MAX_FRAMES);
-        assertThat(keys).hasSize(PdkWriteReturnProbe.MAX_FRAMES).doesNotHaveDuplicates();
+            var page = decode(bytes); page.frames().forEach(frame -> keys.addAll(frame.keys()));
+            assertThat(page.next()).isGreaterThan(cursor); cursor = page.next();
+        } while (cursor < admitted);
+        assertThat(keys).containsExactlyElementsOf(java.util.stream.IntStream.range(0, admitted).boxed().toList());
+        assertThat(rawBytes).isLessThanOrEqualTo(2 * 1024 * 1024);
+        assertThat((long) rawBytes).isGreaterThan(probe.getRetainedBytes());
+    }
+
+    @Test
+    void the_total_record_limit_remains_independent_of_the_transport_frame_limit() throws Exception {
+        var probe = new PdkWriteReturnProbe(new AtomicLong()::incrementAndGet);
+        var writer = probe.writer("writer"); assertThat(probe.start("row-boundary")).isTrue();
+        for (int call = 0; call < 256; call++) {
+            var rows = java.util.stream.IntStream.range(call * 1024, (call + 1) * 1024)
+                    .mapToObj(PdkWriteReturnProbeTest::event).toList();
+            var ticket = writer.begin("source", table(), rows);
+            ticket.callback(new WriteListResult<>(1024L, 0L, 0L)); ticket.callbackExited(); ticket.returned(null);
+        }
+        assertThat(probe.getState()).isEqualTo("RECORDED_SCOPE_UNQUALIFIED");
+        long retained = probe.getRetainedBytes();
+        var rejected = writer.begin("source", table(), List.of(event(262144)));
+        rejected.callback(new WriteListResult<>(1L, 0L, 0L)); rejected.callbackExited(); rejected.returned(null);
+        assertThat(probe.getState()).isEqualTo("UNKNOWN:LEDGER_OVERFLOW");
+        assertThat(probe.getRetainedBytes()).isEqualTo(retained); assertThat(probe.getCompletedCalls()).isEqualTo(257);
+        assertThat(probe.getReportedRecords()).isEqualTo(262145); assertThat(probe.getFailedCalls()).isZero();
+        int cursor = 0, records = 0;
+        while (true) { var page = decode(probe.read(cursor));
+            records += page.frames().stream().mapToInt(frame -> frame.keys().size()).sum(); cursor = page.next();
+            if (cursor == 512) break; }
+        assertThat(records).isEqualTo(262144);
     }
 
     @Test

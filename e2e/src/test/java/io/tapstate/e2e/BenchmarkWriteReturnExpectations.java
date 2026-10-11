@@ -12,8 +12,8 @@ import java.util.Set;
 
 /** Exact source registrations for a measured phase; association does not qualify either clock domain. */
 final class BenchmarkWriteReturnExpectations {
-    private static final int MAX_RECORDS = 512 * 512;
-    private static final int MAX_FRAMES = 512;
+    private static final int MAX_RECORDS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
+    private static final int MAX_FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES;
     private static final int MAX_PART_ROWS = 512;
     private static final int MAX_CALL_ROWS = 1024;
     private static final int MAX_WRITERS = 128;

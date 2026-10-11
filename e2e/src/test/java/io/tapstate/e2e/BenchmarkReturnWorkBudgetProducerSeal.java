@@ -16,7 +16,7 @@ import java.util.Map;
 
 /** Binds a producer shutdown body to its companion after the original owned process has exited. */
 final class BenchmarkReturnWorkBudgetProducerSeal {
-    static final String FORMULA_SHA256 = "5248e6d4304d26ccfd6744b0b05cc6206cd7de0d31b3bb057a9b4569b19776cb";
+    static final String FORMULA_SHA256 = "5e7e3babad7f8e2bd19f22c8ce0aac1ba5164e72e3867d5957cc568a6bfa4c89";
     static final int MAX_BODY_BYTES = 65536;
     static final int COMPANION_BYTES = 256;
     static final java.util.Set<String> ACTIVITY_NAMES = java.util.Set.of("CONFIG", "INSTALL", "WRITER_INSTALL", "WRITER_ROSTER",

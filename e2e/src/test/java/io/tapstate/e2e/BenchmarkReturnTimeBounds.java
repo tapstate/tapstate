@@ -5,7 +5,7 @@ import java.util.List;
 
 /** Conservative return-time arithmetic; none of these bounds substitutes for live method evidence. */
 final class BenchmarkReturnTimeBounds {
-    private static final int MAX_ROWS = 512 * 512;
+    private static final int MAX_ROWS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
     private BenchmarkReturnTimeBounds() { }
 
     record Delivery(String target, String key, long callSequence,

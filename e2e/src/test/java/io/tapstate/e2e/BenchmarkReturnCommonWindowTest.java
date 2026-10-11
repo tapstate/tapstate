@@ -204,7 +204,7 @@ class BenchmarkReturnCommonWindowTest {
         assertThatThrownBy(() -> BenchmarkReturnCommonWindow.evidence(Collections.nCopies(262_145, sample)))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("bounded cohort");
         var calls = new ArrayList<BenchmarkReturnTimeBounds.Delivery>();
-        for (int index = 1; index <= 513; index++) { add(calls, "target", index, index, index, 1); }
+        for (int index = 1; index <= 18488; index++) { add(calls, "target", index, index, index, 1); }
         assertThatThrownBy(() -> BenchmarkReturnCommonWindow.evidence(calls))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("call roster");
         var tooManyRows = new ArrayList<BenchmarkReturnTimeBounds.Delivery>();

@@ -7,7 +7,7 @@ import java.util.Map;
 /** Prior material envelope for a complete fixed pilot report or one controlled diagnostic packet. */
 final class BenchmarkReturnWorkBudgetReportPlan {
     private static final long RAW_BYTES = 2L * 1024 * 1024;
-    private static final int PAGE_BYTES = 65536, PAGES = 512, FRAMES = 512, RETURN_ROWS = 262144;
+    private static final int PAGE_BYTES = 65536, PAGES = 512, FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES, RETURN_ROWS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
     private static final int CLOCK_SAMPLES = 512, RESOURCE_ATTEMPTS = 4096;
     private static final int SOURCE_PACKET_NODES = 4096, SOURCE_PACKET_DEPTH = 16;
     private static final int SOURCE_LEAF_CHARS = 65536, SOURCE_PACKET_BYTES = 2 * 1024 * 1024;
@@ -106,9 +106,9 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         add(parts, "RETURN_CLOCK_ROSTERS", "BenchmarkWriteReturnPhaseEvidence.clockSamples/Capture.retainedEvidence.samples",
                 Math.multiplyExact(Math.multiplyExact(2, measuredPhases), CLOCK_SAMPLES), mapNodes(6), 6L * 64, 128, 4, "COMPLETE_PERIODIC_CAP_512_NO_CONTROL_SAMPLES_INSERTED");
         add(parts, "RETURN_CALL_AND_ROW_REPRESENTATION", "BenchmarkWriteReturnLedger/Assembly/Expectations retained diagnostics",
-                Math.multiplyExact(measuredPhases, FRAMES), mapNodes(24), 24L * 128, 512, 6, "FRAME_CAP_512_CALL_ROW_CAP_1024_NO_FULL_ROW_METADATA_DUPLICATION");
+                Math.multiplyExact(measuredPhases, FRAMES), mapNodes(24), 24L * 128, 512, 6, "SOURCE_BYTE_DERIVED_STORED_PIECE_CAP_CALL_ROW_CAP1024_NO_FULL_ROW_METADATA_DUPLICATION");
         add(parts, "RETURN_ROWS_IF_MATERIALIZED", "bounded return row/key/association failure projections",
-                Math.multiplyExact(measuredPhases, RETURN_ROWS), mapNodes(12), 12L * 128, 512, 8, "DERIVED_512_PIECES_TIMES_512_ROWS_INCLUDES_PARTIAL_REFUSALS");
+                Math.multiplyExact(measuredPhases, RETURN_ROWS), mapNodes(12), 12L * 128, 512, 8, "INDEPENDENT_RETURN_ROW_CAP262144_INCLUDES_PARTIAL_REFUSALS");
         add(parts, "TABLE_CONFIRMATIONS", "PipelineBenchmarkLiveRunIT.tableConfirmation/terminalMetaReceipts/sourceChains",
                 Math.multiplyExact(Math.multiplyExact(2, chains), measuredPhases), SOURCE_PACKET_NODES + mapNodes(11) + WRITERS + 1,
                 PAGE_BYTES + 2L * MAX_LEAF + 11L * 128 + WRITERS * 256L, MAX_LEAF, SOURCE_PACKET_DEPTH,

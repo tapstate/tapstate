@@ -28,7 +28,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
                 java.util.Objects.requireNonNull(clockMode);
                 costStages = Map.copyOf(costStages);
             } else {
-                calls = BenchmarkReturnCaptureMaterialBounds.copy(calls, 512);
+                calls = BenchmarkReturnCaptureMaterialBounds.copy(calls, BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS);
                 samples = BenchmarkReturnCaptureMaterialBounds.copy(samples, 512);
                 pagesBase64 = BenchmarkReturnCaptureMaterialBounds.copy(pagesBase64, 512);
                 java.util.Objects.requireNonNull(clockMode);

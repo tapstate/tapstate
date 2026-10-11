@@ -5,7 +5,8 @@ import java.util.Map;
 
 /** Scoped DTO material limits; successful validation is neither acquisition nor runtime proof. */
 final class BenchmarkReturnCaptureMaterialBounds {
-    private static final int CALLS = 512, ROWS = 262144, CALL_ROWS = 1024, DETAILS = 512;
+    private static final int CALLS = BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS, ROWS = BenchmarkReturnLocalSourceWork.MAX_ROWS, CALL_ROWS = 1024, DETAILS = 512;
+    private static final int COPY_LIST_CAP = CALLS > CALL_ROWS ? CALLS : CALL_ROWS;
     private static final int TOTAL = 2097152, PAGE = 65536, ENCODED_PAGE = 4 * ((PAGE + 2) / 3);
     private BenchmarkReturnCaptureMaterialBounds() { }
 
@@ -13,7 +14,7 @@ final class BenchmarkReturnCaptureMaterialBounds {
         var scope = BenchmarkReturnWorkBudget.current();
         if (scope == null) return List.copyOf(values);
         return BenchmarkReturnWorkBudget.operation(scope, BenchmarkReturnWorkBudget.Activity.COPY, () -> {
-            require(cap >= 0 && cap <= CALL_ROWS, "copy cap is outside the fixed material envelope");
+            require(cap >= 0 && cap <= COPY_LIST_CAP, "copy cap is outside the fixed material envelope");
             int count = count(values, cap); var owned = new java.util.ArrayList<T>(count);
             for (int index = 0; index < count; index++) owned.add(values.get(index));
             require(values.size() == count, "material roster changed during copy");
@@ -136,16 +137,16 @@ final class BenchmarkReturnCaptureMaterialBounds {
 
     static Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> upper() {
         return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> {
-        long slots = add(CALLS, 512, 512, 512L * DETAILS, 2L * CALLS, ROWS, 2L * ROWS);
+        long slots = add(CALLS, 512, 512, (long) CALLS * DETAILS, 2L * CALLS, ROWS, 2L * ROWS);
         long visits = add(slots, TOTAL, 8192);
         // Per guarded visit: <=64 accessor/length/iterator/checked-arithmetic/JDK APIs and stores.
         // Fixed128 covers entry/failure setup. Extra8192 encloses summary/final-reject scalar visits; no encoded scalar arrays are allocated.
         var complete = new BenchmarkReturnWorkBudget.Work(1, add(128, Math.multiplyExact(64, visits)), ROWS, 0,
                 Math.multiplyExact(16, visits), 8, Math.multiplyExact(32, visits), Math.multiplyExact(16, visits));
-        long copyVisits = add(CALL_ROWS, 512L * 128, 512);
+        long copyVisits = add(COPY_LIST_CAP, 512L * 128, 512);
         // Fixed size/get copies never invoke caller iterator/toArray; stage keys are bounded before hashing.
         // Includes up to128 UTF8 visits for each of512 shallow stage keys. Stage values are not traversed.
-        var copies = new BenchmarkReturnWorkBudget.Work(1, add(128, Math.multiplyExact(64, copyVisits)), CALL_ROWS, 0,
+        var copies = new BenchmarkReturnWorkBudget.Work(1, add(128, Math.multiplyExact(64, copyVisits)), COPY_LIST_CAP, 0,
                 add(256, Math.multiplyExact(32, copyVisits)), 8, Math.multiplyExact(32, copyVisits), Math.multiplyExact(16, copyVisits));
         return Map.of(BenchmarkReturnWorkBudget.Activity.ASSOCIATION, complete,
                 BenchmarkReturnWorkBudget.Activity.COPY, copies,

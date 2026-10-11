@@ -11,8 +11,8 @@ import java.util.Map;
 /** A conservative common-window certificate, never runtime provenance or formal performance qualification. */
 final class BenchmarkReturnCommonWindow {
     private static final int BINS = 10;
-    private static final int MAX_ROWS = 512 * 512;
-    private static final int MAX_CALLS = 512;
+    private static final int MAX_ROWS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
+    private static final int MAX_CALLS = BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS;
     private static final int MAX_CALL_ROWS = 1024;
     private static final BigInteger TEN = BigInteger.TEN;
     private BenchmarkReturnCommonWindow() { }
