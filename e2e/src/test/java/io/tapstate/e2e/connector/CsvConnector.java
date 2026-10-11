@@ -671,30 +671,51 @@ public class CsvConnector implements TapConnector {
      * course, each with a connector of its own and spread over every member, as they would a database.
      *
      * <p>A lock on a file beside the table is what processes meet on, under a name that is not a table's.
-     * Writers in this JVM also meet on an interned, canonical lock path: the string pool is shared even when
-     * their connectors have different class loaders. That monitor covers opening and closing the channel as
-     * well as applying the batch. A released channel's close can otherwise remove a newer channel's lock from
-     * the JDK registry, and on POSIX can release this process's locks on the same file.
+     * Writers in this JVM also meet on an interned, canonical lock path: the string pool and system properties
+     * are shared even when their connectors have different class loaders. Its monitor only guards a shared
+     * ownership marker, so waiting for ownership can use the same deadline as waiting for the file lock.
+     * Ownership covers opening and closing the channel as well as applying the batch. A released channel's
+     * close can otherwise remove a newer channel's lock from the JDK registry, and on POSIX can release this
+     * process's locks on the same file.
      */
     private static <T> T exclusively(Path file, java.util.function.Supplier<T> work) {
+        long deadline = System.nanoTime() + LOCK_WAIT_NANOS;
         Path lockFile = file.resolveSibling(lockNameOf(file.getFileName().toString()));
         try {
             Files.createDirectories(file.getParent());
             String processLock = ("io.tapstate.e2e.csv-writer:"
                     + lockFile.getParent().toRealPath().resolve(lockFile.getFileName())).intern();
-            synchronized (processLock) {
+            acquireProcessLock(processLock, file, deadline);
+            try {
                 try (FileChannel channel = FileChannel.open(
                         lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
-                    FileLock held = acquire(channel, file);
+                    FileLock held = acquire(channel, file, deadline);
                     try {
                         return work.get();
                     } finally {
                         held.release();
                     }
                 }
+            } finally {
+                synchronized (processLock) {
+                    System.clearProperty(processLock);
+                }
             }
         } catch (IOException e) {
             throw new UncheckedIOException("cannot hold the table at " + file + " for a write", e);
+        }
+    }
+
+    /** Claims the table in this JVM without holding a monitor while the batch or channel close runs. */
+    private static void acquireProcessLock(String processLock, Path file, long deadline) {
+        while (true) {
+            synchronized (processLock) {
+                if (System.getProperty(processLock) == null) {
+                    System.setProperty(processLock, "held");
+                    return;
+                }
+            }
+            awaitLock(file, deadline);
         }
     }
 
@@ -715,8 +736,7 @@ public class CsvConnector implements TapConnector {
     }
 
     /** The lock on {@code channel}'s file, waiting for whichever writer holds it now, here or elsewhere. */
-    private static FileLock acquire(FileChannel channel, Path file) throws IOException {
-        long deadline = System.nanoTime() + LOCK_WAIT_NANOS;
+    private static FileLock acquire(FileChannel channel, Path file, long deadline) throws IOException {
         while (true) {
             try {
                 FileLock held = channel.tryLock();
@@ -726,12 +746,16 @@ public class CsvConnector implements TapConnector {
             } catch (OverlappingFileLockException heldInThisProcess) {
                 // Another writer in this process holds it; wait for it as for a writer in another process.
             }
-            if (System.nanoTime() - deadline > 0) {
-                throw new IllegalStateException("the table at " + file + " was held by another write for over "
-                        + TimeUnit.NANOSECONDS.toSeconds(LOCK_WAIT_NANOS) + "s");
-            }
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+            awaitLock(file, deadline);
         }
+    }
+
+    private static void awaitLock(Path file, long deadline) {
+        if (System.nanoTime() - deadline > 0) {
+            throw new IllegalStateException("the table at " + file + " was held by another write for over "
+                    + TimeUnit.NANOSECONDS.toSeconds(LOCK_WAIT_NANOS) + "s");
+        }
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
     }
 
     /**
