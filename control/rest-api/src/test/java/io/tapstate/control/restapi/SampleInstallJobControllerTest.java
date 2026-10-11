@@ -40,6 +40,10 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -48,6 +52,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SampleInstallJobControllerTest {
     private static final String SAMPLE = "sample_core_banking";
     private static final String OTHER = "sample_cards_crm";
+
+    @Test
+    void installationStatusIsReachableThroughHttpWithoutCompilerParameterMetadata() throws Exception {
+        try (Fixture fixture = new Fixture(SampleInstallJobControllerTest::codedFailure)) {
+            String id = fixture.start(SAMPLE).id();
+            MockMvcBuilders.standaloneSetup(fixture.controller).build()
+                    .perform(get("/sample-sources/installations/{jobId}", id))
+                    .andExpect(status().isOk());
+        }
+    }
 
     @AfterEach
     void clearAuthentication() {

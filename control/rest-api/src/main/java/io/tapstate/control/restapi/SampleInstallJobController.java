@@ -86,7 +86,7 @@ final class SampleInstallJobController implements AutoCloseable {
 
     @Verb("sample-source.list")
     @GetMapping("/sample-sources/installations/{jobId}")
-    Status status(@PathVariable String jobId) {
+    Status status(@PathVariable("jobId") String jobId) {
         Job job;
         synchronized (jobs) { job = jobs.get(jobId); }
         if (job == null || !job.principal.equals(AuthenticatedCaller.subject())) {
