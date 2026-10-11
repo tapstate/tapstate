@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY) != null) {
+            throw new AssertionError("root CPU diagnostics cannot establish a live performance gate");
+        }
         if (System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY) != null) {
             throw new AssertionError("return collector calibration cannot establish a live performance gate");
         }

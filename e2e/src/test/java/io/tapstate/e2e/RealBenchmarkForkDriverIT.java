@@ -40,6 +40,18 @@ class RealBenchmarkForkDriverIT {
 
     @BeforeAll
     static void requireServices() {
+        String cpu = System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY);
+        if (cpu != null) {
+            String mode = System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY);
+            var calibration = "ON".equals(mode) ? RealBenchmarkForkDriver.CollectorCalibration.ON
+                    : "OFF".equals(mode) ? RealBenchmarkForkDriver.CollectorCalibration.OFF : null;
+            RealBenchmarkForkDriver.rootCpuDiagnostics(cpu, calibration);
+            return;
+        }
+        requireBenchmarkServices();
+    }
+
+    private static void requireBenchmarkServices() {
         DockerGate.require();
         RealConnectorGate.require("mysql", "postgres", "mongodb");
         String configured = System.getProperty(BOOT_JAR_PROPERTY);
@@ -64,6 +76,7 @@ class RealBenchmarkForkDriverIT {
     }
 
     private static void run(String workloadId) throws Exception {
+        boolean rootCpuDiagnostics = requireRootCpuRunServices(workloadId, RealBenchmarkForkDriverIT::requireBenchmarkServices);
         Path forkOutput = forkOutput();
         PipelineBenchmarkComparison.Arm arm = PipelineBenchmarkComparison.Arm.valueOf(
                 System.getProperty(ARM_PROPERTY, "A"));
@@ -262,6 +275,23 @@ class RealBenchmarkForkDriverIT {
                 evidence.phases().forEach(phase -> assertThat(phase.reportedRecordsOut())
                         .as("replayed sink work remains visible as a cost beside logical delivery")
                         .isGreaterThanOrEqualTo(phase.acknowledgedOutputs()));
+                evidence.phases().forEach(phase -> {
+                    if (rootCpuDiagnostics) {
+                        var rootCpu = (Map<?, ?>) phase.targetClockEvidence().get("rootCpuDiagnostics");
+                        assertThat(rootCpu.get("state")).isEqualTo("RECORDED_DIAGNOSTIC");
+                        assertThat((List<?>) rootCpu.get("readings")).hasSize(3);
+                        assertThat((List<?>) rootCpu.get("operations")).hasSize(4);
+                        assertThat(((Map<?, ?>) rootCpu.get("accountingErrorAllowance")).get("state")).isEqualTo("UNKNOWN");
+                        assertThat(((Map<?, ?>) rootCpu.get("collectionCpuUpperBound")).get("state")).isEqualTo("UNKNOWN");
+                        for (String flag : List.of("accountingErrorBoundQualified", "wholeMethodCostQualified",
+                                "collectionCostUpperBoundQualified", "samplingCostQualified", "causalOverheadQualified",
+                                "costAcceptanceEligible", "performanceAcceptanceEligible", "formalPerformance")) {
+                            assertThat(rootCpu.get(flag)).isEqualTo(false);
+                        }
+                    } else {
+                        assertThat(phase.targetClockEvidence()).doesNotContainKeys("rootCpuDiagnostics", "rootCpuDiagnosticScope");
+                    }
+                });
                 if (writeReturnDiagnostics) {
                     evidence.phases().forEach(phase -> {
                         @SuppressWarnings("unchecked")
@@ -393,6 +423,29 @@ class RealBenchmarkForkDriverIT {
                     .as("owned startup, namespace, JVM and exit facts are complete: %s", runtime.get("reasons"))
                     .isEqualTo("QUALIFIED");
         }
+    }
+
+    static boolean requireRootCpuRunServices(String workload, Runnable services) {
+        boolean enabled = requireRootCpuAdmission(workload);
+        if (enabled) { services.run(); }
+        return enabled;
+    }
+
+    static boolean requireRootCpuAdmission(String workload) {
+        String value = System.getProperty(RealBenchmarkForkDriver.ROOT_CPU_DIAGNOSTICS_PROPERTY);
+        if (value == null) { return false; }
+        if (!"true".equals(value)) { return RealBenchmarkForkDriver.rootCpuDiagnostics(value, null); }
+        boolean diagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY);
+        boolean pilot = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot");
+        var clocks = RealBenchmarkForkDriver.writeReturnClockMode(
+                System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_CLOCK_CONTROL_PROPERTY), diagnostics, pilot);
+        var calibration = RealBenchmarkForkDriver.collectorCalibration(
+                System.getProperty(RealBenchmarkForkDriver.RETURN_COLLECTOR_CALIBRATION_PROPERTY), workload,
+                PipelineBenchmarkComparison.Arm.valueOf(System.getProperty(ARM_PROPERTY, "A")), diagnostics, pilot,
+                clocks, System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY),
+                "PLAIN".equals(System.getProperty(MODE_PROPERTY, "PLAIN")), RealBenchmarkForkDriver.explicitCalibrationOutput(),
+                RealBenchmarkForkDriver.conflictingCalibrationControls());
+        return RealBenchmarkForkDriver.rootCpuDiagnostics(value, calibration);
     }
 
     static List<String> returnArguments(boolean methodControl, boolean costStages, String nativeLibrary) {
