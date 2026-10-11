@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ClusterCapacityDemand;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.DesiredStateFingerprint;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.ProcessorRuntimeContext;
@@ -618,6 +619,156 @@ class ClusterRecoveryRuntimeTest {
         verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
         assertNoNativeSubmission();
     }
+
+    @Test void aSubmittedInheritedFailureIsVisibleToConvergenceAfterControllerTakeover() {
+        InheritedExecution inherited = inheritedExecution();
+        EngineLifecycleActuator actuator = new EngineLifecycleActuator(engine, mock(DagSource.class), captures,
+                mock(NestStateTeardown.class), ownership, ExecutionPlanRecorder.NONE,
+                java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC), ConnectorReadiness.NONE, runtime);
+
+        assertThat(actuator.failure("p")).containsSame(inherited.failure());
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+    }
+
+    @Test void aSubmittedInheritedFailureRecordsMemberLossWhileAllNodeSessionsRemainLeased() {
+        inheritedExecution();
+
+        runtime.recordFailure("p");
+
+        verify(ownership).recordClassifiedFailure("p", true);
+        verify(ownership, never()).recordClassifiedFailure("p", false);
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+    }
+
+    @Test void anAlreadyClassifiedInheritedFailureCannotFailThePendingRecoveryAgain() {
+        InheritedExecution inherited = inheritedExecution();
+        WorkloadClaim previous = inherited.current();
+        WorkloadClaim classified = new WorkloadClaim(previous.key(), previous.owner(), previous.claimGeneration(),
+                previous.executionGeneration(), previous.topologyRevision(), previous.leaseUntil(),
+                previous.contextExecutionGeneration(), previous.executionClaimGeneration(), previous.executionNodeIds(),
+                1, true, previous.profileGeneration(), previous.executionProfile(), previous.executionTopologyRevision(),
+                previous.executionIncarnation(), previous.executionRevision(), previous.executionMembers());
+        when(ownership.currentClaim("p")).thenReturn(Optional.of(classified));
+        when(capacity.submittedExecution(classified)).thenReturn(Optional.of(
+                new ClusterCapacityStore.SubmittedExecution(inherited.submitted(), true)));
+        EngineLifecycleActuator actuator = new EngineLifecycleActuator(engine, mock(DagSource.class), captures,
+                mock(NestStateTeardown.class), ownership, ExecutionPlanRecorder.NONE,
+                java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC), ConnectorReadiness.NONE, runtime);
+
+        assertThat(actuator.failure("p")).isEmpty();
+        verify(capacity, never()).advanceExecution(any(), any(), anySet());
+    }
+
+    @Test void anInheritedCodedOperatorFailureKeepsItsOrdinaryClassification() {
+        inheritedExecution();
+        var ordinary = new TapstateException(EngineError.ROUTING_KEY_MISSING,
+                Map.of("node", "join", "stream", "s.orders", "columns", "id"), null);
+        when(engine.failureOf("p")).thenReturn(Optional.of(ordinary));
+
+        runtime.recordFailure("p");
+
+        verify(ownership).recordClassifiedFailure("p", false);
+        verify(ownership, never()).recordClassifiedFailure("p", true);
+    }
+
+    @Test void anInheritedConnectorWriteFailureRemainsOrdinaryWhenAMemberAlsoLeft() {
+        inheritedExecution();
+        var ordinary = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED,
+                Map.of("connector", "target", "detail", "write rejected"), null);
+        when(engine.failureOf("p")).thenReturn(Optional.of(ordinary));
+
+        runtime.recordFailure("p");
+
+        verify(ownership).recordClassifiedFailure("p", false);
+        verify(ownership, never()).recordClassifiedFailure("p", true);
+    }
+
+    @Test void aDifferentNativeJobWithTheSameFenceCannotReplaceTheFailureBeingRead() {
+        InheritedExecution inherited = inheritedExecution();
+        var replacement = new Engine.NativeRun("43", 1, 8, 2, JobStatus.FAILED, Optional.empty());
+        when(engine.failureOf("p")).thenAnswer(call -> {
+            when(engine.nativeRun("p")).thenReturn(Optional.of(replacement));
+            return Optional.of(inherited.failure());
+        });
+
+        runtime.recordFailure("p");
+
+        verify(ownership, never()).recordClassifiedFailure(anyString(), anyBoolean());
+    }
+
+    @Test void unrelatedOrUnprovenNativeResultsCannotClassifyAnInheritedExecution() {
+        for (String change : List.of("foreignJob", "newExecution", "oldProfile", "wrongOriginalClaim", "liveJob",
+                "completedJob", "noReceipt", "foreignReceiptJob", "foreignIncarnation", "wrongReceiptProfile", "unknownMembers")) {
+            InheritedExecution inherited = inheritedExecution();
+            Engine.NativeRun candidate = new Engine.NativeRun("42", 1, 8, 2, JobStatus.FAILED, Optional.empty());
+            switch (change) {
+                case "foreignJob" -> candidate = new Engine.NativeRun("43", 1, 8, 2, JobStatus.FAILED, Optional.empty());
+                case "newExecution" -> candidate = new Engine.NativeRun("42", 1, 9, 2, JobStatus.FAILED, Optional.empty());
+                case "oldProfile" -> candidate = new Engine.NativeRun("42", 1, 8, 1, JobStatus.FAILED, Optional.empty());
+                case "wrongOriginalClaim" -> candidate = new Engine.NativeRun("42", 7, 8, 2, JobStatus.FAILED, Optional.empty());
+                case "liveJob" -> candidate = new Engine.NativeRun("42", 1, 8, 2, JobStatus.RUNNING, Optional.empty());
+                case "completedJob" -> candidate = new Engine.NativeRun("42", 1, 8, 2, JobStatus.COMPLETED, Optional.empty());
+                case "noReceipt" -> when(capacity.submittedExecution(inherited.current())).thenReturn(Optional.empty());
+                case "foreignReceiptJob", "foreignIncarnation", "wrongReceiptProfile" -> {
+                    var previous = inherited.submitted();
+                    var altered = new ClusterCapacityReservation(previous.reservationId(), previous.clusterId(), previous.pipelineId(),
+                            change.equals("foreignIncarnation") ? "another-incarnation" : previous.incarnationId(), previous.intentFingerprint(),
+                            change.equals("wrongReceiptProfile") ? new ClusterExecutionProfile("cluster", 1, profile.profile()) : previous.profile(),
+                            previous.pipelineClaim(), previous.demandByNode(), previous.reservedAt(), previous.deadline(), previous.executionGeneration(),
+                            change.equals("foreignReceiptJob") ? "43" : previous.nativeJobId());
+                    when(capacity.submittedExecution(inherited.current())).thenReturn(Optional.of(new ClusterCapacityStore.SubmittedExecution(altered, false)));
+                }
+                case "unknownMembers" -> {
+                    var original = inherited.current();
+                    var unknown = new WorkloadClaim(original.key(), original.owner(), original.claimGeneration(), original.executionGeneration(),
+                            original.topologyRevision(), original.leaseUntil(), original.contextExecutionGeneration(), original.executionClaimGeneration(),
+                            original.executionNodeIds(), 0, false, original.profileGeneration(), original.executionProfile(), original.executionTopologyRevision(),
+                            original.executionIncarnation(), original.executionRevision(), Map.of());
+                    when(ownership.currentClaim("p")).thenReturn(Optional.of(unknown));
+                    when(capacity.submittedExecution(unknown)).thenReturn(Optional.of(new ClusterCapacityStore.SubmittedExecution(inherited.submitted(), false)));
+                }
+                default -> throw new AssertionError("unexpected native-result variation");
+            }
+            when(engine.nativeRun("p")).thenReturn(Optional.of(candidate));
+            clearInvocations(ownership);
+
+            runtime.recordFailure("p");
+
+            verify(ownership, never().description(change)).recordClassifiedFailure(anyString(), anyBoolean());
+        }
+    }
+
+    @Test void aNativeReplacementDuringTheFailureReadCannotClassifyTheFormerJob() {
+        inheritedExecution();
+        var original = new Engine.NativeRun("42", 1, 8, 2, JobStatus.FAILED, Optional.empty());
+        var replacement = new Engine.NativeRun("43", 2, 9, 2, JobStatus.FAILED, Optional.empty());
+        when(engine.nativeRun("p")).thenReturn(Optional.of(original), Optional.of(original), Optional.of(replacement));
+
+        runtime.recordFailure("p");
+
+        verify(ownership, never()).recordClassifiedFailure(anyString(), anyBoolean());
+    }
+
+    private InheritedExecution inheritedExecution() {
+        WorkloadClaim current = new WorkloadClaim(initial.key(), owner, 2, 8, 7, NOW.plusSeconds(60),
+                8, 1, NODES, 0, false, 2, profile, 7L, "inc", "a".repeat(64), ORIGINAL_MEMBERS);
+        WorkloadClaimFence original = new WorkloadClaimFence(initial.key(), new WorkloadOwner("c", "boot-c"), 1, 8, 7, 2);
+        Map<String, ClusterCapacityDemand> demands = NODES.stream()
+                .collect(java.util.stream.Collectors.toMap(node -> node, node -> demand));
+        String fingerprint = DesiredStateFingerprint.of(store.desired().read("p").orElseThrow());
+        ClusterCapacityReservation submitted = new ClusterCapacityReservation("previous", "cluster", "p", "inc", fingerprint,
+                profile, original, demands, NOW.minusSeconds(30), NOW.plusSeconds(30), 8L, "42");
+        Throwable failure = new com.hazelcast.jet.RestartableException("The member was reconnected");
+        when(ownership.currentClaim("p")).thenReturn(Optional.of(current));
+        when(capacity.submittedExecution(current)).thenReturn(Optional.of(new ClusterCapacityStore.SubmittedExecution(submitted, false)));
+        when(engine.nativeRun("p")).thenReturn(Optional.of(new Engine.NativeRun("42", 1, 8, 2, JobStatus.FAILED, Optional.empty())));
+        when(engine.failureOf("p")).thenReturn(Optional.of(failure));
+        // The registry still proves all three sessions; only the real native cohort lost c.
+        useLiveMembers(Map.of("a", ORIGINAL_MEMBERS.get("a"), "b", ORIGINAL_MEMBERS.get("b")));
+        return new InheritedExecution(current, submitted, failure);
+    }
+
+    private record InheritedExecution(WorkloadClaim current, ClusterCapacityReservation submitted, Throwable failure) { }
 
     @Test void aCodedOperatorFailureIsClassifiedBeforeAnUnrelatedMembershipObservation() {
         WorkloadClaim current = claim(8);

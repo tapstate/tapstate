@@ -6,11 +6,15 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.srs.CaptureStartupException;
+import io.tapstate.spi.store.ClusterCapacityReservation;
+import io.tapstate.spi.store.ClusterCapacityStore;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -81,6 +85,58 @@ final class PipelineFailures {
                                 && run.executionGeneration() == claim.executionGeneration()
                                 && run.profileGeneration() == claim.profileGeneration())
                         .flatMap(run -> engine.failureOf(pipelineId)));
+    }
+
+    /** A new controller may report only the failed native job named by the retained execution receipt. */
+    static Optional<Throwable> inherited(String pipelineId, WorkloadClaim claim,
+            Engine engine, ClusterCapacityStore capacity) {
+        if (claim == null || capacity == null || claim.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || !pipelineId.equals(claim.key().resourceId()) || claim.profileGeneration() < 1
+                || claim.executionGeneration() < 1 || claim.contextExecutionGeneration() != claim.executionGeneration()
+                || claim.executionClaimGeneration() < 1 || claim.claimGeneration() <= claim.executionClaimGeneration()
+                || claim.failureClaimGeneration() != 0
+                || claim.executionProfile() == null || claim.executionProfile().generation() != claim.profileGeneration()
+                || claim.executionTopologyRevision() == null || claim.executionTopologyRevision() < 1
+                || claim.executionIncarnation() == null || claim.executionRevision() == null
+                || claim.executionIncarnation().isBlank() || claim.executionRevision().isBlank()
+                || claim.executionMembers().isEmpty() || !claim.executionMembers().keySet().equals(claim.executionNodeIds())) {
+            return Optional.empty();
+        }
+        Engine.NativeRun run = engine.nativeRun(pipelineId).orElse(null);
+        if (!matchesInheritedRun(run, claim)) { return Optional.empty(); }
+        ClusterCapacityReservation submitted = capacity.submittedExecution(claim)
+                .map(ClusterCapacityStore.SubmittedExecution::reservation).orElse(null);
+        if (!matchesSubmittedExecution(submitted, run, claim)) { return Optional.empty(); }
+        Throwable failure = engine.failureOf(pipelineId).orElse(null);
+        if (failure == null) { return Optional.empty(); }
+        // A name lookup may have changed while reading the terminal result. The exact old job must still match.
+        Engine.NativeRun after = engine.nativeRun(pipelineId).orElse(null);
+        return matchesInheritedRun(after, claim) && run.nativeJobId().equals(after.nativeJobId())
+                ? Optional.of(failure) : Optional.empty();
+    }
+
+    private static boolean matchesInheritedRun(Engine.NativeRun run, WorkloadClaim claim) {
+        return run != null && run.status() == com.hazelcast.jet.core.JobStatus.FAILED
+                && run.claimGeneration() == claim.executionClaimGeneration()
+                && run.executionGeneration() == claim.executionGeneration()
+                && run.profileGeneration() == claim.profileGeneration();
+    }
+
+    private static boolean matchesSubmittedExecution(ClusterCapacityReservation submitted,
+            Engine.NativeRun run, WorkloadClaim claim) {
+        if (submitted == null || !claim.key().equals(submitted.pipelineClaim().key())
+                || !claim.executionIncarnation().equals(submitted.incarnationId())
+                || !claim.executionProfile().equals(submitted.profile())
+                || submitted.executionGeneration() == null || submitted.executionGeneration() != claim.executionGeneration()
+                || !submitted.nativeJobId().equals(run.nativeJobId())
+                || submitted.pipelineClaim().claimGeneration() != claim.executionClaimGeneration()
+                || submitted.pipelineClaim().executionGeneration() != claim.executionGeneration()
+                || submitted.pipelineClaim().profileGeneration() != claim.profileGeneration()
+                || !submitted.demandByNode().keySet().equals(claim.executionNodeIds())) {
+            return false;
+        }
+        var originalOwner = claim.executionMembers().get(submitted.pipelineClaim().owner().nodeId());
+        return originalOwner != null && Objects.equals(originalOwner.bootId(), submitted.pipelineClaim().owner().bootId());
     }
 
     /** Recognizes the coded sink failure before Jet can reduce it to a generic wrapper. */

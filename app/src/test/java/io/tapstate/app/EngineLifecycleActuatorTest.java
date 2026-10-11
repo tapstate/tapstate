@@ -47,6 +47,8 @@ import io.tapstate.spi.store.ClusterCapacityReservation;
 import io.tapstate.spi.store.ClusterCapacityStore;
 import io.tapstate.spi.store.ClusterExecutionMember;
 import io.tapstate.spi.store.ClusterExecutionProfile;
+import io.tapstate.spi.store.ClusterNodeReading;
+import io.tapstate.spi.store.ClusterNodeRegistration;
 import io.tapstate.spi.store.ClusterProfileStore;
 import io.tapstate.spi.store.ClusterRecoveryStore;
 import io.tapstate.spi.store.DesiredStore;
@@ -961,6 +963,18 @@ class EngineLifecycleActuatorTest {
             when(stores.state()).thenReturn(state);
             when(stores.meta()).thenReturn(mock(SrsMetaStore.class));
             when(profiles.profile("cluster-a")).thenReturn(Optional.of(profile));
+            List<ClusterNodeReading> joined = this.live.values().stream().map(identity -> {
+                var session = new WorkloadClaim(new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, identity.nodeId()),
+                        new WorkloadOwner(identity.nodeId(), identity.bootId()), 1, 0, topology,
+                        NOW.plusSeconds(60), 0, 0, Set.of(), 0, false, profile.generation());
+                var address = com.hazelcast.cluster.Address.createUnresolvedAddress("127.0.0.1",
+                        6000 + identity.nodeId().charAt(identity.nodeId().length() - 1));
+                var registration = new ClusterNodeRegistration(session, profile,
+                        java.net.URI.create("http://" + identity.nodeId() + ".example:8080"), true,
+                        identity.memberUuid(), address.toString(), NOW);
+                return new ClusterNodeReading(registration, Duration.ofSeconds(60));
+            }).toList();
+            when(profiles.nodes("cluster-a")).thenReturn(joined);
             when(artifacts.identity(PIPE)).thenReturn(Optional.of(new ArtifactIdentity(PIPE, "inc", "a".repeat(64))));
             when(desired.read(PIPE)).thenReturn(Optional.of(new DesiredState(PIPE, PipelineState.RUNNING, "a".repeat(64))));
             when(recovery.read(any())).thenReturn(Optional.empty());

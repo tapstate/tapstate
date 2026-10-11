@@ -372,8 +372,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // A pipeline fails two ways the converge loop must see as one: the Jet job itself dies (engine), or the
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
         // Either surfaces here so the converge side drives the pipeline into the observable FAILED state.
-        return PipelineFailures.current(pipelineId, actuation.currentClaim(pipelineId).orElse(null),
-                actuation.isFenced(), engine, captureCoordinator);
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
+        return PipelineFailures.current(pipelineId, current, actuation.isFenced(), engine, captureCoordinator)
+                .or(() -> admission.inheritedFailure(pipelineId, current));
     }
 
     @Override

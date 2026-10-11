@@ -330,10 +330,15 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         }
     }
 
+    @Override public Optional<Throwable> inheritedFailure(String pipelineId, WorkloadClaim expected) {
+        return active() ? PipelineFailures.inherited(pipelineId, expected, engine, stores.clusterCapacity()) : Optional.empty();
+    }
+
     @Override public void recordFailure(String pipelineId) {
         if (!active()) { return; }
         WorkloadClaim failedClaim = actuation.currentClaim(pipelineId).orElse(null);
-        Throwable failure = PipelineFailures.current(pipelineId, failedClaim, true, engine, captures).orElse(null);
+        Throwable failure = PipelineFailures.current(pipelineId, failedClaim, true, engine, captures)
+                .or(() -> inheritedFailure(pipelineId, failedClaim)).orElse(null);
         FailedExecution recorded = failures.get(pipelineId);
         if (failure == null && recorded != null && recorded.belongsTo(failedClaim)) {
             failure = recorded.executionCause();

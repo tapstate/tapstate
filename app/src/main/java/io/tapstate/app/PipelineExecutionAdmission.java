@@ -54,5 +54,8 @@ interface PipelineExecutionAdmission {
 
     default void stopped(String pipelineId, WorkloadClaim stoppedClaim, boolean jobOver) { }
 
+    /** Reports an inherited failed job only through the existing submitted-execution identity proof. */
+    default Optional<Throwable> inheritedFailure(String pipelineId, WorkloadClaim expected) { return Optional.empty(); }
+
     default boolean mayComplete(String pipelineId) { return true; }
 }
