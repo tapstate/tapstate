@@ -110,6 +110,9 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
     image_config = config.get("config")
     if not isinstance(image_config, dict):
         raise ImageError(f"{platform} has no valid image config")
+    user = image_config.get("User")
+    if not isinstance(user, str) or user not in {"0", "0:0", "root", "root:root"}:
+        raise ImageError(f"{platform} Cloud runtime requires an explicit root user for Db2 initialization")
     labels = image_config.get("Labels")
     if not isinstance(labels, dict):
         raise ImageError(f"{platform} has no image labels")

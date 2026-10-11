@@ -20,7 +20,7 @@
 # the build being verified. Copying into a directory keeps every match, so the step below can refuse
 # anything but exactly one. The stage shares the final base image, so it downloads nothing extra, and
 # none of its layers reach the shipped image.
-FROM eclipse-temurin:21-jre AS boot-jar
+FROM eclipse-temurin:21-jre-noble AS boot-jar
 COPY app/target/app-*-boot.jar /jars/
 RUN set -eu; \
     cd /jars; \
@@ -33,7 +33,8 @@ RUN set -eu; \
     fi; \
     mv "$1" tapstate.jar
 
-FROM eclipse-temurin:21-jre AS runtime-base
+# Keep the Ubuntu 24.04 native-library ABI required by bundled connector runtimes.
+FROM eclipse-temurin:21-jre-noble AS runtime-base
 
 # Common OCI self-description. Only the public server target associates its package with the
 # public source repository; the Cloud target retains independent package metadata.
@@ -103,6 +104,11 @@ CMD ["--role=all"]
 # The connector seed has separate distribution terms, so this target does not inherit the server label's
 # Apache-2.0 assertion. Publication still requires a reviewed license inventory and permission.
 FROM runtime-base AS cloud
+# The bundled Db2 runtime registers its installation and client instance on first use.
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libxml2 \
+ && rm -rf /var/lib/apt/lists/*
 LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
       org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed" \
       io.tapstate.source="https://github.com/tapstate/tapstate" \

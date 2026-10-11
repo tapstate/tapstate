@@ -130,7 +130,7 @@ docker run -d --name "$SERVER" --label "$label=$OWNER" --network "$NETWORK" \
   -e 'TAPSTATE_STORE_MONGO_URI=mongodb://unreachable.invalid:27017/no_fallback' \
   "$CLOUD" "${BASE_ARGS[@]}" >/dev/null
 ready "$SERVER"
-[[ "$(docker exec "$SERVER" id -u)" = 10001 ]]
+[[ "$(docker exec "$SERVER" id -u)" = 0 ]]
 docker exec "$SERVER" sh -ec 'test "$(cat /proc/1/comm)" = java; cd /opt/tapstate/connectors; sha256sum -c /opt/tapstate/release/connectors.sha256' \
   >"$WORK/seed-bytes.log"
 SERVER_URL="$(url "$SERVER" 8080)"

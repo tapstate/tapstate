@@ -152,7 +152,7 @@ if ! docker buildx build --progress=plain --load --target server \
     exit 1
 fi
 docker run --rm --entrypoint sh "$SERVER_TAG" -ec \
-    'test ! -e /opt/tapstate/connectors; test -z "${TAPSTATE_CONNECTORS_SEED_DIR:-}"'
+    'test "$(id -u)" = 10001; test ! -e /opt/tapstate/connectors; test -z "${TAPSTATE_CONNECTORS_SEED_DIR:-}"'
 test "$(docker image inspect "$SERVER_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = Apache-2.0
 test "$(docker image inspect "$SERVER_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = https://github.com/tapstate/tapstate
 test "$(docker image inspect "$SERVER_TAG" --format '{{ index .Config.Labels "io.tapstate.distribution" }}')" = onprem
@@ -168,7 +168,12 @@ if ! docker buildx build --progress=plain --load --target cloud \
     exit 1
 fi
 docker run --rm --entrypoint sh "$CLOUD_TAG" -ec \
-    'test "$TAPSTATE_CONNECTORS_SEED_DIR" = /opt/tapstate/connectors; \
+    'failed=0; \
+     uid="$(id -u)"; \
+     if [ "$uid" != 0 ]; then echo "FAIL: Cloud image requires uid 0, received $uid" >&2; failed=1; fi; \
+     if ! ldconfig -p | grep -F "libxml2.so.2"; then echo "FAIL: Cloud image lacks libxml2.so.2" >&2; failed=1; fi; \
+     test "$failed" = 0; \
+     test "$TAPSTATE_CONNECTORS_SEED_DIR" = /opt/tapstate/connectors; \
      cd /opt/tapstate/connectors; \
      sha256sum -c /opt/tapstate/release/connectors.sha256; \
      test "$(find . -maxdepth 1 -type f -name "*-connector.jar" | wc -l | tr -d " ")" = 8'
