@@ -94,7 +94,8 @@ final class BenchmarkTargetClock {
         if (!before.primary().equals(after.primary()) || !before.processId().equals(after.processId())) {
             throw new AssertionError("target primary changed across the output window");
         }
-        long minimumElapsedMillis = (after.startedAtNanos() - before.completedAtNanos()) / 1_000_000L;
+        // Integer dates need an inward lower threshold; truncation could admit a fractional violation.
+        long minimumElapsedMillis = Math.ceilDiv(after.startedAtNanos() - before.completedAtNanos(), 1_000_000L);
         long maximumElapsedMillis = (after.completedAtNanos() - before.startedAtNanos()) / 1_000_000L;
         long serverElapsedMillis = Math.subtractExact(after.serverWallMillis(), before.serverWallMillis());
         if (minimumElapsedMillis < 0 || serverElapsedMillis < minimumElapsedMillis - ENDPOINT_RESOLUTION_ERROR_MILLIS
