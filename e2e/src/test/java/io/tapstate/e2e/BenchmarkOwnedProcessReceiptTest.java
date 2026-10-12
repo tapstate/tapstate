@@ -131,17 +131,10 @@ class BenchmarkOwnedProcessReceiptTest {
 
     @Test
     void anOwnedBenignJavaProcessRetainsItsActualIdentityAndExitWithoutAProductLaunch(@TempDir Path scratch) throws Exception {
-        Path jar = childJar(scratch), java = Path.of(System.getProperty("java.home"), "bin", "java");
-        List<String> command = List.of(java.toString(), "-jar", jar.toString());
-        Process child = new ProcessBuilder(command).redirectErrorStream(true).start();
-        RealProcessServer owned = new RealProcessServer(child, URI.create("http://127.0.0.1:1"),
-                scratch.resolve("unused-server.out"), scratch.resolve("unused-staging"), command);
+        Path jar = childJar(scratch);
+        OwnedChild started = startReadyChild(scratch, jar);
+        Process child = started.child(); RealProcessServer owned = started.owned();
         try {
-            BufferedReader output = new BufferedReader(new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8));
-            long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-            while (!output.ready() && child.isAlive() && System.nanoTime() - deadline < 0) { Thread.sleep(10); }
-            assertThat(output.ready()).as("the owned benign JVM reached its input barrier").isTrue();
-            assertThat(output.readLine()).isEqualTo("READY");
             var receipt = BenchmarkOwnedProcessReceipt.capture(owned, jar, bindings());
             receipt.verifyBeforeClose(); child.getOutputStream().close();
             assertThat(child.waitFor(5, TimeUnit.SECONDS)).isTrue();
@@ -156,6 +149,53 @@ class BenchmarkOwnedProcessReceiptTest {
             assertThatThrownBy(receipt::verifyBeforeClose).isInstanceOf(AssertionError.class);
             assertThatThrownBy(receipt::finishAfterClose).isInstanceOf(AssertionError.class);
             assertThat(receipt.evidence()).isSameAs(evidence);
+        } finally {
+            if (child.isAlive()) { child.destroyForcibly(); child.waitFor(5, TimeUnit.SECONDS); }
+        }
+    }
+
+    @Test
+    void aFailedForkRetainsItsOwnedRuntimeEvidenceEvenWhenTheExitSealAlsoRefuses(@TempDir Path scratch) throws Exception {
+        Path jar = childJar(scratch);
+        OwnedChild started = startReadyChild(scratch, jar);
+        Process child = started.child(); RealProcessServer owned = started.owned();
+        try {
+            var receipt = BenchmarkOwnedProcessReceipt.capture(owned, jar, bindings());
+            // A refusal raised inside the open fork, before the success path verifies the receipt.
+            var primary = new AssertionError("primary measured-phase refusal");
+            RealBenchmarkForkDriver.verifyOwnedReceiptBeforeClose(receipt);
+            assertThat(primary.getSuppressed()).isEmpty();
+            child.getOutputStream().close();
+            assertThat(child.waitFor(5, TimeUnit.SECONDS)).isTrue();
+
+            var printed = new ArrayList<String>();
+            var sealRefusal = new AssertionError("producer work seal refused");
+            RealBenchmarkForkDriver.finishOwnedReceipt(receipt, primary, actual -> { throw sealRefusal; }, printed::add);
+
+            assertThat(primary.getSuppressed()).containsExactly(sealRefusal);
+            assertThat(printed).singleElement().asString().startsWith("benchmark-owned-runtime-at-failure=");
+            Map<String, Object> evidence = receipt.evidence();
+            assertThat(evidence.get("verifiedBeforeCloseAt")).isInstanceOf(String.class);
+            assertThat(evidence).containsEntry("ownedAliveAfterClose", false).containsEntry("ownedExitCode", 0);
+            assertThat(((List<?>) evidence.get("reasons")).contains("BEFORE_CLOSE_VERIFICATION_NOT_RECORDED")).isFalse();
+        } finally {
+            if (child.isAlive()) { child.destroyForcibly(); child.waitFor(5, TimeUnit.SECONDS); }
+        }
+    }
+
+    @Test
+    void aReceiptAlreadyVerifiedOnTheSuccessPathIsNotVerifiedAgainAfterALaterFailure(@TempDir Path scratch) throws Exception {
+        Path jar = childJar(scratch);
+        OwnedChild started = startReadyChild(scratch, jar);
+        Process child = started.child(); RealProcessServer owned = started.owned();
+        try {
+            var receipt = BenchmarkOwnedProcessReceipt.capture(owned, jar, bindings());
+            receipt.verifyBeforeClose();
+            String verifiedAt = (String) receipt.evidence().get("verifiedBeforeCloseAt");
+            var primary = new AssertionError("failure after the success-path verification");
+            RealBenchmarkForkDriver.verifyOwnedReceiptBeforeClose(receipt);
+            assertThat(primary.getSuppressed()).isEmpty();
+            assertThat(receipt.evidence()).containsEntry("verifiedBeforeCloseAt", verifiedAt);
         } finally {
             if (child.isAlive()) { child.destroyForcibly(); child.waitFor(5, TimeUnit.SECONDS); }
         }
@@ -176,6 +216,26 @@ class BenchmarkOwnedProcessReceiptTest {
         return Map.of("namespace", "owned_receipt", "sourceSettings", Map.of("host", "127.0.0.1", "port", 1, "database", "source"),
                 "storeUri", "mongodb://localhost:1/control", "externalTargetUri", "mongodb://localhost:1/target",
                 "managedViewsUri", "mongodb://localhost:1/views", "operatorDatabase", "operator", "operatorStateUri", "mongodb://localhost:1/operator");
+    }
+    private record OwnedChild(Process child, RealProcessServer owned) { }
+    /** Starts the benign child and waits on its READY line; the loop's condition, not the sleep, decides. */
+    private static OwnedChild startReadyChild(Path scratch, Path jar) throws Exception {
+        Path java = Path.of(System.getProperty("java.home"), "bin", "java");
+        List<String> command = List.of(java.toString(), "-jar", jar.toString());
+        Process child = new ProcessBuilder(command).redirectErrorStream(true).start();
+        RealProcessServer owned = new RealProcessServer(child, URI.create("http://127.0.0.1:1"),
+                scratch.resolve("unused-server.out"), scratch.resolve("unused-staging"), command);
+        try {
+            BufferedReader output = new BufferedReader(new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8));
+            long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            while (!output.ready() && child.isAlive() && System.nanoTime() - deadline < 0) { Thread.sleep(10); }
+            assertThat(output.ready()).as("the owned benign JVM reached its input barrier").isTrue();
+            assertThat(output.readLine()).isEqualTo("READY");
+            return new OwnedChild(child, owned);
+        } catch (Exception | Error failed) {
+            child.destroyForcibly(); child.waitFor(5, TimeUnit.SECONDS);
+            throw failed;
+        }
     }
     private static Path childJar(Path scratch) throws Exception {
         Manifest manifest = new Manifest(); manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");

@@ -195,6 +195,8 @@ final class BenchmarkOwnedProcessReceipt {
         verifiedAt = Instant.now();
     }
 
+    boolean verifiedBeforeClose() { return verifiedAt != null; }
+
     /** Uses the original owned Process outcome, never the absence of a PID in a lookup. */
     void finishAfterClose() {
         BenchmarkReturnWorkBudget.add(BenchmarkReturnWorkBudget.Activity.CLEANUP, BenchmarkReturnWorkBudget.Work.call());

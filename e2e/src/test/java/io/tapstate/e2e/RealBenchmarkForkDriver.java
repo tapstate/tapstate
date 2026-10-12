@@ -694,7 +694,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         BenchmarkOwnedProcessReceipt ownedReceipt = null;
         Throwable primary = null;
         PipelineBenchmarkHarness.ForkResult result;
-        try (BenchmarkForkEnvironment fork = BenchmarkForkEnvironment.open(workload, applicationJar, forkId, launcher)) {
+        try (BenchmarkForkEnvironment fork = BenchmarkForkEnvironment.open(workload, applicationJar, forkId, launcher);
+             // Closed before the fork: a failure before the success-path check still records the owned identity.
+             AutoCloseable receiptGuard = verifyBeforeCloseGuard(fork.ownedProcessReceipt())) {
             ownedReceipt = fork.ownedProcessReceipt();
             BenchmarkSourceLineage.Witness lineage = workload.database()
                     == BenchmarkWorkloadDefinitions.Database.MYSQL
@@ -857,21 +859,40 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             throw failure;
         } finally {
             if (ownedReceipt != null) {
-                try {
-                    ownedReceipt.finishAfterClose();
+                finishOwnedReceipt(ownedReceipt, primary, receipt -> {
                     if (BenchmarkReturnWorkBudgetRun.current() != null) {
-                        BenchmarkReturnWorkBudgetRun.current().afterExit(ownedReceipt);
+                        BenchmarkReturnWorkBudgetRun.current().afterExit(receipt);
                     }
-                    if (primary != null) {
-                        BenchmarkReturnWorkBudgetRun.println("benchmark-owned-runtime-at-failure=" + BenchmarkReturnWorkBudgetRun.json(ownedReceipt.evidence()));
-                    }
-                } catch (Exception | Error recording) {
-                    if (primary == null) { throw recording; }
-                    if (recording != primary) { primary.addSuppressed(recording); }
-                }
+                }, BenchmarkReturnWorkBudgetRun::println);
             }
         }
         return result;
+    }
+
+    interface OwnedExitCheck { void check(BenchmarkOwnedProcessReceipt receipt) throws Exception; }
+
+    private static AutoCloseable verifyBeforeCloseGuard(BenchmarkOwnedProcessReceipt receipt) {
+        return () -> verifyOwnedReceiptBeforeClose(receipt);
+    }
+
+    /** Verifies the live owned identity once; the success path has normally done so already. */
+    static void verifyOwnedReceiptBeforeClose(BenchmarkOwnedProcessReceipt receipt) {
+        if (receipt != null && !receipt.verifiedBeforeClose()) { receipt.verifyBeforeClose(); }
+    }
+
+    /** Records the owned process outcome after the fork has closed it; failure evidence precedes the exit check. */
+    static void finishOwnedReceipt(BenchmarkOwnedProcessReceipt receipt, Throwable primary,
+            OwnedExitCheck afterExit, java.util.function.Consumer<String> println) throws Exception {
+        try {
+            receipt.finishAfterClose();
+            if (primary != null) {
+                println.accept("benchmark-owned-runtime-at-failure=" + BenchmarkReturnWorkBudgetRun.json(receipt.evidence()));
+            }
+            afterExit.check(receipt);
+        } catch (Exception | Error recording) {
+            if (primary == null) { throw recording; }
+            if (recording != primary) { primary.addSuppressed(recording); }
+        }
     }
 
     private static PhaseWindow runMeasuredPhase(BenchmarkWorkloadDefinitions.Workload workload,
