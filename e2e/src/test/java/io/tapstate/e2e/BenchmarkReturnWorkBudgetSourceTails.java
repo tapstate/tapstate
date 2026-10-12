@@ -58,7 +58,7 @@ final class BenchmarkReturnWorkBudgetSourceTails {
                 // Fixed preflight2 and boundary258 both lie in the protected even first-quarter domain.
                 outputs = new long[]{PILOT_ROWS, 256, 23996, 23996, PILOT_ROWS, 2};
                 sql = new int[]{0, 1, 240, 240, 960, 1}; perBatch = new int[]{1, 1, 1, 1, 1, 1}; coverage = new int[]{1, 1, 1, 1, 1, 1};
-                cadence = new long[]{0, 0, 0, 0, 20_000_000, 0};
+                cadence = new long[]{0, 0, 0, 0, 80_000_000, 0};
                 database = "POSTGRES"; pipelines = 1; chains = 1; targets = 1; setup = 194;
             }
             case "stateful" -> {

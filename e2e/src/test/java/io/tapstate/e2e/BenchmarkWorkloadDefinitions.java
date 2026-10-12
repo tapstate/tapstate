@@ -709,7 +709,7 @@ final class BenchmarkWorkloadDefinitions {
     static Duration pilotOfferInterval(String workload, String phase) {
         return switch (workload + "/" + phase) {
             case COPY + "/cdc-update" -> Duration.ofMillis(80);
-            case STATELESS + "/cdc-update" -> Duration.ofMillis(20);
+            case STATELESS + "/cdc-update" -> Duration.ofMillis(80);
             case STATEFUL + "/cold-read", STATEFUL + "/cdc-update" -> Duration.ofMillis(200);
             default -> throw new IllegalArgumentException("no fixed pilot offer for " + workload + "/" + phase);
         };
