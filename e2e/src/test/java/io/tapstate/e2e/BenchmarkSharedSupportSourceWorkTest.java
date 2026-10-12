@@ -163,7 +163,8 @@ class BenchmarkSharedSupportSourceWorkTest {
         var rows = BenchmarkSharedSupportSourceWork.bounds();
         assertThat(rows.get(BenchmarkSharedSupportSourceWork.Kind.PG_CONNECT).requests()).isGreaterThanOrEqualTo(9);
         assertThat(rows.get(BenchmarkSharedSupportSourceWork.Kind.TARGET_RESET).requests()).isGreaterThanOrEqualTo(5);
-        assertThat(rows.get(BenchmarkSharedSupportSourceWork.Kind.SQL_PARENT).elements()).isEqualTo(194);
+        // Two element slots per statement over the largest original setup roster (581 statements).
+        assertThat(rows.get(BenchmarkSharedSupportSourceWork.Kind.SQL_PARENT).elements()).isEqualTo(1162);
         assertThat(BenchmarkSharedSupportSourceWork.sharedUpper().records()).isEqualTo(1);
         assertThat(BenchmarkSharedSupportSourceWork.cleanupUpper().records()).isEqualTo(1);
     }

@@ -101,7 +101,9 @@ class BenchmarkTargetClockSamplerTest {
         }, closed::incrementAndGet);
         try {
             assertThat(sampler.samplesRecorded()).isZero();
-            TimeUnit.MILLISECONDS.sleep(450);
+            // Two sampling intervals pass without a second provider request; a second one ends the poll early.
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(450);
+            while (calls.get() <= 1 && System.nanoTime() - deadline < 0) TimeUnit.MILLISECONDS.sleep(10);
         } finally { sampler.close(); }
         assertThat(calls).hasValue(1); assertThat(closed).hasValue(1);
         assertThatThrownBy(sampler::evidence).isInstanceOf(AssertionError.class)

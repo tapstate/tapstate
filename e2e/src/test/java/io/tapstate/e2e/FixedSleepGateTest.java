@@ -92,6 +92,12 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/BenchmarkProcessProbeTest.java", 1L),
             // The benign owned-process control polls READY and child liveness within ten seconds.
             entry("test/java/io/tapstate/e2e/BenchmarkOwnedProcessReceiptTest.java", 1L),
+            // The latched sampler control polls the provider call count for two sampling intervals; a
+            // second request ends the loop early, so the count, not the elapsed time, decides.
+            entry("test/java/io/tapstate/e2e/BenchmarkTargetClockSamplerTest.java", 1L),
+            // The dispatch-timeout control polls for the child's written pid within ten seconds; the
+            // second sleep keeps the owned grandchild alive so the timeout under test has a process to stop.
+            entry("test/java/io/tapstate/e2e/PipelineBenchmarkReturnOwnedProcessTest.java", 2L),
             // The cold writer control polls complete output lines and child liveness within thirty
             // seconds, retaining the bounded log rather than inferring readiness from elapsed time.
             entry("test/java/io/tapstate/e2e/BenchmarkWriteReturnProbeIT.java", 1L),

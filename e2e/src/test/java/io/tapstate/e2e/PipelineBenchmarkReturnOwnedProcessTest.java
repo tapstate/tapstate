@@ -16,9 +16,10 @@ class PipelineBenchmarkReturnOwnedProcessTest {
         long childPid = 0;
         try {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-            while (!Files.exists(pidFile) && System.nanoTime() < deadline) TimeUnit.MILLISECONDS.sleep(10);
-            assertThat(Files.exists(pidFile)).isTrue();
-            childPid = Long.parseLong(Files.readString(pidFile));
+            // The file appears before the child's pid is written into it; wait for the content, not the name.
+            while (!hasPid(pidFile) && System.nanoTime() < deadline) TimeUnit.MILLISECONDS.sleep(10);
+            assertThat(hasPid(pidFile)).isTrue();
+            childPid = Long.parseLong(Files.readString(pidFile).trim());
             var child = ProcessHandle.of(childPid).orElseThrow();
             assertThat(child.isAlive()).isTrue();
             assertThatThrownBy(() -> PipelineBenchmarkReturnLiveRun.awaitOwned(parent, 100, TimeUnit.MILLISECONDS))
@@ -30,6 +31,9 @@ class PipelineBenchmarkReturnOwnedProcessTest {
             if (parent.isAlive()) parent.destroyForcibly();
             if (childPid > 0) ProcessHandle.of(childPid).filter(ProcessHandle::isAlive).ifPresent(ProcessHandle::destroyForcibly);
         }
+    }
+    private static boolean hasPid(Path file) throws java.io.IOException {
+        return Files.exists(file) && !Files.readString(file).isBlank();
     }
     private static Process launch(Path pidFile) throws Exception {
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
