@@ -95,23 +95,28 @@ final class PartitionableCluster implements AutoCloseable {
     }
 
     /**
-     * Launches one member per node id, in that order, each reporting its own link and dialling from
-     * its own ports.
+     * Launches one member per node id before waiting for health, each reporting its own link and
+     * dialling from its own ports. Membership remains the case's own explicit witness.
      *
      * <p>Every port -- the member ports, the link ports and the outbound ranges -- is settled before
      * any process starts, because a member is told what to report, what to dial and what to dial from
      * on its command line and cannot be told any of it afterwards.
      */
     static PartitionableCluster start(String storeUri, String name, List<String> nodeIds) {
+        if (nodeIds.isEmpty() || nodeIds.stream().distinct().count() != nodeIds.size()) {
+            throw new IllegalArgumentException("initial cluster members must have distinct node ids");
+        }
         String clusterId = name + "-" + UUID.randomUUID();
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, int[]> outbound = outboundRanges(nodeIds);
         Map<String, CuttableLink> links = new LinkedHashMap<>();
         Map<String, RealProcessServer> servers = new LinkedHashMap<>();
+        Map<String, RealProcessServer.PreparedLaunch> prepared = new LinkedHashMap<>();
         // Kept per member, because what a member is told is fixed on its command line: a member that
         // comes back has to come back as the same member, on the same port, behind the same link.
         Map<String, IntFunction<List<String>>> launchArguments = new LinkedHashMap<>();
+        Throwable startingFailure = null;
         try {
             for (String nodeId : nodeIds) {
                 memberPorts.put(nodeId, RealProcessServer.reservePort());
@@ -129,15 +134,40 @@ final class PartitionableCluster implements AutoCloseable {
                         seeds, httpPort, bindAddress, nodeIds.size(), range));
             }
             for (String nodeId : nodeIds) {
-                servers.put(nodeId,
-                        RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
+                prepared.put(nodeId,
+                        RealProcessServer.prepare(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
             }
+            for (String nodeId : nodeIds) servers.put(nodeId, prepared.get(nodeId).launch());
+            servers.values().forEach(RealProcessServer::awaitHealthy);
         } catch (RuntimeException | Error failure) {
-            servers.values().forEach(RealProcessServer::close);
-            links.values().forEach(CuttableLink::close);
+            startingFailure = failure;
+            Map<String, Path> launchedLogs = new LinkedHashMap<>();
+            prepared.forEach((nodeId, launch) -> launchedLogs.put(nodeId, launch.output()));
+            try { closeOwned(servers, prepared, links, clusterId, launchedLogs); }
+            catch (RuntimeException | Error cleanup) {
+                if (cleanup != failure) failure.addSuppressed(cleanup);
+            }
             throw failure;
         } finally {
-            memberPorts.values().forEach(RealProcessServer::releasePort);
+            List<Throwable> portFailures = new ArrayList<>();
+            for (int memberPort : memberPorts.values()) {
+                try { RealProcessServer.releasePort(memberPort); }
+                catch (RuntimeException | Error cleanup) { portFailures.add(cleanup); }
+            }
+            if (!portFailures.isEmpty()) {
+                Throwable primary = startingFailure == null ? portFailures.getFirst() : startingFailure;
+                portFailures.stream().filter(cleanup -> cleanup != primary).forEach(primary::addSuppressed);
+                if (startingFailure == null) {
+                    Map<String, Path> launchedLogs = new LinkedHashMap<>();
+                    prepared.forEach((nodeId, launch) -> launchedLogs.put(nodeId, launch.output()));
+                    try { closeOwned(servers, prepared, links, clusterId, launchedLogs); }
+                    catch (RuntimeException | Error cleanup) {
+                        if (cleanup != primary) primary.addSuppressed(cleanup);
+                    }
+                    if (primary instanceof RuntimeException failure) throw failure;
+                    throw (Error) primary;
+                }
+            }
         }
         PartitionableCluster cluster = new PartitionableCluster(
                 nodeIds, servers, links, clusterId, storeUri, launchArguments);
@@ -146,7 +176,10 @@ final class PartitionableCluster implements AutoCloseable {
             // The administrator lives in the store they all share, so the rest do not create one.
             nodeIds.stream().skip(1).forEach(nodeId -> cluster.planes.get(nodeId).login(ADMIN, PASSWORD));
         } catch (RuntimeException | Error failure) {
-            cluster.close();
+            try { cluster.close(); }
+            catch (RuntimeException | Error cleanup) {
+                if (cleanup != failure) failure.addSuppressed(cleanup);
+            }
             throw failure;
         }
         return cluster;
@@ -259,19 +292,50 @@ final class PartitionableCluster implements AutoCloseable {
 
     @Override
     public void close() {
-        List<RuntimeException> failures = new ArrayList<>();
+        closeOwned(servers, Map.of(), links, clusterId, logs);
+    }
+
+    /** Final fixture cleanup signals every owned process before waiting for any one of them. */
+    private static void closeOwned(Map<String, RealProcessServer> servers,
+            Map<String, RealProcessServer.PreparedLaunch> prepared, Map<String, CuttableLink> links,
+            String clusterId, Map<String, Path> logs) {
+        List<Throwable> failures = new ArrayList<>();
         for (RealProcessServer server : servers.values()) {
             try {
-                server.close();
-            } catch (RuntimeException failure) {
+                server.requestClose();
+            } catch (RuntimeException | Error failure) {
                 failures.add(failure);
             }
         }
-        links.values().forEach(CuttableLink::close);
-        // After the processes are down, so what a member said on its way out is in what is kept.
-        FailureScene.writeMemberLogs(clusterId, logs);
+        for (RealProcessServer server : servers.values()) {
+            try {
+                server.awaitClosed();
+            } catch (RuntimeException | Error failure) {
+                failures.add(failure);
+            }
+        }
+        for (RealProcessServer.PreparedLaunch launch : prepared.values()) {
+            try {
+                launch.close();
+            } catch (RuntimeException | Error failure) {
+                failures.add(failure);
+            }
+        }
+        for (CuttableLink link : links.values()) {
+            try {
+                link.close();
+            } catch (RuntimeException | Error failure) {
+                failures.add(failure);
+            }
+        }
+        // Preserve every incarnation's log even when another member or link could not close.
+        try { FailureScene.writeMemberLogs(clusterId, logs); }
+        catch (RuntimeException | Error failure) { failures.add(failure); }
         if (!failures.isEmpty()) {
-            throw failures.getFirst();
+            Throwable first = failures.getFirst();
+            failures.stream().skip(1).filter(failure -> failure != first).forEach(first::addSuppressed);
+            if (first instanceof RuntimeException failure) throw failure;
+            throw (Error) first;
         }
     }
 

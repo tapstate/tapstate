@@ -55,6 +55,8 @@ final class RealProcessServer implements ServerHandle {
     // Whether the launch made the directory itself, and so deletes it as it ends; one a witness named is the
     // witness's to keep or clear.
     private final boolean ownsStagingDirectory;
+    private boolean closeRequested;
+    private long closeRequestedAt;
 
     private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory,
             boolean ownsStagingDirectory) {
@@ -205,6 +207,19 @@ final class RealProcessServer implements ServerHandle {
                 List.of(), stagingDirectory, extraArguments);
     }
 
+    /** Prepares one initial member's owned paths, ports and command without creating a process. */
+    static PreparedLaunch prepare(String storeUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(storeUri, listenAddress, null, extraArguments);
+    }
+
+    /** The same preparation, retaining a staging directory explicitly owned by the witness. */
+    static PreparedLaunch prepare(String storeUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
+                List.of(), stagingDirectory, extraArguments);
+    }
+
     /** The same, listening on {@code listenAddress}. See {@link #start(String, String, IntFunction)}. */
     static RealProcessServer launching(String storeUri, Path jar, String listenAddress,
             IntFunction<List<String>> extraArguments) {
@@ -249,20 +264,177 @@ final class RealProcessServer implements ServerHandle {
         return server;
     }
 
+    /** Waits on the same health predicate and budget used by a single-process start. */
+    void awaitHealthy() {
+        healthy(this);
+    }
+
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        try (PreparedLaunch prepared = prepare(storeUri, operatorStateDatabase, jar, listenAddress,
+                jvmOptions, stagingDirectory, extraArguments)) {
+            return prepared.launch();
+        }
+    }
+
+    private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
-        Path workingDirectory = workingDirectory();
-        Path output = workingDirectory.resolve("server.out");
         boolean owned = stagingDirectory == null;
-        Path staging = owned ? ServerHandle.privateStagingDirectory() : stagingDirectory;
-        Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, staging, extraArguments.apply(port));
-        return new RealProcessServer(process, baseUrl, output, staging, owned);
+        Path staging = stagingDirectory;
+        try {
+            Path workingDirectory = workingDirectory();
+            Path output = workingDirectory.resolve("server.out");
+            try { Files.createFile(output); }
+            catch (IOException failure) {
+                throw new UncheckedIOException("could not prepare the server output at " + output, failure);
+            }
+            if (owned) staging = ServerHandle.privateStagingDirectory();
+            return new PreparedLaunch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
+                    workingDirectory, baseUrl, output, staging, owned, extraArguments.apply(port));
+        } catch (RuntimeException | Error failure) {
+            try { releasePort(port); }
+            catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            if (owned && staging != null) {
+                try { ServerHandle.discardStagingDirectory(staging); }
+                catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            }
+            // The working directory is diagnostic evidence, not a connector cache to discard.
+            throw failure;
+        }
+    }
+
+    /** One owned launch plan; handed-off processes and caller-owned staging are never cancelled here. */
+    static final class PreparedLaunch implements AutoCloseable {
+        private final Path jar;
+        private final List<String> jvmOptions;
+        private final int httpPort;
+        private final String listenAddress;
+        private final String storeUri;
+        private final String operatorStateDatabase;
+        private final Path workingDirectory;
+        private final URI baseUrl;
+        private final Path output;
+        private final Path stagingDirectory;
+        private final boolean ownsStagingDirectory;
+        private final List<String> extraArguments;
+        private boolean launchAttempted;
+        private boolean handedOff;
+        private boolean released;
+        private Process unhandedProcess;
+        private long forcedAt;
+
+        private PreparedLaunch(Path jar, List<String> jvmOptions, int httpPort, String listenAddress,
+                String storeUri, String operatorStateDatabase, Path workingDirectory, URI baseUrl,
+                Path output, Path stagingDirectory, boolean ownsStagingDirectory, List<String> extraArguments) {
+            this.jar = jar;
+            this.jvmOptions = List.copyOf(jvmOptions);
+            this.httpPort = httpPort;
+            this.listenAddress = listenAddress;
+            this.storeUri = storeUri;
+            this.operatorStateDatabase = operatorStateDatabase;
+            this.workingDirectory = workingDirectory;
+            this.baseUrl = baseUrl;
+            this.output = output;
+            this.stagingDirectory = stagingDirectory;
+            this.ownsStagingDirectory = ownsStagingDirectory;
+            this.extraArguments = List.copyOf(extraArguments);
+        }
+
+        synchronized RealProcessServer launch() {
+            if (released || launchAttempted) {
+                throw new IllegalStateException("the prepared server launch is no longer available");
+            }
+            launchAttempted = true;
+            try {
+                unhandedProcess = RealProcessServer.launch(jar, jvmOptions, httpPort, listenAddress,
+                        storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments);
+                RealProcessServer server = new RealProcessServer(
+                        unhandedProcess, baseUrl, output, stagingDirectory, ownsStagingDirectory);
+                handedOff = true;
+                unhandedProcess = null;
+                return server;
+            } catch (RuntimeException | Error failure) {
+                try { close(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
+        }
+
+        int httpPort() {
+            return httpPort;
+        }
+
+        Path workingDirectory() {
+            return workingDirectory;
+        }
+
+        Path output() {
+            return output;
+        }
+
+        Path stagingDirectory() {
+            return stagingDirectory;
+        }
+
+        @Override
+        public synchronized void close() {
+            if (handedOff || released) return;
+            List<Throwable> failures = new ArrayList<>();
+            InterruptedException interrupted = null;
+            boolean exited = unhandedProcess == null || !unhandedProcess.isAlive();
+            try {
+                if (!exited) {
+                    try {
+                        unhandedProcess.destroyForcibly();
+                        if (forcedAt == 0) forcedAt = System.nanoTime();
+                        while (!exited) {
+                            long remaining = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - forcedAt);
+                            if (remaining <= 0) break;
+                            try {
+                                exited = unhandedProcess.waitFor(remaining, TimeUnit.NANOSECONDS);
+                            } catch (InterruptedException failure) {
+                                if (interrupted == null) interrupted = failure;
+                                else interrupted.addSuppressed(failure);
+                            }
+                        }
+                    } catch (RuntimeException | Error failure) {
+                        failures.add(failure);
+                    }
+                }
+                boolean exitConfirmed = exited && (unhandedProcess == null || !unhandedProcess.isAlive());
+                if (!exitConfirmed) {
+                    failures.add(new AssertionError("the unhanded server did not exit within "
+                            + SHUTDOWN_BUDGET + "; its output was:\n" + tail(output), interrupted));
+                }
+                try { releasePort(httpPort); }
+                catch (RuntimeException | Error failure) { failures.add(failure); }
+                if (exitConfirmed && ownsStagingDirectory) {
+                    try { ServerHandle.discardStagingDirectory(stagingDirectory); }
+                    catch (RuntimeException | Error failure) { failures.add(failure); }
+                }
+                if (interrupted != null) {
+                    failures.add(new AssertionError("interrupted while cancelling the prepared server", interrupted));
+                }
+                if (!failures.isEmpty()) {
+                    Throwable primary = failures.getFirst();
+                    failures.stream().skip(1).filter(failure -> failure != primary).forEach(primary::addSuppressed);
+                    if (primary instanceof RuntimeException failure) throw failure;
+                    throw (Error) primary;
+                }
+                released = true;
+                // Logs and the private working directory are retained even when no JVM could start.
+            } finally {
+                if (interrupted != null) Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**
@@ -277,7 +449,10 @@ final class RealProcessServer implements ServerHandle {
     void kill() {
         process.destroyForcibly();
         try {
-            process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+            if (!process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS)) {
+                throw new AssertionError("the killed server did not exit within " + SHUTDOWN_BUDGET
+                        + "; its output was:\n" + tail());
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while waiting for the killed server to go away", e);
@@ -351,17 +526,69 @@ final class RealProcessServer implements ServerHandle {
 
     @Override
     public void close() {
+        requestClose();
+        awaitClosed();
+    }
+
+    /** Requests this owned process's polite exit without waiting for another member. */
+    synchronized void requestClose() {
+        if (closeRequested) return;
+        closeRequestedAt = System.nanoTime();
+        closeRequested = true;
         process.destroy();
-        try {
-            if (!process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly();
-                process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    /** Confirms exit under the original grace and forced-exit budgets before discarding staging. */
+    void awaitClosed() {
+        long requestedAt;
+        synchronized (this) {
+            if (!closeRequested) {
+                throw new IllegalStateException("the owned server has not been asked to close");
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            process.destroyForcibly();
+            requestedAt = closeRequestedAt;
         }
-        discardOwnStagingDirectory();
+        InterruptedException interrupted = null;
+        try {
+            boolean exited = !process.isAlive();
+            long remainingGrace = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - requestedAt);
+            if (!exited && remainingGrace > 0) {
+                try {
+                    exited = process.waitFor(remainingGrace, TimeUnit.NANOSECONDS);
+                } catch (InterruptedException failure) {
+                    interrupted = failure;
+                }
+            }
+            if (!exited) {
+                process.destroyForcibly();
+                long forcedAt = System.nanoTime();
+                while (!exited) {
+                    long remaining = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - forcedAt);
+                    if (remaining <= 0) break;
+                    try {
+                        exited = process.waitFor(remaining, TimeUnit.NANOSECONDS);
+                    } catch (InterruptedException failure) {
+                        if (interrupted == null) interrupted = failure;
+                        else interrupted.addSuppressed(failure);
+                    }
+                }
+            }
+            if (!exited || process.isAlive()) {
+                throw new AssertionError("the server did not exit after its " + SHUTDOWN_BUDGET
+                        + " grace and " + SHUTDOWN_BUDGET + " forced-exit budgets; its output was:\n"
+                        + tail(), interrupted);
+            }
+            AssertionError interruptedFailure = interrupted == null ? null : new AssertionError(
+                    "interrupted while waiting for the server to close; its exit was confirmed", interrupted);
+            try {
+                discardOwnStagingDirectory();
+            } catch (RuntimeException | Error cleanup) {
+                if (interruptedFailure == null) throw cleanup;
+                interruptedFailure.addSuppressed(cleanup);
+            }
+            if (interruptedFailure != null) throw interruptedFailure;
+        } finally {
+            if (interrupted != null) Thread.currentThread().interrupt();
+        }
     }
 
     private void discardOwnStagingDirectory() {
