@@ -3,11 +3,13 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.ClientSession;
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
+import com.mongodb.event.CommandFailedEvent;
 import com.mongodb.MongoException;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import io.tapstate.core.common.TapstateException;
@@ -15,6 +17,7 @@ import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -25,6 +28,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -43,6 +49,163 @@ class SourceConfigKeyringAcknowledgementIT {
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     private static final Duration TTL = Duration.ofSeconds(10);
+
+    @Test
+    void anUnlabelledWriteConflictDoesNotAuthorizeReplayingAnAcknowledgement() {
+        rejectedSessionIsNotRetried(new MongoException(112, "unlabelled conflict"), false);
+    }
+
+    @Test
+    void interruptionStopsConflictRetriesAndPreservesTheInterrupt() {
+        MongoException conflict = new MongoException(112, "transaction conflict");
+        conflict.addLabel("TransientTransactionError");
+        try {
+            rejectedSessionIsNotRetried(conflict, true);
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    private static void rejectedSessionIsNotRetried(MongoException failure, boolean interrupt) {
+        try (MongoClient actual = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = freshDatabase(actual);
+            SourceConfigKeyringStore ring = new SourceConfigKeyringStore(actual, database);
+            ring.loadOrCreateCipher();
+            WorkloadClaim node = acquire(claims(database), "boot-live", TTL);
+            AtomicInteger attempts = new AtomicInteger();
+            MongoClient rejecting = (MongoClient) Proxy.newProxyInstance(MongoClient.class.getClassLoader(),
+                    new Class<?>[] {MongoClient.class}, (proxy, method, arguments) -> {
+                        if (method.getName().equals("startSession")) {
+                            attempts.incrementAndGet();
+                            if (interrupt) Thread.currentThread().interrupt();
+                            throw failure;
+                        }
+                        return invoke(method, actual, arguments);
+                    });
+            SourceConfigKeyringStore acknowledgements = new SourceConfigKeyringStore(rejecting, database);
+            try {
+                assertThatThrownBy(() -> acknowledgements.acknowledge(node, 1L, TTL))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                assertThat(attempts.get()).isEqualTo(1);
+                if (interrupt) assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            } finally {
+                // Check the production method's flag before clearing this test thread for DB reads
+                // and cleanup; the driver itself refuses those operations while interrupted.
+                if (interrupt) Thread.interrupted();
+            }
+            assertThat(acknowledgement(database)).isNull();
+        }
+    }
+
+    @Test
+    void anUnknownCommitResultDoesNotReplayAnAlreadyCommittedAcknowledgement() {
+        try (MongoClient actual = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = freshDatabase(actual);
+            new SourceConfigKeyringStore(actual, database).loadOrCreateCipher();
+            WorkloadClaim node = acquire(claims(database), "boot-live", TTL);
+            AtomicInteger transactions = new AtomicInteger();
+            AtomicInteger commits = new AtomicInteger();
+            MongoException ambiguous = new MongoException(91, "commit response unavailable");
+            ambiguous.addLabel("TransientTransactionError");
+            ambiguous.addLabel("UnknownTransactionCommitResult");
+            MongoClient uncertain = (MongoClient) Proxy.newProxyInstance(MongoClient.class.getClassLoader(),
+                    new Class<?>[] {MongoClient.class}, (proxy, method, arguments) -> {
+                        if (!method.getName().equals("startSession")) return invoke(method, actual, arguments);
+                        ClientSession session = (ClientSession) invoke(method, actual, arguments);
+                        transactions.incrementAndGet();
+                        return Proxy.newProxyInstance(ClientSession.class.getClassLoader(),
+                                new Class<?>[] {ClientSession.class}, (wrapped, operation, parameters) -> {
+                                    Object result = invoke(operation, session, parameters);
+                                    if (operation.getName().equals("commitTransaction")) {
+                                        commits.incrementAndGet();
+                                        // The server committed, but its answer was lost. Replaying the
+                                        // transaction would publish a second ownership fence.
+                                        throw ambiguous;
+                                    }
+                                    return result;
+                                });
+                    });
+            SourceConfigKeyringStore acknowledgements = new SourceConfigKeyringStore(uncertain, database);
+            assertThatThrownBy(() -> acknowledgements.acknowledge(node, 1L, TTL))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            assertThat(transactions.get()).isEqualTo(1);
+            assertThat(commits.get()).isEqualTo(1);
+            assertThat(acknowledgement(database)).containsEntry("epoch", 1L).containsEntry("bootId", "boot-live");
+            assertThat(SystemCollections.WORKLOAD_CLAIMS.on(database)
+                    .find(new Document("ownerBootId", "boot-live")).first())
+                    .containsEntry("sourceConfigAckFence", 1L);
+        }
+    }
+
+    private static Object invoke(Method method, Object target, Object[] arguments) throws Throwable {
+        try {
+            return method.invoke(target, arguments);
+        } catch (InvocationTargetException failure) {
+            throw failure.getCause();
+        }
+    }
+
+    @Test
+    void acknowledgementSurvivesThreeCompetingKeyringWritesWithoutLosingItsNodeSession() {
+        try (MongoClient competing = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = freshDatabase(competing);
+            SourceConfigKeyringStore rings = new SourceConfigKeyringStore(competing, database);
+            rings.loadOrCreateCipher();
+            MongoWorkloadClaimStore claims = claims(database);
+            WorkloadClaim node = acquire(claims, "boot-live", TTL);
+            AtomicInteger writes = new AtomicInteger();
+            AtomicInteger conflicts = new AtomicInteger();
+            AtomicReference<Throwable> hookFailure = new AtomicReference<>();
+            CommandListener contender = new CommandListener() {
+                @Override
+                public void commandStarted(CommandStartedEvent event) {
+                    if (!"update".equals(event.getCommandName())) return;
+                    var update = event.getCommand().getArray("updates").get(0).asDocument().getDocument("u");
+                    if (!update.containsKey("$inc")
+                            || !update.getDocument("$inc").containsKey("nodeAckFence")) return;
+                    if (writes.getAndIncrement() < 3) {
+                        try {
+                            // The transaction already read its node claim. A committed competing write
+                            // makes its keyring snapshot stale before it attempts the shared fence.
+                            assertThat(SystemCollections.SYSTEM_META.on(database).updateOne(
+                                    new Document("_id", "source-config-keyring"),
+                                    new Document("$inc", new Document("nodeAckFence", 1L)))
+                                    .getModifiedCount()).isEqualTo(1);
+                        } catch (Throwable error) {
+                            hookFailure.set(error);
+                        }
+                    }
+                }
+
+                @Override
+                public void commandFailed(CommandFailedEvent event) {
+                    if (event.getThrowable() instanceof MongoException error && error.getCode() == 112) {
+                        assertThat(error.hasErrorLabel("TransientTransactionError")).isTrue();
+                        conflicts.incrementAndGet();
+                    }
+                }
+            };
+            MongoClientSettings settings = MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(contender).build();
+            try (MongoClient acknowledging = MongoClients.create(settings)) {
+                SourceConfigKeyringHandle handle = new SourceConfigKeyringHandle(new SourceConfigKeyringStore(
+                        acknowledging, acknowledging.getDatabase(database.getName())));
+                handle.acknowledge(node, TTL);
+                assertThat(hookFailure.get()).isNull();
+                assertThat(conflicts.get()).as("three real snapshot write conflicts were observed").isEqualTo(3);
+                assertThat(writes.get()).isEqualTo(4);
+                assertThat(acknowledgement(database)).containsEntry("bootId", "boot-live")
+                        .containsEntry("claimGeneration", node.claimGeneration()).containsEntry("epoch", 1L);
+                assertThat(claims.read(node.key()).orElseThrow().leased()).isTrue();
+                assertThat(SystemCollections.WORKLOAD_CLAIMS.on(database)
+                        .find(new Document("ownerBootId", "boot-live")).first())
+                        .containsEntry("sourceConfigAckFence", 1L);
+            }
+        }
+    }
 
     @ParameterizedTest
     @EnumSource(LostOwnership.class)
