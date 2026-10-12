@@ -17,7 +17,14 @@ final class BenchmarkReturnWorkBudgetReportPlan {
     private static final int OUTER_DEPTH = 12;
     private static final int SOURCE_KEY_BYTES = 4 * SOURCE_LEAF_CHARS;
     private static final int MAX_LEAF = Math.max(SOURCE_KEY_BYTES, base64(PAGE_BYTES));
-    static final int RETURN_COMPONENT_CATALOGUE_ROWS = 19, CATALOGUE_ROWS = 64;
+    static final int RETURN_COMPONENT_CATALOGUE_ROWS = 23, CATALOGUE_ROWS = 64;
+    // Source-fixed ACK material: original nine-field reading plus two nine-field diagnostics;
+    // the native calibration is a 33-field header with the original sixteen-field route,
+    // four class digests and three fixed condition strings. These caps precede rendering.
+    static final int ACK_READING_FIELDS = 9, ACK_COMPARISON_FIELDS = 9, ACK_ROW_FIELDS = ACK_READING_FIELDS + 2;
+    static final int ACK_HELLO_FIELDS = 11 + 18 + 2, ACK_CONTEXT_FIELDS = 11 + 18 + 3;
+    static final int ACK_PAIR_FIELDS = 6 + 18, ACK_MAPPING_FIELDS = 15 + 18;
+    static final int ACK_ROUTE_FIELDS = 16, ACK_ROUTE_CLASSES = 4, ACK_ROUTE_CONDITIONS = 3;
 
     record Component(String id, String sourceBranch, long rows, long nodesPerRow, long stringsPerRow,
                      int leafUtf8Upper, int localDepthUpper, String boundBasis) {
@@ -246,13 +253,30 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         add(parts, "METHOD_COMMON_WINDOW_CERTIFICATES", "BoundPhase.evidence.commonWindowCertificate/BoundPhase.commonWindow",
                 Math.multiplyExact(2, phases), commonNodes, commonStrings, 8192, 6,
                 "TWO_PROJECTIONS_MAX_PER_PHASE_FORTY_FIELDS_TWO_TARGETS_TEN_BINS_THREE_RATIOS");
-        add(parts, "METHOD_SERIAL_HELLO_READINGS", "BenchmarkTargetClock.validateSeries.readings",
-                Math.multiplyExact(phases, 6000), mapNodes(9), 9L * 64 + 4L * 65536 + 4L * 24 + 64,
-                MAX_LEAF, 5,
-                "GUARD_BEFORE_LISTCOPY_AND_PROJECTION_PRIMARY65536_CHARS_PROCESS24_CHARS_NINE_FIELDS");
-        add(parts, "METHOD_SERIAL_HELLO_HEADER", "BenchmarkTargetClock.validateSeries",
-                phases, mapNodes(7) + 1, 7L * (64 + 128), 128, 4,
-                "SEVEN_FIXED_HEADER_FIELDS_READINGS_MATERIAL_COUNTED_SEPARATELY");
+        add(parts, "METHOD_SERIAL_HELLO_READINGS", "BenchmarkTargetClock.verifyAckHello.readings",
+                Math.multiplyExact(phases, 6000), ackHelloRowNodes(), ackHelloRowStrings(),
+                MAX_LEAF, 6,
+                "ELEVEN_FIELDS_TWO_NINE_FIELD_NUMERIC_COMPARISONS_PRIOR_PRIMARY65536_PROCESS24_NO_MESSAGES");
+        add(parts, "METHOD_SERIAL_HELLO_HEADER", "BenchmarkTargetClock.verifyAckHello",
+                phases, mapNodes(ACK_HELLO_FIELDS) + 1, ACK_HELLO_FIELDS * (128L + 128), 128, 4,
+                "THIRTEEN_FIXED_CONTEXT_FIELDS_EIGHTEEN_FALSE_FLAGS_LIST_MATERIAL_SEPARATE");
+        add(parts, "METHOD_SERIAL_MAPPING_CALIBRATION", "BenchmarkNativeNominalReturnClock.serialCalibrationEvidence",
+                phases, ackMappingNodes(), ackMappingStrings(), 512, 5,
+                "THIRTYTHREE_FIELDS_BOUND_ROUTE16_CLASSES4_CONDITIONS3_NO_SAMPLE_ROSTER_DUPLICATION");
+        // A complete report has one sampledInterior context. The controlled target-clock
+        // stdout packet also has a top-level sampledInterior alongside calibration's context.
+        // Reserve both original projections independently; no future output-call count is used.
+        add(parts, "ACK_TARGET_HELLO_CONTEXT_READINGS", "BenchmarkTargetClockSampler.evidenceForAck/benchmark-target-clock.sampledInterior",
+                Math.multiplyExact(Math.multiplyExact(2, phases), 6000), ackHelloRowNodes(), ackHelloRowStrings(), MAX_LEAF, 6,
+                "TWO_SAMPLER_PROJECTIONS_EACH6000_ELEVEN_FIELDS_AND_TWO_NUMERIC_COMPARISONS");
+        add(parts, "ACK_TARGET_HELLO_CONTEXT_HEADERS", "BenchmarkTargetClockSampler.evidenceForAck",
+                Math.multiplyExact(2, phases), mapNodes(ACK_CONTEXT_FIELDS) + 1,
+                ACK_CONTEXT_FIELDS * (128L + 128), 128, 4,
+                "TWENTYNINE_SERIES_FIELDS_THREE_SAMPLER_FIELDS_LIST_MATERIAL_SEPARATE");
+        add(parts, "ACK_TARGET_HELLO_OUTER_PAIR", "RealBenchmarkForkDriver.targetClockQualification/BenchmarkTargetClock.validateAckPair",
+                phases, mapNodes(ACK_PAIR_FIELDS) + 2 * mapNodes(ACK_READING_FIELDS) + mapNodes(ACK_COMPARISON_FIELDS),
+                ACK_PAIR_FIELDS * (128L + 128) + 2 * ackRawReadingStrings() + ackComparisonStrings(), MAX_LEAF, 6,
+                "TWENTYFOUR_FIELD_PAIR_TWO_RAW_NINE_FIELD_READINGS_ONE_NUMERIC_COMPARISON");
         add(parts, "METHOD_TYPED_REFUSAL", "BenchmarkReturnMethodAdmission.Refusal.retainedEvidence",
                 1, mapNodes(64), 64L * (128 + 256), 512, 4,
                 "FIXED_REASON_AND_EIGHTEEN_FALSE_FLAGS_NO_CAUSE_STACK_OR_ARBITRARY_CALLBACK_BODY");
@@ -302,6 +326,32 @@ final class BenchmarkReturnWorkBudgetReportPlan {
         return new BenchmarkReturnWorkBudget.Work(1, requests, rows, 0,
                 Math.addExact(Math.multiplyExact(8, scalarSlots), Math.multiplyExact(4, descriptorChars)), 4,
                 Math.addExact(Math.multiplyExact(2, scalarSlots), descriptorChars), scalarSlots).times(entries);
+    }
+
+    static long ackHelloRowNodes() {
+        return Math.addExact(mapNodes(ACK_ROW_FIELDS), Math.multiplyExact(2, mapNodes(ACK_COMPARISON_FIELDS)));
+    }
+    static long ackRawReadingStrings() {
+        // Keys <=128; primary is guarded as UTF-16 characters and needs four UTF-8 bytes
+        // per character. ObjectId's 24 characters conservatively use the same factor.
+        return Math.addExact(ACK_READING_FIELDS * 128L,
+                Math.addExact(4L * 65536, Math.addExact(4L * 24, 128)));
+    }
+    static long ackComparisonStrings() {
+        // Nine bounded keys; only state and failureType are String values, each <=128.
+        return Math.addExact(ACK_COMPARISON_FIELDS * 128L, 2L * 128);
+    }
+    static long ackHelloRowStrings() {
+        return Math.addExact(ackRawReadingStrings(),
+                Math.addExact(2L * 128, Math.multiplyExact(2, ackComparisonStrings())));
+    }
+    static long ackMappingNodes() {
+        return Math.addExact(mapNodes(ACK_MAPPING_FIELDS), Math.addExact(mapNodes(ACK_ROUTE_FIELDS),
+                Math.addExact(mapNodes(ACK_ROUTE_CLASSES), ACK_ROUTE_CONDITIONS + 1L)));
+    }
+    static long ackMappingStrings() {
+        return Math.addExact(ACK_MAPPING_FIELDS * (128L + 512), Math.addExact(ACK_ROUTE_FIELDS * (128L + 512),
+                Math.addExact(ACK_ROUTE_CLASSES * (128L + 64), ACK_ROUTE_CONDITIONS * 512L)));
     }
 
     private static void add(List<Component> parts, String id, String source, long rows, long nodes,

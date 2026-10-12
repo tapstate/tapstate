@@ -963,7 +963,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 target.location() == BenchmarkWorkloadDefinitions.TargetLocation.MANAGED_VIEW
                         ? fork.managedViewsUri() : fork.externalTargetUri()).distinct().toList();
         List<BenchmarkTargetClock.Reading> targetClocksBefore = workload.pilotProfile()
-                ? targetClockUris.stream().map(BenchmarkTargetClock::read).toList() : List.of();
+                ? targetClockUris.stream().map(uri -> returnBridge == null ? BenchmarkTargetClock.read(uri)
+                        : BenchmarkTargetClock.readForAck(uri)).toList() : List.of();
         if (!targetClocksBefore.isEmpty()) { BenchmarkTargetClock.requireSharedClock(targetClocksBefore); }
         BenchmarkTargetClock.Reading targetClockBefore = targetClocksBefore.isEmpty() ? null : targetClocksBefore.getFirst();
         Map<String, Object> interiorClockEvidence = Map.of();
@@ -1005,7 +1006,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 : BenchmarkResourceSampler.open(fork.server().pid(), RESOURCE_INTERVAL);
              BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri());
              BenchmarkTargetClockSampler clockSampler = targetClockBefore == null ? null
-                     : BenchmarkTargetClockSampler.open(targetClockUris.getFirst())) {
+                     : returnBridge == null ? BenchmarkTargetClockSampler.open(targetClockUris.getFirst())
+                            : BenchmarkTargetClockSampler.openForAck(targetClockUris.getFirst())) {
             fork.ownedProcessReceipt().recordJvmRuntime(resourceSampler.runtimeEvidence());
             if (collectorCalibration != null) {
                 String rootRaw = BenchmarkReturnWorkBudgetRun.rootClockMetadataBefore(workload.id() + "/" + phase.id());
@@ -1180,9 +1182,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 }
                 if (clockSampler != null) {
                     clockSampler.close();
-                    interiorClockEvidence = clockSampler.evidence();
+                    interiorClockEvidence = returnBridge == null ? clockSampler.evidence() : clockSampler.evidenceForAck();
                     interiorClockReadings = clockSampler.readings();
-                    BenchmarkTargetClock.validate(targetClockBefore, interiorClockReadings.getFirst());
+                    if (returnBridge == null) BenchmarkTargetClock.validate(targetClockBefore, interiorClockReadings.getFirst());
+                    else BenchmarkTargetClock.validateAckPair(targetClockBefore, interiorClockReadings.getFirst());
                 }
             } catch (Exception | Error failure) {
                 samplingFailure = failure;
@@ -1315,20 +1318,24 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         List<BenchmarkTargetClock.Reading> interiorForClockCheck = interiorClockReadings;
         ValidatedTargetClocks checkedClocks = BenchmarkReturnFailureRetention.run(() -> {
             List<BenchmarkTargetClock.Reading> after = targetClockBefore == null ? List.of()
-                    : targetClockUris.stream().map(BenchmarkTargetClock::read).toList();
+                    : targetClockUris.stream().map(uri -> returnBridge == null ? BenchmarkTargetClock.read(uri)
+                            : BenchmarkTargetClock.readForAck(uri)).toList();
             if (!after.isEmpty()) {
                 BenchmarkTargetClock.requireSharedClock(after);
                 for (int i = 0; i < targetClocksBefore.size(); i++) {
-                    BenchmarkTargetClock.validate(targetClocksBefore.get(i), after.get(i));
+                    if (returnBridge == null) BenchmarkTargetClock.validate(targetClocksBefore.get(i), after.get(i));
+                    else BenchmarkTargetClock.validateAckPair(targetClocksBefore.get(i), after.get(i));
                 }
             }
             BenchmarkTargetClock.Reading firstAfter = after.isEmpty() ? null : after.getFirst();
             if (!interiorForClockCheck.isEmpty()) {
-                BenchmarkTargetClock.validate(interiorForClockCheck.getLast(), firstAfter);
+                if (returnBridge == null) BenchmarkTargetClock.validate(interiorForClockCheck.getLast(), firstAfter);
+                else BenchmarkTargetClock.validateAckPair(interiorForClockCheck.getLast(), firstAfter);
             }
             Map<String, Object> outer = targetClockBefore == null
                     ? Map.of("state", "UNQUALIFIED", "reason", "MULTI_TARGET_CLOCKS_NOT_YET_CALIBRATED")
-                    : BenchmarkTargetClock.validate(targetClockBefore, firstAfter);
+                    : returnBridge == null ? BenchmarkTargetClock.validate(targetClockBefore, firstAfter)
+                            : BenchmarkTargetClock.validateAckPair(targetClockBefore, firstAfter);
             return new ValidatedTargetClocks(after, outer);
         }, () -> capturedForClockFailure.isEmpty() ? Map.of() : Map.of(
                 "state", "UNKNOWN", "capture", capturedForClockFailure, "sourceIssue", sourceForClockFailure,

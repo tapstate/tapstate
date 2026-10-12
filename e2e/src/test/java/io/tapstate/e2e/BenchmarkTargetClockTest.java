@@ -96,4 +96,108 @@ class BenchmarkTargetClockTest {
         assertThatThrownBy(()->BenchmarkTargetClock.requireSharedClock(java.util.List.of(reading("one",1000,0,2),reading("two",1002,2,4))))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("same actual primary");
     }
+
+    @Test void ack_outer_pair_retains_a_wall_refusal_without_using_it_as_nominal_mapping_calibration() {
+        // These numeric observations exercise the historical refusal; this control does not rerate its run.
+        var before = new BenchmarkTargetClock.Reading("owned:27017", "one", 1_791_754_866_975L,
+                914_149_522_441_625L, 914_149_523_234_000L, 1_791_754_866_978L, 1_791_754_866_979L);
+        var after = new BenchmarkTargetClock.Reading("owned:27017", "one", 1_791_754_874_531L,
+                914_157_075_305_208L, 914_157_076_271_500L, 1_791_754_874_531L, 1_791_754_874_532L);
+        assertThatThrownBy(() -> BenchmarkTargetClock.validate(before, after)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("maximumElapsedMillis=7553");
+        var ack = BenchmarkTargetClock.validateAckPair(before, after);
+        @SuppressWarnings("unchecked") var diagnostic = (java.util.Map<String, Object>) ack.get("wallComparison");
+        assertThat(diagnostic).containsEntry("state", "LEGACY_WALL_COMPARISON_REFUSED")
+                .containsEntry("rootElapsedUpperNominalNanos", 7_553_829_875L)
+                .containsEntry("serverElapsedMillis", 7_556L).containsEntry("hostWallOuterUpperMillis", 7_554L);
+        assertThat(ack).containsEntry("state", "ACK_HELLO_PAIR_IDENTITY_AND_ORDER_VERIFIED");
+        for (String flag : BenchmarkReturnProducerOrigins.FLAGS) { assertThat(ack).containsEntry(flag, false); }
+    }
+
+    @Test void ack_outer_pairs_do_not_apply_the_interior_sampling_gap_limit() {
+        var before = reading("one", 1_000, 0, 2);
+        var after = reading("one", 2_000, 999, 1002);
+        assertThat(BenchmarkTargetClock.validateAckPair(before, after))
+                .containsEntry("state", "ACK_HELLO_PAIR_IDENTITY_AND_ORDER_VERIFIED");
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckSeries(java.util.List.of(before, after, reading("one", 3_000, 1999, 2002))))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("sampling gap");
+    }
+
+    @Test void ack_series_keeps_first_to_each_wall_diagnostics_even_when_adjacent_pairs_pass() {
+        var samples = java.util.List.of(reading("one", 1_000, 0, 2), reading("one", 1_204, 199, 202),
+                reading("one", 1_408, 399, 402));
+        assertThat(BenchmarkTargetClock.validateSeries(samples)).containsEntry("state", "QUALIFIED_SAMPLED_INTERIOR");
+        assertThatThrownBy(() -> BenchmarkTargetClock.validate(samples.getFirst(), samples.getLast()))
+                .isInstanceOf(AssertionError.class);
+        var ack = BenchmarkTargetClock.verifyAckHello(samples, 10_000_000L, 398_000_000L);
+        assertThat(ack).containsEntry("adjacentWallRefusals", 0L).containsEntry("firstToEachWallRefusals", 1L)
+                .containsEntry("sampleIntervalMillis", 200).containsEntry("maximumObservedGapNominalNanos", 197_000_000L)
+                .containsEntry("state", "ACK_HELLO_IDENTITY_ORDER_AND_COVERAGE_VERIFIED");
+        for (String flag : BenchmarkReturnProducerOrigins.FLAGS) { assertThat(ack).containsEntry(flag, false); }
+        assertThatThrownBy(() -> ack.put("performanceAcceptanceEligible", true)).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test void actual_utc_reversal_is_retained_for_ack_but_legacy_validation_still_refuses_it() {
+        var first = new BenchmarkTargetClock.Reading("owned:27017", "one", 1_000, 0, 2_000_000, 1_000, 999);
+        var samples = java.util.List.of(first, reading("one", 1_200, 199, 202), reading("one", 1_400, 399, 402));
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateSeries(samples)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("ordered actual identity");
+        var ack = BenchmarkTargetClock.validateAckSeries(samples);
+        assertThat(ack).containsEntry("adjacentWallRefusals", 1L).containsEntry("firstToEachWallRefusals", 2L);
+        var rows = (java.util.List<?>) ack.get("readings");
+        @SuppressWarnings("unchecked") var retained = (java.util.Map<String, Object>) rows.getFirst();
+        assertThat(retained).containsEntry("localUtcBeforeMillis", 1_000L).containsEntry("localUtcAfterMillis", 999L);
+    }
+
+    @Test void ack_series_refuses_borrowed_identity_overlapping_requests_and_uncovered_phase_endpoints() {
+        var first = reading("one", 1_000, 0, 2);
+        var second = reading("one", 1_200, 199, 202);
+        var last = reading("one", 1_400, 399, 402);
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckSeries(java.util.List.of(first, reading("two", 1_200, 199, 202), last)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("primary changed");
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckSeries(java.util.List.of(first, second, reading("one", 1_400, 201, 402))))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("ordered serial requests");
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckSeries(java.util.List.of(first, last)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("bounded interior samples");
+        for (long[] coverage : new long[][]{{1_999_999, 398_000_000}, {10_000_000, 399_000_001}, {10_000_000, 9_999_999}}) {
+            assertThatThrownBy(() -> BenchmarkTargetClock.verifyAckHello(java.util.List.of(first, second, last), coverage[0], coverage[1]))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("coverage");
+        }
+    }
+
+    @Test void ack_series_checks_the_exact_gap_and_prior_roster_limit_before_copying() {
+        var first = reading("one", 1_000, 0, 2);
+        var boundary = new BenchmarkTargetClock.Reading("owned:27017", "one", 1_502, 502_000_000, 503_000_000, 1_502, 1_503);
+        var last = reading("one", 1_703, 703, 704);
+        assertThat(BenchmarkTargetClock.validateAckSeries(java.util.List.of(first, boundary, last)))
+                .containsEntry("maximumObservedGapNominalNanos", 500_000_000L);
+        var beyond = new BenchmarkTargetClock.Reading("owned:27017", "one", 1_502, 502_000_001, 503_000_000, 1_502, 1_503);
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckSeries(java.util.List.of(first, beyond, last)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("sampling gap");
+        var oversized = new java.util.AbstractList<BenchmarkTargetClock.Reading>() {
+            @Override public int size() { return 6_001; }
+            @Override public BenchmarkTargetClock.Reading get(int index) { throw new AssertionError("oversized roster was traversed"); }
+        };
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckSeries(oversized)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("bounded interior samples");
+        var wideIdentity = new BenchmarkTargetClock.Reading("x".repeat(65_537), "one", 1_000, 0, 2_000_000, 999, 1001);
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckPair(wideIdentity, boundary)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("bounded raw shape");
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckSeries(java.util.List.of(wideIdentity, boundary, last)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("bounded raw shape");
+    }
+
+    @Test void wall_delta_overflow_remains_bounded_diagnostic_data_without_hiding_context_failure() {
+        var before = new BenchmarkTargetClock.Reading("owned:27017", "one", Long.MIN_VALUE, 0, 2_000_000, Long.MIN_VALUE, Long.MIN_VALUE);
+        var after = new BenchmarkTargetClock.Reading("owned:27017", "one", Long.MAX_VALUE, 199_000_000, 202_000_000, Long.MAX_VALUE, Long.MAX_VALUE);
+        var ack = BenchmarkTargetClock.validateAckPair(before, after);
+        @SuppressWarnings("unchecked") var comparison = (java.util.Map<String, Object>) ack.get("wallComparison");
+        assertThat(comparison).containsEntry("state", "WALL_DELTA_ARITHMETIC_REFUSED")
+                .containsEntry("failureType", "java.lang.ArithmeticException");
+        assertThat(comparison).doesNotContainKeys("serverElapsedMillis", "failureMessage");
+        assertThatThrownBy(() -> BenchmarkTargetClock.validate(before, after)).isInstanceOf(ArithmeticException.class);
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateAckPair(before,
+                new BenchmarkTargetClock.Reading("other:27017", "one", 1_200, 199_000_000, 202_000_000, 1_199, 1_201)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("primary changed");
+    }
 }

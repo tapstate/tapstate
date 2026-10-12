@@ -99,6 +99,27 @@ class BenchmarkReturnMethodAdmissionTest {
         assertThatThrownBy(admitted::requireProductionAuthority).hasMessageContaining("CONTROL_REVIEW");
     }
 
+    @Test void external_correspondence_refuses_changed_mapping_or_hello_diagnostics() throws Exception {
+        var captured = fixture(); var owner = captured.result().samples().getFirst().identity();
+        var evidence = BenchmarkReturnMethodAdmission.verifyPhase(control(), phase(captured, cold(owner), cold(owner))).evidence();
+        @SuppressWarnings("unchecked") var retained = (Map<String, Object>) io.tapstate.core.common.JsonReader.parse(JsonWriter.write(evidence));
+        BenchmarkReturnCompletedMethod.requireMatchingClockContexts(retained, evidence);
+        for (String field : List.of("sameDomainSerialCalibration", "helloSerialValidation")) {
+            var changed = new LinkedHashMap<String, Object>(retained);
+            @SuppressWarnings("unchecked") var context = new LinkedHashMap<String, Object>((Map<String, Object>) retained.get(field));
+            context.put("state", "CALLER_SUPPLIED_QUALIFICATION"); changed.put(field, context);
+            assertThatThrownBy(() -> BenchmarkReturnCompletedMethod.requireMatchingClockContexts(changed, evidence))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("differs from actual reconstruction");
+            context = new LinkedHashMap<>((Map<String, Object>) retained.get(field));
+            context.put(BenchmarkReturnProducerOrigins.FLAGS.getFirst(), true); changed.put(field, context);
+            assertThatThrownBy(() -> BenchmarkReturnCompletedMethod.requireMatchingClockContexts(changed, evidence))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("differs from actual reconstruction");
+            changed.remove(field);
+            assertThatThrownBy(() -> BenchmarkReturnCompletedMethod.requireMatchingClockContexts(changed, evidence))
+                    .isInstanceOf(AssertionError.class);
+        }
+    }
+
     @Test void changed_fork_boot_or_clock_source_and_missing_raw_pages_refuse_without_repairing_evidence() throws Exception {
         var fixture = fixture(); var owner = fixture.result().samples().getFirst().identity();
         var after = cold(owner); var changed = metadata(owner);
@@ -113,12 +134,19 @@ class BenchmarkReturnMethodAdmissionTest {
                 .hasMessageContaining("ORIGINAL_RAW_SOURCE_OR_COHORT_REFUSED");
     }
 
-    @Test void serial_hello_two_millisecond_checks_cannot_be_bypassed_by_a_good_nominal_mapping() throws Exception {
+    @Test void wall_drift_is_retained_as_diagnostic_without_replacing_good_same_domain_mapping() throws Exception {
         var fixture = fixture(); var owner = fixture.result().samples().getFirst().identity();
         var good = phase(fixture, cold(owner), cold(owner));
-        var bad = new BenchmarkReturnMethodAdmission.PhaseFacts(good.workload(), good.phase(), good.sourceBatches(), good.capture(),
-                good.root(), good.owned(), good.nativeBefore(), good.nativeAfter(), List.of(hello(0, 1000), hello(200_000_000, 1300), hello(400_000_000, 1400)));
-        assertThatThrownBy(() -> BenchmarkReturnMethodAdmission.verifyPhase(control(), bad)).hasMessageContaining("clock stepped");
+        var readings = new ArrayList<>(good.serialHello()); var reading = readings.get(1);
+        readings.set(1, new BenchmarkTargetClock.Reading(reading.primary(), reading.processId(),
+                reading.serverWallMillis() + 100, reading.startedAtNanos(), reading.completedAtNanos(),
+                reading.localUtcBeforeMillis(), reading.localUtcAfterMillis()));
+        var input = new BenchmarkReturnMethodAdmission.PhaseFacts(good.workload(), good.phase(), good.sourceBatches(), good.capture(),
+                good.root(), good.owned(), good.nativeBefore(), good.nativeAfter(), readings);
+        var phase = BenchmarkReturnMethodAdmission.verifyPhase(control(), input);
+        assertThat(phase.evidence()).containsKeys("sameDomainSerialCalibration", "helloSerialValidation");
+        for (String flag : BenchmarkReturnProducerOrigins.FLAGS) assertThat(phase.evidence().get(flag)).isEqualTo(false);
+        assertThatThrownBy(() -> BenchmarkTargetClock.validateSeries(readings)).hasMessageContaining("clock stepped");
     }
 
     @Test void source_serial_order_and_prior_roster_cap_are_checked_without_a_new_read_or_unbounded_copy() throws Exception {

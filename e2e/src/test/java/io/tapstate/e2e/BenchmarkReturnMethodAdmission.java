@@ -316,14 +316,10 @@ final class BenchmarkReturnMethodAdmission {
         }
         require(input.serialHello().size() >= 3 && input.serialHello().size() <= BenchmarkTargetClock.MAX_INTERIOR_SAMPLES,
                 "SERIAL_HELLO_ROSTER_MISSING");
-        var hello = BenchmarkTargetClock.validateSeries(input.serialHello());
-        for (var reading : input.serialHello().subList(1, input.serialHello().size())) {
-            BenchmarkTargetClock.validate(input.serialHello().getFirst(), reading);
-        }
-        BenchmarkTargetClock.validate(input.serialHello().getFirst(), input.serialHello().getLast());
-        require(input.serialHello().getFirst().completedAtNanos() <= input.sourceBatches().getFirst().issuedAtNanos()
-                && input.serialHello().getLast().startedAtNanos() >= input.capture().calls().stream()
-                .mapToLong(BenchmarkWriteReturnAssembly.FullCall::observedNanos).max().orElseThrow(), "SERIAL_HELLO_DOES_NOT_COVER_ORIGINAL_PHASE");
+        var serialCalibration = clock.serialCalibrationEvidence(input.capture().samples());
+        var hello = BenchmarkTargetClock.verifyAckHello(input.serialHello(),
+                input.sourceBatches().getFirst().issuedAtNanos(), input.capture().calls().stream()
+                        .mapToLong(BenchmarkWriteReturnAssembly.FullCall::observedNanos).max().orElseThrow());
         Map<String, Object> phase;
         try { phase = BenchmarkWriteReturnPhaseEvidence.recordNominal(input.workload(), input.phase(), input.sourceBatches(), input.capture(), clock); }
         catch (RuntimeException | Error invalid) { throw new Refusal("ORIGINAL_RAW_SOURCE_OR_COHORT_REFUSED", invalid); }
@@ -333,9 +329,10 @@ final class BenchmarkReturnMethodAdmission {
         var out = new LinkedHashMap<String, Object>(phase);
         out.put("method", METHOD); out.put("endpoint", ENDPOINT);
         out.put("methodAdmission", admitted.evidence()); out.put("helloSerialValidation", hello);
+        out.put("sameDomainSerialCalibration", serialCalibration);
         out.put("helloRootCoordinateBasis", "ORIGINAL_TARGETCLOCK_READ_USES_WORKBUDGET_ROOTNANOTIME_TO_PDK_NATIVE_SOURCE");
         out.put("commonWindowCertificate", common);
-        out.put("newConsumerWorkAccounting", "DUPLICATE_RAW_ASSOCIATION_MAPPING_AND_FREEZE_NOT_YET_IN_STRUCTURAL_SOURCE_RECIPE");
+        out.put("newConsumerWorkAccounting", "STATIC_ENTERED_BODY_SOURCE_UPPER_REQUIRES_COMPLETE_ACTUAL_ENTRY_AND_COMPLETION_VERIFICATION");
         out.put("componentState", "ORIGINAL_FORK_CLOCK_COHORT_FACTS_MATCHED_NO_FORMAL_METRIC_CREDIT");
         BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> out.put(flag, false));
         return new BoundPhase(input.phase().id(), out, common, deliveries, admitted.cost.profile().prepared().fieldsRegisteredOutputPlan());

@@ -13,9 +13,16 @@ final class BenchmarkReturnComponentSourceWork {
     static final int META_NODES = 4096, COLD_NODES = 32768;
     static final long META_STRINGS = 65536, COLD_STRINGS = 4L * 2080768 + 4L * 8192;
     static final int UNITS = 8, FACTORY_FIELDS = 48;
+    static final int ACK_FLAGS = 18, ACK_READING_FIELDS = 9, ACK_COMPARISON_FIELDS = 9;
+    static final int ACK_PAIR_FIELDS = 6 + ACK_FLAGS, ACK_SERIES_FIELDS = 11 + ACK_FLAGS;
+    static final int ACK_COVERAGE_FIELDS = ACK_SERIES_FIELDS + 2, ACK_MAPPING_FIELDS = 15 + ACK_FLAGS;
+    // Nineteen checked expression groups below use 176 helper/Math/header/constructor slots.
+    // Two eight-coordinate guards and Work.plus's method/eight checked adds/constructor add
+    // sixteen and ten slots. This allowance is repeated conservatively for every table kind.
+    static final int ACK_FORMULA_SLOTS = 176 + 2 * UNITS + 10;
     // Three bounded tree formulas fit 96 checked/accessor/helper slots. Three component-wise
     // maxima use eight Math.max calls and sixteen accessors each; merge/copy/boxing uses 24 slots.
-    static final int FORMULA_SLOTS = 96, MAXIMUM_SLOTS = 3 * 24, TABLE_ENTRY_SLOTS = 24;
+    static final int FORMULA_SLOTS = 96 + ACK_FORMULA_SLOTS, MAXIMUM_SLOTS = 3 * 24, TABLE_ENTRY_SLOTS = 24;
     enum Kind {
         STRUCTURAL_RECIPE, PREFLIGHT, PHASE_FACTS, VERIFY_PHASE, METHOD_EVIDENCE,
         INSPECTION_COPY, DELIVERIES_COPY, TREE_FREEZE, REFUSAL,
@@ -119,7 +126,7 @@ final class BenchmarkReturnComponentSourceWork {
                     mul(32, BATCHES), mul(128, HELLO), mul(4, jsonRequests(NATIVE_CHARS)), mul(64, 6 * 2 + 4)),
                     ROWS, CALLS, add(mul(32, CALLS + BATCHES + HELLO), mul(32, ROWS), mul(4, 4 * 6L * 512)), 16,
                     add(mul(CALLS, CALLS), mul(4, SAMPLES), mul(4, BATCHES), mul(4, HELLO), ROWS, 6 * 2 + 4 * 6),
-                    add(CALLS, BATCHES, HELLO, ROWS, 6 * 2 + 4));
+                    add(CALLS, BATCHES, HELLO, ROWS, 6 * 2 + 4)).plus(ackCalibrationUpper());
             case METHOD_EVIDENCE -> row(256, 0, 0, 8192, 4, 128, 64);
             case INSPECTION_COPY -> row(64, 0, 0, 512, 2, 16, 16);
             case DELIVERIES_COPY -> row(add(32, mul(8, ROWS)), ROWS, 0, mul(16, ROWS), 2, ROWS, ROWS);
@@ -164,6 +171,67 @@ final class BenchmarkReturnComponentSourceWork {
                     0, 0, add(mul(16, NATIVE_CHARS), mul(64, 512)), 8,
                     add(mul(4, NATIVE_CHARS), mul(4, 512), 16, 4), 4L * 512 + 32);
         };
+    }
+
+    /** Additional source allowance for each actually entered ACK helper or phase body. */
+    static BenchmarkReturnWorkBudget.Work ackCalibrationUpper() {
+        // All four helpers enter VERIFY_PHASE. The coverage wrapper enters the series child
+        // separately. Summing all four local bodies for each entry is permitted overlap, not
+        // a limit on future invocations. HELLO/SAMPLES are checked before owned roster copies.
+        // Reading guards: one helper call, eight identity accessor/length/isEmpty APIs and
+        // three bracket accessors. Pair adds two guarded readings, six equality APIs and
+        // six serial-order accessors. String/List/provider interiors remain opaque requests.
+        long readingGuard = 1 + 8 + 3;
+        long pairGuard = add(1, mul(2, readingGuard), 6, 6);
+        // Numeric comparison: one helper, twenty-two field accessors, five subtractExact
+        // plus one ceilDiv, nine put calls, seven boxing APIs, constructor/copy/get/unbox.
+        // The legacy numeric predicate is reproduced without message formatting or encoding.
+        long comparison = 1 + 22 + 6 + 9 + 7 + 4;
+        long carrier = 1 + 1 + 6; // Reading.evidence, Map.of and six numeric boxing APIs
+        long pairRequests = add(16, pairGuard, headerRequests(ACK_PAIR_FIELDS), mul(2, carrier), comparison);
+        // Per series row: three list APIs, raw carrier + mutable/final map + two puts/add,
+        // pair guard, gap/max arithmetic, two comparisons and two get/equals status checks.
+        long rowRequests = add(3, carrier, 1, 2, 1, 1, pairGuard, 2, mul(2, comparison), 4);
+        long rosterRow = add(1, readingGuard, 1); // indexed get, guard, owned add
+        long seriesRequests = add(16, 8, 6, headerRequests(ACK_SERIES_FIELDS), mul(HELLO, add(rowRequests, rosterRow)));
+        // Coverage's series child has its own actual entry. Its local work is one additional
+        // bounded roster copy, four endpoint accessors and eight state/copy/boxing APIs.
+        long coverageRequests = add(16, 8, 4, 8, mul(HELLO, rosterRow));
+        // Each mapping sample uses two iterator APIs, its owned accessor, seven enclosure
+        // constructor/helper/checked APIs, three width APIs, max and four bracket APIs.
+        // The fixed integer mapper evidence has at most 10 + 12 + 2 put/copy source fields.
+        long bindingFields = 10 + 12 + 2;
+        long mappingRequests = add(16, 2, 4, 6, 2, headerRequests(ACK_MAPPING_FIELDS),
+                headerRequests(bindingFields), mul(SAMPLES, 2 + 1 + 7 + 3 + 1 + 4));
+        long requests = add(pairRequests, seriesRequests, coverageRequests, mappingRequests);
+
+        // Map entries carry two eight-byte scalar/reference slots. The series retains an
+        // original nine-field carrier, two eleven-field copies, and two comparisons with
+        // mutable/final nine-field maps. Boxing carries eight-byte scalar material; this
+        // inventory is not a claim about VM object size, exclusive allocation or CPU cost.
+        long diagnosticBytes = add(mul(16, mul(2, ACK_COMPARISON_FIELDS)), 8L * 7);
+        long seriesRowBytes = add(mul(16, ACK_READING_FIELDS + 2L * (ACK_READING_FIELDS + 2)),
+                8L * 6, mul(2, diagnosticBytes), 32);
+        long pairBytes = add(mul(48, ACK_PAIR_FIELDS), mul(2, 16L * ACK_READING_FIELDS + 8L * 6), diagnosticBytes, 16);
+        long seriesBytes = add(mul(HELLO, seriesRowBytes), mul(48, ACK_SERIES_FIELDS));
+        long coverageBytes = add(mul(16, HELLO), mul(48, ACK_COVERAGE_FIELDS));
+        long mappingBytes = add(mul(32, SAMPLES), mul(48, ACK_MAPPING_FIELDS + bindingFields));
+        long fields = add(mul(2, ACK_PAIR_FIELDS + ACK_SERIES_FIELDS + ACK_COVERAGE_FIELDS + ACK_MAPPING_FIELDS + bindingFields),
+                mul(2, ACK_READING_FIELDS), mul(2, ACK_COMPARISON_FIELDS),
+                mul(HELLO, ACK_READING_FIELDS + 2L * (ACK_READING_FIELDS + 2) + 4L * ACK_COMPARISON_FIELDS));
+        long references = mul(2, add(SAMPLES, HELLO, HELLO));
+        // At most eight owned primitive argument/local/update slots surround a source API.
+        // Variable Map.of operands and copied entries are added explicitly as two field slots,
+        // so JDK requests are never replaced by elements or updates. There are no new frames,
+        // JSON operations, clock observations, native provider requests or IO in these bodies.
+        long cells = add(mul(8, requests), mul(2, fields), references);
+        return new BenchmarkReturnWorkBudget.Work(4, requests, add(SAMPLES, 2, mul(2, HELLO)), 0,
+                add(pairBytes, seriesBytes, coverageBytes, mappingBytes), 3 + 7 + 3 + 4, cells, cells);
+    }
+
+    private static long headerRequests(long fields) {
+        // Construction/copy/forEach plus put, possible boxing and the owned flag callback.
+        return add(3, mul(3, fields));
     }
 
     static BenchmarkReturnWorkBudget.Work pooledSortUpper() {

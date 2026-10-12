@@ -16,6 +16,7 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
     private final BenchmarkReturnWorkBudget.Ticket workLifetime = BenchmarkReturnWorkBudget.begin(workScope,
             BenchmarkReturnWorkBudget.Activity.HELLO_CLIENT, BenchmarkReturnWorkBudget.Work.call());
     private final Runnable closeSource;
+    private final boolean ackContext;
     private final ScheduledThreadPoolExecutor worker = BenchmarkReturnWorkBudget.opaqueRequest(workScope,
             BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(1));
     private final List<BenchmarkTargetClock.Reading> readings = new ArrayList<>();
@@ -23,13 +24,21 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
     private boolean closed;
 
     static BenchmarkTargetClockSampler open(String uri) {
+        return open(uri, false);
+    }
+
+    static BenchmarkTargetClockSampler openForAck(String uri) {
+        return open(uri, true);
+    }
+
+    private static BenchmarkTargetClockSampler open(String uri, boolean ackContext) {
         var scope = BenchmarkReturnWorkBudget.current();
         var client = BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> MongoClients.create(uri));
         try {
             var admin = client.getDatabase("admin").withTimeout(1, TimeUnit.SECONDS);
             ping(admin);
-            return new BenchmarkTargetClockSampler(() -> BenchmarkTargetClock.read(admin),
-                    () -> BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { client.close(); return null; }));
+            return new BenchmarkTargetClockSampler(() -> ackContext ? BenchmarkTargetClock.readForAck(admin) : BenchmarkTargetClock.read(admin),
+                    () -> BenchmarkReturnWorkBudget.opaqueRequest(scope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { client.close(); return null; }), ackContext);
         } catch (RuntimeException | Error failure) {
             BenchmarkReturnWorkBudget.failure(scope, failure);
             client.close(); throw failure;
@@ -43,8 +52,13 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
     }
 
     BenchmarkTargetClockSampler(Supplier<BenchmarkTargetClock.Reading> source, Runnable closeSource) {
+        this(source, closeSource, false);
+    }
+
+    BenchmarkTargetClockSampler(Supplier<BenchmarkTargetClock.Reading> source, Runnable closeSource, boolean ackContext) {
         this.source = java.util.Objects.requireNonNull(source);
         this.closeSource = java.util.Objects.requireNonNull(closeSource);
+        this.ackContext = ackContext;
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         read();
         worker.scheduleWithFixedDelay(this::read, BenchmarkTargetClock.INTERIOR_SAMPLE_INTERVAL_MILLIS,
@@ -54,7 +68,11 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
     private void read() {
         synchronized (this) { if (closed || failure != null) { return; } }
         try {
-            var next = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.HELLO_READ, source::get);
+            var next = BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.HELLO_READ, () -> {
+                var reading = source.get();
+                if (!ackContext) BenchmarkTargetClock.requireLegacyReadOrder(reading);
+                return reading;
+            });
             synchronized (this) {
                 if (readings.size() >= BenchmarkTargetClock.MAX_INTERIOR_SAMPLES) { throw new AssertionError("clock sampling exceeded its bounded trace"); }
                 readings.add(next);
@@ -72,6 +90,16 @@ final class BenchmarkTargetClockSampler implements AutoCloseable {
         result.put("helloCommands", readings.size());
         result.put("setupPingCommands", 1);
         result.put("scope", "EXTERNAL_TARGET_PRIMARY_HELLO_REQUEST_BRACKETS");
+        return Map.copyOf(result);
+    }
+
+    synchronized Map<String, Object> evidenceForAck() {
+        if (!closed) { throw new IllegalStateException("clock sampling is still active"); }
+        if (failure != null) { throw new AssertionError("target clock sampling failed", failure); }
+        var result = new java.util.LinkedHashMap<String, Object>(BenchmarkTargetClock.validateAckSeries(List.copyOf(readings)));
+        result.put("helloCommands", readings.size());
+        result.put("setupPingCommands", 1);
+        result.put("scope", "ACK_TARGET_PRIMARY_HELLO_CONTEXT_WITH_WALL_DIAGNOSTICS");
         return Map.copyOf(result);
     }
 

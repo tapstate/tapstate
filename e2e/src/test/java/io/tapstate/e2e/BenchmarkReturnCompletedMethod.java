@@ -155,11 +155,20 @@ final class BenchmarkReturnCompletedMethod {
             var actualCommon = verified.commonWindow(); var retainedCommon = object(retained.get("commonWindowCertificate"));
             require(io.tapstate.core.common.JsonReader.parse(JsonWriter.write(actualCommon)).equals(retainedCommon),
                     "retained common-window proof differs from actual raw/source reconstruction");
+            requireMatchingClockContexts(retained, verified.evidence());
             for (String field : List.of("captureEpoch", "frameCount", "rawPageBytes", "pageCount", "callCount", "fullRows", "fixedCohortRows"))
                 require(number(verified.evidence(), field) == number(retained, field), "retained capture totals differ: " + field);
             phases.add(verified.intervalMetrics());
         }
         return BenchmarkReturnIntervalMetrics.aggregate(phases);
+    }
+
+    static void requireMatchingClockContexts(Map<String, Object> retained, Map<String, Object> reconstructed) {
+        for (String field : List.of("sameDomainSerialCalibration", "helloSerialValidation")) {
+            require(io.tapstate.core.common.JsonReader.parse(JsonWriter.write(reconstructed.get(field)))
+                            .equals(object(retained.get(field))),
+                    "retained calibration or hello context differs from actual reconstruction: " + field);
+        }
     }
 
     static BenchmarkWriteReturnCapture.Result reconstructCapture(Map<String, Object> retained,

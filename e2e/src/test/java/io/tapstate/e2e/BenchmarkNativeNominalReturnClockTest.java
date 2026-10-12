@@ -117,6 +117,81 @@ class BenchmarkNativeNominalReturnClockTest {
         assertThatThrownBy(() -> nominal.put("clockQualified", true)).isInstanceOf(UnsupportedOperationException.class);
     }
 
+    @Test void serial_calibration_bounds_mapping_without_using_request_or_literal_return_width_as_error() {
+        var retained = List.of(new BenchmarkCausalClock.Sample(0, OWNED, 0, 20_000_000, 10_000_000),
+                new BenchmarkCausalClock.Sample(1, OWNED, 30_000_000, 50_000_000, 40_000_000),
+                new BenchmarkCausalClock.Sample(2, OWNED, 60_000_000, 80_000_000, 70_000_000));
+        var clock = clock(receipt(), receipt(), retained);
+        var evidence = clock.serialCalibrationEvidence(retained);
+        assertThat(evidence).containsEntry("mappingUncertaintyUpperNominalNanos", 1L)
+                .containsEntry("mappingToleranceNominalNanos", 2_000_000L)
+                .containsEntry("maximumActualRequestBracketNominalNanos", 20_000_000L)
+                .containsEntry("rootPid", 29L).containsEntry("ownedPid", 17L);
+        var lower = clock.map(OWNED, 20_000_000);
+        var upper = clock.map(OWNED, 60_000_000);
+        assertThat(new BenchmarkCausalClock.Interval(lower.lowerNanos(), upper.upperNanos()).widthNanos())
+                .isEqualTo(40_000_001L).isGreaterThan(2_000_000L);
+        for (String flag : BenchmarkReturnProducerOrigins.FLAGS) { assertThat(evidence).containsEntry(flag, false); }
+        assertThatThrownBy(() -> evidence.put("mappingUncertaintyUpperNominalNanos", 0L))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test void calibration_requires_the_exact_retained_capture_roster_and_refuses_borrowed_owners() {
+        var retained = samples();
+        var clock = clock(receipt(), receipt(), retained);
+        var changed = List.of(retained.getFirst(), retained.get(1), new BenchmarkCausalClock.Sample(2, OWNED, 300, 310, 306));
+        assertThatThrownBy(() -> clock.serialCalibrationEvidence(changed)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("capture sample roster differs");
+        var borrowed = List.of(new BenchmarkCausalClock.Sample(0, ROOT, 100, 110, 105), retained.get(1), retained.getLast());
+        assertThatThrownBy(() -> clock(receipt(), receipt(), borrowed)).isInstanceOf(AssertionError.class).hasMessageContaining("identity");
+        assertThatThrownBy(() -> clock.serialCalibrationEvidence(null)).isInstanceOf(AssertionError.class);
+    }
+
+    @Test void serial_mapping_records_one_actual_entry_and_fits_its_prior_report_shape() {
+        var retained = samples(); var clock = clock(receipt(), receipt(), retained);
+        var upper = new java.util.EnumMap<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work>(BenchmarkReturnWorkBudget.Activity.class);
+        upper.put(BenchmarkReturnWorkBudget.Activity.ASSOCIATION, BenchmarkReturnComponentSourceWork.ackCalibrationUpper());
+        var excluded = java.util.EnumSet.allOf(BenchmarkReturnWorkBudget.Activity.class); excluded.removeAll(upper.keySet());
+        var definition = new BenchmarkReturnWorkBudget.Definition("mapping-entry-control", "a".repeat(64), Map.of(), upper, excluded);
+        Map<String, Object> evidence;
+        try (var scope = BenchmarkReturnWorkBudget.activate(definition, "mapping-entry")) {
+            scope.bindRoot(ROOT.pid(), ROOT.jvmStartTimeMillis());
+            evidence = clock.serialCalibrationEvidence(retained);
+            @SuppressWarnings("unchecked") var activities = (Map<String, Object>) scope.snapshot().get("activities");
+            @SuppressWarnings("unchecked") var mapping = (Map<String, Object>) activities.get("ASSOCIATION");
+            assertThat(mapping).containsEntry("attempts", 1L).containsEntry("completedAttempts", 1L)
+                    .containsEntry("issuedRequests", 0L).containsEntry("failedAttempts", 0L);
+            assertThat(scope.snapshot()).containsEntry("state", "OPEN").containsEntry("pendingOperations", 0L);
+        }
+        var descriptor = BenchmarkReturnWorkBudgetReportPlan.prepareWithReturnComponents(
+                BenchmarkReturnWorkBudgetProfile.WorkloadInput.original("stateless"), false).components().stream()
+                .filter(part -> part.id().equals("METHOD_SERIAL_MAPPING_CALIBRATION")).findFirst().orElseThrow();
+        var plan = new BenchmarkReturnWorkBudgetDefinitions.OutputPlan(descriptor.nodesPerRow(), descriptor.localDepthUpper(),
+                descriptor.leafUtf8Upper(), descriptor.stringsPerRow(), 128, 24);
+        var frozen = BenchmarkReturnWorkBudgetDefinitions.freezeOutputTree(evidence, plan);
+        assertThat(evidence).hasSize(33);
+        assertThat(frozen.work().nodes()).isLessThanOrEqualTo(descriptor.nodesPerRow());
+        assertThat(frozen.work().stringUtf8Bytes()).isLessThanOrEqualTo(descriptor.stringsPerRow());
+    }
+
+    @Test void two_millisecond_mapping_tolerance_does_not_relax_the_actual_integer_request_bracket() {
+        for (long point : new long[]{99, 111}) {
+            var outside = List.of(new BenchmarkCausalClock.Sample(0, OWNED, 100, 110, point), samples().get(1), samples().getLast());
+            assertThatThrownBy(() -> clock(receipt(), receipt(), outside)).isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("root bracket");
+        }
+        var changedRoute = receipt(snapshot -> snapshot.put("timebaseDenom", 4L), metadata -> { });
+        assertThatThrownBy(() -> clock(changedRoute, changedRoute, samples())).isInstanceOf(AssertionError.class);
+    }
+
+    @Test void calibration_refuses_an_unrepresentable_floor_successor_without_inventing_a_wider_mapping() {
+        var nearLimit = List.of(new BenchmarkCausalClock.Sample(0, OWNED, Long.MAX_VALUE - 20, Long.MAX_VALUE - 10, Long.MAX_VALUE - 15),
+                new BenchmarkCausalClock.Sample(1, OWNED, Long.MAX_VALUE - 5, Long.MAX_VALUE, Long.MAX_VALUE));
+        var clock = clock(receipt(), receipt(), nearLimit);
+        assertThatThrownBy(() -> clock.serialCalibrationEvidence(nearLimit)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("enclosure overflow");
+    }
+
     private static BenchmarkNativeNominalReturnClock clock(Map<String, Object> before, Map<String, Object> after,
             List<BenchmarkCausalClock.Sample> samples) {
         return new BenchmarkNativeNominalReturnClock(OWNED, ROOT, LIBRARY, samples, before, after);

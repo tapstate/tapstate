@@ -50,8 +50,9 @@ final class BenchmarkTargetClock {
     record Reading(String primary, String processId, long serverWallMillis,
                    long startedAtNanos, long completedAtNanos, long localUtcBeforeMillis, long localUtcAfterMillis) {
         Reading {
-            if (primary == null || processId == null || completedAtNanos < startedAtNanos
-                    || localUtcAfterMillis < localUtcBeforeMillis) { throw new AssertionError("target clock read has no ordered actual identity"); }
+            if (primary == null || processId == null || completedAtNanos < startedAtNanos) {
+                throw new AssertionError("target clock read has no ordered actual identity");
+            }
         }
         Map<String, Object> evidence() {
             return Map.of("primary", primary, "processId", processId, "serverWallMillis", serverWallMillis,
@@ -62,15 +63,30 @@ final class BenchmarkTargetClock {
     }
 
     static Reading read(String uri) {
+        return read(uri, false);
+    }
+
+    static Reading readForAck(String uri) {
+        return read(uri, true);
+    }
+
+    private static Reading read(String uri, boolean ackContext) {
         var address = new ConnectionString(uri);
         if (address.getDatabase() == null) { throw new AssertionError("target clock needs the owned database URI"); }
         try (var client = MongoClients.create(uri)) {
             client.getDatabase("admin").runCommand(new Document("ping", 1));
-            return read(client.getDatabase("admin"));
+            var admin = client.getDatabase("admin");
+            return ackContext ? readForAck(admin) : read(admin);
         }
     }
 
     static Reading read(com.mongodb.client.MongoDatabase admin) {
+        Reading reading = readForAck(admin);
+        requireLegacyReadOrder(reading);
+        return reading;
+    }
+
+    static Reading readForAck(com.mongodb.client.MongoDatabase admin) {
             long utcBefore = System.currentTimeMillis(); long began = BenchmarkReturnWorkBudget.rootNanoTime();
             Document hello = admin.runCommand(new Document("hello", 1));
             long ended = BenchmarkReturnWorkBudget.rootNanoTime(); long utcAfter = System.currentTimeMillis();
@@ -91,6 +107,8 @@ final class BenchmarkTargetClock {
     }
 
     static Map<String, Object> validate(Reading before, Reading after) {
+        // Wall ordering remains mandatory for the legacy calibration and date-based paths.
+        requireLegacyReadOrder(before); requireLegacyReadOrder(after);
         if (!before.primary().equals(after.primary()) || !before.processId().equals(after.processId())) {
             throw new AssertionError("target primary changed across the output window");
         }
@@ -111,6 +129,12 @@ final class BenchmarkTargetClock {
                 "maximumElapsedMillis", maximumElapsedMillis, "endpointResolutionErrorMillis", ENDPOINT_RESOLUTION_ERROR_MILLIS);
     }
 
+    static void requireLegacyReadOrder(Reading reading) {
+        if (reading.localUtcAfterMillis() < reading.localUtcBeforeMillis()) {
+            throw new AssertionError("target clock read has no ordered actual identity");
+        }
+    }
+
     static Map<String, Object> validateSeries(java.util.List<Reading> readings) {
         if (readings.size() < 3 || readings.size() > MAX_INTERIOR_SAMPLES) {
             throw new AssertionError("target clock lacks bounded interior samples");
@@ -128,6 +152,162 @@ final class BenchmarkTargetClock {
                 "maximumAllowedGapMillis", MAX_INTERIOR_SAMPLE_GAP_MILLIS,
                 "endpointResolutionErrorMillis", ENDPOINT_RESOLUTION_ERROR_MILLIS,
                 "readings", readings.stream().map(Reading::evidence).toList());
+    }
+
+    /** Outer pairs can span a whole phase; the interior sampler's gap policy is not an outer-pair limit. */
+    static Map<String, Object> validateAckPair(Reading before, Reading after) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.VERIFY_PHASE,
+                () -> validateAckPairBounded(before, after));
+    }
+
+    private static Map<String, Object> validateAckPairBounded(Reading before, Reading after) {
+        requireAckPair(before, after);
+        var result = new java.util.LinkedHashMap<String, Object>();
+        result.put("state", "ACK_HELLO_PAIR_IDENTITY_AND_ORDER_VERIFIED");
+        result.put("before", before.evidence()); result.put("after", after.evidence());
+        result.put("wallComparison", wallDiagnosticComparison(before, after));
+        result.put("wallComparisonScope", "DIAGNOSTIC_ONLY_NOT_RETURN_POINT_MAPPING_CALIBRATION");
+        result.put("clockCause", "UNKNOWN");
+        BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> result.put(flag, false));
+        return Map.copyOf(result);
+    }
+
+    /** Verifies the unchanged interior policy without requiring wall clocks to calibrate the return coordinate. */
+    static Map<String, Object> validateAckSeries(java.util.List<Reading> readings) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.VERIFY_PHASE,
+                () -> validateAckSeriesBounded(readings));
+    }
+
+    private static Map<String, Object> validateAckSeriesBounded(java.util.List<Reading> readings) {
+        var retained = ackRoster(readings);
+        Reading first = retained.getFirst();
+        long maximumGap = 0;
+        long adjacentRefusals = 0;
+        long firstToEachRefusals = 0;
+        var facts = new java.util.ArrayList<Map<String, Object>>(retained.size());
+        for (int i = 0; i < retained.size(); i++) {
+            Reading current = retained.get(i);
+            var fact = new java.util.LinkedHashMap<String, Object>(current.evidence());
+            if (i > 0) {
+                Reading previous = retained.get(i - 1);
+                requireAckPair(previous, current);
+                long gap = Math.subtractExact(current.startedAtNanos(), previous.completedAtNanos());
+                if (gap > MAX_INTERIOR_SAMPLE_GAP_MILLIS * 1_000_000L) {
+                    throw new AssertionError("ACK hello has an unqualified interior sampling gap");
+                }
+                maximumGap = Math.max(maximumGap, gap);
+                var adjacent = wallDiagnosticComparison(previous, current);
+                var fromFirst = wallDiagnosticComparison(first, current);
+                fact.put("adjacentWallComparison", adjacent);
+                fact.put("firstToEachWallComparison", fromFirst);
+                if (!"WITHIN_LEGACY_TOLERANCE".equals(adjacent.get("state"))) { adjacentRefusals++; }
+                if (!"WITHIN_LEGACY_TOLERANCE".equals(fromFirst.get("state"))) { firstToEachRefusals++; }
+            } else {
+                fact.put("adjacentWallComparison", "NOT_APPLICABLE");
+                fact.put("firstToEachWallComparison", "NOT_APPLICABLE");
+            }
+            facts.add(Map.copyOf(fact));
+        }
+        var result = new java.util.LinkedHashMap<String, Object>();
+        result.put("state", "ACK_HELLO_SERIES_IDENTITY_ORDER_AND_GAPS_VERIFIED");
+        result.put("samples", retained.size());
+        result.put("sampleIntervalMillis", INTERIOR_SAMPLE_INTERVAL_MILLIS);
+        result.put("maximumObservedGapNominalNanos", maximumGap);
+        result.put("maximumAllowedGapMillis", MAX_INTERIOR_SAMPLE_GAP_MILLIS);
+        result.put("wallComparisonScope", "DIAGNOSTIC_ONLY_NOT_RETURN_POINT_MAPPING_CALIBRATION");
+        result.put("wallComparisonToleranceMillis", ENDPOINT_RESOLUTION_ERROR_MILLIS);
+        result.put("adjacentWallRefusals", adjacentRefusals);
+        result.put("firstToEachWallRefusals", firstToEachRefusals);
+        result.put("clockCause", "UNKNOWN"); result.put("readings", java.util.List.copyOf(facts));
+        BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> result.put(flag, false));
+        return Map.copyOf(result);
+    }
+
+    static Map<String, Object> verifyAckHello(java.util.List<Reading> readings,
+            long firstSourceIssuedAtNanos, long lastReturnObservedAtNanos) {
+        return BenchmarkReturnComponentSourceWork.entered(BenchmarkReturnComponentSourceWork.Kind.VERIFY_PHASE,
+                () -> verifyAckHelloBounded(readings, firstSourceIssuedAtNanos, lastReturnObservedAtNanos));
+    }
+
+    private static Map<String, Object> verifyAckHelloBounded(java.util.List<Reading> readings,
+            long firstSourceIssuedAtNanos, long lastReturnObservedAtNanos) {
+        var retained = ackRoster(readings);
+        if (firstSourceIssuedAtNanos < 0 || lastReturnObservedAtNanos < firstSourceIssuedAtNanos) {
+            throw new AssertionError("ACK hello phase coverage endpoints are invalid");
+        }
+        if (retained.getFirst().completedAtNanos() > firstSourceIssuedAtNanos
+                || retained.getLast().startedAtNanos() < lastReturnObservedAtNanos) {
+            throw new AssertionError("ACK hello phase coverage does not contain the original source and return window");
+        }
+        var result = new java.util.LinkedHashMap<String, Object>(validateAckSeries(retained));
+        result.put("state", "ACK_HELLO_IDENTITY_ORDER_AND_COVERAGE_VERIFIED");
+        result.put("firstSourceIssuedAtNanos", firstSourceIssuedAtNanos);
+        result.put("lastReturnObservedAtNanos", lastReturnObservedAtNanos);
+        return Map.copyOf(result);
+    }
+
+    private static java.util.List<Reading> ackRoster(java.util.List<Reading> readings) {
+        if (readings == null || readings.size() < 3 || readings.size() > MAX_INTERIOR_SAMPLES) {
+            throw new AssertionError("ACK hello lacks bounded interior samples");
+        }
+        int size = readings.size();
+        var retained = new java.util.ArrayList<Reading>(size);
+        for (int i = 0; i < size; i++) {
+            Reading reading = readings.get(i);
+            requireAckReading(reading);
+            retained.add(reading);
+        }
+        if (readings.size() != size) { throw new AssertionError("ACK hello roster changed during its bounded copy"); }
+        return java.util.List.copyOf(retained);
+    }
+
+    private static void requireAckPair(Reading before, Reading after) {
+        requireAckReading(before); requireAckReading(after);
+        if (!before.primary().equals(after.primary()) || !before.processId().equals(after.processId())) {
+            throw new AssertionError("ACK hello target primary changed across the output window");
+        }
+        if (before.startedAtNanos() < 0 || after.startedAtNanos() < 0
+                || after.startedAtNanos() <= before.startedAtNanos()
+                || after.startedAtNanos() < before.completedAtNanos()) {
+            throw new AssertionError("ACK hello requests are not ordered serial requests");
+        }
+    }
+
+    private static void requireAckReading(Reading reading) {
+        if (reading == null || reading.primary().isEmpty() || reading.processId().isEmpty()
+                || reading.primary().length() > 65_536 || reading.processId().length() > 24) {
+            throw new AssertionError("ACK hello actual identity exceeds its bounded raw shape");
+        }
+        if (reading.startedAtNanos() < 0 || reading.completedAtNanos() < reading.startedAtNanos()) {
+            throw new AssertionError("ACK hello root request bracket is invalid");
+        }
+    }
+
+    private static Map<String, Object> wallDiagnosticComparison(Reading before, Reading after) {
+        var result = new java.util.LinkedHashMap<String, Object>();
+        result.put("rootElapsedLowerNominalNanos", Math.subtractExact(after.startedAtNanos(), before.completedAtNanos()));
+        result.put("rootElapsedUpperNominalNanos", Math.subtractExact(after.completedAtNanos(), before.startedAtNanos()));
+        result.put("localUtcReadOrder", before.localUtcAfterMillis() >= before.localUtcBeforeMillis()
+                && after.localUtcAfterMillis() >= after.localUtcBeforeMillis());
+        result.put("toleranceMillis", ENDPOINT_RESOLUTION_ERROR_MILLIS);
+        try {
+            result.put("serverElapsedMillis", Math.subtractExact(after.serverWallMillis(), before.serverWallMillis()));
+            result.put("hostWallOuterLowerMillis", Math.subtractExact(after.localUtcBeforeMillis(), before.localUtcAfterMillis()));
+            result.put("hostWallOuterUpperMillis", Math.subtractExact(after.localUtcAfterMillis(), before.localUtcBeforeMillis()));
+            // Reproduce the numeric legacy predicate without constructing a large refusal message.
+            long minimum = Math.ceilDiv(after.startedAtNanos() - before.completedAtNanos(), 1_000_000L);
+            long maximum = (after.completedAtNanos() - before.startedAtNanos()) / 1_000_000L;
+            long server = (Long) result.get("serverElapsedMillis");
+            boolean within = before.localUtcAfterMillis() >= before.localUtcBeforeMillis()
+                    && after.localUtcAfterMillis() >= after.localUtcBeforeMillis()
+                    && minimum >= 0 && server >= minimum - ENDPOINT_RESOLUTION_ERROR_MILLIS
+                    && server <= maximum + ENDPOINT_RESOLUTION_ERROR_MILLIS;
+            result.put("state", within ? "WITHIN_LEGACY_TOLERANCE" : "LEGACY_WALL_COMPARISON_REFUSED");
+            result.put("failureType", within ? "NONE" : "java.lang.AssertionError");
+        } catch (ArithmeticException refused) {
+            result.put("state", "WALL_DELTA_ARITHMETIC_REFUSED"); result.put("failureType", "java.lang.ArithmeticException");
+        }
+        return Map.copyOf(result);
     }
 
     static long earliestLocalNanos(Reading bracket, long serverWallMillis) {
