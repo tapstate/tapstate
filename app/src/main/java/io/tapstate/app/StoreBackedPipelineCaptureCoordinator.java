@@ -197,21 +197,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // window that had already closed.
         Instant loadBegan = Instant.now();
         PipelineLoad load = PipelineLoad.of(plans, loadBegan);
+        Map<String, CaptureHandoff> buffersByRing = new LinkedHashMap<>();
         try {
             for (SourcePlan plan : plans) {
-                SourceCaptureResolution resolution = plan.resolution();
                 CaptureRunSpec spec = plan.spec();
                 CaptureId captureId = plan.captureId();
                 // Written by the thread reading the load and read by whoever asks how far it has got.
                 Map<String, Long> observedSnapshotCounts = new ConcurrentHashMap<>();
-                if (CapturePlan.forReadMode(spec.readMode()).snapshot()) {
-                    // Before the run starts, and so before the job that takes its rows is even assembled: the
-                    // source vertex reads the declaration when it starts, and one that found none would read
-                    // its ring at once, ahead of snapshot rows still to come.
-                    resolution.tables().forEach(
-                            table -> snapshotBuffer.declareSnapshot(pipelineId, resolution.ringName(table)));
-                }
-                CaptureHandoff handoff = snapshotPassthrough(pipelineId, plan, observedSnapshotCounts, load);
+                CaptureHandoff handoff = snapshotPassthrough(
+                        pipelineId, plan, observedSnapshotCounts, load, buffersByRing);
                 CaptureRun run;
                 if (!managedOwnership) {
                     run = captureStarter.start(spec, handoff);
@@ -1110,8 +1104,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             run.chainId().ifPresent(chain -> readers.ran(chain, pipelineRun.spec()));
         }
         // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
-        // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
-        // this is where all of the pipeline's queues and their coordinate strings are released. Keep them when
+        // after the drain returns. Release invalidates this run's buffer callbacks before removing queues,
+        // including an approved row that resumes after a shared run lets go of its load. Keep them when
         // a close failed because that capture may still be appending.
         if (capturesStopped) {
             snapshotBuffer.release(pipelineId);
@@ -1536,13 +1530,26 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * to the ring, and the table is published to the read face with what it read.
      */
     private CaptureHandoff snapshotPassthrough(
-            String pipelineId, SourcePlan plan, Map<String, Long> observedSnapshotCounts, PipelineLoad load) {
+            String pipelineId, SourcePlan plan, Map<String, Long> observedSnapshotCounts, PipelineLoad load,
+            Map<String, CaptureHandoff> buffersByRing) {
         SourceCaptureResolution resolution = plan.resolution();
         Set<String> selectedTables = Set.copyOf(resolution.tables());
         CaptureRunSpec spec = plan.spec();
         CapturePlan phases = CapturePlan.forReadMode(spec.readMode());
         Optional<String> chainId = phases.snapshot() && phases.cdc()
                 ? Optional.of(spec.miningChainId().value()) : Optional.empty();
+        Map<String, CaptureHandoff> buffers = new LinkedHashMap<>();
+        resolution.tables().forEach(table -> {
+            String ring = resolution.ringName(table);
+            buffers.put(table, buffersByRing.computeIfAbsent(ring, key -> {
+                // Declare before capture starts and the job is assembled. Repeated source references
+                // share this declaration and callback, so drains credit every reader's active hand-off.
+                if (phases.snapshot()) {
+                    snapshotBuffer.declareSnapshot(pipelineId, key);
+                }
+                return snapshotBuffer.handoff(pipelineId, key);
+            }));
+        });
         return new CaptureHandoff() {
             @Override
             public void accept(Envelope event) {
@@ -1550,14 +1557,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     throw new TapstateException(
                             CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
                 }
-                snapshotBuffer.append(pipelineId, resolution.ringName(event.src()), event);
+                buffers.get(event.src()).accept(event);
                 observedSnapshotCounts.merge(event.src(), 1L, Long::sum);
             }
 
             @Override
             public void loaded(String table) {
                 saveLoadCountIfOwed(spec, chainId, table, observedSnapshotCounts.getOrDefault(table, 0L));
-                snapshotBuffer.endSnapshot(pipelineId, resolution.ringName(table));
+                buffers.get(table).loaded(table);
                 load.loaded(plan.sourceId(), table, observedSnapshotCounts.getOrDefault(table, 0L),
                         estimatedRows(plan.discovered(), table));
             }
