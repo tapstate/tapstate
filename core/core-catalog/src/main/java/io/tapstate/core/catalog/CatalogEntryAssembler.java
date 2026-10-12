@@ -49,12 +49,8 @@ public final class CatalogEntryAssembler {
                 capabilities.contains(DerivedCapability.WRITE_RECORD),
                 spec.dmlInsertAlternatives(),
                 spec.hasDmlUpdatePolicy());
-        // Last, and over a declaration too: a connector this release supports as a source only is not
-        // a target, whatever its jar can write. Applied here because both callers come through here,
-        // so the bundled row and the row a registration derives cannot disagree about it.
-        if (OfficialConnectors.isSourceOnly(spec.id())) {
-            sink = new SinkCapability(false, List.of());
-        }
+        // Apply the same support restriction used when reading rows stored by an earlier release.
+        sink = SinkRules.applySupportPolicy(spec.id(), sink);
 
         ConnectorGroup group = GroupRules.refine(spec.tagGroup(), modeResolution.modes(), spec.id());
         Discovery discovery = DiscoveryRules.fromGroup(group);
