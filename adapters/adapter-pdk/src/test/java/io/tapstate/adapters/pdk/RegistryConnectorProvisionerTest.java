@@ -9,6 +9,8 @@ import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.RegistrationSource;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -153,6 +155,51 @@ class RegistryConnectorProvisionerTest {
         assertThat(Files.readAllBytes(cached)).isEqualTo(corrupted);
         assertThat(registry.artifactCalls).as("a damaged cache is refused rather than replaced from the store")
                 .isEqualTo(1);
+    }
+
+    @Test
+    void refusesACacheLargerThanTheHeapWithoutExhaustingMemory(@TempDir Path dir) throws Exception {
+        Path output = dir.resolve("limited-heap.log");
+        Process process = new ProcessBuilder(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx64m", "-cp",
+                System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
+                CachedArtifactHeapProbe.class.getName(), dir.toString())
+                .redirectErrorStream(true).redirectOutput(output.toFile()).start();
+        try {
+            assertThat(process.waitFor(30, TimeUnit.SECONDS))
+                    .as("limited-heap cache validation completes").isTrue();
+            assertThat(process.exitValue())
+                    .withFailMessage("Limited-heap cache validation failed:%n%s", Files.readString(output))
+                    .isZero();
+        } finally {
+            process.destroyForcibly();
+        }
+    }
+
+    /** Runs the corrupt-cache refusal in a JVM whose heap is smaller than the cached artifact. */
+    public static final class CachedArtifactHeapProbe {
+        public static void main(String[] args) throws IOException {
+            Path cacheDir = Files.createDirectories(Path.of(args[0]).resolve("plugins"));
+            InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+            String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, new byte[] {1})
+                    .registration().contentHash();
+            Path cached = cacheDir.resolve(hash + ".jar");
+            long cacheSize = 96L * 1024 * 1024;
+            // A sparse file supplies the oversized corruption without allocating its bytes in the test.
+            try (FileChannel file = FileChannel.open(cached, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                file.position(cacheSize - 1);
+                file.write(ByteBuffer.wrap(new byte[] {0}));
+            }
+            assertThat(Files.size(cached)).isEqualTo(cacheSize).isGreaterThan(Runtime.getRuntime().maxMemory());
+            RegistryConnectorProvisioner provisioner =
+                    new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+
+            assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+
+            assertThat(registry.artifactCalls).isZero();
+            assertThat(Files.size(cached)).isEqualTo(cacheSize);
+        }
     }
 
     @Test

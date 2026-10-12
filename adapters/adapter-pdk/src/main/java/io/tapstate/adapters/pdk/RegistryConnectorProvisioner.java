@@ -96,7 +96,7 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
             }
             byte[] bytes = registry.artifact(contentHash).orElseThrow(() ->
                     new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null));
-            validateContent(connectorId, contentHash, bytes);
+            validateContent(connectorId, contentHash, ContentHash.of(bytes));
             try {
                 Files.createDirectories(cacheDir);
                 Path tmp = Files.createTempFile(cacheDir, contentHash, ".tmp");
@@ -116,16 +116,16 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     }
 
     private static Path validatedCache(String connectorId, String contentHash, Path target) {
-        try {
-            validateContent(connectorId, contentHash, Files.readAllBytes(target));
+        try (var bytes = Files.newInputStream(target)) {
+            validateContent(connectorId, contentHash, ContentHash.of(bytes));
             return target;
         } catch (IOException e) {
             throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
         }
     }
 
-    private static void validateContent(String connectorId, String contentHash, byte[] bytes) {
-        if (!contentHash.equals(ContentHash.of(bytes))) {
+    private static void validateContent(String connectorId, String contentHash, String actualHash) {
+        if (!contentHash.equals(actualHash)) {
             throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
         }
     }
