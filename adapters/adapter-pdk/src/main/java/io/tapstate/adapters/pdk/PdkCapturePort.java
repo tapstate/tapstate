@@ -1236,6 +1236,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     }
 
     static TapstateException captureFailure(String connectorId, Throwable failure, String requestedToken) {
+        Objects.requireNonNull(failure, "failure");
         if (failure instanceof TapstateException coded) {
             return coded;
         }

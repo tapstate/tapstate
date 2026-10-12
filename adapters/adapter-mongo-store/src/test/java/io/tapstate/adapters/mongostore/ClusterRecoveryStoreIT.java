@@ -2603,6 +2603,274 @@ class ClusterRecoveryStoreIT {
         }
     }
 
+    @Test
+    void cancellationRetainsUserIntentAndDoesNotChangeAnotherWaitingItem() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline head = fixture.pipeline("cancel-head", true);
+            Pipeline follower = fixture.pipeline("cancel-follower", true);
+            ClusterRecoveryItem item = fixture.enqueue(head).item();
+            ClusterRecoveryItem following = fixture.enqueue(follower).item();
+            assertThat(fixture.store.cancel(fixture.fence(item)).outcome()).isEqualTo(ClusterRecoveryMutation.STALE_INTENT);
+            assertThat(fixture.store.read(head.key()).orElseThrow()).isEqualTo(item);
+
+            var misrouted = new ClusterRecoveryFence(follower.key(), following.itemRevision(),
+                    item.event().intentFingerprint(), item.targetProfile(), item.executionFrontier(),
+                    WorkloadClaimFence.from(fixture.recovery));
+            assertThat(fixture.store.cancel(misrouted).outcome()).isEqualTo(ClusterRecoveryMutation.STALE_INTENT);
+            assertThat(fixture.store.read(follower.key()).orElseThrow()).isEqualTo(following);
+            fixture.pauseRequested(head);
+            var acceptedIntent = fixture.desired.read(head.key().pipelineId()).orElseThrow();
+            var acceptedCheckpoint = fixture.states.read(head.key().pipelineId()).orElseThrow();
+            ClusterRecoveryFence formerOwner = fixture.fence(item);
+            WorkloadOwner owner = fixture.recovery.owner();
+            assertThat(fixture.workloads.release(fixture.recovery)).isTrue();
+            fixture.recovery = fixture.workloads.acquire(recoveryKey(), owner, 2, TTL).claim();
+            assertThat(fixture.store.cancel(formerOwner).outcome()).isEqualTo(ClusterRecoveryMutation.STALE_RECOVERY_CLAIM);
+            assertThat(fixture.store.read(head.key()).orElseThrow()).isEqualTo(item);
+            var cancelled = fixture.store.cancel(fixture.fence(item));
+            assertThat(cancelled.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(cancelled.item().status()).isEqualTo(ClusterRecoveryStatus.CANCELLED);
+            assertThat(cancelled.item().attempt()).isZero();
+            assertThat(cancelled.item().executionFrontier()).isEqualTo(item.executionFrontier());
+            assertThat(cancelled.item().permit()).isNull();
+            assertThat(fixture.desired.read(head.key().pipelineId()).orElseThrow()).isEqualTo(acceptedIntent);
+            assertThat(fixture.states.read(head.key().pipelineId()).orElseThrow()).isEqualTo(acceptedCheckpoint);
+            assertThat(fixture.store.read(follower.key()).orElseThrow()).isEqualTo(following);
+            assertThat(fixture.store.list("east", 0, 10)).containsExactly(cancelled.item(), following);
+            assertThat(fixture.store.cancel(fixture.fence(item)).outcome()).isEqualTo(ClusterRecoveryMutation.STALE_ITEM);
+            assertThat(fixture.store.cancel(fixture.fence(cancelled.item())).outcome()).isEqualTo(ClusterRecoveryMutation.TERMINAL);
+            assertThat(fixture.workloads.read(head.claim().key()).orElseThrow().claim().executionGeneration()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void cancellationWaitsForTheAllocatedPromiseAndReleasesOnlyItsOwnBudget() {
+        for (boolean submitted : List.of(false, true)) {
+            try (Fixture fixture = new Fixture()) {
+                Pipeline head = fixture.pipeline("cancel-allocated", true, List.of(SourceRef.bare("crm")),
+                        true, fixture.nodeB.owner(), Duration.ofSeconds(8));
+                ClusterRecoveryItem item = fixture.permit(fixture.enqueue(head).item(), DEMAND, LIMITS).item();
+                var allocated = fixture.advance(item, head.claim());
+                assertThat(allocated.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+                item = allocated.item();
+                if (submitted) {
+                    var receipt = fixture.submitted(item);
+                    assertThat(receipt.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+                    item = receipt.item();
+                }
+                fixture.pauseRequested(head);
+                String reservation = item.permit().reservationId();
+                assertThat(fixture.store.cancel(fixture.fence(item)).outcome())
+                        .isEqualTo(ClusterRecoveryMutation.SUCCESSOR_STILL_AUTHORIZED);
+                assertThat(fixture.store.read(head.key()).orElseThrow()).isEqualTo(item);
+                assertThat(fixture.capacity.occupied("east")).isEqualTo(DEMAND);
+                assertThat(fixture.workloads.release(allocated.advancedPipelineClaim())).isTrue();
+                fixture.awaitRetirement(head.claim().key());
+                var cancelled = fixture.store.cancel(fixture.fence(item));
+                assertThat(cancelled.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+                assertThat(cancelled.item().status()).isEqualTo(ClusterRecoveryStatus.CANCELLED);
+                assertThat(cancelled.item().attempt()).isEqualTo(1);
+                assertThat(cancelled.item().executionFrontier()).isEqualTo(2);
+                assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEmpty();
+                Document row = fixture.occupancy.find(new Document("_id", reservation)).first();
+                if (submitted) {
+                    assertThat(row).isNotNull();
+                    assertThat(row.getString("nativeJobId")).isEqualTo(item.successor().nativeJobId());
+                    WorkloadClaim inherited = fixture.workloads.acquire(head.claim().key(), fixture.nodeB.owner(), 2, TTL).claim();
+                    var historical = fixture.capacity.submittedExecution(inherited).orElseThrow();
+                    assertThat(historical.authorityRetired()).isTrue();
+                    assertThat(historical.reservation().pipelineClaim()).isEqualTo(item.successor().pipelineClaim());
+                } else {
+                    assertThat(row).isNull();
+                }
+                Pipeline follower = fixture.pipeline("after-cancel", true);
+                ClusterRecoveryItem following = fixture.enqueue(follower).item();
+                ClusterCapacityLimits one = new ClusterCapacityLimits(1, 1, 1, 1, 1, 1);
+                assertThat(fixture.permit(following, DEMAND, one).outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+                assertThat(fixture.workloads.read(head.claim().key()).orElseThrow().claim().executionGeneration()).isEqualTo(2);
+            }
+        }
+    }
+
+    @Test
+    void removingDeletedQueueHistoryDoesNotRemoveARecreatedArtifactOrAnotherItem() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline old = fixture.pipeline("recreated", true);
+            ClusterRecoveryItem item = fixture.enqueue(old).item();
+            Pipeline follower = fixture.pipeline("surviving-item", true);
+            ClusterRecoveryItem following = fixture.enqueue(follower).item();
+            assertThat(fixture.store.removeDeleted(fixture.fence(item)).outcome()).isEqualTo(ClusterRecoveryMutation.STALE_INTENT);
+            ArtifactIdentity identity = fixture.artifacts.identity(old.key().pipelineId()).orElseThrow();
+            assertThat(fixture.artifacts.delete(old.key().pipelineId(), identity.contentHash()))
+                    .isEqualTo(io.tapstate.spi.store.ArtifactMutation.DELETED);
+            assertThat(fixture.artifacts.create(new PipelineResource(old.key().pipelineId(), null,
+                    List.of(SourceRef.bare("crm")), null, null, null, null, Map.of())))
+                    .isEqualTo(io.tapstate.spi.store.ArtifactMutation.CREATED);
+            ArtifactIdentity replacement = fixture.artifacts.identity(old.key().pipelineId()).orElseThrow();
+            assertThat(replacement.incarnation()).isNotEqualTo(identity.incarnation());
+            assertThat(replacement.contentHash()).isEqualTo(identity.contentHash());
+            assertThat(fixture.store.removeDeleted(fixture.fence(item)).outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.store.read(old.key())).isEmpty();
+            assertThat(fixture.artifacts.identity(old.key().pipelineId()).orElseThrow()).isEqualTo(replacement);
+            assertThat(fixture.store.read(follower.key()).orElseThrow()).isEqualTo(following);
+            assertThat(fixture.store.removeDeleted(fixture.fence(item)).outcome()).isEqualTo(ClusterRecoveryMutation.NOT_FOUND);
+        }
+    }
+
+    @Test
+    void removingADeletedAllocatedItemCannotDiscardItsLivePromise() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("deleted-allocated", true, List.of(SourceRef.bare("crm")),
+                    true, fixture.nodeB.owner(), Duration.ofSeconds(8));
+            ClusterRecoveryItem item = fixture.permit(fixture.enqueue(pipeline).item(), DEMAND, LIMITS).item();
+            var allocated = fixture.advance(item, pipeline.claim());
+            assertThat(allocated.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            item = allocated.item();
+            String reservation = item.permit().reservationId();
+            var identity = fixture.artifacts.identity(pipeline.key().pipelineId()).orElseThrow();
+            assertThat(fixture.artifacts.delete(pipeline.key().pipelineId(), identity.contentHash()))
+                    .isEqualTo(io.tapstate.spi.store.ArtifactMutation.DELETED);
+            assertThat(fixture.store.removeDeleted(fixture.fence(item)).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.SUCCESSOR_STILL_AUTHORIZED);
+            assertThat(fixture.store.read(pipeline.key()).orElseThrow()).isEqualTo(item);
+            assertThat(fixture.occupancy.find(new Document("_id", reservation)).first()).isNotNull();
+            assertThat(fixture.workloads.release(allocated.advancedPipelineClaim())).isTrue();
+            fixture.awaitRetirement(pipeline.claim().key());
+            assertThat(fixture.store.removeDeleted(fixture.fence(item)).outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(fixture.store.read(pipeline.key())).isEmpty();
+            assertThat(fixture.occupancy.find(new Document("_id", reservation)).first()).isNull();
+            assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void anOrdinaryStartCannotReserveUnknownOrPartialCohortDemand() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("ordinary-unknown-demand", false);
+            for (Map<String, ClusterCapacityDemand> requested : List.of(
+                    Map.<String, ClusterCapacityDemand>of(), Map.of("a", demand(1)))) {
+                var refused = fixture.capacity.reserve(pipeline.claim(), fixture.profile, pipeline.key().incarnation(),
+                        pipeline.intentFingerprint(), requested, LIMITS, PERMIT_TTL);
+                assertThat(refused.outcome()).isEqualTo(ClusterCapacityStore.Outcome.UNKNOWN_DEMAND);
+                assertThat(refused.reservation()).isNull();
+                assertThat(refused.advancedPipelineClaim()).isNull();
+                assertThat(fixture.occupancy.countDocuments()).isZero();
+                assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration()).isZero();
+            }
+            var known = fixture.capacity.reserve(pipeline.claim(), fixture.profile, pipeline.key().incarnation(),
+                    pipeline.intentFingerprint(), DEMAND, LIMITS, PERMIT_TTL);
+            assertThat(known.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            assertThat(known.reservation().demandByNode()).isEqualTo(DEMAND);
+            assertThat(known.reservation().executionGeneration()).isNull();
+            assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void aSupersededOrdinaryHolderCannotReserveAnotherTenuresBudget() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("ordinary-stale-holder", false);
+            WorkloadClaim former = pipeline.claim();
+            assertThat(fixture.workloads.release(former)).isTrue();
+            WorkloadClaim current = fixture.workloads.acquire(former.key(), former.owner(), 2, TTL).claim();
+            assertThat(current.claimGeneration()).isGreaterThan(former.claimGeneration());
+            var stale = fixture.capacity.reserve(former, fixture.profile, pipeline.key().incarnation(),
+                    pipeline.intentFingerprint(), DEMAND, LIMITS, PERMIT_TTL);
+            assertThat(stale.outcome()).isEqualTo(ClusterCapacityStore.Outcome.STALE_CLAIM);
+            assertThat(stale.reservation()).isNull();
+            assertThat(stale.advancedPipelineClaim()).isNull();
+            assertThat(fixture.occupancy.countDocuments()).isZero();
+            assertThat(fixture.workloads.read(current.key()).orElseThrow().claim().executionGeneration()).isZero();
+            var authorized = fixture.capacity.reserve(current, fixture.profile, pipeline.key().incarnation(),
+                    pipeline.intentFingerprint(), DEMAND, LIMITS, PERMIT_TTL);
+            assertThat(authorized.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            assertThat(authorized.reservation().pipelineClaim()).isEqualTo(WorkloadClaimFence.from(current));
+            assertThat(authorized.reservation().executionGeneration()).isNull();
+            assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void missingAdmissionFactsCannotIssueOrdinaryBudgetOrARecoveryPermit() {
+        for (boolean missingMembership : List.of(true, false)) {
+            try (Fixture fixture = new Fixture()) {
+                Pipeline pipeline = fixture.pipeline("missing-admission-fact", true);
+                ClusterRecoveryItem item = fixture.enqueue(pipeline).item();
+                if (missingMembership) {
+                    assertThat(fixture.memberDocuments.deleteOne(new Document("_id", "east")).getDeletedCount()).isEqualTo(1);
+                } else {
+                    assertThat(fixture.stateDocuments.deleteOne(new Document("_id", pipeline.key().pipelineId()))
+                            .getDeletedCount()).isEqualTo(1);
+                }
+                var ordinary = fixture.capacity.reserve(pipeline.claim(), fixture.profile, pipeline.key().incarnation(),
+                        pipeline.intentFingerprint(), DEMAND, LIMITS, PERMIT_TTL);
+                assertThat(ordinary.outcome()).isEqualTo(missingMembership ? ClusterCapacityStore.Outcome.WAITING_QUORUM
+                        : ClusterCapacityStore.Outcome.STALE_EXECUTION);
+                assertThat(ordinary.reservation()).isNull();
+                assertThat(ordinary.advancedPipelineClaim()).isNull();
+                var recovery = fixture.permit(item, DEMAND, LIMITS);
+                assertThat(recovery.outcome()).isEqualTo(missingMembership ? ClusterRecoveryMutation.WAITING_QUORUM
+                        : ClusterRecoveryMutation.STALE_EXECUTION);
+                assertThat(fixture.store.read(pipeline.key()).orElseThrow()).isEqualTo(item);
+                assertThat(item.attempt()).isZero();
+                assertThat(item.permit()).isNull();
+                assertThat(fixture.occupancy.countDocuments()).isZero();
+                assertThat(fixture.workloads.read(pipeline.claim().key()).orElseThrow().claim().executionGeneration()).isEqualTo(1);
+            }
+        }
+    }
+
+    @Test
+    void anAbsentProfileIsDifferentFromAKnownEmptyBudgetAndReadsDoNotMutateEither() {
+        try (Fixture fixture = new Fixture()) {
+            var before = fixture.storedFacts();
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEmpty();
+            assertThat(fixture.capacity.readOccupied("never-created-profile")).isEmpty();
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> fixture.capacity.occupied("never-created-profile"))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(fixture.storedFacts()).isEqualTo(before);
+        }
+    }
+
+    @Test
+    void damagedPersistedDemandCannotReadAsZeroOrAuthorizeAnotherPipeline() {
+        for (boolean wrongType : List.of(false, true)) {
+            try (Fixture fixture = new Fixture()) {
+                Pipeline occupied = fixture.pipeline("damaged-demand-owner", false);
+                var reserved = fixture.capacity.reserve(occupied.claim(), fixture.profile, occupied.key().incarnation(),
+                        occupied.intentFingerprint(), DEMAND, LIMITS, PERMIT_TTL);
+                assertThat(reserved.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+                Pipeline waiting = fixture.pipeline("waiting-behind-damaged-demand", true);
+                ClusterRecoveryItem item = fixture.enqueue(waiting).item();
+                Document reservationId = new Document("_id", reserved.reservation().reservationId());
+                String field = "demandByNode.0.writers";
+                Document damage = wrongType ? new Document("$set", new Document(field, "unreadable-count"))
+                        : new Document("$unset", new Document(field, ""));
+                assertThat(fixture.occupancy.updateOne(reservationId, damage).getModifiedCount()).isEqualTo(1);
+                Document damaged = fixture.occupancy.find(reservationId).first();
+                String reportedField = wrongType ? "capacityReservation" : "writers";
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> fixture.capacity.readOccupied("east"))
+                        .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                            assertThat(failure.args()).containsEntry("field", reportedField);
+                        });
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> fixture.capacity.reserve(waiting.claim(), fixture.profile,
+                        waiting.key().incarnation(), waiting.intentFingerprint(), DEMAND, LIMITS, PERMIT_TTL))
+                        .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> fixture.permit(item, DEMAND, LIMITS))
+                        .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                assertThat(fixture.store.read(waiting.key()).orElseThrow()).isEqualTo(item);
+                assertThat(fixture.occupancy.find(reservationId).first()).isEqualTo(damaged);
+                assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
+                assertThat(fixture.workloads.read(occupied.claim().key()).orElseThrow().claim().executionGeneration()).isZero();
+                assertThat(fixture.workloads.read(waiting.claim().key()).orElseThrow().claim().executionGeneration()).isEqualTo(1);
+            }
+        }
+    }
+
     private static ClusterRecoveryStartupReceipt receiptFor(ClusterRecoveryStartupReceipt receipt, WorkloadClaimFence pipeline) {
         return new ClusterRecoveryStartupReceipt(pipeline, receipt.nativeJobId(), receipt.nativeInitializedAt(),
                 receipt.preparedWitnesses(), receipt.requestedPositions(), receipt.acceptedPositions(),
@@ -3117,6 +3385,15 @@ class ClusterRecoveryStoreIT {
             return new ClusterRecoveryStartupReceipt(
                     item.successor().pipelineClaim(), item.successor().nativeJobId(), observed, Map.of("crm", witness),
                     Map.of("crm", proof.requestedPosition()), Map.of("crm", proof.acceptedPosition()), proof.acceptedAt(), false);
+        }
+
+        private void pauseRequested(Pipeline pipeline) {
+            var identity = artifacts.identity(pipeline.key().pipelineId()).orElseThrow();
+            desired.save(new DesiredState(pipeline.key().pipelineId(), PipelineState.PAUSED, identity.contentHash()));
+            var checkpoint = states.read(pipeline.key().pipelineId()).orElseThrow();
+            assertThat(states.compareAndSwap(pipeline.key().pipelineId(), checkpoint.epoch(),
+                    StateJson.of(PipelineState.PAUSED), checkpoint.touchTime()))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
         }
 
         private void running(String pipeline) {

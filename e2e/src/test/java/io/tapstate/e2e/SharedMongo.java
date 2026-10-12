@@ -63,7 +63,8 @@ final class SharedMongo {
     static synchronized String replicaSetUrl(String database) {
         if (container == null) {
             DockerGate.require();
-            MongoDBContainer starting = new MongoDBContainer(IMAGE);
+            MongoDBContainer starting = new MongoDBContainer(IMAGE)
+                    .withCommand("--replSet", "docker-rs", "--wiredTigerCacheSizeGB", "1.0");
             starting.start();
             container = starting;
         }

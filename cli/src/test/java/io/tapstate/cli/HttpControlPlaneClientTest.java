@@ -219,6 +219,51 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void machineDocumentsKeepTheFrozenPlanAndReplacementAfterHttpDecoding() throws Exception {
+        String plan = """
+                {"claimGeneration":8,"executionGeneration":22,"topologyRevision":3,
+                 "members":["node-a","node-b"],
+                 "nodes":[
+                  {"node":"orders_sink","requested":4,"requestedOrigin":"node-default","scope":"native",
+                   "memberCount":2,"computedLocal":4,"effective":8,"reasons":["full-member-width"],
+                   "batch":{"maxRecords":25,"maxWaitMillis":200},
+                   "resources":{"writers":8,"connectorMode":"PER_WRITER","connectorInstances":8,
+                    "bufferedRecords":200,"edgeQueueRecords":128},
+                   "change":{"previousEffective":4,"causes":["member-set-changed"]}},
+                  {"node":"orders_source","requested":1,"requestedOrigin":"explicit","scope":"cluster",
+                   "memberCount":2,"effective":1,"reasons":["shared-reader"],
+                   "batch":{"maxRecords":10,"maxWaitMillis":100}}],
+                 "plannedAt":"2026-10-10T12:00:00Z",
+                 "replaces":{"executionGeneration":21,"members":["node-a"],
+                  "plannedAt":"2026-10-10T11:00:00Z"}}
+                """;
+        for (boolean status : List.of(true, false)) {
+            String path = "/api/pipelines/orders/" + (status ? "status" : "explain");
+            String document = status ? "{\"pipelineId\":\"orders\",\"state\":\"RUNNING\",\"plan\":" + plan + "}"
+                    : "{\"pipelineId\":\"orders\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                      + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                      + "\"evidence\":[],\"cannotSay\":[],\"next\":null,\"plan\":" + plan + "}";
+            HttpServer server = serverReplying(path, 200, document);
+            try {
+                HttpControlPlaneClient client = new HttpControlPlaneClient();
+                Map<String, Object> rendered;
+                if (status) {
+                    var outcome = client.status(baseOf(server), "token", "orders");
+                    assertThat(outcome).isInstanceOf(StatusOutcome.Found.class);
+                    rendered = ReadViewDocuments.status((StatusOutcome.Found) outcome);
+                } else {
+                    var outcome = client.explain(baseOf(server), "token", "orders");
+                    assertThat(outcome).isInstanceOf(ExplainOutcome.Found.class);
+                    rendered = ReadViewDocuments.explanation((ExplainOutcome.Found) outcome);
+                }
+                assertThat(JsonReader.parse(JsonOut.compact(rendered))).isEqualTo(JsonReader.parse(document));
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
     void malformedRecoveryDoesNotDecodeAsAHealthyEmptyQueue() throws Exception {
         Map<String, Object> malformed = new java.util.LinkedHashMap<>(RecoveryFixtures.explanation());
         malformed.put("recovery", Map.of("recoveryState", "RECOVERED", "causes", List.of(), "items", "wrong-type"));

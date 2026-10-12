@@ -24,9 +24,9 @@ public class CodedFailureAnalyzer extends AbstractFailureAnalyzer<TapstateExcept
     private static final int CALLSITE_LIMIT = 8;
     private static final int INSPECTED_FRAME_LIMIT = 64;
     private static final Pattern COMMAND_DETAIL =
-            Pattern.compile("MongoCommandException code=([1-9][0-9]{0,9})");
+            Pattern.compile("MongoCommandException code=([1-9]\\d{0,9})");
     private static final Pattern PRODUCT_CLASS =
-            Pattern.compile("io\\.tapstate(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)+");
+            Pattern.compile("io\\.tapstate(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)++");
     private static final Pattern METHOD =
             Pattern.compile("(?:[A-Za-z_$][A-Za-z0-9_$]*|<init>|<clinit>)");
 
@@ -44,23 +44,25 @@ public class CodedFailureAnalyzer extends AbstractFailureAnalyzer<TapstateExcept
         Integer commandCode = commandCode(cause.args().get("detail"));
         if (commandCode == null) return;
         try {
-            List<String> callsites = new ArrayList<>(CALLSITE_LIMIT);
-            StackTraceElement[] stack = cause.getStackTrace();
-            for (int index = 0; index < Math.min(stack.length, INSPECTED_FRAME_LIMIT)
-                    && callsites.size() < CALLSITE_LIMIT; index++) {
-                StackTraceElement frame = stack[index];
-                String className = frame.getClassName();
-                String methodName = frame.getMethodName();
-                if (className.length() <= 192 && methodName.length() <= 128
-                        && PRODUCT_CLASS.matcher(className).matches()
-                        && METHOD.matcher(methodName).matches()) {
-                    callsites.add(className + "#" + methodName + ":" + frame.getLineNumber());
+            if (LOG.isWarnEnabled()) {
+                List<String> callsites = new ArrayList<>(CALLSITE_LIMIT);
+                StackTraceElement[] stack = cause.getStackTrace();
+                for (int index = 0; index < Math.min(stack.length, INSPECTED_FRAME_LIMIT)
+                        && callsites.size() < CALLSITE_LIMIT; index++) {
+                    StackTraceElement frame = stack[index];
+                    String className = frame.getClassName();
+                    String methodName = frame.getMethodName();
+                    if (className.length() <= 192 && methodName.length() <= 128
+                            && PRODUCT_CLASS.matcher(className).matches()
+                            && METHOD.matcher(methodName).matches()) {
+                        callsites.add(className + "#" + methodName + ":" + frame.getLineNumber());
+                    }
                 }
+                // Only bounded product locations and the numeric command code enter this extra diagnostic.
+                // No argument maps, free-form detail, file names or cause chains enter this extra log.
+                LOG.warn("Startup store command failed [code={}, driverCode={}, callsites={}]",
+                        cause.code().code(), commandCode, List.copyOf(callsites));
             }
-            // Only bounded product locations and the numeric command code enter this extra diagnostic.
-            // No argument maps, free-form detail, file names or cause chains enter this extra log.
-            LOG.warn("Startup store command failed [code={}, driverCode={}, callsites={}]",
-                    cause.code().code(), commandCode, List.copyOf(callsites));
         } catch (RuntimeException diagnosticUnavailable) {
             // Optional logging must not replace the original coded startup analysis.
         }

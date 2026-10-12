@@ -216,6 +216,71 @@ class ClusterRecoveryProjectionTest {
         assertThat(projected.attempt()).isEqualTo(2);
     }
 
+    @Test
+    void aProfileReadFailureStaysUnavailableWhileKnownQueueAndCapacityFactsRemainVisible() {
+        Fixture fixture = new Fixture();
+        fixture.add(item("pipeline", "inc", 4, 1));
+        ClusterRecoveryView original = fixture.projection().cluster("east", true);
+        TapstateException failure = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "MongoCommandException code=112"), null);
+        fixture.profileFailure = failure;
+
+        ClusterRecoveryView unavailable = fixture.projection().cluster("east", true);
+
+        assertThat(unavailable.currentProfile()).isNull();
+        assertThat(unavailable.profileUnavailable()).isNotNull();
+        assertThat(unavailable.profileUnavailable().code()).isEqualTo(IoError.STORE_UNAVAILABLE.code());
+        assertThat(unavailable.profileUnavailable().params()).containsExactlyInAnyOrderEntriesOf(failure.args());
+        assertThat(unavailable.recoveryState()).isEqualTo("RECOVERING");
+        assertThat(unavailable.queueUnavailable()).isNull();
+        assertThat(unavailable.items()).isEqualTo(original.items());
+        assertThat(unavailable.capacity()).isEqualTo(original.capacity());
+        assertThat(unavailable.capacity().availability()).isEqualTo("AVAILABLE");
+        assertThat(unavailable.capacity().configuredLimits().processors()).isEqualTo(11);
+        assertThat(unavailable.capacity().occupiedByNode().get("node").processors()).isEqualTo(3);
+
+        Fixture absentFixture = new Fixture();
+        absentFixture.add(item("pipeline", "inc", 4, 1));
+        absentFixture.profileAbsent = true;
+        absentFixture.capacityAbsent = true;
+        ClusterRecoveryView absent = absentFixture.projection().cluster("east", true);
+        assertThat(absent.currentProfile()).isNull();
+        assertThat(absent.profileUnavailable()).isNull();
+        assertThat(absent.recoveryState()).isEqualTo("RECOVERING");
+        assertThat(absent.queueUnavailable()).isNull();
+        assertThat(absent.items()).isEqualTo(original.items());
+        assertThat(absent.capacity().availability()).isEqualTo("PROFILE_ABSENT");
+        assertThat(absent.capacity().profile()).isNull();
+        assertThat(absent.capacity().configuredLimits()).isNull();
+        assertThat(absent.capacity().occupiedByNode()).isNull();
+    }
+
+    @Test
+    void anUnreadableCurrentArtifactIsUnavailableRatherThanInventedIdle() {
+        Fixture fixture = new Fixture();
+        ClusterPipelineRecoveryView absent = fixture.projection().pipeline("east", "pipeline", true);
+        assertThat(absent.currentIncarnation()).isNull();
+        assertThat(absent.recoveryState()).isEqualTo("IDLE");
+        assertThat(absent.unavailable()).isNull();
+        assertThat(absent.items()).isEmpty();
+        assertThat(absent.capacity().availability()).isEqualTo("AVAILABLE");
+
+        TapstateException failure = new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", "pipeline", "field", "incarnation"), null);
+        fixture.identityFailure = failure;
+
+        ClusterPipelineRecoveryView unavailable = fixture.projection().pipeline("east", "pipeline", true);
+
+        assertThat(unavailable.currentIncarnation()).isNull();
+        assertThat(unavailable.recoveryState()).isNull();
+        assertThat(unavailable.items()).isEmpty();
+        assertThat(unavailable.unavailable()).isNotNull();
+        assertThat(unavailable.unavailable().code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+        assertThat(unavailable.unavailable().params()).containsExactlyInAnyOrderEntriesOf(failure.args());
+        assertThat(unavailable.capacity()).isEqualTo(absent.capacity());
+        assertThat(unavailable.capacity().occupiedByNode().get("node").processors()).isEqualTo(3);
+    }
+
     private static ClusterRecoveryItem item(String pipeline, String incarnation, long original, long sequence) {
         var key = new ClusterRecoveryKey("east", pipeline, incarnation);
         var event = new ClusterRecoveryEvent(key, ClusterRecoveryCause.FULL_CLUSTER_RESTART, original, "original-hash", 1L,
@@ -248,6 +313,9 @@ class ClusterRecoveryProjectionTest {
         private ClusterExecutionProfile current = CURRENT;
         private ClusterExecutionProfile snapshotProfile;
         private TapstateException queueFailure;
+        private TapstateException profileFailure;
+        private TapstateException identityFailure;
+        private boolean profileAbsent;
         private TapstateException capacityFailure;
         private boolean capacityAbsent;
 
@@ -259,7 +327,10 @@ class ClusterRecoveryProjectionTest {
 
         ClusterRecoveryProjection projection() {
             ArtifactStore artifacts = port(ArtifactStore.class, (proxy, method, args) -> {
-                if (method.getName().equals("identity")) { return Optional.ofNullable(identities.get(args[0])); }
+                if (method.getName().equals("identity")) {
+                    if (identityFailure != null) { throw identityFailure; }
+                    return Optional.ofNullable(identities.get(args[0]));
+                }
                 throw unexpected(method.getName());
             });
             ClusterRecoveryStore queue = port(ClusterRecoveryStore.class, (proxy, method, args) -> {
@@ -272,7 +343,10 @@ class ClusterRecoveryProjectionTest {
                 return rows.subList(Math.min(offset, rows.size()), Math.min(offset + limit, rows.size()));
             });
             ClusterProfileStore profiles = port(ClusterProfileStore.class, (proxy, method, args) -> {
-                if (method.getName().equals("profile")) { return Optional.of(current); }
+                if (method.getName().equals("profile")) {
+                    if (profileFailure != null) { throw profileFailure; }
+                    return profileAbsent ? Optional.empty() : Optional.of(current);
+                }
                 throw unexpected(method.getName());
             });
             ClusterCapacityStore capacity = port(ClusterCapacityStore.class, (proxy, method, args) -> {

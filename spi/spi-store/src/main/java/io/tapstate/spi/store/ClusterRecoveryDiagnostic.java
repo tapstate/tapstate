@@ -20,7 +20,7 @@ public record ClusterRecoveryDiagnostic(
     public ClusterRecoveryDiagnostic {
         reason = Objects.requireNonNull(reason, "reason");
         code = ClusterRecoveryKey.required(code, "code");
-        if (!code.matches("[a-z][a-z0-9-]*(?:\\.[a-z0-9][a-z0-9-]*)+")) {
+        if (!code.matches("[a-z][a-z0-9-]*+(?:\\.[a-z0-9][a-z0-9-]*+)++")) {
             throw new IllegalArgumentException("diagnostic code must be canonical");
         }
         params = Collections.unmodifiableMap(new LinkedHashMap<>(Objects.requireNonNull(params, "params")));

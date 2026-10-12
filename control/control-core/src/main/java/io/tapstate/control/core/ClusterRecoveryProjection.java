@@ -49,8 +49,8 @@ public final class ClusterRecoveryProjection {
     public ClusterRecoveryView cluster(String clusterId, Boolean quorumReady) {
         Reading<QueueRows> queued = read(() -> queueRows(clusterId));
         List<Row> rows = queued.value() == null ? List.of() : queued.value().rows();
-        Reading<Optional<ClusterExecutionProfile>> installed = read(() -> profiles.profile(clusterId));
-        ClusterExecutionProfile profile = installed.value() == null ? null : installed.value().orElse(null);
+        Reading<ClusterExecutionProfile> installed = read(() -> profiles.profile(clusterId).orElse(null));
+        ClusterExecutionProfile profile = installed.value();
         List<WorkloadClaimKey> keys = new ArrayList<>();
         WorkloadClaimKey coordinator = new WorkloadClaimKey(clusterId, WorkloadClaimType.CLUSTER_RECOVERY, clusterId);
         keys.add(coordinator);
@@ -69,8 +69,8 @@ public final class ClusterRecoveryProjection {
     /** Keeps the active item and latest terminal result for this pipeline's actual current incarnation. */
     public ClusterPipelineRecoveryView pipeline(String clusterId, String pipelineId, Boolean quorumReady) {
         ClusterRecoveryView all = cluster(clusterId, quorumReady);
-        Reading<Optional<ArtifactIdentity>> current = read(() -> artifacts.identity(pipelineId));
-        ArtifactIdentity identity = current.value() == null ? null : current.value().orElse(null);
+        Reading<ArtifactIdentity> current = read(() -> artifacts.identity(pipelineId).orElse(null));
+        ArtifactIdentity identity = current.value();
         ClusterRecoveryReadFailure unavailable = current.unavailable() == null
                 ? all.queueUnavailable() : current.unavailable();
         List<ClusterRecoveryItemView> items = identity == null ? List.of() : all.items().stream()

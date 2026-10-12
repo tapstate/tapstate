@@ -65,4 +65,28 @@ class PdkResumePositionRejectionTest {
                 .containsEntry("pdkArgs", List.of("the original source argument"));
         assertThat(coded.getCause()).isSameAs(refusal);
     }
+
+    @Test
+    void anAlreadyCodedCaptureFailureKeepsTheExactOriginalInstance() {
+        Throwable cause = new IllegalArgumentException();
+        TapstateException original = new TapstateException(ConnectorError.PROJECTION_FAILED,
+                Map.of("connector", "mongodb", "detail", "IllegalArgumentException"), cause);
+
+        TapstateException reported = PdkCapturePort.captureFailure("mongodb", original);
+
+        assertThat(reported).isSameAs(original);
+        assertThat(reported.getCause()).isSameAs(cause);
+    }
+
+    @Test
+    void aMessageLessCaptureFailureKeepsItsCodedKindAndOriginalCause() {
+        IllegalStateException original = new IllegalStateException();
+
+        TapstateException reported = PdkCapturePort.captureFailure("mongodb", original);
+
+        assertThat(reported.code()).isEqualTo(ConnectorError.CAPTURE_FAILED);
+        assertThat(reported.args()).containsExactlyInAnyOrderEntriesOf(
+                Map.of("connector", "mongodb", "detail", "IllegalStateException"));
+        assertThat(reported.getCause()).isSameAs(original);
+    }
 }
