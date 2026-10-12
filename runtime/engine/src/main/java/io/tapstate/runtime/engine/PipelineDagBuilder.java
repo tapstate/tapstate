@@ -450,7 +450,8 @@ public final class PipelineDagBuilder {
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             bindings.join().stores(), bindings.join().displaced(),
-                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn)));
+                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn), axes,
+                            chains == null ? null : alias -> chains.union(aliasUpstream(inline.from(), alias, bindings))));
                     attachTraceInputs(dag, step.id(), inline.from(), bindings, byKey, trace,
                             outboundOrdinal, inboundOrdinal, shape);
                     attachTrace(dag, step.id(), byKey.get(step.id()), trace, outboundOrdinal, inboundOrdinal, shape);
