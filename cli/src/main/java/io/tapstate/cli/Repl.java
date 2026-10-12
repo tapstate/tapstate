@@ -1915,8 +1915,15 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case GetOutcome.Found found -> {
-                out.println(found.artifact().canonicalForm().stripTrailing());
+                String canonical = found.artifact().canonicalForm();
+                out.println(canonical.stripTrailing());
                 out.flush();
+                if ("source".equals(found.artifact().kind())
+                        && (canonical.contains("<redacted>") || canonical.equals("<redacted-source>"))) {
+                    err.println("get: Source credentials were redacted; this output cannot be applied as-is. "
+                            + "Use the Source API to retain saved credentials or provide complete settings.");
+                    err.flush();
+                }
                 yield Cli.EXIT_OK;
             }
             case GetOutcome.Absent ignored -> {
@@ -2240,8 +2247,9 @@ final class Repl {
     }
 
     /**
-     * Reads the stored connection a probing verb targets (server-as-truth, so the probe runs against
-     * exactly what is stored) and parses it to a source connection, or reports why it cannot be probed
+     * Reads the stored connection a probing verb targets and obtains its redacted probe settings from
+     * the dedicated Source API. The server restores saved credentials internally; generic artifact
+     * reads do not contain any config. Reports why it cannot be probed
      * and returns {@code null}: a benign "not found" for a missing id, a benign "not a {adjective}
      * connection" for a non-source kind (using the reliable stored kind, without parsing a body that is
      * not a connection at all), and a benign "cannot read" for a stored body that no longer parses to a
@@ -2284,13 +2292,33 @@ final class Repl {
             err.flush();
             return null;
         }
-        return source;
+        ConnectionSettingsOutcome settings = withFailover(() ->
+                controlPlane.connectionSettings(session.landingNode(), session.credential(), connectionId),
+                value -> value instanceof ConnectionSettingsOutcome.Unreachable);
+        return switch (settings) {
+            case ConnectionSettingsOutcome.Found current -> new SourceResource(
+                    source.id(), source.metadata(), current.connector(), current.settings(),
+                    source.mode(), source.tables(), source.srs(), source.experimental());
+            case ConnectionSettingsOutcome.Absent ignored -> {
+                err.println("not found: " + connectionId);
+                err.flush();
+                yield null;
+            }
+            case ConnectionSettingsOutcome.Rejected rejected -> {
+                renderRejection(rejected.code(), rejected.message());
+                yield null;
+            }
+            case ConnectionSettingsOutcome.Unreachable ignored -> {
+                reportRequestFailed();
+                yield null;
+            }
+        };
     }
 
     /**
      * {@code discover-schema <id> [-o text|json|yaml]} — discovers a stored connection's source model. It
-     * reads the connection from the server first (server-as-truth), parses the connector and connection
-     * config it holds, then posts the discovery and renders the discovered tables. A missing operand or an
+     * reads the connection from the server first, obtains redacted settings from the dedicated Source
+     * API, then posts the discovery and renders the discovered tables. A missing operand or an
      * unknown option is a benign usage line; an id that resolves to nothing is a benign "not found"; an id
      * that is not a source connection is a benign "not a discoverable connection"; a coded refusal renders
      * its code and message.

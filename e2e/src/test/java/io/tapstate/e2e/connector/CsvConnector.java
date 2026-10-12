@@ -17,6 +17,7 @@ import io.tapdata.pdk.apis.context.TapConnectionContext;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectionOptions;
 import io.tapdata.pdk.apis.entity.ExecuteResult;
+import io.tapdata.pdk.apis.entity.FilterResults;
 import io.tapdata.pdk.apis.entity.TapExecuteCommand;
 import io.tapdata.pdk.apis.entity.TestItem;
 import io.tapdata.pdk.apis.entity.WriteListResult;
@@ -44,6 +45,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -276,6 +278,23 @@ public class CsvConnector implements TapConnector {
                     List<TapEvent> rows = snapshot(context, table.getId());
                     noteRead(context, "snapshot", table.getId(), rows.size());
                     consumer.accept(rows, null);
+                })
+                .supportQueryByAdvanceFilter((context, filter, table, consumer) -> {
+                    Map<String, Object> match = filter.getMatch() == null ? Map.of() : filter.getMatch();
+                    List<Map<String, Object>> selected = new ArrayList<>();
+                    int limit = filter.getLimit() == null ? Integer.MAX_VALUE : filter.getLimit();
+                    for (Map<String, Object> row : rows(file(context, table.getId()))) {
+                        if (match.entrySet().stream()
+                                .allMatch(entry -> Objects.equals(row.get(entry.getKey()), entry.getValue()))) {
+                            selected.add(row);
+                            if (selected.size() == limit) {
+                                break;
+                            }
+                        }
+                    }
+                    FilterResults result = new FilterResults();
+                    result.setResults(selected);
+                    consumer.accept(result);
                 })
                 .supportStreamRead((context, tables, offset, size, consumer) -> {
                     mintTheIdentityOnce(context);
@@ -670,26 +689,52 @@ public class CsvConnector implements TapConnector {
      * put back a table missing the other's rows - and a sink's writers write one table at once as a matter of
      * course, each with a connector of its own and spread over every member, as they would a database.
      *
-     * <p>A lock on a file beside the table is what they meet on, under a name that is not a table's. Nothing held
-     * in this class can do it: each writer's connector is loaded apart from the others', so a lock kept here is a
-     * lock per writer. The file lock is held for this machine as a whole; one already held by another writer in
-     * this process is refused rather than waited on, so that is waited out here as another process's is.
+     * <p>A lock on a file beside the table is what processes meet on, under a name that is not a table's.
+     * Writers in this JVM also meet on an interned, canonical lock path: the string pool and system properties
+     * are shared even when their connectors have different class loaders. Its monitor only guards a shared
+     * ownership marker, so waiting for ownership can use the same deadline as waiting for the file lock.
+     * Ownership covers opening and closing the channel as well as applying the batch. A released channel's
+     * close can otherwise remove a newer channel's lock from the JDK registry, and on POSIX can release this
+     * process's locks on the same file.
      */
     private static <T> T exclusively(Path file, java.util.function.Supplier<T> work) {
+        long deadline = System.nanoTime() + LOCK_WAIT_NANOS;
         Path lockFile = file.resolveSibling(lockNameOf(file.getFileName().toString()));
         try {
             Files.createDirectories(file.getParent());
-            try (FileChannel channel = FileChannel.open(
-                    lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
-                FileLock held = acquire(channel, file);
-                try {
-                    return work.get();
-                } finally {
-                    held.release();
+            String processLock = ("io.tapstate.e2e.csv-writer:"
+                    + lockFile.getParent().toRealPath().resolve(lockFile.getFileName())).intern();
+            acquireProcessLock(processLock, file, deadline);
+            try {
+                try (FileChannel channel = FileChannel.open(
+                        lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                    FileLock held = acquire(channel, file, deadline);
+                    try {
+                        return work.get();
+                    } finally {
+                        held.release();
+                    }
+                }
+            } finally {
+                synchronized (processLock) {
+                    System.clearProperty(processLock);
                 }
             }
         } catch (IOException e) {
             throw new UncheckedIOException("cannot hold the table at " + file + " for a write", e);
+        }
+    }
+
+    /** Claims the table in this JVM without holding a monitor while the batch or channel close runs. */
+    private static void acquireProcessLock(String processLock, Path file, long deadline) {
+        while (true) {
+            synchronized (processLock) {
+                if (System.getProperty(processLock) == null) {
+                    System.setProperty(processLock, "held");
+                    return;
+                }
+            }
+            awaitLock(file, deadline);
         }
     }
 
@@ -710,8 +755,7 @@ public class CsvConnector implements TapConnector {
     }
 
     /** The lock on {@code channel}'s file, waiting for whichever writer holds it now, here or elsewhere. */
-    private static FileLock acquire(FileChannel channel, Path file) throws IOException {
-        long deadline = System.nanoTime() + LOCK_WAIT_NANOS;
+    private static FileLock acquire(FileChannel channel, Path file, long deadline) throws IOException {
         while (true) {
             try {
                 FileLock held = channel.tryLock();
@@ -721,12 +765,16 @@ public class CsvConnector implements TapConnector {
             } catch (OverlappingFileLockException heldInThisProcess) {
                 // Another writer in this process holds it; wait for it as for a writer in another process.
             }
-            if (System.nanoTime() - deadline > 0) {
-                throw new IllegalStateException("the table at " + file + " was held by another write for over "
-                        + TimeUnit.NANOSECONDS.toSeconds(LOCK_WAIT_NANOS) + "s");
-            }
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+            awaitLock(file, deadline);
         }
+    }
+
+    private static void awaitLock(Path file, long deadline) {
+        if (System.nanoTime() - deadline > 0) {
+            throw new IllegalStateException("the table at " + file + " was held by another write for over "
+                    + TimeUnit.NANOSECONDS.toSeconds(LOCK_WAIT_NANOS) + "s");
+        }
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
     }
 
     /**

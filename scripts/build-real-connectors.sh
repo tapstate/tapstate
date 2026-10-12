@@ -208,7 +208,17 @@ done
 # reached when there really is no native build - a version that has one is left to the plugin, so this
 # stops applying by itself once the connectors move past 3.17.
 protoc_flags=()
-if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+# The Atlas and AWS RDS MySQL selected reactors have been built without a
+# protobuf compiler module. Neither alone nor the pair needs Rosetta. Keep the
+# fallback for every other selection, including the default PostgreSQL witness.
+needs_protoc=true
+for module in "${CONNECTOR_MODULES[@]}"; do
+    case "$module" in
+        connectors/mongodb-atlas-connector|connectors/aws-rds-mysql-connector) needs_protoc=false ;;
+        *) needs_protoc=true; break ;;
+    esac
+done
+if [ "$needs_protoc" = true ] && [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
     bom="$checkout/connectors-common/debezium-bucket/debezium-bom/pom.xml"
     protoc_version="$(sed -n 's|.*<version\.com\.google\.protobuf>\(.*\)</version\.com\.google\.protobuf>.*|\1|p' \
         "$bom" | head -1)"

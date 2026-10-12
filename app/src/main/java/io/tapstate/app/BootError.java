@@ -21,6 +21,42 @@ enum BootError implements TapstateErrorCode {
     /** The embedded Hazelcast member could not be started (e.g. its loopback port is in use). */
     HAZELCAST_UNAVAILABLE("boot.hazelcast-unavailable", Set.of()),
 
+    /** A managed Cloud runtime must receive its four external settings as one complete unit. */
+    CLOUD_CONFIG_INCOMPLETE("boot.cloud-config-incomplete", Set.of()),
+
+    /** The configured Global Control Plane address is not an absolute HTTP(S) base URL. */
+    CLOUD_BASE_URL_INVALID("boot.cloud-base-url-invalid", Set.of()),
+
+    /** The managed metadata connection is not a MongoDB or MongoDB SRV connection string. */
+    CLOUD_ATLAS_URI_INVALID("boot.cloud-atlas-uri-invalid", Set.of()),
+
+    /** A Web-bearing distribution has missing, unsupported, malformed, or conflicting metadata. */
+    WEB_PROFILE_INVALID("boot.web-profile-invalid", Set.of("reason")),
+
+    /** The packaged Web profile does not match the mode selected by the external Cloud settings. */
+    WEB_PROFILE_MODE_MISMATCH("boot.web-profile-mode-mismatch", Set.of("profile", "mode")),
+
+    /** Cloud Web metadata requires a safe HTTPS Console URL; on-prem must carry no Console URL. */
+    WEB_CONSOLE_URL_INVALID("boot.web-console-url-invalid", Set.of()),
+
+    /** The optional on-prem store switch cannot disable managed Cloud metadata persistence. */
+    CLOUD_STORE_REQUIRED("boot.cloud-store-required", Set.of()),
+
+    /** An existing view-store resource conflicts with the managed deployment or a concurrent refresh. */
+    CLOUD_VIEW_STORE_CONFLICT("boot.cloud-view-store-conflict", Set.of("store")),
+
+    /** The outbound status switch is malformed; its value is deliberately not echoed. */
+    CLOUD_STATUS_CONFIG_INVALID("boot.cloud-status-config-invalid", Set.of()),
+
+    /** An on-prem process attempted to enable managed Cloud status reporting. */
+    CLOUD_STATUS_MODE_REQUIRED("boot.cloud-status-mode-required", Set.of()),
+
+    /** Status reporting was explicitly enabled without the real SDK-backed reporter. */
+    CLOUD_STATUS_SDK_REQUIRED("boot.cloud-status-sdk-required", Set.of()),
+
+    /** A Cloud connector release is missing, mismatched, or cannot be fully registered and loaded. */
+    CLOUD_CONNECTORS_INVALID("boot.cloud-connectors-invalid", Set.of("connector", "reason")),
+
     /** The selected member-discovery mode is missing a required, deterministic input. */
     DISCOVERY_CONFIG_INVALID("boot.discovery-config-invalid", Set.of("detail")),
 
