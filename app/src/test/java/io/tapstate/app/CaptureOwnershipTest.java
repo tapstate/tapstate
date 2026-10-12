@@ -1,8 +1,15 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.config.Config;
+import com.hazelcast.config.InMemoryFormat;
+import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
+import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -24,6 +31,7 @@ import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -54,6 +62,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -65,6 +74,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 
 class CaptureOwnershipTest {
 
@@ -82,6 +93,140 @@ class CaptureOwnershipTest {
 
     /** The chain every pipeline here reads, whichever member drives it. */
     private static final String CHAIN = SourceCaptureResolution.of(SOURCE).chainId().value();
+
+    @Test
+    void repeatedSourceReferencesKeepBothSnapshotOnlyLoadsDrainable() throws Exception {
+        repeatedSourceReferencesKeepBothLoadsDrainable(ReadMode.SNAPSHOT_ONLY);
+    }
+
+    @Test
+    void repeatedSourceReferencesLetTheOwningLoadOpenCdc() throws Exception {
+        repeatedSourceReferencesKeepBothLoadsDrainable(ReadMode.SNAPSHOT_AND_CDC);
+    }
+
+    private static void repeatedSourceReferencesKeepBothLoadsDrainable(ReadMode readMode) throws Exception {
+        PipelineResource pipeline = (PipelineResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source:
+                  - {id: orders-source, srs: true}
+                  - {id: orders-source, srs: true}
+                serve:
+                  from: orders-source.orders
+                  sync:
+                    - source: orders-source
+                settings:
+                  read_mode: %s
+                """.formatted(readMode.yaml()));
+        Workspace.of(List.of(SOURCE, pipeline));
+        assertThat(pipeline.sources()).containsExactly(
+                SourceRef.spec("orders-source", true), SourceRef.spec("orders-source", true));
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(SOURCE);
+        artifacts.save(pipeline);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        // Each read exceeds the default bound, so it cannot finish unless drains credit its declaration.
+        int rows = 9_000;
+        CapturePort source = mock(CapturePort.class);
+        when(source.snapshot(any())).thenAnswer(invocation -> new CaptureBatch() {
+            private int next = 1;
+
+            @Override
+            public boolean hasNext() { return next <= rows; }
+
+            @Override
+            public Envelope next() {
+                return Envelope.read(1L, "orders", Map.of("id", (long) next++), Map.of());
+            }
+
+            @Override
+            public Optional<SourcePosition> seam() { return Optional.of(new SourcePosition("seam-0")); }
+
+            @Override
+            public void close() { }
+        });
+        AtomicInteger tails = new AtomicInteger();
+        when(source.cdc(any(), any(), any())).thenAnswer(invocation -> {
+            tails.incrementAndGet();
+            return (Subscription) () -> { };
+        });
+        InMemorySrsLogStore log = new InMemorySrsLogStore();
+        Config config = new Config().addRingBufferConfig(new RingbufferConfig("srs.*")
+                .setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
+        HazelcastInstance hz = mock(HazelcastInstance.class);
+        when(hz.getConfig()).thenReturn(config);
+        when(hz.getUserContext()).thenReturn(new ConcurrentHashMap<>(
+                Map.of(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, log)));
+        when(hz.getRingbuffer(anyString())).thenReturn(mock(Ringbuffer.class));
+        SrsCoordinator chains = new SrsCoordinator(store.meta());
+        CaptureRunUnit unit = new CaptureRunUnit(source, chains, store.meta(), hz);
+        CountDownLatch attached = new CountDownLatch(1);
+        List<CaptureRun> runs = new ArrayList<>();
+        List<Boolean> tailOwners = new ArrayList<>();
+        CaptureAttacher reader = (spec, handoff, startTail) -> {
+            tailOwners.add(startTail);
+            CaptureRun run = unit.begin(spec, new CaptureHandoff() {
+                private boolean first = true;
+
+                @Override
+                public void accept(Envelope row) {
+                    if (first) {
+                        first = false;
+                        try {
+                            if (!attached.await(10, TimeUnit.SECONDS)) {
+                                throw new AssertionError("both attachments must start before rows arrive");
+                            }
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(interrupted);
+                        }
+                    }
+                    handoff.accept(row);
+                }
+
+                @Override
+                public void loaded(String table) { handoff.loaded(table); }
+            }, startTail);
+            runs.add(run);
+            return run;
+        };
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", Member.owner("node-a"), gate, new ClusterWorkloadClaims(new MemoryClaims(), gate), TTL);
+        StoreBackedPipelineCaptureCoordinator node = new StoreBackedPipelineCaptureCoordinator(
+                store, reader, chains, buffer, ownership, RENEW);
+        String ring = SourceCaptureResolution.of(SOURCE).ringName();
+        try {
+            node.startCapture("p");
+            assertThat(tailOwners).containsExactly(true, false);
+            attached.countDown();
+            int drained = 0;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while ((runs.stream().anyMatch(CaptureRun::loading) || drained < rows * 2)
+                    && System.nanoTime() - deadline < 0) {
+                drained += buffer.drain("p", ring).size();
+                Thread.sleep(1);
+            }
+            assertThat(runs).allSatisfy(run -> {
+                assertThat(run.loading()).as("each attachment finishes its %s rows while draining (read %s)",
+                        rows, run.snapshotCount()).isFalse();
+                assertThat(run.health().failure()).isEmpty();
+                assertThat(run.snapshotCount()).isEqualTo(rows);
+            });
+            assertThat(drained).isEqualTo(rows * 2);
+            assertThat(buffer.snapshotState("p", ring).handedOver()).isTrue();
+            assertThat(tails).hasValue(readMode == ReadMode.SNAPSHOT_AND_CDC ? 1 : 0);
+        } finally {
+            attached.countDown();
+            node.stopCapture("p", false);
+            node.close();
+            unit.close();
+        }
+    }
 
     /**
      * A capture nobody tails is not taken over while a pipeline here is still reading its own load of it.

@@ -197,21 +197,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // window that had already closed.
         Instant loadBegan = Instant.now();
         PipelineLoad load = PipelineLoad.of(plans, loadBegan);
+        Map<String, CaptureHandoff> buffersByRing = new LinkedHashMap<>();
         try {
             for (SourcePlan plan : plans) {
-                SourceCaptureResolution resolution = plan.resolution();
                 CaptureRunSpec spec = plan.spec();
                 CaptureId captureId = plan.captureId();
                 // Written by the thread reading the load and read by whoever asks how far it has got.
                 Map<String, Long> observedSnapshotCounts = new ConcurrentHashMap<>();
-                if (CapturePlan.forReadMode(spec.readMode()).snapshot()) {
-                    // Before the run starts, and so before the job that takes its rows is even assembled: the
-                    // source vertex reads the declaration when it starts, and one that found none would read
-                    // its ring at once, ahead of snapshot rows still to come.
-                    resolution.tables().forEach(
-                            table -> snapshotBuffer.declareSnapshot(pipelineId, resolution.ringName(table)));
-                }
-                CaptureHandoff handoff = snapshotPassthrough(pipelineId, plan, observedSnapshotCounts, load);
+                CaptureHandoff handoff = snapshotPassthrough(
+                        pipelineId, plan, observedSnapshotCounts, load, buffersByRing);
                 CaptureRun run;
                 if (!managedOwnership) {
                     run = captureStarter.start(spec, handoff);
@@ -1536,7 +1530,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * to the ring, and the table is published to the read face with what it read.
      */
     private CaptureHandoff snapshotPassthrough(
-            String pipelineId, SourcePlan plan, Map<String, Long> observedSnapshotCounts, PipelineLoad load) {
+            String pipelineId, SourcePlan plan, Map<String, Long> observedSnapshotCounts, PipelineLoad load,
+            Map<String, CaptureHandoff> buffersByRing) {
         SourceCaptureResolution resolution = plan.resolution();
         Set<String> selectedTables = Set.copyOf(resolution.tables());
         CaptureRunSpec spec = plan.spec();
@@ -1544,8 +1539,17 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         Optional<String> chainId = phases.snapshot() && phases.cdc()
                 ? Optional.of(spec.miningChainId().value()) : Optional.empty();
         Map<String, CaptureHandoff> buffers = new LinkedHashMap<>();
-        resolution.tables().forEach(table ->
-                buffers.put(table, snapshotBuffer.handoff(pipelineId, resolution.ringName(table))));
+        resolution.tables().forEach(table -> {
+            String ring = resolution.ringName(table);
+            buffers.put(table, buffersByRing.computeIfAbsent(ring, key -> {
+                // Declare before capture starts and the job is assembled. Repeated source references
+                // share this declaration and callback, so drains credit every reader's active hand-off.
+                if (phases.snapshot()) {
+                    snapshotBuffer.declareSnapshot(pipelineId, key);
+                }
+                return snapshotBuffer.handoff(pipelineId, key);
+            }));
+        });
         return new CaptureHandoff() {
             @Override
             public void accept(Envelope event) {
