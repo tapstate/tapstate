@@ -237,7 +237,7 @@ class BenchmarkReturnAfterReceiptTest {
         body.put("nonceSha256", hash(registration.nonce().getBytes(StandardCharsets.US_ASCII))); body.put("state", "RECORDED_STRUCTURAL_DIAGNOSTIC");
         body.put("limits", vector(Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE));
         body.put("materialLimits", Map.of("connectorHashBytes", 134217728L, "runtimeArguments", 128L, "runtimeArgumentBytes", 2093056L, "primaryKeys", 2L));
-        body.put("actualMaterial", vector(0, 0, 0, 0, 0, 0, 0, 0)); body.put("sourceUpper", vector(3, 598316, 0, 0, 444044, 865, 1018612, 953140));
+        body.put("actualMaterial", vector(0, 0, 0, 0, 0, 0, 0, 0)); body.put("sourceUpper", vector(3, 598316, 0, 0, 444052, 865, 1018628, 953156));
         body.put("inputRowsAttempted", 0L); body.put("sourceUpperIsActualWork", false); body.put("limitsIndependentlyVerified", false);
         var rows = new LinkedHashMap<String, Object>();
         for (String name : BenchmarkReturnWorkBudgetProducerSeal.ACTIVITY_NAMES) rows.put(name, Map.of("invocations", 0L, "completed", 0L, "failed", 0L, "pending", 0L));

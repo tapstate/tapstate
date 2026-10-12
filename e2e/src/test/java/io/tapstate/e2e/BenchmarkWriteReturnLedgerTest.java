@@ -103,7 +103,7 @@ class BenchmarkWriteReturnLedgerTest {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("no completion cursor progress");
         assertThatThrownBy(() -> BenchmarkWriteReturnLedger.decode(page(1, 2, 1, 2, "window", RECORDED, List.of())))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("cursor");
-        assertThatThrownBy(() -> BenchmarkWriteReturnLedger.decode(page(1, 18488, 18488, 18488, "window", RECORDED, List.of())))
+        assertThatThrownBy(() -> BenchmarkWriteReturnLedger.decode(page(1, 73969, 73969, 73969, "window", RECORDED, List.of())))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("cursor");
         byte[] call = new Fixture().bytes();
         assertThatThrownBy(() -> BenchmarkWriteReturnLedger.decode(page(1, 0, 2, 2, "window", RECORDED, List.of(call, call))))

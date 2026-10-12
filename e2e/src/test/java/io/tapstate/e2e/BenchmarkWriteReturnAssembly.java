@@ -14,7 +14,7 @@ import java.util.Set;
  */
 final class BenchmarkWriteReturnAssembly {
     private static final int MAX_PAGE_BYTES = 64 * 1024;
-    private static final int MAX_RAW_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_RAW_BYTES = BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES;
     private static final int MAX_FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES;
     private static final int MAX_RECORDS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
     private static final int MAX_WRITERS = 128;

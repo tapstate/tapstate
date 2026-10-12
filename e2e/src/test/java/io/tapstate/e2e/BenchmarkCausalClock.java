@@ -8,7 +8,7 @@ import java.util.List;
  * its resolution, the delay between a write return and its clock read, or instrumentation cost.
  */
 final class BenchmarkCausalClock implements BenchmarkReturnPointClock {
-    static final int MAX_SAMPLES = 8192;
+    static final int MAX_SAMPLES = 16384;
 
     record Identity(long pid, long jvmStartTimeMillis) {
         Identity {

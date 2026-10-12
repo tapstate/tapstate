@@ -30,7 +30,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     static final String COST_STAGES_PROPERTY = "tapstate.benchmark.write-return-cost-stages";
     static final String OBJECT_NAME = "io.tapstate.benchmark:type=WriteReturn";
     static final int MAX_FRAME_BYTES = 64 * 1024;
-    static final int MAX_LEDGER_BYTES = 2 * 1024 * 1024;
+    static final int MAX_LEDGER_BYTES = 8 * 1024 * 1024;
     static final int MAX_BATCH_RECORDS = 512;
     static final int MAX_CALL_RECORDS = 1024;
     // A V3 stored piece has seven longs, seven ints, one flag, five non-key text
@@ -41,7 +41,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     static final int PAGE_PAYLOAD_BYTES = MAX_FRAME_BYTES - 2048;
     static final int MAX_PAGE_HEADER_BYTES = 32 + 512 + 128;
     // Greedy adjacent nonempty pages have combined stored payload greater than one page capacity.
-    // Reserve their source-bounded headers within the independent raw two-MiB envelope.
+    // Reserve their source-bounded headers within the independent raw eight-MiB envelope.
     static final int MAX_NONEMPTY_PAGES = 2 * (MAX_LEDGER_BYTES / (PAGE_PAYLOAD_BYTES + 1)) + 1;
     static final int MAX_STORED_BYTES = MAX_LEDGER_BYTES - MAX_NONEMPTY_PAGES * MAX_PAGE_HEADER_BYTES;
     static final int MAX_FRAMES = MAX_STORED_BYTES / MIN_STORED_FRAME_BYTES;

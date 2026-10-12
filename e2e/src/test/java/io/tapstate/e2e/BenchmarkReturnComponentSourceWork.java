@@ -9,7 +9,7 @@ import java.util.Map;
 final class BenchmarkReturnComponentSourceWork {
     static final int CLASSES = 512, CALLS = BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS, SAMPLES = BenchmarkCausalClock.MAX_SAMPLES, PAGES = 512, ORIGINS = 1024, FILES = 10;
     static final int BATCHES = 960, HELLO = 6000, PHASES = 6, ROWS = 262144;
-    static final int NATIVE_CHARS = 8192, RAW_PAGE = 65536, RAW_TOTAL = 2097152;
+    static final int NATIVE_CHARS = 8192, RAW_PAGE = 65536, RAW_TOTAL = BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES;
     static final int META_NODES = 4096, COLD_NODES = 32768;
     static final long META_STRINGS = 65536, COLD_STRINGS = 4L * 2080768 + 4L * 8192;
     static final int UNITS = 8, FACTORY_FIELDS = 48;

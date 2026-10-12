@@ -7,7 +7,7 @@ import java.util.Map;
 final class BenchmarkReturnCaptureMaterialBounds {
     private static final int CALLS = BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS, ROWS = BenchmarkReturnLocalSourceWork.MAX_ROWS, CALL_ROWS = 1024, DETAILS = 512;
     private static final int COPY_LIST_CAP = CALLS > CALL_ROWS ? CALLS : CALL_ROWS;
-    private static final int TOTAL = 2097152, PAGE = 65536, ENCODED_PAGE = 4 * ((PAGE + 2) / 3);
+    private static final int TOTAL = BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES, PAGE = 65536, ENCODED_PAGE = 4 * ((PAGE + 2) / 3);
     private BenchmarkReturnCaptureMaterialBounds() { }
 
     static <T> List<T> copy(List<T> values, int cap) {

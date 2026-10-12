@@ -119,7 +119,7 @@ final class PdkWriteReturnWorkBudget {
     // number/literal paths get twelve calls per input character; JsonWriter's control escape path
     // gets five. The preparse roster has at most 64 tokens/nodes. Startup additionally renders the
     // fixed formula rosters and eight coefficients per activity before digesting the ASCII formula.
-    static final String TRANSPORT_SOURCE = "ledger-raw=2097152;stored=2052128;page-header=672;nonempty-pages=67;min-stored-v3-piece=111;stored-frames=18487;part-rows=512;total-rows=262144;cost-stage-calls=512;admitted-storage-only-not-future-total-calls;";
+    static final String TRANSPORT_SOURCE = "ledger-raw=8388608;stored=8210528;page-header=672;nonempty-pages=265;min-stored-v3-piece=111;stored-frames=73968;part-rows=512;total-rows=262144;cost-stage-calls=512;admitted-storage-only-not-future-total-calls;";
     static final long TRANSPORT_SOURCE_CHARS = TRANSPORT_SOURCE.length();
     static final long CONFIG_BOOTSTRAP_REQUESTS = add(mul(8, REPORT_ENTRIES), mul(4, REPORT_KEY_CHARS),
             mul(4, mul(ACTIVITY_NAMES.size(), UNITS.size())), 8, 8);

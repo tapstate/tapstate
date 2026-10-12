@@ -184,16 +184,18 @@ class BenchmarkWriteReturnAssemblyTest {
     @Test void oversized_pages_frame_rosters_and_raw_receipt_growth_are_rejected_before_closure() throws Exception {
         assertThatThrownBy(() -> new BenchmarkWriteReturnAssembly("window").add(new byte[65_537]))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("page exceeds");
-        assertThatThrownBy(() -> new BenchmarkWriteReturnAssembly("window").add(page(1, 0, 1, 18488,
+        assertThatThrownBy(() -> new BenchmarkWriteReturnAssembly("window").add(page(1, 0, 1, 73969,
                 "window", RECORDED, new Fixture()))).isInstanceOf(AssertionError.class);
         var assembly = new BenchmarkWriteReturnAssembly("window");
         boolean refused = false;
-        for (int index = 0; index < 512; index++) {
+        // About 2.4 KiB per page: the eight-MiB raw ledger bound is crossed near 3500 pages, before the
+        // 262144-row roster bound or 4096 declared frames.
+        for (int index = 0; index < 4096; index++) {
             var fixture = new Fixture(); fixture.sequence = index + 1L;
             fixture.writerIdentity = "w".repeat(512); fixture.stream = "s".repeat(512); fixture.target = "t".repeat(512);
-            fixture.keyFields = List.of("a".repeat(128), "b".repeat(128)); fixture.inserted = 256;
-            fixture.rows = IntStream.range(0, 256).mapToObj(key -> new Row(1, List.of(key, key))).toList();
-            try { assembly.add(page(1, index, index + 1, 512, "window", RECORDED, fixture)); }
+            fixture.keyFields = List.of("a".repeat(128), "b".repeat(128)); fixture.inserted = 64;
+            fixture.rows = IntStream.range(0, 64).mapToObj(key -> new Row(1, List.of(key, key))).toList();
+            try { assembly.add(page(1, index, index + 1, 4096, "window", RECORDED, fixture)); }
             catch (AssertionError failure) {
                 assertThat(failure).hasMessageContaining("raw ledger exceeds"); refused = true; break;
             }

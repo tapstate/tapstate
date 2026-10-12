@@ -109,9 +109,9 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 MAX_LEAF, 6, "RETAINED_ATTEMPT_CAP_4096_WITH_READING_AND_UTC_FIELDS");
         add(parts, "RAW_RETURN_BASE64", "BenchmarkWriteReturnPhaseEvidence.pagesBase64/BenchmarkWriteReturnCapture.retainedEvidence",
                 measuredPhases, 2L * (PAGES + 1), 2L * base64Total(RAW_BYTES, PAGES), base64(PAGE_BYTES), 3,
-                "COMPLETE_RAW_TWO_MIB_WITH_INDEPENDENT_PADDING_FOR_EACH_OF_512_PAGES");
+                "COMPLETE_RAW_EIGHT_MIB_WITH_INDEPENDENT_PADDING_FOR_EACH_OF_512_PAGES");
         add(parts, "RETURN_CLOCK_ROSTERS", "BenchmarkWriteReturnPhaseEvidence.clockSamples/Capture.retainedEvidence.samples",
-                Math.multiplyExact(Math.multiplyExact(2, measuredPhases), CLOCK_SAMPLES), mapNodes(6), 6L * 64, 128, 4, "COMPLETE_PERIODIC_CAP_8192_NO_CONTROL_SAMPLES_INSERTED");
+                Math.multiplyExact(Math.multiplyExact(2, measuredPhases), CLOCK_SAMPLES), mapNodes(6), 6L * 64, 128, 4, "COMPLETE_PERIODIC_CAP_16384_NO_CONTROL_SAMPLES_INSERTED");
         add(parts, "RETURN_CALL_AND_ROW_REPRESENTATION", "BenchmarkWriteReturnLedger/Assembly/Expectations retained diagnostics",
                 Math.multiplyExact(measuredPhases, FRAMES), mapNodes(24), 24L * 128, 512, 6, "SOURCE_BYTE_DERIVED_STORED_PIECE_CAP_CALL_ROW_CAP1024_NO_FULL_ROW_METADATA_DUPLICATION");
         add(parts, "RETURN_ROWS_IF_MATERIALIZED", "bounded return row/key/association failure projections",
@@ -206,7 +206,7 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                     "RESUME_BSON_LOCAL_MATERIAL_BEFORE_TOJSON_NODES4096_DEPTH16_BYTES2097152",
                     "HELLO_PRIMARY_CHARACTERS65536_AND_ORIGINAL_OBJECTID24_HEX_BEFORE_READING_DTO",
                     "CONTROLLED_FAILURE_PACKET_PRIOR_PLAN_VALIDATION_BEFORE_JSON_ENCODING",
-                    "METHOD_PHASE_MAX6_SOURCEBATCH960_CLOCK8192_RAW_TWO_MIB_BEFORE_COPY_AND_CONSUMPTION",
+                    "METHOD_PHASE_MAX6_SOURCEBATCH960_CLOCK16384_RAW_EIGHT_MIB_BEFORE_COPY_AND_CONSUMPTION",
                     "ONE_BOUND_EVIDENCE_AND_ONE_COMMONWINDOW_ACCESSOR_PER_ORIGINAL_MEASURED_PHASE"));
             metadata = Map.copyOf(additional);
         }
@@ -233,10 +233,10 @@ final class BenchmarkReturnWorkBudgetReportPlan {
                 "ONE_THREE_NUMERIC_FIELD_MAP_PER_ORIGINAL_BATCH_PLUS_LIST_NODE");
         add(parts, "METHOD_CLOCK_SAMPLE_PROJECTION", "BenchmarkWriteReturnPhaseEvidence.clockSamples",
                 Math.multiplyExact(phases, CLOCK_SAMPLES + 1L), mapNodes(6), 6L * 64, 128, 4,
-                "ONE_COMPLETE_PERIODIC_SAMPLE_ROSTER_MAX8192_PLUS_LIST_NODE");
+                "ONE_COMPLETE_PERIODIC_SAMPLE_ROSTER_MAX16384_PLUS_LIST_NODE");
         add(parts, "METHOD_RAW_RETURN_PAGES", "BenchmarkWriteReturnPhaseEvidence.pagesBase64",
                 phases, PAGES + 1L, base64Total(RAW_BYTES, PAGES), base64(PAGE_BYTES), 3,
-                "ADDITIONAL_COMPLETE_TWO_MIB_RAW_PAGES_WITH_PRIOR_512_PADDING");
+                "ADDITIONAL_COMPLETE_EIGHT_MIB_RAW_PAGES_WITH_PRIOR_512_PADDING");
         add(parts, "METHOD_NOMINAL_MAPPING", "BenchmarkNativeNominalReturnClock.evidence",
                 phases, 4096, 65536, 8192, 16,
                 "OWNED_IMMUTABLE_ROUTE_METADATA_PRIOR_FREEZE4096_NODES_65536_UTF8");

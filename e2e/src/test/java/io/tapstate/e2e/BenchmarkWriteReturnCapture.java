@@ -164,7 +164,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         while (true) {
             byte[] bytes = access.page(cursor);
             if (bytes == null || bytes.length > 64 * 1024 || retainedPages.size() >= 512
-                    || retainedPageBytes + bytes.length > 2 * 1024 * 1024) {
+                    || retainedPageBytes + bytes.length > BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES) {
                 throw new AssertionError("owned return capture page exceeds its retention bound");
             }
             retainedPages.add(BenchmarkReturnWorkBudget.opaqueRequest(workScope, BenchmarkReturnWorkBudget.Activity.BASE64,

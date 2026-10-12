@@ -6,7 +6,7 @@ import java.util.Map;
 /** Inclusive source bounds per entered local helper; opaque provider instructions are excluded. */
 final class BenchmarkReturnLocalSourceWork {
     // Stored V3 source lower: fixed85 +five UTF8prefixes10 +keyCount1 +keyPrefix2 +rowCount4 +row5 +storedLength4.
-    static final int RAW_LEDGER_BYTES = 2097152, MIN_STORED_FRAME_BYTES = 85 + 5 * Short.BYTES + 1 + Short.BYTES
+    static final int RAW_LEDGER_BYTES = 8 * 1024 * 1024, MIN_STORED_FRAME_BYTES = 85 + 5 * Short.BYTES + 1 + Short.BYTES
             + Integer.BYTES + 1 + Integer.BYTES + Integer.BYTES;
     static final int MIN_PAGE_HEADER_BYTES = 32, MAX_PAGE_HEADER_BYTES = 32 + 512 + 128;
     static final int MAX_STORED_PIECE_BYTES = 65536 - 2048;

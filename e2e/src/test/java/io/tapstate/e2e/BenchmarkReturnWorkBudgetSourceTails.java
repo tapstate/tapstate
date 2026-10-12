@@ -66,7 +66,7 @@ final class BenchmarkReturnWorkBudgetSourceTails {
                 stages = new String[]{"SNAPSHOT", "WARM_UP", "HOT_STATE", "COLD_READ", "CDC_UPDATE", "TERMINAL"};
                 outputs = new long[]{2 * PILOT_ROWS, 888, 64, PILOT_ROWS, 2 * PILOT_ROWS, 2};
                 sql = new int[]{0, 4, 1, 960, 1920, 4}; perBatch = new int[]{1, 1, 1, 1, 2, 1}; coverage = new int[]{4, 4, 1, 1, 2, 4};
-                cadence = new long[]{0, 0, 0, 200_000_000, 200_000_000, 0};
+                cadence = new long[]{0, 0, 0, 500_000_000, 500_000_000, 0};
                 database = "MYSQL"; pipelines = 2; chains = 4; targets = 2; setup = 581;
             }
             default -> throw new AssertionError("source tail workload selector differs");

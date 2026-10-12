@@ -27,7 +27,7 @@ class BenchmarkReturnCaptureMaterialBoundsTest {
     @Test void scoped_over_capacity_rosters_refuse_before_any_element_or_caller_iterator() {
         var accesses = new AtomicInteger();
         try (var scope = scope()) {
-            assertThatThrownBy(() -> result(unreadable(18488, accesses)))
+            assertThatThrownBy(() -> result(unreadable(73969, accesses)))
                     .isInstanceOf(AssertionError.class).hasMessageContaining("prior cap");
             assertThat(accesses).hasValue(0);
             assertThat(scope.primaryCause()).isInstanceOf(AssertionError.class);

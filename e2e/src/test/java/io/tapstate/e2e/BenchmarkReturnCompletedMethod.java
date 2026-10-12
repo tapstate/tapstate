@@ -208,7 +208,7 @@ final class BenchmarkReturnCompletedMethod {
             try { raw = Base64.getDecoder().decode(page); }
             catch (IllegalArgumentException bad) { throw new AssertionError("invalid original raw page base64", bad); }
             bytes = Math.addExact(bytes, raw.length);
-            require(raw.length <= 65536 && bytes <= 2097152 && Base64.getEncoder().encodeToString(raw).equals(page),
+            require(raw.length <= 65536 && bytes <= BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES && Base64.getEncoder().encodeToString(raw).equals(page),
                     "original raw page exceeds its bound or is noncanonical");
             assembly.add(raw);
         }

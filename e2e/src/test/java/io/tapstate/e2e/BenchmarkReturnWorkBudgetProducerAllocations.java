@@ -8,7 +8,7 @@ import java.util.Set;
 /** Independent arithmetic for one frozen producer definition; runtime coverage is verified separately. */
 final class BenchmarkReturnWorkBudgetProducerAllocations {
     static final String DEFINITION_ID = "WRITE_RETURN_PRODUCER_WORK_V1";
-    static final String FORMULA_SHA256 = "5e7e3babad7f8e2bd19f22c8ce0aac1ba5164e72e3867d5957cc568a6bfa4c89";
+    static final String FORMULA_SHA256 = "57c27826165e0233070ede286aaec748f06519d4a3e3fa3ab4502a36ef6f6080";
     static final List<String> UNITS = List.of("calls", "requests", "records", "frames", "bytes", "passes", "elements", "updates");
     private static final List<String> FLAGS = List.of("structuralBudgetQualified", "accountingErrorBoundQualified",
             "wholeMethodCostQualified", "collectionCostUpperBoundQualified", "samplingCostQualified",
@@ -54,8 +54,8 @@ final class BenchmarkReturnWorkBudgetProducerAllocations {
     private static final long REPORT_BYTES = add(mul(2, STRING_CHARS), JSON_CHARS, 64, 32, 64);
     private static final long REPORT_PASSES = add(4, 1, 1, MAPS, 2, ENTRIES, NODES, 1);
     private static final long REPORT_ELEMENTS = mul(8, add(NODES, ENTRIES, STRING_CHARS, JSON_CHARS));
-    private static final String TRANSPORT_SOURCE = "ledger-raw=2097152;stored=2052128;page-header=672;nonempty-pages=67;min-stored-v3-piece=111;stored-frames=18487;part-rows=512;total-rows=262144;cost-stage-calls=512;admitted-storage-only-not-future-total-calls;";
-    private static final long TRANSPORT_SOURCE_CHARS = 210;
+    private static final String TRANSPORT_SOURCE = "ledger-raw=8388608;stored=8210528;page-header=672;nonempty-pages=265;min-stored-v3-piece=111;stored-frames=73968;part-rows=512;total-rows=262144;cost-stage-calls=512;admitted-storage-only-not-future-total-calls;";
+    private static final long TRANSPORT_SOURCE_CHARS = TRANSPORT_SOURCE.length();
     private static final long CONFIG_REQUESTS = add(mul(6, INPUT_BYTES), mul(12, INPUT_BYTES), mul(5, INPUT_BYTES),
             mul(64, 32), mul(8, ENTRIES), mul(4, KEY_CHARS), mul(4, mul(ACTORS.size(), UNITS.size())), 16);
     private static final long CLOCK_HASH_BYTES = add(16L * 1024 * 1024, 4L * 256 * 1024, 5L * 8192);

@@ -9,7 +9,7 @@ import java.util.Map;
 /** Complete diagnostic source and return receipts, with conservative arithmetic and no acceptance credit. */
 final class BenchmarkWriteReturnPhaseEvidence {
     private static final int MAX_PAGE_BYTES = 64 * 1024;
-    private static final int MAX_LEDGER_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_LEDGER_BYTES = BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES;
     private static final int MAX_PAGES = 512;
 
     private BenchmarkWriteReturnPhaseEvidence() { }

@@ -1024,7 +1024,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     BenchmarkReturnWorkBudget.Work.pass(1));
         }
         try (BenchmarkResourceSampler resourceSampler = workload.pilotProfile()
-                ? BenchmarkResourceSampler.openForPhaseBudget(fork.server().pid(), RESOURCE_INTERVAL, ACK_WAIT)
+                // Retain reads across the whole fixed offer as well as the ACK wait that follows it.
+                ? BenchmarkResourceSampler.openForPhaseBudget(fork.server().pid(), RESOURCE_INTERVAL,
+                        ACK_WAIT.plus(phase.batchInterval().multipliedBy(phase.sql().size() / phase.statementsPerBatch())))
                 : BenchmarkResourceSampler.open(fork.server().pid(), RESOURCE_INTERVAL);
              BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri());
              BenchmarkTargetClockSampler clockSampler = targetClockBefore == null ? null

@@ -52,7 +52,8 @@ class PdkWriteReturnWorkBudgetTest {
         assertThat(shape.entries).isLessThanOrEqualTo(staticLong("REPORT_ENTRIES"));
         assertThat(count(actual, "COLD_ORIGINS", "completed")).isEqualTo(1);
         assertThat(PdkWriteReturnWorkBudget.SOURCE_FORMULA_SHA256)
-                .isEqualTo("5e7e3babad7f8e2bd19f22c8ce0aac1ba5164e72e3867d5957cc568a6bfa4c89")
+                .isEqualTo("57c27826165e0233070ede286aaec748f06519d4a3e3fa3ab4502a36ef6f6080")
+                .isNotEqualTo("5e7e3babad7f8e2bd19f22c8ce0aac1ba5164e72e3867d5957cc568a6bfa4c89")
                 .isNotEqualTo("5248e6d4304d26ccfd6744b0b05cc6206cd7de0d31b3bb057a9b4569b19776cb")
                 .isNotEqualTo("66db340eda98ee81382063031665532e1348d93ff0e5de90a67a39b674d9bada");
     }
@@ -60,11 +61,11 @@ class PdkWriteReturnWorkBudgetTest {
     @Test
     void transport_recipe_binds_independent_raw_row_and_derived_frame_priors() {
         assertThat(PdkWriteReturnProbe.MIN_STORED_FRAME_BYTES).isEqualTo(111);
-        assertThat(PdkWriteReturnProbe.MAX_LEDGER_BYTES).isEqualTo(2097152);
+        assertThat(PdkWriteReturnProbe.MAX_LEDGER_BYTES).isEqualTo(8388608);
         assertThat(PdkWriteReturnProbe.MAX_PAGE_HEADER_BYTES).isEqualTo(672);
-        assertThat(PdkWriteReturnProbe.MAX_NONEMPTY_PAGES).isEqualTo(67);
-        assertThat(PdkWriteReturnProbe.MAX_STORED_BYTES).isEqualTo(2052128);
-        assertThat(PdkWriteReturnProbe.MAX_FRAMES).isEqualTo(18487);
+        assertThat(PdkWriteReturnProbe.MAX_NONEMPTY_PAGES).isEqualTo(265);
+        assertThat(PdkWriteReturnProbe.MAX_STORED_BYTES).isEqualTo(8210528);
+        assertThat(PdkWriteReturnProbe.MAX_FRAMES).isEqualTo(73968);
         assertThat(PdkWriteReturnProbe.MAX_RECORDS).isEqualTo(262144);
         assertThat(PdkWriteReturnProbe.MAX_BATCH_RECORDS).isEqualTo(512);
         assertThat(PdkWriteReturnProbe.MAX_CALL_RECORDS).isEqualTo(1024);
@@ -72,7 +73,7 @@ class PdkWriteReturnWorkBudgetTest {
         assertThat(PdkWriteReturnWorkBudget.TRANSPORT_SOURCE).contains("admitted-storage-only-not-future-total-calls");
         // The source definition independently includes the fixed descriptor's bootstrap append/hash
         // transfer; admission does not substitute successful retained frames for complete attempt counts.
-        assertThat(PdkWriteReturnWorkBudget.Activity.CONFIG.upper).containsExactly(1, 396952, 0, 0, 132752, 16, 265504, 265504);
+        assertThat(PdkWriteReturnWorkBudget.Activity.CONFIG.upper).containsExactly(1, 396952, 0, 0, 132760, 16, 265520, 265520);
         assertThat(PdkWriteReturnWorkBudget.Activity.RECEIPT_PIECE.upper).containsExactly(0, 32, 0, 1, 524288, 8, 524288, 128);
     }
 

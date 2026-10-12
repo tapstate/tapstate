@@ -66,10 +66,10 @@ class BenchmarkReturnStorageCapacityTest {
 
     @Test void source_header_reservation_encloses_all_nonempty_pages_without_counting_initial_validation() {
         assertThat(BenchmarkReturnLocalSourceWork.MIN_STORED_FRAME_BYTES).isEqualTo(111);
-        assertThat(BenchmarkReturnLocalSourceWork.HEADER_PAGE_RESERVATION).isEqualTo(67);
-        assertThat(BenchmarkReturnLocalSourceWork.STORED_LEDGER_BYTES + 67 * 672).isEqualTo(2097152);
-        assertThat((long) BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES * 111).isLessThanOrEqualTo(2052128);
-        assertThat((long) (BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES + 1) * 111).isGreaterThan(2052128);
+        assertThat(BenchmarkReturnLocalSourceWork.HEADER_PAGE_RESERVATION).isEqualTo(265);
+        assertThat(BenchmarkReturnLocalSourceWork.STORED_LEDGER_BYTES + 265 * 672).isEqualTo(8388608);
+        assertThat((long) BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES * 111).isLessThanOrEqualTo(8210528);
+        assertThat((long) (BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES + 1) * 111).isGreaterThan(8210528);
         assertThat((long) BenchmarkReturnLocalSourceWork.MAX_PAGE_FRAMES * 111 + 32).isLessThanOrEqualTo(65536);
         assertThat((long) (BenchmarkReturnLocalSourceWork.MAX_PAGE_FRAMES + 1) * 111 + 32).isGreaterThan(65536);
     }

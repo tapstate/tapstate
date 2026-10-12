@@ -552,7 +552,7 @@ class PdkWriteReturnProbeTest {
         assertThat(probe.getState()).isEqualTo("UNKNOWN:LEDGER_OVERFLOW");
         // The controlled frames have equal binary size; the next complete call exceeds bytes,
         // rather than assuming the source-derived frame envelope is always physically filled.
-        int storedCeiling = 2 * 1024 * 1024 - 67 * 672;
+        int storedCeiling = 8 * 1024 * 1024 - 265 * 672;
         assertThat(probe.getRetainedBytes()).isLessThanOrEqualTo(storedCeiling);
         assertThat(probe.getRetainedBytes() + storedPerCall).isGreaterThan(storedCeiling);
         int cursor = 0, rawBytes = 0; List<Integer> keys = new ArrayList<>();
@@ -563,7 +563,7 @@ class PdkWriteReturnProbeTest {
             assertThat(page.next()).isGreaterThan(cursor); cursor = page.next();
         } while (cursor < admitted);
         assertThat(keys).containsExactlyElementsOf(java.util.stream.IntStream.range(0, admitted).boxed().toList());
-        assertThat(rawBytes).isLessThanOrEqualTo(2 * 1024 * 1024);
+        assertThat(rawBytes).isLessThanOrEqualTo(8 * 1024 * 1024);
         assertThat((long) rawBytes).isGreaterThan(probe.getRetainedBytes());
     }
 
