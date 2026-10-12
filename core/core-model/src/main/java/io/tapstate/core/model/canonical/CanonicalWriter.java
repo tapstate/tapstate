@@ -1,7 +1,9 @@
 package io.tapstate.core.model.canonical;
 
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -150,6 +152,7 @@ public final class CanonicalWriter {
         if (s.srs() != null) {
             b.put("srs", srs(s.srs()));
         }
+        execution(b, s.execution());
         b.freeMap("experimental", s.experimental());
         return b.build();
     }
@@ -194,6 +197,7 @@ public final class CanonicalWriter {
         if (v.storage() != null) {
             b.put("storage", storage(v.storage()));
         }
+        execution(b, v.execution());
         b.freeMap("experimental", v.experimental());
         return b.build();
     }
@@ -217,6 +221,8 @@ public final class CanonicalWriter {
                 m.freeMap("labels", new TreeMap<>(md.labels()));
             }
             m.scalar("description", md.description());
+            m.scalar("cloud", md.cloud());
+            m.scalar("user_id", md.userId());
             b.put("metadata", m.build());
         }
     }
@@ -288,6 +294,7 @@ public final class CanonicalWriter {
                 b.scalar("type", s.body().type());
                 b.put("from", fromClause(s.from()));
                 body(b, s.body());
+                execution(b, s.execution());
                 b.freeMap("experimental", s.experimental());
             }
             case Step.Use u -> {
@@ -296,6 +303,7 @@ public final class CanonicalWriter {
                 }
                 b.scalar("use", u.use());
                 b.put("from", fromClause(u.from()));
+                execution(b, u.execution());
             }
         }
         return b.build();
@@ -341,10 +349,10 @@ public final class CanonicalWriter {
     private Node fieldRules(Map<String, FieldRule> fields) {
         B b = new B();
         for (Map.Entry<String, FieldRule> e : fields.entrySet()) {
-            b.put(e.getKey(), switch (e.getValue()) {
+            b.putRequired(e.getKey(), switch (e.getValue()) {
                 case FieldRule.Rename r -> scalar("$" + r.sourceField());
                 case FieldRule.Drop ignored -> scalar(Boolean.FALSE);
-                case FieldRule.Literal l -> scalar(l.value());
+                case FieldRule.Literal l -> literalValue(l.value());
                 case FieldRule.Computed c -> new Node.ScalarN("=" + c.celExpr(), Node.Style.EXPRESSION);
             });
         }
@@ -428,6 +436,7 @@ public final class CanonicalWriter {
                 if (v.storage() != null) {
                     b.put("storage", storage(v.storage()));
                 }
+                execution(b, v.execution());
             }
             case ViewBlock.Use u -> {
                 if (!u.id().equals(u.use())) {
@@ -511,7 +520,30 @@ public final class CanonicalWriter {
         if (e.onFullLoad() != null && e.onFullLoad() != OnFullLoad.APPEND) {
             b.scalar("on_full_load", e.onFullLoad().yaml());
         }
+        execution(b, e.execution());
         return b.build();
+    }
+
+    /**
+     * A node's {@code execution} block, written exactly as far as the author wrote it. Unlike the sync
+     * element's other policies, a value equal to its default is kept rather than dropped: whether a
+     * parallelism was written or left to the node type is itself reported when the node runs, and
+     * dropping a written default here would make the artifact say the author left it out.
+     */
+    private static void execution(B b, ExecutionSpec execution) {
+        if (execution == null) {
+            return;
+        }
+        B e = new B();
+        e.scalar("parallelism", execution.parallelism());
+        BatchSpec batch = execution.batch();
+        if (batch != null) {
+            B t = new B();
+            t.scalar("max_records", batch.maxRecords());
+            t.scalar("max_wait", batch.maxWait());
+            e.put("batch", t.build());
+        }
+        b.put("execution", e.build());
     }
 
     private Node rename(RenameSpec r) {
@@ -613,6 +645,21 @@ public final class CanonicalWriter {
             return new Node.SeqN(items);
         }
         return scalar(v);
+    }
+
+    /** Literal collection values are data, so their empty members must survive serialization. */
+    private static Node literalValue(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            B builder = new B();
+            for (Map.Entry<String, Object> entry : new TreeMap<>(asStringMap(map)).entrySet()) {
+                builder.putRequired(entry.getKey(), literalValue(entry.getValue()));
+            }
+            return builder.build();
+        }
+        if (value instanceof List<?> list) {
+            return new Node.SeqN(list.stream().map(CanonicalWriter::literalValue).toList());
+        }
+        return scalar(value);
     }
 
     @SuppressWarnings("unchecked")

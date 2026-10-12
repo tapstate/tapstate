@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
@@ -20,11 +21,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * The read side of the double-layer model: the store is the truth layer, and a read returns an
- * artifact as its canonical form straight from that layer (server-as-truth). Its central guarantee is
- * that the online read path — apply -> store -> get — reproduces the offline canonical contract
- * byte-for-byte, the same {@link CanonicalWriter} the authoring corpus golden locks, so the online side
- * never forks the canonical form.
+ * The read side of the double-layer model: the store is the truth layer. Every public Source read omits
+ * connector config, while its authoritative model and content hash stay unchanged. Non-Source resources
+ * retain their byte-stable canonical round trip.
  */
 class ArtifactQueryServiceTest {
 
@@ -44,7 +43,7 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
-    void getReadsBackAnAppliedArtifactAsItsCanonicalForm() {
+    void getReadsBackSourceIdentityButOmitsConnectorConfig() {
         apply.apply("alice", List.of(draft(TGT_MG)));
 
         Optional<StoredArtifact> got = query.get("tgt_mg");
@@ -52,9 +51,8 @@ class ArtifactQueryServiceTest {
         assertThat(got).isPresent();
         assertThat(got.get().id()).isEqualTo("tgt_mg");
         assertThat(got.get().kind()).isEqualTo("source");
-        assertThat(got.get().canonicalForm())
-                .as("get reads back the stored canonical form")
-                .isEqualTo(offlineCanonical(TGT_MG));
+        assertThat(got.get().canonicalForm()).contains("id: tgt_mg", "connector: mongodb")
+                .doesNotContain("config:", "10.30.0.11");
     }
 
     @Test
@@ -65,17 +63,15 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
-    void appliedArtifactsReadBackByteStableAsTheOfflineCanonical() {
-        // The core golden: the online read path (apply -> store -> get) reproduces the offline canonical
-        // form byte-for-byte, using the one CanonicalWriter the authoring corpus golden locks. No second
-        // baseline is checked in on the online side: forking the canonical form here is exactly the drift
-        // this guards, so the expectation is the offline contract.
+    void sourceOutersRemainReadableWhileEveryConnectorConfigIsOmitted() {
         apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.get("src_ora")).get().extracting(StoredArtifact::canonicalForm)
-                .isEqualTo(offlineCanonical(SRC_ORA));
+                .asString().contains("id: src_ora", "connector: oracle", "mode: cdc")
+                .doesNotContain("config:", "Ora_2026");
         assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
-                .isEqualTo(offlineCanonical(TGT_MG));
+                .asString().contains("id: tgt_mg", "connector: mongodb")
+                .doesNotContain("config:", "10.30.0.11");
     }
 
     /**
@@ -107,15 +103,103 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
-    void listReturnsEveryStoredArtifactAsItsCanonicalForm() {
+    void listReturnsTheSamePublicProjectionAsGet() {
         apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.list()).extracting(ArtifactListEntry::id)
                 .containsExactlyInAnyOrder("src_ora", "tgt_mg", "ora2my_ods");
-        // Each listed artifact carries the same canonical form its own get returns.
+        // Each listed artifact carries the same public representation its own get returns.
         assertThat(query.list()).allSatisfy(a ->
                 assertThat(a.canonicalForm())
                         .isEqualTo(query.get(a.id()).orElseThrow().canonicalForm()));
+    }
+
+    @Test
+    void genericArtifactReadsDoNotExposeAtlasUriCredentials() {
+        String uri = "mongodb+srv://alice:pa%40ss@cluster.example/test";
+        SourceResource atlas = new SourceResource(
+                "atlas", null, "mongodb-atlas", Map.of("isUri", true, "uri", uri),
+                null, null, null, null);
+        store.save(atlas);
+
+        StoredArtifact got = query.get("atlas").orElseThrow();
+        ArtifactListEntry listed = query.list("source").stream()
+                .filter(entry -> entry.id().equals("atlas")).findFirst().orElseThrow();
+
+        assertThat(got.canonicalForm()).contains("id: atlas", "connector: mongodb-atlas")
+                .doesNotContain("config:", "cluster.example/test", "alice", "pa%40ss");
+        assertThat(listed.canonicalForm()).isEqualTo(got.canonicalForm());
+        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(atlas));
+        assertThat(((SourceResource) query.getResource("atlas").orElseThrow().resource()).config())
+                .containsEntry("uri", uri);
+    }
+
+    @Test
+    void genericReadsOmitConfigEvenWhenTheSourceHasNoPassword() {
+        apply.apply("alice", List.of(draft(TGT_MG)));
+
+        StoredArtifact got = query.get("tgt_mg").orElseThrow();
+        ArtifactListEntry listed = query.list("source").getFirst();
+
+        assertThat(got.canonicalForm()).contains("kind: source", "id: tgt_mg", "connector: mongodb")
+                .doesNotContain("config:", "10.30.0.11");
+        assertThat(listed.canonicalForm()).isEqualTo(got.canonicalForm());
+        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(store.get("tgt_mg").orElseThrow()));
+    }
+
+    @Test
+    void allDeclaredSourceConfigIsOmittedWithoutChangingTheAuthoritativeHash() {
+        SourceResource oracle = new SourceResource(
+                "oracle", null, "oracle",
+                Map.of("host", "db.example", "user", "alice", "password", "sentinel-secret"),
+                null, null, null, null);
+        store.save(oracle);
+
+        StoredArtifact got = query.get("oracle").orElseThrow();
+
+        assertThat(got.canonicalForm()).contains("id: oracle", "connector: oracle")
+                .doesNotContain("config:", "db.example", "alice", "sentinel-secret");
+        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(oracle));
+    }
+
+    @Test
+    void unreadableSourceInventoryDoesNotReturnUnparsedCredentials() {
+        store.putUnreadable("broken", "source", "uri: mongodb+srv://alice:pa%40ss@cluster.example/test");
+
+        ArtifactListEntry listed = query.list("source").getFirst();
+
+        assertThat(listed.readable()).isFalse();
+        assertThat(listed.canonicalForm()).doesNotContain("alice", "pa%40ss");
+    }
+
+    @Test
+    void unknownConnectorsStillExposeOnlyTheSourceOuterFields() {
+        SourceResource first = new SourceResource(
+                "first", null, "unregistered-connector",
+                Map.of("isUri", true, "uri", "mongodb+srv://alice:first@db.example/test"),
+                null, null, null, null);
+        SourceResource second = new SourceResource(
+                "second", null, "unregistered-connector",
+                Map.of("isUri", true, "uri", "mongodb+srv://alice:second@db.example/test"),
+                null, null, null, null);
+        store.save(first);
+        store.save(second);
+        assertThat(query.list("source")).hasSize(2)
+                .allSatisfy(row -> assertThat(row.canonicalForm()).contains("kind: source")
+                        .doesNotContain("config:", "alice:"));
+    }
+
+    @Test
+    void anUnboundedNestedConfigIsOmittedWithTheRestOfTheConnectionConfig() {
+        SourceResource malformed = new SourceResource(
+                "nested", null, "mongodb-atlas",
+                Map.of("isUri", true, "additionalString", Map.of("opaque", "sentinel-secret")),
+                null, null, null, null);
+        store.save(malformed);
+
+        assertThat(query.get("nested").orElseThrow().canonicalForm())
+                .contains("id: nested", "connector: mongodb-atlas")
+                .doesNotContain("config:", "sentinel-secret");
     }
 
     @Test
@@ -153,10 +237,11 @@ class ArtifactQueryServiceTest {
                 .filter(row -> row.id().equals("unreadable-atlas"))
                 .findFirst().orElseThrow().canonicalForm();
 
-        assertThat(List.of(got, readable, unreadable)).allSatisfy(canonical ->
+        assertThat(List.of(got, readable)).allSatisfy(canonical ->
                 assertThat(canonical)
-                        .contains("cluster.example/test")
-                        .doesNotContain("probe", "sentinel-secret"));
+                        .contains("id: atlas", "connector: mongodb-atlas")
+                        .doesNotContain("config:", "cluster.example/test", "probe", "sentinel-secret"));
+        assertThat(unreadable).isEqualTo(SourceReadProjection.WITHHELD);
     }
 
     @Test
@@ -168,20 +253,24 @@ class ArtifactQueryServiceTest {
 
         assertThat(List.of(got, listed)).allSatisfy(canonical ->
                 assertThat(canonical)
-                        .contains("cluster.example/test")
-                        .doesNotContain("probe", "sentinel'secret"));
+                        .contains("id: atlas-apostrophe", "connector: mongodb-atlas")
+                        .doesNotContain("config:", "cluster.example/test", "probe", "sentinel'secret"));
     }
 
     @Test
-    void credentialFreeMongoDbAtCharactersSurviveGenericReadsAndReapply() {
+    void credentialFreeMongoDbConfigsRemainStoredWhenGenericReadsAreReapplied() {
         apply.apply("alice", List.of(draft(MONGO_WITH_AT_IN_PATH), draft(MONGO_WITH_AT_IN_QUERY)));
 
         String path = query.get("mongo-at-path").orElseThrow().canonicalForm();
         String queryValue = query.get("mongo-at-query").orElseThrow().canonicalForm();
 
-        assertThat(path).isEqualTo(offlineCanonical(MONGO_WITH_AT_IN_PATH));
-        assertThat(queryValue).isEqualTo(offlineCanonical(MONGO_WITH_AT_IN_QUERY));
+        assertThat(path).doesNotContain("config:", "test@archive");
+        assertThat(queryValue).doesNotContain("config:", "ops@example.com");
         apply.apply("alice", List.of(draft(path), draft(queryValue)));
+        assertThat(((SourceResource) query.getResource("mongo-at-path").orElseThrow().resource()).config())
+                .containsEntry("uri", "mongodb://cluster.example/test@archive");
+        assertThat(((SourceResource) query.getResource("mongo-at-query").orElseThrow().resource()).config())
+                .containsEntry("uri", "mongodb://cluster.example/test?appName=ops@example.com");
     }
 
     @Test
@@ -198,7 +287,7 @@ class ArtifactQueryServiceTest {
 
         StoredArtifact got = query.get("tgt_mg").orElseThrow();
 
-        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(new DslParser().parse(got.canonicalForm())));
+        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(store.get("tgt_mg").orElseThrow()));
     }
 
     @Test
@@ -267,22 +356,27 @@ class ArtifactQueryServiceTest {
     @Test
     void onlyApplyMovesTheTruthLayerNotAPreparedEdit() {
         // Server-as-truth: the store is the read source and only apply mutates it. Apply v1 -> get is v1;
-        // preparing the edit through plan (the store-free validate + canonicalize front half, which writes
+        // preparing the edit through plan (the write-free validate + canonicalize front half, which writes
         // nothing) leaves the store — and get — at v1; applying the edit is what finally moves get to v2.
         apply.apply("alice", List.of(draft(TGT_MG)));
-        assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
-                .isEqualTo(offlineCanonical(TGT_MG));
+        StoredArtifact before = query.get("tgt_mg").orElseThrow();
+        assertThat(before.canonicalForm()).doesNotContain("config:");
+        assertThat(((SourceResource) query.getResource("tgt_mg").orElseThrow().resource()).config())
+                .containsEntry("uri", "mongodb://10.30.0.11:27017/ods");
 
-        // The edit is only prepared, never applied — plan touches no store — so get still reads v1.
+        // The edit is only prepared, never applied — plan writes no store state — so get still reads v1.
         apply.plan(List.of(draft(TGT_MG_CHANGED)));
-        assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
+        assertThat(query.get("tgt_mg").orElseThrow().contentHash())
                 .as("a prepared-but-unapplied edit does not reach the truth layer")
-                .isEqualTo(offlineCanonical(TGT_MG));
+                .isEqualTo(before.contentHash());
 
         apply.apply("alice", List.of(draft(TGT_MG_CHANGED)));
-        assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
-                .as("get reflects the last apply — server-as-truth, last write wins")
-                .isEqualTo(offlineCanonical(TGT_MG_CHANGED));
+        assertThat(query.get("tgt_mg").orElseThrow().contentHash())
+                .as("the new config changed the authoritative version even though it is not displayed")
+                .isNotEqualTo(before.contentHash());
+        assertThat(query.get("tgt_mg").orElseThrow().canonicalForm()).isEqualTo(before.canonicalForm());
+        assertThat(((SourceResource) query.getResource("tgt_mg").orElseThrow().resource()).config())
+                .containsEntry("uri", "mongodb://10.30.0.12:27017/ods");
     }
 
     @Test
@@ -401,6 +495,19 @@ class ArtifactQueryServiceTest {
             for (Resource artifact : artifacts) {
                 kindById.put(artifact.id(), artifact.kind());
             }
+        }
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+            for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
+                String canonical = byId.get(expected.getKey());
+                if (canonical == null
+                        || !CanonicalHash.of(parser.parse(canonical)).equals(expected.getValue())) {
+                    return Optional.of(expected.getKey());
+                }
+            }
+            saveAll(artifacts);
+            return Optional.empty();
         }
 
         @Override

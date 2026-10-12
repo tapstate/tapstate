@@ -21,13 +21,25 @@ public sealed interface Step {
 
     FromClause from();
 
+    /** How this step runs, or null where the author left it to the step type's defaults. */
+    ExecutionSpec execution();
+
     static Inline inline(String id, FromClause from, TransformBody body,
                          Map<String, Object> experimental) {
-        return new Inline(id, from, body, experimental);
+        return new Inline(id, from, body, null, experimental);
+    }
+
+    static Inline inline(String id, FromClause from, TransformBody body, ExecutionSpec execution,
+                         Map<String, Object> experimental) {
+        return new Inline(id, from, body, execution, experimental);
     }
 
     static Use use(String id, String use, FromClause from) {
-        return new Use(id, use, from);
+        return new Use(id, use, from, null);
+    }
+
+    static Use use(String id, String use, FromClause from, ExecutionSpec execution) {
+        return new Use(id, use, from, execution);
     }
 
     @Doc("A transform defined inline in the pipeline, with its body specified directly.")
@@ -37,8 +49,14 @@ public sealed interface Step {
             @Doc(value = "The upstream steps or sources this transform reads from.", required = true)
             FromClause from,
             @YamlFlatten TransformBody body,
+            @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
+            ExecutionSpec execution,
             @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
             Map<String, Object> experimental) implements Step {
+        public Inline(String id, FromClause from, TransformBody body, Map<String, Object> experimental) {
+            this(id, from, body, null, experimental);
+        }
+
         public Inline {
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(from, "from");
@@ -54,9 +72,9 @@ public sealed interface Step {
 
     /**
      * {@code use:} reference. The definition body is taken as it stands: the reference overrides
-     * nothing. Options were the one documented override and they carried no engine option anyone
-     * read, so the override existed on paper only; it comes back with the first real option, as a
-     * typed component rather than a free map.
+     * nothing in it. How the step runs is not part of the body - a definition is pure logic, and the
+     * same one may run wide in one pipeline and narrow in another - so {@code execution} lives here, on
+     * the step that instantiates it, as a typed component rather than the free options map it replaced.
      */
     @Doc("A reference to a named transform definition, used as defined.")
     record Use(
@@ -65,8 +83,14 @@ public sealed interface Step {
             @Doc(value = "Name of the transform definition to reuse.", required = true)
             String use,
             @Doc(value = "The upstream steps or sources this transform reads from.", required = true)
-            FromClause from)
+            FromClause from,
+            @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
+            ExecutionSpec execution)
             implements Step {
+        public Use(String id, String use, FromClause from) {
+            this(id, use, from, null);
+        }
+
         public Use {
             Objects.requireNonNull(use, "use");
             Objects.requireNonNull(from, "from");

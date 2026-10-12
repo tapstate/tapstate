@@ -892,6 +892,41 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.PreparationSink", code);
     }
 
+    /**
+     * A sink connector that writes one line to {@code trace} as it starts ({@code init}), as each write call
+     * reaches it ({@code write}) and as it stops ({@code stop}) - which is what tells one instance serving several
+     * writers apart from one instance each.
+     */
+    static Path lifecycleSink(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "LifecycleSink", LIFECYCLE_WRITES, "mark(\"init\");");
+    }
+
+    /** As {@link #lifecycleSink}, but a sink that offers no write at all, so no writer of it can open. */
+    static Path lifecycleSinkThatCannotWrite(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "SilentLifecycleSink", "", "mark(\"init\");");
+    }
+
+    /** As {@link #lifecycleSink}, but one that fails as it starts, having written {@code init}. */
+    static Path lifecycleSinkThatFailsToStart(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "FailingLifecycleSink", LIFECYCLE_WRITES,
+                "mark(\"init\"); throw new IllegalStateException(\"the target refused the connection\");");
+    }
+
+    private static final String LIFECYCLE_WRITES = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
+            + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
+
+    private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init) {
+        String members = "private void mark(String value) throws Exception {"
+                + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
+                + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
+        String code = source(simpleName, "", register, members)
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) throws Throwable { " + init + " }")
+                .replace("public void stop(TapConnectionContext c) {}",
+                        "public void stop(TapConnectionContext c) throws Throwable { mark(\"stop\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName, code);
+    }
+
     /** A sink connector whose writeRecord counts events and reports them all inserted. */
     static Path countingSink(Path dir) {
         String register = "functions.supportWriteRecord((context, events, table, consumer) -> {"
@@ -1479,6 +1514,16 @@ final class Synthetic {
                 Map.of());
     }
 
+    /** A MongoDB target connector that restores portable string keys through its registered codec. */
+    static Path mongoPreviewTarget(Path dir) {
+        String register = "codecs.registerFromTapValue(io.tapdata.entity.schema.value.TapStringValue.class, "
+                + "value -> new org.bson.types.ObjectId(value.getValue()));"
+                + "codecs.registerFromTapValue(io.tapdata.entity.schema.value.TapDateTimeValue.class, "
+                + "value -> java.util.Date.from(value.getValue().toInstant()));";
+        return SyntheticJar.compileToJar(dir, "synthetic.MongoPreviewTarget",
+                source("MongoPreviewTarget", "", register));
+    }
+
     /** A second registrable connector under a distinct id, whose manifest declares no PDK API version. */
     static Path seedablePaymentsConnector(Path dir) {
         String src = SELF_SCAN_IMPORTS
@@ -1774,5 +1819,90 @@ final class Synthetic {
                 + "  throw new RuntimeException(\"execute boom\");"
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.ThrowingQuery", readFace("ThrowingQuery", register));
+    }
+
+    /** A finite-query source with composite-key matches and a query limit that it honors. */
+    static Path exactTupleQuerySource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.pdk.apis.entity.FilterResults;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.Objects;"
+                + "import java.util.function.Consumer;"
+                + "public class ExactTupleQuery implements TapConnector {"
+                + "  public void registerCapabilities(ConnectorFunctions f, TapCodecsRegistry codecs) {"
+                + "    f.supportQueryByAdvanceFilter((c, filter, table, consumer) -> {"
+                + "      List<Map<String,Object>> matches = new ArrayList<>();"
+                + "      for (Map<String,Object> row : rows()) {"
+                + "        boolean match = filter.getMatch() == null || filter.getMatch().entrySet().stream()"
+                + "          .allMatch(entry -> Objects.equals(row.get(entry.getKey()), entry.getValue()));"
+                + "        if (match) matches.add(row);"
+                + "      }"
+                + "      int limit = filter.getLimit() == null ? Integer.MAX_VALUE : filter.getLimit();"
+                + "      if (matches.size() > limit) matches = new ArrayList<>(matches.subList(0, limit));"
+                + "      FilterResults results = new FilterResults(); results.setResults(matches); consumer.accept(results);"
+                + "    });"
+                + "  }"
+                + "  private List<Map<String,Object>> rows() {"
+                + "    List<Map<String,Object>> rows = new ArrayList<>();"
+                + "    rows.add(row(1, 1, \"a\")); rows.add(row(1, 2, \"cross-a\"));"
+                + "    rows.add(row(2, 1, \"cross-b\")); rows.add(row(2, 2, \"b\"));"
+                + "    return rows;"
+                + "  }"
+                + "  private Map<String,Object> row(int tenant, int order, String value) {"
+                + "    Map<String,Object> row = new LinkedHashMap<>(); row.put(\"tenant_id\", tenant);"
+                + "    row.put(\"order_id\", order); row.put(\"value\", value); return row;"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> names, int limit, Consumer<List<TapTable>> sink) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"tenant_id\", \"int\").isPrimaryKey(true));"
+                + "    table.add(new TapField(\"order_id\", \"int\").isPrimaryKey(true));"
+                + "    table.add(new TapField(\"value\", \"string\"));"
+                + "    sink.accept(List.of(table));"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> sink) {"
+                + "    sink.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY)); return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.ExactTupleQuery", source);
+    }
+
+    static Path boundedQuerySource(Path dir, String mode) {
+        String query = switch (mode) {
+            case "throw" -> "throw new IllegalStateException(\"query failed\");";
+            case "null-result" -> "consumer.accept(null);";
+            case "empty-results" -> "io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); consumer.accept(r);";
+            case "null-row" -> "java.util.List<java.util.Map<String,Object>> rows = new java.util.ArrayList<>(); "
+                    + "rows.add(null); io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); r.setResults(rows); consumer.accept(r);";
+            case "null-field" -> "java.util.Map<String,Object> row = new java.util.LinkedHashMap<>(); "
+                    + "row.put(null, 1); io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); r.setResults(java.util.List.of(row)); "
+                    + "consumer.accept(r);";
+            case "reported-error" -> "io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); "
+                    + "r.setError(new IllegalStateException(\"reported query failure\")); consumer.accept(r);";
+            default -> throw new IllegalArgumentException("unsupported bounded query mode: " + mode);
+        };
+        String register = "functions.supportQueryByAdvanceFilter((context, filter, table, consumer) -> {"
+                + query + "});";
+        String className = "BoundedQuery" + mode.replace('-', '_');
+        return SyntheticJar.compileToJar(dir, "synthetic." + className,
+                source(className, "", register));
     }
 }

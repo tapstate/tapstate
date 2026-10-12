@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
@@ -13,9 +14,16 @@ import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
+import com.hazelcast.jet.core.TopologyChangedException;
+import com.hazelcast.jet.JetException;
+import com.hazelcast.jet.impl.JetServiceBackend;
+import com.hazelcast.instance.impl.HazelcastInstanceProxy;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -34,11 +42,10 @@ import org.junit.jupiter.api.Test;
  * re-plan underneath would have made already, invisibly and without any of them.
  *
  * <p>The second half is the more useful one, and it is written as a standing check on somebody else's
- * behaviour. A run ended by a member leaving and a run ended by a connector giving up arrive here as the
- * same class with no cause behind it; the only thing that differs is text inside the message. So the
- * product does not ask the engine why a run ended -- it asks its own committed membership whether the
- * cluster changed under that run. If this case ever goes red because the two became distinguishable,
- * that is worth knowing: it would mean the question could be asked of the engine after all.
+ * behaviour. Once Jet retires a job's live context, its stored result reconstructs both member loss
+ * and connector failure as the same class with no cause; their text differs. The live completion can
+ * still carry a typed topology failure. The product asks its own committed membership whether the
+ * cluster changed under that run, so that answer does not depend on which result lifetime it observes.
  */
 class ARunEndsWhenAMemberLeavesRatherThanBeingRePlannedTest {
 
@@ -86,23 +93,24 @@ class ARunEndsWhenAMemberLeavesRatherThanBeingRePlannedTest {
     }
 
     @Test
-    @DisplayName("the engine does not say why a run ended in any way that can be branched on")
-    void whyARunEndedIsNotSomethingTheEngineAnswers() {
+    @DisplayName("stored job failures do not preserve a typed distinction between member loss and connector failure")
+    void storedFailuresDoNotPreserveTheTypedReasonARunEnded() {
         Engine onSurvivor = new Engine(first);
         onSurvivor.submit(PIPELINE, foreverDag());
         awaitStatus(JobStatus.RUNNING);
         second.getLifecycleService().terminate();
-        awaitOver();
-        Throwable afterMemberLoss = onSurvivor.failureOf(PIPELINE).orElseThrow();
+        assertThat(awaitOver()).isEqualTo(JobStatus.FAILED);
+        assertThat(onSurvivor.hasLiveJob(PIPELINE)).isFalse();
+        Throwable afterMemberLoss = awaitStoredFailure(onSurvivor, PIPELINE);
 
         Engine ordinary = new Engine(first);
         ordinary.submit("other-pipe", failingDag());
-        awaitOver("other-pipe");
-        Throwable afterAConnectorGaveUp = ordinary.failureOf("other-pipe").orElseThrow();
+        assertThat(awaitOver("other-pipe")).isEqualTo(JobStatus.FAILED);
+        assertThat(ordinary.hasLiveJob("other-pipe")).isFalse();
+        Throwable afterAConnectorGaveUp = awaitStoredFailure(ordinary, "other-pipe");
 
-        assertThat(afterMemberLoss.getClass())
-                .as("same class for both, so nothing here can be told apart by type")
-                .isEqualTo(afterAConnectorGaveUp.getClass());
+        assertThat(afterMemberLoss).isExactlyInstanceOf(JetException.class);
+        assertThat(afterAConnectorGaveUp).isExactlyInstanceOf(JetException.class);
         assertThat(afterMemberLoss.getCause())
                 .as("and no cause behind it either, so nothing can be told apart by walking the chain")
                 .isNull();
@@ -112,7 +120,51 @@ class ARunEndsWhenAMemberLeavesRatherThanBeingRePlannedTest {
                         + "its own committed membership instead of asking the engine")
                 .contains("TopologyChangedException");
         assertThat(String.valueOf(afterAConnectorGaveUp.getMessage()))
+                .contains("IllegalStateException", "the connector gave up")
                 .doesNotContain("TopologyChangedException");
+    }
+
+    @Test
+    void aLiveTopologyFailureIsTypedBeforeItsStoredResultBecomesAMock() {
+        Engine engine = new Engine(first);
+        engine.submit(PIPELINE, foreverDag());
+        awaitStatus(JobStatus.RUNNING);
+        long jobId = first.getJet().getJob(PIPELINE).getId();
+        CompletableFuture<Void> live = jetBackend().getJobCoordinationService()
+                .getMasterContext(jobId).jobContext().jobCompletionFuture();
+        assertThat(live.isDone()).isFalse();
+
+        second.getLifecycleService().terminate();
+
+        assertThat(awaitOver()).isEqualTo(JobStatus.FAILED);
+        assertThat(engine.hasLiveJob(PIPELINE)).isFalse();
+        assertThatThrownBy(() -> live.get(30, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseExactlyInstanceOf(TopologyChangedException.class);
+        Throwable stored = awaitStoredFailure(engine, PIPELINE);
+        assertThat(stored).isExactlyInstanceOf(JetException.class).hasNoCause();
+        assertThat(stored.getMessage()).contains("TopologyChangedException");
+        assertThat(first.getJet().getJob(PIPELINE).getId()).isEqualTo(jobId);
+    }
+
+    /** FAILED can be visible while Jet still holds the typed live completion. */
+    private Throwable awaitStoredFailure(Engine engine, String pipelineId) {
+        long jobId = first.getJet().getJob(pipelineId).getId();
+        JetServiceBackend backend = jetBackend();
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (System.nanoTime() < deadline) {
+            if (backend.getJobCoordinationService().getMasterContext(jobId) == null
+                    && backend.getJobRepository().getJobResult(jobId) != null) {
+                return engine.failureOf(pipelineId).orElseThrow();
+            }
+            sleep(25);
+        }
+        throw new AssertionError("the job's live context was not retired into a stored result");
+    }
+
+    private JetServiceBackend jetBackend() {
+        return ((HazelcastInstanceProxy) first).getOriginal().node.nodeEngine
+                .getService(JetServiceBackend.SERVICE_NAME);
     }
 
     private JobStatus awaitOver() {

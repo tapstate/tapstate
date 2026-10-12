@@ -13,6 +13,7 @@ import io.tapstate.core.sql.JoinKind;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
 import io.tapstate.core.sql.OutputField;
+import io.tapstate.runtime.engine.NodeWidth;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -114,7 +115,7 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInTest {
         upstream.put("c", dag.newVertex("customers_src", Processors.noopP()));
         JoinDag.attach(dag, PLAN, "p", JOIN, List.of("id"), Map.of("c", List.of("id")),
                 source -> List.of(upstream.get(source)), vertex -> 0,
-                JoinStoresBinding.onTheCluster(), DimensionRowDisplacedAlert.NONE);
+                JoinStoresBinding.onTheCluster(), DimensionRowDisplacedAlert.NONE, new NodeWidth(JOIN, 4, 1, null));
         return dag;
     }
 

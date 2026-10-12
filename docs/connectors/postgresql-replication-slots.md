@@ -7,7 +7,7 @@ target: https://tapstate.dev/docs/connectors/postgresql-replication-slots
 # PostgreSQL replication slots
 
 Reading changes from PostgreSQL goes through a **logical replication slot** that the `postgres` connector
-creates on your database the first time a pipeline reads it. Its name starts with `tapdata_cdc_`.
+creates on your database for a pipeline with a change tail. Its name starts with `tapdata_cdc_`.
 PostgreSQL keeps every write-ahead log (WAL) segment the slot has not confirmed, so how far the slot is
 confirmed decides how much log your database holds on to. This page says when Tapstate moves it, what
 holds it back, and when it drops it.
@@ -111,9 +111,8 @@ from it.
   name.
 - Deleting a pipeline does not drop its slot, and neither does anything after that. Clear a pipeline's state
   with `stop <pipeline>` before deleting it if nothing else reads its source.
-- A pipeline that only loads its source (`read_mode: snapshot_only`) still creates a slot when its load
-  starts, reads nothing through it afterwards, and clearing it does not drop that slot yet. Drop it by hand
-  as below once the load is done.
+- A pipeline that only loads its source (`read_mode: snapshot_only`) does not create a replication slot.
+  If an earlier Tapstate version left one behind, drop it by hand as below once nothing is using it.
 - If the source cannot be reached at that moment, or does not answer within ten seconds, the clearing still
   completes, and the server logs a warning, `connector.release-failed`, naming the source and the slot.
   The same applies when the session that read through the slot has not ended yet: PostgreSQL drops only a

@@ -152,6 +152,9 @@ final class ConvergenceDriver {
         // Same for the claims: a pipeline that is gone still has this member named as its driver until the
         // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
         actuation.retain(pipelineIds);
+        // And the rebuilds spent on them, or a pipeline created again under a deleted one's id would start
+        // with whatever the deleted one had left of its budget.
+        converger.retain(pipelineIds);
         publisher.forgetPipelinesOutside(pipelineIds);
         if (sampler != null) {
             sampler.forgetPipelinesOutside(pipelineIds);

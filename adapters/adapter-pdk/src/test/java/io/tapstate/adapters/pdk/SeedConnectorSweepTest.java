@@ -118,7 +118,11 @@ class SeedConnectorSweepTest {
 
         assertThat(outcomes).hasSize(2);
         SeedOutcome.Failed failed = (SeedOutcome.Failed) outcomes.get(0);
-        assertThat(failed.cause()).isInstanceOf(UncheckedIOException.class);
+        assertThat(failed.cause()).isInstanceOfSatisfying(TapstateException.class, error -> {
+            assertThat(error.code()).isEqualTo(ConnectorError.ARTIFACT_UNREADABLE);
+            assertThat(error.args()).containsEntry("artifact", "a-garbage.jar");
+            assertThat(error).hasCauseInstanceOf(java.util.zip.ZipException.class);
+        });
         assertThat(registry.list()).extracting(ConnectorRegistration::connectorId).containsExactly("mysql");
     }
 
