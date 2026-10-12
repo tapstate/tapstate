@@ -237,6 +237,53 @@ class MongoArtifactStoreIT {
     }
 
     @Test
+    void membersCreatingTheSameManagedSourceAtOnceSeeItCreatedExactlyOnce() throws Exception {
+        String databaseName = "concurrent_managed_create";
+        int members = 6;
+        List<MongoClient> clients = new ArrayList<>();
+        ExecutorService workers = Executors.newFixedThreadPool(members);
+        try {
+            for (int member = 0; member < members; member++) {
+                clients.add(MongoClients.create(REPLICA_SET.getReplicaSetUrl()));
+            }
+            var database = clients.getFirst().getDatabase(databaseName);
+            database.drop();
+            new SourceConfigKeyringStore(clients.getFirst(), database).loadOrCreateCipher();
+            List<MongoArtifactStore> stores = new ArrayList<>();
+            for (MongoClient client : clients) {
+                var own = client.getDatabase(databaseName);
+                SourceConfigKeyringHandle keys = new SourceConfigKeyringHandle(new SourceConfigKeyringStore(client, own));
+                assertThat(keys.requiresWriteFence()).isTrue();
+                stores.add(new MongoArtifactStore(client, SystemCollections.ARTIFACTS.on(own), keys));
+            }
+            for (int round = 0; round < 10; round++) {
+                Resource source = PARSER.parse(ORDERS.replace("id: orders", "id: views_" + round));
+                CountDownLatch start = new CountDownLatch(1);
+                List<Future<ArtifactMutation>> outcomes = new ArrayList<>();
+                for (MongoArtifactStore store : stores) {
+                    outcomes.add(workers.submit(() -> {
+                        start.await();
+                        return store.create(source);
+                    }));
+                }
+                start.countDown();
+                List<ArtifactMutation> results = new ArrayList<>();
+                for (Future<ArtifactMutation> outcome : outcomes) {
+                    results.add(outcome.get(60, TimeUnit.SECONDS));
+                }
+                assertThat(results).as("round %d", round).hasSize(members)
+                        .containsOnly(ArtifactMutation.CREATED, ArtifactMutation.ALREADY_EXISTS)
+                        .containsOnlyOnce(ArtifactMutation.CREATED);
+                assertThat(stores.getFirst().get(source.id())).contains(source);
+            }
+        } finally {
+            workers.shutdownNow();
+            assertThat(workers.awaitTermination(20, TimeUnit.SECONDS)).isTrue();
+            clients.forEach(MongoClient::close);
+        }
+    }
+
+    @Test
     void aManagedSourceRetryPreservesAnOrderedPipelineCreateThenReplace() throws Exception {
         managedSourceRetryPreservesAnOrderedPipelineBirth(true);
     }

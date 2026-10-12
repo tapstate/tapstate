@@ -27,6 +27,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -36,6 +37,7 @@ import java.util.Set;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
@@ -62,6 +64,8 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
+    /** How long a fenced Source write keeps retrying a transaction that lost a write conflict. */
+    private static final Duration CONFLICT_RETRY_WINDOW = Duration.ofSeconds(2);
     private static final TransactionOptions DURABLE_WRITE = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
 
@@ -183,14 +187,31 @@ public final class MongoArtifactStore implements ArtifactStore {
     }
 
     private static <T> T retryTransaction(boolean fenced, Supplier<T> transaction) {
-        for (int attempt = 0; attempt < 3; attempt++) {
+        long started = System.nanoTime();
+        int keyringNotReady = 0;
+        int conflicts = 0;
+        while (true) {
             try {
                 return transaction.get();
             } catch (RuntimeException error) {
-                if (!fenced || attempt == 2 || !retryableKeyringWrite(error)) throw error;
+                if (!fenced) throw error;
+                if (!transientConflict(error)) {
+                    if (!keyringNotReady(error) || ++keyringNotReady == 3) throw error;
+                    continue;
+                }
+                // Every fenced Source write touches the one keyring record, so members writing even
+                // different Sources at once conflict. Give the competing transaction time to commit.
+                long remaining = CONFLICT_RETRY_WINDOW.toNanos() - (System.nanoTime() - started);
+                if (remaining <= 0 || Thread.currentThread().isInterrupted()) throw error;
+                long delay = TimeUnit.MILLISECONDS.toNanos(Math.min(50L, 5L << Math.min(conflicts++, 4)));
+                try {
+                    TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw error;
+                }
             }
         }
-        throw new IllegalStateException("transaction attempts must return or throw");
     }
 
     /** Rewrites only the observed Source envelope, preserving all unrelated raw document fields. */
@@ -230,10 +251,11 @@ public final class MongoArtifactStore implements ArtifactStore {
         return resource instanceof SourceResource && ciphers.requiresWriteFence();
     }
 
-    private static boolean retryableKeyringWrite(RuntimeException error) {
-        if (error instanceof TapstateException coded) {
-            return coded.code() == StoreError.SOURCE_CONFIG_KEYRING_NOT_READY;
-        }
+    private static boolean keyringNotReady(RuntimeException error) {
+        return error instanceof TapstateException coded && coded.code() == StoreError.SOURCE_CONFIG_KEYRING_NOT_READY;
+    }
+
+    private static boolean transientConflict(RuntimeException error) {
         return error instanceof MongoException driver && driver.hasErrorLabel("TransientTransactionError")
                 && !driver.hasErrorLabel("UnknownTransactionCommitResult");
     }
