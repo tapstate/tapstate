@@ -85,9 +85,20 @@ final class ControlPlane {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
     private String credential;
+    /** A login's bearer token expires after fifteen minutes; a long benchmark fork outlives one. */
+    private static final Duration CREDENTIAL_RENEWAL_AGE = Duration.ofMinutes(10);
+    private final java.util.function.LongSupplier nanoTime;
+    private String loginUsername;
+    private String loginPassword;
+    private long credentialIssuedAtNanos;
 
     ControlPlane(URI baseUrl) {
+        this(baseUrl, System::nanoTime);
+    }
+
+    ControlPlane(URI baseUrl, java.util.function.LongSupplier nanoTime) {
         this.baseUrl = baseUrl;
+        this.nanoTime = nanoTime;
     }
 
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
@@ -150,6 +161,9 @@ final class ControlPlane {
             throw new AssertionError("login returned no token: " + login.body());
         }
         credential = token;
+        loginUsername = username;
+        loginPassword = password;
+        credentialIssuedAtNanos = nanoTime.getAsLong();
     }
 
     /**
@@ -2331,9 +2345,12 @@ final class ControlPlane {
         return requireCredential();
     }
 
-    private String requireCredential() {
+    private synchronized String requireCredential() {
         if (credential == null) {
             throw new IllegalStateException("no credential: log in before driving an authenticated verb");
+        }
+        if (loginUsername != null && nanoTime.getAsLong() - credentialIssuedAtNanos >= CREDENTIAL_RENEWAL_AGE.toNanos()) {
+            login(loginUsername, loginPassword);
         }
         return credential;
     }
