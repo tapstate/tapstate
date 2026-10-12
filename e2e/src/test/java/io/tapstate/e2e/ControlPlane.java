@@ -788,6 +788,16 @@ final class ControlPlane {
         return asObject(map);
     }
 
+    /** Reads the aggregate lifecycle projection for a known pipeline draft. */
+    Map<String, Object> pipelineStatus(String id) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(id) + "/status"));
+        expect(response, 200, "read pipeline status " + id);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("pipeline status was not an object: " + response.body());
+        }
+        return asObject(map);
+    }
+
     /** A stored Source as the API projects it, including its secret-free configuration. */
     Map<String, Object> source(String sourceId) {
         HttpResponse<String> response = send(authedGet("/api/sources/" + urlSegment(sourceId)));

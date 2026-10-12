@@ -54,6 +54,12 @@ class PipelineDraftAuthoringRoundTripIT {
                     .containsEntry("description", "Persisted independently of compiled DSL")
                     .containsEntry("revision", 1L);
             assertThat(saved.get("graph")).isEqualTo(graph);
+
+            Map<String, Object> status = control.pipelineStatus(PIPELINE_ID);
+            assertThat(status).containsEntry("state", "NEW")
+                    .containsEntry("displayState", "DRAFT")
+                    .containsEntry("hasArtifact", false)
+                    .doesNotContainKey("observedState");
         }
     }
 }
