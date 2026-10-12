@@ -182,6 +182,7 @@ final class PipelineBenchmarkReturnLiveRun {
     }
     private static Map<String, Object> summary(BenchmarkReturnIntervalComparison.Summary summary) {
         return Map.of("throughput", statistics(summary.throughput()), "p99", statistics(summary.p99()),
+                "appCpuNanosPerCohortRow", statistics(summary.cpuNanosPerRow()),
                 "maximumPeakHeapBytes", summary.peakHeapBytes(), "maximumPeakRssBytes", summary.peakRssBytes());
     }
     private static Map<String, Object> statistics(BenchmarkReturnIntervalComparison.Statistics value) {

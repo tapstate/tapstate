@@ -40,6 +40,8 @@ final class BenchmarkReturnWorkBudgetSourceTails {
                 "original pilot row or seed scalars differ");
         scalar(workload.id(), 9); scalar(workload.database(), 8);
         String[] ids; String[] stages; long[] outputs; int[] sql; int[] perBatch; int[] coverage;
+        // The fixed sub-capacity offer of each measured phase; unmeasured phases issue without a cadence.
+        long[] cadence;
         String database; int pipelines, chains, targets, setup;
         switch (workload.id()) {
             case "copy" -> {
@@ -47,6 +49,7 @@ final class BenchmarkReturnWorkBudgetSourceTails {
                 stages = new String[]{"SNAPSHOT", "WARM_UP", "CDC_UPDATE", "TERMINAL"};
                 outputs = new long[]{PILOT_ROWS, 128, PILOT_ROWS, 1};
                 sql = new int[]{0, 1, 960, 1}; perBatch = new int[]{1, 1, 1, 1}; coverage = new int[]{1, 1, 1, 1};
+                cadence = new long[]{0, 0, 80_000_000, 0};
                 database = "MYSQL"; pipelines = 1; chains = 1; targets = 1; setup = 193;
             }
             case "stateless" -> {
@@ -55,6 +58,7 @@ final class BenchmarkReturnWorkBudgetSourceTails {
                 // Fixed preflight2 and boundary258 both lie in the protected even first-quarter domain.
                 outputs = new long[]{PILOT_ROWS, 256, 23996, 23996, PILOT_ROWS, 2};
                 sql = new int[]{0, 1, 240, 240, 960, 1}; perBatch = new int[]{1, 1, 1, 1, 1, 1}; coverage = new int[]{1, 1, 1, 1, 1, 1};
+                cadence = new long[]{0, 0, 0, 0, 20_000_000, 0};
                 database = "POSTGRES"; pipelines = 1; chains = 1; targets = 1; setup = 194;
             }
             case "stateful" -> {
@@ -62,6 +66,7 @@ final class BenchmarkReturnWorkBudgetSourceTails {
                 stages = new String[]{"SNAPSHOT", "WARM_UP", "HOT_STATE", "COLD_READ", "CDC_UPDATE", "TERMINAL"};
                 outputs = new long[]{2 * PILOT_ROWS, 888, 64, PILOT_ROWS, 2 * PILOT_ROWS, 2};
                 sql = new int[]{0, 4, 1, 960, 1920, 4}; perBatch = new int[]{1, 1, 1, 1, 2, 1}; coverage = new int[]{4, 4, 1, 1, 2, 4};
+                cadence = new long[]{0, 0, 0, 200_000_000, 200_000_000, 0};
                 database = "MYSQL"; pipelines = 2; chains = 4; targets = 2; setup = 581;
             }
             default -> throw new AssertionError("source tail workload selector differs");
@@ -80,7 +85,7 @@ final class BenchmarkReturnWorkBudgetSourceTails {
             require(ids[index].equals(phase.id()) && stages[index].equals(phase.stage()) && phase.measured() == selected
                             && phase.logicalOutputs() == outputs[index] && phase.statements() == sql[index]
                             && phase.statementsPerBatch() == perBatch[index] && phase.batches() == sql[index] / perBatch[index]
-                            && phase.cadenceNanos() == (selected ? 1_000_000 : 0)
+                            && phase.cadenceNanos() == cadence[index]
                             && phase.targets().size() == targets && phase.logicalCoverage().size() == coverage[index],
                     "original phase scalar recipe differs");
             for (var entry : phase.logicalCoverage().entrySet()) {

@@ -357,7 +357,7 @@ final class BenchmarkWorkloadDefinitions {
                         coverage(orders, "warm-up", 128), copyTarget(1, rows)),
                 pacedPhase("cdc-update", Stage.CDC_UPDATE, rows,
                         updates(COPY_TABLE, "amount = amount + 1", 1, rows, 100, ""),
-                        1, coverage(orders, "cdc-update", rows), copyTarget(2, rows)),
+                        1, offerInterval(rows, COPY, "cdc-update"), coverage(orders, "cdc-update", rows), copyTarget(2, rows)),
                 phase("terminal", Stage.TERMINAL, false, 1,
                         List.of("INSERT INTO " + COPY_TABLE
                                 + " (id,amount,payload,marker) VALUES (900001,7,'terminal','copy-orders-terminal')"),
@@ -418,7 +418,8 @@ final class BenchmarkWorkloadDefinitions {
                 pacedPhase("cdc-update", Stage.CDC_UPDATE, rows,
                         updates(STATELESS_TABLE, "qty = qty + 1", 1, rows, 100,
                                 " AND id % 2 = 0"),
-                        1, coverage(orders, "cdc-update", rows / 2), statelessTarget(2, rows)),
+                        1, offerInterval(rows, STATELESS, "cdc-update"), coverage(orders, "cdc-update", rows / 2),
+                        statelessTarget(2, rows)),
                 phase("terminal", Stage.TERMINAL, false, 2,
                         List.of("INSERT INTO " + STATELESS_TABLE
                                 + " (id,qty,region,items) VALUES"
@@ -516,9 +517,9 @@ final class BenchmarkWorkloadDefinitions {
                         statefulTargets(1, rows)),
                 phase("hot-state", Stage.HOT_STATE, false, 64, hot,
                         coverage(nestItems, "hot-state", 64), statefulTargets(2, rows)),
-                pacedPhase("cold-read", Stage.COLD_READ, rows, cold, 1,
+                pacedPhase("cold-read", Stage.COLD_READ, rows, cold, 1, offerInterval(rows, STATEFUL, "cold-read"),
                         coverage(nestItems, "cold-read", rows), statefulTargets(3, rows)),
-                pacedPhase("cdc-update", Stage.CDC_UPDATE, 2L * rows, update, 2,
+                pacedPhase("cdc-update", Stage.CDC_UPDATE, 2L * rows, update, 2, offerInterval(rows, STATEFUL, "cdc-update"),
                         coverage(Map.of(joinOrders, (long) rows,
                                 nestItems, (long) rows), "cdc-update"), statefulTargets(4, rows)),
                 phase("terminal", Stage.TERMINAL, false, 2, terminal,
@@ -685,18 +686,33 @@ final class BenchmarkWorkloadDefinitions {
     }
 
     private static Phase pacedPhase(String id, Stage stage, long logicalOutputChanges,
-                                   List<String> sql, int statementsPerBatch,
+                                   List<String> sql, int statementsPerBatch, Duration interval,
                                    Map<String, Long> coverage, TargetExpectation target) {
-        // Keep source issuance ahead of the data plane; actual SQL completion remains measured per batch.
-        return new Phase(id, stage, true, logicalOutputChanges, sql, statementsPerBatch,
-                Duration.ofMillis(1), coverage, List.of(target));
+        return pacedPhase(id, stage, logicalOutputChanges, sql, statementsPerBatch, interval, coverage, List.of(target));
     }
 
     private static Phase pacedPhase(String id, Stage stage, long logicalOutputChanges,
-                                   List<String> sql, int statementsPerBatch,
+                                   List<String> sql, int statementsPerBatch, Duration interval,
                                    Map<String, Long> coverage, List<TargetExpectation> targets) {
-        return new Phase(id, stage, true, logicalOutputChanges, sql, statementsPerBatch,
-                Duration.ofMillis(1), coverage, targets);
+        return new Phase(id, stage, true, logicalOutputChanges, sql, statementsPerBatch, interval, coverage, targets);
+    }
+
+    /**
+     * The measured offer. The correctness profile keeps source issuance ahead of the data plane; the
+     * steady pilot offers a fixed rate below the slowest observed completion rate, so completions track
+     * issuance at a constant load instead of draining a backlog that grows during the window.
+     */
+    private static Duration offerInterval(int rows, String workload, String phase) {
+        return rows == STEADY_PILOT_ROWS ? pilotOfferInterval(workload, phase) : Duration.ofMillis(1);
+    }
+
+    static Duration pilotOfferInterval(String workload, String phase) {
+        return switch (workload + "/" + phase) {
+            case COPY + "/cdc-update" -> Duration.ofMillis(80);
+            case STATELESS + "/cdc-update" -> Duration.ofMillis(20);
+            case STATEFUL + "/cold-read", STATEFUL + "/cdc-update" -> Duration.ofMillis(200);
+            default -> throw new IllegalArgumentException("no fixed pilot offer for " + workload + "/" + phase);
+        };
     }
 
     private static Map<String, Long> coverage(SourceChain chain, String phase, long events) {

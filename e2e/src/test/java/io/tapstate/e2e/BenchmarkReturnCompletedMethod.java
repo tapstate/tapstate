@@ -60,9 +60,10 @@ final class BenchmarkReturnCompletedMethod {
         admitted.requireProductionAuthority();
         require(io.tapstate.core.common.JsonReader.parse(JsonWriter.write(admitted.evidence())).equals(method),
                 "retained method admission differs from independently acquired native/source authority");
-        var recomputed = verifyPhases(measurement, workload, admitted,
+        var checked = verifyPhases(measurement, workload, admitted,
                 new BenchmarkCausalClock.Identity(registration.root().pid(), registration.root().jvmStartTimeMillis()),
                 registration.producer().runtime());
+        var recomputed = checked.metrics();
         var count = object(interval.get("completedRows"));
         var duration = object(interval.get("durationNanos"));
         long countLower = number(count, "lower"), countUpper = number(count, "upper");
@@ -108,19 +109,28 @@ final class BenchmarkReturnCompletedMethod {
         proof.put("sourceUpperIsActualWork", false);
         proof.put("intervalCorrespondence", "INDEPENDENT_RAW_CAPTURE_SOURCE_NATIVE_HELLO_COMMON_WINDOW_AND_FULL_COHORT_POOL_RECOMPUTED");
         proof.put("acceptanceScope", "STRUCTURAL_ENTERED_SOURCE_WORK_AND_ORIGINAL_NOMINAL_TIME_INTERVALS");
+        proof.put("offeredLoad", checked.offeredLoad());
+        proof.put("appCpuNanosPerCohortRow", Map.of("lower", BenchmarkReturnForkBridge.decimal(checked.cpuPerRow().lower()),
+                "upper", BenchmarkReturnForkBridge.decimal(checked.cpuPerRow().upper()),
+                "scope", "APP_PROCESS_CPU_OVER_EACH_PHASE_COMMON_RETURN_WINDOW_DIVIDED_BY_COHORT_ROWS"));
         BenchmarkReturnProducerOrigins.FLAGS.forEach(flag -> proof.put(flag, false));
         return new CompletedFork(id, workload.id(), arm, Math.toIntExact(ordinal), correctness, rate,
-                new BenchmarkCausalClock.Interval(p99Lower, p99Upper), Math.toIntExact(cohort), peakHeap, peakRss,
+                new BenchmarkCausalClock.Interval(p99Lower, p99Upper), checked.cpuPerRow(), Math.toIntExact(cohort), peakHeap, peakRss,
                 countLower, countUpper, durationLower, durationUpper, expectedPhases, Map.copyOf(proof), acquired.application());
     }
 
-    private static BenchmarkReturnIntervalMetrics.Fork verifyPhases(Map<String, Object> measurement,
+    private record CheckedPhases(BenchmarkReturnIntervalMetrics.Fork metrics, BenchmarkReturnIntervalComparison.Bounds cpuPerRow,
+                                 List<Map<String, Object>> offeredLoad) { }
+
+    private static CheckedPhases verifyPhases(Map<String, Object> measurement,
             BenchmarkWorkloadDefinitions.Workload workload, BenchmarkReturnMethodAdmission.AdmittedMethod admitted,
             BenchmarkCausalClock.Identity root, BenchmarkCausalClock.Identity producer) {
         var expected = workload.phases().stream().filter(BenchmarkWorkloadDefinitions.Phase::measured).toList();
         var windows = list(measurement.get("measuredPhaseWindows"), 6);
         require(windows.size() == expected.size(), "complete acquired measured phase windows differ");
         var phases = new ArrayList<BenchmarkReturnIntervalMetrics.Phase>();
+        var cpu = new ArrayList<BenchmarkReturnCpuPerRow.Phase>();
+        var offered = new ArrayList<Map<String, Object>>();
         for (int i = 0; i < expected.size(); i++) {
             var phase = expected.get(i); var window = object(windows.get(i));
             require(phase.id().equals(window.get("id")), "acquired measured phase order differs");
@@ -159,8 +169,14 @@ final class BenchmarkReturnCompletedMethod {
             for (String field : List.of("captureEpoch", "frameCount", "rawPageBytes", "pageCount", "callCount", "fullRows", "fixedCohortRows"))
                 require(number(verified.evidence(), field) == number(retained, field), "retained capture totals differ: " + field);
             phases.add(verified.intervalMetrics());
+            var load = BenchmarkReturnOfferedLoad.evidence(workload, phase, batches,
+                    (Long) actualCommon.get("durationNanosLower"), (Long) actualCommon.get("durationNanosUpper"));
+            require("PASS".equals(load.get("state")), "measured phase did not sustain its fixed offer: " + phase.id() + " " + load.get("reason"));
+            offered.add(Map.of("phase", phase.id(), "evidence", load));
+            cpu.add(BenchmarkReturnCpuPerRow.phase(object(window.get("resources")), verified.deliveries(),
+                    object(retained.get("resourceBounds"))));
         }
-        return BenchmarkReturnIntervalMetrics.aggregate(phases);
+        return new CheckedPhases(BenchmarkReturnIntervalMetrics.aggregate(phases), BenchmarkReturnCpuPerRow.perRow(cpu), List.copyOf(offered));
     }
 
     static void requireMatchingClockContexts(Map<String, Object> retained, Map<String, Object> reconstructed) {
@@ -244,17 +260,18 @@ final class BenchmarkReturnCompletedMethod {
         private final BenchmarkAckOracle.Fork correctness;
         private final BenchmarkReturnIntervalComparison.Bounds rate;
         private final BenchmarkCausalClock.Interval p99;
+        private final BenchmarkReturnIntervalComparison.Bounds cpuPerRow;
         private final long heap, rss, countLower, countUpper, durationLower, durationUpper;
         private final List<String> phases;
         private final Map<String, Object> proof;
         private final BenchmarkReturnWorkBudgetBindings.FileFact application;
         private CompletedFork(String id, String workload, PipelineBenchmarkComparison.Arm arm, int ordinal,
                 BenchmarkAckOracle.Fork correctness, BenchmarkReturnIntervalComparison.Bounds rate,
-                BenchmarkCausalClock.Interval p99, int cohort, long heap, long rss,
+                BenchmarkCausalClock.Interval p99, BenchmarkReturnIntervalComparison.Bounds cpuPerRow, int cohort, long heap, long rss,
                 long countLower, long countUpper, long durationLower, long durationUpper,
                 List<String> phases, Map<String, Object> proof, BenchmarkReturnWorkBudgetBindings.FileFact application) {
             this.id = id; this.workload = workload; this.arm = arm; this.ordinal = ordinal;
-            this.correctness = correctness; this.rate = rate; this.p99 = p99; this.cohort = cohort;
+            this.correctness = correctness; this.rate = rate; this.p99 = p99; this.cpuPerRow = cpuPerRow; this.cohort = cohort;
             this.heap = heap; this.rss = rss; this.countLower = countLower; this.countUpper = countUpper;
             this.durationLower = durationLower; this.durationUpper = durationUpper; this.phases = List.copyOf(phases); this.proof = proof;
             this.application = application;
@@ -270,7 +287,7 @@ final class BenchmarkReturnCompletedMethod {
             require(p99.lowerNanos() > 0, "retained p99 enclosure is not positive for relative comparison");
             return new BenchmarkReturnIntervalComparison.Fork(arm, rate,
                     new BenchmarkReturnIntervalComparison.Bounds(BigDecimal.valueOf(p99.lowerNanos()), BigDecimal.valueOf(p99.upperNanos())),
-                    cohort, heap, rss);
+                    cpuPerRow, cohort, heap, rss);
         }
         Map<String, Object> evidence() {
             return Map.ofEntries(Map.entry("id", id), Map.entry("workload", workload), Map.entry("arm", arm.name()),

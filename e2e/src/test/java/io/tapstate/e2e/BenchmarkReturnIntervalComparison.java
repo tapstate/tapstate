@@ -35,30 +35,40 @@ final class BenchmarkReturnIntervalComparison {
         }
     }
 
-    /** P99 already covers all original measured-phase cohort rows in this fork. */
-    record Fork(PipelineBenchmarkComparison.Arm arm, Bounds throughput, Bounds p99,
+    /**
+     * P99 already covers all original measured-phase cohort rows in this fork. The APP CPU enclosure is
+     * process CPU over the fixed cohort's common return window divided by the cohort row count; a projection
+     * without it cannot be evaluated.
+     */
+    record Fork(PipelineBenchmarkComparison.Arm arm, Bounds throughput, Bounds p99, Bounds cpuNanosPerRow,
                 long completedCohortRows, long peakHeapBytes, long peakRssBytes) {
         Fork {
             var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.COMPARISON_INPUT);
             try {
             require(arm != null && throughput != null && p99 != null && completedCohortRows >= 10000
                     && throughput.lower().signum() > 0 && p99.lower().signum() > 0
+                    && (cpuNanosPerRow == null || cpuNanosPerRow.upper().signum() > 0)
                     && peakHeapBytes > 0 && peakRssBytes > 0, "fork metric or memory input is incomplete");
             BenchmarkReturnWorkBudget.done(ticket);
             } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
         }
+        Fork(PipelineBenchmarkComparison.Arm arm, Bounds throughput, Bounds p99,
+                long completedCohortRows, long peakHeapBytes, long peakRssBytes) {
+            this(arm, throughput, p99, null, completedCohortRows, peakHeapBytes, peakRssBytes);
+        }
     }
 
     record Statistics(Bounds median, Bounds relativeMad) { }
-    record Summary(Statistics throughput, Statistics p99, long peakHeapBytes, long peakRssBytes) { }
+    record Summary(Statistics throughput, Statistics p99, Statistics cpuNanosPerRow, long peakHeapBytes, long peakRssBytes) { }
     record Pair(Summary baseline, Summary candidate) { }
     record Evaluation(Map<PipelineBenchmarkComparison.Workload, Pair> workloads,
                       List<String> failures, List<String> unresolved) {
         Evaluation {
             var ticket = BenchmarkReturnComponentSourceWork.begin(BenchmarkReturnComponentSourceWork.Kind.COMPARISON_INPUT);
             try {
-                require(workloads != null && workloads.size() <= 3 && failures != null && failures.size() <= 24
-                        && unresolved != null && unresolved.size() <= 24, "evaluation projection exceeds prior roster");
+                // Eleven named gates per workload: six noise, three regression and two memory checks.
+                require(workloads != null && workloads.size() <= 3 && failures != null && failures.size() <= 33
+                        && unresolved != null && unresolved.size() <= 33, "evaluation projection exceeds prior roster");
                 workloads = Map.copyOf(workloads); failures = List.copyOf(failures); unresolved = List.copyOf(unresolved);
                 BenchmarkReturnWorkBudget.done(ticket);
             } catch (RuntimeException | Error primary) { BenchmarkReturnWorkBudget.failed(ticket, primary); throw primary; }
@@ -84,9 +94,11 @@ final class BenchmarkReturnIntervalComparison {
             for (int index = 0; index < order.size(); index++) {
                 var fork = forks.get(index);
                 require(fork != null && fork.arm() == order.get(index), "fork order or arm differs");
+                require(fork.cpuNanosPerRow() != null, "every fork needs its APP CPU per cohort row enclosure");
                 (fork.arm() == PipelineBenchmarkComparison.Arm.A ? baseline : candidate).add(fork);
             }
             var a = summary(baseline); var b = summary(candidate); summaries.put(workload, new Pair(a, b));
+            cpuChecks(workload, a, b, failures, unresolved);
             if (forks.stream().allMatch(fork -> point(fork.throughput()) && point(fork.p99()))) {
                 // Preserve the original IEEE-754 operation order at point inputs, including its
                 // tolerance boundary. Exact decimal algebra is not an equivalent legacy bridge.
@@ -138,6 +150,7 @@ final class BenchmarkReturnIntervalComparison {
         require(forks.size() == 5, "exactly five forks per arm are required");
         return new Summary(floatingStatistics(forks.stream().map(Fork::throughput).toList()),
                 floatingStatistics(forks.stream().map(Fork::p99).toList()),
+                floatingStatistics(forks.stream().map(Fork::cpuNanosPerRow).toList()),
                 forks.stream().mapToLong(Fork::peakHeapBytes).max().orElseThrow(),
                 forks.stream().mapToLong(Fork::peakRssBytes).max().orElseThrow());
     }
@@ -200,6 +213,20 @@ final class BenchmarkReturnIntervalComparison {
         if (b.p99().median().lower().doubleValue() / a.p99().median().lower().doubleValue() - 1 > 0.05 + LEGACY_TOLERANCE)
             failures.add(workload + " delivery p99 regresses more than 5%");
         memoryChecks(workload, a, b, failures);
+    }
+    /** At a fixed offered load the observability cost is the APP CPU spent per cohort row. */
+    private static void cpuChecks(PipelineBenchmarkComparison.Workload workload, Summary a, Summary b,
+            List<String> failures, List<String> unresolved) {
+        for (var arm : PipelineBenchmarkComparison.Arm.values()) {
+            var noise = (arm == PipelineBenchmarkComparison.Arm.A ? a : b).cpuNanosPerRow().relativeMad();
+            fpAtMost(workload + " " + arm + " APP CPU per cohort row noise exceeds 3%", noise.lower().doubleValue(),
+                    noise.upper().doubleValue(), 0.03 + LEGACY_TOLERANCE, failures, unresolved);
+        }
+        var ac = a.cpuNanosPerRow().median(); var bc = b.cpuNanosPerRow().median();
+        double growthLower = Math.nextDown(Math.nextDown(bc.lower().doubleValue() / ac.upper().doubleValue()) - 1);
+        double growthUpper = Math.nextUp(Math.nextUp(bc.upper().doubleValue() / ac.lower().doubleValue()) - 1);
+        fpAtMost(workload + " APP CPU per cohort row regresses more than 5%", growthLower, growthUpper,
+                0.05 + LEGACY_TOLERANCE, failures, unresolved);
     }
     private static void memoryChecks(PipelineBenchmarkComparison.Workload workload, Summary a, Summary b, List<String> failures) {
         if ((double) b.peakHeapBytes() / a.peakHeapBytes() - 1 > 0.10 + LEGACY_TOLERANCE)

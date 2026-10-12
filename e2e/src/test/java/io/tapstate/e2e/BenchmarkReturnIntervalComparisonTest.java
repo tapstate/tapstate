@@ -16,7 +16,7 @@ class BenchmarkReturnIntervalComparisonTest {
                         new BenchmarkReturnIntervalComparison.Fork(fork.arm(), fork.arm() == PipelineBenchmarkComparison.Arm.A
                                 ? bounds(1000, 1000) : new BenchmarkReturnIntervalComparison.Bounds(
                                         new BigDecimal("949.999999999"), new BigDecimal("950")),
-                                bounds(1000, 1000), 10000, 1000, 1000)).toList());
+                                bounds(1000, 1000), CPU, 10000, 1000, 1000)).toList());
         var result = BenchmarkReturnIntervalComparison.evaluateObservabilityCost(input);
         assertThat(result.state()).isEqualTo(BenchmarkReturnIntervalComparison.State.UNKNOWN);
         assertThat(result.unresolved()).contains("STATELESS throughput regresses more than 5%");
@@ -78,7 +78,7 @@ class BenchmarkReturnIntervalComparisonTest {
     @Test void uncertain_noise_and_regression_remain_unknown() {
         var input = runs(0); var changed = input.get(PipelineBenchmarkComparison.Workload.STATELESS).stream()
                 .map(fork -> new BenchmarkReturnIntervalComparison.Fork(fork.arm(), fork.arm() == PipelineBenchmarkComparison.Arm.A
-                        ? bounds(990, 1010) : bounds(930, 960), bounds(990, 1010), 10000, 1000, 1000)).toList();
+                        ? bounds(990, 1010) : bounds(930, 960), bounds(990, 1010), CPU, 10000, 1000, 1000)).toList();
         input.put(PipelineBenchmarkComparison.Workload.STATELESS, changed);
         var result = BenchmarkReturnIntervalComparison.evaluateObservabilityCost(input);
         assertThat(result.state()).isEqualTo(BenchmarkReturnIntervalComparison.State.UNKNOWN);
@@ -90,7 +90,7 @@ class BenchmarkReturnIntervalComparisonTest {
         var input = runs(0); input.put(PipelineBenchmarkComparison.Workload.COPY,
                 input.get(PipelineBenchmarkComparison.Workload.COPY).stream().map(fork -> new BenchmarkReturnIntervalComparison.Fork(
                         fork.arm(), fork.arm() == PipelineBenchmarkComparison.Arm.A ? bounds(990, 1010) : bounds(800, 900),
-                        bounds(990, 1010), 10000, 1000, 1000)).toList());
+                        bounds(990, 1010), CPU, 10000, 1000, 1000)).toList());
         var result = BenchmarkReturnIntervalComparison.evaluateObservabilityCost(input);
         assertThat(result.state()).isEqualTo(BenchmarkReturnIntervalComparison.State.FAIL);
         assertThat(result.failures()).contains("COPY throughput regresses more than 5%");
@@ -115,6 +115,58 @@ class BenchmarkReturnIntervalComparisonTest {
                 bounds(1, 2), bounds(1, 2), 9999, 100, 100)).hasMessageContaining("incomplete");
     }
 
+    @Test void cpu_per_cohort_row_growth_beyond_five_percent_fails_at_the_same_fixed_offer() {
+        var input = runs(0); input.put(PipelineBenchmarkComparison.Workload.STATEFUL,
+                input.get(PipelineBenchmarkComparison.Workload.STATEFUL).stream().map(fork -> withCpu(fork,
+                        fork.arm() == PipelineBenchmarkComparison.Arm.A ? bounds(1000, 1004) : bounds(1060, 1064))).toList());
+        var result = BenchmarkReturnIntervalComparison.evaluateObservabilityCost(input);
+        assertThat(result.state()).isEqualTo(BenchmarkReturnIntervalComparison.State.FAIL);
+        assertThat(result.failures()).containsExactly("STATEFUL APP CPU per cohort row regresses more than 5%");
+        assertThat(result.unresolved()).isEmpty();
+    }
+
+    @Test void cpu_per_cohort_row_within_five_percent_passes_and_an_enclosure_reaching_the_limit_stays_unknown() {
+        var passing = runs(0); passing.put(PipelineBenchmarkComparison.Workload.COPY,
+                passing.get(PipelineBenchmarkComparison.Workload.COPY).stream().map(fork -> withCpu(fork,
+                        fork.arm() == PipelineBenchmarkComparison.Arm.A ? bounds(1000, 1004) : bounds(1040, 1044))).toList());
+        assertThat(BenchmarkReturnIntervalComparison.evaluateObservabilityCost(passing).state())
+                .isEqualTo(BenchmarkReturnIntervalComparison.State.PASS);
+        var straddling = runs(0); straddling.put(PipelineBenchmarkComparison.Workload.COPY,
+                straddling.get(PipelineBenchmarkComparison.Workload.COPY).stream().map(fork -> withCpu(fork,
+                        fork.arm() == PipelineBenchmarkComparison.Arm.A ? bounds(1000, 1004) : bounds(1040, 1060))).toList());
+        var result = BenchmarkReturnIntervalComparison.evaluateObservabilityCost(straddling);
+        assertThat(result.state()).isEqualTo(BenchmarkReturnIntervalComparison.State.UNKNOWN);
+        assertThat(result.unresolved()).containsExactly("COPY APP CPU per cohort row regresses more than 5%");
+    }
+
+    @Test void cpu_per_cohort_row_noise_beyond_three_percent_fails_the_arm() {
+        var input = runs(0); var rows = new ArrayList<BenchmarkReturnIntervalComparison.Fork>();
+        long[] spread = {900, 950, 1000, 1050, 1100}; int b = 0;
+        for (var fork : input.get(PipelineBenchmarkComparison.Workload.STATELESS)) {
+            rows.add(fork.arm() == PipelineBenchmarkComparison.Arm.B ? withCpu(fork, bounds(spread[b], spread[b++])) : fork);
+        }
+        input.put(PipelineBenchmarkComparison.Workload.STATELESS, rows);
+        var result = BenchmarkReturnIntervalComparison.evaluateObservabilityCost(input);
+        assertThat(result.failures()).containsExactly("STATELESS B APP CPU per cohort row noise exceeds 3%");
+    }
+
+    @Test void a_fork_without_its_cpu_enclosure_cannot_be_evaluated() {
+        var input = runs(0); var rows = new ArrayList<>(input.get(PipelineBenchmarkComparison.Workload.COPY));
+        var first = rows.getFirst();
+        rows.set(0, new BenchmarkReturnIntervalComparison.Fork(first.arm(), first.throughput(), first.p99(),
+                first.completedCohortRows(), first.peakHeapBytes(), first.peakRssBytes()));
+        input.put(PipelineBenchmarkComparison.Workload.COPY, rows);
+        assertThatThrownBy(() -> BenchmarkReturnIntervalComparison.evaluateObservabilityCost(input))
+                .hasMessageContaining("APP CPU per cohort row enclosure");
+    }
+
+    private static final BenchmarkReturnIntervalComparison.Bounds CPU = bounds(1000, 1000);
+    private static BenchmarkReturnIntervalComparison.Fork withCpu(BenchmarkReturnIntervalComparison.Fork fork,
+            BenchmarkReturnIntervalComparison.Bounds cpu) {
+        return new BenchmarkReturnIntervalComparison.Fork(fork.arm(), fork.throughput(), fork.p99(), cpu,
+                fork.completedCohortRows(), fork.peakHeapBytes(), fork.peakRssBytes());
+    }
+
     private static EnumMap<PipelineBenchmarkComparison.Workload, List<BenchmarkReturnIntervalComparison.Fork>> runs(int scenario) {
         var result = new EnumMap<PipelineBenchmarkComparison.Workload, List<BenchmarkReturnIntervalComparison.Fork>>(PipelineBenchmarkComparison.Workload.class);
         for (var workload : PipelineBenchmarkComparison.Workload.values()) {
@@ -130,7 +182,7 @@ class BenchmarkReturnIntervalComparisonTest {
                 if (scenario == 7 && arm == PipelineBenchmarkComparison.Arm.B) rate = 950 - 0.0000000005;
                 if (scenario == 8 && arm == PipelineBenchmarkComparison.Arm.B) rate = 949.999999999;
                 forks.add(new BenchmarkReturnIntervalComparison.Fork(arm, BenchmarkReturnIntervalComparison.Bounds.point(rate),
-                        BenchmarkReturnIntervalComparison.Bounds.point(p99), 10000, heap, rss));
+                        BenchmarkReturnIntervalComparison.Bounds.point(p99), CPU, 10000, heap, rss));
             }
             result.put(workload, forks);
         }
