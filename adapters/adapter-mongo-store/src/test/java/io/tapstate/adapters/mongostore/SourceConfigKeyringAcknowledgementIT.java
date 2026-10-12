@@ -148,6 +148,93 @@ class SourceConfigKeyringAcknowledgementIT {
     }
 
     @Test
+    void persistentConflictsExhaustTheRetryWindowWithoutPublishingAnAcknowledgement() {
+        try (MongoClient actual = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = freshDatabase(actual);
+            new SourceConfigKeyringStore(actual, database).loadOrCreateCipher();
+            WorkloadClaim node = acquire(claims(database), "boot-live", TTL);
+            AtomicInteger attempts = new AtomicInteger();
+            MongoException conflict = new MongoException(112, "persistent transaction conflict");
+            conflict.addLabel("TransientTransactionError");
+            MongoClient refusing = (MongoClient) Proxy.newProxyInstance(MongoClient.class.getClassLoader(),
+                    new Class<?>[] {MongoClient.class}, (proxy, method, arguments) -> {
+                        if (method.getName().equals("startSession")) {
+                            attempts.incrementAndGet();
+                            throw conflict;
+                        }
+                        return invoke(method, actual, arguments);
+                    });
+            SourceConfigKeyringStore ring = new SourceConfigKeyringStore(refusing, database);
+            org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
+                long started = System.nanoTime();
+                assertThatThrownBy(() -> ring.acknowledge(node, 1L, TTL))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                assertThat(System.nanoTime() - started).isGreaterThanOrEqualTo(Duration.ofSeconds(2).toNanos());
+            });
+            assertThat(attempts.get()).isGreaterThan(3);
+            assertThat(acknowledgement(database)).isNull();
+        }
+    }
+
+    @Test
+    void interruptionDuringBackoffStopsRetryingAndPreservesTheInterrupt() throws Exception {
+        try (MongoClient actual = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = freshDatabase(actual);
+            new SourceConfigKeyringStore(actual, database).loadOrCreateCipher();
+            WorkloadClaim node = acquire(claims(database), "boot-live", TTL);
+            CountDownLatch backingOff = new CountDownLatch(1);
+            AtomicInteger attempts = new AtomicInteger();
+            MongoException conflict = new MongoException(112, "transaction conflict while backing off");
+            conflict.addLabel("TransientTransactionError");
+            MongoClient refusing = (MongoClient) Proxy.newProxyInstance(MongoClient.class.getClassLoader(),
+                    new Class<?>[] {MongoClient.class}, (proxy, method, arguments) -> {
+                        if (method.getName().equals("startSession")) {
+                            if (attempts.incrementAndGet() >= 4) backingOff.countDown();
+                            throw conflict;
+                        }
+                        return invoke(method, actual, arguments);
+                    });
+            SourceConfigKeyringStore ring = new SourceConfigKeyringStore(refusing, database);
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            AtomicBoolean interrupted = new AtomicBoolean();
+            Thread worker = new Thread(() -> {
+                try {
+                    ring.acknowledge(node, 1L, TTL);
+                } catch (Throwable error) {
+                    failure.set(error);
+                } finally {
+                    interrupted.set(Thread.currentThread().isInterrupted());
+                }
+            }, "keyring-ack-backoff-test");
+            worker.setDaemon(true);
+            worker.start();
+            try {
+                assertThat(backingOff.await(5, TimeUnit.SECONDS)).isTrue();
+                long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+                boolean sleeping = false;
+                while (worker.isAlive() && System.nanoTime() < deadline && !sleeping) {
+                    sleeping = java.util.Arrays.stream(worker.getStackTrace()).anyMatch(frame ->
+                            frame.getClassName().equals(TimeUnit.class.getName())
+                                    && frame.getMethodName().equals("sleep"));
+                    if (!sleeping) Thread.onSpinWait();
+                }
+                assertThat(sleeping).as("interrupt the actual retry backoff, not a database call").isTrue();
+                worker.interrupt();
+                worker.join(5_000);
+                assertThat(worker.isAlive()).isFalse();
+                assertThat(failure.get()).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                assertThat(interrupted.get()).isTrue();
+                assertThat(acknowledgement(database)).isNull();
+            } finally {
+                worker.interrupt();
+                worker.join(5_000);
+            }
+        }
+    }
+
+    @Test
     void acknowledgementSurvivesThreeCompetingKeyringWritesWithoutLosingItsNodeSession() {
         try (MongoClient competing = MongoClients.create(MONGO.getReplicaSetUrl())) {
             MongoDatabase database = freshDatabase(competing);

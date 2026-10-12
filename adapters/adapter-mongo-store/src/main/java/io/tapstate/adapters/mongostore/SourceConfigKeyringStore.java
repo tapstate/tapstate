@@ -439,22 +439,26 @@ public final class SourceConfigKeyringStore {
                 try {
                     return acknowledgeOnce(session, epoch, ttl);
                 } catch (MongoException error) {
-                    if (!error.hasErrorLabel("TransientTransactionError")
-                            || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
-                    // Every live node touches the same keyring fence. Immediate retries can lose
-                    // repeatedly to another node's transaction during a join or renewal.
-                    long remaining = ACK_CONFLICT_RETRY_WINDOW.toNanos() - (System.nanoTime() - started);
-                    if (remaining <= 0 || Thread.currentThread().isInterrupted()) throw error;
-                    long delay = TimeUnit.MILLISECONDS.toNanos(Math.min(50L, 5L << Math.min(conflicts++, 4)));
-                    try {
-                        TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw error;
-                    }
+                    awaitAcknowledgementRetry(error, started, conflicts++);
                 }
             }
         });
+    }
+
+    private static void awaitAcknowledgementRetry(MongoException error, long started, int conflicts) {
+        if (!error.hasErrorLabel("TransientTransactionError")
+                || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
+        // Every live node touches the same keyring fence. Immediate retries can lose
+        // repeatedly to another node's transaction during a join or renewal.
+        long remaining = ACK_CONFLICT_RETRY_WINDOW.toNanos() - (System.nanoTime() - started);
+        if (remaining <= 0 || Thread.currentThread().isInterrupted()) throw error;
+        long delay = TimeUnit.MILLISECONDS.toNanos(Math.min(50L, 5L << Math.min(conflicts, 4)));
+        try {
+            TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw error;
+        }
     }
 
     private boolean acknowledgeOnce(WorkloadClaim node, long epoch, Duration ttl) {
