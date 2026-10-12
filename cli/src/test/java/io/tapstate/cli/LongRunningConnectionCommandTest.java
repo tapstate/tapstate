@@ -64,6 +64,9 @@ class LongRunningConnectionCommandTest {
             server.setExecutor(executor);
             server.createContext("/api/artifacts/slow-db2", exchange -> reply(exchange,
                     JsonOut.write(Map.of("id", "slow-db2", "kind", "source", "canonicalForm", source))));
+            server.createContext("/api/sources/slow-db2", exchange -> reply(exchange,
+                    JsonOut.write(Map.of("id", "slow-db2", "connector", "db2",
+                            "config", Map.of("host", "db.internal", "username", "cdc")))));
             for (String verb : calls.keySet()) {
                 String resultPath = "/api/connections/slow-db2/"
                         + (verb.equals("test") ? "test-result" : "schema");

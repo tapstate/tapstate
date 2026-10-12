@@ -58,6 +58,9 @@ class ASlowConnectionTestFinishesBeforeTheCliExitsIT {
                 """));
         server.createContext("/api/artifacts/slow-db2", exchange -> reply(exchange,
                 JsonWriter.write(Map.of("id", "slow-db2", "kind", "source", "canonicalForm", source))));
+        server.createContext("/api/sources/slow-db2", exchange -> reply(exchange,
+                JsonWriter.write(Map.of("id", "slow-db2", "connector", "db2",
+                        "config", Map.of("host", "db.internal", "username", "cdc")))));
         server.createContext("/api/connections:test", exchange -> {
             exchange.getRequestBody().readAllBytes();
             tests.incrementAndGet();
