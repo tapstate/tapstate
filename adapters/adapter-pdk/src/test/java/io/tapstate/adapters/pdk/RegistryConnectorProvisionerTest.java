@@ -11,10 +11,16 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.jar.JarFile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -89,6 +95,185 @@ class RegistryConnectorProvisionerTest {
 
         assertThat(second).isEqualTo(first);
         assertThat(registry.artifactCalls).isEqualTo(1);
+    }
+
+    @Test
+    void refusesAByteChangedButStillReadableCachedConnectorOnResolve(@TempDir Path dir) throws Exception {
+        Path seed = Synthetic.annotatedConnector(dir);
+        byte[] artifact = Files.readAllBytes(seed);
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        var registration = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact).registration();
+        Path cacheDir = dir.resolve("plugins");
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+        ConnectorRef original = provisioner.resolve("orders");
+        Path cached = original.classpath().get(0);
+        assertThat(original.contentHash()).isEqualTo(registration.contentHash());
+        assertThat(cached).isEqualTo(cacheDir.resolve(registration.contentHash() + ".jar"));
+        assertThat(Files.readAllBytes(cached)).isEqualTo(artifact);
+
+        Files.write(cached, new byte[] {0}, StandardOpenOption.APPEND);
+
+        assertThat(Files.size(cached)).isEqualTo(artifact.length + 1L);
+        assertThat(ContentHash.of(Files.readAllBytes(cached))).isNotEqualTo(registration.contentHash());
+        try (JarFile jar = new JarFile(cached.toFile())) {
+            var spec = jar.getJarEntry("orders-spec.json");
+            assertThat(spec).isNotNull();
+            try (var stream = jar.getInputStream(spec)) {
+                assertThat(new String(stream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8))
+                        .isEqualTo(original.spec());
+            }
+        }
+        try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(cached))) {
+            assertThat(loader.loadConnectorClass(original.className()).getName())
+                    .isEqualTo("synthetic.OrdersConnector");
+        }
+        assertThat(Files.readAllBytes(seed)).isEqualTo(artifact);
+        assertThat(registry.list()).containsExactly(registration);
+        assertThat(registry.artifact(registration.contentHash())).hasValue(artifact);
+
+        assertThatThrownBy(() -> provisioner.resolve("orders"))
+                .as("a readable cached JAR with bytes different from its content address must be refused")
+                .isInstanceOf(TapstateException.class);
+    }
+
+    @Test
+    void refusesACorruptCacheEvenWhenItsLengthIsUnchanged(@TempDir Path dir) throws IOException {
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact);
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"));
+        Path cached = provisioner.resolve("orders").classpath().get(0);
+        byte[] corrupted = new byte[artifact.length];
+        Files.write(cached, corrupted);
+
+        assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+
+        assertThat(Files.readAllBytes(cached)).isEqualTo(corrupted);
+        assertThat(registry.artifactCalls).as("a damaged cache is refused rather than replaced from the store")
+                .isEqualTo(1);
+    }
+
+    @Test
+    void refusesAnUnreadableCacheWithoutPathsOrCauses(@TempDir Path dir) throws IOException {
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact)
+                .registration().contentHash();
+        Path cacheDir = dir.resolve("plugins");
+        Path cached = Files.createDirectories(cacheDir.resolve(hash + ".jar"));
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+
+        assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+
+        assertThat(cached).isDirectory();
+        assertThat(registry.artifactCalls).isZero();
+    }
+
+    @Test
+    void materializesAMissingCacheAgainFromValidatedStoreBytes(@TempDir Path dir) throws IOException {
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact);
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"));
+        ConnectorRef first = provisioner.resolve("orders");
+        Files.delete(first.classpath().get(0));
+
+        ConnectorRef restored = provisioner.resolve("orders");
+
+        assertThat(restored).isEqualTo(first);
+        assertThat(Files.readAllBytes(restored.classpath().get(0))).isEqualTo(artifact);
+        assertThat(registry.artifactCalls).isEqualTo(2);
+    }
+
+    @Test
+    void refusesMismatchedStoreBytesBeforeCreatingTheCache(@TempDir Path dir) throws IOException {
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact)
+                .registration().contentHash();
+        registry.replaceArtifact(hash, java.util.Arrays.copyOf(artifact, artifact.length + 1));
+        Path cacheDir = dir.resolve("plugins");
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+
+        assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+
+        assertThat(cacheDir).doesNotExist();
+        assertThat(registry.artifactCalls).isEqualTo(1);
+    }
+
+    @Test
+    void refusesAnUnwritableStagingDirectoryWithoutPathsOrCauses(@TempDir Path dir) throws IOException {
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact);
+        Path cacheDir = Files.createFile(dir.resolve("not-a-directory")).resolve("plugins");
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+
+        assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+
+        assertThat(cacheDir.getParent()).isRegularFile();
+        assertThat(Files.size(cacheDir.getParent())).isZero();
+    }
+
+    @Test
+    void refusesACacheAnotherStagerPlacedWithDifferentBytes(@TempDir Path dir) throws IOException {
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        byte[] changed = java.util.Arrays.copyOf(artifact, artifact.length + 1);
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact)
+                .registration().contentHash();
+        Path cacheDir = dir.resolve("plugins");
+        Path target = cacheDir.resolve(hash + ".jar");
+        AtomicReference<Object> placedFile = new AtomicReference<>();
+        registry.onArtifactFetch = () -> {
+            try {
+                Files.createDirectories(cacheDir);
+                Files.write(target, changed);
+                placedFile.set(fileKey(target));
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+
+        assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+
+        assertThat(Files.readAllBytes(target)).isEqualTo(changed);
+        assertThat(fileKey(target)).isEqualTo(placedFile.get());
+        try (var files = Files.list(cacheDir)) {
+            assertThat(files.toList()).containsExactly(target);
+        }
+    }
+
+    @Test
+    void concurrentResolvesStageOnceAndShareTheValidCache(@TempDir Path dir) throws Exception {
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact);
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"));
+        CountDownLatch start = new CountDownLatch(1);
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            var first = workers.submit(() -> { start.await(); return provisioner.resolve("orders"); });
+            var second = workers.submit(() -> { start.await(); return provisioner.resolve("orders"); });
+            start.countDown();
+
+            ConnectorRef firstRef = first.get(10, TimeUnit.SECONDS);
+            ConnectorRef secondRef = second.get(10, TimeUnit.SECONDS);
+
+            assertThat(secondRef).isEqualTo(firstRef);
+            assertThat(registry.artifactCalls).isEqualTo(1);
+            assertThat(Files.readAllBytes(firstRef.classpath().get(0))).isEqualTo(artifact);
+            assertThat(ConnectorClassLoader.shared(secondRef.classpath()))
+                    .isSameAs(ConnectorClassLoader.shared(firstRef.classpath()));
+        }
     }
 
     @Test
@@ -187,6 +372,14 @@ class RegistryConnectorProvisionerTest {
 
     private static Object fileKey(Path file) throws IOException {
         return Files.readAttributes(file, BasicFileAttributes.class).fileKey();
+    }
+
+    private static void assertSafeLoadFailure(Runnable resolve) {
+        assertThatThrownBy(resolve::run).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED);
+            assertThat(failure.args()).isEqualTo(Map.of("connector", "orders"));
+            assertThat(failure).hasNoCause().hasMessage("connector.load-failed {connector=orders}");
+        });
     }
 
 }

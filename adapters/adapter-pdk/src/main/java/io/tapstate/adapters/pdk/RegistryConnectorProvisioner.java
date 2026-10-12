@@ -3,9 +3,9 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
+import io.tapstate.spi.store.ContentHash;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,14 +18,13 @@ import java.util.stream.Collectors;
  * Resolves a connector id against the distribution store and materializes it for loading: it finds the
  * id's registration, stages the registered artifact bytes into a content-addressed on-disk cache — a
  * file named for the content hash, written once and reused on every later resolve — and introspects the
- * staged jar into the {@link ConnectorRef} the bridge loads from. Staging is content-addressed, so the
- * bytes are fetched from the store only the first time a given artifact is seen.
+ * staged jar into the {@link ConnectorRef} the bridge loads from. Cached bytes are checked against
+ * their content address on every resolve; valid caches do not fetch the store's bytes again.
  *
  * <p>An id that resolves to no registered artifact, or to more than one, is refused with a coded
  * connector-domain exception rather than loaded blindly: selecting among connector versions is out of
  * scope, and a silent wrong-version load is never taken. A registration whose bytes the store cannot
- * produce is a load failure. A raw I/O failure staging the artifact is not a connector defect and
- * surfaces as an unchecked I/O exception.
+ * produce, validate or stage is a load failure, reported without paths or underlying causes.
  */
 public final class RegistryConnectorProvisioner implements ConnectorProvisioner {
 
@@ -76,8 +75,8 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     /**
      * The path to the artifact staged under its content hash: it writes the store's bytes into the cache
      * the first time the hash is seen and reuses the file every time after, so an already-staged hash is
-     * never re-fetched. The write goes through a temp file renamed into place, so a reader never sees a
-     * half-written jar.
+     * never re-fetched. Store bytes and each reused cache are checked against their content address.
+     * The write goes through a temp file renamed into place, so a reader never sees a half-written jar.
      *
      * <p>A staged file is never replaced, not even by the identical bytes of a second stager. A running
      * server keeps one class loader per staged artifact, keyed by the file as it first found it, and a
@@ -89,14 +88,15 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     private Path stage(String connectorId, String contentHash) {
         Path target = cacheDir.resolve(contentHash + ".jar");
         if (Files.exists(target)) {
-            return target;
+            return validatedCache(connectorId, contentHash, target);
         }
         synchronized (STAGING) {
             if (Files.exists(target)) {
-                return target;
+                return validatedCache(connectorId, contentHash, target);
             }
             byte[] bytes = registry.artifact(contentHash).orElseThrow(() ->
                     new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null));
+            validateContent(connectorId, contentHash, bytes);
             try {
                 Files.createDirectories(cacheDir);
                 Path tmp = Files.createTempFile(cacheDir, contentHash, ".tmp");
@@ -104,15 +104,30 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
                     Files.write(tmp, bytes);
                     Files.move(tmp, target);
                 } catch (FileAlreadyExistsException stagedElsewhere) {
-                    // Content-addressed: the file already there holds these same bytes, and it stays.
+                    // Keep the other stager's file and validate it before returning it.
                 } finally {
                     Files.deleteIfExists(tmp);
                 }
             } catch (IOException e) {
-                throw new UncheckedIOException("staging connector artifact " + target, e);
+                throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
             }
         }
-        return target;
+        return validatedCache(connectorId, contentHash, target);
+    }
+
+    private static Path validatedCache(String connectorId, String contentHash, Path target) {
+        try {
+            validateContent(connectorId, contentHash, Files.readAllBytes(target));
+            return target;
+        } catch (IOException e) {
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
+    }
+
+    private static void validateContent(String connectorId, String contentHash, byte[] bytes) {
+        if (!contentHash.equals(ContentHash.of(bytes))) {
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
     }
 
     private static String contentHashes(List<ConnectorRegistration> registrations) {
