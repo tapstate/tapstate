@@ -437,7 +437,7 @@ final class StoreBackedDagSource implements DagSource {
                 || serve.sync() == null || serve.sync().isEmpty()) {
             throw previewRefused("the selected output has no materialized rows");
         }
-        Map<String, TargetTable> sourceTargets = targetModelResolver.resolveAll(pipeline);
+        Map<String, TargetTable> sourceTargets = sourceTargets(vertices);
         Map<String, TargetTable> targets = new LinkedHashMap<>(sourceTargets);
         targets.putAll(assembledTargets(pipeline, sourceTargets, vertices, compiledJoins));
         Set<String> streams = streamsReaching(pipeline, serve.from(), sourceKeyByTable,
@@ -560,7 +560,7 @@ final class StoreBackedDagSource implements DagSource {
         // Resolve every selected table once. The terminal-specific stream sets below then narrow this map to
         // what can actually reach each sink, so an unrelated source neither gains a discovery obligation nor
         // a target binding.
-        Map<String, TargetTable> bySourceTable = targetModelResolver.resolveAll(pipeline);
+        Map<String, TargetTable> bySourceTable = sourceTargets(sourceVertices);
         // Compiled once, here, and handed to both the targets below and the join binding. Compiling it
         // twice would mean two answers to the same question with nothing comparing them.
         Map<String, CompiledJoin> compiledJoins =
@@ -724,10 +724,10 @@ final class StoreBackedDagSource implements DagSource {
         return executions;
     }
 
-    /** The stream each source vertex emits: the table it reads, which is what its rows name as their stream. */
+    /** The stream each source emits, qualified when several sources read the same table. */
     private static Map<String, String> streamOfSourceVertex(Map<String, SourceVertex> sourceVertices) {
         Map<String, String> streams = new LinkedHashMap<>();
-        sourceVertices.forEach((key, vertex) -> streams.put(key, vertex.table()));
+        sourceVertices.forEach((key, vertex) -> streams.put(key, vertex.stream()));
         return streams;
     }
 
@@ -846,7 +846,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private record SourceVertex(
-            String pipelineId, String sourceId, String table, SourceCaptureResolution resolution) {
+            String pipelineId, String sourceId, String table, SourceCaptureResolution resolution, String stream) {
         String consumerId() {
             return SrsConsumerId.of(pipelineId, sourceId).value();
         }
@@ -934,7 +934,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private static FrontierBinding frontierBinding(Map<String, SourceVertex> sourceVertices) {
         Map<String, String> chainByVertex = new LinkedHashMap<>();
-        sourceVertices.forEach((key, vertex) -> chainByVertex.put(key, vertex.table()));
+        sourceVertices.forEach((key, vertex) -> chainByVertex.put(key, vertex.stream()));
         return new FrontierBinding(chainByVertex);
     }
 
@@ -947,6 +947,7 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> byTable = new LinkedHashMap<>();
         for (SourceVertex vertex : sourceVertices.values()) {
             byTable.putIfAbsent(vertex.table(), vertex.sourceId());
+            byTable.put(vertex.stream(), vertex.sourceId());
         }
         return byTable;
     }
@@ -954,8 +955,8 @@ final class StoreBackedDagSource implements DagSource {
     /**
      * The source id to reach for each table the pipeline's sources read. A reference into a source names the
      * table, while the vertex reading it is keyed by the source id, so this is what carries one to the other.
-     * A table read by two of one pipeline's sources cannot occur here: the reference rules reject the
-     * ambiguity before a pipeline is ever stored.
+     * Qualified references can select the same table from different sources. Those inputs keep
+     * separate stream identities, including separate frontier axes and durable acknowledgements.
      */
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline) {
         return sourceVertices(pipeline, false);
@@ -977,28 +978,38 @@ final class StoreBackedDagSource implements DagSource {
             SourceCaptureResolution resolution = selected.orElseThrow();
             for (String table : resolution.tables()) {
                 String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
-                vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution));
+                vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution, table));
             }
         }
+        Map<String, Long> counts = vertices.values().stream().collect(java.util.stream.Collectors.groupingBy(
+                SourceVertex::table, java.util.stream.Collectors.counting()));
+        vertices.replaceAll((key, vertex) -> counts.get(vertex.table()) > 1
+                ? new SourceVertex(vertex.pipelineId(), vertex.sourceId(), vertex.table(), vertex.resolution(),
+                        vertex.sourceId() + "." + vertex.table())
+                : vertex);
         return vertices;
     }
 
     private Map<String, String> sourceKeyByTable(Map<String, SourceVertex> sourceVertices) {
         Map<String, String> byTable = new LinkedHashMap<>();
-        Map<String, SourceVertex> firstByTable = new LinkedHashMap<>();
         for (Map.Entry<String, SourceVertex> entry : sourceVertices.entrySet()) {
-            SourceVertex previous = firstByTable.putIfAbsent(entry.getValue().table(), entry.getValue());
-            if (previous != null && !previous.sourceId().equals(entry.getValue().sourceId())) {
-                throw new TapstateException(
-                        ActuationError.SOURCE_TABLE_AMBIGUOUS,
-                        Map.of(
-                                "table", entry.getValue().table(),
-                                "sources", previous.sourceId() + ", " + entry.getValue().sourceId()),
-                        null);
-            }
             byTable.putIfAbsent(entry.getValue().table(), entry.getKey());
         }
         return byTable;
+    }
+
+    /** Keeps each discovered model attached to the stream that reads that source's table. */
+    private Map<String, TargetTable> sourceTargets(Map<String, SourceVertex> vertices) {
+        Map<String, Map<String, TargetTable>> bySource = new LinkedHashMap<>();
+        Map<String, TargetTable> targets = new LinkedHashMap<>();
+        for (SourceVertex vertex : vertices.values()) {
+            TargetTable target = bySource.computeIfAbsent(vertex.sourceId(), targetModelResolver::resolveAll)
+                    .get(vertex.table());
+            if (target != null) {
+                targets.put(vertex.stream(), target);
+            }
+        }
+        return targets;
     }
 
     /**
@@ -1140,7 +1151,7 @@ final class StoreBackedDagSource implements DagSource {
         for (String key : upstreams(from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
             SourceVertex vertex = sourceVertices.get(key);
             if (vertex != null) {
-                if (vertex.table().equals(stream)) {
+                if (vertex.stream().equals(stream)) {
                     NodeColumns copied = sourceColumns.apply(vertex);
                     if (copied != null) {
                         Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
@@ -1521,7 +1532,7 @@ final class StoreBackedDagSource implements DagSource {
             String pipelineId, String table, Map<String, SourceVertex> sourceVertices,
             Function<SourceVertex, NodeColumns> sourceColumns) {
         for (SourceVertex vertex : sourceVertices.values()) {
-            if (vertex.table().equals(table)) {
+            if (vertex.stream().equals(table)) {
                 return sourceColumns.apply(vertex);
             }
         }
@@ -1717,9 +1728,10 @@ final class StoreBackedDagSource implements DagSource {
             boolean direct = pipeline.sources().stream().anyMatch(ref ->
                     ref.id().equals(vertex.sourceId())
                             && ref instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs());
-            progress.put(vertex.table(), new StoreBackedSinkAckFactory.SourceProgress(
+            progress.put(vertex.stream(), new StoreBackedSinkAckFactory.SourceProgress(
                     vertex.resolution().chainId().value(), vertex.consumerId(),
-                    direct ? ConsumerProgressKind.DIRECT_SOURCE : ConsumerProgressKind.SRS));
+                    direct ? ConsumerProgressKind.DIRECT_SOURCE : ConsumerProgressKind.SRS,
+                    vertex.stream().equals(vertex.table()) ? null : vertex.table()));
         }
         return progress;
     }
@@ -1754,14 +1766,14 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
-                        progress.get(sourceVertices.get(key).table()).kind() == ConsumerProgressKind.DIRECT_SOURCE),
+                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
-                        viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById), fence),
+                        viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices)), fence),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
     }
@@ -1798,7 +1810,7 @@ final class StoreBackedDagSource implements DagSource {
                             .map(DiscoveredSourceModel::model)
                             .map(model -> discoveredTable(model, vertex.table()))
                             .map(SourceTable::primaryKey).orElse(List.of());
-                    byStream.put(vertex.table(), primaryKey);
+                    byStream.put(vertex.stream(), primaryKey);
                 }
             }
             return byStream;
@@ -2097,7 +2109,17 @@ final class StoreBackedDagSource implements DagSource {
         List<String> streams = new ArrayList<>();
         List<TransformBody.Nest> assemblies = new ArrayList<>();
         collectFeed(pipeline, view.from(), tablesBySourceId, streams, assemblies, new HashSet<>());
-        if (streams.size() + assemblies.size() > 1) {
+        Set<String> tables = new LinkedHashSet<>();
+        int unresolved = 0;
+        for (String stream : streams) {
+            TargetTable model = feedTarget(targets, stream, tablesBySourceId);
+            if (model == null) {
+                unresolved++;
+            } else {
+                tables.add(model.name());
+            }
+        }
+        if (tables.size() + unresolved + assemblies.size() > 1) {
             throw new TapstateException(ActuationError.VIEW_FED_BY_MANY_TABLES,
                     Map.of("view", view.id(), "tables", String.join(", ", streams)), null);
         }
@@ -2108,23 +2130,47 @@ final class StoreBackedDagSource implements DagSource {
         // An undiscovered table has no identity claim to compare, so the view remains usable before
         // discovery. Once discovery has supplied a model, the selected key is either the identity that
         // model records for every row, or an index discovery proved constrains every one of them.
-        if (streams.size() == 1 && targets != null) {
-            TargetTable model = targets.get(streams.getFirst());
+        boolean alternate = false;
+        for (String stream : streams) {
+            TargetTable model = feedTarget(targets, stream, tablesBySourceId);
             if (model != null) {
                 List<String> selected = List.of(view.primaryKey());
                 List<String> discoveredKey = model.fields().stream()
                         .filter(TargetField::primaryKey).map(TargetField::name).toList();
                 if (selected.equals(discoveredKey)) {
-                    return false;
+                    continue;
                 }
                 if (model.indexes().stream().filter(TargetIndex::constrainsEveryRow)
                         .anyMatch(index -> index.fields().equals(selected))) {
-                    return true;
+                    alternate = true;
+                    continue;
                 }
                 refuseKey(view, discoveredKey.isEmpty() ? claimedIdentity(model) : discoveredKey);
             }
         }
-        return false;
+        return alternate;
+    }
+
+    private static TargetTable feedTarget(Map<String, TargetTable> targets, String stream,
+            Map<String, List<String>> streamsBySource) {
+        if (targets == null) {
+            return null;
+        }
+        TargetTable target = targets.get(stream);
+        if (target == null) {
+            int dot = stream.indexOf('.');
+            if (dot > 0 && streamsBySource.containsKey(stream.substring(0, dot))) {
+                target = targets.get(stream.substring(dot + 1));
+            }
+        }
+        return target;
+    }
+
+    private static Map<String, List<String>> sourceStreamsById(Map<String, SourceVertex> vertices) {
+        Map<String, List<String>> streams = new LinkedHashMap<>();
+        vertices.values().forEach(vertex -> streams.computeIfAbsent(vertex.sourceId(), ignored -> new ArrayList<>())
+                .add(vertex.stream()));
+        return streams;
     }
 
     /**
@@ -2465,7 +2511,7 @@ final class StoreBackedDagSource implements DagSource {
                 from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
             SourceVertex source = sourceVertices.get(key);
             if (source != null) {
-                streams.add(source.table());
+                streams.add(source.stream());
                 continue;
             }
             Step step = stepOf(pipeline, key);
@@ -2774,10 +2820,11 @@ final class StoreBackedDagSource implements DagSource {
         if (sourceId == null) {
             return List.of();
         }
+        String physicalTable = table.startsWith(sourceId + ".") ? table.substring(sourceId.length() + 1) : table;
         return storePort.schemas().get(sourceId)
                 .map(DiscoveredSourceModel::model)
                 .flatMap(model -> model.tables().stream()
-                        .filter(t -> t.name().equals(table)).findFirst())
+                        .filter(t -> t.name().equals(physicalTable)).findFirst())
                 .map(t -> t.fields().stream()
                         .map(f -> new io.tapstate.core.sql.SourceColumn(f.name(), f.type(), true))
                         .toList())
@@ -2889,9 +2936,10 @@ final class StoreBackedDagSource implements DagSource {
             return new NestTable(table, List.of());
         }
         String resolvedTable = table;
+        String physicalTable = table.startsWith(sourceId + ".") ? table.substring(sourceId.length() + 1) : table;
         return storePort.schemas().get(sourceId)
                 .map(DiscoveredSourceModel::model)
-                .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(resolvedTable)).findFirst())
+                .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(physicalTable)).findFirst())
                 .map(discovered -> new NestTable(
                         resolvedTable,
                         discovered.primaryKey(),
@@ -2931,16 +2979,16 @@ final class StoreBackedDagSource implements DagSource {
         // The ring knows a generation and a sequence; which axis this stream travels on and how the pair
         // packs into the one long a bound rides are properties of the whole job, so they are closed over
         // here rather than reached for from the source.
-        String chain = vertex.table();
+        String chain = vertex.stream();
         byte axis = axes.axisOf(chain);
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
-                    vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
+                    vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.stream(), snapshotEpoch,
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
         if (direct) {
             return SrsSourceProcessor.directMetaSupplier(vertex.pipelineId(),
-                    vertex.resolution().ringName(vertex.table()), vertex.table(),
+                    vertex.resolution().ringName(vertex.table()), vertex.stream(),
                     sourceContextEpoch(vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
@@ -2953,7 +3001,7 @@ final class StoreBackedDagSource implements DagSource {
                 .ringDoneThrough(vertex.resolution().chainId().value(), vertex.consumerId())
                 .get(vertex.table());
         return SrsSourceProcessor.metaSupplier(
-                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), freshStart,
+                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.stream(), freshStart,
                 doneThrough, sourceContextEpoch(
                         vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 CaptureRunUnit.readCursorPublisher(
@@ -3177,6 +3225,15 @@ final class StoreBackedDagSource implements DagSource {
                                 Map.of("source", sourceId, "table", table), null);
                     }
                     return matches;
+                }
+            }
+            if (sourceIdByTable.containsKey(literal.ref())) {
+                List<String> owners = sourceVertices.values().stream()
+                        .filter(vertex -> vertex.table().equals(literal.ref()))
+                        .map(SourceVertex::sourceId).distinct().toList();
+                if (owners.size() > 1) {
+                    throw new TapstateException(ActuationError.SOURCE_TABLE_AMBIGUOUS,
+                            Map.of("table", literal.ref(), "sources", String.join(", ", owners)), null);
                 }
             }
             return List.of(sourceIdByTable.getOrDefault(literal.ref(), literal.ref()));

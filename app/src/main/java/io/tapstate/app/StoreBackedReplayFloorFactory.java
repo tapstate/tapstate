@@ -59,7 +59,7 @@ final class StoreBackedReplayFloorFactory implements ReplayFloorFactory {
     private Optional<SourceOrder> ackedOrder(SrsMetaStore meta, SourceProgress progress, String table) {
         return meta.read(progress.miningChainId())
                 .flatMap(record -> record.consumerOffset(progress.consumerId()))
-                .map(offset -> tablePosition(offset, progress, table))
+                .map(offset -> tablePosition(offset, progress, progress.table(table)))
                 .map(ChainPosition::order);
     }
 
