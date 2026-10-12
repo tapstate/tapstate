@@ -67,6 +67,16 @@ record PipelineStatusResponse(
                 runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance());
     }
 
+    /** Builds a merged status for an authoring or applied Pipeline before its first runtime observation. */
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
+        PipelineCatalogItem.Status status = item.status();
+        PipelineState state = status.observedState() != null ? status.observedState()
+                : status.desiredState() != null ? status.desiredState() : PipelineState.NEW;
+        return new PipelineStatusResponse(item.id(), state, status.displayState(),
+                failure(status.failure(), catalog), status.observedAt(), null,
+                status.desiredState(), status.observedState(), item.hasArtifact(), null, null);
+    }
+
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {
         if (failure == null) {
             return null;

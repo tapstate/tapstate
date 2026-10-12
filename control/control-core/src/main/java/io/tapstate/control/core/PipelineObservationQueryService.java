@@ -65,10 +65,7 @@ public final class PipelineObservationQueryService {
      * run was submitted on where one is recorded, and the members of the cluster that plan was not worked out for.
      */
     public PipelineStatus status(String pipelineId) {
-        PipelineStatus status = lifecycleStatus(pipelineId);
-        ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
-        return new PipelineStatus(status.pipelineId(), status.state(), status.failure(), status.observedAt(),
-                plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
+        return findStatusWithPlan(pipelineId).orElseThrow(() -> unobserved(pipelineId));
     }
 
     /**
@@ -88,6 +85,16 @@ public final class PipelineObservationQueryService {
         return observations.read(pipelineId)
                 .map(observation -> new PipelineStatus(observation.pipelineId(), observation.state(),
                         observation.failure(), observation.observedAt()));
+    }
+
+    /** Returns an observed status with its current execution plan, without requiring an observation to exist. */
+    public Optional<PipelineStatus> findStatusWithPlan(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return observations.read(pipelineId).map(observation -> {
+            ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+            return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
+                    observation.observedAt(), plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
+        });
     }
 
     /**
