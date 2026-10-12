@@ -60,6 +60,29 @@ class PdkConnectorTest {
         }
     }
 
+    /**
+     * A test, a discovery and each pipeline node open the same connector separately, and every one of them
+     * must reach the classes the first one loaded: a library the connector bound to its loader through JNI
+     * is refused to any other loader. Closing one handle leaves the loader to the next open.
+     */
+    @Test
+    void everyOpenOfOneArtifactDrivesTheSameConnectorClasses(@TempDir Path dir) {
+        ConnectorRef ref = ref(dir);
+        Class<?> first;
+        try (PdkConnector a = PdkConnector.open("demo", ref, Map.of());
+             PdkConnector b = PdkConnector.open("demo", ref, Map.of())) {
+            first = a.connector().getClass();
+            assertThat(b.connector()).isNotSameAs(a.connector());
+            assertThat(b.connector().getClass()).isSameAs(first);
+        }
+        try (PdkConnector later = PdkConnector.open("demo", ref, Map.of())) {
+            assertThat(later.connector().getClass()).isSameAs(first);
+        }
+        try (PdkConnector other = PdkConnector.open("demo", ref(dir.resolve("other")), Map.of())) {
+            assertThat(other.connector().getClass()).isNotSameAs(first);
+        }
+    }
+
     @Test
     void theDrivingContextCarriesAUsableStateMap(@TempDir Path dir) {
         try (PdkConnector connector = PdkConnector.open("demo", ref(dir), Map.of())) {

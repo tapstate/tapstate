@@ -69,6 +69,29 @@ class DataBrowserServiceTest {
     }
 
     @Test
+    void readsAtlasRowsThroughTheSourcesConnection() {
+        SourceResource atlas = new SourceResource(
+                "atlas_rows", null, "mongodb-atlas", VIEWS.config(), null, null, null, null);
+        AtomicReference<ConnectionConfig> driven = new AtomicReference<>();
+        AtomicReference<DataBrowserQuery> query = new AtomicReference<>();
+        DataBrowserService service = new DataBrowserService(
+                store(atlas), new EmptySchemaStore(), config -> List.of("order_state"),
+                (config, collection) -> null,
+                (config, requested) -> {
+                    driven.set(config);
+                    query.set(requested);
+                    return NOTHING;
+                }, NO_FOLLOWS);
+
+        assertThat(service.find("atlas_rows", "order_state", null, null, 10))
+                .isEqualTo(DataBrowserPreviewReport.from(NOTHING));
+        assertThat(driven.get().id()).isEqualTo("atlas_rows");
+        assertThat(driven.get().connectorId()).isEqualTo("mongodb-atlas");
+        assertThat(driven.get().settings()).containsEntry("database", "shop");
+        assertThat(query.get()).isNotNull();
+    }
+
+    @Test
     void refusesAnOrderFieldWhoseSpellingIsMalformedWithACode() {
         DataBrowserService service = service(store(VIEWS), config -> List.of("order_state"));
 
@@ -488,7 +511,7 @@ class DataBrowserServiceTest {
                     // other says what can, which is the only thing a reader can act on.
                     assertThat(coded.args())
                             .containsEntry("connector", "mysql")
-                            .containsEntry("browsable", "mongodb");
+                            .containsEntry("browsable", "mongodb, mongodb-atlas");
                 });
         assertThat(read.get()).as("a read that was refused must not have been sent").isNull();
         assertThat(listed.get()).as("nor cost a round trip to find out").isNull();

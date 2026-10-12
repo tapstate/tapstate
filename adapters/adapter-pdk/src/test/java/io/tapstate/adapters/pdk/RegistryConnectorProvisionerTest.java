@@ -5,10 +5,16 @@ import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.RegistrationSource;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -43,6 +49,32 @@ class RegistryConnectorProvisionerTest {
         assertThat(Files.readAllBytes(staged)).isEqualTo(artifact);
     }
 
+    /**
+     * An artifact certified for one instance to serve several writers resolves to a ref that says so and names
+     * its bytes; an artifact with no certification, or another's, runs one instance per writer.
+     */
+    @Test
+    void resolvesAnArtifactCertifiedForSharingToARefThatSharesIt(@TempDir Path dir) throws IOException {
+        Path cacheDir = dir.resolve("plugins");
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact)
+                .registration().contentHash();
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+
+        ConnectorRef uncertified = provisioner.resolve("orders");
+        registry.shareSafe.put("some-other-bytes", "v1");
+        ConnectorRef certifiedForOthers = provisioner.resolve("orders");
+        registry.shareSafe.put(hash, "v1");
+        ConnectorRef certified = provisioner.resolve("orders");
+
+        assertThat(uncertified.shareSafe()).isFalse();
+        assertThat(certifiedForOthers.shareSafe()).isFalse();
+        assertThat(certified.shareSafe()).isTrue();
+        assertThat(certified.contentHash()).isEqualTo(hash);
+    }
+
     @Test
     void reusesTheStagedArtifactOnASecondResolveInsteadOfFetchingBytesAgain(@TempDir Path dir) throws IOException {
         Path cacheDir = dir.resolve("plugins");
@@ -57,6 +89,41 @@ class RegistryConnectorProvisionerTest {
 
         assertThat(second).isEqualTo(first);
         assertThat(registry.artifactCalls).isEqualTo(1);
+    }
+
+    @Test
+    void anArtifactAnotherStagerPlacedFirstIsKeptAndKeepsItsLoader(@TempDir Path dir) throws IOException {
+        Path cacheDir = dir.resolve("plugins");
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact);
+        Path target = cacheDir.resolve(ContentHash.of(artifact) + ".jar");
+        AtomicReference<Object> placedFile = new AtomicReference<>();
+        AtomicReference<ConnectorClassLoader> placedLoader = new AtomicReference<>();
+        // Another stager - a second process on this cache - finishes while this resolve is fetching the
+        // bytes, and a connector is already opened from what it placed.
+        registry.onArtifactFetch = () -> {
+            try {
+                Files.createDirectories(cacheDir);
+                Files.write(target, artifact);
+                Files.setLastModifiedTime(target, FileTime.fromMillis(1_000_000_000_000L));
+                placedFile.set(fileKey(target));
+                placedLoader.set(ConnectorClassLoader.shared(List.of(target)));
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+
+        ConnectorRef ref = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir)
+                .resolve("orders");
+
+        assertThat(ref.classpath()).containsExactly(target);
+        assertThat(placedFile.get()).as("this file system names a file by a key").isNotNull();
+        assertThat(fileKey(target)).as("the file the other stager placed, not one renamed over it")
+                .isEqualTo(placedFile.get());
+        assertThat(ConnectorClassLoader.shared(ref.classpath()))
+                .as("the loader a connector was already opened through")
+                .isSameAs(placedLoader.get());
     }
 
     @Test
@@ -116,6 +183,10 @@ class RegistryConnectorProvisionerTest {
                 () -> new RegistryConnectorProvisioner(registry, null, cacheDir));
         assertThatNullPointerException().isThrownBy(
                 () -> new RegistryConnectorProvisioner(registry, introspector, null));
+    }
+
+    private static Object fileKey(Path file) throws IOException {
+        return Files.readAttributes(file, BasicFileAttributes.class).fileKey();
     }
 
 }

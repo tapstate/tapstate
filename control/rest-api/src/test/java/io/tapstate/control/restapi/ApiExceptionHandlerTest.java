@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import io.tapstate.control.core.ArtifactError;
 import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
@@ -12,6 +13,12 @@ import io.tapstate.messages.MessageCatalog;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.web.context.request.RequestAttributes;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+import tools.jackson.databind.ObjectMapper;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -29,6 +36,38 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
+
+    @Test
+    void mvcAndSecurityExposeOnlyTheExistingErrorWhileCloudDiagnosticsKeepItsCode() throws Exception {
+        RequestAttributes previous = RequestContextHolder.getRequestAttributes();
+        try {
+            MockHttpServletRequest request = new MockHttpServletRequest();
+            request.setAttribute(CloudAuthenticationObserver.REQUEST_ID_CONTEXT_KEY, "controlled-request");
+            RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+            ResponseEntity<ApiError> mvc = handler.handle(
+                    new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null));
+            assertThat(mvc.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            assertThat(mvc.getBody().code()).isEqualTo(ControlError.UNAUTHENTICATED.code());
+            assertThat(request.getAttribute(CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY))
+                    .isEqualTo(ControlError.UNAUTHENTICATED.code());
+
+            request.removeAttribute(CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY);
+            MockHttpServletResponse response = new MockHttpServletResponse();
+            new ApiSecurityErrorWriter(MessageCatalog.bundled(), new ObjectMapper()).unauthenticated(request, response);
+            assertThat(response.getStatus()).isEqualTo(401);
+            assertThat(response.getContentAsString()).contains(ControlError.UNAUTHENTICATED.code());
+            assertThat(request.getAttribute(CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY))
+                    .isEqualTo(ControlError.UNAUTHENTICATED.code());
+
+            request.removeAttribute(CloudAuthenticationObserver.REQUEST_ID_CONTEXT_KEY);
+            request.removeAttribute(CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY);
+            handler.handle(new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null));
+            assertThat(request.getAttribute(CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY)).isNull();
+        } finally {
+            if (previous == null) RequestContextHolder.resetRequestAttributes();
+            else RequestContextHolder.setRequestAttributes(previous);
+        }
+    }
 
     @Test
     void aClientInputErrorIsABadRequestWithACodedRenderedBody() {
@@ -74,6 +113,15 @@ class ApiExceptionHandlerTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
         assertThat(response.getBody().code()).isEqualTo("control.audit-blocked");
         assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("control.audit-blocked");
+    }
+
+    @Test
+    void anOverloadedPreviewAnswersServiceUnavailable() {
+        ResponseEntity<ApiError> response = handler.handle(
+                new TapstateException(ControlError.PREVIEW_OVERLOADED, Map.of(), null));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getBody().code()).isEqualTo("control.preview-overloaded");
     }
 
     @Test

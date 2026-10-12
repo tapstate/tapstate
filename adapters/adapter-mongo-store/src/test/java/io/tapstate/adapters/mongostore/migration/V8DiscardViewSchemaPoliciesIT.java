@@ -6,6 +6,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.MongoArtifactStore;
+import io.tapstate.adapters.mongostore.SourceConfigCipher;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
@@ -51,7 +52,7 @@ class V8DiscardViewSchemaPoliciesIT {
         artifacts.insertMany(List.of(releasedInlineView(), releasedReusableView()));
         SystemCollections.SYSTEM_META.on(database)
                 .insertOne(new Document("_id", "schema").append("installedVersion", 7));
-        MongoArtifactStore store = new MongoArtifactStore(client, artifacts);
+        MongoArtifactStore store = new MongoArtifactStore(client, artifacts, new SourceConfigCipher(new byte[32]));
 
         assertUnreadable(store, "orders", "view.schema");
         assertUnreadable(store, "enforced_view", "schema");

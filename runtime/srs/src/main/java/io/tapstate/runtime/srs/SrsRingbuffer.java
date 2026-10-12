@@ -34,6 +34,11 @@ public final class SrsRingbuffer {
         this.ringbuffer = Objects.requireNonNull(ringbuffer, "ringbuffer");
     }
 
+    /** The resolved ring identity, carried in recovery diagnostics. */
+    String name() {
+        return ringbuffer.getName();
+    }
+
     /**
      * The ring name for one table of a mining chain — the per-chain, per-table namespace under which
      * the ring is created and looked up.

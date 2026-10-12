@@ -11,9 +11,13 @@ final class AuthenticatedCaller {
     }
 
     static String subject() {
+        return principal().subject();
+    }
+
+    static TapstatePrincipal principal() {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
         if (authentication != null && authentication.getPrincipal() instanceof TapstatePrincipal principal) {
-            return principal.subject();
+            return principal;
         }
         throw new IllegalStateException("an audited REST controller requires a verified Tapstate principal");
     }

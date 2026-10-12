@@ -32,6 +32,7 @@ import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.runtime.engine.nest.NestVertex;
+import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.spi.store.KeyedStateStore;
 
 import java.io.IOException;
@@ -256,7 +257,8 @@ public final class NestCrashHarness {
                 new NestBinding(tables::get, NestBinding.onMap().bind(member),
                         (from, released) -> report.line("unassemblable=" + from + ":" + released)),
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
-                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
+                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))),
+                new NodeWidth("doc", 4, 1, null));
 
         Vertex collector = dag.newVertex("collector", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)));

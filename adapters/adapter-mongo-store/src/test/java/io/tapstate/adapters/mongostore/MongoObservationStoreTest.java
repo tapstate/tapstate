@@ -91,6 +91,41 @@ class MongoObservationStoreTest {
     }
 
     @Test
+    void aLandedTableIsStoredAsLandedAndOneStillLandingIsStoredAsBeforeTheFieldExisted() {
+        Observation obs = new Observation("p1", PipelineState.RUNNING, Map.of(), Map.of(
+                "orders", new TableSnapshot(10L, 10L, 100, true),
+                "customers", new TableSnapshot(4L, 9L, 44, false)));
+
+        Document snapshot = (Document) MongoObservationStore.toDocument(obs).get("snapshot");
+
+        assertThat(((Document) snapshot.get("orders")).get("landed")).isEqualTo(true);
+        assertThat((Document) snapshot.get("customers")).doesNotContainKey("landed");
+        assertThat(MongoObservationStore.toObservation(MongoObservationStore.toDocument(obs))).isEqualTo(obs);
+    }
+
+    @Test
+    void aTableStoredBeforeLandingWasRecordedReadsBackAsLanding() {
+        Document stored = new Document("_id", "p1")
+                .append("state", "RUNNING")
+                .append("snapshot", new Document("orders", new Document("rowsDone", 10L).append("rowsTotal", 10L)
+                        .append("donePct", 100)));
+
+        assertThat(MongoObservationStore.toObservation(stored).snapshot().get("orders").landed()).isFalse();
+    }
+
+    @Test
+    void aLandedFieldThatIsNotABooleanIsDocumentUnreadable() {
+        Document corrupt = new Document("_id", "p1")
+                .append("state", "RUNNING")
+                .append("snapshot", new Document("orders", new Document("rowsDone", 10L).append("landed", "yes")));
+
+        Throwable thrown = catchThrowable(() -> MongoObservationStore.toObservation(corrupt));
+
+        assertThat(thrown).isInstanceOf(TapstateException.class);
+        assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+    }
+
+    @Test
     void roundTripsAStateOnlyObservationWithEmptyMetricsAndSnapshot() {
         Observation obs = new Observation("p1", PipelineState.NEW, Map.of(), Map.of());
 

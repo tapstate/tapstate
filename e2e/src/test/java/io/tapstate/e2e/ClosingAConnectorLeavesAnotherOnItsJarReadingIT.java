@@ -28,8 +28,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>The harness connector holds its read open between two signal files, so the connectors meet in that
  * state every run rather than when a race happens to line them up. The specification vocabulary has no word
- * for holding a connector part way through a read, which is why this is Java. Without the fix the held
- * discovery fails with "Stream closed".
+ * for holding a connector part way through a read, which is why this is Java. When it was written, the held
+ * discovery failed with "Stream closed" without the fix. A running server now opens every connector over one
+ * artifact through one class loader that a close leaves open, so this holds without that fix as well; it
+ * stays as the guard on what a pipeline sees, whichever of the two keeps it true.
  */
 class ClosingAConnectorLeavesAnotherOnItsJarReadingIT {
 

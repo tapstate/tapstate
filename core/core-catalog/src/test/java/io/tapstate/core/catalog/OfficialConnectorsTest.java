@@ -22,7 +22,8 @@ class OfficialConnectorsTest {
                 "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
                 "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
                 "tencent-db-postgres",
-                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver");
+                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
+                "db2");
     }
 
     @Test
@@ -40,6 +41,10 @@ class OfficialConnectorsTest {
                         .isInstanceOf(UnsupportedOperationException.class));
         assertThatThrownBy(() -> OfficialConnectors.IDS.add("other"))
                 .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> OfficialConnectors.SOURCE_ONLY_IDS.add("other"))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> OfficialConnectors.PREVIEW_IDS.add("other"))
+                .isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
@@ -54,5 +59,48 @@ class OfficialConnectorsTest {
     void membershipIsAskedOfTheSameList() {
         assertThat(OfficialConnectors.isOfficial("mysql")).isTrue();
         assertThat(OfficialConnectors.isOfficial("kafka")).isFalse();
+    }
+
+    @Test
+    void pinsThePreviewIdsAndKeepsThemOutOfEveryVerifiedKind() {
+        // A preview is accepted without a verified database behind it. Listed under a kind as well, it
+        // would quietly pick up that kind's verification promise, which no release lane keeps for it.
+        assertThat(OfficialConnectors.PREVIEW_IDS).containsExactly("db2");
+        // Flattened and pinned first: over an empty set of kinds, "contains no preview" holds trivially.
+        List<String> idsUnderAKind = OfficialConnectors.IDS_BY_DATABASE_KIND.values().stream()
+                .flatMap(List::stream)
+                .toList();
+        assertThat(idsUnderAKind)
+                .contains("mysql", "sqlserver")
+                .doesNotContainAnyElementsOf(OfficialConnectors.PREVIEW_IDS);
+        assertThat(OfficialConnectors.IDS).endsWith(OfficialConnectors.PREVIEW_IDS.toArray(String[]::new));
+        assertThat(OfficialConnectors.isOfficial("db2")).isTrue();
+    }
+
+    @Test
+    void pinsTheConnectorsSupportedAsASourceOnly() {
+        // Pinned like the supported set: adding an id withdraws a target role users may rely on, and
+        // removing one grants a target role nobody has certified.
+        assertThat(OfficialConnectors.SOURCE_ONLY_IDS).containsExactly("db2");
+        assertThat(OfficialConnectors.isSourceOnly("db2")).isTrue();
+        assertThat(OfficialConnectors.isSourceOnly("mysql")).isFalse();
+    }
+
+    @Test
+    void aSourceOnlyIdIsOneThisReleaseSupports() {
+        // A source-only id outside the supported set could never be registered, so its boundary would
+        // describe a connector no deployment can hold.
+        assertThat(OfficialConnectors.IDS).containsAll(OfficialConnectors.SOURCE_ONLY_IDS);
+    }
+
+    @Test
+    void theBundledCatalogOffersNoSourceOnlyConnectorAsATarget() {
+        TapstateCatalog catalog = TapstateCatalog.load();
+        for (String id : OfficialConnectors.SOURCE_ONLY_IDS) {
+            ConnectorCatalogEntry entry = catalog.byId(id);
+            assertThat(entry.sink().capable()).as("sink capability of source-only %s", id).isFalse();
+            assertThat(entry.modes()).as("source modes of source-only %s", id)
+                    .contains(io.tapstate.core.model.SourceMode.SNAPSHOT, io.tapstate.core.model.SourceMode.CDC);
+        }
     }
 }

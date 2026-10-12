@@ -147,7 +147,8 @@ class PipelineContinuesOnSurvivingMemberIT {
                                 + "rebuild that kept going would also leave this higher, and a pipeline "
                                 + "rebuilt three times before it caught is not a recovered one")
                         .contains(generationBefore + 1);
-                TableSnapshot completedLoad = new TableSnapshot(SEEDED_ROWS, SEEDED_ROWS, 100);
+                // Landed as well as complete: the load the dead run confirmed is one its target durably holds.
+                TableSnapshot completedLoad = new TableSnapshot(SEEDED_ROWS, SEEDED_ROWS, 100, true);
                 Await.until("the replacement observation to retain the confirmed load without rereading it",
                         Duration.ofSeconds(30),
                         () -> Long.valueOf(0L).equals(survivor.snapshotRowsRead(PIPELINE).get(TABLE))

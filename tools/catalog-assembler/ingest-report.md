@@ -2,7 +2,7 @@
 
 Spec SHA: `cc13816`
 Capability SHA: `cc13816`
-Ingested connectors: 80
+Ingested connectors: 81
 
 ## Unclassified — no resolvable mode (need tapstate.modes)
 - ai-chat

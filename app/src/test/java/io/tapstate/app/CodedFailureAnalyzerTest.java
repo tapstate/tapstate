@@ -27,10 +27,26 @@ class CodedFailureAnalyzerTest {
         FailureAnalysis analysis = new CodedFailureAnalyzer().analyze(coded);
 
         assertThat(analysis).as("a coded startup failure produces an analysis").isNotNull();
-        assertThat(analysis.getDescription()).isEqualTo("Cannot reach the store at localhost:27017.");
+        assertThat(analysis.getDescription()).isEqualTo("[store.unreachable] Cannot reach the store at localhost:27017.");
         assertThat(analysis.getAction())
                 .isEqualTo("Check the store is running and the connection settings are correct, then restart.");
         assertThat(analysis.getCause()).isSameAs(coded);
+    }
+
+    @Test
+    void earlyConfigurationFailuresRetainTheirCanonicalCodeWithoutDumpingArgumentsOrCause() {
+        String sentinel = "startup-diagnostic-secret-sentinel";
+        TapstateException coded = new TapstateException(BootError.CLOUD_CONFIG_INCOMPLETE,
+                Map.of("unrendered", sentinel), new IllegalArgumentException(sentinel));
+        FailureAnalysis analysis = new CodedFailureAnalyzer().analyze(coded);
+        assertThat(analysis.getDescription()).startsWith("[boot.cloud-config-incomplete] ")
+                .doesNotContain(sentinel, "unrendered");
+        assertThat(analysis.getAction()).doesNotContain(sentinel);
+    }
+
+    @Test
+    void programmerDefectsAreNotReclassifiedAsCodedStartupFailures() {
+        assertThat(new CodedFailureAnalyzer().analyze(new IllegalStateException("programmer-defect"))).isNull();
     }
 
     @Test

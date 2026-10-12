@@ -100,6 +100,50 @@ class MongoTargetPreparationIT {
         }
     }
 
+    /**
+     * The same refusal where the tables are prepared once, ahead of every writer of the sink, which is how a
+     * run prepares them: the preparation is made on a connector opened for that alone, and has to know which
+     * connector it is preparing for as much as a writer's own would.
+     */
+    @Test
+    void aFullLoadFailPreparedAheadOfItsWritersRefusesAnExistingNonEmptyCollection() {
+        String database = "e2e_mongo_preparation_" + UUID.randomUUID().toString().replace("-", "");
+        String uri = SharedMongo.replicaSetUrl(database);
+        Map<String, Object> config = Map.of("uri", uri, "database", database);
+        TargetTable target = new TargetTable("orders", List.of(
+                new TargetField("id", "source_integer", true, TapstateType.INT64),
+                new TargetField("seq", "source_integer", false, TapstateType.INT64)),
+                List.of(new TargetIndex(List.of("id"), true)));
+        State state = new State();
+
+        try (var client = MongoClients.create(uri)) {
+            var mongo = client.getDatabase(database);
+            try {
+                var orders = mongo.getCollection("orders");
+                orders.insertOne(new Document("id", 99L).append("seq", 99L));
+
+                Throwable failure = catchThrowable(() -> new PdkSinkPort(connectors::get, state).prepare(
+                        new SinkConfig("mongodb", config, WriteMode.UPSERT, DdlPolicy.FAIL, target, NODE,
+                                OnFullLoad.FAIL, true),
+                        Map.of("orders", target)));
+
+                List<Document> rows = orders.find().projection(new Document("_id", 0)).into(new ArrayList<>());
+                assertThat(failure)
+                        .as("on_full_load fail must refuse a non-empty collection before any writer opens; "
+                                + "target rows: %s", rows)
+                        .isInstanceOf(TapstateException.class)
+                        .hasRootCauseInstanceOf(IllegalStateException.class)
+                        .hasStackTraceContaining("orders").hasStackTraceContaining("not empty");
+                assertThat(rows).containsExactly(new Document("id", 99L).append("seq", 99L));
+                assertThat(state.count(SinkPreparationNamespace.of(NODE)))
+                        .as("a refused preparation leaves no receipt saying the table was prepared")
+                        .isZero();
+            } finally {
+                mongo.drop();
+            }
+        }
+    }
+
     private static final class State implements KeyedStateStore {
         private final Map<String, byte[]> entries = new HashMap<>();
         public Optional<byte[]> load(String namespace, String key) { return Optional.ofNullable(entries.get(namespace + "/" + key)); }
