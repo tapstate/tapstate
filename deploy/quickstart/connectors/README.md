@@ -49,7 +49,11 @@ Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
 all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
 and 16 across these five database kinds, including existing managed variants of MySQL,
-PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
+live-verified individually. The Atlas connector was verified with snapshot and change-stream
+reads, restart continuation, and target writes against a real Atlas deployment in both cloud
+and on-prem runtimes. This verifies the tested deployment and does not establish an exhaustive
+Atlas version or tier compatibility matrix.
 Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
@@ -66,7 +70,7 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle, SQL Server and Db2 connector jars are separate assets on the floating
+Oracle, SQL Server, Db2, MongoDB Atlas, and AWS RDS MySQL connector jars are separate assets on the floating
 `connectors-preview` release. They remain outside versioned Tapstate releases and this
 three-database quickstart does not fetch them automatically. An authenticated CLI can
 download and register each one explicitly:
@@ -74,6 +78,8 @@ download and register each one explicitly:
 ```
 tapstate register oracle
 tapstate register sqlserver
+tapstate register mongodb-atlas
+tapstate register aws-rds-mysql
 tapstate register db2
 ```
 

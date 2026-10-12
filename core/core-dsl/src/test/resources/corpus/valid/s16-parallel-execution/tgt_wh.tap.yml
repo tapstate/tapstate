@@ -1,0 +1,6 @@
+# Write-target connection (pure connection supplier).
+version: tapstate/v1
+kind: source
+id: tgt_wh
+connector: mysql
+config: { host: 10.30.4.5, username: writer, password: Wh_2026 }

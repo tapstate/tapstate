@@ -25,7 +25,7 @@ final class SourceReadProjection {
         try {
             SourceResource display = new SourceResource(
                     source.id(), source.metadata(), source.connector(), Map.of(),
-                    source.mode(), source.tables(), source.srs(), source.experimental());
+                    source.mode(), source.tables(), source.srs(), source.execution(), source.experimental());
             return redactMongoUserInfo(writer.write(display));
         } catch (RuntimeException unsafeProjection) {
             // A broken stored Source is not permission to return its raw connection configuration.

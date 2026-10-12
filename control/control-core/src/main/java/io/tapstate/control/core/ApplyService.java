@@ -106,7 +106,7 @@ public final class ApplyService {
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
     private static final Set<String> SOURCE_PATCH_FIELDS = Set.of(
-            "metadata", "config", "mode", "tables", "srs", "experimental");
+            "metadata", "config", "mode", "tables", "srs", "execution", "experimental");
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
@@ -257,6 +257,7 @@ public final class ApplyService {
                 fields.contains("mode") ? submitted.mode() : existing.mode(),
                 fields.contains("tables") ? submitted.tables() : existing.tables(),
                 fields.contains("srs") ? submitted.srs() : existing.srs(),
+                fields.contains("execution") ? submitted.execution() : existing.execution(),
                 fields.contains("experimental") ? submitted.experimental() : existing.experimental());
         return new MergedSource(merged, storedHash(existing));
     }
@@ -585,6 +586,12 @@ public final class ApplyService {
         return plan;
     }
 
+    /** Prepares a publication with the verified publisher's server-managed resource attribution. */
+    public ApplyPlan planDraftPublication(String principal, Resource resource) {
+        Objects.requireNonNull(principal, "principal");
+        return attributed(principal, planDraftPublication(resource));
+    }
+
     /** Re-derives the published pipeline's schema after the artifact transaction has committed. */
     public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -614,7 +621,8 @@ public final class ApplyService {
      */
     public ApplyResult apply(String principal, List<ArtifactDraft> drafts) {
         Objects.requireNonNull(principal, "principal");
-        ApplyPlan plan = attributed(principal, plan(drafts));
+        AttributedPlan attributed = attributedWithSnapshots(principal, plan(drafts));
+        ApplyPlan plan = attributed.plan();
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
@@ -663,7 +671,14 @@ public final class ApplyService {
         // comparison and the write one store operation, which is the only form of the check that
         // survives a concurrent writer.
         ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
-            String conflicted = store.saveAll(toWrite, enforced).orElse(null);
+            String conflicted;
+            if (attribution.requiresSnapshotFence() && !toWrite.isEmpty()) {
+                List<ArtifactWrite> writes = new ArrayList<>(toWrite.stream().map(attributed::write).toList());
+                writes.set(0, writes.getFirst().guardedBy(enforced));
+                conflicted = store.writeAll(writes).refusedId();
+            } else {
+                conflicted = store.saveAll(toWrite, enforced).orElse(null);
+            }
             if (conflicted != null) {
                 throw new TapstateException(ArtifactError.VERSION_CONFLICT, Map.of("id", conflicted), null);
             }
@@ -691,14 +706,34 @@ public final class ApplyService {
     }
 
     private ApplyPlan attributed(String principal, ApplyPlan planned) {
+        return attributedWithSnapshots(principal, planned).plan();
+    }
+
+    private AttributedPlan attributedWithSnapshots(String principal, ApplyPlan planned) {
         List<PreparedArtifact> attributed = new ArrayList<>();
+        Map<String, String> existingHashes = new LinkedHashMap<>();
+        Set<String> absentIds = new LinkedHashSet<>();
         for (PreparedArtifact prepared : planned.artifacts()) {
-            Resource resource = attribution.attribute(
-                    principal, prepared.resource(), store.get(prepared.id()).orElse(null));
+            Resource existing = store.get(prepared.id()).orElse(null);
+            Resource resource = attribution.attribute(principal, prepared.resource(), existing);
+            if (attribution.requiresSnapshotFence()) {
+                if (existing == null) absentIds.add(prepared.id());
+                else existingHashes.put(prepared.id(), storedHash(existing));
+            }
             attributed.add(new PreparedArtifact(resource, writer.write(resource), CanonicalHash.of(resource)));
         }
-        return new ApplyPlan(
-                attributed, planned.warnings(), planned.preconditions(), planned.workspacePreconditions());
+        return new AttributedPlan(new ApplyPlan(
+                attributed, planned.warnings(), planned.preconditions(), planned.workspacePreconditions()),
+                Map.copyOf(existingHashes), Set.copyOf(absentIds));
+    }
+
+    private record AttributedPlan(ApplyPlan plan, Map<String, String> existingHashes, Set<String> absentIds) {
+        ArtifactWrite write(Resource resource) {
+            // The same read that supplied attribution chooses the atomic write intent. A concurrent
+            // create or delete/recreate must not let an unconditional upsert install stale provenance.
+            return absentIds.contains(resource.id()) ? ArtifactWrite.createOnly(resource)
+                    : ArtifactWrite.replaceOnly(resource, Objects.requireNonNull(existingHashes.get(resource.id())));
+        }
     }
 
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {

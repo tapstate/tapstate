@@ -11,6 +11,9 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.context.request.NativeWebRequest;
+import org.springframework.web.context.request.async.CallableProcessingInterceptor;
+import org.springframework.web.context.request.async.WebAsyncUtils;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
@@ -23,6 +26,8 @@ import java.util.ArrayList;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** NDJSON presentation for bounded, no-write Pipeline preview runs. */
 @RestController
@@ -49,16 +54,56 @@ class PipelinePreviewController {
         }
         byte[] bytes = readBounded(request.getInputStream(), MAX_REQUEST_BYTES);
         PipelinePreviewCommand command = parse(decodeRequest(bytes, json));
-        PipelinePreviewSession stream = previews.open(AuthenticatedCaller.subject(), command);
-        StreamingResponseBody response = output -> {
-            try (stream) {
+        PreviewResponse response = new PreviewResponse(json, previews.open(AuthenticatedCaller.subject(), command));
+        try {
+            WebAsyncUtils.getAsyncManager(request).registerCallableInterceptor(response, response);
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                    .contentType(MediaType.parseMediaType("application/x-ndjson"))
+                    .body(response);
+        } catch (RuntimeException | Error setupFailure) {
+            try {
+                response.close();
+            } catch (RuntimeException | Error cleanupFailure) {
+                if (cleanupFailure != setupFailure) {
+                    setupFailure.addSuppressed(cleanupFailure);
+                }
+            }
+            throw setupFailure;
+        }
+    }
+
+    private static final class PreviewResponse
+            implements StreamingResponseBody, CallableProcessingInterceptor, AutoCloseable {
+        private final ObjectMapper json;
+        private final PipelinePreviewSession stream;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        private PreviewResponse(ObjectMapper json, PipelinePreviewSession stream) {
+            this.json = json;
+            this.stream = stream;
+        }
+
+        @Override
+        public void writeTo(OutputStream output) throws IOException {
+            PreviewResponse owner = this;
+            try (owner) {
                 writeEvents(json, output, stream);
             }
-        };
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CACHE_CONTROL, "no-store")
-                .contentType(MediaType.parseMediaType("application/x-ndjson"))
-                .body(response);
+        }
+
+        @Override
+        public <T> void afterCompletion(NativeWebRequest request, Callable<T> task) {
+            // Async scheduling can fail before writeTo gets an opportunity to release the session.
+            close();
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                stream.close();
+            }
+        }
     }
 
     static Map<?, ?> decodeRequest(byte[] bytes, ObjectMapper json) {
@@ -158,10 +203,11 @@ class PipelinePreviewController {
     }
 
     static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream) throws IOException {
+        SerializationOutputStream serializationOutput = new SerializationOutputStream(output);
         try {
             PipelinePreviewEvent event;
             while ((event = stream.next()) != null) {
-                json.writeValue(output, event);
+                json.writeValue(serializationOutput, event);
                 output.write('\n');
                 output.flush();
                 if ("run.completed".equals(event.kind()) || "run.failed".equals(event.kind())) {
@@ -172,9 +218,59 @@ class PipelinePreviewController {
             Thread.currentThread().interrupt();
             stream.cancel();
             throw new IOException("Pipeline preview stream was interrupted", interrupted);
+        } catch (RuntimeException serializationFailure) {
+            if (serializationOutput.ioFailure != null) {
+                stream.cancel();
+                throw serializationOutput.ioFailure;
+            }
+            throw serializationFailure;
         } catch (IOException disconnected) {
             stream.cancel();
             throw disconnected;
+        }
+    }
+
+    private static final class SerializationOutputStream extends OutputStream {
+        private final OutputStream target;
+        private IOException ioFailure;
+
+        private SerializationOutputStream(OutputStream target) {
+            this.target = target;
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            try {
+                target.write(value);
+            } catch (IOException failure) {
+                ioFailure = failure;
+                throw failure;
+            }
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            try {
+                target.write(bytes, offset, length);
+            } catch (IOException failure) {
+                ioFailure = failure;
+                throw failure;
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            try {
+                target.flush();
+            } catch (IOException failure) {
+                ioFailure = failure;
+                throw failure;
+            }
+        }
+
+        @Override
+        public void close() {
+            // Serialization owns its generator; the servlet owns the response stream.
         }
     }
 }

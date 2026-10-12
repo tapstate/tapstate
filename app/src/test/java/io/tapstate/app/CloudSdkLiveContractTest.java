@@ -15,6 +15,7 @@ import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionStore;
 import org.junit.jupiter.api.Test;
@@ -55,6 +56,60 @@ class CloudSdkLiveContractTest {
     private static final String REQUEST_AUDIENCE = "cluster.dev.cloud.tapstate.com";
     private static final String TOKEN = "shared-static-token-sentinel";
     private static final String KID = "test-key-one";
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1})
+    void overlappingJwksKeysVerifyCallbacksWithoutAcceptingUnknownKeysOrAlteredSignedFields(int signingKey)
+            throws Exception {
+        List<KeyPair> publishedKeys = List.of(rsaKeyPair(), rsaKeyPair());
+        KeyPair unknownKey = rsaKeyPair();
+        AtomicInteger jwksRequests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/api/jwks.json", exchange -> {
+            jwksRequests.incrementAndGet();
+            respond(exchange, Map.of("keys", List.of(
+                    jwk(publishedKeys.get(0), KID),
+                    jwk(publishedKeys.get(1), "active-key"))));
+        });
+        server.start();
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            CloudProperties properties = new CloudProperties();
+            properties.setBaseUrl(baseUrl);
+            properties.setToken(TOKEN);
+            properties.setAtlasUri("mongodb://user:secret@atlas.example/cluster_meta");
+            properties.setClusterId(CLUSTER);
+            CloudSdkBridge bridge = new CloudSdkBridge(CloudRuntimeSettings.resolve(properties));
+            CloudSessionIdentity deployment = new CloudSessionIdentity(
+                    baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER);
+            assertThat(bridge.validate(jwt(publishedKeys.get(0), baseUrl), deployment, REQUEST_AUDIENCE)).isPresent();
+            String timestamp = Long.toString(Instant.now().toEpochMilli());
+            String nonce = "overlap-callback-nonce";
+            String jti = "overlap-jti";
+            String canonical = "POST|" + timestamp + "|" + nonce + "|" + jti;
+            String signature = sign(publishedKeys.get(signingKey), canonical);
+
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti, signature)).isTrue();
+            assertThat(jwksRequests.get()).isPositive();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti, sign(unknownKey, canonical))).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "GET", timestamp, nonce, jti, signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp + "1", nonce, jti, signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce + "-altered", jti, signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti + "-altered", signature)).isFalse();
+            assertThat(bridge.verify(baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, "other-cluster",
+                    "POST", timestamp, nonce, jti, signature)).isFalse();
+            assertThat(bridge.verify("https://other-issuer.example", CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER,
+                    "POST", timestamp, nonce, jti, signature)).isFalse();
+        } finally {
+            server.stop(0);
+        }
+    }
 
     @Test
     void jwtVerificationRejectionsKeepAnInternalClassificationWithoutLoggingTheJwt() throws Exception {
@@ -114,7 +169,8 @@ class CloudSdkLiveContractTest {
             exchanges.incrementAndGet();
             respond(exchange, Map.of("opId", "jwks-failed-exchange", "code", "ok", "msg", "ok",
                     "data", Map.of("jwt", rawJwt, "expiresAt", "2030-01-01T00:00:00Z", "jti", "jwt-one",
-                            "userEmail", "user@example.test", "orgId", "org-one", "clusterId", CLUSTER)));
+                            "userEmail", "user@example.test", "orgId", "org-one", "clusterId", CLUSTER,
+                            "organizationName", "Organization One", "clusterName", "Cluster One", "region", "us-east-1")));
         });
         server.createContext("/v1/api/jwks.json", exchange -> {
             jwksRequests.incrementAndGet();
@@ -240,7 +296,10 @@ class CloudSdkLiveContractTest {
                             "jti", "jwt-one",
                             "userEmail", "user@example.test",
                             "orgId", "org-one",
-                            "clusterId", CLUSTER)));
+                            "clusterId", CLUSTER,
+                            "organizationName", "Organization One",
+                            "clusterName", "Cluster One",
+                            "region", "us-east-1")));
         });
         server.createContext("/v1/api/jwks.json", exchange -> respond(exchange, jwks(keyPair)));
         server.createContext("/v1/api/clusters/" + CLUSTER + "/status-report", exchange -> {
@@ -265,7 +324,10 @@ class CloudSdkLiveContractTest {
             for (String audience : List.of(REQUEST_AUDIENCE, "cluster.cloud.tapstate.com", "data.customer.example")) {
                 requestedAudience.set(audience);
                 String code = "one-time-code-" + ++expectedExchanges;
-                String exchanged = bridge.exchange(code, CLUSTER);
+                var result = bridge.exchangeWithContext(code, CLUSTER);
+                assertThat(result.context()).isEqualTo(new CloudSessionContext(
+                        "org-one", CLUSTER, "Organization One", "Cluster One", "us-east-1"));
+                String exchanged = result.jwt();
                 assertThat(bridge.validate(exchanged, deployment, audience)).hasValueSatisfying(login -> {
                     assertThat(login.userId()).isEqualTo("stable-user-one");
                     assertThat(login.jwtId()).isEqualTo("jwt-one");
@@ -342,14 +404,18 @@ class CloudSdkLiveContractTest {
     }
 
     private static Map<String, Object> jwks(KeyPair keyPair) {
+        return Map.of("keys", List.of(jwk(keyPair, KID)));
+    }
+
+    private static Map<String, Object> jwk(KeyPair keyPair, String keyId) {
         RSAPublicKey key = (RSAPublicKey) keyPair.getPublic();
-        return Map.of("keys", List.of(Map.of(
+        return Map.of(
                 "kty", "RSA",
-                "kid", KID,
+                "kid", keyId,
                 "use", "sig",
                 "alg", "RS256",
                 "n", base64(unsigned(key.getModulus().toByteArray())),
-                "e", base64(unsigned(key.getPublicExponent().toByteArray())))));
+                "e", base64(unsigned(key.getPublicExponent().toByteArray())));
     }
 
     private static String sign(KeyPair keyPair, String canonical) throws Exception {

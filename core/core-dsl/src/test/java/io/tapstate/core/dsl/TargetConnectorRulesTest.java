@@ -184,6 +184,113 @@ class TargetConnectorRulesTest {
     }
 
     @Test
+    void leavesTheReadSideAlone() {
+        // The same batch that refuses writing to mysql above reads from mysql here, and the only
+        // difference is which side of the pipeline the connection is on.
+        assertThatCode(() -> validate(true,
+                READ_SOURCE, target("tgt_mg", "mongodb"), pipelineWritingTo("tgt_mg")))
+                .doesNotThrowAnyException();
+
+        Throwable t = catchThrowable(() -> validate(true,
+                READ_SOURCE, target("tgt_my", "mysql"), pipelineWritingTo("tgt_my")));
+        assertThat(t).isInstanceOf(DslException.class);
+        assertThat(((DslException) t).args()).containsEntry("connector", "mysql");
+    }
+
+    @ParameterizedTest(name = "RDS MySQL remains source-only in cloud={0}")
+    @ValueSource(booleans = {false, true})
+    void awsRdsMysqlMayBeReadButNotUsedAsASyncTarget(boolean cloud) {
+        String awsSource = READ_SOURCE.replace("connector: mysql", "connector: aws-rds-mysql");
+        assertThatCode(() -> validate(cloud,
+                awsSource, target("tgt_mg", "mongodb-atlas"), pipelineWritingTo("tgt_mg")))
+                .doesNotThrowAnyException();
+
+        Throwable failure = catchThrowable(() -> validate(cloud,
+                awsSource, target("tgt_aws", "aws-rds-mysql"), pipelineWritingTo("tgt_aws")));
+        assertThat(failure).isInstanceOf(DslException.class);
+        DslException refusal = (DslException) failure;
+        assertThat(refusal.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+        assertThat(refusal.path()).isEqualTo("serve.sync[0].source");
+        assertThat(refusal.args()).containsEntry("connector", "aws-rds-mysql");
+    }
+
+    @Test
+    void onPremAcceptsAnElasticsearchSinkFromTheCatalog() {
+        assertThatCode(() -> validate(false,
+                READ_SOURCE, target("tgt_es", "elasticsearch"), pipelineWritingTo("tgt_es")))
+                .doesNotThrowAnyException();
+    }
+
+    // ---- what is judged, and what is only resolved ---------------------------------------
+
+    @Test
+    void judgesASyncWhoseTargetTheBatchDidNotResubmit() {
+        // A connection document is filed once and referred to by every later batch, so a target
+        // resolved only within the batch is a target normally not found -- and a rule that passes
+        // what it cannot resolve would then pass the ordinary case. What reaches apply with the
+        // target still stored has its own cases in control-core; this one is the rule alone.
+        Throwable t = catchThrowable(() -> validate(true,
+                List.of(READ_SOURCE, pipelineWritingTo("tgt_pg")),
+                List.of(target("tgt_pg", "postgres"))));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        assertThat(((DslException) t).code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+    }
+
+    @Test
+    void leavesAStoredPipelineThisBatchDidNotSubmitAlone() {
+        // The same stored pipeline the case above refuses when it is applied. Here the batch only
+        // rotates the connection it reads from, and nothing it submitted installs a write.
+        String rotated = """
+                version: tapstate/v1
+                kind: source
+                id: src_my
+                connector: mysql
+                config: { password: rotated }
+                mode: cdc
+                tables: [ orders ]
+                """;
+
+        assertThatCode(() -> validate(true,
+                List.of(rotated),
+                List.of(READ_SOURCE, target("tgt_pg", "postgres"), pipelineWritingTo("tgt_pg"))))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void judgesASyncCarriedByAServeDefinition() {
+        Throwable t = catchThrowable(() -> validate(true,
+                READ_SOURCE, target("tgt_pg", "postgres"), definitionWritingTo("tgt_pg"), DEFINITION_USING));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        DslException ex = (DslException) t;
+        assertThat(ex.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+        // The element is written in the definition, where there is no `serve:` key above it, so a
+        // path carrying one would not resolve in the document the author has to edit.
+        assertThat(ex.path()).isEqualTo("sync[0].source");
+        assertThat(ex.args()).containsEntry("resource", "out");
+    }
+
+    @Test
+    void judgesADefinitionReachedOnlyThroughTheSubmittedPipeline() {
+        // Nothing existence-checks a standalone definition's sinks, and the pipeline that uses one is
+        // what installs its writes -- so applying the pipeline has to reach them wherever they live.
+        Throwable t = catchThrowable(() -> validate(true,
+                List.of(DEFINITION_USING),
+                List.of(READ_SOURCE, target("tgt_pg", "postgres"), definitionWritingTo("tgt_pg"))));
+
+        assertThat(t).isInstanceOf(DslException.class);
+        assertThat(((DslException) t).args()).containsEntry("resource", "out");
+    }
+
+    @Test
+    void acceptsADefinitionOnTheSupportedKind() {
+        assertThatCode(() -> validate(true,
+                READ_SOURCE, target("tgt_mg", "mongodb-atlas"), definitionWritingTo("tgt_mg"), DEFINITION_USING))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     void judgesAStoredPipelineWhenTheTargetItWritesToIsMovedOntoARefusedConnector() {
         Throwable thrown = catchThrowable(() -> validate(false,
                 List.of(target("tgt", "db2")),

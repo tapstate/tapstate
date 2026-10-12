@@ -23,6 +23,7 @@ import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.CreatedToken;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DataBrowserService;
+import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
@@ -39,12 +40,18 @@ import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
+import io.tapstate.control.core.SampleSourceCredentialsProvider;
+import io.tapstate.control.core.SampleSourceService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.control.core.SourceProjectionService;
+import io.tapstate.control.core.SourceRepresentation;
+import io.tapstate.control.core.StateStoreSetupService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
+import io.tapstate.control.core.ViewCatalogService;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -182,6 +189,31 @@ class AuthTest {
         assertThat(body.code()).isEqualTo("control.unauthenticated");
         // The refusal echoes nothing back, so it cannot be used to probe which credentials exist.
         assertThat(body.params()).isEmpty();
+    }
+
+    @Test
+    void sampleCatalogAndAsyncInstallationUseTheSharedAuthenticationAndScopeBoundary() {
+        for (String route : List.of("/api/sample-sources/catalog", "/api/sample-sources/installations/unknown")) {
+            ApiError anonymous = client().get().uri(route).exchange((request, response) -> {
+                assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                return response.bodyTo(ApiError.class);
+            });
+            assertThat(anonymous.code()).isEqualTo("control.unauthenticated");
+        }
+        String reader = machineToken(Scope.READ);
+        ResponseEntity<String> catalog = client().get().uri("/api/sample-sources/catalog")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + reader).retrieve().toEntity(String.class);
+        assertThat(catalog.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(catalog.getBody()).doesNotContain("password", "token", "config");
+
+        ApiError refused = client().post().uri("/api/sample-sources/installations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + reader).contentType(MediaType.APPLICATION_JSON)
+                .body("{\"ids\":[\"sample_core_banking\"]}").exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(refused.code()).isEqualTo("control.forbidden");
+        assertThat(refused.params()).containsEntry("op", "sample-source.install");
     }
 
     @Test
@@ -1028,6 +1060,33 @@ class AuthTest {
         @Bean
         SourceSchemaQueryService sourceSchemaQueryService(InMemoryArtifactStore store) {
             return new SourceSchemaQueryService(store, new EmptySchemaStore());
+        }
+
+        @Bean
+        ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
+                PipelineObservationQueryService observations, DataBrowserService browser,
+                SourceSchemaQueryService schemas, Clock clock) {
+            return new ViewCatalogService(artifacts, observations, browser, schemas, clock);
+        }
+
+        @Bean
+        SampleSourceService sampleSourceService(SourceProjectionService sources,
+                SchemaDiscoveryService discovery, ConnectionTestService connections,
+                ConnectorCatalogView connectors) {
+            return new SampleSourceService(sources, discovery, connections, connectors,
+                    new SampleSourceCredentialsProvider() {
+                        @Override public boolean available() { return false; }
+                        @Override public Credentials fetch() {
+                            throw new IllegalStateException("Sample credentials are not configured in this fixture");
+                        }
+                    });
+        }
+
+        @Bean
+        StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
+                SourceRepresentation representation, ConnectionTestService connections) {
+            return new StateStoreSetupService(apply, artifacts, representation,
+                    DeploymentProfile.ON_PREM, connections);
         }
 
         // The three data-browser controller methods are bundled too, so their service must be present for

@@ -45,6 +45,38 @@ class SourceRepresentationTest {
     }
 
     @Test
+    void carriesHowTheSourceIsReadBothWays() {
+        // A source's execution block reaches the model and comes back out unchanged. Dropped on the way
+        // in, a saved source would lose the batch its author set; dropped on the way out, an editor would
+        // show the defaults for a source that is read otherwise.
+        SourceDraft draft = new SourceDraft(
+                "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc", null, null, null,
+                Map.of("parallelism", 2, "batch", Map.of("maxRecords", 512)), null, List.of());
+
+        SourceResource model = representation.toModel(draft, null);
+
+        assertThat(model.execution()).isEqualTo(
+                new io.tapstate.core.model.ExecutionSpec(2, new io.tapstate.core.model.BatchSpec(512, null)));
+        SourceView view = representation.toView(model, "e".repeat(64));
+        assertThat(view.execution()).isEqualTo(linkedMap(
+                "parallelism", 2, "batch", linkedMap("maxRecords", 512, "maxWait", null)));
+    }
+
+    @Test
+    void refusesAPerMemberCountOnASourceByName() {
+        SourceDraft draft = new SourceDraft(
+                "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc", null, null, null,
+                Map.of("local_parallelism", 2), null, List.of());
+
+        assertThatThrownBy(() -> representation.toModel(draft, null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(String.valueOf(error.args().get("reason")))
+                            .contains("local_parallelism is not a field of execution");
+                });
+    }
+
+    @Test
     void refusesATableDraftCarryingOptions() {
         SourceDraft draft = new SourceDraft(
                 "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc",

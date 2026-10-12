@@ -36,6 +36,11 @@ public final class ResourceAttributionPolicy {
         return new ResourceAttributionPolicy(true);
     }
 
+    /** Managed writes must atomically preserve the snapshot supplying their creator attribution. */
+    boolean requiresSnapshotFence() {
+        return managedCloud;
+    }
+
     /**
      * Returns the resource that may be persisted. {@code existing} is null for a create. The caller's
      * principal is already verified by the selected authentication implementation and is therefore the
@@ -123,14 +128,14 @@ public final class ResourceAttributionPolicy {
         return switch (resource) {
             case SourceResource source -> new SourceResource(
                     source.id(), metadata, source.connector(), source.config(), source.mode(), source.tables(),
-                    source.srs(), source.experimental());
+                    source.srs(), source.execution(), source.experimental());
             case PipelineResource pipeline -> new PipelineResource(
                     pipeline.id(), metadata, pipeline.sources(), pipeline.transforms(), pipeline.view(),
                     pipeline.serve(), pipeline.settings(), pipeline.experimental());
             case TransformResource transform -> new TransformResource(
                     transform.id(), metadata, transform.body(), transform.experimental());
             case ViewResource view -> new ViewResource(
-                    view.id(), metadata, view.primaryKey(), view.storage(), view.experimental());
+                    view.id(), metadata, view.primaryKey(), view.storage(), view.execution(), view.experimental());
             case ServeResource serve -> new ServeResource(
                     serve.id(), metadata, serve.sync(), serve.query(), serve.push(), serve.experimental());
         };

@@ -566,7 +566,7 @@ jobs:
           if-no-files-found: error
 
   cloud-image:
-    # The image is built and verified before approval, without pushing it. Its seven connector
+    # The image is built and verified before approval, without pushing it. Its locked connector
     # bytes and companion license texts must match the versioned lock in this release commit.
     needs: [version, cloud-server-jar, server-image]
     runs-on: ubuntu-latest
@@ -1402,6 +1402,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1429,6 +1430,7 @@ jobs:
         env:
           CLOUD_GHCR_USERNAME: ${{ vars.CLOUD_GHCR_USERNAME }}
           CLOUD_GHCR_TOKEN: ${{ secrets.CLOUD_GHCR_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           bash deploy/cloud/ghcr-publish.sh publish
           --archive "$RUNNER_TEMP/cloud-image/cloud-image.tar"

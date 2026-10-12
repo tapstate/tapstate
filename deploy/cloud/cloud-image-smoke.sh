@@ -28,8 +28,9 @@ cleanup() {
     fi
   done
   for resource in "${VOLUMES[@]}"; do
-    [[ "$(docker volume inspect -f "{{index .Labels \"$label\"}}" "$resource" 2>/dev/null || true)" = "$OWNER" ]] \
-      && docker volume rm "$resource" >/dev/null 2>&1 || true
+    if [[ "$(docker volume inspect -f "{{index .Labels \"$label\"}}" "$resource" 2>/dev/null || true)" = "$OWNER" ]]; then
+      docker volume rm "$resource" >/dev/null 2>&1 || true
+    fi
   done
   if [[ "$(docker network inspect -f "{{index .Labels \"$label\"}}" "$NETWORK" 2>/dev/null || true)" = "$OWNER" ]]; then
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
@@ -204,7 +205,7 @@ refuses onprem-with-cloud-config "$ONPREM" boot.web-profile-mode-mismatch "${CLO
   -e 'TAPSTATE_CLOUD_ATLAS_URI=mongodb://mongo:27017/image_crossed?replicaSet=rs0'
 mkdir "$WORK/missing" "$WORK/damaged"
 docker cp "$SERVER:/opt/tapstate/connectors/." "$WORK/damaged/"
-# Mutate an owned copy, never the input image or the seven shared published artifacts.
+# Mutate an owned copy, never the input image or the shared published artifacts.
 printf 'changed-owned-fixture' >>"$WORK/damaged/mongodb-atlas-connector.jar"
 for scenario in missing damaged; do
   refuses "cloud-$scenario-seed" "$CLOUD" boot.cloud-connectors-invalid "${CLOUD_ENV[@]}" \
@@ -219,4 +220,4 @@ for sentinel in image-runtime-static-token-sentinel image-runtime-one-time-code-
     exit 1
   fi
 done
-echo 'PASS: real Cloud/onprem images, seven locked registrations, restart/session/C2, shutdown and five fail-closed startup scenarios'
+echo 'PASS: real Cloud/onprem images, eight locked registrations, restart/session/C2, shutdown and five fail-closed startup scenarios'

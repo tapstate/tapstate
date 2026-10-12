@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.Set;
@@ -52,7 +53,9 @@ class MongoCloudSessionStoreTest {
         assertThat(key).isNotEqualTo(MongoCloudSessionStore.sessionKey(IDENTITY, "jwt-two"));
         assertThat(MongoCloudSessionStore.sessionKey(new CloudSessionIdentity("a", "bc", "d"), "e"))
                 .isNotEqualTo(MongoCloudSessionStore.sessionKey(new CloudSessionIdentity("ab", "c", "d"), "e"));
-        assertThat(key).isNotEqualTo("jwt-one");
+        String rawKey = "0123456789abcdef0123456789abcdef";
+        assertThat(MongoCloudSessionStore.sessionKey(IDENTITY, rawKey).getData())
+                .isNotEqualTo(rawKey.getBytes(StandardCharsets.UTF_8));
     }
 
     @Test

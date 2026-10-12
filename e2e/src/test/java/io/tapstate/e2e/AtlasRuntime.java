@@ -79,11 +79,16 @@ final class AtlasRuntime implements AutoCloseable {
     }
 
     ServerHandle launch(Tiers tier) {
+        return launch(tier, List.of());
+    }
+
+    ServerHandle launch(Tiers tier, List<String> additionalArguments) {
         List<String> arguments = new ArrayList<>(List.of(
                 "--spring.config.location=optional:classpath:/application.properties",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--logging.level.root=ERROR", "--logging.level.io.tapstate.app.Bootstrap=INFO",
                 "--SDK_STATUS_SENDER_ENABLED=false"));
+        arguments.addAll(additionalArguments);
         if (mode == Mode.CLOUD) {
             arguments.addAll(List.of("--tapstate.cloud.base-url=" + issuer,
                     "--tapstate.cloud.token=" + TOKEN, "--tapstate.cloud.atlas-uri=" + storeUri,
@@ -176,7 +181,9 @@ final class AtlasRuntime implements AutoCloseable {
         Instant expires = Instant.now().plusSeconds(900);
         respond(exchange, 200, Map.of("opId", "atlas-exchange", "code", "ok", "msg", "ok", "data", Map.of(
                 "jwt", jwt(audience, jti, expires), "expiresAt", expires.toString(), "jti", jti,
-                "userEmail", "atlas-user@example.test", "orgId", "atlas-data-org", "clusterId", CLUSTER)));
+                "userEmail", "atlas-user@example.test", "orgId", "atlas-data-org", "clusterId", CLUSTER,
+                "organizationName", "Atlas Test Organization", "clusterName", "Atlas Test Cluster",
+                "region", "test-region")));
     }
 
     private String jwt(String audience, String jti, Instant expires) {

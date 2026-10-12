@@ -95,6 +95,9 @@ class PipelineCatalogServiceTest {
         assertThat(byId.get("draft-only").name()).isEqualTo("draft-only");
         assertThat(byId.get("draft-only").description()).isNull();
         assertThat(byId.get("draft-only").hasArtifact()).isFalse();
+        assertThat(byId.get("draft-only").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+        assertThat(byId.get("draft-only").status().displayState()).isEqualTo(PipelineCatalogItem.UiState.DRAFT);
+        assertThat(service.find("draft-only")).contains(byId.get("draft-only"));
 
         assertThat(byId.get("artifact-stop").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.STOPPING);
         assertThat(byId.get("failed").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.FAILED);
@@ -113,6 +116,9 @@ class PipelineCatalogServiceTest {
                 .isEqualTo(PipelineCatalogItem.DisplayState.COMPLETED);
         assertThat(byId.get("corrupt-intent").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+        assertThat(byId.get("new").hasArtifact()).isTrue();
+        assertThat(byId.get("new").status().displayState()).isEqualTo(PipelineCatalogItem.UiState.NEW);
+        assertThat(service.find("new")).contains(byId.get("new"));
         assertThat(service.list(0, 2)).extracting(PipelineCatalogItem::id)
                 .containsExactly("artifact-stop", "completed-running-intent");
     }

@@ -2,7 +2,6 @@ package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
-import io.tapstate.core.event.EventJsonValues;
 import io.tapstate.spi.capture.BoundedSnapshotQueryPort;
 import io.tapstate.spi.capture.BoundedQueryCancellation;
 import io.tapstate.spi.capture.BoundedSnapshotQueryRequest;
@@ -38,7 +37,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
 
     private final ConnectorProvisioner provisioner;
     private final Clock clock;
-    private final ConnectorInstancePool<PdkConnector> pool;
+    private final ConnectorInstancePool<PreviewConnector> pool;
     private final ScheduledExecutorService evictions;
 
     public PdkBoundedSnapshotQueryPort(ConnectorProvisioner provisioner) {
@@ -50,27 +49,10 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         this.clock = Objects.requireNonNull(clock, "clock");
         ConnectorInstancePool.Limits limits = new ConnectorInstancePool.Limits(
                 2, 8, Duration.ofSeconds(2), Duration.ofSeconds(42), Duration.ofMinutes(5));
-        this.pool = new ConnectorInstancePool<>(config -> {
-            PdkConnector connector = PdkConnector.open(
-                    config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
-            try {
-                connector.underLoader(() -> {
-                    connector.connector().init(connector.context());
-                    return null;
-                });
-                return connector;
-            } catch (Throwable failed) {
-                connector.stopQuietly();
-                connector.close();
-                if (failed instanceof Error error) throw error;
-                if (failed instanceof RuntimeException runtime) throw runtime;
-                throw new TapstateException(ConnectorError.DISCOVER_FAILED,
-                        Map.of("connector", config.connectorId(), "detail", "preview connector initialization failed"),
-                        null);
-            }
-        }, connector -> {
-            connector.stopQuietly();
-            connector.close();
+        this.pool = new ConnectorInstancePool<>(config -> new PreviewConnector(PdkConnector.open(
+                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings())), instance -> {
+            instance.connector.stopQuietly();
+            instance.connector.close();
         }, limits, clock);
         this.evictions = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "preview-connector-eviction");
@@ -105,19 +87,24 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         ensureBeforeDeadline(request);
         ConnectionConfig config = new ConnectionConfig(
                 request.sourceId(), request.connectorId(), request.settings());
-        return pool.call(config, connector -> queryWith(connector, request, cancellation), PdkConnector::isAlive);
+        return pool.call(config, instance -> queryWith(instance, request, cancellation), PreviewConnector::reusable);
     }
 
-    private BoundedSnapshotQueryResult queryWith(PdkConnector connector,
+    private BoundedSnapshotQueryResult queryWith(PreviewConnector instance,
             BoundedSnapshotQueryRequest request, BoundedQueryCancellation cancellation) {
+        PdkConnector connector = instance.connector;
         BoundedQueryCancellation.Registration stopOnCancel = cancellation.onCancel(connector::stopQuietly);
         try {
             cancellation.throwIfCancelled();
+            ensureBeforeDeadline(request);
             QueryByAdvanceFilterFunction query = connector.functions().getQueryByAdvanceFilterFunction();
             if (query == null) {
                 throw new TapstateException(ConnectorError.CAPABILITY_MISSING,
                         Map.of("connector", connector.connectorId(), "capability", "query-by-advance-filter"), null);
             }
+            instance.initialize();
+            cancellation.throwIfCancelled();
+            ensureBeforeDeadline(request);
             TapTable table = discover(connector, request);
             List<Envelope> rows = new ArrayList<>(Math.min(request.limit(), 1024));
             int[] queryCount = {0};
@@ -169,6 +156,39 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                     !request.stableOrder().isEmpty(), queryCount[0], clock.instant());
         } finally {
             stopOnCancel.close();
+        }
+    }
+
+    /** Initialization belongs to the timed, cancellable call, while a healthy lease reuses it once. */
+    private static final class PreviewConnector {
+        private final PdkConnector connector;
+        private boolean initialized;
+
+        private PreviewConnector(PdkConnector connector) {
+            this.connector = connector;
+        }
+
+        private void initialize() {
+            if (initialized) {
+                return;
+            }
+            try {
+                connector.underLoader(() -> {
+                    connector.connector().init(connector.context());
+                    return null;
+                });
+                initialized = true;
+            } catch (Throwable failed) {
+                if (failed instanceof Error error) throw error;
+                if (failed instanceof RuntimeException runtime) throw runtime;
+                throw new TapstateException(ConnectorError.DISCOVER_FAILED,
+                        Map.of("connector", connector.connectorId(),
+                                "detail", "preview connector initialization failed"), null);
+            }
+        }
+
+        private boolean reusable() {
+            return initialized && connector.isAlive();
         }
     }
 
@@ -256,7 +276,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             filter.projection(projection);
         }
 
-        List<Envelope> rows = new ArrayList<>(Math.min(queryLimit, 1024));
+        QueryRows rows = new QueryRows(queryLimit);
         AtomicReference<Throwable> reported = new AtomicReference<>();
         queryCount[0]++;
         try {
@@ -280,7 +300,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         }
         ensureBeforeDeadline(request);
         cancellation.throwIfCancelled();
-        return rows;
+        return rows.snapshot();
     }
 
     private void collect(
@@ -289,11 +309,11 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             TapTable table,
             int cap,
             FilterResults result,
-            List<Envelope> rows,
+            QueryRows rows,
             AtomicReference<Throwable> reported,
             long[] bytesUsed,
             BoundedQueryCancellation cancellation) {
-        synchronized (rows) {
+        synchronized (rows.monitor) {
             if (reported.get() != null) {
                 return;
             }
@@ -317,7 +337,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                 if (reported.get() != null || cancellation.isCancelled()) {
                     return;
                 }
-                if (rows.size() >= cap) {
+                if (rows.values.size() >= cap) {
                     return;
                 }
                 try {
@@ -325,7 +345,8 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                     TapEvent event = TapInsertRecordEvent.create().table(table.getId()).after(copy);
                     Envelope envelope = TapEventCodec.decodeSnapshotRow(event, connector.codecs(), declaredTypes(table));
                     long remainingBytes = request.maxBytes() - bytesUsed[0];
-                    long rowBytes = EventJsonValues.encodedSize(envelope.after(), remainingBytes);
+                    // Byte accounting renders PDK temporal values without changing the typed row.
+                    long rowBytes = PdkPreviewJsonValues.encodedSize(envelope.after(), remainingBytes);
                     if (rowBytes > remainingBytes) {
                         reported.compareAndSet(null, new TapstateException(ConnectorError.READ_FAILED,
                                 Map.of("connector", connector.connectorId(),
@@ -333,12 +354,28 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                         return;
                     }
                     bytesUsed[0] += rowBytes;
-                    rows.add(envelope);
+                    rows.values.add(envelope);
                 } catch (RuntimeException failure) {
                     reported.compareAndSet(null, new IllegalArgumentException(
                             "connector row could not be decoded for preview table " + request.table().name(), failure));
                     return;
                 }
+            }
+        }
+    }
+
+    /** The callback monitor stays private even when a completed sample is handed to its caller. */
+    private static final class QueryRows {
+        private final Object monitor = new Object();
+        private final List<Envelope> values;
+
+        private QueryRows(int limit) {
+            values = new ArrayList<>(Math.min(limit, 1024));
+        }
+
+        private List<Envelope> snapshot() {
+            synchronized (monitor) {
+                return List.copyOf(values);
             }
         }
     }

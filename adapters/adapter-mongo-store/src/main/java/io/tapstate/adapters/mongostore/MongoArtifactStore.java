@@ -85,7 +85,8 @@ public final class MongoArtifactStore implements ArtifactStore {
                 collection.insertOne(codec.encode(artifact));
                 return ArtifactMutation.CREATED;
             } catch (MongoException e) {
-                if (ErrorCategory.fromErrorCode(e.getCode()) == ErrorCategory.DUPLICATE_KEY) {
+                if (ErrorCategory.fromErrorCode(e.getCode()) == ErrorCategory.DUPLICATE_KEY
+                        && idExistsAfterDuplicate(artifact.id())) {
                     return ArtifactMutation.ALREADY_EXISTS;
                 }
                 throw e;
@@ -235,13 +236,13 @@ public final class MongoArtifactStore implements ArtifactStore {
                 for (ArtifactWrite write : writes) {
                     ArtifactBatchWrite refusal = writeOne(session, write);
                     if (!refusal.appliedSuccessfully()) {
-                        session.abortTransaction();
+                        if (session.hasActiveTransaction()) session.abortTransaction();
                         return refusal;
                     }
                 }
             } catch (RuntimeException error) {
                 try {
-                    session.abortTransaction();
+                    if (session.hasActiveTransaction()) session.abortTransaction();
                 } catch (RuntimeException abortFailure) {
                     error.addSuppressed(abortFailure);
                 }
@@ -271,9 +272,31 @@ public final class MongoArtifactStore implements ArtifactStore {
             return ArtifactBatchWrite.applied();
         } catch (MongoException error) {
             if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
-                return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
+                // The failed transaction must end before observing committed ids: its own earlier
+                // batch writes must not supply the evidence for a create-only condition refusal.
+                try {
+                    if (session.hasActiveTransaction()) session.abortTransaction();
+                } catch (MongoException abortFailure) {
+                    error.addSuppressed(abortFailure);
+                    throw error;
+                }
+                if (idExistsAfterDuplicate(write.resource().id())) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
+                }
             }
             throw error;
+        }
+    }
+
+    private boolean idExistsAfterDuplicate(String id) {
+        // The driver retains errInfo but can discard the server's duplicate keyPattern. A 11000
+        // alone does not establish an id collision. Observe only the committed id, without decoding
+        // an existing Source. This judges the current create-only condition, not the discarded index
+        // metadata; an absent id or failed observation preserves the original store fault.
+        try {
+            return collection.find(new Document("_id", id)).projection(new Document("_id", 1)).first() != null;
+        } catch (MongoException observationFailure) {
+            return false;
         }
     }
 

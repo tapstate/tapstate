@@ -19,7 +19,15 @@ done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'a numeric release version is required; floating tags are forbidden'
 [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'expected OCI digest is missing or invalid'
 [[ -f "$archive" ]] || fail 'verified OCI archive is missing'
-[[ -n "${CLOUD_GHCR_USERNAME:-}" && -n "${CLOUD_GHCR_TOKEN:-}" ]] || fail 'the dedicated GHCR username and token are required'
+workflow_identity=false
+if [[ -z "${CLOUD_GHCR_TOKEN:-}" && "${GITHUB_ACTIONS:-}" == true && -n "${GITHUB_TOKEN:-}" ]]; then
+    [[ "${GITHUB_REPOSITORY:-}" == tapstate/tapstate && -n "${GITHUB_ACTOR:-}" ]] \
+        || fail 'the publishing workflow identity is invalid'
+    CLOUD_GHCR_USERNAME="$GITHUB_ACTOR"
+    CLOUD_GHCR_TOKEN="$GITHUB_TOKEN"
+    workflow_identity=true
+fi
+[[ -n "${CLOUD_GHCR_USERNAME:-}" && -n "${CLOUD_GHCR_TOKEN:-}" ]] || fail 'the GHCR username and token are required'
 for tool in docker gh jq curl sha256sum tar; do
     command -v "$tool" >/dev/null 2>&1 || fail "required command is unavailable: $tool"
 done
@@ -48,8 +56,17 @@ blob="$scratch/layout/blobs/sha256/${expected_digest#sha256:}"
 [[ "sha256:$(sha256sum "$blob" | awk '{print $1}')" == "$expected_digest" ]] \
     || fail 'OCI manifest bytes differ from the verified digest'
 
-actor="$(gh api user --jq .login 2>"$scratch/api-error")" || fail 'GHCR account authentication failed'
-[[ "$actor" == "$CLOUD_GHCR_USERNAME" ]] || fail 'the publishing account differs from the configured username'
+if [[ "$workflow_identity" == true ]]; then
+    # Installation tokens authenticate the workflow repository, not a personal /user endpoint.
+    gh api repos/tapstate/tapstate >"$scratch/repository.json" 2>"$scratch/api-error" \
+        || fail 'workflow repository authentication failed'
+    jq -e '.full_name == "tapstate/tapstate" and .permissions.pull == true' \
+        "$scratch/repository.json" >/dev/null \
+        || fail 'workflow repository authentication failed'
+else
+    actor="$(gh api user --jq .login 2>"$scratch/api-error")" || fail 'GHCR account authentication failed'
+    [[ "$actor" == "$CLOUD_GHCR_USERNAME" ]] || fail 'the publishing account differs from the configured username'
+fi
 
 check_public() {
     if gh api "$endpoint" >"$scratch/package.json" 2>"$scratch/api-error"; then

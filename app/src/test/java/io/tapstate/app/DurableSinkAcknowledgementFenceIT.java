@@ -93,12 +93,13 @@ class DurableSinkAcknowledgementFenceIT {
                 Map<String, List<String>> plan = snapshot
                         ? Map.of(TABLE, List.of("writer-1"), "items", List.of("writer-1"))
                         : Map.of(TABLE, List.of("writer-1"));
-                StoreBackedSinkAckFactory durable = new StoreBackedSinkAckFactory(
-                        Map.of(TABLE, CHAIN, "items", CHAIN), PIPELINE, meta);
-                durable.prepareWriterPlan(plan);
-                SinkAckFactory writer = durable.forWriter("writer-1", List.copyOf(plan.keySet()), plan);
-                SinkAck ack = FencedSinkAckFactory.heldTo(writer, execution)
-                        .resolve(memberWith(meta, authorization));
+                HazelcastInstance member = memberWith(meta, authorization);
+                SinkAckFactory durable = FencedSinkAckFactory.heldTo(new StoreBackedSinkAckFactory(
+                        StoreBackedSinkAckFactory.legacyProgress(Map.of(TABLE, CHAIN, "items", CHAIN), PIPELINE),
+                        PIPELINE, "g" + run.executionGeneration()),
+                        execution);
+                durable.beginRun(member, plan);
+                SinkAck ack = durable.resolve(member).forWriter("writer-1");
                 ChainPosition snapshotPosition = new ChainPosition(SourceOrder.snapshotRow(1), null);
                 ack.advance(TABLE, snapshot ? snapshotPosition : position(1));
                 if (snapshot) {
@@ -180,11 +181,11 @@ class DurableSinkAcknowledgementFenceIT {
                     "cluster-a", claims, Duration.ofSeconds(10))) {
                 HazelcastInstance member = memberWith(staleMeta, authorization);
                 Map<String, List<String>> writerPlan = Map.of(TABLE, List.of("writer-1"));
-                StoreBackedSinkAckFactory durable = new StoreBackedSinkAckFactory(
-                        Map.of(TABLE, CHAIN), PIPELINE, staleMeta);
-                durable.prepareWriterPlan(writerPlan);
-                SinkAckFactory writer = durable.forWriter("writer-1", List.of(TABLE), writerPlan);
-                SinkAck staleAck = FencedSinkAckFactory.heldTo(writer, staleFence).resolve(member);
+                SinkAckFactory durable = FencedSinkAckFactory.heldTo(new StoreBackedSinkAckFactory(
+                        StoreBackedSinkAckFactory.legacyProgress(Map.of(TABLE, CHAIN), PIPELINE),
+                        PIPELINE, "g" + firstRun.executionGeneration()), staleFence);
+                durable.beginRun(member, writerPlan);
+                SinkAck staleAck = durable.resolve(member).forWriter("writer-1");
                 ChainPosition lastCurrentAck = position(1);
                 staleAck.advance(TABLE, lastCurrentAck);
                 assertThat(ackedBy(currentMeta)).isEqualTo(lastCurrentAck);

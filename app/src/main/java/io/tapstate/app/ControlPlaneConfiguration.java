@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
@@ -18,6 +19,7 @@ import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
+import io.tapstate.control.core.ExecutionAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -74,7 +76,7 @@ import io.tapstate.control.core.SourceConfigRevealAuthorizer;
 import io.tapstate.control.core.SourceConfigRevealService;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SessionService;
@@ -133,6 +135,8 @@ import org.springframework.lang.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Clock;
+import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Wires the control plane into the assembly root: the authentication ports over the store, the control-core
@@ -249,7 +253,24 @@ class ControlPlaneConfiguration {
                 new StoreBackedPipelineCaptures(storePort),
                 claims.getIfAvailable(),
                 storePort.desired(),
-                clusterProperties.getId());
+                clusterProperties.getId(),
+                executionPlans(engine));
+    }
+
+    /**
+     * Where a read face reads the plan of each pipeline's current run from: the cluster's own record of it,
+     * whichever member submitted the run, or nowhere on a server that is no cluster member.
+     */
+    private static ExecutionPlans executionPlans(HazelcastInstance engine) {
+        return engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine);
+    }
+
+    /**
+     * The members a run would take part on now, by stable id; none on a server that is no cluster member, and none
+     * while this member's engine cannot be asked.
+     */
+    private static Supplier<List<String>> dataMembers(HazelcastInstance engine) {
+        return engine == null ? List::of : () -> ClusterMembershipGate.dataMembersIfReadable(engine);
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----
@@ -378,10 +399,13 @@ class ControlPlaneConfiguration {
         // lands in a document store as a key that store reads as a path, so the ordinary read for it
         // answers nothing and no index can be declared over it. Nothing downstream of apply says this,
         // and the discovered model already holds the name, so this is the one moment it can be said.
+        // Last, how the batch asks its nodes to run where that will not happen as written: a
+        // pipeline-level parallelism or batch size nothing reads, and a source asking for parallel reads.
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
-                        new DocumentKeyAdvisories()),
+                        new DocumentKeyAdvisories(),
+                        new ExecutionAdvisories()),
                 derivation, livePipelines, attribution, stateDatabasePolicy);
     }
 
@@ -544,9 +568,10 @@ class ControlPlaneConfiguration {
         // built from the deployment's own store URI, which is the last one that should be the exception.
         // It changes nothing observable while the mongodb catalog marks `uri` non-secret; what it
         // removes is a seam where a later change to that marking would silently not apply here.
-        return new ViewStoreSeedRunner(
-                artifactStore, cloud.metadataUri(mongoProperties.getUri()), mongoProperties.getTlsCaFile(),
-                cloud.viewsDatabase(ViewTargetResolver.STATE_STORE_SOURCE_ID), cloud.cloud(), !cloud.cloud());
+        // Only on-prem deployments seed a views Source. Cloud never publishes its metadata
+        // connection as a Source and leaves any existing views resource untouched on restart.
+        if (cloud.cloud()) return new ViewStoreSeedRunner(artifactStore, null, null, false);
+        return new ViewStoreSeedRunner(artifactStore, mongoProperties.getUri(), mongoProperties.getTlsCaFile());
     }
 
     @Bean
@@ -698,8 +723,10 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
-            ArtifactQueryService artifactQueryService, StorePort storePort) {
-        return new PipelineObservationQueryService(artifactQueryService, storePort.observations());
+            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member) {
+        HazelcastInstance engine = member.getIfAvailable();
+        return new PipelineObservationQueryService(artifactQueryService, storePort.observations(),
+                executionPlans(engine), dataMembers(engine));
     }
 
     @Bean
@@ -715,10 +742,13 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineExplainService pipelineExplainService(
-            ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock) {
+            ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock,
+            ObjectProvider<HazelcastInstance> member) {
         ExplanationCatalog messages = ExplanationCatalog.bundled();
+        HazelcastInstance engine = member.getIfAvailable();
         return new PipelineExplainService(
-                artifactQueryService, storePort.observations(), clock, messages::render);
+                artifactQueryService, storePort.observations(), clock, messages::render,
+                executionPlans(engine), dataMembers(engine));
     }
 
     /**
@@ -790,11 +820,11 @@ class ControlPlaneConfiguration {
 
     @Bean
     SampleSourceCredentialsProvider sampleSourceCredentialsProvider(
-            CloudRuntimeSettings cloudSettings,
-            @Value("${tapstate.sample.host:47.238.126.103}") String host,
+            CloudRuntimeSettings cloudSettings, JsonMapper objectMapper,
+            @Value("${tapstate.sample.host:113.98.206.139}") String host,
             @Value("${tapstate.sample.password:}") String password) {
         if (cloudSettings.cloud()) {
-            return new CloudSampleSourceCredentialsProvider(cloudSettings, new ObjectMapper());
+            return new CloudSampleSourceCredentialsProvider(cloudSettings, objectMapper);
         }
         return new ConfiguredSampleSourceCredentialsProvider(host, password);
     }
@@ -809,9 +839,9 @@ class ControlPlaneConfiguration {
     @Bean
     StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
             SourceRepresentation representation, ConnectionTestService connections,
-            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
+            CloudRuntimeSettings cloud) {
         return new StateStoreSetupService(apply, artifacts, representation,
-                DeploymentProfile.parse(deploymentProfile), connections);
+                cloud.cloud() ? DeploymentProfile.CLOUD : DeploymentProfile.ON_PREM, connections);
     }
 
     @Bean

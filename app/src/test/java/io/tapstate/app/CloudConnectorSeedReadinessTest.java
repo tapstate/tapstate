@@ -50,7 +50,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class CloudConnectorSeedReadinessTest {
 
     private static final List<String> IDS = List.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
     private static final JsonMapper JSON = new JsonMapper();
     private static final String VERSION = "2.0.5-SNAPSHOT";
     private static final String REVISION = "a".repeat(40);
@@ -102,7 +102,7 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
-    void allSevenMatchingArtifactsMustBeRegisteredLoadableAndHaveReadableSpecsIncludingOnRestart() throws Exception {
+    void allLockedArtifactsMustBeRegisteredLoadableAndHaveReadableSpecsIncludingOnRestart() throws Exception {
         var gate = gate();
         gate.verifyRegistrations(outcomes);
         gate.verifyRegistrations(outcomes.stream().map(outcome -> {
@@ -111,6 +111,23 @@ class CloudConnectorSeedReadinessTest {
                     new RegistrationOutcome(seeded.outcome().registration(), false));
         }).toList());
         assertThat(loaded).containsExactlyElementsOf(java.util.stream.Stream.concat(IDS.stream(), IDS.stream()).toList());
+    }
+
+    @Test
+    void aBundledDb2RuntimeHasItsOwnBoundAndStillNeedsMatchingArtifactBytes() throws Exception {
+        Object originalLength = entry("db2").get("bytes");
+        entry("db2").put("bytes", 203_082_147);
+        writeLock();
+        // Admission of the declared size does not authorize the smaller fixture's actual bytes.
+        refused(this::gate, "artifact-missing-or-mismatched");
+        assertThat(loaded).isEmpty();
+        entry("db2").put("bytes", 256L * 1024 * 1024 + 1);
+        writeLock();
+        refused(this::gate, "lock-invalid");
+        entry("db2").put("bytes", originalLength);
+        entry("mysql").put("bytes", 203_082_147);
+        writeLock();
+        refused(this::gate, "lock-invalid");
     }
 
     @Test
@@ -160,6 +177,22 @@ class CloudConnectorSeedReadinessTest {
         changed[changed.length - 1] ^= 1;
         Files.write(jar, changed);
         refused(this::gate, "artifact-missing-or-mismatched");
+        assertThat(loaded).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "changed"})
+    void theAddedDb2SeedCannotBeOmittedOrReplacedBeforeAnyPdkLoad(String fault) throws Exception {
+        Path jar = seeds.resolve("db2-connector.jar");
+        if (fault.equals("missing")) {
+            Files.delete(jar);
+        } else {
+            byte[] changed = Files.readAllBytes(jar);
+            changed[changed.length - 1] ^= 1;
+            Files.write(jar, changed);
+        }
+        assertThatThrownBy(this::gate).isInstanceOf(TapstateException.class)
+                .extracting(error -> ((TapstateException) error).code()).isEqualTo(BootError.CLOUD_CONNECTORS_INVALID);
         assertThat(loaded).isEmpty();
     }
 

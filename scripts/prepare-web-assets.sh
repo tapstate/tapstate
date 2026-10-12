@@ -58,8 +58,9 @@ done
 [ -n "$web_profile" ] || die "--web-profile is required"
 [[ "$web_profile" = cloud || "$web_profile" = onprem ]] || die "Web profile must be cloud or onprem"
 if [ "$web_profile" = cloud ]; then
-    [ "$cloud_console_url_supplied" = true ] && [ -n "$cloud_console_url" ] \
-        || die "--cloud-console-url is required for Cloud Web"
+    if [ "$cloud_console_url_supplied" != true ] || [ -z "$cloud_console_url" ]; then
+        die "--cloud-console-url is required for Cloud Web"
+    fi
 elif [ "$cloud_console_url_supplied" = true ]; then
     die "onprem Web must not receive a Cloud Console URL"
 fi
@@ -73,8 +74,9 @@ fi
 [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
     || die "release version must be a numeric x.y.z version with an optional prerelease suffix"
 [ -d "$web_root" ] || die "web checkout '$web_root' does not exist"
-[ ! -e "$output" ] && [ ! -L "$output" ] \
-    || die "output '$output' already exists; clean the Maven target directory before staging assets"
+if [ -e "$output" ] || [ -L "$output" ]; then
+    die "output '$output' already exists; clean the Maven target directory before staging assets"
+fi
 
 web_root="$(cd "$web_root" && pwd -P)"
 repo_root="$(git -C "$web_root" rev-parse --show-toplevel 2>/dev/null)" \

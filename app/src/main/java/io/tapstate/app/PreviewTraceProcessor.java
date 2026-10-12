@@ -87,7 +87,7 @@ final class PreviewTraceProcessor extends AbstractProcessor implements Staged {
             collectPointers(row, "", 0);
             if (inputAlias == null && samplesWritten < MAX_ROWS) {
                 Map<String, Object> sample = sample(event, nodeId);
-                long remainingBytes = MAX_BYTES - sampleBytes;
+                long remainingBytes = (long) MAX_BYTES - sampleBytes;
                 long size = EventJsonValues.encodedSize(PreviewJsonValues.normalize(sample), remainingBytes);
                 if (size <= remainingBytes) {
                     String key = "sample:" + nodeId + ":" + String.format("%02d", samplesWritten);

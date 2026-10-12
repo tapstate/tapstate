@@ -88,9 +88,10 @@ final class CloudStatusLifecycle
             // then retain that exact failure in the Future; never reclassify it as provider availability.
             try {
                 defects.accept(Thread.currentThread(), defect);
-            } finally {
-                throw defect;
+            } catch (RuntimeException | Error observerFailure) {
+                if (observerFailure != defect) defect.addSuppressed(observerFailure);
             }
+            throw defect;
         }
     }
 

@@ -27,8 +27,8 @@
     },
     {
       "id": "oracle",
-      "bytes": 36837471,
-      "sha256": "5e273f48ff9ee935881db3863bbbf165e91d86edb9aae3f929f1b835b13c3151",
+      "bytes": 36837472,
+      "sha256": "2d77e8d895f421fab07d776a02eb6afd4fa36a49d1ee6484e7fe908d33dedf3d",
       "upstreamRevision": "2768502d588175b0d7f3c3ba1e3c097f27867857",
       "pdkApiVersion": "2.0.9-SNAPSHOT",
       "specPath": "spec_oracle.json"
@@ -56,6 +56,14 @@
       "upstreamRevision": "cc13816bf624b4b8974bd4c3aa5a0ff34bce013d",
       "pdkApiVersion": "2.0.5-SNAPSHOT",
       "specPath": "aws-rds-mysql-spec.json"
+    },
+    {
+      "id": "db2",
+      "bytes": 203082147,
+      "sha256": "3c7c34e54e110402dca4699ecafce9aa04f719457fccba14e3b759d8e8fdb500",
+      "upstreamRevision": "3679968ea0e5ba3e478ff1a8f7fb3fd6440e7846",
+      "pdkApiVersion": "2.0.5-SNAPSHOT",
+      "specPath": "spec_db2.json"
     }
   ],
   "licenseFiles": [

@@ -20,6 +20,10 @@ set -euo pipefail
 printf 'gh %s\n' "$*" >> "$STUB_LOG"
 if [[ "$2" == user ]]; then
     printf '%s\n' "${STUB_ACTOR:-publisher}"
+elif [[ "$2" == repos/tapstate/tapstate ]]; then
+    [[ "${STUB_WORKFLOW_API_FAIL:-false}" != true ]] || exit 1
+    printf '{"full_name":"%s","permissions":{"pull":%s}}\n' \
+        "${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}" "${STUB_WORKFLOW_PULL:-true}"
 elif [[ "$2" == --paginate ]]; then
     printf '%s' "${STUB_EXISTING_DIGEST:-}"
 elif [[ "${STUB_MISSING:-false}" == true && ! -f "$STUB_PUSHED" ]]; then
@@ -106,8 +110,13 @@ chmod +x "$WORK/bin/gh" "$WORK/bin/docker" "$WORK/bin/curl"
 run_publish() {
     : > "$WORK/commands.log"
     rm -f "$WORK/pushed"
-    env PATH="$WORK/bin:$PATH" CLOUD_GHCR_USERNAME=publisher \
+    env PATH="$WORK/bin:$PATH" CLOUD_GHCR_USERNAME="${TEST_USERNAME-publisher}" \
         CLOUD_GHCR_TOKEN="${TEST_TOKEN-$TOKEN}" GITHUB_OUTPUT="${TEST_GITHUB_OUTPUT:-}" \
+        GITHUB_ACTIONS="${TEST_ACTIONS:-false}" GITHUB_REPOSITORY="${TEST_REPOSITORY:-tapstate/tapstate}" \
+        GITHUB_ACTOR="${TEST_WORKFLOW_ACTOR:-publisher}" GITHUB_TOKEN="${TEST_WORKFLOW_TOKEN:-}" \
+        STUB_WORKFLOW_API_FAIL="${STUB_WORKFLOW_API_FAIL:-false}" \
+        STUB_WORKFLOW_REPOSITORY="${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}" \
+        STUB_WORKFLOW_PULL="${STUB_WORKFLOW_PULL:-true}" \
         STUB_TOKEN="$TOKEN" STUB_ACTOR="${STUB_ACTOR:-publisher}" \
         STUB_LOG="$WORK/commands.log" STUB_PUSHED="$WORK/pushed" STUB_MANIFEST="$WORK/manifest.json" \
         STUB_MISSING="${STUB_MISSING:-false}" STUB_API_FAIL="${STUB_API_FAIL:-false}" \
@@ -145,6 +154,41 @@ if [[ ! -f "$WORK/pushed" ]]; then ok 'missing packages cause no registry write'
 STUB_MISSING=true STUB_NOTFOUND_STRING=true expect_failure 'string-valued 404 also requires visibility setup' 'must already be Public'
 TEST_TOKEN='' expect_failure 'missing dedicated credentials are refused' 'username and token'
 STUB_ACTOR=other expect_failure 'publishing identity must match the configured account' 'differs'
+if TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" TEST_USERNAME=unused-personal-account \
+        run_publish > "$WORK/out" 2> "$WORK/err" \
+        && grep -qF 'gh api repos/tapstate/tapstate' "$WORK/commands.log" \
+        && ! grep -qF 'gh api user' "$WORK/commands.log" \
+        && grep -qF 'docker login ghcr.io --username publisher' "$WORK/commands.log"; then
+    ok 'Actions reuses the workflow token and actor without a new personal token'
+else bad 'Actions reuses the workflow token and actor without a new personal token'; fi
+if ! grep -qF "$TOKEN" "$WORK/out" "$WORK/err" "$WORK/commands.log"; then
+    ok 'workflow credentials stay out of diagnostics and command arguments'
+else bad 'workflow credentials stay out of diagnostics and command arguments'; fi
+
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" TEST_REPOSITORY=tapstate/other \
+    expect_failure 'workflow credentials cannot be borrowed by a different repository' 'workflow identity'
+TEST_TOKEN='' TEST_ACTIONS=false TEST_WORKFLOW_TOKEN="$TOKEN" \
+    expect_failure 'a workflow token is not a standalone personal credential fallback' 'username and token'
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_API_FAIL=true \
+    expect_failure 'workflow authentication failure is refused before registry login' 'workflow repository authentication'
+if ! grep -qF 'docker login' "$WORK/commands.log"; then
+    ok 'workflow authentication refusal causes no registry login or write'
+else bad 'workflow authentication refusal causes no registry login or write'; fi
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_PULL=false \
+    expect_failure 'unauthorized workflow repository metadata fails closed' 'workflow repository authentication'
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_REPOSITORY=tapstate/other \
+    expect_failure 'workflow API must confirm the intended publishing repository' 'workflow repository authentication'
+TEST_USERNAME='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" \
+    expect_failure 'an incomplete configured personal credential never falls back' 'username and token'
+if TEST_ACTIONS=true TEST_WORKFLOW_TOKEN=unused-workflow-sentinel run_publish > "$WORK/out" 2> "$WORK/err" \
+        && grep -qF 'gh api user' "$WORK/commands.log" \
+        && ! grep -qF 'gh api repos/tapstate/tapstate' "$WORK/commands.log"; then
+    ok 'configured personal credentials retain their existing account verification'
+else bad 'configured personal credentials retain their existing account verification'; fi
+if ! grep -qE "$TOKEN|unused-workflow-sentinel" "$WORK/out" "$WORK/err" "$WORK/commands.log"; then
+    ok 'neither credential route exposes tokens in diagnostics or command arguments'
+else bad 'neither credential route exposes tokens in diagnostics or command arguments'; fi
+
 STUB_VISIBILITY=private expect_failure 'a Private package is refused before writing' 'must be Public'
 if [[ ! -f "$WORK/pushed" ]]; then ok 'Private packages cause no registry write'; else bad 'Private packages cause no registry write'; fi
 STUB_VISIBILITY=internal expect_failure 'unknown or non-public visibility is refused' 'must be Public'

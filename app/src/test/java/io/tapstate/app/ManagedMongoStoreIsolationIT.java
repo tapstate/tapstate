@@ -10,6 +10,7 @@ import io.tapstate.adapters.mongostore.MigrationError;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.adapters.mongostore.StoreError;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.Metadata;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.CheckpointDoc;
@@ -136,18 +137,16 @@ class ManagedMongoStoreIsolationIT {
                         proof = writeStorageProof(store, metadata);
                         assertStorageProof(admin.getDatabase(metadata), store, proof);
                         store.keyedState().save("permissions-proof", "same-key", metadata.getBytes(StandardCharsets.UTF_8));
-                        SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
-                        try (MongoClient view = MongoClients.create(String.valueOf(views.config().get("uri")))) {
+                        assertViewsNotSeeded(admin.getDatabase(metadata), store);
+                        try (MongoClient view = MongoClients.create(uri(user, metadata + "_views"))) {
                             view.getDatabase(metadata + "_views").getCollection("proof")
                                     .insertOne(new Document("_id", "same-key").append("owner", metadata));
                         }
-                        assertThat(admin.getDatabase(metadata).getCollection(SystemCollections.ARTIFACTS.collectionName())
-                                .find(new Document("_id", "views")).first().get("body", Document.class).get("config"))
-                                .isInstanceOf(String.class);
                         assertNoProbes(admin, metadata);
                     }
                     try (ConfigurableApplicationContext restarted = start(uri(user, metadata), metadata)) {
                         assertStorageProof(admin.getDatabase(metadata), restarted.getBean(StorePort.class), proof);
+                        assertViewsNotSeeded(admin.getDatabase(metadata), restarted.getBean(StorePort.class));
                         assertThat(restarted.getBean(StorePort.class).keyedState().load("permissions-proof", "same-key"))
                                 .hasValueSatisfying(value -> assertThat(value).isEqualTo(metadata.getBytes(StandardCharsets.UTF_8)));
                         assertThat(admin.getDatabase(metadata + "_views").getCollection("proof")
@@ -213,7 +212,7 @@ class ManagedMongoStoreIsolationIT {
                 .singleElement().satisfies(entry -> assertThat(entry.sample()).isEqualTo(proof.sample()));
         assertThat(store.connectors().list()).containsExactlyInAnyOrderElementsOf(proof.connectors());
         assertThat(proof.connectors()).extracting(ConnectorRegistration::connectorId).containsExactlyInAnyOrder(
-                "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql");
+                "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
         for (ConnectorRegistration registration : proof.connectors()) {
             byte[] bytes = store.connectors().artifact(registration.contentHash()).orElseThrow();
             Path seed = CloudConnectorTestInputs.seedDirectory().resolve(registration.connectorId() + "-connector.jar");
@@ -229,12 +228,16 @@ class ManagedMongoStoreIsolationIT {
         }
         assertThat(SystemCollections.PIPELINE_STATE.on(database).countDocuments(new Document("_id", "permissions-proof"))).isEqualTo(1);
         assertThat(SystemCollections.SRS_META.on(database).countDocuments(new Document("_id", "permissions-chain"))).isEqualTo(1);
-        assertThat(SystemCollections.SRS_LOG.on(database).countDocuments()).isEqualTo(3);
+        // Change rows share the collection with a private high-water mark; the latter is not an event.
+        var logs = SystemCollections.SRS_LOG.on(database);
+        assertThat(logs.countDocuments(new Document("_id.ring", "srs.permissions"))).isEqualTo(3);
+        assertThat(logs.find(new Document("_id", "srs-log-bounds:srs.permissions")).first())
+                .containsEntry("largestSequence", 3L).containsEntry("trimmedThrough", -1L);
         Document history = SystemCollections.PIPELINE_RATE_HISTORY.on(database)
                 .find(new Document("pipelineId", "permissions-proof")).first();
         assertThat(history.getDate("observedAt").toInstant()).isEqualTo(proof.sample().observedAt());
-        assertThat(database.getCollection("connector_artifacts.files").countDocuments()).isEqualTo(7);
-        assertThat(database.getCollection("connector_artifacts.chunks").countDocuments()).isGreaterThan(7);
+        assertThat(database.getCollection("connector_artifacts.files").countDocuments()).isEqualTo(8);
+        assertThat(database.getCollection("connector_artifacts.chunks").countDocuments()).isGreaterThan(8);
         assertThat(historyIndex(database).get("expireAfterSeconds", Number.class).longValue()).isEqualTo(Duration.ofDays(15).toSeconds());
     }
 
@@ -372,7 +375,7 @@ class ManagedMongoStoreIsolationIT {
             AtomicInteger recoveredReady = new AtomicInteger();
             try (ConfigurableApplicationContext recovered = start(uri(user, metadata), metadata, recoveredReady)) {
                 assertThat(recoveredReady.get()).isEqualTo(1);
-                assertThat(recovered.getBean(StorePort.class).artifacts().get("views")).isPresent();
+                assertViewsNotSeeded(admin.getDatabase(metadata), recovered.getBean(StorePort.class));
             }
             assertThat(SystemCollections.SYSTEM_META.on(admin.getDatabase(metadata)).find(new Document("_id", "schema"))
                     .first().getInteger("installedVersion"))
@@ -402,22 +405,30 @@ class ManagedMongoStoreIsolationIT {
     }
 
     @Test
-    void managedViewsUseRenewedDeploymentCredentialsAfterRestart() {
+    void changingCloudMetadataCredentialsDoesNotCreateOrRenewAViewsSource() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String metadata = "isolation_renewed_" + suffix;
         String user = "user_renewed_" + suffix;
         String renewedPassword = "controlled-renewed-mongo-password";
+        SourceResource authored = new SourceResource("views",
+                new Metadata(Map.of(), "authored", true, "verified-user"), "mongodb",
+                Map.of("isUri", true, "uri", "mongodb://source-user:source-secret@user.example/owned"),
+                null, null, null, null);
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             createUser(admin, user, List.of(metadata, metadata + "_operator", metadata + "_views"));
             try (ConfigurableApplicationContext first = start(uri(user, metadata), metadata)) {
                 StorePort store = first.getBean(StorePort.class);
                 store.keyedState().save("permissions-proof", "renewed-key", new byte[] {7});
-                SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
-                try (MongoClient materialization = MongoClients.create(String.valueOf(views.config().get("uri")))) {
+                assertViewsNotSeeded(admin.getDatabase(metadata), store);
+                store.artifacts().create(authored);
+                try (MongoClient materialization = MongoClients.create(uri(user, metadata + "_views"))) {
                     materialization.getDatabase(metadata + "_views").getCollection("proof")
                             .insertOne(new Document("_id", "before-renewal").append("owner", metadata));
                 }
             }
+            Document originalSource = SystemCollections.ARTIFACTS.on(admin.getDatabase(metadata))
+                    .find(new Document("_id", "views")).first();
+            assertThat(originalSource.get("body", Document.class).get("config")).isInstanceOf(String.class);
             admin.getDatabase("admin").runCommand(new Document("updateUser", user).append("pwd", renewedPassword));
             try (MongoClient revoked = MongoClients.create(uri(user, metadata))) {
                 assertThatThrownBy(() -> revoked.getDatabase(metadata).getCollection("proof").countDocuments())
@@ -428,8 +439,10 @@ class ManagedMongoStoreIsolationIT {
                 StorePort store = restarted.getBean(StorePort.class);
                 assertThat(store.keyedState().load("permissions-proof", "renewed-key"))
                         .hasValueSatisfying(value -> assertThat(value).isEqualTo(new byte[] {7}));
-                SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
-                try (MongoClient materialization = MongoClients.create(String.valueOf(views.config().get("uri")))) {
+                assertThat(store.artifacts().get("views")).contains(authored);
+                assertThat(SystemCollections.ARTIFACTS.on(admin.getDatabase(metadata))
+                        .find(new Document("_id", "views")).first()).isEqualTo(originalSource);
+                try (MongoClient materialization = MongoClients.create(uri(user, metadata + "_views", renewedPassword))) {
                     materialization.getDatabase(metadata + "_views").getCollection("proof")
                             .insertOne(new Document("_id", "after-renewal").append("owner", metadata));
                 }
@@ -441,6 +454,12 @@ class ManagedMongoStoreIsolationIT {
                 assertNoProbes(admin, metadata);
             }
         }
+    }
+
+    private static void assertViewsNotSeeded(MongoDatabase metadata, StorePort store) {
+        assertThat(store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID)).isEmpty();
+        assertThat(SystemCollections.ARTIFACTS.on(metadata)
+                .countDocuments(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID))).isZero();
     }
 
     @ParameterizedTest

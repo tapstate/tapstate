@@ -10,8 +10,9 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
-import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.SrsMetaStore;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -48,7 +49,7 @@ class StoreBackedReplayFloorFactoryTest {
         store.create("mc-items", null);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(CHAINS, "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, "pipe-1");
         ack.advance("orders", at(7, "w7"));
         ack.advance("items", at(3, "w3"));
 
@@ -62,9 +63,10 @@ class StoreBackedReplayFloorFactoryTest {
     void doesNotTakeAnotherPipelinesConfirmedWritesForItsOwn() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);
+        store.create("mc-items", null);
         HazelcastInstance member = memberWith(store);
 
-        new StoreBackedSinkAckFactory(CHAINS, "pipe-2").resolve(member).advance("orders", at(9, "w9"));
+        soleWriter(member, "pipe-2").advance("orders", at(9, "w9"));
 
         ReplayFloor floor = new StoreBackedReplayFloorFactory(CHAINS, "pipe-1").resolve(member);
 
@@ -111,6 +113,14 @@ class StoreBackedReplayFloorFactoryTest {
 
     private static ChainPosition at(long seq, String token) {
         return new ChainPosition(order(seq), token);
+    }
+
+    /** The sink side of a pipeline whose one sink is its only writer, reporting as that writer. */
+    private static SinkAck soleWriter(HazelcastInstance member, String pipelineId) {
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                StoreBackedSinkAckFactory.legacyProgress(CHAINS, pipelineId), pipelineId, "run-1");
+        factory.beginRun(member, Map.of("orders", List.of("serve.s#0"), "items", List.of("serve.s#0")));
+        return factory.resolve(member).forWriter("serve.s#0");
     }
 
     private static SourceOrder order(long seq) {

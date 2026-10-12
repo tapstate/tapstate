@@ -20,6 +20,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.runtime.engine.SettledPositions;
 import io.tapstate.runtime.engine.TransformProcessor;
 import java.util.ArrayList;
@@ -60,7 +61,7 @@ class ANestAcceptsPositionsSettledByAFilterTest {
         NestTopology topology = NestTopology.compile("p", "doc", tree, tables());
         NestDag.attach(dag, topology, "doc", "customer", "doc", alias -> List.of(filters.get(alias)),
                 new NestBinding(tables(), HeapNestStores.onHeap(), (from, released) -> { }),
-                vertex -> outgoing.merge(vertex, 1, Integer::sum) - 1, null);
+                vertex -> outgoing.merge(vertex, 1, Integer::sum) - 1, null, new NodeWidth("doc", 4, 1, null));
         assertThat(topology.lookups()).hasSize(1);
         assertThat(topology.vertices()).hasSize(2);
 

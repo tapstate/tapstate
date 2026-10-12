@@ -74,7 +74,7 @@ for profile in ("onprem", "cloud"):
 if fixtures["onprem"]["bootJarSha256"] == fixtures["cloud"]["bootJarSha256"]:
     raise AssertionError("the two image targets must not share a Boot JAR")
 (root / "fixtures.json").write_text(json.dumps(fixtures), encoding="utf-8")
-ids = ("mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql")
+ids = ("mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2")
 spec_paths = {
     "mongodb": "spec.json",
     "postgres": "spec_postgres.json",
@@ -171,7 +171,7 @@ docker run --rm --entrypoint sh "$CLOUD_TAG" -ec \
     'test "$TAPSTATE_CONNECTORS_SEED_DIR" = /opt/tapstate/connectors; \
      cd /opt/tapstate/connectors; \
      sha256sum -c /opt/tapstate/release/connectors.sha256; \
-     test "$(find . -maxdepth 1 -type f -name "*-connector.jar" | wc -l | tr -d " ")" = 7'
+     test "$(find . -maxdepth 1 -type f -name "*-connector.jar" | wc -l | tr -d " ")" = 8'
 test "$(docker image inspect "$CLOUD_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = NOASSERTION
 test "$(docker image inspect "$CLOUD_TAG" --format '{{ index .Config.Labels "io.tapstate.web.profile" }}')" = cloud
 test "$(docker image inspect "$CLOUD_TAG" --format '{{ index .Config.Labels "io.tapstate.web.cloud-console-url" }}')" = "$SMOKE_CLOUD_CONSOLE_URL"
@@ -204,4 +204,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/.github/scripts/web-provenance.py"
     --web-profile cloud --cloud-console-url "$SMOKE_CLOUD_CONSOLE_URL" \
     --boot-jar-sha256 "$CLOUD_BOOT_SHA256"
 
-echo "PASS: independent onprem/Cloud Web JARs have matching profile provenance; default server target remains connector-free; both Cloud OCI platforms carry seven locked synthetic JARs and companion licenses"
+echo "PASS: independent onprem/Cloud Web JARs have matching profile provenance; default server target remains connector-free; both Cloud OCI platforms carry eight locked synthetic JARs and companion licenses"

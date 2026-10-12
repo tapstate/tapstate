@@ -1,6 +1,13 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.core.lifecycle.NestStateWindow;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.slf4j.LoggerFactory;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -195,11 +202,44 @@ class WebDistributionEnvironmentPostProcessorTest {
                 .isSameAs(defect);
     }
 
+    @Test
+    void bootingAProfileFixtureDoesNotSuppressLaterApplicationWarnings() throws Exception {
+        Logger root = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
+        Level previousLevel = root.getLevel();
+        Logger alert = null;
+        ListAppender<ILoggingEvent> events = new ListAppender<>();
+        try {
+            root.setLevel(Level.INFO);
+            var prepared = prepare(Carrier.JVM, Map.of(), "onprem", new Counters());
+            try (var context = prepared.application().run(prepared.arguments())) {
+                assertThat(context.isActive()).isTrue();
+            }
+            assertThat(root.getLevel()).isEqualTo(Level.INFO);
+            alert = (Logger) LoggerFactory.getLogger(LoggingNestColdLayerAlert.class);
+            events.setContext(alert.getLoggerContext());
+            events.start();
+            alert.addAppender(events);
+
+            new LoggingNestColdLayerAlert().crossed("fixture-pipeline", "nest.fixture.orders",
+                    NestStateWindow.between(new NestStateReading(10, 0, 0, 0),
+                            new NestStateReading(10, 100, 90, 100)));
+
+            assertThat(events.list).singleElement().satisfies(event -> {
+                assertThat(event.getLevel()).isEqualTo(Level.WARN);
+                assertThat(event.getFormattedMessage()).contains("nest.state-served-from-cold-layer");
+            });
+        } finally {
+            if (alert != null) alert.detachAppender(events);
+            events.stop();
+            root.setLevel(previousLevel);
+        }
+    }
+
     private Prepared prepare(Carrier carrier, Map<String, String> values, String profile,
             Counters counters) throws Exception {
         URL origin = origin(profile);
         var environment = CloudFixtureEnvironment.isolated();
-        List<String> arguments = new ArrayList<>(List.of("--logging.level.root=OFF"));
+        List<String> arguments = new ArrayList<>();
         if (carrier == Carrier.PROPERTIES) {
             Path properties = properties(values);
             arguments.add("--spring.config.location=" + properties.toUri());

@@ -38,7 +38,7 @@ class ClusterContextController {
         }
         String cookie = CloudSessionCookies.read(request)
                 .orElseThrow(() -> new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null));
-        ClusterContextResponse context = service.clusterContext(cookie)
+        ClusterContextResponse context = service.clusterContextView(cookie)
                 .map(ClusterContextResponse::from)
                 .orElseThrow(() -> new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(context);

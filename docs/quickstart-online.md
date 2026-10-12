@@ -88,7 +88,11 @@ and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validat
 negative fractions and CDC updates. This is not an exhaustive cross-version or
 all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
 and 16 across these five database kinds, including existing managed variants of MySQL,
-PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
+live-verified individually. The Atlas connector was verified with snapshot and change-stream
+reads, restart continuation, and target writes against a real Atlas deployment in both cloud
+and on-prem runtimes. This verifies the tested deployment and does not establish an exhaustive
+Atlas version or tier compatibility matrix.
 Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
@@ -334,12 +338,15 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle, SQL Server and Db2 for an explicit registration. From an
-authenticated CLI session, give `register` the published connector id instead of a local path:
+The same release carries Oracle, SQL Server, Db2, MongoDB Atlas, and the unverified AWS RDS MySQL preview
+for explicit registration. From an authenticated CLI session, give `register` the published
+connector id instead of a local path:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> register oracle
 tapstate(admin@127.0.0.1:8080)> register sqlserver
+tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
+tapstate(admin@127.0.0.1:8080)> register aws-rds-mysql
 tapstate(admin@127.0.0.1:8080)> register db2
 ```
 

@@ -17,6 +17,7 @@ import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.runtime.probe.ConnectionProbe;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.runtime.probe.DelegatingConnectionProbe;
 import io.tapstate.runtime.probe.DelegatingSchemaDiscoveryProbe;
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
@@ -266,6 +267,14 @@ class SourceConfigPdkDeliveryIT {
     @ConditionalOnProperty(prefix = "tapstate.test", name = "pdk-memory", havingValue = "true")
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
     static class Assembly {
+        /** This fixture verifies real PDK config delivery without executing a Pipeline preview. */
+        @Bean
+        PipelinePreviewProbe unusedPreviewProbe() {
+            return request -> {
+                throw new AssertionError("this PDK config fixture does not execute a Pipeline preview");
+            };
+        }
+
         @Bean
         @Primary
         @ConditionalOnProperty(prefix = "tapstate.cloud", name = "base-url")

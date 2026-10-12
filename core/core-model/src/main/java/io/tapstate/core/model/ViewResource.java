@@ -19,9 +19,16 @@ public record ViewResource(
         String primaryKey,
         @Doc("Where and how the view's data is materialized.")
         Storage storage,
+        @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
+        ExecutionSpec execution,
         @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
         Map<String, Object> experimental)
         implements Resource {
+
+    public ViewResource(String id, Metadata metadata, String primaryKey, Storage storage,
+            Map<String, Object> experimental) {
+        this(id, metadata, primaryKey, storage, null, experimental);
+    }
 
     public ViewResource {
         Objects.requireNonNull(id, "id");

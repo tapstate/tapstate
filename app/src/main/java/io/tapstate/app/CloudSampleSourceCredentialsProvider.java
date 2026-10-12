@@ -1,7 +1,8 @@
 package io.tapstate.app;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.core.JacksonException;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.SampleSourceCredentialsProvider;
 import io.tapstate.core.common.TapstateException;
@@ -25,9 +26,9 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
 
     private final CloudRuntimeSettings settings;
     private final HttpClient http;
-    private final ObjectMapper objectMapper;
+    private final JsonMapper objectMapper;
 
-    CloudSampleSourceCredentialsProvider(CloudRuntimeSettings settings, ObjectMapper objectMapper) {
+    CloudSampleSourceCredentialsProvider(CloudRuntimeSettings settings, JsonMapper objectMapper) {
         this.settings = Objects.requireNonNull(settings, "settings");
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper");
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
@@ -90,6 +91,8 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
                         entry.path("orderLineTable").asText(null), entry.path("customerTable").asText(null)));
             }
             return List.copyOf(definitions);
+        } catch (JacksonException malformedResponse) {
+            return List.of();
         } catch (IOException e) {
             return List.of();
         } catch (InterruptedException e) {
@@ -107,9 +110,9 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
             JsonNode data = data(response.body());
             if (!data.isObject() || data.path("password").asText().isBlank()) throw unavailable();
             Map<String, Object> config = new LinkedHashMap<>();
-            data.fields().forEachRemaining(field -> {
-                if (field.getValue().isNumber()) config.put(field.getKey(), field.getValue().intValue());
-                else config.put(field.getKey(), field.getValue().asText());
+            data.forEachEntry((name, value) -> {
+                if (value.isNumber()) config.put(name, value.intValue());
+                else config.put(name, value.asText());
             });
             if ("postgres".equals(catalog().stream().filter(item -> item.id().equals(id))
                     .map(Definition::connector).findFirst().orElse(""))) {
@@ -117,6 +120,8 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
                 config.put("globalPublicationName", "tapstate_sample_pub");
             }
             return config;
+        } catch (JacksonException malformedResponse) {
+            throw unavailable();
         } catch (IOException e) {
             throw unavailable();
         } catch (InterruptedException e) {

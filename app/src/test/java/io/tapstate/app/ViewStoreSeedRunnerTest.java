@@ -33,7 +33,7 @@ class ViewStoreSeedRunnerTest {
     }
 
     @Test
-    void cloudAssemblyDerivesTheManagedViewStoreFromTheAtlasMetadataUri() {
+    void cloudAssemblyDoesNotSeedAManagedViewStore() {
         InMemoryStorePort store = new InMemoryStorePort();
         MongoProperties mongo = new MongoProperties();
         CloudProperties properties = new CloudProperties();
@@ -46,10 +46,7 @@ class ViewStoreSeedRunnerTest {
                 .viewStoreSeedRunner(store.artifacts(), mongo, CloudRuntimeSettings.resolve(properties))
                 .seed();
 
-        SourceResource source = (SourceResource)
-                store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID).orElseThrow();
-        assertThat(source.config().get("uri"))
-                .isEqualTo("mongodb+srv://user:sentinel-password@atlas.example/metadata_views?authSource=metadata");
+        assertThat(store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID)).isEmpty();
     }
 
     @Test

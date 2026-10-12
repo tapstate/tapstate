@@ -175,6 +175,15 @@ class PdkTargetPreparationTest {
         assertThat(calls).containsExactly("create", "create");
     }
 
+    /** A writer of tables its run prepared already calls nothing on the target, whatever the policy says. */
+    @Test
+    void aWriterOfTablesPreparedAheadPreparesNothing() throws Throwable {
+        List<String> calls = new ArrayList<>();
+        new PdkTargetPreparation(null, functions(true, calls), OnFullLoad.CLEAR, true, NODE, new State(), true)
+                .prepare(TARGET, TargetTapTable.build(TARGET));
+        assertThat(calls).isEmpty();
+    }
+
     private static PdkTargetPreparation preparation(boolean exists, OnFullLoad policy, boolean fullLoad,
             List<String> calls, State state) {
         return new PdkTargetPreparation(null, functions(exists, calls), policy, fullLoad, NODE, state);

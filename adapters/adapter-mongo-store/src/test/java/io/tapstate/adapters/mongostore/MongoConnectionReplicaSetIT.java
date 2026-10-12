@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -19,8 +20,15 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /**
@@ -156,6 +164,71 @@ class MongoConnectionReplicaSetIT {
     }
 
     /** The real CAS primitive: swap only when the stored epoch equals {@code expected}, bumping it. */
+    /**
+     * What a process that has gone left open at the store is found by the name its client connected under, and
+     * ended, so what it held is let go at once; what a process that is still here has open is left alone.
+     */
+    @Test
+    void theTransactionsAProcessLeftOpenAreEndedAndNobodyElsesAre() throws Exception {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try (MongoConnection gone = connectedFor(uri, "boot-gone");
+                MongoConnection stillHere = connectedFor(uri, "boot-still-here");
+                MongoConnection left = connectedFor(uri, "boot-left");
+                MongoClient plain = MongoClients.create(uri)) {
+            MongoCollection<Document> held = plain.getDatabase("tapstate").getCollection("held_open");
+            held.drop();
+            held.insertMany(List.of(new Document("_id", "gone").append("n", 0),
+                    new Document("_id", "still-here").append("n", 0)));
+            ClientSession goneSession = writtenAndLeftOpen(gone, "gone");
+            ClientSession stillHereSession = writtenAndLeftOpen(stillHere, "still-here");
+            try {
+                Future<?> intoWhatWasLeftOpen = threads.submit(() -> held.updateOne(
+                        new Document("_id", "gone"), new Document("$inc", new Document("n", 10))));
+                assertThatThrownBy(() -> intoWhatWasLeftOpen.get(2, TimeUnit.SECONDS))
+                        .as("a write to what the transaction wrote waits for it, which is the whole trouble")
+                        .isInstanceOf(TimeoutException.class);
+
+                assertThat(left.endTransactionsLeftOpenBy("boot-gone"))
+                        .as("the one transaction the process that has gone left open")
+                        .isEqualTo(1);
+
+                intoWhatWasLeftOpen.get(10, TimeUnit.SECONDS);
+                assertThat(held.find(new Document("_id", "gone")).first().getInteger("n"))
+                        .as("and it lands, while what the ended transaction wrote is gone with it")
+                        .isEqualTo(10);
+                Future<?> intoWhatIsStillOpen = threads.submit(() -> held.updateOne(
+                        new Document("_id", "still-here"), new Document("$inc", new Document("n", 10))));
+                assertThatThrownBy(() -> intoWhatIsStillOpen.get(2, TimeUnit.SECONDS))
+                        .as("a transaction of a process still here is its own to end")
+                        .isInstanceOf(TimeoutException.class);
+            } finally {
+                stillHereSession.abortTransaction();
+                stillHereSession.close();
+                goneSession.close();
+            }
+        } finally {
+            threads.shutdownNow();
+            assertThat(threads.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    private static MongoConnection connectedFor(String uri, String processId) {
+        MongoConnection connection =
+                new MongoConnection(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5), processId));
+        connection.verifyConnectivity();
+        return connection;
+    }
+
+    /** A transaction on {@code connection}'s client that writes the held document {@code id} and is never ended. */
+    private static ClientSession writtenAndLeftOpen(MongoConnection connection, String id) {
+        ClientSession session = connection.client().startSession();
+        session.startTransaction();
+        connection.client().getDatabase("tapstate").getCollection("held_open").updateOne(session,
+                new Document("_id", id), new Document("$inc", new Document("n", 1)));
+        return session;
+    }
+
     private static Document conditionalSwap(
             MongoCollection<Document> checkpoints, String pipelineId, long expected, String nextStateJson, Instant touch) {
         Document filter = new Document("_id", pipelineId).append("epoch", expected);

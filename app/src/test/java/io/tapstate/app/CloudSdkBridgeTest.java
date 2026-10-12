@@ -18,6 +18,19 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CloudSdkBridgeTest {
 
+    @Test
+    void reportableFailureCodesKeepTheBoundedAsciiGrammarWithoutRecursiveMatching() {
+        for (String code : List.of("sdk.bad-token", "exchange.code-expired", "c2.ack0",
+                "exchange." + "a".repeat(119))) {
+            assertThat(CloudSdkBridge.reportableFailureCode(code)).as(code).isTrue();
+        }
+        for (String code : List.of("sdk.", "sdk.-code", "sdk.code-", "sdk.code--again",
+                "sdk.CODE", "other.code", "sdk.code\nforged-log", "exchange." + "a".repeat(120))) {
+            assertThat(CloudSdkBridge.reportableFailureCode(code)).as(code).isFalse();
+        }
+        assertThat(CloudSdkBridge.reportableFailureCode(null)).isFalse();
+    }
+
     private static final Instant EXPIRY = Instant.parse("2030-01-01T00:00:00Z");
     private static final String AUDIENCE = "cluster.customer.example";
     private CloudRuntimeSettings settings;

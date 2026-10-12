@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.Job;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
@@ -31,11 +32,63 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verify;
 
 class BoundedPipelinePreviewExecutorTest {
+
+    @Test
+    void interruptedCleanupWaitPreservesTheWorkerInterruptAndDefersMapCleanup() throws Exception {
+        HazelcastInstance member = member("preview-interrupted-cleanup");
+        BoundedPipelinePreviewExecutor executor = executor(member);
+        CompletableFuture<Void> completion = new CompletableFuture<>() {
+            @Override
+            public Void get(long timeout, TimeUnit unit)
+                    throws InterruptedException, ExecutionException, TimeoutException {
+                Thread.currentThread().interrupt();
+                return super.get(timeout, unit);
+            }
+        };
+        try {
+            Object stream = stream(executor);
+            Job active = mock(Job.class);
+            when(active.getFuture()).thenReturn(completion);
+            AtomicReference<Job> runningJob = getField(stream, "job");
+            runningJob.set(active);
+            String inputMap = getField(stream, "inputMapName");
+            member.<String, String>getMap(inputMap).put("sentinel", "still-owned-by-the-job");
+
+            try {
+                invoke(stream, "execute", new Class<?>[0]);
+            } catch (CancellationException interruptedEmission) {
+                // Restoring interruption also prevents the event queue from blocking this worker.
+            }
+
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            verify(active).cancel();
+            Thread.interrupted();
+            Map<String, String> waitingRows = member.getMap(inputMap);
+            assertThat(waitingRows).containsEntry("sentinel", "still-owned-by-the-job");
+            completion.complete(null);
+            Map<String, String> cleanedRows = member.getMap(inputMap);
+            assertThat(cleanedRows).isEmpty();
+        } finally {
+            Thread.interrupted();
+            completion.complete(null);
+            executor.close();
+            member.shutdown();
+        }
+    }
 
     @Test
     void invalidCandidateEmitsSafeFailureAndReleasesItsPipelineLease() throws Exception {

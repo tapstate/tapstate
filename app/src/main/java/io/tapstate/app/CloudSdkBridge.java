@@ -160,8 +160,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
 
     private static void logExchangeFailure(CloudControlPlaneException failure) {
         String code = failure.getErrorCode();
-        String diagnostic = code != null && code.length() <= 128
-                && code.matches("(?:sdk|exchange|c2)\\.[a-z0-9]+(?:-[a-z0-9]+)*")
+        String diagnostic = reportableFailureCode(code)
                 ? code : "unclassified";
         int status = failure.getHttpStatus();
         if (status < 0 || status > 599) status = 0;
@@ -169,6 +168,28 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         markFailure("code-exchange", diagnostic);
         LOG.warn("Cloud authentication rejected [request_id={}, stage=code-exchange, http={}, reason={}]",
                 requestId(), status, diagnostic);
+    }
+
+    static boolean reportableFailureCode(String code) {
+        if (code == null || code.length() > 128) return false;
+        int start;
+        if (code.startsWith("sdk.")) start = 4;
+        else if (code.startsWith("exchange.")) start = 9;
+        else if (code.startsWith("c2.")) start = 3;
+        else return false;
+        boolean segmentEmpty = true;
+        for (int index = start; index < code.length(); index++) {
+            char value = code.charAt(index);
+            if (value == '-') {
+                if (segmentEmpty) return false;
+                segmentEmpty = true;
+            } else if ((value >= 'a' && value <= 'z') || (value >= '0' && value <= '9')) {
+                segmentEmpty = false;
+            } else {
+                return false;
+            }
+        }
+        return !segmentEmpty;
     }
 
     private static void logValidationFailure(String stage, String reason) {

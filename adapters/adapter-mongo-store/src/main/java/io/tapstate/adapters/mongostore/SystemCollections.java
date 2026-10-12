@@ -10,6 +10,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * Every collection this product keeps, written out one row per collection — and the only place in the
@@ -257,6 +258,14 @@ public enum SystemCollections {
             throw new IllegalStateException(collectionName + " is a GridFS bucket; ask for the bucket");
         }
         return database.getCollection(collectionName);
+    }
+
+    /**
+     * A unique, uncommitted startup probe rather than a collection the product keeps.
+     * The connection uses this handle only inside transactions it always aborts.
+     */
+    static MongoCollection<Document> accessProbeOn(MongoDatabase database, UUID id) {
+        return database.getCollection("tapstate_access_probe_" + id.toString().replace("-", ""));
     }
 
     /** The handle on this GridFS bucket — the one call to {@code GridFSBuckets.create}, for the same reason. */

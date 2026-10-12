@@ -14,6 +14,7 @@ import java.util.Objects;
  * version, so two authors editing the same resource cannot silently overwrite each other. Omitted,
  * a full replacement keeps the original unconditional-write behavior. A partial Source draft is an
  * exception: omitted top-level fields are copied from the stored Source and guarded by its version.
+ * Managed Cloud apply additionally fences the stored snapshot that supplies server-managed attribution.
  */
 public record ArtifactDraft(String source, String content, String expectedContentHash) {
 

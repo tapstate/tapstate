@@ -35,10 +35,12 @@ class StoreConfiguration {
 
     @Bean(destroyMethod = "close")
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    MongoConnection storeConnection(MongoProperties properties, CloudRuntimeSettings cloud) {
+    MongoConnection storeConnection(MongoProperties properties, CloudRuntimeSettings cloud, BootId bootId) {
+        // Named for this start of the process, so the members left can end what it leaves open if it goes
+        // halfway through a write. See DepartedMemberTransactions.
         MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
                 cloud.metadataUri(properties.getUri()), properties.getTlsCaFile(),
-                properties.getServerSelectionTimeout()));
+                properties.getServerSelectionTimeout(), bootId.value()));
         // Fail fast at startup: a coded diagnostic surfaces through CodedFailureAnalyzer if the
         // store is unreachable or is not a replica-set, rather than a bare driver stack trace.
         try {

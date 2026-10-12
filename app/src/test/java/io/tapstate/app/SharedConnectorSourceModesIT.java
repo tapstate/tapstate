@@ -11,6 +11,7 @@ import io.tapstate.control.core.SourceView;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.runtime.probe.ConnectionProbe;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionStore;
@@ -356,6 +357,14 @@ class SharedConnectorSourceModesIT {
         @Bean RecordingProbes recordingProbes() { return new RecordingProbes(); }
         @Bean @Primary ConnectionProbe controlledConnectionProbe(RecordingProbes probes) { return probes::test; }
         @Bean @Primary SchemaDiscoveryProbe controlledSchemaDiscoveryProbe(RecordingProbes probes) { return probes::discover; }
+
+        /** These Source witnesses mount the HTTP face but never execute Pipeline previews. */
+        @Bean
+        PipelinePreviewProbe unusedPreviewProbe() {
+            return request -> {
+                throw new AssertionError("this Source HTTP fixture does not execute a Pipeline preview");
+            };
+        }
 
         @Bean
         @Primary

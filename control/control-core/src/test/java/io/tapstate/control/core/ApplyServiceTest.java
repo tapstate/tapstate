@@ -123,6 +123,65 @@ class ApplyServiceTest {
     }
 
     @Test
+    void managedCloudApplyCannotReplaceAConcurrentCreatorOrWriteItsBatchSiblings() {
+        ApplyService cloud = cloudForAttribution();
+        Resource firstCreator = ResourceAttributionPolicy.managedCloud().attribute("first-cloud-user",
+                new DslParser().parse(TGT_MG), null);
+        store.concurrentWriter = () -> store.landDirectly(firstCreator);
+
+        assertThatThrownBy(() -> cloud.apply("later-cloud-user", List.of(
+                draft(TGT_MG.replace("tgt_mg", "new_sibling")), draft(TGT_MG))))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT);
+                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_mg"));
+                });
+
+        assertThat(store.get("tgt_mg")).contains(firstCreator);
+        assertThat(store.get("new_sibling")).isEmpty();
+        assertThat(store.saveCount).isZero();
+    }
+
+    @Test
+    void managedCloudApplyCannotRestoreAttributionFromAReplacedResource() {
+        ApplyService cloud = cloudForAttribution();
+        String transform = """
+                version: tapstate/v1
+                kind: transform
+                id: attributed_transform
+                type: filter
+                expr: "true"
+                """;
+        cloud.apply("original-cloud-user", List.of(draft(transform)));
+        Resource replacement = ResourceAttributionPolicy.managedCloud().attribute("replacement-cloud-user",
+                new DslParser().parse(transform), null);
+        // Another request deletes and recreates the id after this request copied its old creator.
+        store.concurrentWriter = () -> store.landDirectly(replacement);
+
+        assertThatThrownBy(() -> cloud.apply("editing-cloud-user",
+                List.of(draft(transform + "metadata: { description: edited }\n"))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT));
+
+        assertThat(store.get("attributed_transform")).contains(replacement);
+    }
+
+    @Test
+    void onPremApplyKeepsItsUnconditionalCreateBehaviorDuringAConcurrentCreate() {
+        Resource earlier = new DslParser().parse(TGT_MG_EDITED);
+        store.concurrentWriter = () -> store.landDirectly(earlier);
+
+        service.apply("on-prem-user", List.of(draft(TGT_MG)));
+
+        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG));
+    }
+
+    private ApplyService cloudForAttribution() {
+        return new ApplyService(TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud());
+    }
+
+    @Test
     void cloudRejectsInlineStatePlacementInValidateAndApplyBeforeAnyBatchWrite() {
         ApplyService cloud = cloudWithStatePolicy();
         List<ArtifactDraft> batch = nestBatch("custom_ops");
@@ -1591,23 +1650,31 @@ class ApplyServiceTest {
                     }
                 }
             }
-            ArtifactWrite write = writes.getFirst();
-            if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && byId.containsKey(write.resource().id())) {
-                return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
-            }
-            if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
-                String canonical = byId.get(write.resource().id());
-                if (canonical == null) {
-                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND);
+            for (ArtifactWrite write : writes) {
+                if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && byId.containsKey(write.resource().id())) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
                 }
-                if (!storedHash(canonical).equals(write.expectedContentHash())) {
-                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
+                if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
+                    String canonical = byId.get(write.resource().id());
+                    if (canonical == null) {
+                        return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND);
+                    }
+                    if (!storedHash(canonical).equals(write.expectedContentHash())) {
+                        return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
+                    }
                 }
             }
-            byId.put(write.resource().id(), writer.write(write.resource()));
-            unreadable.remove(write.resource().id());
-            saveCount++;
-            saveAllBatches.add(List.of(write.resource().id()));
+            Map<String, String> staged = new LinkedHashMap<>();
+            for (ArtifactWrite write : writes) {
+                if (write.resource().id().equals(failOnId)) {
+                    throw new RuntimeException("simulated store write failure at " + failOnId);
+                }
+                staged.put(write.resource().id(), writer.write(write.resource()));
+            }
+            byId.putAll(staged);
+            unreadable.removeAll(staged.keySet());
+            saveCount += writes.size();
+            saveAllBatches.add(writes.stream().map(write -> write.resource().id()).toList());
             return ArtifactBatchWrite.applied();
         }
 

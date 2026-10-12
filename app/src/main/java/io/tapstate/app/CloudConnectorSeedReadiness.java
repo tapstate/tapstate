@@ -44,7 +44,7 @@ final class CloudConnectorSeedReadiness {
 
     static final String LOCK_RESOURCE = "/META-INF/tapstate/connectors.lock.json";
     private static final List<String> IDS = List.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
     private static final Set<String> LICENSES = Set.of("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt");
     private static final Set<String> ARTIFACT_KEYS = Set.of(
             "id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath");
@@ -226,7 +226,8 @@ final class CloudConnectorSeedReadiness {
             }
             String id = entry.path("id").asString("");
             if (!IDS.contains(id) || !ids.add(id)
-                    || !validLength(entry.path("bytes"), 1_000_000, 128_000_000)
+                    || !validLength(entry.path("bytes"), 1_000_000,
+                            "db2".equals(id) ? 256L * 1024 * 1024 : 128_000_000)
                     || !matches(entry.path("sha256"), "[0-9a-f]{64}")
                     || !matches(entry.path("upstreamRevision"), "[0-9a-f]{40}")
                     || !matches(entry.path("pdkApiVersion"), "[A-Za-z0-9][A-Za-z0-9._-]*")

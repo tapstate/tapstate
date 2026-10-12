@@ -8,7 +8,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
-/** Administrative connection setup for the single Cloud view store. */
+/** Connects the user's MongoDB Atlas store for materialized Cloud views. */
 @RestController
 class StateStoreController {
     private final StateStoreSetupService setup;
