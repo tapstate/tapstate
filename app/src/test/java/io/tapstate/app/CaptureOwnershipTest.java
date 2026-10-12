@@ -16,6 +16,7 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.srs.CaptureError;
+import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
@@ -144,19 +145,50 @@ class CaptureOwnershipTest {
         InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
         HeldSnapshots source = new HeldSnapshots(true);
         SnapshotBuffer buffer = new SnapshotBuffer();
-        StoreBackedPipelineCaptureCoordinator node = managed(store, reading(source, store), buffer);
-        node.startCapture("p");
-        node.startCapture("q");
+        HeldFirstHandoff probe = new HeldFirstHandoff();
+        CaptureAttacher reader = reading(source, store);
+        CaptureAttacher ordered = (spec, handoff, startTail) -> reader.start(
+                spec, spec.pipelineId().equals("p") ? probe.wrap(handoff) : handoff, startTail);
+        StoreBackedPipelineCaptureCoordinator node = managed(store, ordered, buffer);
+        String ring = SourceCaptureResolution.of(SOURCE).ringName();
+        try {
+            node.startCapture("p");
+            node.startCapture("q");
+            assertThat(probe.approved.await(10, TimeUnit.SECONDS))
+                    .as("the first row passed the load's abandonment check before stop").isTrue();
+            assertThat(buffer.snapshotState("p", ring).declared()).isTrue();
+            assertThat(buffer.drain("p", ring))
+                    .as("the approved first row has not been appended before stop").isEmpty();
 
-        node.stopCapture("p", false);
-        source.rest.countDown();
-        awaitLoadLetGo("p");
+            node.stopCapture("p", false);
+            assertThat(probe.interrupted.await(10, TimeUnit.SECONDS))
+                    .as("stop interrupted the still-held load").isTrue();
+            assertThat(buffer.snapshotState("p", ring)).isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
+            assertThat(buffer.drain("p", ring))
+                    .as("stop released the buffer before the approved row can append").isEmpty();
+            probe.events.add("buffer released");
+            source.rest.countDown();
+            probe.resume.countDown();
+            awaitLoadLetGo("p");
+            probe.events.add("load exited");
 
-        assertThat(buffer.drain("p", SourceCaptureResolution.of(SOURCE).ringName()))
-                .as("rows of the stopped pipeline's load, handed over after the stop").isEmpty();
-        assertThat(node.captureFailure("q")).isEmpty();
-        node.stopCapture("q", false);
-        node.close();
+            awaitLoadLetGo("q");
+            assertThat(node.captureFailure("q")).isEmpty();
+            assertThat(buffer.drain("q", ring)).extracting(Envelope::after)
+                    .as("the other shared consumer still receives its entire held snapshot")
+                    .containsExactly(Map.of("id", 1L), Map.of("id", 2L), Map.of("id", 3L));
+            assertThat(probe.events).containsExactly(
+                    "first row approved", "load interrupted", "buffer released", "first row appended", "load exited");
+            System.out.println("Stopped shared-capture handoff order: " + String.join(" -> ", probe.events));
+            assertThat(buffer.drain("p", SourceCaptureResolution.of(SOURCE).ringName()))
+                    .as("rows of the stopped pipeline's load, handed over after the stop").isEmpty();
+        } finally {
+            source.rest.countDown();
+            probe.resume.countDown();
+            node.stopCapture("p", false);
+            node.stopCapture("q", false);
+            node.close();
+        }
     }
 
     /**
@@ -188,6 +220,66 @@ class CaptureOwnershipTest {
         CaptureRunUnit unit = new CaptureRunUnit(
                 source, new SrsCoordinator(store.meta()), store.meta(), mock(HazelcastInstance.class));
         return unit::begin;
+    }
+
+    /** Holds only the first handoff already approved by the load, before the real buffer sees it. */
+    private static final class HeldFirstHandoff {
+        final CountDownLatch approved = new CountDownLatch(1);
+        final CountDownLatch interrupted = new CountDownLatch(1);
+        final CountDownLatch resume = new CountDownLatch(1);
+        final List<String> events = Collections.synchronizedList(new ArrayList<>());
+
+        CaptureHandoff wrap(CaptureHandoff delegate) {
+            return new CaptureHandoff() {
+                private boolean first = true;
+
+                @Override
+                public void accept(Envelope row) {
+                    boolean held = first;
+                    first = false;
+                    if (held) {
+                        events.add("first row approved");
+                        approved.countDown();
+                        awaitResume();
+                    }
+                    delegate.accept(row);
+                    if (held) {
+                        events.add("first row appended");
+                    }
+                }
+
+                @Override
+                public void loaded(String table) {
+                    delegate.loaded(table);
+                }
+            };
+        }
+
+        private void awaitResume() {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            boolean restoreInterrupt = false;
+            try {
+                while (true) {
+                    try {
+                        if (!resume.await(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+                            throw new AssertionError("the first-row handoff was not resumed within ten seconds");
+                        }
+                        return;
+                    } catch (InterruptedException cancelled) {
+                        // Model a thread descheduled after approval: the interrupt cannot undo that approval.
+                        restoreInterrupt = true;
+                        if (interrupted.getCount() != 0) {
+                            events.add("load interrupted");
+                            interrupted.countDown();
+                        }
+                    }
+                }
+            } finally {
+                if (restoreInterrupt) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
     }
 
     /** Waits for the thread reading {@code pipelineId}'s load to be gone, so what it did is all it did. */

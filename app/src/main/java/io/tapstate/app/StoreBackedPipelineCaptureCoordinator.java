@@ -1110,8 +1110,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             run.chainId().ifPresent(chain -> readers.ran(chain, pipelineRun.spec()));
         }
         // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
-        // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
-        // this is where all of the pipeline's queues and their coordinate strings are released. Keep them when
+        // after the drain returns. Release invalidates this run's buffer callbacks before removing queues,
+        // including an approved row that resumes after a shared run lets go of its load. Keep them when
         // a close failed because that capture may still be appending.
         if (capturesStopped) {
             snapshotBuffer.release(pipelineId);
@@ -1543,6 +1543,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         CapturePlan phases = CapturePlan.forReadMode(spec.readMode());
         Optional<String> chainId = phases.snapshot() && phases.cdc()
                 ? Optional.of(spec.miningChainId().value()) : Optional.empty();
+        Map<String, CaptureHandoff> buffers = new LinkedHashMap<>();
+        resolution.tables().forEach(table ->
+                buffers.put(table, snapshotBuffer.handoff(pipelineId, resolution.ringName(table))));
         return new CaptureHandoff() {
             @Override
             public void accept(Envelope event) {
@@ -1550,14 +1553,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     throw new TapstateException(
                             CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
                 }
-                snapshotBuffer.append(pipelineId, resolution.ringName(event.src()), event);
+                buffers.get(event.src()).accept(event);
                 observedSnapshotCounts.merge(event.src(), 1L, Long::sum);
             }
 
             @Override
             public void loaded(String table) {
                 saveLoadCountIfOwed(spec, chainId, table, observedSnapshotCounts.getOrDefault(table, 0L));
-                snapshotBuffer.endSnapshot(pipelineId, resolution.ringName(table));
+                buffers.get(table).loaded(table);
                 load.loaded(plan.sourceId(), table, observedSnapshotCounts.getOrDefault(table, 0L),
                         estimatedRows(plan.discovered(), table));
             }
