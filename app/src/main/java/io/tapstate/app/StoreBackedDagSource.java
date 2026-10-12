@@ -1473,7 +1473,8 @@ final class StoreBackedDagSource implements DagSource {
             fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false,
                     inferred,
                     produced.numericTypes().get(column), produced.stringTypes().get(column)));
-            TargetField identity = declared.get(produced.origins().get(column));
+            TargetField identity = produced.expanded()
+                    ? declared.get(produced.origins().get(column)) : carried;
             if (identity != null && identity.primaryKey()
                     && (!produced.expanded() || column.equals(parentNames.get(identity.name())))) {
                 key.add(column);
