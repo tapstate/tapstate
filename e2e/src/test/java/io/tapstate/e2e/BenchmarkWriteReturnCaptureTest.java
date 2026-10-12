@@ -74,7 +74,7 @@ class BenchmarkWriteReturnCaptureTest {
             assertThat(result.calls()).hasSize(1);
             assertThat(result.calls().getFirst().lastCallbackExitNanos()).isEqualTo(1550);
             assertThat(result.calls().getFirst().rows().getFirst().keys()).containsExactly(1);
-            assertThat(result.samples().size()).isBetween(2, 512);
+            assertThat(result.samples().size()).isBetween(2, 1024);
             assertThat(result.pagesBase64()).containsExactly(java.util.Base64.getEncoder().encodeToString(access.page));
             assertThatThrownBy(() -> result.pagesBase64().clear()).isInstanceOf(UnsupportedOperationException.class);
             assertThat(access.starts).hasValue(1); assertThat(access.stops).hasValue(1);

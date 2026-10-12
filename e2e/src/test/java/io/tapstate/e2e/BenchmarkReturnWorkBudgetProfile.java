@@ -14,7 +14,7 @@ final class BenchmarkReturnWorkBudgetProfile {
     static final int ROWS = 96_000;
     static final long SEED = 424_242L;
     static final int PAGE_BYTES = 65_536, RAW_BYTES = 2 * 1024 * 1024, PAGES = 512, FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES;
-    static final int RETURN_ROWS = 262_144, CLOCK_SAMPLES = 512, RESOURCE_ATTEMPTS = 4096;
+    static final int RETURN_ROWS = 262_144, CLOCK_SAMPLES = BenchmarkCausalClock.MAX_SAMPLES, RESOURCE_ATTEMPTS = 4096;
     static final String DEFINITION_ID = "WRITE_RETURN_ROOT_FIXED_PILOT_V1";
 
     enum FileRole {

@@ -24,12 +24,16 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
                   Map<String, Object> costStages) {
         Result {
             if (BenchmarkReturnWorkBudget.current() == null) {
-                calls = List.copyOf(calls); samples = List.copyOf(samples); pagesBase64 = List.copyOf(pagesBase64);
+                if (samples == null || samples.size() < 0 || samples.size() > BenchmarkCausalClock.MAX_SAMPLES) {
+                    throw new AssertionError("sample roster exceeds its prior material cap");
+                }
+                calls = List.copyOf(calls); samples = List.copyOf(samples);
+                pagesBase64 = List.copyOf(pagesBase64);
                 java.util.Objects.requireNonNull(clockMode);
                 costStages = Map.copyOf(costStages);
             } else {
                 calls = BenchmarkReturnCaptureMaterialBounds.copy(calls, BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS);
-                samples = BenchmarkReturnCaptureMaterialBounds.copy(samples, 512);
+                samples = BenchmarkReturnCaptureMaterialBounds.copy(samples, BenchmarkCausalClock.MAX_SAMPLES);
                 pagesBase64 = BenchmarkReturnCaptureMaterialBounds.copy(pagesBase64, 512);
                 java.util.Objects.requireNonNull(clockMode);
                 costStages = BenchmarkReturnCaptureMaterialBounds.stages(costStages);

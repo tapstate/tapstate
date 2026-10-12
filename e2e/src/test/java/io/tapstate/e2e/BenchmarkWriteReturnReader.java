@@ -29,7 +29,7 @@ final class BenchmarkWriteReturnReader {
     private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
 
     enum ClockRequestRole {
-        PERIODIC_CLOCK(512), START_VALIDATION(1), STOP_VALIDATION(1), SUMMARY_VALIDATION(1), PAGE_VALIDATION(514);
+        PERIODIC_CLOCK(BenchmarkCausalClock.MAX_SAMPLES), START_VALIDATION(1), STOP_VALIDATION(1), SUMMARY_VALIDATION(1), PAGE_VALIDATION(514);
         private final long maximumRequests;
         ClockRequestRole(long maximumRequests) { this.maximumRequests = maximumRequests; }
     }

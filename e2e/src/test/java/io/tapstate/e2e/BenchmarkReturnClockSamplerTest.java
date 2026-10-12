@@ -161,16 +161,49 @@ class BenchmarkReturnClockSamplerTest {
         assertThat(calls).hasValue(2);
     }
 
-    @Test void capacity_exhaustion_refuses_final_coverage_without_a_five_hundred_thirteenth_read() throws Exception {
+    @Test void capacity_exhaustion_refuses_final_coverage_without_a_request_beyond_the_material_cap() throws Exception {
         AtomicInteger calls = new AtomicInteger(); CountDownLatch last = new CountDownLatch(1);
         var sampler = new BenchmarkReturnClockSampler(sequence -> {
-            calls.incrementAndGet(); if (sequence == 511) { last.countDown(); } return sample(sequence);
+            calls.incrementAndGet(); if (sequence == BenchmarkCausalClock.MAX_SAMPLES - 1) { last.countDown(); } return sample(sequence);
         }, Duration.ZERO);
         try { sampler.start(); } catch (AssertionError capacity) { assertThat(capacity).hasMessageContaining("CAPACITY"); }
         assertThat(last.await(2, TimeUnit.SECONDS)).isTrue();
         assertThatThrownBy(sampler::finishAfterSuccessfulStop).isInstanceOf(AssertionError.class).hasMessageContaining("CAPACITY");
         assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class);
-        assertThat(calls).hasValue(512); assertThat(sampler.readings()).hasSize(512);
+        assertThat(calls).hasValue(1024); assertThat(sampler.readings()).hasSize(1024);
+    }
+
+    @Test void six_hundred_periodic_reads_keep_every_point_and_a_distinct_final_read() throws Exception {
+        CountDownLatch boundary = new CountDownLatch(1), release = new CountDownLatch(1);
+        AtomicInteger calls = new AtomicInteger(); AtomicReference<Thread> finishingThread = new AtomicReference<>();
+        var sampler = new BenchmarkReturnClockSampler(sequence -> {
+            calls.incrementAndGet();
+            if (sequence == 599) { boundary.countDown(); awaitUninterruptibly(release); }
+            return sample(sequence);
+        }, Duration.ZERO);
+        var finisher = Executors.newSingleThreadExecutor();
+        try {
+            sampler.start(); assertThat(boundary.await(2, TimeUnit.SECONDS)).isTrue();
+            var completed = finisher.submit(() -> {
+                finishingThread.set(Thread.currentThread());
+                return sampler.finishAfterSuccessfulStop();
+            });
+            long began = System.nanoTime();
+            while ((finishingThread.get() == null || finishingThread.get().getState() != Thread.State.TIMED_WAITING)
+                    && System.nanoTime() - began < TimeUnit.SECONDS.toNanos(1)) { Thread.yield(); }
+            assertThat(finishingThread.get()).isNotNull();
+            assertThat(finishingThread.get().getState()).isEqualTo(Thread.State.TIMED_WAITING);
+            release.countDown();
+            var retained = completed.get(3, TimeUnit.SECONDS);
+            assertThat(retained).hasSize(601); assertThat(calls).hasValue(601);
+            for (int i = 0; i < retained.size(); i++) assertThat(retained.get(i)).isEqualTo(sample(i));
+            assertThat(sampler.evidence()).containsEntry("firstRecorded", true).containsEntry("finalRecorded", true)
+                    .containsEntry("workerExited", true).containsEntry("state", "RECORDED");
+        } finally {
+            release.countDown(); finisher.shutdownNow();
+            assertThat(finisher.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
+            try { sampler.close(); } catch (AssertionError refusal) { assertThat(refusal).hasMessageContaining("CAPACITY"); }
+        }
     }
 
     @Test void a_stuck_borrowed_reader_has_bounded_refused_close_and_cannot_keep_the_JVM_alive() throws Exception {

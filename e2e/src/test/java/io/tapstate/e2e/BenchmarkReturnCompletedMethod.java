@@ -198,7 +198,7 @@ final class BenchmarkReturnCompletedMethod {
         }
         var calls = assembly.finish(typed.completedCalls(), typed.reportedRecords());
         var samples = new ArrayList<BenchmarkCausalClock.Sample>();
-        for (Object raw : list(retained.get("clockSamples"), 512)) {
+        for (Object raw : list(retained.get("clockSamples"), BenchmarkCausalClock.MAX_SAMPLES)) {
             var row = object(raw);
             var actual = new BenchmarkCausalClock.Identity(number(row, "pid"), number(row, "jvmStartTimeMillis"));
             require(producer.equals(actual), "original clock sample belongs to another producer");

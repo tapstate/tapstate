@@ -11,6 +11,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkReturnCompletedCorrespondenceTest {
+    @Test void complete_raw_correspondence_retains_more_than_the_old_sample_limit_and_refuses_the_new_limit() throws Exception {
+        var fixture = BenchmarkWriteReturnPhaseEvidenceTest.nativeFixture(BenchmarkWorkloadDefinitions.steadyPilot("stateless"));
+        var original = fixture.result(); var owner = original.samples().getFirst().identity();
+        var samples = java.util.stream.LongStream.range(0, 600).mapToObj(index -> new BenchmarkCausalClock.Sample(
+                index, owner, index * 1000, index * 1000 + 10, index * 1000 + 5)).toList();
+        var expanded = new BenchmarkWriteReturnCapture.Result(original.calls(), samples, original.summary(), original.pagesBase64());
+        var retained = capture(expanded);
+        assertThat(BenchmarkReturnCompletedMethod.reconstructCapture(retained, owner, "stateless/cdc-update").samples())
+                .containsExactlyElementsOf(samples);
+        retained.put("clockSamples", java.util.Collections.nCopies(1025, ((List<?>) retained.get("clockSamples")).getFirst()));
+        assertThatThrownBy(() -> BenchmarkReturnCompletedMethod.reconstructCapture(retained, owner, "stateless/cdc-update"))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("bounded list");
+        var hostile = new java.util.AbstractList<BenchmarkCausalClock.Sample>() {
+            @Override public int size() { return 1025; }
+            @Override public BenchmarkCausalClock.Sample get(int index) { throw new AssertionError("oversized sample roster was traversed"); }
+        };
+        assertThatThrownBy(() -> new BenchmarkWriteReturnCapture.Result(original.calls(), hostile, original.summary(), original.pagesBase64()))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("prior");
+    }
+
     @Test void retained_complete_raw_material_reconstructs_every_call_sample_and_summary() throws Exception {
         var fixture = BenchmarkWriteReturnPhaseEvidenceTest.nativeFixture(BenchmarkWorkloadDefinitions.steadyPilot("stateless"));
         var result = fixture.result(); var owner = result.samples().getFirst().identity();

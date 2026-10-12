@@ -96,7 +96,7 @@ class BenchmarkWriteReturnProbeIT {
                         assertThat(result.summary().reportedRecords()).isEqualTo(6);
                         assertThat(result.summary().openCalls()).isZero();
                         assertThat(result.summary().failedCalls()).isZero();
-                        assertThat(result.samples().size()).isBetween(2, 512);
+                        assertThat(result.samples().size()).isBetween(2, BenchmarkCausalClock.MAX_SAMPLES);
                         samples.addAll(result.samples());
                     }
                     byte[] raw = probe.page(0);

@@ -16,14 +16,14 @@ class BenchmarkAckCalibrationBudgetTest {
     @Test void fixed_source_decomposition_has_an_independent_eight_unit_numeric_witness() {
         var actual = BenchmarkReturnComponentSourceWork.ackCalibrationUpper();
         // Four local helper bodies; request witness includes every fixed map/guard API and
-        // the full512/6000 input envelopes, independently of observed material or RPC time.
-        var expected = new BenchmarkReturnWorkBudget.Work(4, 1119772, 12514, 0,
-                7703896, 17, 9787836, 9787836);
+        // the full1024/6000 input envelopes, independently of observed material or RPC time.
+        var expected = new BenchmarkReturnWorkBudget.Work(4, 1128988, 13026, 0,
+                7720280, 17, 9862588, 9862588);
         assertThat(actual).isEqualTo(expected);
         assertThat(BenchmarkReturnProducerOrigins.FLAGS).hasSize(18);
         var phase = BenchmarkReturnComponentSourceWork.upper(BenchmarkReturnComponentSourceWork.Kind.VERIFY_PHASE, limits());
         long calls = BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS;
-        long legacyRequests = 1024 + 8 * calls * calls + 64 * calls + 32L * 512 + 32L * 960
+        long legacyRequests = 1024 + 8 * calls * calls + 64 * calls + 32L * 1024 + 32L * 960
                 + 128L * 6000 + 4 * (64L * 8192 + 64L * 512 + 128) + 64L * (6 * 2 + 4) + 16;
         assertThat(phase.requests()).isEqualTo(legacyRequests + expected.requests());
         assertThat(BenchmarkReturnComponentSourceWork.ACK_FORMULA_SLOTS).isEqualTo(202);

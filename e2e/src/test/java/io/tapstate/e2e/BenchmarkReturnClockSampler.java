@@ -13,7 +13,7 @@ final class BenchmarkReturnClockSampler implements AutoCloseable {
     enum Mode { PERIODIC, FIRST_FINAL_CONTROL }
 
     static final Duration SAMPLE_DELAY = Duration.ofMillis(50);
-    static final int MAX_SAMPLES = 512;
+    static final int MAX_SAMPLES = BenchmarkCausalClock.MAX_SAMPLES;
     private static final long OWNER_WAIT_NANOS = Duration.ofSeconds(2).toNanos();
 
     private final Object lock = new Object();

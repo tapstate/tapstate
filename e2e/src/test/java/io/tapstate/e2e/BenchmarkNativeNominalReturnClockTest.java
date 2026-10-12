@@ -192,6 +192,20 @@ class BenchmarkNativeNominalReturnClockTest {
                 .hasMessageContaining("enclosure overflow");
     }
 
+    @Test void expanded_complete_serial_mapping_uses_the_shared_bounded_sample_roster() {
+        var retained = java.util.stream.LongStream.range(0, 600).mapToObj(index -> new BenchmarkCausalClock.Sample(
+                index, OWNED, index * 1000, index * 1000 + 10, index * 1000 + 5)).toList();
+        var evidence = clock(receipt(), receipt(), retained).serialCalibrationEvidence(retained);
+        assertThat(evidence).containsEntry("samples", 600).containsEntry("mappingUncertaintyUpperNominalNanos", 1L);
+        for (String flag : BenchmarkReturnProducerOrigins.FLAGS) assertThat(evidence).containsEntry(flag, false);
+        var hostile = new java.util.AbstractList<BenchmarkCausalClock.Sample>() {
+            @Override public int size() { return 1025; }
+            @Override public BenchmarkCausalClock.Sample get(int index) { throw new AssertionError("oversized clock roster was traversed"); }
+        };
+        assertThatThrownBy(() -> clock(receipt(), receipt(), hostile)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("bounded");
+    }
+
     private static BenchmarkNativeNominalReturnClock clock(Map<String, Object> before, Map<String, Object> after,
             List<BenchmarkCausalClock.Sample> samples) {
         return new BenchmarkNativeNominalReturnClock(OWNED, ROOT, LIBRARY, samples, before, after);

@@ -71,7 +71,7 @@ final class BenchmarkReturnCaptureMaterialBounds {
 
     private static void guard(List<BenchmarkWriteReturnAssembly.FullCall> calls, List<BenchmarkCausalClock.Sample> samples,
                               BenchmarkWriteReturnReader.Summary summary, List<String> pages, Map<String, Object> stages) {
-        int callCount = count(calls, CALLS), pageCount = count(pages, 512); size(samples, 512);
+        int callCount = count(calls, CALLS), pageCount = count(pages, 512); size(samples, BenchmarkCausalClock.MAX_SAMPLES);
         require(stages != null && stages.size() <= 512, "cost-stage wrapper exceeds its shallow prior cap");
         require(summary != null, "capture summary is missing");
         utf8(summary.window(), 512); utf8(summary.state(), 512);
@@ -137,7 +137,7 @@ final class BenchmarkReturnCaptureMaterialBounds {
 
     static Map<BenchmarkReturnWorkBudget.Activity, BenchmarkReturnWorkBudget.Work> upper() {
         return BenchmarkReturnWorkBudget.operation(BenchmarkReturnWorkBudget.Activity.INSTALL_BINDINGS, () -> {
-        long slots = add(CALLS, 512, 512, (long) CALLS * DETAILS, 2L * CALLS, ROWS, 2L * ROWS);
+        long slots = add(CALLS, BenchmarkCausalClock.MAX_SAMPLES, 512, (long) CALLS * DETAILS, 2L * CALLS, ROWS, 2L * ROWS);
         long visits = add(slots, TOTAL, 8192);
         // Per guarded visit: <=64 accessor/length/iterator/checked-arithmetic/JDK APIs and stores.
         // Fixed128 covers entry/failure setup. Extra8192 encloses summary/final-reject scalar visits; no encoded scalar arrays are allocated.

@@ -19,7 +19,7 @@ final class BenchmarkReturnLocalSourceWork {
     static final int MAX_PAGE_FRAMES = (65536 - MIN_PAGE_HEADER_BYTES) / MIN_STORED_FRAME_BYTES;
     static final int MAX_ROWS = 262144;
     static final int PAGE_BYTES = 65_536, FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES, PAGE_FRAMES = BenchmarkReturnLocalSourceWork.MAX_PAGE_FRAMES, PART_ROWS = 512, CALL_ROWS = 1024;
-    static final int ROWS = 262_144, SAMPLES = 512, RESOURCE_ATTEMPTS = 4096, KEYS = 2;
+    static final int ROWS = 262_144, SAMPLES = BenchmarkCausalClock.MAX_SAMPLES, RESOURCE_ATTEMPTS = 4096, KEYS = 2;
     static final int ROUTING_TEXT_BYTES = 512;
 
     record Capacity(long fullRows, long cohortRows, long sourceBatches) {
@@ -131,7 +131,7 @@ final class BenchmarkReturnLocalSourceWork {
                     add(32, mul(8, ROWS)), ROWS, 0, mul(16, ROWS), 2, ROWS, ROWS));
         }
 
-        // Causal coverage scans no more than 512 samples. Native/nominal wrappers retain that scan
+        // Causal coverage scans the declared sample cap. Native/nominal wrappers retain that scan
         // and add checked interval arithmetic; they do not read another clock or transport.
         var mapping = new BenchmarkReturnWorkBudget.Work(add(8, SAMPLES), add(mul(2, SAMPLES), 10),
                 0, 0, 64, 1, add(SAMPLES, 8), 4);

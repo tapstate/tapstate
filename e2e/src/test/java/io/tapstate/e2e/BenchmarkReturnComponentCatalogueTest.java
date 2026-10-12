@@ -24,7 +24,7 @@ class BenchmarkReturnComponentCatalogueTest {
                 "METHOD_RAW_RETURN_PAGES", "METHOD_NOMINAL_MAPPING", "METHOD_ADMISSION_HEADERS",
                 "METHOD_NATIVE_SOURCE_AUTHORITY", "METHOD_COMMON_WINDOW_CERTIFICATES", "METHOD_SERIAL_HELLO_READINGS");
         assertThat(components.get("METHOD_SOURCE_BATCH_PROJECTION").rows()).isEqualTo(961);
-        assertThat(components.get("METHOD_CLOCK_SAMPLE_PROJECTION").rows()).isEqualTo(513);
+        assertThat(components.get("METHOD_CLOCK_SAMPLE_PROJECTION").rows()).isEqualTo(1025);
         assertThat(components.get("METHOD_COMMON_WINDOW_CERTIFICATES").rows()).isEqualTo(2);
         assertThat(components.get("METHOD_SERIAL_HELLO_READINGS").rows()).isEqualTo(6000);
         assertThat(components.get("METHOD_RAW_RETURN_PAGES").strings()).isEqualTo(4L * ((2097152L + 2L * 512) / 3));

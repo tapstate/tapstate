@@ -34,7 +34,7 @@ class BenchmarkReturnWorkBudgetReportPlanTest {
         Map<String, BenchmarkReturnWorkBudgetReportPlan.Component> parts = index(prepared);
         assertThat(parts.get("RETURN_ROWS_IF_MATERIALIZED").rows()).isEqualTo(262144);
         assertThat(parts.get("RESOURCE_TRACES_AND_REFUSALS").rows()).isEqualTo(3L * 4096);
-        assertThat(parts.get("RETURN_CLOCK_ROSTERS").rows()).isEqualTo(2L * 512);
+        assertThat(parts.get("RETURN_CLOCK_ROSTERS").rows()).isEqualTo(2L * 1024);
         assertThat(parts.get("NATIVE_BASELINE_CHECKPOINTS").rows()).isEqualTo(8);
         assertThat(parts.get("LEGACY_TARGET_HELLO_TIMELINE").rows()).isEqualTo(6002);
         assertThat(parts).containsKeys("OWNED_RUNTIME_AND_FAILURE_RECEIPT", "PRODUCER_WORK_BODY_AND_EVALUATION",
@@ -110,7 +110,7 @@ class BenchmarkReturnWorkBudgetReportPlanTest {
             assertThat(parts.get("SOURCE_BATCH_DOUBLE_REPRESENTATION").rows()).isEqualTo(960 * phases);
             assertThat(parts.get("RAW_RETURN_BASE64").rows()).isEqualTo(phases);
             assertThat(parts.get("RESOURCE_TRACES_AND_REFUSALS").rows()).isEqualTo(3 * phases * 4096);
-            assertThat(parts.get("RETURN_CLOCK_ROSTERS").rows()).isEqualTo(2 * phases * 512);
+            assertThat(parts.get("RETURN_CLOCK_ROSTERS").rows()).isEqualTo(2 * phases * 1024);
             assertThat(parts.get("RETURN_ROWS_IF_MATERIALIZED").rows()).isEqualTo(phases * 262144);
             assertThat(parts.get("NATIVE_METADATA_AND_REGISTRATIONS").rows()).isEqualTo(8 * phases);
             assertThat(parts.get("PRODUCER_COLD_ORIGIN_PACKETS").rows()).isEqualTo(6 * phases);

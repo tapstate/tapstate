@@ -7,7 +7,7 @@ import java.util.Map;
 
 /** Static material/source bounds for entered return components, independent of measured sizes. */
 final class BenchmarkReturnComponentSourceWork {
-    static final int CLASSES = 512, CALLS = BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS, SAMPLES = 512, PAGES = 512, ORIGINS = 1024, FILES = 10;
+    static final int CLASSES = 512, CALLS = BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS, SAMPLES = BenchmarkCausalClock.MAX_SAMPLES, PAGES = 512, ORIGINS = 1024, FILES = 10;
     static final int BATCHES = 960, HELLO = 6000, PHASES = 6, ROWS = 262144;
     static final int NATIVE_CHARS = 8192, RAW_PAGE = 65536, RAW_TOTAL = 2097152;
     static final int META_NODES = 4096, COLD_NODES = 32768;
