@@ -107,8 +107,11 @@ FROM runtime-base AS cloud
 # The bundled Db2 runtime registers its installation and client instance on first use.
 USER root
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libxml2 \
+ && apt-get install -y --no-install-recommends libxml2 libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
+# The Db2 bridge embeds an older static C++ runtime. Load the shared runtime first so IBM
+# constructors do not bind to the bridge's incompatible static locale implementation.
+ENV LD_PRELOAD=libstdc++.so.6
 LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
       org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed" \
       io.tapstate.source="https://github.com/tapstate/tapstate" \

@@ -172,6 +172,8 @@ docker run --rm --entrypoint sh "$CLOUD_TAG" -ec \
      uid="$(id -u)"; \
      if [ "$uid" != 0 ]; then echo "FAIL: Cloud image requires uid 0, received $uid" >&2; failed=1; fi; \
      if ! ldconfig -p | grep -F "libxml2.so.2"; then echo "FAIL: Cloud image lacks libxml2.so.2" >&2; failed=1; fi; \
+     test "$LD_PRELOAD" = libstdc++.so.6; \
+     grep -F "libstdc++.so.6" /proc/self/maps; \
      test "$failed" = 0; \
      test "$TAPSTATE_CONNECTORS_SEED_DIR" = /opt/tapstate/connectors; \
      cd /opt/tapstate/connectors; \

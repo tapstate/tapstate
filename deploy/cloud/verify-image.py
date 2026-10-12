@@ -113,6 +113,12 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
     user = image_config.get("User")
     if not isinstance(user, str) or user not in {"0", "0:0", "root", "root:root"}:
         raise ImageError(f"{platform} Cloud runtime requires an explicit root user for Db2 initialization")
+    environment = image_config.get("Env")
+    if not isinstance(environment, list) or any(not isinstance(entry, str) for entry in environment):
+        raise ImageError(f"{platform} Cloud runtime requires the shared C++ runtime preload")
+    preloads = [entry for entry in environment if entry.partition("=")[0] == "LD_PRELOAD"]
+    if preloads != ["LD_PRELOAD=libstdc++.so.6"]:
+        raise ImageError(f"{platform} Cloud runtime requires the shared C++ runtime preload without overrides")
     labels = image_config.get("Labels")
     if not isinstance(labels, dict):
         raise ImageError(f"{platform} has no image labels")

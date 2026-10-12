@@ -47,7 +47,9 @@ production use.
 
 The Cloud image runs its Java process as root so the bundled runtime can register its installation
 and create the private client instance. Its Ubuntu 24.04 base and `libxml2.so.2` dependency are
-included in the image. The ordinary on-prem image continues to run as UID 10001; native Db2 setup
+included in the image. It preloads shared `libstdc++.so.6` so the bundled bridge's older static C++
+locale symbols do not override the IBM client's constructors and abort Java during library loading.
+The ordinary on-prem image continues to run as UID 10001; native Db2 setup
 there remains the operator's responsibility. The Cloud arm64 image still cannot execute the
 connector's Linux x86_64 native bridge. Image initialization does not certify live Db2 CDC.
 

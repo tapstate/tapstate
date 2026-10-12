@@ -173,6 +173,7 @@ class StageConnectorsTest(unittest.TestCase):
                  omit_path: str | None = None, add_license_directory: bool = False,
                  label_overrides: dict[str, str | None] | None = None,
                  runtime_users: dict[str, str | None] | None = None,
+                 runtime_env: dict[str, list[str]] | None = None,
                  duplicate_profile_label: bool = False) -> Path:
         MODULE.stage(self.lock, self.jars, self.staged)
         layout = self.root / "oci"
@@ -228,7 +229,8 @@ class StageConnectorsTest(unittest.TestCase):
                 else:
                     labels[key] = value
             user = (runtime_users or {}).get(architecture, "0")
-            image_config = {"Labels": labels}
+            image_config = {"Labels": labels, "Env": (runtime_env or {}).get(
+                architecture, ["LD_PRELOAD=libstdc++.so.6"])}
             if user is not None:
                 image_config["User"] = user
             config_bytes = json.dumps({"config": image_config}, sort_keys=True).encode("utf-8")
@@ -374,6 +376,16 @@ class StageConnectorsTest(unittest.TestCase):
     def test_oci_rejects_unspecified_cloud_runtime_user(self) -> None:
         layout = self.make_oci(runtime_users={"amd64": None})
         with self.assertRaisesRegex(IMAGE.ImageError, "explicit root user"):
+            self.verify_image(layout)
+
+    def test_oci_rejects_missing_shared_cpp_preload(self) -> None:
+        layout = self.make_oci(runtime_env={"amd64": []})
+        with self.assertRaisesRegex(IMAGE.ImageError, "shared C\\+\\+ runtime preload"):
+            self.verify_image(layout)
+
+    def test_oci_rejects_overridden_shared_cpp_preload(self) -> None:
+        layout = self.make_oci(runtime_env={"arm64": ["LD_PRELOAD=libstdc++.so.6", "LD_PRELOAD="]})
+        with self.assertRaisesRegex(IMAGE.ImageError, "shared C\\+\\+ runtime preload"):
             self.verify_image(layout)
 
     def test_oci_rejects_different_boot_jars_across_platforms(self) -> None:

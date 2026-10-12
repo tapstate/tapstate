@@ -131,7 +131,7 @@ docker run -d --name "$SERVER" --label "$label=$OWNER" --network "$NETWORK" \
   "$CLOUD" "${BASE_ARGS[@]}" >/dev/null
 ready "$SERVER"
 [[ "$(docker exec "$SERVER" id -u)" = 0 ]]
-docker exec "$SERVER" sh -ec 'test "$(cat /proc/1/comm)" = java; cd /opt/tapstate/connectors; sha256sum -c /opt/tapstate/release/connectors.sha256' \
+docker exec "$SERVER" sh -ec 'test "$(cat /proc/1/comm)" = java; test "$LD_PRELOAD" = libstdc++.so.6; grep -F "libstdc++.so.6" /proc/1/maps; cd /opt/tapstate/connectors; sha256sum -c /opt/tapstate/release/connectors.sha256' \
   >"$WORK/seed-bytes.log"
 SERVER_URL="$(url "$SERVER" 8080)"
 node "$ROOT/deploy/cloud/image-runtime-probe.mjs" verify cloud "$SERVER_URL" "$FIXTURE_URL" "$WORK/cloud.json" "$WORK/cloud-state.json"
