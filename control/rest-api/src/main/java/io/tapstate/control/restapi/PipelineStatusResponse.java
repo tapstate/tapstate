@@ -70,8 +70,13 @@ record PipelineStatusResponse(
     /** Builds a merged status for an authoring or applied Pipeline before its first runtime observation. */
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
         PipelineCatalogItem.Status status = item.status();
-        PipelineState state = status.observedState() != null ? status.observedState()
-                : status.desiredState() != null ? status.desiredState() : PipelineState.NEW;
+        PipelineState state = PipelineState.NEW;
+        if (status.desiredState() != null) {
+            state = status.desiredState();
+        }
+        if (status.observedState() != null) {
+            state = status.observedState();
+        }
         return new PipelineStatusResponse(item.id(), state, status.displayState(),
                 failure(status.failure(), catalog), status.observedAt(), null,
                 status.desiredState(), status.observedState(), item.hasArtifact(), null, null);

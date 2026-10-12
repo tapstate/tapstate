@@ -32,6 +32,7 @@ public final class PipelineObservationQueryService {
 
     /** The stored-artifact kind a lifecycle verb can observe; any other kind is not a pipeline at all. */
     private static final String PIPELINE_KIND = "pipeline";
+    private static final String PIPELINE_ID_ARGUMENT = "pipelineId";
 
     private final ArtifactQueryService artifacts;
     private final ObservationStore observations;
@@ -81,7 +82,7 @@ public final class PipelineObservationQueryService {
 
     /** Returns the latest status when an observation exists, without turning an unobserved pipeline into an error. */
     public Optional<PipelineStatus> findStatus(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
         return observations.read(pipelineId)
                 .map(observation -> new PipelineStatus(observation.pipelineId(), observation.state(),
                         observation.failure(), observation.observedAt()));
@@ -89,7 +90,7 @@ public final class PipelineObservationQueryService {
 
     /** Returns an observed status with its current execution plan, without requiring an observation to exist. */
     public Optional<PipelineStatus> findStatusWithPlan(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
         return observations.read(pipelineId).map(observation -> {
             ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
             return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
@@ -116,7 +117,7 @@ public final class PipelineObservationQueryService {
     }
 
     private Observation require(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
         return observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
     }
 

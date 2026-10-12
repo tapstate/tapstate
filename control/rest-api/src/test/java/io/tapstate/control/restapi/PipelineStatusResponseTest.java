@@ -1,5 +1,6 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
@@ -80,5 +81,48 @@ class PipelineStatusResponseTest {
         // from the epoch, which serializes as a number and reads as a real answer.
         assertThat(response.observedAt()).isNull();
         assertThat(response.observedAgeMillis()).isNull();
+    }
+
+    @Test
+    void projectsAnUnobservedDraftAsNewWhilePreservingItsDraftDisplayState() {
+        PipelineCatalogItem item = catalogItem(PipelineCatalogItem.UiState.DRAFT, null, null);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(item, catalog);
+
+        assertThat(response.state()).isEqualTo(PipelineState.NEW);
+        assertThat(response.displayState()).isEqualTo(PipelineCatalogItem.UiState.DRAFT);
+        assertThat(response.hasArtifact()).isFalse();
+    }
+
+    @Test
+    void usesTheDesiredStateUntilTheRuntimePublishesAnObservation() {
+        PipelineCatalogItem item = catalogItem(PipelineCatalogItem.UiState.STARTING,
+                PipelineState.RUNNING, null);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(item, catalog);
+
+        assertThat(response.state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(response.desiredState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(response.observedState()).isNull();
+    }
+
+    @Test
+    void runtimeObservationTakesPrecedenceOverDesiredState() {
+        PipelineCatalogItem item = catalogItem(PipelineCatalogItem.UiState.STOPPING,
+                PipelineState.RUNNING, PipelineState.STOPPED);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(item, catalog);
+
+        assertThat(response.state()).isEqualTo(PipelineState.STOPPED);
+        assertThat(response.desiredState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(response.observedState()).isEqualTo(PipelineState.STOPPED);
+    }
+
+    private static PipelineCatalogItem catalogItem(PipelineCatalogItem.UiState displayState,
+            PipelineState desiredState, PipelineState observedState) {
+        PipelineCatalogItem.Status status = new PipelineCatalogItem.Status(
+                PipelineCatalogItem.DisplayState.NEW, displayState, desiredState, observedState, null, OBSERVED_AT);
+        return new PipelineCatalogItem("orders", "Orders", null, "cdc", null, OBSERVED_AT,
+                "content-hash", false, status);
     }
 }
