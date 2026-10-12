@@ -4,8 +4,6 @@ import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaField;
 import com.tngtech.archunit.core.domain.JavaParameterizedType;
 import com.tngtech.archunit.core.domain.JavaType;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -49,9 +47,7 @@ class ModelFreeMapGatesTest {
 
     @BeforeAll
     static void importClasses() {
-        modelClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate.core.model");
+        modelClasses = ProductionClassImports.packages("io.tapstate.core.model");
     }
 
     /** A field of type {@code Map<?, Object>} — the shape that promises nothing about its values. */
