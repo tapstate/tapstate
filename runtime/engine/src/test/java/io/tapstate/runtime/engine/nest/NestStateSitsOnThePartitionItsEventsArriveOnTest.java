@@ -23,6 +23,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.runtime.engine.NodeWidth;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -118,7 +119,7 @@ class NestStateSitsOnThePartitionItsEventsArriveOnTest {
         NestDag.attach(graph, tree, "doc", rootAlias, "doc",
                 alias -> List.of(sources.get(alias)),
                 new NestBinding(tables(), HeapNestStores.onHeap(), (from, released) -> { }),
-                vertex -> handedOut.merge(vertex, 1, Integer::sum) - 1, null);
+                vertex -> handedOut.merge(vertex, 1, Integer::sum) - 1, null, new NodeWidth("doc", 4, 1, null));
         return graph;
     }
 

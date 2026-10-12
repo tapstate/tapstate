@@ -33,14 +33,12 @@ RUN set -eu; \
     fi; \
     mv "$1" tapstate.jar
 
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:21-jre AS runtime-base
 
-# Image self-description (OCI). The source label connects this package to its repository, so the
-# registry renders the repository README on the package page; the description states the preview
-# posture up front so the image is not mistaken for a production default.
+# Common OCI self-description. Only the public server target associates its package with the
+# public source repository; the Cloud target retains independent package metadata.
 LABEL org.opencontainers.image.title="Tapstate server" \
       org.opencontainers.image.description="Preview runtime: a single member by default, with opt-in cluster mode and MongoDB-persisted control-plane state and recovery positions. Restart recovery depends on the source and read mode; delivery is at-least-once. Not for production." \
-      org.opencontainers.image.source="https://github.com/tapstate/tapstate" \
       org.opencontainers.image.url="https://tapstate.com" \
       org.opencontainers.image.documentation="https://github.com/tapstate/tapstate/blob/main/docs/quickstart-online.md" \
       org.opencontainers.image.licenses="Apache-2.0" \
@@ -71,10 +69,14 @@ ARG TAPSTATE_RELEASE_VERSION=development
 ARG TAPSTATE_REVISION=unknown
 ARG TAPSTATE_WEB_REVISION=unknown
 ARG TAPSTATE_WEB_FILES_SHA256=unknown
+ARG TAPSTATE_WEB_PROFILE=unknown
+ARG TAPSTATE_WEB_CLOUD_CONSOLE_URL=""
 LABEL org.opencontainers.image.version="$TAPSTATE_RELEASE_VERSION" \
       org.opencontainers.image.revision="$TAPSTATE_REVISION" \
       io.tapstate.web.revision="$TAPSTATE_WEB_REVISION" \
-      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256"
+      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256" \
+      io.tapstate.web.profile="$TAPSTATE_WEB_PROFILE" \
+      io.tapstate.web.cloud-console-url="$TAPSTATE_WEB_CLOUD_CONSOLE_URL"
 
 USER tapstate
 
@@ -95,3 +97,26 @@ ENTRYPOINT ["java", "-jar", "/opt/tapstate/tapstate.jar"]
 
 # Overridable: replacing it is how an operator passes a different role or extra Spring arguments.
 CMD ["--role=all"]
+
+# Each profile supplies its own Boot JAR while sharing the runtime layers above. The connector context is
+# supplied only to this target, so ordinary server builds neither fetch nor bundle connector jars.
+# The connector seed has separate distribution terms, so this target does not inherit the server label's
+# Apache-2.0 assertion. Publication still requires a reviewed license inventory and permission.
+FROM runtime-base AS cloud
+LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
+      org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed" \
+      io.tapstate.source="https://github.com/tapstate/tapstate" \
+      io.tapstate.distribution="cloud" \
+      org.opencontainers.image.licenses="NOASSERTION"
+COPY --from=cloud_connectors --chown=tapstate:tapstate /connectors/ /opt/tapstate/connectors/
+COPY --from=cloud_connectors --chown=tapstate:tapstate /release/ /opt/tapstate/release/
+ENV TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors
+RUN set -eu; \
+    cd /opt/tapstate/connectors; \
+    sha256sum -c /opt/tapstate/release/connectors.sha256; \
+    test "$(find . -maxdepth 1 -type f -name '*-connector.jar' | wc -l | tr -d ' ')" = 8
+
+# Keep the standard image as the default target and preserve its on-prem connector lifecycle.
+FROM runtime-base AS server
+LABEL org.opencontainers.image.source="https://github.com/tapstate/tapstate" \
+      io.tapstate.distribution="onprem"

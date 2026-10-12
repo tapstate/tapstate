@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -353,8 +354,12 @@ class MongoSchemaStoreIT {
                     () -> { throw failure; }, false);
 
             assertThatThrownBy(() -> new MongoSchemaStore(interrupted).save(observation(2, "abandoned")))
-                    .isInstanceOf(TapstateException.class)
-                    .hasCause(failure);
+                    .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                        assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(coded.args()).containsEntry("detail", "MongoException");
+                        assertThat(coded.getCause()).isNull();
+                        assertThat(coded.toString()).doesNotContain(failure.getMessage());
+                    });
             assertThat(store.get("orders-db")).contains(before);
             Document abandoned = collection.find(new Document("name", "abandoned")).first();
             assertThat(abandoned).isNotNull();

@@ -49,6 +49,16 @@ public interface ConnectorRegistry {
     Optional<byte[]> artifact(String contentHash);
 
     /**
+     * The version of the certification that one instance of the artifact stored under {@code contentHash} may
+     * serve every writer of a sink on one member, or empty where there is none. A certification is for exact
+     * bytes: a changed artifact is another one, and runs an instance per writer until it is certified in turn.
+     * A registry that records no certifications has none for any artifact, which is the default.
+     */
+    default Optional<String> shareSafeCertification(String connectorId, String contentHash) {
+        return Optional.empty();
+    }
+
+    /**
      * Whether bytes are stored under a content hash, without fetching them. A read face asking "can this
      * connector actually run here?" needs the answer, not the artifact; {@link #artifact(String)} would
      * pull tens of megabytes to compute a boolean.

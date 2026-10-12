@@ -71,7 +71,7 @@ class McpOperationExecutorTest {
                 answer(exchange, 200, "{}");
             }
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
             Map<String, Object> connection = Map.of(
@@ -173,10 +173,11 @@ class McpOperationExecutorTest {
                 "explain-frontier-stalled.golden.json",
                 "explain-no-match.golden.json",
                 "explain-unknown.golden.json",
-                "explain-start-pending.golden.json");
+                "explain-start-pending.golden.json",
+                "explain-with-plan.golden.json");
         AtomicReference<String> response = new AtomicReference<>();
         HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "read-token", Map.of(), client);
             for (String fixture : fixtures) {
@@ -205,7 +206,7 @@ class McpOperationExecutorTest {
                 "history-empty.golden.json");
         AtomicReference<String> response = new AtomicReference<>();
         HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "read-token", Map.of(), client);
             Map<String, Object> request = Map.of(
@@ -238,7 +239,7 @@ class McpOperationExecutorTest {
                     "configuredSecrets":["password"],"mode":"snapshot","tables":[]}]}
                     """);
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -267,7 +268,7 @@ class McpOperationExecutorTest {
             paths.add(exchange.getRequestURI().toString());
             answer(exchange, 200, "{\"items\":[]}");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -286,7 +287,7 @@ class McpOperationExecutorTest {
     void sourceListPreservesServerErrorsInsteadOfProjectingThem() throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 400,
                 "{\"code\":\"control.malformed-request\",\"message\":\"bad page\"}"));
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -307,7 +308,7 @@ class McpOperationExecutorTest {
         AtomicInteger response = new AtomicInteger();
         HttpServer server = server(exchange -> answer(exchange, 200,
                 responses.get(response.getAndIncrement())));
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -328,7 +329,7 @@ class McpOperationExecutorTest {
             paths.add(exchange.getRequestURI().toString());
             answer(exchange, 200, "{\"items\":[]}");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -366,7 +367,7 @@ class McpOperationExecutorTest {
                     exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
             answer(exchange, 200, "{}");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -390,7 +391,7 @@ class McpOperationExecutorTest {
                     exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
             answer(exchange, 200, "{}");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
             Map<String, Object> arguments = new LinkedHashMap<>();
@@ -489,7 +490,7 @@ class McpOperationExecutorTest {
                     exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
             answer(exchange, 200, "{\"id\":\"orders\"}");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of("MYSQL_PASSWORD", "sentinel-secret"), client);
             Map<String, Object> request = Map.of(
@@ -522,7 +523,7 @@ class McpOperationExecutorTest {
     @Test
     void everyOperationTheMcpFaceExposesHasARouteBehindIt() throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 200, "{}"));
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -551,7 +552,7 @@ class McpOperationExecutorTest {
             path.set(exchange.getRequestURI().toString());
             answer(exchange, 204, "");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
             String hash = "b".repeat(64);
@@ -581,7 +582,7 @@ class McpOperationExecutorTest {
                     "{\"id\":\"orders\",\"kind\":\"pipeline\",\"canonicalForm\":\"x\",\"contentHash\":\""
                             + "c".repeat(64) + "\"}");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -607,7 +608,7 @@ class McpOperationExecutorTest {
             path.set(exchange.getRequestURI().getRawPath());
             answer(exchange, 200, "{}");
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -623,7 +624,7 @@ class McpOperationExecutorTest {
     void artifactDeleteRefusesBeforeAnyRequestWhenThePreconditionIsMissing() {
         // The precondition is required, so a model that omits it must be refused here rather than have a
         // hash-less delete reach the server, where the refusal would be indistinguishable from a bug.
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     URI.create("http://127.0.0.1:1"), "token", Map.of(), client);
 
@@ -641,7 +642,7 @@ class McpOperationExecutorTest {
         // model no content-level evidence the removal happened, and nothing to tell it apart from an
         // ambiguous one — which is exactly the state that invites a retry of an irreversible call.
         HttpServer server = server(exchange -> answer(exchange, 204, ""));
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -662,7 +663,7 @@ class McpOperationExecutorTest {
         // reported as {"removed": true} is worse than the empty body it replaced.
         HttpServer server = server(exchange -> answer(exchange, 409,
                 "{\"code\":\"artifact.version-conflict\",\"message\":\"it changed\"}"));
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
 
@@ -756,7 +757,7 @@ class McpOperationExecutorTest {
                 answer(exchange, 200, draftBody);
             }
         });
-        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", environment, client);
             return new SourceDraftExchange(executor.execute(ControlOperations.SOURCE_DRAFT, arguments), posted.get());

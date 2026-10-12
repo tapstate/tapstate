@@ -136,6 +136,11 @@ final class SettledFloor implements SinkFrontier {
         advance(chain, ack);
     }
 
+    @Override
+    public String chainOf(Watermark bound) {
+        return axes == null ? null : axes.chainOn(bound.key());
+    }
+
     /**
      * How far each chain's bound runs ahead of the position this frontier reached. A chain that has reached
      * none is absent rather than zero: the distance is measured from the position acked, and answering zero

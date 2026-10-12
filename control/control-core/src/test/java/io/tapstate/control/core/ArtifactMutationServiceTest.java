@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.CasOutcome;
@@ -8,14 +10,19 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.ManagedViewStore;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewResource;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -203,6 +210,107 @@ class ArtifactMutationServiceTest {
         assertThat(store.get("orders")).isPresent();
         assertThat(store.get("alpha")).isPresent();
         assertThat(store.get("zeta")).isPresent();
+    }
+
+    @Test
+    void viewStoreDeleteNamesInlineAndReusableConsumersOnceInSortedOrder() {
+        SourceResource views = new SourceResource(
+                ManagedViewStore.SOURCE_ID, null, "mongodb", Map.of("uri", "mongodb://mongo/my_views"),
+                null, null, null, null);
+        PipelineResource inline = new PipelineResource(
+                "zeta", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
+                new ServeBlock.Inline(null, FromRef.literal("orders"),
+                        List.of(new SyncElement("copy", views.id(), null, null, null)), null, null),
+                null, null);
+        PipelineResource reused = new PipelineResource(
+                "alpha", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Use(null, "shared_view", FromRef.literal("orders")),
+                null, null, null);
+        ViewResource shared = new ViewResource("shared_view", null, "id", null, null);
+        store.saveAll(List.of(views, source("orders"), inline, reused, shared));
+        state.put(reused.id(), PipelineState.RUNNING);
+
+        assertArtifactError(
+                () -> service.delete(PRINCIPAL, views.id(), hash(views)),
+                ArtifactError.IN_USE,
+                Map.of("id", views.id(), "referrers", List.of("alpha", "zeta")));
+
+        assertThat(store.get(views.id())).contains(views);
+        assertThat(store.get(inline.id())).contains(inline);
+        assertThat(store.get(reused.id())).contains(reused);
+        assertThat(auditStore.records).isEmpty();
+        assertThat(followsStopped).isEmpty();
+    }
+
+    @Test
+    void viewStoreWithoutAnyDeclaringViewCanStillBeDeleted() {
+        SourceResource views = source(ManagedViewStore.SOURCE_ID);
+        store.saveAll(List.of(views, source("orders"), pipelineReading("reader", "orders")));
+
+        service.delete(PRINCIPAL, views.id(), hash(views));
+
+        assertThat(store.get(views.id())).isEmpty();
+        assertThat(store.get("reader")).isPresent();
+    }
+
+    @Test
+    void aPipelineNamedViewsWithAnInlineViewCanBeAppliedAndDeletedAfterTheSourceIsRemoved() {
+        SourceResource views = new SourceResource(
+                ManagedViewStore.SOURCE_ID, null, "mongodb", Map.of("uri", "mongodb://mongo/views"),
+                null, null, null, null);
+        store.save(views);
+        service.delete(PRINCIPAL, views.id(), hash(views));
+        assertThat(store.get(views.id())).isEmpty();
+
+        ApplyService apply = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
+        apply.apply(PRINCIPAL, List.of(
+                new ArtifactDraft(null, """
+                        version: tapstate/v1
+                        kind: source
+                        id: orders_src
+                        connector: mongodb
+                        config: { uri: "mongodb://mongo/orders" }
+                        mode: cdc
+                        tables: [orders]
+                        """),
+                new ArtifactDraft(null, """
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: views
+                        source: orders_src
+                        view:
+                          id: order_state
+                          from: orders
+                          primary_key: id
+                        """)));
+        PipelineResource pipeline = (PipelineResource) store.get(views.id()).orElseThrow();
+        assertThat(pipeline.view()).isInstanceOf(ViewBlock.Inline.class);
+        assertThat(ReferenceGraph.of(store.list()).referencedBy(pipeline.id())).isEmpty();
+
+        service.delete(PRINCIPAL, pipeline.id(), hash(pipeline));
+
+        assertThat(store.get(pipeline.id())).isEmpty();
+        assertThat(store.get("orders_src")).isPresent();
+        assertThat(followsStopped).containsExactly(views.id());
+    }
+
+    @Test
+    void anInlineViewDoesNotBlockDeletingAnUnrelatedSource() {
+        SourceResource unrelated = source("unrelated");
+        PipelineResource inline = new PipelineResource(
+                "reader", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
+                null, null, null);
+        store.saveAll(List.of(unrelated, source("orders"), source(ManagedViewStore.SOURCE_ID), inline));
+
+        service.delete(PRINCIPAL, unrelated.id(), hash(unrelated));
+
+        assertThat(store.get(unrelated.id())).isEmpty();
+        assertThat(store.get(ManagedViewStore.SOURCE_ID)).isPresent();
+        assertThat(store.get(inline.id())).contains(inline);
     }
 
     @Test

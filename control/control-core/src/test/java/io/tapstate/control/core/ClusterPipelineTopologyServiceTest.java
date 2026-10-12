@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.ExecutionPlans;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
@@ -102,6 +104,35 @@ class ClusterPipelineTopologyServiceTest {
     }
 
     @Test
+    void eachProcessorSaysItsPlaceOnItsMemberAndWhatItWasLastReadToBeCarrying() {
+        // Six processors, three on each of two members, reported out of order: the engine numbers each
+        // member's processors of a vertex in one run, so a processor's place on its member is its rank there.
+        ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
+                runs(new LivePipelineVertex("serve.s", List.of(
+                        new LivePipelineProcessor(4, UUID_B, true, 7L, Map.of("shop", 12L), Map.of("shop", 900L),
+                                Map.of("shop.orders", 30L), Map.of("orders", 512L)),
+                        new LivePipelineProcessor(0, UUID_A, true, 0L, Map.of(), Map.of()),
+                        new LivePipelineProcessor(3, UUID_B, true),
+                        new LivePipelineProcessor(2, UUID_A, true),
+                        new LivePipelineProcessor(5, UUID_B, true),
+                        new LivePipelineProcessor(1, UUID_A, true)))),
+                PipelineCaptures.none(), claims, desired("orders"), CLUSTER);
+
+        ClusterVertexView vertex = topology.pipelines(MEMBERS).get(0).vertices().get(0);
+
+        assertThat(vertex.processors())
+                .extracting(ClusterProcessorView::index, ClusterProcessorView::localIndex,
+                        ClusterProcessorView::nodeId, ClusterProcessorView::backlog)
+                .containsExactly(
+                        tuple(0, 0, "node-a", 0L), tuple(1, 1, "node-a", null), tuple(2, 2, "node-a", null),
+                        tuple(3, 0, "node-b", null), tuple(4, 1, "node-b", 7L), tuple(5, 2, "node-b", null));
+        assertThat(vertex.processors().get(4).frontierGaps()).containsExactly(Map.entry("shop", 12L));
+        assertThat(vertex.processors().get(4).frontierStalledMillis()).containsExactly(Map.entry("shop", 900L));
+        assertThat(vertex.processors().get(4).queuedByStream()).containsExactly(Map.entry("shop.orders", 30L));
+        assertThat(vertex.processors().get(4).inFlightByTable()).containsExactly(Map.entry("orders", 512L));
+    }
+
+    @Test
     void aVertexPinnedToOneMemberReportsOneProcessorRatherThanOnePerMember() {
         ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
                 runs(new LivePipelineVertex("source", List.of(
@@ -114,16 +145,61 @@ class ClusterPipelineTopologyServiceTest {
         assertThat(vertex.processors())
                 .as("the engine puts an instance that does nothing on every member a pinned vertex is "
                         + "not running on; counting those reports a pinned vertex as running everywhere")
-                .containsExactly(new ClusterProcessorView(0, UUID_B, "node-b"));
+                .containsExactly(new ClusterProcessorView(0, 0, UUID_B, "node-b", null, Map.of(), Map.of()));
         assertThat(vertex.effective()).isEqualTo(1);
         assertThat(vertex.requested())
-                .as("what ran is not what was asked for: nothing in the plan pins a vertex's "
-                        + "parallelism yet, and reporting the one processor that happened to run as the "
-                        + "request would make the two impossible to compare once one exists")
+                .as("what ran is not what was asked for: a run with no plan recorded asked for nothing, and "
+                        + "reporting the one processor that happened to run as the request would make the two "
+                        + "impossible to compare")
                 .isNull();
         assertThat(vertex.computedLocal())
-                .as("and no planner has worked out a per-member value, for the same reason")
+                .as("and nothing worked out a per-member value for it, for the same reason")
                 .isNull();
+    }
+
+    @Test
+    void aVertexRunningAtItsNodesWidthSaysTheTargetAndTheCountItsPlanWorkedOut() {
+        claims.put(WorkloadClaimType.PIPELINE_ACTUATION, "orders", "node-b", "boot-b1", 3, 7, true);
+        ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
+                runs(working("route.serve.s"), working("serve.s"), working("serve.s:gather")),
+                PipelineCaptures.none(), claims, desired("orders"), CLUSTER, plannedAt(7L));
+
+        List<ClusterVertexView> vertices = topology.pipelines(MEMBERS).get(0).vertices();
+
+        assertThat(vertices).extracting(ClusterVertexView::name, ClusterVertexView::requested,
+                        ClusterVertexView::computedLocal)
+                .as("the sink and its router run at the sink's width; a vertex the plan does not name "
+                        + "asked for nothing")
+                .containsExactly(tuple("route.serve.s", 8, 3), tuple("serve.s", 8, 3),
+                        tuple("serve.s:gather", null, null));
+    }
+
+    @Test
+    void aPlanWrittenForAnEarlierRunSaysNothingAboutTheRunExecuting() {
+        claims.put(WorkloadClaimType.PIPELINE_ACTUATION, "orders", "node-b", "boot-b1", 3, 7, true);
+        ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
+                runs(working("serve.s")), PipelineCaptures.none(), claims, desired("orders"), CLUSTER,
+                plannedAt(6L));
+
+        ClusterVertexView vertex = topology.pipelines(MEMBERS).get(0).vertices().get(0);
+
+        assertThat(vertex.requested())
+                .as("its widths were worked out for another run, and would put an old answer beside a new one")
+                .isNull();
+        assertThat(vertex.computedLocal()).isNull();
+    }
+
+    /** One working processor of {@code name}, on the second member. */
+    private static LivePipelineVertex working(String name) {
+        return new LivePipelineVertex(name, List.of(new LivePipelineProcessor(0, UUID_B, true)));
+    }
+
+    /** The plan of an execution of {@code orders} with the given generation: its sink eight wide, three a member. */
+    private static ExecutionPlans plannedAt(Long executionGeneration) {
+        ExecutionPlan plan = new ExecutionPlan("orders", 3L, executionGeneration, 4L, List.of("node-a", "node-b",
+                "node-c"), List.of(new ExecutionPlan.Node("serve.s", 8, "explicit", "native", 3, 3, 9,
+                        List.of("rounded-up"), 1024, 0L, List.of("route.serve.s", "serve.s"))), MEASURED);
+        return pipelineIds -> pipelineIds.contains("orders") ? Map.of("orders", plan) : Map.of();
     }
 
     @Test

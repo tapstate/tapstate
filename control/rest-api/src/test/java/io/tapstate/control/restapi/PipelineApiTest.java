@@ -19,6 +19,7 @@ import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ControlOperations;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DataBrowserService;
@@ -40,6 +41,13 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.control.core.SourceProjectionService;
+import io.tapstate.control.core.ViewCatalogService;
+import io.tapstate.control.core.SampleSourceService;
+import io.tapstate.control.core.SampleSourceCredentialsProvider;
+import io.tapstate.control.core.SourceRepresentation;
+import io.tapstate.control.core.StateStoreSetupService;
+import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -181,6 +189,68 @@ class PipelineApiTest {
     // ---- the four verbs round-trip through the service ----
 
     @Test
+    void browserPipelineMetadataRoundTripsWithoutDerivedBeanProperties() {
+        String token = machineToken(Scope.WRITE);
+        Map<String, Object> input = new LinkedHashMap<>(Map.of(
+                "id", "metadata_round_trip", "metadata", Map.of("labels", Map.of(), "description", "draft"),
+                "sources", List.of(), "transforms", List.of()));
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(input).retrieve().toEntity(Map.class);
+        Map<String, Object> echoedMetadata = new LinkedHashMap<>((Map<String, Object>) created.getBody().get("metadata"));
+        echoedMetadata.put("description", "updated through the browser");
+        input.put("metadata", echoedMetadata);
+        ResponseEntity<Map> replaced = client().put().uri("/api/pipelines/metadata_round_trip")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON).body(input).exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    return ResponseEntity.status(response.getStatusCode()).headers(response.getHeaders())
+                            .body(response.bodyTo(Map.class));
+                });
+        assertThat((Map<String, Object>) replaced.getBody().get("metadata"))
+                .containsOnlyKeys("labels", "description");
+        assertThat(((Map<?, ?>) replaced.getBody().get("metadata")).get("description"))
+                .isEqualTo("updated through the browser");
+    }
+
+    @Test
+    void aCachedDerivedMetadataFlagIsIgnoredWithoutAcceptingUnknownMetadataFields() {
+        String token = machineToken(Scope.WRITE);
+        Map<String, Object> metadata = new LinkedHashMap<>(Map.of("labels", Map.of(), "description", "draft", "empty", false));
+        Map<String, Object> input = new LinkedHashMap<>(Map.of(
+                "id", "legacy_metadata", "metadata", metadata, "sources", List.of(), "transforms", List.of()));
+        Map<String, Object> created = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(input).retrieve().body(Map.class);
+        assertThat((Map<String, Object>) created.get("metadata")).doesNotContainKey("empty");
+        metadata.put("unknown_metadata_field", true);
+        input.put("id", "unknown_metadata");
+        client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(input).exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    assertThat(response.bodyTo(ApiError.class).code()).isEqualTo(ControlError.MALFORMED_REQUEST.code());
+                    return null;
+                });
+    }
+
+    @Test
+    void provenanceOnlySourceMetadataKeepsTheNullableDescriptionInPipelineResponses() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X.replace(
+                "id: src_x", "id: src_x\nmetadata: {cloud: true, user_id: fixture-cloud-user}"));
+        Map<?, ?> pipeline = client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(Map.class);
+        Map<?, ?> source = (Map<?, ?>) ((List<?>) pipeline.get("sources")).getFirst();
+        Map<String, Object> metadata = (Map<String, Object>) source.get("metadata");
+        assertThat(metadata).containsKey("description");
+        assertThat(metadata.get("description")).isNull();
+        assertThat(metadata).containsEntry("cloud", true).containsEntry("user_id", "fixture-cloud-user");
+        assertThat(metadata).doesNotContainKey("empty");
+    }
+
+    @Test
     void createPersistsABlankEditorDraftBeforeTheFirstTypedDagSave() {
         String mutation = """
                 {"id":"blank_draft","metadata":{"labels":{},"description":"draft"},
@@ -269,6 +339,7 @@ class PipelineApiTest {
             assertThat(draftOnly.containsKey(forbidden)).as(forbidden).isFalse();
         }
         assertThat(((Map<?, ?>) draftOnly.get("status")).get("state")).isEqualTo("NEW");
+        assertThat(((Map<?, ?>) draftOnly.get("status")).get("displayState")).isEqualTo("DRAFT");
 
         Map<?, ?> merged = catalogItems.stream()
                 .map(item -> (Map<?, ?>) item)
@@ -320,6 +391,18 @@ class PipelineApiTest {
                 .body(Map.of("revision", 2)).retrieve().toEntity(Map.class);
         assertThat(published.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(published.getBody()).containsEntry("published", true).containsKey("artifactHash");
+        Map<?, ?> afterPublish = ((List<?>) client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class).getBody().get("items")).stream()
+                .map(item -> (Map<?, ?>) item)
+                .filter(item -> "draft-p1".equals(item.get("id")))
+                .findFirst().orElseThrow();
+        assertThat(afterPublish.get("hasArtifact")).isEqualTo(true);
+        assertThat(afterPublish.get("contentHash")).isEqualTo(published.getBody().get("artifactHash"));
+        assertThat(((Map<?, ?>) afterPublish.get("status")).get("state")).isEqualTo("NEW");
+        assertThat(((Map<?, ?>) afterPublish.get("status")).get("displayState")).isEqualTo("NEW");
+        assertThat(context.getBean(PipelineCatalogService.class).find("draft-p1").orElseThrow().hasArtifact())
+                .isTrue();
 
         ResponseEntity<Void> deleted = client().method(HttpMethod.DELETE)
                 .uri("/api/pipelines/draft-p1/draft")
@@ -438,6 +521,46 @@ class PipelineApiTest {
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
                 .retrieve().toEntity(Map.class);
         assertThat(artifacts.getBody()).containsKey("items");
+    }
+
+    @Test
+    void candidatePreviewCompilesUnsavedEditorStateWithoutChangingTheStoredDraft() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"candidate-preview","mode":"wizard","name":"Stored orders",
+                 "wizard":{"root":{"id":"orders","sourceId":"crm","table":"orders",
+                   "key":["id"],"preTransforms":[]},"related":[],"transforms":[],
+                   "output":{"kind":"atlas","config":{"sourceId":"atlas","table":"orders_output"}}}}
+                """;
+        client().post().uri("/api/pipelines/candidate-preview/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity();
+        Map<String, Object> candidate = Map.of(
+                "pipelineId", "candidate-preview", "mode", "wizard", "name", "Unsaved candidate",
+                "wizard", Map.of("root", Map.of("id", "orders", "sourceId", "crm", "table", "orders",
+                                "key", List.of("id"), "preTransforms", List.of()),
+                        "related", List.of(), "transforms", List.of(),
+                        "output", Map.of("kind", "atlas",
+                                "config", Map.of("sourceId", "atlas", "table", "candidate_output"))));
+
+        ResponseEntity<Map> preview = client().post().uri("/api/pipelines/candidate-preview/draft:preview")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of("revision", 1, "candidate", candidate))
+                .retrieve().toEntity(Map.class);
+        ResponseEntity<Map> stored = client().get().uri("/api/pipelines/candidate-preview/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token).retrieve().toEntity(Map.class);
+
+        assertThat(preview.getBody()).containsEntry("pipelineId", "candidate-preview").containsKey("dsl");
+        assertThat((String) preview.getBody().get("dsl")).contains("candidate_output");
+        assertThat(stored.getBody()).containsEntry("name", "Stored orders").containsEntry("revision", 1);
+        ApiError malformedCandidate = client().post().uri("/api/pipelines/candidate-preview/draft:preview")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of("candidate", List.of()))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(malformedCandidate.code()).isEqualTo("control.malformed-request");
     }
 
     @Test
@@ -978,6 +1101,7 @@ class PipelineApiTest {
                 .containsExactlyInAnyOrder(
                         "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
                         "pipeline.update",
+                        "pipeline.preview",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain",
@@ -1087,7 +1211,8 @@ class PipelineApiTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class, ClusterTopologyTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
+            PipelinePreviewTestConfiguration.class})
     static class TestApp {
 
         @Bean
@@ -1121,8 +1246,8 @@ class PipelineApiTest {
         }
 
         @Bean
-        FakePipelineDraftStore pipelineDraftStore() {
-            return new FakePipelineDraftStore();
+        FakePipelineDraftStore pipelineDraftStore(FakeArtifactStore artifacts) {
+            return new FakePipelineDraftStore(artifacts);
         }
 
         @Bean
@@ -1386,6 +1511,33 @@ class PipelineApiTest {
         }
 
         @Bean
+        ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
+                PipelineObservationQueryService observations, DataBrowserService browser,
+                SourceSchemaQueryService schemas, Clock clock) {
+            return new ViewCatalogService(artifacts, observations, browser, schemas, clock);
+        }
+
+        @Bean
+        SampleSourceService sampleSourceService(SourceProjectionService sources,
+                SchemaDiscoveryService discovery, ConnectionTestService connections,
+                ConnectorCatalogView connectors) {
+            return new SampleSourceService(sources, discovery, connections, connectors,
+                    new SampleSourceCredentialsProvider() {
+                        @Override public boolean available() { return false; }
+                        @Override public Credentials fetch() {
+                            throw new IllegalStateException("Sample credentials are not configured in this fixture");
+                        }
+                    });
+        }
+
+        @Bean
+        StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
+                SourceRepresentation representation, ConnectionTestService connections) {
+            return new StateStoreSetupService(apply, artifacts, representation,
+                    DeploymentProfile.ON_PREM, connections);
+        }
+
+        @Bean
         ConnectorRegisterService connectorRegisterService(AuditGate auditGate) {
             io.tapstate.spi.store.ConnectorRegistrar registrar = (artifact, source) -> {
                 throw new UnsupportedOperationException("connector.register is not exercised in this test");
@@ -1562,6 +1714,15 @@ class PipelineApiTest {
     static final class FakePipelineDraftStore implements PipelineDraftStore {
         private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
         private final Map<String, Long> lastRevision = new LinkedHashMap<>();
+        private final FakeArtifactStore artifacts;
+
+        FakePipelineDraftStore() {
+            this(null);
+        }
+
+        FakePipelineDraftStore(FakeArtifactStore artifacts) {
+            this.artifacts = artifacts;
+        }
 
         synchronized void clear() {
             drafts.clear();
@@ -1648,6 +1809,22 @@ class PipelineApiTest {
             if (!Objects.equals(current.baseArtifactHash(), publication.expectedArtifactHash())) {
                 return PipelineDraftMutation.ARTIFACT_CONFLICT;
             }
+            if (artifacts == null) {
+                throw new AssertionError("a publication fixture must own its artifact store");
+            }
+            Resource existing = artifacts.get(publication.pipelineId()).orElse(null);
+            if ((existing != null && !(existing instanceof PipelineResource))
+                    || !Objects.equals(existing == null ? null : CanonicalHash.of(existing),
+                            publication.expectedArtifactHash())) {
+                return PipelineDraftMutation.ARTIFACT_CONFLICT;
+            }
+            for (Map.Entry<String, String> dependency : publication.workspacePreconditions().entrySet()) {
+                Resource resource = artifacts.get(dependency.getKey()).orElse(null);
+                if (resource == null || !Objects.equals(CanonicalHash.of(resource), dependency.getValue())) {
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+            }
+            artifacts.saveAll(List.of(publication.artifact()));
             drafts.put(publication.pipelineId(), new PipelineDraft(
                     current.pipelineId(), current.schemaVersion(), current.revision(), current.mode(),
                     current.name(), current.description(), current.graph(), current.wizard(),

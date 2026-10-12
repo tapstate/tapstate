@@ -18,6 +18,7 @@ import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -84,6 +85,7 @@ final class ControlPlane {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
     private String credential;
+    private boolean cloudCookie;
 
     ControlPlane(URI baseUrl) {
         this.baseUrl = baseUrl;
@@ -149,6 +151,43 @@ final class ControlPlane {
             throw new AssertionError("login returned no token: " + login.body());
         }
         credential = token;
+        cloudCookie = false;
+    }
+
+    /** Redeems one code once; the real SDK and server create the local session. */
+    String exchangeCloudCode(String code) {
+        HttpResponse<String> response = send(get("/auth/exchange?code=" + urlSegment(code)));
+        expect(response, 302, "redeem the Cloud handoff");
+        String header = response.headers().firstValue("Set-Cookie")
+                .orElseThrow(() -> new AssertionError("the handoff returned no session cookie"));
+        List<String> attributes = java.util.Arrays.stream(header.split(";")).skip(1).map(String::strip).toList();
+        if (attributes.stream().noneMatch("HttpOnly"::equalsIgnoreCase)
+                || attributes.stream().noneMatch("Secure"::equalsIgnoreCase)) {
+            throw new AssertionError("the handoff returned an unprotected session cookie");
+        }
+        useCloudSessionCookie(header.substring(0, header.indexOf(';')));
+        return credential;
+    }
+
+    /** Reuses the persisted Cloud session after a server restart without redeeming another code. */
+    void useCloudSessionCookie(String cookie) {
+        if (cookie == null || cookie.isBlank()) throw new IllegalArgumentException("a session cookie is required");
+        credential = cookie;
+        cloudCookie = true;
+    }
+
+    /** A fresh timestamp rules out a retained observation from the process that was replaced. */
+    Optional<Instant> observedAt(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        expect(response, 200, "read the observation time of " + pipelineId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> answer)
+                || !(answer.get("observedAt") instanceof String time)) {
+            throw new AssertionError("the pipeline status returned no observation time");
+        }
+        return Optional.of(Instant.parse(time));
     }
 
     /**
@@ -164,6 +203,44 @@ final class ControlPlane {
         HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
         expect(response, 200, "apply " + contentBySource.keySet());
         return warningsOf(response.body());
+    }
+
+    /** One unsaved candidate resource carried by a Pipeline preview request. */
+    record PreviewDraft(String source, String content) {}
+
+    /**
+     * Runs the candidate preview over its NDJSON face and keeps each wire event as the object it arrived as.
+     * The harness reads the complete response only because it is a bounded test sample; the browser client
+     * exercises the same endpoint incrementally.
+     */
+    List<Map<String, Object>> preview(
+            String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts) {
+        List<Map<String, String>> encodedDrafts = drafts.stream()
+                .map(draft -> Map.of("source", draft.source(), "content", draft.content()))
+                .toList();
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("pipelineId", pipelineId);
+        request.put("outputId", outputId);
+        request.put("rootLimit", rootLimit);
+        request.put("sampleId", sampleId);
+        request.put("drafts", encodedDrafts);
+        HttpResponse<String> response = send(authed("/api/artifacts:preview", JsonWriter.write(request)));
+        expect(response, 200, "preview Pipeline " + pipelineId);
+        String contentType = response.headers().firstValue("content-type").orElse("");
+        if (!contentType.startsWith("application/x-ndjson")) {
+            throw new AssertionError("Pipeline preview was not NDJSON: " + contentType);
+        }
+        List<Map<String, Object>> events = new ArrayList<>();
+        for (String line : response.body().lines().filter(value -> !value.isBlank()).toList()) {
+            if (!(JsonReader.parse(line) instanceof Map<?, ?> event)) {
+                throw new AssertionError("a Pipeline preview event was not an object: " + line);
+            }
+            events.add(asObject(event));
+        }
+        if (events.isEmpty()) {
+            throw new AssertionError("Pipeline preview returned no events");
+        }
+        return List.copyOf(events);
     }
 
     /**
@@ -515,6 +592,97 @@ final class ControlPlane {
         return measuring;
     }
 
+    /** One processor of a run as the cluster places it: its index in the run, on its member, and that member. */
+    record PlacedProcessor(int index, int localIndex, String nodeId) {
+    }
+
+    /**
+     * One vertex of a pipeline's current run as the cluster reports it: the width the run's plan gave it, the engine's
+     * id for the execution it belongs to, and where each of its processors runs. A width the plan does not give the
+     * vertex is null.
+     */
+    record PlacedVertex(String name, Integer requested, Integer effective, Integer computedLocal, String executionId,
+            List<PlacedProcessor> processors) {
+    }
+
+    /**
+     * The vertices of this pipeline's current run as the cluster reports them - empty when no run of it is being
+     * measured. Assembled from the members that have reported so far, like {@link #membersCarryingPartOf}: a case that
+     * counts processors waits for {@link #membersMeasuring} to name every member first.
+     */
+    List<PlacedVertex> placedVertices(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read where " + pipelineId + "'s run is placed");
+        List<PlacedVertex> placed = new ArrayList<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (!(pipeline instanceof Map<?, ?> one) || !pipelineId.equals(one.get("pipelineId"))
+                    || !(one.get("vertices") instanceof List<?> vertices)) {
+                continue;
+            }
+            for (Object vertex : vertices) {
+                if (vertex instanceof Map<?, ?> reported) {
+                    placed.add(placedVertex(reported, response.body()));
+                }
+            }
+        }
+        return placed;
+    }
+
+    private static PlacedVertex placedVertex(Map<?, ?> vertex, String body) {
+        List<PlacedProcessor> processors = new ArrayList<>();
+        if (vertex.get("processors") instanceof List<?> running) {
+            for (Object processor : running) {
+                if (!(processor instanceof Map<?, ?> one) || !(one.get("index") instanceof Number index)
+                        || !(one.get("localIndex") instanceof Number localIndex)
+                        || !(one.get("nodeId") instanceof String nodeId)) {
+                    throw new AssertionError("a processor carried no index, local index or node id: " + body);
+                }
+                processors.add(new PlacedProcessor(index.intValue(), localIndex.intValue(), nodeId));
+            }
+        }
+        return new PlacedVertex(String.valueOf(vertex.get("name")), integerOrNull(vertex.get("requested")),
+                integerOrNull(vertex.get("effective")), integerOrNull(vertex.get("computedLocal")),
+                vertex.get("executionId") instanceof String executionId ? executionId : null,
+                List.copyOf(processors));
+    }
+
+    private static Integer integerOrNull(Object value) {
+        return value instanceof Number number ? number.intValue() : null;
+    }
+
+    /**
+     * The members the cluster says joined after this pipeline's current run was planned, by stable node id - empty
+     * when there are none or no run of it is being measured.
+     */
+    List<String> clusterAwaitingRebalance(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which members " + pipelineId + "'s run awaits");
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("awaitingRebalance") instanceof List<?> members) {
+                return members.stream().map(String::valueOf).toList();
+            }
+        }
+        return List.of();
+    }
+
+    /**
+     * When the cluster's latest readings of this pipeline's run were taken, by the server's clock - empty when no
+     * run of it is being measured. What lets a case wait for a reading taken after something happened, rather than
+     * for a length of time.
+     */
+    Optional<Instant> measuredAt(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read when " + pipelineId + "'s run was last measured");
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("measuredAt") instanceof String taken) {
+                return Optional.of(Instant.parse(taken));
+            }
+        }
+        return Optional.empty();
+    }
+
     private static List<?> pipelinesOf(String body) {
         if (!(JsonReader.parse(body) instanceof Map<?, ?> topology)
                 || !(topology.get("pipelines") instanceof List<?> pipelines)) {
@@ -566,12 +734,10 @@ final class ControlPlane {
         expect(current, 200, "read the source " + sourceId + " before deleting it");
         String tag = current.headers().firstValue("ETag")
                 .orElseThrow(() -> new AssertionError("the source " + sourceId + " came back with no ETag"));
-        HttpRequest request = HttpRequest.newBuilder(baseUrl.resolve("/api/sources/" + sourceId))
+        HttpRequest request = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/sources/" + sourceId))
                 .timeout(TIMEOUT)
-                .header("Authorization", "Bearer " + requireCredential())
                 .header("If-Match", tag)
-                .DELETE()
-                .build();
+                .DELETE()).build();
         HttpResponse<String> response = send(request);
         if (response.statusCode() != 204 && response.statusCode() != 200) {
             throw new AssertionError("could not delete the source " + sourceId + ": HTTP "
@@ -630,6 +796,14 @@ final class ControlPlane {
             throw new AssertionError("the source read was not an object: " + response.body());
         }
         return asObject(map);
+    }
+
+    /** The quoted authoritative version exposed by the typed Source HTTP read. */
+    String sourceEtag(String sourceId) {
+        HttpResponse<String> response = send(authedGet("/api/sources/" + urlSegment(sourceId)));
+        expect(response, 200, "read the source version " + sourceId);
+        return response.headers().firstValue("ETag")
+                .orElseThrow(() -> new AssertionError("the Source read returned no ETag"));
     }
 
     /**
@@ -886,6 +1060,9 @@ final class ControlPlane {
      * behind counts against the host's ceiling for the rest of the JVM.
      */
     Follow follow(String sourceId, String collection, Map<String, Object> filter) {
+        if (cloudCookie) {
+            throw new IllegalStateException("this WebSocket harness supports only on-prem Bearer authentication");
+        }
         String path = "/api/data-browser/" + sourceId + "/" + collection + "/tail";
         String query = filter == null
                 ? ""
@@ -1268,6 +1445,114 @@ final class ControlPlane {
         return interpretFailureCode(response.statusCode(), response.body(), pipelineId);
     }
 
+    /** A coded failure as the status carries it: the code, and the named arguments it was raised with. */
+    record Failure(String code, Map<String, Object> params) {
+    }
+
+    /**
+     * The failure the status carries, with its named arguments, or empty while it carries none - read on the terms
+     * {@link #failureCode} reads the code on, for a case that also has to say which member or connector it names.
+     */
+    Optional<Failure> failure(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        Optional<String> code = interpretFailureCode(response.statusCode(), response.body(), pipelineId);
+        if (code.isEmpty()) {
+            return Optional.empty();
+        }
+        Map<?, ?> failure = (Map<?, ?>) ((Map<?, ?>) JsonReader.parse(response.body())).get("failure");
+        Map<String, Object> params = new LinkedHashMap<>();
+        if (failure.get("params") instanceof Map<?, ?> named) {
+            named.forEach((name, value) -> params.put(String.valueOf(name), value));
+        }
+        return Optional.of(new Failure(code.get(), Collections.unmodifiableMap(params)));
+    }
+
+    /** A run's plan as the status carries it: the execution it was made for, its members, and each node's width. */
+    record Plan(Long executionGeneration, List<String> members, List<PlannedNode> nodes, Replaced replaces) {
+
+        /** The one node planned at a target of {@code requested}, failing when the plan has not exactly one. */
+        PlannedNode nodeRequested(int requested) {
+            List<PlannedNode> matching = nodes.stream().filter(node -> node.requested() == requested).toList();
+            if (matching.size() != 1) {
+                throw new AssertionError("expected one node planned at a target of " + requested + ", found "
+                        + matching + " in " + nodes);
+            }
+            return matching.get(0);
+        }
+    }
+
+    /** One node of a plan: what was asked of it, the width it was worked out to and why, and how that moved. */
+    record PlannedNode(String node, int requested, String scope, int memberCount, Integer computedLocal,
+            int effective, List<String> reasons, Change change) {
+    }
+
+    /** The run a plan replaced: its execution and the members it was planned over. */
+    record Replaced(Long executionGeneration, List<String> members) {
+    }
+
+    /** How a node's width moved from the run before: what it ran at then, and what moved it. */
+    record Change(int previousEffective, List<String> causes) {
+    }
+
+    /**
+     * The plan the pipeline's current run was submitted under, as its status carries it - empty while nothing about
+     * the pipeline has been published, or no run of it has been planned.
+     */
+    Optional<Plan> executionPlan(String pipelineId) {
+        return statusBody(pipelineId).flatMap(status -> status.get("plan") instanceof Map<?, ?> plan
+                ? Optional.of(plan(plan))
+                : Optional.empty());
+    }
+
+    /**
+     * The members the status says joined after the pipeline's current run was planned, by stable node id - empty when
+     * there are none, which is when the status leaves the field out.
+     */
+    List<String> awaitingRebalance(String pipelineId) {
+        return statusBody(pipelineId)
+                .map(status -> status.get("awaitingRebalance") instanceof List<?> members
+                        ? members.stream().map(String::valueOf).toList()
+                        : List.<String>of())
+                .orElse(List.of());
+    }
+
+    private Optional<Map<?, ?>> statusBody(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        if (interpretState(response.statusCode(), response.body(), pipelineId).isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of((Map<?, ?>) JsonReader.parse(response.body()));
+    }
+
+    private static Plan plan(Map<?, ?> plan) {
+        List<PlannedNode> nodes = new ArrayList<>();
+        if (plan.get("nodes") instanceof List<?> planned) {
+            for (Object node : planned) {
+                Map<?, ?> one = (Map<?, ?>) node;
+                Change change = one.get("change") instanceof Map<?, ?> moved
+                        ? new Change(((Number) moved.get("previousEffective")).intValue(), strings(moved.get("causes")))
+                        : null;
+                nodes.add(new PlannedNode(String.valueOf(one.get("node")), ((Number) one.get("requested")).intValue(),
+                        String.valueOf(one.get("scope")), ((Number) one.get("memberCount")).intValue(),
+                        integerOrNull(one.get("computedLocal")), ((Number) one.get("effective")).intValue(),
+                        strings(one.get("reasons")), change));
+            }
+        }
+        Replaced replaces = plan.get("replaces") instanceof Map<?, ?> replaced
+                ? new Replaced(longOrNull(replaced.get("executionGeneration")), strings(replaced.get("members")))
+                : null;
+        return new Plan(longOrNull(plan.get("executionGeneration")), strings(plan.get("members")),
+                List.copyOf(nodes), replaces);
+    }
+
+    private static Long longOrNull(Object value) {
+        return value instanceof Number number ? number.longValue() : null;
+    }
+
+    private static List<String> strings(Object value) {
+        return value instanceof List<?> list ? list.stream().map(String::valueOf).toList() : List.of();
+    }
+
     /**
      * What a status answer is allowed to say about a failure, read the way the two above are: only the
      * product's own {@code monitor.no-observation} code reads as "nothing published yet", every other refusal
@@ -1578,6 +1863,32 @@ final class ControlPlane {
         return read;
     }
 
+    /**
+     * Every table the snapshot read reports for the pipeline, by name - empty while nothing about the pipeline has
+     * been published or no table of its load has been read through. For a case waiting on a table to appear, where
+     * {@link #snapshotTable} would fail the read that comes first.
+     */
+    Map<String, TableSnapshot> snapshotTables(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Map.of();
+        }
+        expect(response, 200, "read the snapshot progress of " + pipelineId);
+        Map<String, TableSnapshot> tables = new LinkedHashMap<>();
+        if (JsonReader.parse(response.body()) instanceof Map<?, ?> map
+                && map.get("snapshot") instanceof Map<?, ?> snapshot) {
+            snapshot.forEach((table, progress) -> {
+                if (progress instanceof Map<?, ?> reading && reading.get("rowsDone") instanceof Number done) {
+                    Long total = reading.get("rowsTotal") instanceof Number rows ? rows.longValue() : null;
+                    Integer percent = reading.get("donePct") instanceof Number share ? share.intValue() : null;
+                    tables.put(String.valueOf(table), new TableSnapshot(done.longValue(), total, percent,
+                            Boolean.TRUE.equals(reading.get("landed"))));
+                }
+            });
+        }
+        return tables;
+    }
+
     Optional<TableSnapshot> snapshotTable(String pipelineId, String table) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
         if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
@@ -1595,7 +1906,8 @@ final class ControlPlane {
         }
         Long total = progress.get("rowsTotal") instanceof Number rows ? rows.longValue() : null;
         Integer percent = progress.get("donePct") instanceof Number share ? share.intValue() : null;
-        return Optional.of(new TableSnapshot(done.longValue(), total, percent));
+        boolean landed = Boolean.TRUE.equals(progress.get("landed"));
+        return Optional.of(new TableSnapshot(done.longValue(), total, percent, landed));
     }
 
     static Optional<Long> interpretRecordCount(int status, String body, String pipelineId) {
@@ -1665,6 +1977,18 @@ final class ControlPlane {
             return Optional.of(seq.longValue());
         }
         return Optional.empty();
+    }
+
+    /** The cluster read as it answers now, status and all, for a case to say what it last read. */
+    String clusterReading() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        return response.statusCode() + " " + response.body();
+    }
+
+    /** The position face as it answers now, status and all, for a case to say what it last read. */
+    String positionReading(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        return response.statusCode() + " " + response.body();
     }
 
     /**
@@ -1785,10 +2109,9 @@ final class ControlPlane {
      * refusal of a removal that carried no precondition in the first place.
      */
     private HttpRequest authedDelete(String id, String expectedContentHash) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
+        HttpRequest.Builder builder = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
                 .timeout(TIMEOUT)
-                .header("Authorization", "Bearer " + requireCredential())
-                .DELETE();
+                .DELETE());
         if (expectedContentHash != null) {
             builder.header("If-Match", "\"" + expectedContentHash + "\"");
         }
@@ -1796,11 +2119,9 @@ final class ControlPlane {
     }
 
     private HttpRequest authedGet(String path) {
-        return HttpRequest.newBuilder(baseUrl.resolve(path))
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(TIMEOUT)
-                .header("Authorization", "Bearer " + requireCredential())
-                .GET()
-                .build();
+                .GET()).build();
     }
 
     private HttpRequest post(String path, String body) {
@@ -1813,12 +2134,10 @@ final class ControlPlane {
 
     /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
     private HttpRequest authedPut(String path, String body) {
-        return HttpRequest.newBuilder(baseUrl.resolve(path))
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(TIMEOUT)
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + requireCredential())
-                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                .build();
+                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))).build();
     }
 
     private HttpRequest authed(String path, String body) {
@@ -1827,12 +2146,28 @@ final class ControlPlane {
 
     /** The same request with a bound of the caller's own, for a body large enough to need one. */
     private HttpRequest authed(String path, String body, Duration timeout) {
-        return HttpRequest.newBuilder(baseUrl.resolve(path))
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(timeout)
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + requireCredential())
-                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                .build();
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))).build();
+    }
+
+    private HttpRequest.Builder authenticate(HttpRequest.Builder request) {
+        return cloudCookie
+                ? request.header("Cookie", requireCredential()).header("Origin", baseUrl.toString())
+                : request.header("Authorization", "Bearer " + requireCredential());
+    }
+
+    /** The typed Source wire, including its caller-visible ETag precondition. */
+    HttpResponse<String> sourceRequest(String method, String path, Map<String, ?> body, String etag, int status) {
+        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
+                .header("Content-Type", "application/json");
+        if (etag != null) request.header("If-Match", etag);
+        request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+                : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(request.build());
+        expect(response, status, method + " " + path);
+        return response;
     }
 
     /**
