@@ -128,7 +128,8 @@ final class PipelineBenchmarkReturnLiveRun {
         builder.environment().put("JAVA_HOME", config.javaHome().toString());
         builder.environment().put("PATH", config.javaHome().resolve("bin") + java.io.File.pathSeparator
                 + builder.environment().getOrDefault("PATH", ""));
-        int exit = awaitOwned(builder.start(), 40, TimeUnit.MINUTES);
+        // A stateful fork at its fixed offer runs about 45 minutes, two sixteen-minute measured phases included.
+        int exit = awaitOwned(builder.start(), 120, TimeUnit.MINUTES);
         write(evidence.resolve("process-exit.json"), Map.of("exitCode", exit, "normalWaitReturned", true));
         require(exit == 0, "original Maven/Failsafe process failed; slot remains ended without retry");
         Path originalXml = config.repository().resolve("e2e/target/failsafe-reports/TEST-io.tapstate.e2e.RealBenchmarkForkDriverIT.xml");

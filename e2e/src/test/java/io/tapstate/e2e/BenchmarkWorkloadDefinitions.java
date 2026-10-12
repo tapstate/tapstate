@@ -710,7 +710,7 @@ final class BenchmarkWorkloadDefinitions {
         return switch (workload + "/" + phase) {
             case COPY + "/cdc-update" -> Duration.ofMillis(80);
             case STATELESS + "/cdc-update" -> Duration.ofMillis(80);
-            case STATEFUL + "/cold-read", STATEFUL + "/cdc-update" -> Duration.ofMillis(500);
+            case STATEFUL + "/cold-read", STATEFUL + "/cdc-update" -> Duration.ofMillis(1000);
             default -> throw new IllegalArgumentException("no fixed pilot offer for " + workload + "/" + phase);
         };
     }

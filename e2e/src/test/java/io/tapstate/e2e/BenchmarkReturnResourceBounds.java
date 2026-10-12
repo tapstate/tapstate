@@ -7,7 +7,7 @@ import java.util.Map;
 /** Counter enclosures from actual read brackets; identity, continuous memory peaks and sampler cost remain separate. */
 final class BenchmarkReturnResourceBounds {
     private static final int MAX_ROWS = 512 * 512;
-    private static final int MAX_ATTEMPTS = 4096;
+    private static final int MAX_ATTEMPTS = BenchmarkResourceSampler.MAX_PHASE_ATTEMPTS;
 
     private BenchmarkReturnResourceBounds() { }
 

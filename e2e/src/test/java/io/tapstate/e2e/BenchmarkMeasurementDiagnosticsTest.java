@@ -234,7 +234,7 @@ class BenchmarkMeasurementDiagnosticsTest {
         var serialized = PipelineBenchmarkLiveRunIT.resourceEvidence(phaseSummary,
                 new BenchmarkForkEnvironment.ClockAnchor(java.time.Instant.EPOCH, 0, 0));
         assertThat(((Map<?, ?>) serialized.get("sampling")).get("retainedAttemptLimit")).isEqualTo(1504);
-        assertThatThrownBy(()->new BenchmarkResourceSampler.AttemptLog(4097))
+        assertThatThrownBy(()->new BenchmarkResourceSampler.AttemptLog(BenchmarkResourceSampler.MAX_PHASE_ATTEMPTS + 1))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("finite phase bound");
     }
 

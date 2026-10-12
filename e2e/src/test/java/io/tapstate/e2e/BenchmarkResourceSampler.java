@@ -22,6 +22,8 @@ import java.util.function.Supplier;
 final class BenchmarkResourceSampler implements AutoCloseable {
 
     static final int MAX_RETAINED_ATTEMPTS = 256;
+    // A fixed-offer phase of up to sixteen minutes plus its ACK wait, read every 200 ms.
+    static final int MAX_PHASE_ATTEMPTS = 8192;
 
     private final BenchmarkProcessProbe probe;
     private final BenchmarkReturnWorkBudget.Scope workScope = BenchmarkReturnWorkBudget.current();
@@ -93,7 +95,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     static BenchmarkResourceSampler openForPhaseBudget(long childPid, Duration interval, Duration budget) {
         int retained = Math.toIntExact(budget.toNanos() / interval.toNanos() + 4);
-        if (retained < 2 || retained > 4096) { throw new AssertionError("phase resource retention exceeds its declared finite budget"); }
+        if (retained < 2 || retained > MAX_PHASE_ATTEMPTS) { throw new AssertionError("phase resource retention exceeds its declared finite budget"); }
         BenchmarkProcessProbe probe = BenchmarkProcessProbe.open(childPid);
         return new BenchmarkResourceSampler(probe, probe::sample, interval, BenchmarkReturnWorkBudget.rootClock(),
                 ScheduledExecutorService::awaitTermination, retained);
@@ -495,7 +497,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         private final int retention;
         AttemptLog() { this(MAX_RETAINED_ATTEMPTS); }
         AttemptLog(int retention) {
-            if (retention < 2 || retention > 4096) { throw new IllegalArgumentException("resource trace retention must have a finite phase bound"); }
+            if (retention < 2 || retention > MAX_PHASE_ATTEMPTS) { throw new IllegalArgumentException("resource trace retention must have a finite phase bound"); }
             this.retention = retention;
         }
         private final List<Attempt> first = new ArrayList<>();

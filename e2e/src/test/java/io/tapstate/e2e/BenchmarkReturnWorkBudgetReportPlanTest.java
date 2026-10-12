@@ -33,7 +33,7 @@ class BenchmarkReturnWorkBudgetReportPlanTest {
         var prepared = BenchmarkReturnWorkBudgetReportPlan.prepare(original());
         Map<String, BenchmarkReturnWorkBudgetReportPlan.Component> parts = index(prepared);
         assertThat(parts.get("RETURN_ROWS_IF_MATERIALIZED").rows()).isEqualTo(262144);
-        assertThat(parts.get("RESOURCE_TRACES_AND_REFUSALS").rows()).isEqualTo(3L * 4096);
+        assertThat(parts.get("RESOURCE_TRACES_AND_REFUSALS").rows()).isEqualTo(3L * BenchmarkResourceSampler.MAX_PHASE_ATTEMPTS);
         assertThat(parts.get("RETURN_CLOCK_ROSTERS").rows()).isEqualTo(2L * BenchmarkCausalClock.MAX_SAMPLES);
         assertThat(parts.get("NATIVE_BASELINE_CHECKPOINTS").rows()).isEqualTo(8);
         assertThat(parts.get("LEGACY_TARGET_HELLO_TIMELINE").rows()).isEqualTo(6002);
@@ -109,7 +109,7 @@ class BenchmarkReturnWorkBudgetReportPlanTest {
                     .containsEntry("pooledCohortRows", id.equals("stateful") ? 144000L : 48000L);
             assertThat(parts.get("SOURCE_BATCH_DOUBLE_REPRESENTATION").rows()).isEqualTo(960 * phases);
             assertThat(parts.get("RAW_RETURN_BASE64").rows()).isEqualTo(phases);
-            assertThat(parts.get("RESOURCE_TRACES_AND_REFUSALS").rows()).isEqualTo(3 * phases * 4096);
+            assertThat(parts.get("RESOURCE_TRACES_AND_REFUSALS").rows()).isEqualTo(3L * phases * BenchmarkResourceSampler.MAX_PHASE_ATTEMPTS);
             assertThat(parts.get("RETURN_CLOCK_ROSTERS").rows()).isEqualTo(2L * phases * BenchmarkCausalClock.MAX_SAMPLES);
             assertThat(parts.get("RETURN_ROWS_IF_MATERIALIZED").rows()).isEqualTo(phases * 262144);
             assertThat(parts.get("NATIVE_METADATA_AND_REGISTRATIONS").rows()).isEqualTo(8 * phases);

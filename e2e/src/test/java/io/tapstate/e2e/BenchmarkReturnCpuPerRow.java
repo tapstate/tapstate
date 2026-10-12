@@ -17,7 +17,7 @@ import java.util.OptionalLong;
  * reads around the common return window; both ends are divided by the cohort row count.
  */
 final class BenchmarkReturnCpuPerRow {
-    private static final int MAX_ATTEMPTS = 4096;
+    private static final int MAX_ATTEMPTS = BenchmarkResourceSampler.MAX_PHASE_ATTEMPTS;
 
     private BenchmarkReturnCpuPerRow() { }
 

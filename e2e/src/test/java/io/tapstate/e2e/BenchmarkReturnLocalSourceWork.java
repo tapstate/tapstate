@@ -19,7 +19,7 @@ final class BenchmarkReturnLocalSourceWork {
     static final int MAX_PAGE_FRAMES = (65536 - MIN_PAGE_HEADER_BYTES) / MIN_STORED_FRAME_BYTES;
     static final int MAX_ROWS = 262144;
     static final int PAGE_BYTES = 65_536, FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES, PAGE_FRAMES = BenchmarkReturnLocalSourceWork.MAX_PAGE_FRAMES, PART_ROWS = 512, CALL_ROWS = 1024;
-    static final int ROWS = 262_144, SAMPLES = BenchmarkCausalClock.MAX_SAMPLES, RESOURCE_ATTEMPTS = 4096, KEYS = 2;
+    static final int ROWS = 262_144, SAMPLES = BenchmarkCausalClock.MAX_SAMPLES, RESOURCE_ATTEMPTS = BenchmarkResourceSampler.MAX_PHASE_ATTEMPTS, KEYS = 2;
     static final int ROUTING_TEXT_BYTES = 512;
 
     record Capacity(long fullRows, long cohortRows, long sourceBatches) {
