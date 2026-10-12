@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.join;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.sql.Expressions;
 import io.tapstate.core.sql.JoinKey;
@@ -602,7 +603,7 @@ public final class JoinDriver {
             // The mirror where there is one: a connector's before image may hold the key columns
             // alone, and the published row is built from the whole row.
             Map<String, Object> row = mirrored != null ? mirrored : before;
-            queueRow(row, event.ts(), true);
+            queueRow(row, event.ts(), true, event.positions());
             forget(key, row);
             return;
         }
@@ -639,7 +640,7 @@ public final class JoinDriver {
         if (previous != null && !previousKey.equals(key)) {
             // The row's own identity moved, so what was published under the old one is a different
             // row and nothing else will ever remove it.
-            queueRow(previous, event.ts(), true);
+            queueRow(previous, event.ts(), true, event.positions());
             forget(previousKey, previous);
             previous = null;
         }
@@ -662,13 +663,13 @@ public final class JoinDriver {
                 indexRemove(dimension.source(), was, key);
                 // The old bucket's row is a different published row wherever the identity carries the
                 // dimension key, so it is removed rather than overwritten.
-                queueRow(previous, event.ts(), true);
+                queueRow(previous, event.ts(), true, event.positions());
             }
             if (now != null) {
                 stores.indexAdd(dimension.source(), now, key);
             }
         }
-        queueRow(after, event.ts(), false);
+        queueRow(after, event.ts(), false, event.positions());
     }
 
     /**
@@ -786,7 +787,7 @@ public final class JoinDriver {
 
         if (was != null && keyMoved) {
             stores.removeDimensionRow(dimension.source(), was);
-            queueRecompute(dimension, was, event.ts());
+            queueRecompute(dimension, was, event.ts(), event.positions());
         }
         if (after == null || now == null) {
             // A dimension row whose join key holds a null matches nothing, by the same rule that makes
@@ -812,7 +813,7 @@ public final class JoinDriver {
             displaced.displaced(dimension.source(), now);
         }
         if (keyMoved || publishedValuesDiffer(dimension, before, after)) {
-            queueRecompute(dimension, now, event.ts());
+            queueRecompute(dimension, now, event.ts(), event.positions());
         }
     }
 
@@ -855,13 +856,14 @@ public final class JoinDriver {
      * and every one of those rows would otherwise queue a walk of a bucket that does not exist. The
      * check is one look at the index, against a walk that is skipped.
      */
-    private void queueRecompute(Dimension dimension, String dimensionKey, long ts) {
+    private void queueRecompute(Dimension dimension, String dimensionKey, long ts,
+            Map<String, ChainPosition> positions) {
         int pages = stores.indexPageCount(dimension.source(), dimensionKey);
         if (pages == 0) {
             return;
         }
         pending.add(new Recompute(dimension, dimensionKey, 0, 0, ts,
-                estimateRows(dimension.source(), dimensionKey, pages)));
+                estimateRows(dimension.source(), dimensionKey, pages), positions));
     }
 
     /**
@@ -1016,7 +1018,7 @@ public final class JoinDriver {
                 // idempotent sink, against a row that otherwise stays for ever.
                 event = rowEvent(factRow, recompute.ts(), true);
             }
-            if (!sink.test(new JoinUpdate(factKey, event))) {
+            if (!sink.test(new JoinUpdate(factKey, event.withPositions(recompute.positions)))) {
                 // Nothing has been removed yet, so the entries found stale on this pass are simply
                 // found again on the next one. Removing them mid-walk would move the positions the
                 // bookmark below is written in.
@@ -1063,13 +1065,14 @@ public final class JoinDriver {
     static final String WRITTEN_IN = "\u0000writtenIn";
 
     /** Queues the published row for {@code factRow}, or its removal. */
-    private void queueRow(Map<String, Object> factRow, long ts, boolean removed) {
+    private void queueRow(Map<String, Object> factRow, long ts, boolean removed,
+            Map<String, ChainPosition> positions) {
         if (factRow == null) {
             return;
         }
         Envelope event = rowEvent(factRow, ts, removed);
         if (event != null) {
-            pending.add(new Row(new JoinUpdate(factKeyOf(factRow), event)));
+            pending.add(new Row(new JoinUpdate(factKeyOf(factRow), event.withPositions(positions))));
         }
     }
 
@@ -1330,18 +1333,20 @@ public final class JoinDriver {
         private final String dimensionKey;
         private final long ts;
         private final long expected;
+        private final Map<String, ChainPosition> positions;
         private int page;
         private int at;
         private long done;
 
         private Recompute(Dimension dimension, String dimensionKey, int page, int at, long ts,
-                long expected) {
+                long expected, Map<String, ChainPosition> positions) {
             this.dimension = dimension;
             this.dimensionKey = dimensionKey;
             this.page = page;
             this.at = at;
             this.ts = ts;
             this.expected = expected;
+            this.positions = positions;
         }
 
         /** About how many rows this rebuild has to send - an estimate, never a count. */
