@@ -1639,10 +1639,27 @@ final class ControlPlane {
                     "could not read the status of " + pipelineId + ": expected HTTP 200, got " + status
                             + " - " + body);
         }
-        if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("state") instanceof String state)) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)) {
             throw new AssertionError("status carried no state: " + body);
         }
-        return Optional.of(PipelineState.valueOf(state));
+
+        // The aggregate status projection can report a desired/catalog state before the runtime publishes
+        // an observation. E2E waits must use observedState for that contract; keep reading state only for
+        // legacy responses that do not carry the projection markers.
+        if (map.containsKey("observedState") || map.containsKey("hasArtifact")) {
+            Object observedState = map.get("observedState");
+            if (observedState == null) {
+                return Optional.empty();
+            }
+            if (observedState instanceof String state) {
+                return Optional.of(PipelineState.valueOf(state));
+            }
+            throw new AssertionError("status carried an invalid observedState: " + body);
+        }
+        if (map.get("state") instanceof String state) {
+            return Optional.of(PipelineState.valueOf(state));
+        }
+        throw new AssertionError("status carried no state: " + body);
     }
 
     /**

@@ -31,6 +31,29 @@ class ControlPlaneTest {
     }
 
     @Test
+    void doesNotTreatTheMergedDesiredStateAsARuntimeObservation() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "RUNNING",
+                "desiredState", "RUNNING",
+                "hasArtifact", true));
+
+        assertThat(ControlPlane.interpretState(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
+    void readsTheObservedStateFromTheMergedStatusProjection() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "PAUSED",
+                "desiredState", "RUNNING",
+                "observedState", "PAUSED",
+                "hasArtifact", true));
+
+        assertThat(ControlPlane.interpretState(200, body, PIPELINE)).contains(PipelineState.PAUSED);
+    }
+
+    @Test
     void readsTheProductsOwnNoObservationCodeAsNothingPublishedYet() {
         assertThat(ControlPlane.interpretState(404, coded(MonitorError.NO_OBSERVATION.code()), PIPELINE))
                 .isEmpty();
