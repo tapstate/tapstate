@@ -846,6 +846,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         }
                     }
                 }
+                fork.stopPipelines();
                 ownedReceipt.verifyBeforeClose();
                 Evidence run = new Evidence(forkId, workload, arm, applicationJar,
                         measured, resources, mongoCommands,

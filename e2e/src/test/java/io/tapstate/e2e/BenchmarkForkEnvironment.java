@@ -347,6 +347,24 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         BenchmarkReturnWorkBudget.external(workScope, BenchmarkReturnWorkBudget.Activity.CLEANUP, () -> { boot.close(); return null; });
     }
 
+    /**
+     * Stops every pipeline after the measured, ACK and oracle windows have closed, so the product closes its
+     * sink writers before the owned server shuts down instead of racing the producer's bounded final seal.
+     */
+    void stopPipelines() {
+        requireOpen();
+        for (String pipeline : workload.pipelineIds()) {
+            BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                    () -> { control.lifecycle(pipeline, LifecycleVerb.STOP); return null; });
+        }
+        for (String pipeline : workload.pipelineIds()) {
+            Await.until(pipeline + " to stop", PIPELINE_WAIT,
+                    () -> BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
+                            () -> control.state(pipeline)).filter(PipelineState.STOPPED::equals).isPresent(),
+                    () -> String.valueOf(control.state(pipeline)));
+        }
+    }
+
     private static void awaitRunning(ControlPlane control, String pipeline) {
         Await.until(pipeline + " to run", PIPELINE_WAIT,
                 () -> BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
