@@ -481,11 +481,20 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             execute(source, sql);
             long completedAt = BenchmarkReturnWorkBudget.rootNanoTime();
             batches.add(new BatchResult(batchIndex, issuedAt, completedAt));
-            nextBatchStart = issuedAt + phase.batchInterval().toNanos();
+            nextBatchStart = nextBatchStart(nextBatchStart, issuedAt, phase.batchInterval().toNanos());
             batchIndex++;
         }
         pendingPhase = phase;
         return new PhaseIssue(phase, started, BenchmarkReturnWorkBudget.rootNanoTime(), batches, clockAnchor);
+    }
+
+    /**
+     * Holds the declared offer on a fixed grid so timer overshoot does not accumulate into a slower rate. A
+     * batch that starts more than half an interval late re-anchors the grid there, so time lost to a slow
+     * statement is never repaid in a burst.
+     */
+    static long nextBatchStart(long scheduled, long issuedAt, long interval) {
+        return Math.max(Math.addExact(scheduled, interval), Math.addExact(issuedAt, interval / 2));
     }
 
     /** Verifies final target content after the external ACK window has ended. */

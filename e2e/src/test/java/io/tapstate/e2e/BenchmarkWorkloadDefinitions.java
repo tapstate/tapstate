@@ -154,8 +154,8 @@ final class BenchmarkWorkloadDefinitions {
         }
 
         /**
-         * Start each batch no sooner than the fixed interval after the prior batch start. If SQL takes
-         * longer, start the next batch when it completes; never catch up by releasing a burst.
+         * Start each batch on a fixed grid of the declared interval. If SQL runs past a grid point, start
+         * the next batch when it completes and re-anchor the grid there; never catch up in a burst.
          */
         List<List<String>> batches() {
             return BenchmarkSharedSupportSourceWork.entered(BenchmarkReturnWorkBudget.Activity.SHARED_SUPPORT,
