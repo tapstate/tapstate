@@ -199,7 +199,7 @@ class BenchmarkNativeNominalReturnClockTest {
         assertThat(evidence).containsEntry("samples", 600).containsEntry("mappingUncertaintyUpperNominalNanos", 1L);
         for (String flag : BenchmarkReturnProducerOrigins.FLAGS) assertThat(evidence).containsEntry(flag, false);
         var hostile = new java.util.AbstractList<BenchmarkCausalClock.Sample>() {
-            @Override public int size() { return 1025; }
+            @Override public int size() { return BenchmarkCausalClock.MAX_SAMPLES + 1; }
             @Override public BenchmarkCausalClock.Sample get(int index) { throw new AssertionError("oversized clock roster was traversed"); }
         };
         assertThatThrownBy(() -> clock(receipt(), receipt(), hostile)).isInstanceOf(AssertionError.class)

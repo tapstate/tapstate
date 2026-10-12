@@ -20,11 +20,11 @@ class BenchmarkReturnCompletedCorrespondenceTest {
         var retained = capture(expanded);
         assertThat(BenchmarkReturnCompletedMethod.reconstructCapture(retained, owner, "stateless/cdc-update").samples())
                 .containsExactlyElementsOf(samples);
-        retained.put("clockSamples", java.util.Collections.nCopies(1025, ((List<?>) retained.get("clockSamples")).getFirst()));
+        retained.put("clockSamples", java.util.Collections.nCopies(BenchmarkCausalClock.MAX_SAMPLES + 1, ((List<?>) retained.get("clockSamples")).getFirst()));
         assertThatThrownBy(() -> BenchmarkReturnCompletedMethod.reconstructCapture(retained, owner, "stateless/cdc-update"))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("bounded list");
         var hostile = new java.util.AbstractList<BenchmarkCausalClock.Sample>() {
-            @Override public int size() { return 1025; }
+            @Override public int size() { return BenchmarkCausalClock.MAX_SAMPLES + 1; }
             @Override public BenchmarkCausalClock.Sample get(int index) { throw new AssertionError("oversized sample roster was traversed"); }
         };
         assertThatThrownBy(() -> new BenchmarkWriteReturnCapture.Result(original.calls(), hostile, original.summary(), original.pagesBase64()))

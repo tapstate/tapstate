@@ -170,7 +170,7 @@ class BenchmarkReturnClockSamplerTest {
         assertThat(last.await(2, TimeUnit.SECONDS)).isTrue();
         assertThatThrownBy(sampler::finishAfterSuccessfulStop).isInstanceOf(AssertionError.class).hasMessageContaining("CAPACITY");
         assertThatThrownBy(sampler::close).isInstanceOf(AssertionError.class);
-        assertThat(calls).hasValue(1024); assertThat(sampler.readings()).hasSize(1024);
+        assertThat(calls).hasValue(BenchmarkCausalClock.MAX_SAMPLES); assertThat(sampler.readings()).hasSize(BenchmarkCausalClock.MAX_SAMPLES);
     }
 
     @Test void six_hundred_periodic_reads_keep_every_point_and_a_distinct_final_read() throws Exception {
