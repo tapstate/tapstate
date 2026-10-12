@@ -482,7 +482,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         BenchmarkSharedSupportSourceWork.phaseSql(phase);
         ClockAnchor clockAnchor = ClockAnchor.capture();
         long started = BenchmarkReturnWorkBudget.rootNanoTime();
-        long nextBatchStart = started;
+        long nextBatchStart = started, grid = started;
         List<BatchResult> batches = new ArrayList<>();
         int batchIndex = 0;
         for (List<String> sql : phase.batches()) {
@@ -499,7 +499,8 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             execute(source, sql);
             long completedAt = BenchmarkReturnWorkBudget.rootNanoTime();
             batches.add(new BatchResult(batchIndex, issuedAt, completedAt));
-            nextBatchStart = nextBatchStart(nextBatchStart, issuedAt, phase.batchInterval().toNanos());
+            grid = Math.addExact(grid, phase.batchInterval().toNanos());
+            nextBatchStart = nextBatchStart(grid, issuedAt, phase.batchInterval().toNanos());
             batchIndex++;
         }
         pendingPhase = phase;
@@ -507,12 +508,12 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     }
 
     /**
-     * Holds the declared offer on a fixed grid so timer overshoot does not accumulate into a slower rate. A
-     * batch that starts more than half an interval late re-anchors the grid there, so time lost to a slow
-     * statement is never repaid in a burst.
+     * Holds the declared offer on a fixed grid so neither timer overshoot nor a slow statement lowers the average
+     * rate. A batch behind its grid point follows the previous one after four fifths of an interval, so lost time
+     * is repaid at no more than 1.25 times the declared rate, never in a burst.
      */
-    static long nextBatchStart(long scheduled, long issuedAt, long interval) {
-        return Math.max(Math.addExact(scheduled, interval), Math.addExact(issuedAt, interval / 2));
+    static long nextBatchStart(long grid, long issuedAt, long interval) {
+        return Math.max(grid, Math.addExact(issuedAt, interval - interval / 5));
     }
 
     /** Verifies final target content after the external ACK window has ended. */
