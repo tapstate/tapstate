@@ -50,14 +50,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
 
-# A fixed, unprivileged uid: the server needs no root capability, and a numeric id keeps the
-# ownership legible when a host directory is mounted in.
+# The standard server uses a fixed, unprivileged uid. The Cloud target deliberately overrides it
+# for bundled Db2 initialization; a numeric id keeps standard host-mount ownership legible.
 RUN groupadd --gid 10001 tapstate \
  && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin tapstate
 
 # Several settings default to paths relative to the working directory (the plugin directory the
-# server unpacks into, the log directory, the connector seed directory). WORKDIR therefore has to be
-# a directory the unprivileged user can write, and it is where a host mount is expected to land.
+# server unpacks into, the log directory, the connector seed directory). The common WORKDIR supports
+# the standard unprivileged user and is where a host mount is expected to land.
 WORKDIR /var/lib/tapstate
 RUN mkdir -p /var/lib/tapstate/plugins /var/lib/tapstate/logs /var/lib/tapstate/connectors \
  && chown -R tapstate:tapstate /var/lib/tapstate
@@ -104,7 +104,8 @@ CMD ["--role=all"]
 # The connector seed has separate distribution terms, so this target does not inherit the server label's
 # Apache-2.0 assertion. Publication still requires a reviewed license inventory and permission.
 FROM runtime-base AS cloud
-# The bundled Db2 runtime registers its installation and client instance on first use.
+# Override the standard user: the bundled Db2 runtime registers its installation and client instance
+# on first use. Keep libstdc++6 explicit as a native requirement, even when the base already supplies it.
 USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libxml2 libstdc++6 \
@@ -117,8 +118,8 @@ LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
       io.tapstate.source="https://github.com/tapstate/tapstate" \
       io.tapstate.distribution="cloud" \
       org.opencontainers.image.licenses="NOASSERTION"
-COPY --from=cloud_connectors --chown=tapstate:tapstate /connectors/ /opt/tapstate/connectors/
-COPY --from=cloud_connectors --chown=tapstate:tapstate /release/ /opt/tapstate/release/
+COPY --from=cloud_connectors /connectors/ /opt/tapstate/connectors/
+COPY --from=cloud_connectors /release/ /opt/tapstate/release/
 ENV TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors
 RUN set -eu; \
     cd /opt/tapstate/connectors; \

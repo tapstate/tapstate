@@ -39,7 +39,11 @@ sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as 
 the cloud profile. Change capture needs archive logging on the database and
 `DATA CAPTURE CHANGES` on each captured table. With `useNativeMiner: true` the connector reads
 the log in-process; that needs the server on Linux x86_64, running as root at least for the
-first Db2 connection. The current preview JAR bundles the IBM Db2 runtime client and initializes
+first Db2 connection. Every native-mode JVM, including on-prem hosts, must have `libxml2.so.2`
+available and preload shared `libstdc++.so.6` before Java starts. Set `LD_PRELOAD=libstdc++.so.6`
+in the server process environment; the Cloud image supplies it, while on-prem operators configure
+it themselves. This prevents the current bridge's older static C++ locale symbols from overriding
+the IBM client's constructors. The current preview JAR bundles the IBM Db2 runtime client and initializes
 it on first native use. Older preview JARs need the runtime prepared once on that host with
 `db2-native-runtime-setup.sh` from the same release. Otherwise it reads from a raw log server
 at `rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
@@ -52,6 +56,11 @@ locale symbols do not override the IBM client's constructors and abort Java duri
 The ordinary on-prem image continues to run as UID 10001; native Db2 setup
 there remains the operator's responsibility. The Cloud arm64 image still cannot execute the
 connector's Linux x86_64 native bridge. Image initialization does not certify live Db2 CDC.
+
+Both image targets use the Ubuntu 24.04 Noble JRE base. Cloud runs can create root-owned files in
+the persistent `/var/lib/tapstate` working volume. Reusing that volume unchanged with an earlier
+UID-10001 Cloud image is not rollback-safe. Stop the cluster before restoring a pre-upgrade working
+volume or preparing its ownership for the earlier image; automatic ownership repair is not provided.
 
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL and
 MongoDB, with snapshot and CDC inserts, updates and deletes.

@@ -228,9 +228,10 @@ class StageConnectorsTest(unittest.TestCase):
                     labels.pop(key, None)
                 else:
                     labels[key] = value
-            user = (runtime_users or {}).get(architecture, "0")
+            user = (runtime_users or {}).get(architecture, "root")
             image_config = {"Labels": labels, "Env": (runtime_env or {}).get(
-                architecture, ["LD_PRELOAD=libstdc++.so.6"])}
+                architecture, ["PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                               "LD_PRELOAD=libstdc++.so.6"])}
             if user is not None:
                 image_config["User"] = user
             config_bytes = json.dumps({"config": image_config}, sort_keys=True).encode("utf-8")
