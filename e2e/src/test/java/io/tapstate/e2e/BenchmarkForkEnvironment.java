@@ -353,12 +353,16 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
      */
     void stopPipelines() {
         requireOpen();
-        for (String pipeline : workload.pipelineIds()) {
+        stopAll(control, workload.pipelineIds(), PIPELINE_WAIT);
+    }
+
+    static void stopAll(ControlPlane control, List<String> pipelines, Duration wait) {
+        for (String pipeline : pipelines) {
             BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
-                    () -> { control.lifecycle(pipeline, LifecycleVerb.STOP); return null; });
+                    () -> { control.stop(pipeline, false); return null; });
         }
-        for (String pipeline : workload.pipelineIds()) {
-            Await.until(pipeline + " to stop", PIPELINE_WAIT,
+        for (String pipeline : pipelines) {
+            Await.until(pipeline + " to stop", wait,
                     () -> BenchmarkReturnWorkBudget.opaqueRequest(BenchmarkReturnWorkBudget.current(), BenchmarkReturnWorkBudget.Activity.CONTROL_RPC,
                             () -> control.state(pipeline)).filter(PipelineState.STOPPED::equals).isPresent(),
                     () -> String.valueOf(control.state(pipeline)));
