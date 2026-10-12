@@ -57,6 +57,7 @@ final class RealProcessServer implements ServerHandle {
     private final boolean ownsStagingDirectory;
     private boolean closeRequested;
     private long closeRequestedAt;
+    private ClusterLifecycleProbe.Facts lifecycle;
 
     private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory,
             boolean ownsStagingDirectory) {
@@ -251,6 +252,7 @@ final class RealProcessServer implements ServerHandle {
      * why the server did not come up is the thing a reader needs.
      */
     private static RealProcessServer healthy(RealProcessServer server) {
+        server.observe(ClusterLifecycleProbe.Phase.HEALTH_STARTED);
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -261,6 +263,7 @@ final class RealProcessServer implements ServerHandle {
             }
             throw e;
         }
+        server.observe(ClusterLifecycleProbe.Phase.HEALTH_PASSED);
         return server;
     }
 
@@ -323,6 +326,7 @@ final class RealProcessServer implements ServerHandle {
         private final Path stagingDirectory;
         private final boolean ownsStagingDirectory;
         private final List<String> extraArguments;
+        private final ClusterLifecycleProbe.Facts lifecycle;
         private boolean launchAttempted;
         private boolean handedOff;
         private boolean released;
@@ -344,6 +348,9 @@ final class RealProcessServer implements ServerHandle {
             this.stagingDirectory = stagingDirectory;
             this.ownsStagingDirectory = ownsStagingDirectory;
             this.extraArguments = List.copyOf(extraArguments);
+            this.lifecycle = ClusterLifecycleProbe.facts(httpPort, workingDirectory, output, stagingDirectory,
+                    storeUri, operatorStateDatabase, listenAddress, this.jvmOptions, this.extraArguments);
+            ClusterLifecycleProbe.record(ClusterLifecycleProbe.Phase.PREPARED, lifecycle, -1);
         }
 
         synchronized RealProcessServer launch() {
@@ -356,6 +363,8 @@ final class RealProcessServer implements ServerHandle {
                         storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments);
                 RealProcessServer server = new RealProcessServer(
                         unhandedProcess, baseUrl, output, stagingDirectory, ownsStagingDirectory);
+                server.lifecycle = lifecycle;
+                server.observe(ClusterLifecycleProbe.Phase.LAUNCHED);
                 handedOff = true;
                 unhandedProcess = null;
                 return server;
@@ -483,6 +492,10 @@ final class RealProcessServer implements ServerHandle {
         return process.pid();
     }
 
+    private void observe(ClusterLifecycleProbe.Phase phase) {
+        if (lifecycle != null) ClusterLifecycleProbe.record(phase, lifecycle, pid());
+    }
+
     /** Where this launch staged its connectors, for a witness that the directory goes when the launch does. */
     Path stagingDirectory() {
         return stagingDirectory;
@@ -495,6 +508,7 @@ final class RealProcessServer implements ServerHandle {
 
     /** Waits for all startup runners, not merely the earlier Tomcat health response. */
     void awaitReady() {
+        observe(ClusterLifecycleProbe.Phase.READY_STARTED);
         ControlPlane control = new ControlPlane(baseUrl);
         Await.until("the process to complete application startup", STARTUP_BUDGET, () -> {
             if (!process.isAlive()) {
@@ -507,6 +521,7 @@ final class RealProcessServer implements ServerHandle {
                 throw new UncheckedIOException("could not read application readiness", failure);
             }
         }, this::tail);
+        observe(ClusterLifecycleProbe.Phase.READY_PASSED);
     }
 
     /**
@@ -536,6 +551,7 @@ final class RealProcessServer implements ServerHandle {
         closeRequestedAt = System.nanoTime();
         closeRequested = true;
         process.destroy();
+        observe(ClusterLifecycleProbe.Phase.QUIT_REQUESTED);
     }
 
     /** Confirms exit under the original grace and forced-exit budgets before discarding staging. */
@@ -560,6 +576,7 @@ final class RealProcessServer implements ServerHandle {
             }
             if (!exited) {
                 process.destroyForcibly();
+                observe(ClusterLifecycleProbe.Phase.FORCE_REQUESTED);
                 long forcedAt = System.nanoTime();
                 while (!exited) {
                     long remaining = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - forcedAt);
@@ -577,6 +594,7 @@ final class RealProcessServer implements ServerHandle {
                         + " grace and " + SHUTDOWN_BUDGET + " forced-exit budgets; its output was:\n"
                         + tail(), interrupted);
             }
+            observe(ClusterLifecycleProbe.Phase.EXIT_CONFIRMED);
             AssertionError interruptedFailure = interrupted == null ? null : new AssertionError(
                     "interrupted while waiting for the server to close; its exit was confirmed", interrupted);
             try {
