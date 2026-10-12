@@ -27,7 +27,7 @@ class BenchmarkReturnComponentCatalogueTest {
         assertThat(components.get("METHOD_CLOCK_SAMPLE_PROJECTION").rows()).isEqualTo(BenchmarkCausalClock.MAX_SAMPLES + 1L);
         assertThat(components.get("METHOD_COMMON_WINDOW_CERTIFICATES").rows()).isEqualTo(2);
         assertThat(components.get("METHOD_SERIAL_HELLO_READINGS").rows()).isEqualTo(6000);
-        assertThat(components.get("METHOD_RAW_RETURN_PAGES").strings()).isEqualTo(4L * ((2097152L + 2L * 512) / 3));
+        assertThat(components.get("METHOD_RAW_RETURN_PAGES").strings()).isEqualTo(4L * ((8388608L + 2L * 512) / 3));
         assertThat(added.plan().nodeUpper()).isGreaterThan(old.plan().nodeUpper());
         assertThat(added.plan().stringUtf8Upper()).isGreaterThan(old.plan().stringUtf8Upper());
         assertThat(added.metadata()).containsEntry("wholeMethodCostQualified", false)

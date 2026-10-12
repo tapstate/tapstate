@@ -46,7 +46,7 @@ class BenchmarkReturnWorkBudgetReportPlanTest {
     void bounded_raw_base64_padding_is_derived_before_any_output_is_observed() {
         var prepared = BenchmarkReturnWorkBudgetReportPlan.prepare(original());
         var raw = index(prepared).get("RAW_RETURN_BASE64");
-        long independent = 2L * 4 * ((2L * 1024 * 1024 + 2L * 512) / 3);
+        long independent = 2L * 4 * ((8L * 1024 * 1024 + 2L * 512) / 3);
         assertThat(raw.strings()).isEqualTo(independent);
         assertThat(raw.nodes()).isEqualTo(2L * (512 + 1));
         assertThat(raw.leafUtf8Upper()).isEqualTo(4 * ((65536 + 2) / 3));

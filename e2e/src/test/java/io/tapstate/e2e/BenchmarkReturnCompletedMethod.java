@@ -197,7 +197,7 @@ final class BenchmarkReturnCompletedMethod {
         var typed = new BenchmarkWriteReturnReader.Summary(window, text(summary.get("state"), 128),
                 number(summary, "completedCalls"), number(summary, "failedCalls"), number(summary, "reportedRecords"),
                 number(summary, "openCalls"), number(summary, "retainedBytes"));
-        require(typed.completedCalls() <= BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS && typed.reportedRecords() <= 262144 && typed.retainedBytes() <= 2097152,
+        require(typed.completedCalls() <= BenchmarkReturnLocalSourceWork.MAX_STORED_CALLS && typed.reportedRecords() <= 262144 && typed.retainedBytes() <= BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES,
                 "acquired capture summary exceeds prior source material");
         var pages = strings(retained.get("pagesBase64"), 512, 4 * ((65536 + 2) / 3));
         require(!pages.isEmpty(), "complete original raw pages are missing");

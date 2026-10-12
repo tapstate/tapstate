@@ -548,7 +548,7 @@ class BenchmarkWriteReturnReaderTest {
         var foreign = summary(3L, 0L, 6L, 0L, 826L); foreign.set(0, new Attribute("Pid", 18L));
         var duplicate = summary(3L, 0L, 6L, 0L, 826L); duplicate.add(new Attribute("State", "IDLE"));
         for (var values : List.of(missing, foreign, duplicate, summary(3L, 4L, 6L, 0L, 826L),
-                summary(3L, 0L, -1L, 0L, 826L), summary(3L, 0L, 6L, 0L, 2_097_153L),
+                summary(3L, 0L, -1L, 0L, 826L), summary(3L, 0L, 6L, 0L, 8_388_609L),
                 summary(3, 0L, 6L, 0L, 826L))) {
             assertThatThrownBy(() -> summaryReader(values).summary()).isInstanceOf(AssertionError.class);
         }

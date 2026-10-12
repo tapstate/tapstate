@@ -6,7 +6,7 @@ import java.util.Map;
 
 /** Prior material envelope for a complete fixed pilot report or one controlled diagnostic packet. */
 final class BenchmarkReturnWorkBudgetReportPlan {
-    private static final long RAW_BYTES = 2L * 1024 * 1024;
+    private static final long RAW_BYTES = BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES;
     private static final int PAGE_BYTES = 65536, PAGES = 512, FRAMES = BenchmarkReturnLocalSourceWork.MAX_STORED_FRAMES, RETURN_ROWS = BenchmarkReturnLocalSourceWork.MAX_ROWS;
     private static final int CLOCK_SAMPLES = BenchmarkCausalClock.MAX_SAMPLES, RESOURCE_ATTEMPTS = 4096;
     private static final int SOURCE_PACKET_NODES = 4096, SOURCE_PACKET_DEPTH = 16;

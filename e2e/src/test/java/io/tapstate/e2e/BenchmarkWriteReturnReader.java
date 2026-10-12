@@ -452,7 +452,7 @@ final class BenchmarkWriteReturnReader {
             }
             String window = boundedText(values, "Window", 512), state = boundedText(values, "State", 128);
             long completed = number(values, "CompletedCalls"), failures = number(values, "FailedCalls");
-            if (failures > completed || number(values, "RetainedBytes") > 2L * 1024 * 1024) {
+            if (failures > completed || number(values, "RetainedBytes") > BenchmarkReturnLocalSourceWork.RAW_LEDGER_BYTES) {
                 throw new AssertionError("return summary counters contradict their bounded domain");
             }
             return new Summary(window, state, completed, failures, number(values, "ReportedRecords"),
