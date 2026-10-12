@@ -8,9 +8,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.Optional;
 
@@ -26,10 +24,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoDesiredStoreIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoDesiredStoreIT.class);
 
     @Test
     void savedDesiredReadsBackEqual() {
@@ -123,7 +121,7 @@ class MongoDesiredStoreIT {
     /** Runs a test body against a fresh desired store over a clean collection on the real replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("pipeline_desired");
+            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("pipeline_desired");
             collection.drop();
             test.run(new MongoDesiredStore(collection), collection);
         }
