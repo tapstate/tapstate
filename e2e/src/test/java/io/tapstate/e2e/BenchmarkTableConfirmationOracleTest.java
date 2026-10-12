@@ -25,6 +25,16 @@ class BenchmarkTableConfirmationOracleTest {
     }
 
     @Test
+    void theControllerRecheckReadsAnAbsentMarkerTokenAsTheForkCapturedIt() {
+        assertThat(BenchmarkReturnCompletedMethod.markerSourceToken(null)).isNull();
+        assertThat(BenchmarkReturnCompletedMethod.markerSourceToken("token")).isEqualTo("token");
+        assertThat(BenchmarkReturnCompletedMethod.markerSourceToken("t".repeat(65_536))).hasSize(65_536);
+        for (Object invalid : List.of("", " ", "t".repeat(65_537), 7L)) {
+            assertThatThrownBy(() -> BenchmarkReturnCompletedMethod.markerSourceToken(invalid)).isInstanceOf(AssertionError.class);
+        }
+    }
+
+    @Test
     void exactTableOrderCanProveItsOwnTerminalWithoutInventingAnOpaqueAckToken() {
         Document cursor = cursor();
         var binding = BenchmarkTableAckGate.bind("chain", "pipeline", "source", "orders", cursor);
