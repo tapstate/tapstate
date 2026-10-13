@@ -141,11 +141,13 @@ class AWriteTheTargetHoldsButNeverConfirmedIsWrittenAgainIT {
                 cluster.processCarrying(victim).kill();
                 holds.releaseAfter(TABLE, held);
 
-                // Nothing is asked of the product from here until the assertions below, bar the change made after.
+                // Only the post-kill change and observations follow; no lifecycle request drives the recovery.
                 mongo.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
                 long every = SEEDED_ROWS + 2 + 6 + 1;
-                Await.until("every change, the one made after the kill included, to be in the target", TAKEOVER,
-                        () -> file.countRows(targetAddress, TABLE) == every,
+                Await.until("every change, the one made after the kill included, to be in the target with "
+                                + "published RUNNING", TAKEOVER,
+                        () -> file.countRows(targetAddress, TABLE) == every
+                                && survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "rows at the target = " + file.countRows(targetAddress, TABLE) + " of " + every
                                 + "; the pipeline is " + survivor.state(PIPELINE));
                 assertThat(survivor.state(PIPELINE)).contains(PipelineState.RUNNING);
