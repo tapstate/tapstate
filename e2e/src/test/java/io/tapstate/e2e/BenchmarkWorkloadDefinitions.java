@@ -706,11 +706,17 @@ final class BenchmarkWorkloadDefinitions {
         return rows == STEADY_PILOT_ROWS ? pilotOfferInterval(workload, phase) : Duration.ofMillis(1);
     }
 
+    /**
+     * Each interval shares no small common multiple with the product's sub-second and whole-second emission
+     * cadences, so the batches of one fork sweep every phase of that cadence; an interval commensurate with it
+     * holds one phase offset per fork and turns the cadence into fork-to-fork delivery latency noise. The copy
+     * and stateless windows are long enough to average out second-scale bursts of application CPU.
+     */
     static Duration pilotOfferInterval(String workload, String phase) {
         return switch (workload + "/" + phase) {
-            case COPY + "/cdc-update" -> Duration.ofMillis(80);
-            case STATELESS + "/cdc-update" -> Duration.ofMillis(80);
-            case STATEFUL + "/cold-read", STATEFUL + "/cdc-update" -> Duration.ofMillis(1000);
+            case COPY + "/cdc-update" -> Duration.ofMillis(317);
+            case STATELESS + "/cdc-update" -> Duration.ofMillis(317);
+            case STATEFUL + "/cold-read", STATEFUL + "/cdc-update" -> Duration.ofMillis(1037);
             default -> throw new IllegalArgumentException("no fixed pilot offer for " + workload + "/" + phase);
         };
     }

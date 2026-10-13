@@ -35,6 +35,18 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
 
     record Point(String markerId, String ring, long epoch, long seq, String sourceToken) { }
     private record Key(String ring, long seq) { }
+
+    /**
+     * A captured marker's source token: absent when the log record carries none, which table order alone can still
+     * prove, and otherwise a non-blank bounded text. Both the fork and the controller's independent recheck read
+     * the token through this one rule.
+     */
+    static String markerSourceToken(Object token) {
+        if (token != null && (!(token instanceof String text) || text.isBlank() || text.length() > 65_536)) {
+            throw new AssertionError("marker source token is invalid or exceeds its bound");
+        }
+        return (String) token;
+    }
     private final MongoClient client;
     private final MongoChangeStreamCursor<ChangeStreamDocument<Document>> cursor;
     private final Map<String, Marker> markers = new LinkedHashMap<>();
@@ -165,14 +177,11 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
                     || !(record.get("epoch") instanceof Number epoch) || epoch.longValue() < 1 || key.seq() < 0) {
                 throw new AssertionError("marker has no proven original capture order");
             }
-            Object token = record.get("srcToken");
-            if (token != null && (!(token instanceof String text) || text.isBlank() || text.length() > 65_536)) {
-                throw new AssertionError("marker source token is invalid or exceeds its bound");
-            }
+            String token = markerSourceToken(record.get("srcToken"));
             if (captured.containsKey(marker.id()) || keys.putIfAbsent(key, marker.id()) != null) {
                 throw new AssertionError("duplicate table marker or reused log key");
             }
-            captured.put(marker.id(), new Point(marker.id(), key.ring(), epoch.longValue(), key.seq(), (String) token));
+            captured.put(marker.id(), new Point(marker.id(), key.ring(), epoch.longValue(), key.seq(), token));
             if (event.getResumeToken() == null || event.getClusterTime() == null) {
                 throw new AssertionError("table marker event has no stream provenance");
             }

@@ -301,14 +301,6 @@ final class BenchmarkReturnCompletedMethod {
         }
     }
 
-    /**
-     * The retained marker source token under the rule the fork captured it with: absent when the log record
-     * carried none, which table order alone still proves, and otherwise non-blank text of at most 65536 chars.
-     */
-    static String markerSourceToken(Object value) {
-        return value == null ? null : text(value, 65536);
-    }
-
     private static BenchmarkAckOracle.Fork correctness(Map<String, Object> report,
             BenchmarkWorkloadDefinitions.Workload workload, String id) {
         var chainDefinitions = new LinkedHashMap<String, BenchmarkWorkloadDefinitions.SourceChain>();
@@ -336,7 +328,7 @@ final class BenchmarkReturnCompletedMethod {
             require(binding.consumer().equals(table.get("actualConsumerId"))
                     && binding.writers().equals(strings(table.get("expectedWriters"), 128, 512)), "original table writer binding differs");
             var marker = new BenchmarkTableTerminalObserver.Point(logical, text(table.get("ring"), 512),
-                    number(table, "epoch"), number(table, "seq"), markerSourceToken(table.get("actualMarkerSourceToken")));
+                    number(table, "epoch"), number(table, "seq"), BenchmarkTableTerminalObserver.markerSourceToken(table.get("actualMarkerSourceToken")));
             var proof = new BenchmarkAckOracle.TableConfirmationProof(logical, sourcePosition, marker, binding, cursorJson);
             Object ack = row.get("authoritativeTargetAck");
             chains.add(new BenchmarkAckOracle.SourceChain(chainId, List.of(new BenchmarkAckOracle.TerminalEvent(logical, sourcePosition)),

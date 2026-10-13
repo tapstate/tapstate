@@ -25,12 +25,13 @@ class BenchmarkTableConfirmationOracleTest {
     }
 
     @Test
-    void theControllerRecheckReadsAnAbsentMarkerTokenAsTheForkCapturedIt() {
-        assertThat(BenchmarkReturnCompletedMethod.markerSourceToken(null)).isNull();
-        assertThat(BenchmarkReturnCompletedMethod.markerSourceToken("token")).isEqualTo("token");
-        assertThat(BenchmarkReturnCompletedMethod.markerSourceToken("t".repeat(65_536))).hasSize(65_536);
+    void aRetainedMarkerTokenIsAbsentOrBoundedTextOnBothSidesOfTheRecheck() {
+        assertThat(BenchmarkTableTerminalObserver.markerSourceToken(null)).isNull();
+        assertThat(BenchmarkTableTerminalObserver.markerSourceToken("token")).isEqualTo("token");
+        assertThat(BenchmarkTableTerminalObserver.markerSourceToken("t".repeat(65_536))).hasSize(65_536);
         for (Object invalid : List.of("", " ", "t".repeat(65_537), 7L)) {
-            assertThatThrownBy(() -> BenchmarkReturnCompletedMethod.markerSourceToken(invalid)).isInstanceOf(AssertionError.class);
+            assertThatThrownBy(() -> BenchmarkTableTerminalObserver.markerSourceToken(invalid))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("marker source token");
         }
     }
 

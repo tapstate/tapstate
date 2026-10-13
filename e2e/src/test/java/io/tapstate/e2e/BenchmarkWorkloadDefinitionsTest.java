@@ -108,7 +108,7 @@ class BenchmarkWorkloadDefinitionsTest {
                 assertThat(sql).contains("amount = amount - 1").contains("id NOT IN"));
         assertThat(pilot.phase("cdc-update").batches()).hasSize(960);
         assertThat(pilot.phase("cdc-update").expectedLogicalOutputChanges()).isEqualTo(96_000);
-        assertThat(pilot.phase("cdc-update").batchInterval()).isEqualTo(Duration.ofMillis(80));
+        assertThat(pilot.phase("cdc-update").batchInterval()).isEqualTo(Duration.ofMillis(317));
         assertThat(pilot.inFixedCohort("24000")).isFalse();
         assertThat(pilot.inFixedCohort("24001")).isTrue();
         assertThat(BenchmarkWorkloadDefinitions.byId("copy").phases()).hasSize(4);
