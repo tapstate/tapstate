@@ -38,6 +38,8 @@ def check(workflows, contexts, inputs):
     assert re.search(r'^    needs:.*test-shards', build, re.M), 'build must wait for all shards'
     assert re.search(r'^    if:.*always\(\)', build, re.M), 'build must run when a shard fails'
     assert 'ci-aggregate.sh verify' in build, 'build must admit the global report set'
+    assert 'ci-receipt.sh compare-inputs' in build and 'pattern: ci-inputs-*' in build, \
+        'build must compare every independent worker input snapshot before report admission'
     shards = ci.get('test-shards', '')
     assert 'fail-fast: false' in shards, 'collect evidence from every shard on failure'
     assert 'ci-shard.sh run' in shards and 'ci-aggregate.sh pack' in shards
@@ -105,6 +107,8 @@ for original, replacement in [
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
+    ('ci-receipt.sh compare-inputs', 'echo input-comparison-removed'),
+    ('pattern: ci-inputs-*', 'pattern: no-worker-inputs'),
     ('    name: sonarqube', '    name: sonar-renamed'),
     ('  test-shards:', '  test-shards:\n    env:\n      CLOUD_SDK_REVISION: unpublished'),
     ('run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install',

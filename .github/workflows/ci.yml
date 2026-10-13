@@ -219,10 +219,17 @@ jobs:
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Record the aggregate build inputs
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --resolve-classpath --output "$RUNNER_TEMP/ci-inputs/build-inputs.json"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ci-inputs-*
+          path: ${{ runner.temp }}/ci-shard-inputs
+      - name: Admit independent build input hashes
+        run: .github/scripts/ci-receipt.sh compare-inputs --root . --plan "$RUNNER_TEMP/shards.json" --inputs-root "$RUNNER_TEMP/ci-shard-inputs" --aggregate-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --output "$RUNNER_TEMP/ci-inputs/build-input-equivalence.json"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ci-inputs-build
-          path: ${{ runner.temp }}/ci-inputs/build-inputs.json
+          path: ${{ runner.temp }}/ci-inputs/
           if-no-files-found: error
           retention-days: 7
       - name: Admit the complete report and coverage set

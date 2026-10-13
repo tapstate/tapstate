@@ -190,6 +190,117 @@ with tempfile.TemporaryDirectory() as tmp:
         check(json.loads(out.read_text())['elapsed_seconds']==0.5,'phase timing includes all runtime metadata collection')
     finally:
         m.git,m.command,m.subprocess.run,m.time.monotonic_ns,m.runtime_class_metadata=originals
+    # Equal source labels and totals do not excuse different current build bytes.
+    input_plan = dict(source_sha='a'*40, cohort_hash='b'*64,
+                      shards=[dict(id='e2e-1'), dict(id='engine'), dict(id='rest')])
+    prepared = dict(schema=1, phase='pre-test-after-install', source_sha='a'*40,
+                    source_tree='c'*40, run_id='123', run_attempt='1',
+                    source_files={'pom.xml': 'a'*64}, production_files={'core/target/classes/A.class': 'b'*64},
+                    production_class_ids={'core/target/classes/A.class': '1'*16},
+                    production_class_access_flags={'core/target/classes/A.class': 33},
+                    test_files={'core/target/test-classes/ATest.class': 'c'*64},
+                    test_class_ids={'core/target/test-classes/ATest.class': '2'*16},
+                    packaged_outputs={'test-support/target/test-support-tests.jar': dict(sha256='d'*64, size=1, mode=420),
+                                      'app/target/app-boot.jar': dict(sha256='e'*64, size=1, mode=420)},
+                    resolved_test_classpaths={'core': [dict(identity='repository/io/tapstate/cloud-sdk/1/sdk.jar',
+                                                           sha256='f'*64, size=1, own_classes={})]},
+                    jacoco_version='0.8.13', toolchain=dict(java='JDK21', maven='Maven3', architecture='x86_64'),
+                    dependency_repository_files={'io/tapdata/pdk/2.0/pdk.jar': 'd'*64})
+    worker_inputs = {shard['id']: copy.deepcopy(prepared) for shard in input_plan['shards']}
+    original_workers = copy.deepcopy(worker_inputs)
+    def compare_current(): return m.compare_input_snapshots(input_plan, prepared, worker_inputs)
+    result = compare_current()
+    check(result['declared_input_hashes_equal'] and not result['whole_build_provenance_complete']
+          and not result['ability_proven'] and not result['raw_bytes_uploaded'], 'current declared hashes agree without inventing complete provenance')
+    for field in m.BUILD_INPUT_FIELDS:
+        worker_inputs['engine'][field] = {} if isinstance(prepared[field], dict) else 'wrong'
+        rejected(compare_current, 'missing or different projection rejects: ' + field)
+        worker_inputs = copy.deepcopy(original_workers)
+    for field, value in [('source_sha', 'd'*40), ('run_id', 'old'), ('run_attempt', '2'),
+                         ('phase', 'post-test-before-pack'), ('schema', 2)]:
+        worker_inputs['rest'][field] = value
+        rejected(compare_current, 'old source/run/attempt/schema/phase rejects: ' + field)
+        worker_inputs = copy.deepcopy(original_workers)
+    for key in ['test-support/target/test-support-tests.jar', 'app/target/app-boot.jar']:
+        worker_inputs['engine']['packaged_outputs'].pop(key)
+        rejected(compare_current, 'missing required current package rejects: ' + key)
+        worker_inputs = copy.deepcopy(original_workers)
+    worker_inputs['rest']['production_class_ids']['core/target/classes/A.class'] = '3'*16
+    rejected(compare_current, 'same source and class count with different production class ID rejects')
+    worker_inputs = copy.deepcopy(original_workers)
+    worker_inputs['rest']['resolved_test_classpaths']['core'][0]['sha256'] = 'e'*64
+    rejected(compare_current, 'different same-group published SDK bytes reject')
+    worker_inputs = copy.deepcopy(original_workers)
+    worker_inputs['rest']['dependency_repository_files']['io/tapdata/pdk/2.0/pdk.jar'] = 'e'*64
+    rejected(compare_current, 'different available PDK bytes reject')
+    worker_inputs = copy.deepcopy(original_workers)
+    worker_inputs.pop('engine'); rejected(compare_current, 'missing input shard rejects')
+    worker_inputs = copy.deepcopy(original_workers)
+    worker_inputs['foreign'] = copy.deepcopy(prepared); rejected(compare_current, 'foreign input shard rejects')
+    worker_inputs = copy.deepcopy(original_workers)
+    worker_inputs['rest']['dependency_repository_files']['unused/provider.jar'] = 'e'*64
+    check(compare_current()['declared_input_hashes_equal'], 'unused incoming cache extras are disclosed by scope and do not pretend to be resolved inputs')
+    worker_inputs = copy.deepcopy(original_workers)
+    # File selection must distinguish a retained aggregate from current workers.
+    worker_root = root / 'worker-inputs'; worker_root.mkdir()
+    for shard in input_plan['shards']:
+        directory = worker_root / ('ci-inputs-' + shard['id']); directory.mkdir()
+        (directory / 'build-inputs.json').write_text(json.dumps(prepared))
+    paths = m.worker_input_paths(input_plan, worker_root)
+    check(set(paths) == set(original_workers), 'all dynamic planned worker files are selected')
+    previous_build = worker_root / 'ci-inputs-build'; previous_build.mkdir()
+    (previous_build / 'build-inputs.json').write_text('unreadable old aggregate must never be used')
+    check(m.worker_input_paths(input_plan, worker_root) == paths, 'retained aggregate cannot masquerade as a worker on reruns')
+    unknown = worker_root / 'ci-inputs-foreign'; unknown.mkdir()
+    rejected(lambda: m.worker_input_paths(input_plan, worker_root), 'foreign worker directory still rejects')
+    unknown.rmdir()
+    path = paths['engine']; content = path.read_text(); path.unlink()
+    rejected(lambda: m.worker_input_paths(input_plan, worker_root), 'missing planned input file rejects')
+    path.symlink_to(paths['rest'])
+    rejected(lambda: m.worker_input_paths(input_plan, worker_root), 'symlink planned input file rejects')
+    path.unlink(); path.write_text(content)
+    # Exercise the complete command with a real independent Git source and plan.
+    fixture = root / 'input-comparison-checkout'; (fixture / 'core/src/test/java/sample').mkdir(parents=True)
+    (fixture / 'pom.xml').write_text('<project><modules><module>core</module></modules></project>')
+    (fixture / 'core/pom.xml').write_text('<project/>')
+    (fixture / 'core/src/test/java/sample/OneTest.java').write_text('package sample; class OneTest {}')
+    git_env = {key: value for key, value in os.environ.items() if key not in
+               ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_PREFIX', 'GIT_QUARANTINE_PATH')}
+    def fixture_git(*args):
+        return m.command(['git', '-C', str(fixture), *args], cwd=fixture).strip()
+    import subprocess
+    subprocess.run(['git', 'init', '-q', str(fixture)], env=git_env, check=True)
+    subprocess.run(['git', '-C', str(fixture), 'add', '.'], env=git_env, check=True)
+    subprocess.run(['git', '-C', str(fixture), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+                    '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'Fixture input tree'], env=git_env, check=True)
+    plan_path = root / 'current-plan.json'
+    subprocess.run(['bash', str(Path(sys.argv[1]) / 'ci-shard.sh'), 'plan', '--root', str(fixture), '--output', str(plan_path)],
+                   env=git_env, check=True, capture_output=True)
+    plan = json.loads(plan_path.read_text()); current = copy.deepcopy(prepared)
+    current.update(source_sha=fixture_git('rev-parse', 'HEAD'), source_tree=fixture_git('rev-parse', 'HEAD^{tree}'),
+                   run_id=os.getenv('GITHUB_RUN_ID', 'local'), run_attempt=os.getenv('GITHUB_RUN_ATTEMPT', '1'))
+    aggregate_path = root / 'current-aggregate.json'; aggregate_path.write_text(json.dumps(current))
+    command_workers = root / 'command-worker-inputs'; command_workers.mkdir()
+    for shard in plan['shards']:
+        directory = command_workers / ('ci-inputs-' + shard['id']); directory.mkdir()
+        (directory / 'build-inputs.json').write_text(json.dumps(current))
+    directory = command_workers / 'ci-inputs-build'; directory.mkdir()
+    (directory / 'build-inputs.json').write_text('old aggregate is not current')
+    arguments = argparse.Namespace(root=str(fixture), plan=str(plan_path), inputs_root=str(command_workers),
+                                   aggregate_inputs=str(aggregate_path), output=str(root / 'comparison.json'))
+    m.compare_inputs(arguments)
+    check(json.loads(Path(arguments.output).read_text())['declared_input_hashes_equal'], 'real Git/plan/file/current-run comparison accepts fresh workers with old aggregate artifact')
+    current['run_attempt'] = str(int(current['run_attempt']) + 1)
+    aggregate_path.write_text(json.dumps(current))
+    for shard in plan['shards']:
+        (command_workers / ('ci-inputs-' + shard['id']) / 'build-inputs.json').write_text(json.dumps(current))
+    try:
+        m.compare_inputs(arguments)
+    except ValueError as error:
+        check('differs from the current run/attempt' in str(error),
+              'equal wrong attempts must reject against current execution identity, not worker disagreement')
+    else:
+        raise AssertionError('equal wrong attempts escaped current execution identity admission')
     # First-attempt provenance is validated independently of successful conclusion.
     original_api = m.api
     m.api = lambda endpoint: {'id': 10, 'run_attempt': 1, 'status': 'in_progress', 'repository': {'full_name': 'example/project'}}

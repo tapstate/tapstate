@@ -473,6 +473,106 @@ def inputs(args):
                                          'elapsed_seconds': value['elapsed_seconds'], 'status': 'success'}))
 
 
+
+# Compare declared bytes; generator, processor and effective-realm completeness remain separate.
+BUILD_INPUT_FIELDS = (
+    'source_tree', 'source_files', 'production_files', 'production_class_ids',
+    'production_class_access_flags', 'test_files', 'test_class_ids',
+    'packaged_outputs', 'resolved_test_classpaths', 'jacoco_version', 'toolchain',
+)
+
+
+def compare_input_snapshots(plan, aggregate, workers):
+    require(isinstance(plan, dict) and isinstance(aggregate, dict) and isinstance(workers, dict),
+            'invalid independent input snapshot objects')
+    ids = [shard['id'] for shard in plan['shards']]
+    require(ids and len(set(ids)) == len(ids) and set(workers) == set(ids),
+            'independent build input shard set differs from the plan')
+    source = plan['source_sha']
+    require(re.fullmatch(r'[0-9a-f]{40}', source or ''), 'invalid planned source identity')
+    require(re.fullmatch(r'[0-9a-f]{40}', aggregate.get('source_tree', '')), 'invalid source tree identity')
+    for field in BUILD_INPUT_FIELDS:
+        require(field in aggregate and aggregate[field], 'aggregate input projection missing: ' + field)
+    require(isinstance(aggregate.get('dependency_repository_files'), dict), 'aggregate dependency hash map missing')
+    run, attempt = aggregate.get('run_id'), str(aggregate.get('run_attempt'))
+    require((run == 'local' or str(run).isdecimal()) and attempt.isdecimal() and int(attempt) > 0,
+            'invalid independent build run/attempt')
+    for name, value in [('build', aggregate), *sorted(workers.items())]:
+        require(isinstance(value, dict), 'invalid input snapshot: ' + name)
+        require(type(value.get('schema')) is int and value['schema'] == 1
+                and value.get('phase') == 'pre-test-after-install', 'input is not a pre-test snapshot: ' + name)
+        require(value.get('source_sha') == source and value.get('run_id') == run
+                and str(value.get('run_attempt')) == attempt, 'input source/run/attempt differs: ' + name)
+        for field in BUILD_INPUT_FIELDS:
+            require(value.get(field) == aggregate[field], 'independent build input differs: ' + name + '/' + field)
+        available = value.get('dependency_repository_files')
+        require(isinstance(available, dict), 'dependency hash map missing: ' + name)
+        # Incoming caches may contain unused extras. Their shared bytes may not change;
+        # all actually resolved ordered test classpaths are compared above, including the SDK.
+        for path in aggregate['dependency_repository_files'].keys() & available.keys():
+            require(aggregate['dependency_repository_files'][path] == available[path],
+                    'available dependency bytes differ: ' + name)
+    return dict(schema=1, type='independent-build-input-hashes', source_sha=source,
+                source_tree=aggregate['source_tree'], run_id=run, run_attempt=attempt,
+                cohort_hash=plan['cohort_hash'], shards=ids, compared_fields=list(BUILD_INPUT_FIELDS),
+                declared_input_hashes_equal=True, whole_build_provenance_complete=False,
+                ability_proven=False, raw_bytes_uploaded=False)
+
+
+def worker_input_paths(plan, worker_root):
+    require(worker_root.is_dir() and not worker_root.is_symlink(), 'unsafe worker input root')
+    expected = {'ci-inputs-' + shard['id'] for shard in plan['shards']}
+    actual = {path.name for path in worker_root.iterdir()}
+    # A previous aggregate artifact can remain on a rerun. The current aggregate
+    # snapshot is the direct local file, never this downloaded copy.
+    if 'ci-inputs-build' not in expected:
+        actual.discard('ci-inputs-build')
+    require(actual == expected, 'input artifact set differs from the plan')
+    result = {}
+    for shard in plan['shards']:
+        directory = worker_root / ('ci-inputs-' + shard['id'])
+        require(directory.is_dir() and not directory.is_symlink(), 'unsafe worker input artifact')
+        path = directory / 'build-inputs.json'
+        require(path.is_file() and not path.is_symlink(), 'worker input snapshot missing')
+        require(path.stat().st_size <= 64 * 1024 * 1024, 'worker input snapshot exceeds the budget')
+        result[shard['id']] = path
+    return result
+
+
+def compare_inputs(args):
+    root = Path(args.root).resolve()
+    require(Path(git(root, 'rev-parse', '--show-toplevel')).resolve() == root,
+            'input comparison root must be the actual product checkout')
+    require(not git(root, 'status', '--porcelain', '--untracked-files=no'), 'comparison source must be clean')
+    from importlib.util import spec_from_file_location, module_from_spec
+    spec = spec_from_file_location('input_shards', Path(__file__).with_name('_ci-shards.py'))
+    shards = module_from_spec(spec)
+    spec.loader.exec_module(shards)
+    plan = shards.load_plan(args, root)
+    aggregate_path = Path(args.aggregate_inputs)
+    worker_root = Path(args.inputs_root)
+    require(aggregate_path.is_file() and not aggregate_path.is_symlink(), 'unsafe aggregate input file')
+    worker_paths = worker_input_paths(plan, worker_root)
+    workers = {name: json.loads(path.read_text()) for name, path in worker_paths.items()}
+    require(aggregate_path.stat().st_size <= 64 * 1024 * 1024, 'aggregate input snapshot exceeds the budget')
+    aggregate = json.loads(aggregate_path.read_text())
+    expected_source = git(root, 'rev-parse', 'HEAD')
+    require(aggregate.get('source_sha') == expected_source
+            and aggregate.get('source_tree') == git(root, 'rev-parse', 'HEAD^{tree}'),
+            'aggregate input snapshot differs from the current checkout')
+    identity = shards.execution_identity()
+    expected_run = identity['run_id'] if identity['execution'] == 'github-actions' else 'local'
+    expected_attempt = identity['run_attempt'] if identity['execution'] == 'github-actions' else 1
+    require(aggregate.get('run_id') == expected_run and str(aggregate.get('run_attempt')) == str(expected_attempt),
+            'aggregate input snapshot differs from the current run/attempt')
+    result = compare_input_snapshots(plan, aggregate, workers)
+    result['input_files'] = {'build': digest(aggregate_path), **{
+        shard['id']: digest(worker_root / ('ci-inputs-' + shard['id']) / 'build-inputs.json')
+        for shard in plan['shards']}}
+    write(Path(args.output), result)
+    print('independent build input hashes agree; whole-build provenance is not established')
+
+
 def resources(args):
     value = {'schema': 1, 'run_id': os.getenv('GITHUB_RUN_ID', 'local'),
              'run_attempt': os.getenv('GITHUB_RUN_ATTEMPT', '1'),
@@ -651,6 +751,12 @@ def main():
     p.add_argument('--resolve-classpath', action='store_true')
     p.add_argument('--phase', choices=['pre-test-after-install', 'post-test-before-pack'], default='pre-test-after-install')
     p.add_argument('--runtime-class-dir', help='private existing-JaCoCo class dumps in the worker input sibling')
+    p = commands.add_parser('compare-inputs')
+    p.add_argument('--root', default='.')
+    p.add_argument('--plan', required=True)
+    p.add_argument('--inputs-root', required=True)
+    p.add_argument('--aggregate-inputs', required=True)
+    p.add_argument('--output', required=True)
     p = commands.add_parser('resources')
     p.add_argument('--root', default='.')
     p.add_argument('--output', required=True)
@@ -667,6 +773,8 @@ def main():
     args = parser.parse_args()
     if args.command == 'inputs':
         inputs(args)
+    elif args.command == 'compare-inputs':
+        compare_inputs(args)
     elif args.command == 'resources':
         resources(args)
     elif args.command == 'collect':
