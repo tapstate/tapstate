@@ -21,6 +21,7 @@ import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
+import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
 import java.nio.file.Files;
@@ -101,10 +102,10 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
     @Test
     void aMemberThatCannotStageTheConnectorRefusesTheStartBeforeAnythingIsStarted() throws Exception {
         Path aFile = Files.createFile(scratch.resolve("not-a-directory"));
-        bind(m1, new Loading("h1"));
+        bind(m1, new Loading(Registry.CONTENT_HASH));
         bind(m2, new RegistryConnectorProvisioner(new Registry(true), new ConnectorIntrospector(),
                 aFile.resolve("plugins")));
-        bind(m3, new Loading("h1"));
+        bind(m3, new Loading(Registry.CONTENT_HASH));
         Started started = new Started();
 
         TapstateException refused = catchThrowableOfType(() -> started.actuator(readiness()).start(pipe),
@@ -113,10 +114,8 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
         assertThat(refused.code()).isEqualTo(ActuationError.CONNECTOR_UNAVAILABLE_ON_MEMBER);
         assertThat(refused.args()).containsEntry("pipeline", pipe).containsEntry("member", "m2")
                 .containsEntry("connector", "pg");
-        // The wrapper says what was being done and the cause says why it failed; the reason carries both.
         assertThat((String) refused.args().get("reason"))
-                .startsWith("UncheckedIOException: staging connector artifact " + aFile.resolve("plugins"))
-                .matches("(?s).* \\(\\w+Exception: .+\\)");
+                .isEqualTo("connector.load-failed {connector=pg}");
         started.nothingWasStarted();
     }
 
@@ -390,8 +389,11 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
         }
     }
 
-    /** One connector, {@code pg}, registered as the artifact {@code h1}, whose bytes it can or cannot produce. */
+    /** One connector, {@code pg}, registered by its bytes' hash, whose bytes it can or cannot produce. */
     private static final class Registry implements ConnectorRegistry {
+
+        private static final byte[] BYTES = {1, 2, 3};
+        private static final String CONTENT_HASH = ContentHash.of(BYTES);
 
         private final boolean hasBytes;
 
@@ -407,17 +409,17 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
 
         @Override
         public List<ConnectorRegistration> list() {
-            return List.of(new ConnectorRegistration("pg", "h1", "1.0", RegistrationSource.SEED));
+            return List.of(new ConnectorRegistration("pg", CONTENT_HASH, "1.0", RegistrationSource.SEED));
         }
 
         @Override
         public Optional<byte[]> artifact(String contentHash) {
-            return hasBytes && "h1".equals(contentHash) ? Optional.of(new byte[] {1, 2, 3}) : Optional.empty();
+            return hasBytes && CONTENT_HASH.equals(contentHash) ? Optional.of(BYTES.clone()) : Optional.empty();
         }
 
         @Override
         public boolean hasArtifact(String contentHash) {
-            return hasBytes && "h1".equals(contentHash);
+            return hasBytes && CONTENT_HASH.equals(contentHash);
         }
     }
 }
