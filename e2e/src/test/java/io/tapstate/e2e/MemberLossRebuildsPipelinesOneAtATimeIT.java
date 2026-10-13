@@ -135,6 +135,8 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
                             .map(ClusterClaimView.Member::nodeId)).contains(victim);
                 }
                 List<String> survivors = NODES.stream().filter(node -> !node.equals(victim)).toList();
+                List<Lane> survivingReaders = LANES.stream()
+                        .filter(lane -> !first.captureOwnersOf(lane.pipeline()).containsValue(victim)).toList();
                 ControlPlane surviving = cluster.member(survivors.getFirst());
                 Map<String, Long> writtenBefore = writtenRows(writes);
                 int readsBeforeLoss = lines(reads).size();
@@ -153,6 +155,17 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
                                 return trace.inserted.size() == LANES.size();
                             }, () -> trace.description() + "; queue=" + surviving.clusterRecovery());
                     assertThat(queueDocuments(store, cluster.clusterId())).hasSize(LANES.size());
+                    // Until its authorization ends, the part of an old execution left on the survivors
+                    // may still read and acknowledge. A row its reader still sees is committed there and
+                    // the replacement starts past it, with nothing new left to deliver. Add the rows
+                    // only after every old reader on a surviving member has returned.
+                    for (Lane lane : survivingReaders) {
+                        Await.until("the old reader of " + lane.pipeline() + " on a surviving member to return", BOUND,
+                                () -> {
+                                    trace.drain(changes);
+                                    return returned(reads, lane, readsBeforeLoss);
+                                }, () -> trace.description() + "; reader events=" + lines(reads).size());
+                    }
 
                     // These rows are new after the failure; no lifecycle command asks a pipeline to recover.
                     for (Lane lane : LANES) {
@@ -543,6 +556,11 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
 
     private static boolean delivered(Path reads, Lane lane, String token) {
         return observed(reads, lane, "DELIVERY", token, 0);
+    }
+
+    private static boolean returned(Path reads, Lane lane, int from) {
+        return lines(reads).stream().skip(from).filter(line -> line.startsWith("END\t")).map(line -> line.split("\t", 2))
+                .anyMatch(fields -> fields.length == 2 && Set.of(fields[1].split(",")).equals(Set.copyOf(lane.tables())));
     }
 
     private static boolean observed(Path reads, Lane lane, String event, String token, int from) {
