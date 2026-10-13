@@ -210,7 +210,10 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
                                 .containsExactly(originalCaptures.get(lane.pipeline()));
                         ClusterProjectionAssertions.assertQueueProjection(item, trace.latest.get(lane.pipeline()), store);
                         assertPreparedTables(trace.latest.get(lane.pipeline()), lane);
-                        Map<String, Confirmed> after = awaitFloors(surviving, store, lane, reads);
+                        // Until the replacement's sink ack is durable the store still names the floor
+                        // from before the loss; only a floor past it can be compared with the new capture.
+                        Map<String, Confirmed> after = awaitFloors(surviving, store, lane, reads, lane.tables(),
+                                originalFloors.get(lane.pipeline()));
                         assertCaptureCovers(store, lane, after, reads);
                         for (String table : lane.tables()) {
                             Confirmed old = originalFloors.get(lane.pipeline()).get(table);
