@@ -98,14 +98,15 @@ async function proof(base, minimumReports = 1) {
   throw new Error('no fresh status report');
 }
 
-async function web(base, metadata) {
+export async function web(base, metadata) {
   stage = 'Web entry bytes';
-  const root = await request(base, '/');
+  const navigation = { headers: { Accept: 'text/html' } };
+  const root = await request(base, '/', navigation);
   assert.equal(root.status, 200);
   const html = await root.text();
   assert.equal(sha(html), metadata.webFiles['index.html']);
   for (const path of ['/login', '/pipelines/runtime-image-smoke/edit']) {
-    const page = await request(base, path);
+    const page = await request(base, path, navigation);
     assert.equal(page.status, 200);
     assert.equal(sha(await page.text()), metadata.webFiles['index.html']);
   }
