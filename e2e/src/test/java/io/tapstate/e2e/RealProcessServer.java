@@ -252,6 +252,7 @@ final class RealProcessServer implements ServerHandle {
      * why the server did not come up is the thing a reader needs.
      */
     private static RealProcessServer healthy(RealProcessServer server) {
+        ClusterFixtureTiming.phase(server.process, ClusterFixtureTiming.Phase.HEALTH_BEGIN);
         server.observe(ClusterLifecycleProbe.Phase.HEALTH_STARTED);
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
@@ -264,6 +265,7 @@ final class RealProcessServer implements ServerHandle {
             throw e;
         }
         server.observe(ClusterLifecycleProbe.Phase.HEALTH_PASSED);
+        ClusterFixtureTiming.phase(server.process, ClusterFixtureTiming.Phase.HEALTH_RETURNED);
         return server;
     }
 
@@ -284,7 +286,9 @@ final class RealProcessServer implements ServerHandle {
     private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
+        long fixturePreparation = ClusterFixtureTiming.beginPreparation();
         int port = freePort();
+        ClusterFixtureTiming.bind(fixturePreparation, port);
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
@@ -351,6 +355,7 @@ final class RealProcessServer implements ServerHandle {
             this.lifecycle = ClusterLifecycleProbe.facts(httpPort, workingDirectory, output, stagingDirectory,
                     storeUri, operatorStateDatabase, listenAddress, this.jvmOptions, this.extraArguments);
             ClusterLifecycleProbe.record(ClusterLifecycleProbe.Phase.PREPARED, lifecycle, -1);
+            ClusterFixtureTiming.prepared(httpPort, storeUri, operatorStateDatabase, listenAddress, this.jvmOptions, this.extraArguments);
         }
 
         synchronized RealProcessServer launch() {
@@ -361,6 +366,7 @@ final class RealProcessServer implements ServerHandle {
             try {
                 unhandedProcess = RealProcessServer.launch(jar, jvmOptions, httpPort, listenAddress,
                         storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments);
+                ClusterFixtureTiming.spawned(httpPort, unhandedProcess);
                 RealProcessServer server = new RealProcessServer(
                         unhandedProcess, baseUrl, output, stagingDirectory, ownsStagingDirectory);
                 server.lifecycle = lifecycle;
@@ -508,6 +514,7 @@ final class RealProcessServer implements ServerHandle {
 
     /** Waits for all startup runners, not merely the earlier Tomcat health response. */
     void awaitReady() {
+        ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.READY_BEGIN);
         observe(ClusterLifecycleProbe.Phase.READY_STARTED);
         ControlPlane control = new ControlPlane(baseUrl);
         Await.until("the process to complete application startup", STARTUP_BUDGET, () -> {
@@ -521,6 +528,7 @@ final class RealProcessServer implements ServerHandle {
                 throw new UncheckedIOException("could not read application readiness", failure);
             }
         }, this::tail);
+        ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.READY_RETURNED);
         observe(ClusterLifecycleProbe.Phase.READY_PASSED);
     }
 
@@ -552,6 +560,7 @@ final class RealProcessServer implements ServerHandle {
         closeRequested = true;
         process.destroy();
         observe(ClusterLifecycleProbe.Phase.QUIT_REQUESTED);
+        ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.QUIT_RETURNED);
     }
 
     /** Confirms exit under the original grace and forced-exit budgets before discarding staging. */
@@ -565,6 +574,7 @@ final class RealProcessServer implements ServerHandle {
         }
         InterruptedException interrupted = null;
         try {
+            ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.GRACE_BEGIN);
             boolean exited = !process.isAlive();
             long remainingGrace = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - requestedAt);
             if (!exited && remainingGrace > 0) {
@@ -574,9 +584,11 @@ final class RealProcessServer implements ServerHandle {
                     interrupted = failure;
                 }
             }
+            ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.GRACE_RETURNED);
             if (!exited) {
                 process.destroyForcibly();
                 observe(ClusterLifecycleProbe.Phase.FORCE_REQUESTED);
+                ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.FORCE_RETURNED);
                 long forcedAt = System.nanoTime();
                 while (!exited) {
                     long remaining = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - forcedAt);
@@ -595,6 +607,7 @@ final class RealProcessServer implements ServerHandle {
                         + tail(), interrupted);
             }
             observe(ClusterLifecycleProbe.Phase.EXIT_CONFIRMED);
+            ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.EXIT_CONFIRMED);
             AssertionError interruptedFailure = interrupted == null ? null : new AssertionError(
                     "interrupted while waiting for the server to close; its exit was confirmed", interrupted);
             try {
@@ -605,6 +618,7 @@ final class RealProcessServer implements ServerHandle {
             }
             if (interruptedFailure != null) throw interruptedFailure;
         } finally {
+            if (interrupted != null) ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.INTERRUPTED);
             if (interrupted != null) Thread.currentThread().interrupt();
         }
     }
@@ -646,6 +660,7 @@ final class RealProcessServer implements ServerHandle {
         // to set differently is a parameter above instead of an argument here.
         command.addAll(extraArguments);
         try {
+            ClusterFixtureTiming.spawnBegin(port);
             releaseLaunchPorts(port, extraArguments);
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())
