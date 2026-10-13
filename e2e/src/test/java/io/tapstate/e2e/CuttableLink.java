@@ -153,23 +153,29 @@ final class CuttableLink implements AutoCloseable {
                 // Closing a listener that is already gone is not a failure.
             }
         }
-        // A blocked accept can retain the socket after close returns. Wait for it to release the port.
-        Thread accepting = acceptThread;
-        if (accepting != null) {
-            try {
-                if (!accepting.join(Duration.ofSeconds(10))) {
-                    throw new AssertionError("the cuttable link listener did not stop on " + address());
+        try {
+            // A blocked accept can retain the socket after close returns. Keep the original join budget.
+            Thread accepting = acceptThread;
+            if (accepting != null) {
+                try {
+                    if (!accepting.join(Duration.ofSeconds(10))) {
+                        throw new AssertionError("the cuttable link listener did not stop on " + address());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while closing the cuttable link on " + address(), e);
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted while closing the cuttable link on " + address(), e);
+            }
+        } finally {
+            // A failed join must still close owned relays, including a concurrent accepted connection.
+            synchronized (live) {
+                for (Held held : live) {
+                    closeQuietly(held.inbound());
+                    closeQuietly(held.outbound());
+                }
+                live.clear();
             }
         }
-        for (Held held : live) {
-            closeQuietly(held.inbound());
-            closeQuietly(held.outbound());
-        }
-        live.clear();
     }
 
     private void listen() {
@@ -207,9 +213,17 @@ final class CuttableLink implements AutoCloseable {
             carriedFrom.computeIfAbsent(dialler, unknown -> new AtomicInteger()).incrementAndGet();
             try {
                 Socket outbound = new Socket(targetHost, targetPort);
-                live.add(new Held(inbound, outbound, dialler));
-                pump(inbound, outbound);
-                pump(outbound, inbound);
+                synchronized (live) {
+                    // Closing may have finished while the owned outbound connection was opening.
+                    if (closed) {
+                        closeQuietly(inbound);
+                        closeQuietly(outbound);
+                        return;
+                    }
+                    live.add(new Held(inbound, outbound, dialler));
+                    pump(inbound, outbound);
+                    pump(outbound, inbound);
+                }
             } catch (IOException unreachable) {
                 closeQuietly(inbound);
             }
