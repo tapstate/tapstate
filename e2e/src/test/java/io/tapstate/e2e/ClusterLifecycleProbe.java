@@ -14,10 +14,12 @@ final class ClusterLifecycleProbe {
     enum Phase { PREPARED, LAUNCHED, HEALTH_STARTED, HEALTH_PASSED, READY_STARTED, READY_PASSED,
         QUIT_REQUESTED, FORCE_REQUESTED, EXIT_CONFIRMED }
 
-    record Event(Phase phase, String launch, String cluster, String node, int httpPort, int memberPort,
+    record Event(Phase phase, String launch, String cluster, String node,
+            int httpPort, int memberPort, int ownedLinkPort,
             long pid, String work, String output, String staging, String parameters) { }
 
-    record Facts(Scope owner, String launch, String cluster, String node, int httpPort, int memberPort,
+    record Facts(Scope owner, String launch, String cluster, String node,
+            int httpPort, int memberPort, int ownedLinkPort,
             String work, String output, String staging, String parameters) { }
 
     private static final ThreadLocal<Scope> ACTIVE = new ThreadLocal<>();
@@ -41,8 +43,12 @@ final class ClusterLifecycleProbe {
             String cluster = setting(extraArguments, "--tapstate.cluster.id=");
             String node = setting(extraArguments, "--tapstate.cluster.node-id=");
             String member = setting(extraArguments, "--tapstate.hz.member-port=");
+            String link = setting(extraArguments, "--tapstate.hz.advertised-member-address=");
+            // Only the owned link's numeric port leaves this setting, never its address.
             return new Facts(scope, UUID.randomUUID().toString(), hash(cluster), node, httpPort,
-                    member.isEmpty() ? -1 : Integer.parseInt(member), pathHash(work), pathHash(output),
+                    member.isEmpty() ? -1 : Integer.parseInt(member),
+                    ownedLinkPort(link),
+                    pathHash(work), pathHash(output),
                     pathHash(staging), hash(parameters));
         } catch (RuntimeException | Error failure) {
             scope.failed(failure);
@@ -57,8 +63,9 @@ final class ClusterLifecycleProbe {
             facts.owner().failed(new IllegalStateException("fixture events left their owning probe scope"));
             return;
         }
-        Event event = new Event(phase, facts.launch(), facts.cluster(), facts.node(), facts.httpPort(),
-                facts.memberPort(), pid, facts.work(), facts.output(), facts.staging(), facts.parameters());
+        Event event = new Event(phase, facts.launch(), facts.cluster(), facts.node(),
+                facts.httpPort(), facts.memberPort(), facts.ownedLinkPort(), pid, facts.work(), facts.output(),
+                facts.staging(), facts.parameters());
         try { active.listener.accept(event); }
         catch (RuntimeException | Error failure) { active.failed(failure); }
     }
@@ -74,6 +81,18 @@ final class ClusterLifecycleProbe {
     private static String setting(List<String> arguments, String prefix) {
         return arguments.stream().filter(argument -> argument.startsWith(prefix))
                 .map(argument -> argument.substring(prefix.length())).findFirst().orElse("");
+    }
+
+    private static int ownedLinkPort(String advertised) {
+        if (advertised.isEmpty()) return -1;
+        try {
+            int port = Integer.parseInt(advertised.substring(advertised.lastIndexOf(':') + 1));
+            if (port < 1 || port > 65535) throw new NumberFormatException();
+            return port;
+        } catch (NumberFormatException failure) {
+            // This observation failure must not retain a raw command parameter in its cause.
+            throw new IllegalArgumentException("the fixture link port is not observable");
+        }
     }
 
     private static String hash(List<String> values) {
