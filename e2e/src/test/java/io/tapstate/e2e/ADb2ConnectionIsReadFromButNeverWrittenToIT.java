@@ -1,10 +1,16 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.testsupport.DockerGate;
 
+import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -98,6 +104,46 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
+    }
+
+    @Test
+    void aStoredWritableDb2RowFromAnEarlierReleaseCannotEnableASyncTarget() throws Exception {
+        String database = "e2e_db2_catalog_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String storeUri = SharedMongo.replicaSetUrl(database);
+        // Seed the persisted shape directly: the running release must not derive the legacy fixture.
+        try (var resource = TapstateCatalog.class.getResourceAsStream("/catalog/db2.json");
+                var client = MongoClients.create(storeUri)) {
+            Document legacy = Document.parse(new String(resource.readAllBytes(), StandardCharsets.UTF_8));
+            legacy.put("_id", "db2");
+            legacy.put("sink", new Document("capable", true)
+                    .append("writeSemantics", List.of("upsert", "append")));
+            client.getDatabase(database).getCollection(MongoStorePort.CONNECTOR_CATALOG).insertOne(legacy);
+        }
+
+        try (ServerHandle server = InProcessServer.start(storeUri)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+            control.apply(Map.of(
+                    "src_db2.tap.yml", DB2_SOURCE,
+                    "tgt_mongo.tap.yml", MONGO_TARGET,
+                    "orders_from_db2.tap.yml", READ_FROM_DB2));
+            assertThat(control.artifactIds()).contains("orders_from_db2", "src_db2", "tgt_mongo");
+
+            ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
+                    "src_orders.tap.yml", MYSQL_SOURCE,
+                    "tgt_db2.tap.yml", DB2_TARGET,
+                    "orders_into_db2.tap.yml", WRITE_INTO_DB2));
+
+            assertThat(refusal.code()).isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(refusal.params()).containsEntry("connector", "db2").containsEntry("source", "tgt_db2");
+            assertThat(control.artifactIds()).doesNotContain("orders_into_db2", "tgt_db2", "src_orders");
+            // Reading current support policy must not rewrite the stored document or require re-registration.
+            try (var client = MongoClients.create(storeUri)) {
+                Document persisted = client.getDatabase(database).getCollection(MongoStorePort.CONNECTOR_CATALOG)
+                        .find(new Document("_id", "db2")).first();
+                assertThat(persisted.get("sink", Document.class).getBoolean("capable")).isTrue();
+            }
+        }
     }
 
     @Test
