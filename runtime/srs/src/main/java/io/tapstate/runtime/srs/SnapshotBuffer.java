@@ -77,7 +77,7 @@ public final class SnapshotBuffer {
 
     private final ConcurrentMap<BufferKey, Queue<Envelope>> byConsumerRing = new ConcurrentHashMap<>();
 
-    /** The loads declared on this member, by the same coordinate as the rows they hand over. */
+    /** Live hand-offs, including bounded tails with no declared load, by their row coordinates. */
     private final ConcurrentMap<BufferKey, Handoff> handoffs = new ConcurrentHashMap<>();
 
     public SnapshotBuffer() {
@@ -153,6 +153,28 @@ public final class SnapshotBuffer {
     }
 
     /**
+     * Binds a capture callback to the current lifetime of this coordinate. A callback resumed after
+     * {@link #release} discards its row instead of creating an undeclared queue or writing into a later
+     * run's load. A coordinate with no declared snapshot is bounded by the same capacity.
+     */
+    public CaptureHandoff handoff(String pipelineId, String ringName) {
+        BufferKey key = new BufferKey(pipelineId, ringName);
+        Handoff handoff = handoffs.computeIfAbsent(key, coordinate -> new Handoff(false, queued(coordinate)));
+        return new CaptureHandoff() {
+            @Override
+            public void accept(Envelope row) {
+                Objects.requireNonNull(row, "row");
+                handoff.append(() -> queueOf(key).add(row), capacity, true);
+            }
+
+            @Override
+            public void loaded(String table) {
+                handoff.end();
+            }
+        };
+    }
+
+    /**
      * Removes and returns the rows currently buffered for this pipeline and {@code ringName} in append order,
      * or an empty list when none are waiting. Concurrent appends remain for a later drain; every row is
      * consumed once by the pipeline it belongs to.
@@ -186,7 +208,6 @@ public final class SnapshotBuffer {
      */
     public void release(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        byConsumerRing.keySet().removeIf(key -> key.pipelineId().equals(pipelineId));
         handoffs.entrySet().removeIf(entry -> {
             if (!entry.getKey().pipelineId().equals(pipelineId)) {
                 return false;
@@ -194,6 +215,8 @@ public final class SnapshotBuffer {
             entry.getValue().release();
             return true;
         });
+        // Invalidate callbacks under the same lock as enqueue before removing their queues.
+        byConsumerRing.keySet().removeIf(key -> key.pipelineId().equals(pipelineId));
     }
 
     private Queue<Envelope> queueOf(BufferKey key) {
@@ -224,7 +247,8 @@ public final class SnapshotBuffer {
     /**
      * One bounded channel and its optional load. Total occupancy bounds every append; the load's own
      * pending rows separately determine whether it was begun or handed over. Those rows precede changes
-     * appended after the load ended, so a drain takes the load's rows first.
+     * appended after the load ended, so a drain takes the load's rows first. A capture callback that
+     * resumes after release discards its row.
      */
     private static final class Handoff {
 
@@ -244,8 +268,15 @@ public final class SnapshotBuffer {
         }
 
         void append(Runnable enqueue, int capacity) {
+            append(enqueue, capacity, false);
+        }
+
+        void append(Runnable enqueue, int capacity, boolean discardAfterRelease) {
             lock.lock();
             try {
+                if (discardAfterRelease && released) {
+                    return;
+                }
                 while (!released && queued >= capacity) {
                     room.await();
                 }
