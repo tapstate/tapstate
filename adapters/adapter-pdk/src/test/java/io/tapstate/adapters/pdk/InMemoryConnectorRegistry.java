@@ -70,4 +70,9 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
         registrations.add(new ConnectorRegistration(
                 connectorId, contentHash, pdkApiVersion, RegistrationSource.REGISTER));
     }
+
+    /** Changes stored bytes without changing their registration, modeling a damaged artifact store. */
+    void replaceArtifact(String contentHash, byte[] artifact) {
+        bytesByHash.put(contentHash, artifact.clone());
+    }
 }

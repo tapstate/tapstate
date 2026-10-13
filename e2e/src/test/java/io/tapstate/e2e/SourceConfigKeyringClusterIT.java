@@ -21,6 +21,8 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.util.List;
@@ -39,6 +41,68 @@ class SourceConfigKeyringClusterIT {
     private static final DslParser PARSER = new DslParser();
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final String JOINING = "node-c";
+
+    @Test
+    void threeAckWriteConflictsDoNotFenceARealMemberOrStopItsRenewals() {
+        String name = databaseName("keyring_ack_conflicts");
+        String application = "ack-conflicts-" + UUID.randomUUID();
+        // A private replica set keeps the server failpoint away from every other E2E witness.
+        try (MongoDBContainer mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                .withCommand("--replSet", "docker-rs", "--bind_ip_all",
+                        "--setParameter", "enableTestCommands=1")) {
+            mongo.start();
+            String uri = mongo.getReplicaSetUrl(name);
+            String memberUri = uri + (uri.contains("?") ? "&" : "?") + "appName=" + application;
+            try (MongoClient raw = MongoClients.create(uri);
+                    TwoMemberCluster cluster = TwoMemberCluster.start(memberUri, "keyring-ack-conflicts", LEASE)) {
+                MongoDatabase database = raw.getDatabase(name);
+                String clusterId = cluster.first().clusterId();
+                assertThat(cluster.awaitBothMembers()).hasSize(2);
+                awaitAcknowledgements(database, clusterId, 1, TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+                Resource readable = source("survives_ack_conflict", "ack-conflict-whole-config-sentinel");
+                cluster.first().apply(Map.of("ack.tap.yml", WRITER.write(readable)));
+                Document owner = liveClaim(database, clusterId, TwoMemberCluster.NODE_A);
+                assertThat(owner).isNotNull();
+                MongoDatabase admin = raw.getDatabase("admin");
+                // Match this boot's complete driver application name: three failures split between
+                // members would not discriminate the old three-attempt limit. An idle member's
+                // update is its ACK fence; lease and ACK ownership writes use findAndModify.
+                Document armed = admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 3))
+                        .append("data", new Document("failCommands", List.of("update"))
+                                .append("appName", application + " "
+                                        + MongoConnection.processTag(owner.getString("ownerBootId")))
+                                .append("errorCode", 112)
+                                .append("errorLabels", List.of("TransientTransactionError"))));
+                long entered = armed.get("count", Number.class).longValue();
+                try {
+                    admin.runCommand(new Document("waitForFailPoint", "failCommand")
+                            .append("timesEntered", entered + 3).append("maxTimeMS", WAIT.toMillis()));
+                    Document afterConflicts = acknowledgement(database, clusterId, TwoMemberCluster.NODE_A);
+                    assertThat(afterConflicts).isNotNull();
+                    // Read the baseline after all three injected conflicts, so an ACK published
+                    // between arming the failpoint and its first error cannot satisfy the witness.
+                    Await.until("the real member to keep acknowledging after three write conflicts", WAIT, () -> {
+                        assertThat(cluster.first().clusterMembers()).hasSize(2);
+                        Document ack = liveAcknowledgement(database, clusterId, TwoMemberCluster.NODE_A, 1);
+                        return ack != null && ack.getDate("leaseUntil")
+                                .after(afterConflicts.getDate("leaseUntil"));
+                    }, () -> "the original member has not published a later live acknowledgement");
+                    Document renewed = liveClaim(database, clusterId, TwoMemberCluster.NODE_A);
+                    assertThat(renewed).isNotNull();
+                    assertThat(renewed.getString("ownerBootId")).isEqualTo(owner.getString("ownerBootId"));
+                    assertThat(renewed.get("claimGeneration")).isEqualTo(owner.get("claimGeneration"));
+                    assertThat(cluster.processCarrying(TwoMemberCluster.NODE_A).isAlive()).isTrue();
+                    assertSource(database, cluster.first(), readable, keyring(database).getString("activeKeyId"));
+                } finally {
+                    Document disabled = admin.runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", "off"));
+                    assertThat(disabled.get("count", Number.class).longValue() - entered)
+                            .as("all three server-side ACK write conflicts were consumed").isEqualTo(3);
+                }
+            }
+        }
+    }
 
     @Test
     void concurrentFirstBootAndWholeClusterRestartKeepOneKeyringAndReadableSources() {

@@ -29,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 /** Bootstraps, refreshes and rotates the Cluster keyring stored beside encrypted Source configs. */
 public final class SourceConfigKeyringStore {
@@ -37,6 +38,7 @@ public final class SourceConfigKeyringStore {
     private static final int FORMAT_VERSION = 1;
     private static final int KEY_BYTES = 32;
     private static final String ACK_KIND = "source-config-keyring-node";
+    private static final Duration ACK_CONFLICT_RETRY_WINDOW = Duration.ofSeconds(2);
     private static final TransactionOptions ACK_TRANSACTION = TransactionOptions.builder()
             .readPreference(ReadPreference.primary())
             .readConcern(ReadConcern.SNAPSHOT)
@@ -431,31 +433,32 @@ public final class SourceConfigKeyringStore {
         if (epoch < 1 || ttl.toMillis() < 1) throw new IllegalArgumentException("invalid keyring lease");
         if (client == null) throw new IllegalStateException("keyring acknowledgement needs the owning store client");
         return StoreIo.call(() -> {
-            Duration retryWindow = ttl.compareTo(Duration.ofSeconds(2)) < 0
-                    ? ttl.dividedBy(4) : Duration.ofMillis(500);
             long started = System.nanoTime();
-            long windowNanos = retryWindow.toNanos();
-            for (int attempt = 0; ; attempt++) {
+            int conflicts = 0;
+            while (true) {
                 try {
                     return acknowledgeOnce(session, epoch, ttl);
                 } catch (MongoException error) {
-                    long remaining = windowNanos - (System.nanoTime() - started);
-                    if (remaining <= 0 || !error.hasErrorLabel("TransientTransactionError")
-                            || error.hasErrorLabel("UnknownTransactionCommitResult")
-                            || Thread.currentThread().isInterrupted()) throw error;
-                    // Give a competing transaction time to commit without extending any lease.
-                    long delay = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
-                            Math.min(50L, 5L << Math.min(attempt, 4)));
-                    try {
-                        java.util.concurrent.TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw error;
-                    }
-                    if (System.nanoTime() - started >= windowNanos) throw error;
+                    awaitAcknowledgementRetry(error, started, conflicts++);
                 }
             }
         });
+    }
+
+    private static void awaitAcknowledgementRetry(MongoException error, long started, int conflicts) {
+        if (!error.hasErrorLabel("TransientTransactionError")
+                || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
+        // Every live node touches the same keyring fence. Immediate retries can lose
+        // repeatedly to another node's transaction during a join or renewal.
+        long remaining = ACK_CONFLICT_RETRY_WINDOW.toNanos() - (System.nanoTime() - started);
+        if (remaining <= 0 || Thread.currentThread().isInterrupted()) throw error;
+        long delay = TimeUnit.MILLISECONDS.toNanos(Math.min(50L, 5L << Math.min(conflicts, 4)));
+        try {
+            TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw error;
+        }
     }
 
     private boolean acknowledgeOnce(WorkloadClaim node, long epoch, Duration ttl) {
