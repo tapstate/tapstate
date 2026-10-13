@@ -281,6 +281,16 @@ class CloudExternalConfigStartupIT {
                 assertThat(cloudRequests.get()).isZero();
                 gate.release();
                 running.awaitReady();
+                // Keep the original launch-to-readiness bound; later C2 and database observations
+                // have their own bounds and must not retroactively make a healthy startup late.
+                Duration readyElapsed = Duration.ofNanos(System.nanoTime() - started);
+                System.out.println("Delayed hello " + distribution + " Ready after "
+                        + readyElapsed);
+                assertThat(readyElapsed)
+                        .withFailMessage("Packaged %s startup took %s before Ready and HTTP health; "
+                                        + "expected less than 90 seconds. Child output:%n%s",
+                                distribution, readyElapsed, running.safeOutput())
+                        .isLessThan(Duration.ofSeconds(90));
                 assertVersion(running);
                 if (distribution == Distribution.CLOUD) awaitStatusReport(0, running);
                 else assertThat(cloudRequests.get()).isZero();
@@ -293,7 +303,8 @@ class CloudExternalConfigStartupIT {
                     else assertDefaultOnPremSource(raw.getDatabase(database));
                 }
                 assertSafeOutput(running, uri);
-                assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(90));
+                System.out.println("Delayed hello " + distribution + " observations complete after "
+                        + Duration.ofNanos(System.nanoTime() - started));
             } finally {
                 running.close();
             }

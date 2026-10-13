@@ -49,10 +49,10 @@ public final class OfficialConnectors {
      * The supported ids this release accepts in the source role only.
      *
      * <p>Being listed here is a support boundary, not a statement about the connector: its jar may well
-     * implement writes. The catalog merge records such a connector as no sink at all, and that is the
-     * one place it is applied, because both catalog paths come through that merge - the bundled row and
-     * the row a runtime registration derives from the jar. The server's target check and the API
-     * listings read the sink off the row, so none of them needs to know this list exists.
+     * implement writes. The same sink rule applies when catalog rows are derived and when previously
+     * stored rows are read, so an earlier release's row cannot restore the write role after an upgrade.
+     * The server's target check and the API listings read the sink off the row, so none of them needs
+     * to know this list exists.
      */
     public static final List<String> SOURCE_ONLY_IDS = List.of("db2");
 

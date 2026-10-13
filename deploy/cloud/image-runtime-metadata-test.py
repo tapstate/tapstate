@@ -51,15 +51,18 @@ class MetadataTest(unittest.TestCase):
                   "io.tapstate.web.revision": props["revision"],
                   "io.tapstate.web.files.sha256": props["files.sha256"],
                   "io.tapstate.web.profile": profile, "io.tapstate.distribution": profile}
-        env = []
+        env = ["PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
         if profile == "cloud":
             labels["io.tapstate.web.cloud-console-url"] = props["cloud.console.url"]
-            env = ["TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors"]
+            env.extend(["LD_PRELOAD=libstdc++.so.6",
+                        "TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors"])
         image = self.root / f"{profile}-image.json"
         image.write_text(json.dumps([{"Id": "sha256:" + ("c" if profile == "cloud" else "d") * 64,
-                                     "Config": {"Labels": labels, "Env": env, "User": "tapstate",
+                                     "Config": {"Labels": labels, "Env": env,
+                                                "User": "root" if profile == "cloud" else "tapstate",
                                                 "Entrypoint": ["java", "-jar", "/opt/tapstate/tapstate.jar"],
-                                                "Healthcheck": {"Test": ["CMD-SHELL", "curl"]}}}]))
+                                                "Healthcheck": {"Test": ["CMD-SHELL",
+                                                   "curl -fsS http://127.0.0.1:8080/healthz || exit 1"]}}}]))
         return jar, image
 
     def test_the_distinct_pair_is_bound_to_the_packaged_files(self):
@@ -71,6 +74,55 @@ class MetadataTest(unittest.TestCase):
     def test_crossed_web_profile_is_rejected(self):
         with self.assertRaises(ValueError):
             SUBJECT.metadata(*self.inputs("cloud"), "onprem", self.lock)
+
+    def test_cloud_requires_an_explicit_root_user(self):
+        for user in ["tapstate", "10001", "", None]:
+            with self.subTest(user=user):
+                jar, path = self.inputs("cloud")
+                image = json.loads(path.read_text())
+                if user is None:
+                    image[0]["Config"].pop("User")
+                else:
+                    image[0]["Config"]["User"] = user
+                path.write_text(json.dumps(image))
+                with self.assertRaisesRegex(ValueError, "Cloud runtime image must retain its root user"):
+                    SUBJECT.metadata(jar, path, "cloud", self.lock)
+
+    def test_cloud_accepts_explicit_root_forms(self):
+        for user in ["root", "0", "root:root", "0:0"]:
+            with self.subTest(user=user):
+                jar, path = self.inputs("cloud")
+                image = json.loads(path.read_text())
+                image[0]["Config"]["User"] = user
+                path.write_text(json.dumps(image))
+                self.assertEqual(SUBJECT.metadata(jar, path, "cloud", self.lock)["webProfile"], "cloud")
+
+    def test_onprem_retains_its_unprivileged_user(self):
+        for user in ["root", "0", "10001", "", None]:
+            with self.subTest(user=user):
+                jar, path = self.inputs("onprem")
+                image = json.loads(path.read_text())
+                if user is None:
+                    image[0]["Config"].pop("User")
+                else:
+                    image[0]["Config"]["User"] = user
+                path.write_text(json.dumps(image))
+                with self.assertRaisesRegex(ValueError, "on-prem runtime image must retain its unprivileged user"):
+                    SUBJECT.metadata(jar, path, "onprem", self.lock)
+
+    def test_both_profiles_require_an_enabled_healthcheck(self):
+        for profile in ["cloud", "onprem"]:
+            for healthcheck in [None, {}, {"Test": []}, {"Test": ["NONE"]}, {"Test": ["CMD-SHELL", ""]}]:
+                with self.subTest(profile=profile, healthcheck=healthcheck):
+                    jar, path = self.inputs(profile)
+                    image = json.loads(path.read_text())
+                    if healthcheck is None:
+                        image[0]["Config"].pop("Healthcheck")
+                    else:
+                        image[0]["Config"]["Healthcheck"] = healthcheck
+                    path.write_text(json.dumps(image))
+                    with self.assertRaisesRegex(ValueError, "runtime image must retain its enabled healthcheck"):
+                        SUBJECT.metadata(jar, path, profile, self.lock)
 
     def test_bad_image_labels_and_entrypoint_are_rejected(self):
         for change in ["profile", "entrypoint", "deployment-secret", "seed", "healthcheck"]:
