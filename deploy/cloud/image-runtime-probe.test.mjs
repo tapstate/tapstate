@@ -1,8 +1,38 @@
 import assert from 'node:assert/strict';
-import { createPublicKey, verify } from 'node:crypto';
+import { createHash, createPublicKey, verify } from 'node:crypto';
 import { createServer } from 'node:http';
 import test from 'node:test';
-import { CLUSTER, CODE, TOKEN, createWireFixture } from './image-runtime-probe.mjs';
+import { CLUSTER, CODE, TOKEN, createWireFixture, web } from './image-runtime-probe.mjs';
+
+test('the Web probe requests HTML documents while preserving asset and API dispatch', async (t) => {
+  const html = '<html><script src="/assets/runtime.js"></script></html>';
+  const asset = 'export const runtime = true;';
+  const documents = ['/', '/login', '/pipelines/runtime-image-smoke/edit'];
+  const observed = [];
+  const server = createServer((req, res) => {
+    observed.push([req.url, req.headers.accept]);
+    if (documents.includes(req.url) && req.headers.accept === 'text/html') {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      return res.end(html);
+    }
+    if (req.url === '/assets/runtime.js') {
+      res.writeHead(200, { 'Content-Type': 'application/javascript' });
+      return res.end(asset);
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end('{"code":"not-found"}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  await web(`http://127.0.0.1:${server.address().port}`, {
+    webFiles: { 'index.html': sha(html), 'assets/runtime.js': sha(asset) },
+  });
+  assert.deepEqual(observed, [
+    ...documents.map((path) => [path, 'text/html']),
+    ['/assets/runtime.js', '*/*'], ['/api/runtime-image-smoke-missing', '*/*'],
+  ]);
+});
 
 async function fixture(t) {
   const peer = createWireFixture({ issuer: 'http://gateway:3000', version: '0.6.0' });
