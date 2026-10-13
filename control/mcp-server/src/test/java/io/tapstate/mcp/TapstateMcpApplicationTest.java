@@ -1,9 +1,11 @@
 package io.tapstate.mcp;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.ConfigurableApplicationContext;
 
+import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
 
@@ -12,9 +14,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TapstateMcpApplicationTest {
 
     private static final String STDIO_PROPERTY = "spring.ai.mcp.server.stdio";
+    private InputStream processInput;
+
+    @BeforeEach
+    void isolateStdioInput() {
+        processInput = System.in;
+        // The SDK still creates its fallback stdio transport when stdio=false. In-process contexts
+        // must see EOF on their own input instead of consuming Surefire's command and exit frames.
+        System.setIn(InputStream.nullInputStream());
+    }
 
     @AfterEach
     void clearProcessProperties() {
+        System.setIn(processInput);
         System.clearProperty(TapstateMcpApplication.AOT_PROCESSING_PROPERTY);
         System.clearProperty(TapstateMcpApplication.LOGBACK_STATUS_LISTENER_PROPERTY);
         System.clearProperty(STDIO_PROPERTY);
