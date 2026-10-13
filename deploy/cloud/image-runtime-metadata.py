@@ -28,8 +28,18 @@ def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict
     PROVENANCE.validate_image_labels(props, config["Labels"], profile)
     if config.get("Entrypoint") != ["java", "-jar", "/opt/tapstate/tapstate.jar"]:
         raise ValueError("runtime smoke must execute the actual JVM entrypoint")
-    if config.get("User") != "tapstate" or not config.get("Healthcheck", {}).get("Test"):
-        raise ValueError("runtime image must retain its unprivileged user and healthcheck")
+    user = config.get("User")
+    if profile == "cloud":
+        if user not in ["root", "0", "root:root", "0:0"]:
+            raise ValueError("Cloud runtime image must retain its root user")
+    elif user != "tapstate":
+        raise ValueError("on-prem runtime image must retain its unprivileged user")
+    healthcheck = config.get("Healthcheck")
+    command = healthcheck.get("Test") if isinstance(healthcheck, dict) else None
+    if (not isinstance(command, list) or len(command) < 2
+            or command[0] not in ["CMD", "CMD-SHELL"]
+            or any(not isinstance(part, str) or not part.strip() for part in command[1:])):
+        raise ValueError("runtime image must retain its enabled healthcheck")
     environment = dict(item.split("=", 1) for item in config.get("Env", []))
     if any(key in environment for key in ["TAPSTATE_CLOUD_BASE_URL", "TAPSTATE_CLOUD_TOKEN",
                                          "TAPSTATE_CLOUD_ATLAS_URI", "TAPSTATE_CLOUD_CLUSTER_ID", "CLUSTER_ID"]):
