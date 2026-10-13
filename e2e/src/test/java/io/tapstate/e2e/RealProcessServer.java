@@ -331,6 +331,7 @@ final class RealProcessServer implements ServerHandle {
         private final boolean ownsStagingDirectory;
         private final List<String> extraArguments;
         private final ClusterLifecycleProbe.Facts lifecycle;
+        private final StoreProcessScope processes;
         private boolean launchAttempted;
         private boolean handedOff;
         private boolean released;
@@ -345,6 +346,7 @@ final class RealProcessServer implements ServerHandle {
             this.httpPort = httpPort;
             this.listenAddress = listenAddress;
             this.storeUri = storeUri;
+            this.processes = StoreProcessScope.matching(storeUri);
             this.operatorStateDatabase = operatorStateDatabase;
             this.workingDirectory = workingDirectory;
             this.baseUrl = baseUrl;
@@ -364,8 +366,10 @@ final class RealProcessServer implements ServerHandle {
             }
             launchAttempted = true;
             try {
+                if (processes != null) processes.beforeLaunch();
                 unhandedProcess = RealProcessServer.launch(jar, jvmOptions, httpPort, listenAddress,
                         storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments);
+                if (processes != null) processes.launched(unhandedProcess);
                 ClusterFixtureTiming.spawned(httpPort, unhandedProcess);
                 RealProcessServer server = new RealProcessServer(
                         unhandedProcess, baseUrl, output, stagingDirectory, ownsStagingDirectory);
