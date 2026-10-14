@@ -6,6 +6,25 @@ the original receipt/API-indexed artifact chain. The separate event JSON must
 match `ci-shard-plan`'s original `ci-event-inputs.json` member. Populated nested PR
 identities must match the requested repository/branch/head/base/PR/action scope.
 
+The original `shard-plan` event producer also captures GitHub's
+`GITHUB_WORKFLOW_REF`, `GITHUB_WORKFLOW_SHA` and `GITHUB_JOB` as a separate
+`workflow_source` declaration. The workflow commit is never substituted for the
+checkout, PR head or base. Missing historical declarations remain unknown;
+partial, malformed, foreign-repository or contradictory declarations reject.
+This is the producer job's context, not a record for every worker or matrix leg.
+GitHub documents these values in its
+[default variables reference](https://docs.github.com/en/actions/reference/workflows-and-actions/variables).
+
+The archive reader joins the declared workflow path and commit to independently
+verified checkout archive bytes only when that exact commit equals the archived
+checkout. It records the source SHA-256 separately. A different workflow commit
+remains an explicit source gap, without guessing that checkout bytes served as the
+workflow definition. Runner declarations themselves always keep
+`source_bytes_verified: false`; source readback does not establish guard or backend
+applicability, complete per-job provenance or R/G outcomes. Target workflows retain
+their existing no-checkout boundary and are not routed through this Git-dependent
+ordinary-event producer.
+
 This is raw source readback. It does not evaluate YAML, actions, dynamic expressions
 or backend path filters. Each workflow retains its byte digest, raw top-level
 `on` block, indented event declaration blocks and job-level `if` source blocks.

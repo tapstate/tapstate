@@ -596,6 +596,54 @@ def event_labels(pr):
                 label_ascii_case_complete=all(name.isascii() for name in names))
 
 
+def workflow_source_fact(value, repository):
+    # Runner declarations stay separate from independently read workflow bytes.
+    if value is None:
+        return {'snapshot': 'unknown', 'source_bytes_verified': False}
+    require(isinstance(value, dict), 'invalid runner workflow source')
+    if value.get('snapshot') == 'unknown':
+        require(value == {'snapshot': 'unknown', 'source_bytes_verified': False}
+                and value['source_bytes_verified'] is False,
+                'unknown runner workflow source contradicts populated fields')
+        return dict(value)
+    fields = {'snapshot', 'workflow_ref', 'workflow_sha', 'workflow_path', 'job', 'source_bytes_verified'}
+    require(set(value) == fields and value['snapshot'] == 'captured'
+            and value['source_bytes_verified'] is False, 'invalid runner workflow source fields')
+    ref, path, job = (value[k] for k in ('workflow_ref', 'workflow_path', 'job'))
+    require(all(isinstance(v, str) and 0 < len(v) <= 4096 and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                for v in (ref, path, job)), 'invalid runner workflow source text')
+    sha(value['workflow_sha'], 'runner workflow')
+    require(re.fullmatch(r'\.github/workflows/[^/\\]+\.ya?ml', path)
+            and path.rsplit('/', 1)[1] not in ('.', '..'), 'invalid runner workflow path')
+    prefix = repository + '/' + path + '@'
+    require(ref.startswith(prefix), 'runner workflow repository/path differs')
+    git_ref = ref[len(prefix):]
+    require(git_ref.startswith('refs/') and subprocess.run(['git', 'check-ref-format', git_ref],
+            capture_output=True).returncode == 0, 'invalid runner workflow ref')
+    require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', job), 'invalid runner workflow job')
+    return dict(value)
+
+
+def event_workflow_source(event, repository):
+    require('workflow_source' not in event or isinstance(event['workflow_source'], dict),
+            'explicit null runner workflow source or non-object declaration')
+    return workflow_source_fact(event.get('workflow_source'), repository)
+
+
+def workflow_source_snapshot(environment, repository):
+    keys = ('GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_JOB')
+    if not any(k in environment for k in keys):
+        return workflow_source_fact(None, repository)
+    require(all(k in environment and isinstance(environment[k], str) and environment[k] for k in keys),
+            'incomplete runner workflow source variables')
+    ref = environment['GITHUB_WORKFLOW_REF']
+    match = re.fullmatch(re.escape(repository) + r'/(\.github/workflows/[^/\\]+\.ya?ml)@(refs/.+)', ref)
+    require(match is not None, 'runner workflow repository/path differs')
+    return workflow_source_fact({'snapshot': 'captured', 'workflow_ref': ref,
+            'workflow_sha': environment['GITHUB_WORKFLOW_SHA'], 'workflow_path': match[1],
+            'job': environment['GITHUB_JOB'], 'source_bytes_verified': False}, repository)
+
+
 def event_snapshot(root, payload, environment):
     # Retain event identities and hash-only labels, never issue text or user details.
     repository = environment['GITHUB_REPOSITORY']
@@ -614,7 +662,7 @@ def event_snapshot(root, payload, environment):
     require(run_id > 0 and attempt > 0, 'invalid run identity')
     value = dict(schema=1, repository=repository, event=event, run_id=run_id, run_attempt=attempt,
                  ref=environment['GITHUB_REF'], checkout_sha=checkout, checkout_tree=tree,
-                 checkout_parents=parents)
+                 checkout_parents=parents, workflow_source=workflow_source_snapshot(environment, repository))
     if event == 'pull_request':
         if not payload.get('pull_request'):
             return dict(value, event_payload_complete=False,
@@ -663,6 +711,9 @@ def reconcile_pr_identity(run, event, commit, repository, number, head, branch):
             and run['run_attempt'] == event['run_attempt'] == 1, 'PR first-attempt identity requires attempt 1')
     require(run['status'] == 'completed', 'PR run is not complete')
     require(run['path'] == '.github/workflows/ci.yml', 'unexpected PR workflow')
+    workflow = event_workflow_source(event, repository)
+    if workflow['snapshot'] == 'captured':
+        require(workflow['workflow_path'] == run['path'], 'runner workflow path differs from run')
     pr = event['pull_request']
     require(pr['number'] == number and type(pr['number']) is int, 'foreign PR number')
     require(pr['action'] in ('opened', 'synchronize', 'reopened'), 'not an original PR update action')
@@ -689,7 +740,7 @@ def reconcile_pr_identity(run, event, commit, repository, number, head, branch):
                 and association['base']['sha'] == base, 'run PR association differs from original event')
     return dict(schema=1, repository=repository, run_id=run['id'], run_attempt=1, pull_request=number,
                 head_sha=head, base_sha=base, checkout_sha=checkout, checkout_tree=event['checkout_tree'],
-                conclusion=run['conclusion'], pr_event_identity_consistent=True,
+                conclusion=run['conclusion'], workflow_source=workflow, pr_event_identity_consistent=True,
                 first_attempt_identity_consistent=True, first_complete_pr_sample_proven=False,
                 group_equivalence_proven=False)
 

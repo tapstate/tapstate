@@ -309,6 +309,8 @@ with tempfile.TemporaryDirectory() as tmp:
     environment=dict(os.environ)
     for key in ('GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_PREFIX','GIT_QUARANTINE_PATH'):
         environment.pop(key,None)
+    for key in ('GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_JOB'):
+        environment.pop(key,None)
     environment.update(GIT_AUTHOR_NAME='Fixture',GIT_COMMITTER_NAME='Fixture',
                        GIT_AUTHOR_EMAIL='fixture@example.test',GIT_COMMITTER_EMAIL='fixture@example.test')
     def fixture_git(*args, input=None):
@@ -336,6 +338,27 @@ with tempfile.TemporaryDirectory() as tmp:
                     head=dict(sha=head,ref='ws/fixture',repo={'full_name':'example/project'}),
                     base=dict(sha=base,ref='main',repo={'full_name':'example/project'})))
     captured=m.event_snapshot(checkout,payload,runner)
+    check(captured.get('workflow_source') == {'snapshot':'unknown','source_bytes_verified':False},
+          'absent workflow runner fields stay explicitly unknown')
+    workflow_runner=dict(runner,GITHUB_WORKFLOW_REF='example/project/.github/workflows/ci.yml@refs/heads/main',
+                         GITHUB_WORKFLOW_SHA=base,GITHUB_JOB='shard-plan')
+    workflow_capture=m.event_snapshot(checkout,payload,workflow_runner)
+    declared=workflow_capture.get('workflow_source',{})
+    check(declared.get('snapshot')=='captured' and declared.get('workflow_sha')==base
+          and declared.get('job')=='shard-plan' and workflow_capture['checkout_sha']==merge,
+          'runner workflow commit and job survive independently from merge checkout identity')
+    check(declared['source_bytes_verified'] is False, 'runner declarations never attest workflow source bytes')
+    for key in ('GITHUB_WORKFLOW_REF','GITHUB_WORKFLOW_SHA','GITHUB_JOB'):
+        incomplete=dict(workflow_runner);incomplete.pop(key)
+        rejected(lambda:m.event_snapshot(checkout,payload,incomplete),'partial workflow runner variables reject')
+        incomplete=dict(workflow_runner);incomplete[key]=''
+        rejected(lambda:m.event_snapshot(checkout,payload,incomplete),'blank workflow runner variables reject')
+    for key,wrong in [('GITHUB_WORKFLOW_REF','foreign/project/.github/workflows/ci.yml@refs/heads/main'),
+                      ('GITHUB_WORKFLOW_REF','example/project/.github/workflows/nested/ci.yml@refs/heads/main'),
+                      ('GITHUB_WORKFLOW_REF','example/project/.github/workflows/ci.yml@refs/heads/../main'),
+                      ('GITHUB_WORKFLOW_SHA','invalid'),('GITHUB_JOB','2-invalid'),('GITHUB_JOB','private\ntext')]:
+        invalid=dict(workflow_runner);invalid[key]=wrong
+        rejected(lambda:m.event_snapshot(checkout,payload,invalid),'malformed workflow runner declaration rejects')
     run=dict(id=100,repository={'full_name':'example/project'},event='pull_request',run_attempt=1,
              status='completed',path='.github/workflows/ci.yml',head_branch='ws/fixture',
              head_sha=head,pull_requests=[],conclusion='success')
@@ -345,6 +368,19 @@ with tempfile.TemporaryDirectory() as tmp:
     identity=reconcile()
     check(identity['checkout_sha']==merge and identity['head_sha']==head
           and identity['base_sha']==base,'original PR identity binds distinct head/base/merge in a shallow checkout')
+    check(identity['workflow_source']['snapshot']=='unknown','legacy identity does not infer workflow source from run path')
+    check(reconcile(value=workflow_capture)['workflow_source']==declared,
+          'original workflow declaration survives independent PR identity reconciliation')
+    wrong_workflow=copy.deepcopy(workflow_capture)
+    wrong_workflow['workflow_source'].update(workflow_path='.github/workflows/other.yml',
+        workflow_ref='example/project/.github/workflows/other.yml@refs/heads/main')
+    rejected(lambda:reconcile(value=wrong_workflow),'captured workflow path must match original API run path')
+    wrong_workflow=copy.deepcopy(workflow_capture);wrong_workflow['workflow_source']['source_bytes_verified']=True
+    rejected(lambda:reconcile(value=wrong_workflow),'runner cannot certify source bytes by declaration')
+    null_workflow=copy.deepcopy(captured);null_workflow['workflow_source']=None
+    rejected(lambda:reconcile(value=null_workflow),'explicit null workflow source is malformed, not legacy absence')
+    legacy=copy.deepcopy(captured);legacy.pop('workflow_source')
+    check(reconcile(value=legacy)['workflow_source']['snapshot']=='unknown','older event files remain readable with unknown workflow source')
     check(not identity['first_complete_pr_sample_proven'] and not identity['group_equivalence_proven'],
           'identity consistency alone never proves a complete first sample or group equivalence')
     check('private-event-sentinel' not in json.dumps(captured),'event text and user data are excluded')

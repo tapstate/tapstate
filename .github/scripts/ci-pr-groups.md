@@ -45,6 +45,12 @@ when deriving historical label applicability; current labels cannot replace a
 missing event snapshot. Identity/capture completeness alone does not establish R,
 all applicable workflow results or a first complete performance sample.
 
+Original event metadata separates the producer job's `workflow_source` runner
+declaration from checkout/head/base identity. Its workflow ref, commit and job are
+validated against the original run path; missing legacy declarations stay unknown.
+These fields do not prove workflow bytes or record other jobs and matrix shards.
+Independent source readback is described in `ci-trigger-basis.md`.
+
 `ci-trigger-basis.sh` reads the original workflow source blocks, hash-only label
 facts and ruleset records from the archive chain. See `ci-trigger-basis.md`; raw
 source readback remains distinct from R/G applicability and actual execution.

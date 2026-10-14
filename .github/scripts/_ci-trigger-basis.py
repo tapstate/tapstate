@@ -146,6 +146,17 @@ def project(refs, root, request):
                 and pr.get('head_repository') == scope['repository']
                 and pr.get('action') in ('opened', 'synchronize', 'reopened'), 'original PR trigger scope differs')
     labels = label_fact(pr) if pr is not None else {'snapshot': 'unknown', 'reason': 'original PR event record is absent'}
+    workflow = g.receipt.event_workflow_source(event, basis['scope']['repository'])
+    workflow_readback = {'runner_declaration': workflow, 'source_bytes_verified': False}
+    if workflow['snapshot'] == 'captured':
+        require(workflow['workflow_path'] == '.github/workflows/ci.yml', 'runner workflow path differs from original CI')
+        if workflow['workflow_sha'] == basis['checkout']['sha']:
+            require(workflow['workflow_path'] in workflows, 'runner workflow source is absent from bound checkout')
+            workflow_readback.update(source_bytes_verified=True,
+                                     source_sha256=workflows[workflow['workflow_path']]['source_sha256'],
+                                     source_commit=basis['checkout']['sha'])
+        else:
+            workflow_readback['gap'] = 'declared workflow commit is separate from the archived checkout source'
     rulesets = []
     for name in sorted(archive['files']):
         if re.fullmatch(r'ruleset-[0-9]+\.json', name):
@@ -155,7 +166,8 @@ def project(refs, root, request):
                     and name == 'ruleset-' + str(value['id']) + '.json', 'ruleset identity differs')
             rulesets.append({'file': name, 'sha256': g.checksum(data), 'value': value})
     return {'schema': 1, 'type': 'archived-trigger-source-basis', 'scope': basis['scope'], 'checkout': basis['checkout'],
-            'workflows': workflows, 'original_labels': labels, 'ruleset_records': rulesets,
+            'workflows': workflows, 'runner_workflow_source': workflow_readback,
+            'original_labels': labels, 'ruleset_records': rulesets,
             'source_blocks_readback_verified': True, 'R_G_complete': False,
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
             'unverified_components': ['workflow_YAML_and_dynamic_guard_evaluation', 'backend_path_filter_evaluation',

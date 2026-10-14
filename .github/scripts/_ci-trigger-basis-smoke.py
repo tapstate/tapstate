@@ -68,6 +68,42 @@ def controls(f):
     f['save']('run/event-inputs.json', event)
     seal()
     check(project()['original_labels']['snapshot'] == 'unknown', 'legacy nested PR identities do not invent label captures')
+    check(project()['runner_workflow_source']['runner_declaration']['snapshot'] == 'unknown'
+          and not project()['runner_workflow_source']['source_bytes_verified'],
+          'legacy source archive does not infer workflow provenance from checkout')
+    event['workflow_source'] = None
+    f['save']('run/event-inputs.json', event); seal()
+    rejected(project, 'null runner workflow')
+    event['workflow_source'] = {'snapshot': 'captured', 'workflow_ref': 'example/project/.github/workflows/ci.yml@refs/pull/7/merge',
+        'workflow_sha': event['checkout_sha'], 'workflow_path': workflow, 'job': 'shard-plan', 'source_bytes_verified': False}
+    f['save']('run/event-inputs.json', event); seal()
+    readback = project()['runner_workflow_source']
+    check(readback['source_bytes_verified'] and readback['source_sha256'] == f['sources'][workflow]
+          and readback['runner_declaration']['source_bytes_verified'] is False,
+          'exact declared commit and path join independently hash-bound workflow bytes')
+    event['workflow_source']['workflow_sha'] = f['base']
+    f['save']('run/event-inputs.json', event); seal()
+    check(not project()['runner_workflow_source']['source_bytes_verified']
+          and project()['checkout']['sha'] == event['checkout_sha'],
+          'different workflow commit remains a source gap without changing merge checkout identity')
+    event['workflow_source']['workflow_sha'] = 'bad'
+    f['save']('run/event-inputs.json', event); seal()
+    rejected(project, 'invalid SHA')
+    event['workflow_source']['workflow_sha'] = event['checkout_sha']
+    event['workflow_source']['workflow_ref'] = 'foreign/project/.github/workflows/ci.yml@refs/heads/main'
+    f['save']('run/event-inputs.json', event); seal()
+    rejected(project, 'repository/path differs')
+    event['workflow_source']['workflow_ref'] = 'example/project/.github/workflows/ci.yml@refs/pull/7/merge'
+    event['workflow_source']['source_bytes_verified'] = True
+    f['save']('run/event-inputs.json', event); seal()
+    rejected(project, 'source fields')
+    event['workflow_source']['source_bytes_verified'] = False
+    event['workflow_source'].update(workflow_path='.github/workflows/other.yml',
+        workflow_ref='example/project/.github/workflows/other.yml@refs/pull/7/merge')
+    f['save']('run/event-inputs.json', event); seal()
+    rejected(project, 'path differs from original CI')
+    event.pop('workflow_source')
+    f['save']('run/event-inputs.json', event); seal()
     pr.update(labels_snapshot_complete=True, label_name_sha256=[], label_ascii_lower_sha256=[],
               label_ascii_case_complete=True)
     f['save']('run/event-inputs.json', event)
