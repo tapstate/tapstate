@@ -20,6 +20,11 @@ providers, workflow applicability, actual specifications, and live PR identity
 still need independent reconciliation. This tool explicitly leaves whole input,
 first complete PR sample, and performance acceptance false.
 
+`ci-archive-inputs.sh` extends this basis with original API-indexed build-input
+and result ZIP members. It replays independent input comparison and binds raw
+reports/test bytecode; its remaining source inventory, whole producer and workflow
+applicability gaps remain explicit. See `ci-archive-inputs.md` for its input contract.
+
 ## Inputs
 
 Prepare a `source-variant-recipe` through `ci-variants.sh prepare`. Retain its
