@@ -194,9 +194,16 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
         SrsMeta m = require(miningChainId);
-        // A rewritten record carries no ring places and no writer accounting, as the real store's replacement
-        // carries neither.
+        Optional<WriterRun> held = writerRun(miningChainId, offset.pipelineId());
+        // A rewrite discards ring places and old writer progress, retaining the writer set only when
+        // sink state survives, as the real store's replacement does.
         forget(miningChainId, offset.pipelineId());
+        if (offset.sinkAcked() != null || !offset.sinkAckedByTable().isEmpty()
+                || !offset.snapshotCompletedTables().isEmpty()) {
+            held.ifPresent(run -> writerRuns.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+                    .put(offset.pipelineId(), new WriterRun(java.util.UUID.randomUUID().toString(),
+                            run.expected(), Map.of(), null)));
+        }
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
         next.add(offset);

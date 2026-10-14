@@ -1758,8 +1758,9 @@ class CaptureRunUnitTest {
 
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {
-            // No test on this double writes a position back; a call here is a wiring mistake, not a case.
-            throw new UnsupportedOperationException("rewindSourceReadOffset");
+            SrsMeta m = require(miningChainId);
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), new ChainPosition(null, token),
+                    m.consumerOffsets(), m.schemaHistory(), m.retention(), m.epoch(), Instant.now(), false));
         }
 
         @Override
@@ -2237,6 +2238,124 @@ class CaptureRunUnitTest {
             assertThat(meta.read(shared)).contains(retained);
             assertThat(meta.read(direct.miningChainId().value())).isEmpty();
         }
+    }
+
+    @Test
+    void aSharedCaptureResumesFromAnExplicitPositionAfterItsLoadHasFinished() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec selected = spec(ReadMode.SNAPSHOT_AND_CDC, true, "explicit-start")
+                .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value());
+        String chain = selected.miningChainId().value();
+        meta.create(chain, null);
+        meta.markSnapshotComplete(chain, selected.consumerId(), "orders");
+        meta.rewindSourceReadOffset(chain, "selected-baseline");
+        assertThat(meta.read(chain).orElseThrow().sourceReadDurable()).isFalse();
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, member);
+            try (CaptureRun run = unit.start(selected, event -> { })) {
+                assertThat(source.cdcStarted).isTrue();
+                assertThat(source.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("selected-baseline")));
+                assertThat(run.snapshotCount()).isZero();
+            }
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    @Test
+    void aTokenOnlyLegacySharedCheckpointIsRefusedBeforeCaptureStarts() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec selected = spec(ReadMode.CDC_ONLY, true, "legacy-token-only")
+                .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value());
+        String chain = selected.miningChainId().value();
+        SrsMeta retained = new SrsMeta(chain, new ChainPosition(null, "legacy-checkpoint"),
+                List.of(), List.of(), null, 1L);
+        meta.seed(retained);
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, member);
+            assertThatThrownBy(() -> {
+                try (CaptureRun run = unit.start(selected, event -> { })) {
+                    // Close the run if an unproven checkpoint is mistakenly accepted.
+                }
+            }).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN);
+                assertThat(failure.args()).containsEntry("pipeline", selected.pipelineId())
+                        .containsEntry("source", selected.sourceId());
+            });
+            assertThat(source.cdcStarted).isFalse();
+            assertThat(meta.read(chain)).contains(retained);
+            assertThat(meta.ringDoneThrough(chain, selected.consumerId())).isEmpty();
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    @Test
+    void aSharedCdcCaptureResumesFromAnExplicitPositionMove() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec selected = spec(ReadMode.CDC_ONLY, true, "explicit-cdc-start")
+                .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value());
+        String chain = selected.miningChainId().value();
+        meta.create(chain, null);
+        meta.openEpoch(chain);
+        meta.rewindSourceReadOffset(chain, "selected-baseline");
+        assertThat(meta.read(chain).orElseThrow().sourceReadAt()).isNotNull();
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, member);
+            try (CaptureRun run = unit.start(selected, event -> { })) {
+                assertThat(source.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("selected-baseline")));
+            }
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    @Test
+    void anOrderedSharedCheckpointWithoutDurabilityIsStillRefused() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec selected = spec(ReadMode.SNAPSHOT_AND_CDC, true, "unproven-checkpoint")
+                .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value());
+        String chain = selected.miningChainId().value();
+        meta.create(chain, null);
+        meta.markSnapshotComplete(chain, selected.consumerId(), "orders");
+        meta.advanceSourceReadOffset(chain, new ChainPosition(new SourceOrder(1, 9), "unproven"));
+        SrsMeta recorded = meta.read(chain).orElseThrow();
+        meta.seed(new SrsMeta(chain, recorded.sourceRead(), recorded.consumerOffsets(), recorded.schemaHistory(),
+                recorded.retention(), recorded.epoch(), Instant.now(), false));
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        TapstateException failure = catchThrowableOfType(() -> runUnit(source, meta).start(selected, event -> { }),
+                TapstateException.class);
+
+        assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN);
+        assertThat(source.cdcStarted).isFalse();
+    }
+
+    @Test
+    void anExplicitPositionDoesNotCertifyLegacyConsumerProgress() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec selected = spec(ReadMode.SNAPSHOT_AND_CDC, true, "explicit-legacy-start")
+                .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value());
+        String chain = selected.miningChainId().value();
+        meta.create(chain, null);
+        meta.markSnapshotComplete(chain, selected.pipelineId(), "orders");
+        meta.rewindSourceReadOffset(chain, "selected-baseline");
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        TapstateException failure = catchThrowableOfType(() -> runUnit(source, meta).start(selected, event -> { }),
+                TapstateException.class);
+
+        assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN);
+        assertThat(source.cdcStarted).isFalse();
     }
 
     /**
