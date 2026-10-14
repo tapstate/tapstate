@@ -5,8 +5,7 @@ umask 077
 fail() { printf 'Cloud GHCR publication refused: %s\n' "$1" >&2; exit 1; }
 mode="${1:-}"
 case "$mode" in
-    publish) package=tapstate-cloud ;;
-    publish-dev) package=tapstate-cloud-dev ;;
+    publish|publish-dev) ;;
     *) fail 'usage: ghcr-publish.sh <publish|publish-dev> --archive FILE --version VERSION --expected-digest SHA256' ;;
 esac
 shift
@@ -22,6 +21,8 @@ while [[ $# -gt 0 ]]; do
     shift 2
 done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'a numeric release version is required; floating tags are forbidden'
+tag="$version"
+if [[ "$mode" == publish-dev ]]; then tag="$version-dev"; fi
 [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'expected OCI digest is missing or invalid'
 [[ -f "$archive" ]] || fail 'verified OCI archive is missing'
 workflow_identity=false
@@ -37,8 +38,8 @@ for tool in docker gh jq curl sha256sum tar; do
     command -v "$tool" >/dev/null 2>&1 || fail "required command is unavailable: $tool"
 done
 
-image="ghcr.io/tapstate/$package"
-endpoint="orgs/tapstate/packages/container/$package"
+image=ghcr.io/tapstate/tapstate-cloud
+endpoint=orgs/tapstate/packages/container/tapstate-cloud
 scratch="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tapstate-ghcr-publish.XXXXXX")"
 cleanup() { rm -rf -- "$scratch"; }
 trap cleanup EXIT
@@ -89,7 +90,7 @@ check_public() {
 check_public before
 
 existing="$(gh api --paginate "$endpoint/versions?per_page=100" \
-    --jq ".[] | select((.metadata.container.tags // []) | index(\"$version\")) | .name" \
+    --jq ".[] | select((.metadata.container.tags // []) | index(\"$tag\")) | .name" \
     2>"$scratch/api-error")" || fail 'existing Cloud release tags could not be read'
 [[ "$mode" == publish-dev || -z "$existing" || "$existing" == "$expected_digest" ]] \
     || fail 'the release version already names different bytes; overwriting is forbidden'
@@ -98,11 +99,11 @@ printf '%s' "$CLOUD_GHCR_TOKEN" \
     | docker login ghcr.io --username "$CLOUD_GHCR_USERNAME" --password-stdin \
         >"$scratch/login-out" 2>"$scratch/login-error" || fail 'GHCR login failed'
 if [[ -z "$existing" || ( "$mode" == publish-dev && "$existing" != "$expected_digest" ) ]]; then
-    docker buildx imagetools create --tag "$image:$version" \
+    docker buildx imagetools create --tag "$image:$tag" \
         "oci-layout://$scratch/layout@$expected_digest" \
         >"$scratch/push-out" 2>"$scratch/push-error" || fail 'GHCR image push failed'
 fi
-docker buildx imagetools inspect --raw "$image:$version" \
+docker buildx imagetools inspect --raw "$image:$tag" \
     >"$scratch/remote-manifest.json" 2>"$scratch/read-error" \
     || fail 'the published Cloud image could not be read back'
 actual="sha256:$(sha256sum "$scratch/remote-manifest.json" | awk '{print $1}')"
@@ -113,7 +114,7 @@ check_public after
 # identity. Keep that token out of command arguments and all diagnostic output.
 curl --disable --silent --show-error --fail --connect-timeout 10 --max-time 30 \
     --proto '=https' --output "$scratch/anonymous-token.json" \
-    "https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/$package:pull" \
+    'https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/tapstate-cloud:pull' \
     2>"$scratch/anonymous-error" || fail 'anonymous pull authorization is unavailable'
 anonymous_token="$(jq -er '
     .token | select(type == "string" and length > 0 and length <= 16384)
@@ -126,7 +127,7 @@ curl --disable --silent --show-error --fail --connect-timeout 10 --max-time 30 \
     --proto '=https' --header "@$scratch/anonymous-header" \
     --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
     --output "$scratch/anonymous-manifest.json" \
-    "https://ghcr.io/v2/tapstate/$package/manifests/$expected_digest" \
+    "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$expected_digest" \
     2>"$scratch/anonymous-error" || fail 'the published Cloud image could not be read anonymously'
 anonymous_digest="sha256:$(sha256sum "$scratch/anonymous-manifest.json" | awk '{print $1}')"
 [[ "$anonymous_digest" == "$expected_digest" ]] \
@@ -134,6 +135,6 @@ anonymous_digest="sha256:$(sha256sum "$scratch/anonymous-manifest.json" | awk '{
 
 deployable="$image@$expected_digest"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-    printf 'image=%s\ntag=%s\n' "$deployable" "$image:$version" >> "$GITHUB_OUTPUT"
+    printf 'image=%s\ntag=%s\n' "$deployable" "$image:$tag" >> "$GITHUB_OUTPUT"
 fi
-printf 'Published Public Cloud image %s as %s\n' "$deployable" "$image:$version"
+printf 'Published Public Cloud image %s as %s\n' "$deployable" "$image:$tag"

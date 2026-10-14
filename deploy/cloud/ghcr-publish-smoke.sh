@@ -108,8 +108,6 @@ EOF
 chmod +x "$WORK/bin/gh" "$WORK/bin/docker" "$WORK/bin/curl"
 
 run_publish() {
-    local package=tapstate-cloud
-    if [[ "${TEST_MODE:-publish}" == publish-dev ]]; then package=tapstate-cloud-dev; fi
     : > "$WORK/commands.log"
     rm -f "$WORK/pushed"
     env PATH="$WORK/bin:$PATH" CLOUD_GHCR_USERNAME="${TEST_USERNAME-publisher}" \
@@ -127,7 +125,7 @@ run_publish() {
         STUB_REPOSITORY="${STUB_REPOSITORY:-null}" STUB_EXISTING_DIGEST="${STUB_EXISTING_DIGEST:-}" \
         STUB_LOGIN_FAIL="${STUB_LOGIN_FAIL:-false}" STUB_PUSH_FAIL="${STUB_PUSH_FAIL:-false}" \
         STUB_READ_FAIL="${STUB_READ_FAIL:-false}" STUB_DIGEST_MISMATCH="${STUB_DIGEST_MISMATCH:-false}" \
-        STUB_DIGEST="$DIGEST" STUB_PACKAGE="$package" \
+        STUB_DIGEST="$DIGEST" STUB_PACKAGE=tapstate-cloud \
         STUB_ANONYMOUS_TOKEN_FAIL="${STUB_ANONYMOUS_TOKEN_FAIL:-false}" \
         STUB_ANONYMOUS_TOKEN_VALUE="${STUB_ANONYMOUS_TOKEN_VALUE:-anonymous-pull-sentinel}" \
         STUB_ANONYMOUS_TOKEN_INVALID="${STUB_ANONYMOUS_TOKEN_INVALID:-false}" \
@@ -244,14 +242,14 @@ else bad 'successful authenticated and anonymous verification emits exact deploy
 : > "$WORK/action-output"
 if TEST_MODE=publish-dev TEST_VERSION=0.7.0 STUB_EXISTING_DIGEST=sha256:previous-dev-build \
         TEST_GITHUB_OUTPUT="$WORK/action-output" run_publish > "$WORK/out" 2> "$WORK/err" \
-        && grep -qF 'imagetools create --tag ghcr.io/tapstate/tapstate-cloud-dev:0.7.0' "$WORK/commands.log" \
-        && grep -qF 'orgs/tapstate/packages/container/tapstate-cloud-dev/versions' "$WORK/commands.log" \
-        && grep -qxF "image=ghcr.io/tapstate/tapstate-cloud-dev@$DIGEST" "$WORK/action-output" \
-        && grep -qxF 'tag=ghcr.io/tapstate/tapstate-cloud-dev:0.7.0' "$WORK/action-output" \
-        && ! grep -qE 'tapstate-cloud(:|/|@|:pull)' "$WORK/commands.log" "$WORK/action-output"; then
-    ok 'a repeated dev version replaces only the separate dev tag and emits the checked digest'
-else bad 'a repeated dev version replaces only the separate dev tag and emits the checked digest'; fi
-if grep -qF "https://ghcr.io/v2/tapstate/tapstate-cloud-dev/manifests/$DIGEST" "$WORK/commands.log"; then
+        && grep -qF 'imagetools create --tag ghcr.io/tapstate/tapstate-cloud:0.7.0-dev ' "$WORK/commands.log" \
+        && grep -qF 'index("0.7.0-dev")' "$WORK/commands.log" \
+        && grep -qxF "image=ghcr.io/tapstate/tapstate-cloud@$DIGEST" "$WORK/action-output" \
+        && grep -qxF 'tag=ghcr.io/tapstate/tapstate-cloud:0.7.0-dev' "$WORK/action-output" \
+        && ! grep -qE 'tapstate-cloud:0[.]7[.]0([[:space:]]|$)' "$WORK/commands.log"; then
+    ok 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'
+else bad 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'; fi
+if grep -qF "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$DIGEST" "$WORK/commands.log"; then
     ok 'dev availability is also verified anonymously by digest'
 else bad 'dev availability is also verified anonymously by digest'; fi
 if TEST_MODE=publish-dev STUB_EXISTING_DIGEST="$DIGEST" run_publish > "$WORK/out" 2> "$WORK/err" \

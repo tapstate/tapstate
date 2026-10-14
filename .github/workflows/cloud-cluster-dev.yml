@@ -1,7 +1,7 @@
 # Rebuild the next release version from main for Cloud development validation.
-# This lane spends no release version: only the separate dev package tag is mutable.
-# Configure cloud-ghcr-dev with VITE_CLOUD_CONSOLE_URL and ensure tapstate-cloud-dev
-# is Public with workflow package write access before dispatching. The repository's
+# This lane spends no release version: only tags ending in -dev are mutable.
+# Configure cloud-ghcr-dev with VITE_CLOUD_CONSOLE_URL and reuse the Public
+# tapstate-cloud package with workflow write access. The repository's
 # RELEASE_SATELLITE_TOKEN supplies private Web reads; no plaintext artifacts are uploaded.
 name: cloud-cluster-dev
 run-name: Cloud cluster dev (${{ inputs.bump }})
