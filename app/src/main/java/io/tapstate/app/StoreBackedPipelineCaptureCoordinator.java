@@ -744,8 +744,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * pipeline's load only sits lower -- beneath changes it would have sat beneath anyway.
      */
     private CaptureOwnership.Permit permitOrNotYet(String pipelineId, CaptureId captureId, CaptureRunSpec spec) {
+        // Existing joined readers need the tail throughout opening, even if this opener changes hands.
+        Set<String> pipelines = new LinkedHashSet<>(List.of(pipelineId));
+        JoinedCapture joined = joinedCaptures.get(captureId);
+        if (joined != null) {
+            pipelines.addAll(joined.pipelines.keySet());
+        }
         CaptureOwnership.Permit permit = renewedFromNow(captureId, ownership.acquire(captureId),
-                () -> drivesPipeline.get().test(pipelineId));
+                () -> pipelines.stream().anyMatch(drivesPipeline.get()));
         if (permit.acquired() || spec.readMode() == ReadMode.SNAPSHOT_ONLY
                 || aRingIsOpen(spec.miningChainId().value())) {
             ringWaits.remove(captureId);

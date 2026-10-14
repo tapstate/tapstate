@@ -380,6 +380,53 @@ class CaptureOwnershipTest {
         blockedCaptureStart(false, true);
     }
 
+    @Test
+    void aJoinedPipelineKeepsAnOpeningTakeoverAliveAfterItsOpenerLosesActuation() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        AtomicLong nanos = new AtomicLong();
+        PipelineActuationOwnership actuation = captureActuation(claims, eligibleGate(), nanos);
+        Member a = new Member("node-a", store, claims, TTL, Duration.ofMillis(20), new ArrayList<>());
+        bindActuation(a, store, actuation);
+        assertThat(actuation.permit("p").granted()).isTrue();
+        assertThat(actuation.permit("q").granted()).isTrue();
+        WorkloadClaimKey capture = captureKey(store, "p");
+        WorkloadClaim remote = claims.acquire(capture, Member.owner("node-c"), 7, TTL).claim();
+        opensTheRing(store);
+        AtomicReference<WorkloadClaim> openingClaim = new AtomicReference<>();
+        try {
+            synchronized (a.captures) {
+                a.captures.startCapture("q");
+                assertThat(a.starts).containsExactly("node-a q attached");
+                assertThat(claims.release(remote)).isTrue();
+                a.whileOpening = () -> {
+                    takePipelineFromA(claims, actuation, nanos, "p");
+                    WorkloadClaim before = claims.read(capture).orElseThrow().claim();
+                    openingClaim.set(before);
+                    claims.elapse(Duration.ofSeconds(5));
+                    // Wait inside the connector open while the lease must account for the joined reader.
+                    awaitRenewalPast(claims, capture, before.leaseUntil());
+                };
+                a.captures.startCapture("p");
+            }
+
+            assertThat(actuation.isDriving("p")).isFalse();
+            assertThat(actuation.isDriving("q")).isTrue();
+            assertThat(a.captures.captureFailure("q"))
+                    .as("the joined pipeline stays healthy when only the opener changes hands").isEmpty();
+            WorkloadClaimReading held = claims.read(capture).orElseThrow();
+            assertThat(held.leased()).isTrue();
+            assertThat(held.claim().owner()).isEqualTo(Member.owner("node-a"));
+            assertThat(held.claim().claimGeneration()).isEqualTo(openingClaim.get().claimGeneration());
+            assertThat(held.claim().leaseUntil()).isAfter(openingClaim.get().leaseUntil());
+            assertThat(a.tailsClosed).as("q still needs the tail that finished opening").hasValue(0);
+        } finally {
+            a.captures.stopCapture("p", false);
+            a.captures.stopCapture("q", false);
+            a.captures.close();
+        }
+    }
+
     private static void blockedCaptureStart(boolean shared, boolean openingOwner) throws Exception {
         InMemoryArtifactStore artifacts = artifactsWith("p", "q");
         if (!shared) {
