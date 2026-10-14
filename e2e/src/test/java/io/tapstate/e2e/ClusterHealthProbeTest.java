@@ -16,6 +16,8 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.api.io.TempDir;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -58,6 +60,90 @@ class ClusterHealthProbeTest {
         assertThat(Files.readString(file)).doesNotContain(base.toString(), bodies.get(2));
         assertThat(PosixFilePermissions.toString(Files.getPosixFilePermissions(file))).isEqualTo("rw-------");
         assertThat(capture.get("write_cost_complete")).isEqualTo(false);
+    }
+
+    @Test void observesTheExistingStatusResponseWithoutAnotherRequestOrRawParameters() throws Exception {
+        AtomicInteger statuses = new AtomicInteger();
+        String pipeline = "private-pipeline-sentinel", secret = "private-status-parameter-sentinel";
+        HttpServer server = server(exchange -> {
+            String body;
+            if (exchange.getRequestURI().getPath().equals("/auth/login")) body = "{\"token\":\"fixture-token\"}";
+            else {
+                statuses.incrementAndGet();
+                body = "{\"state\":\"FAILED\",\"failure\":{\"code\":\"engine.job-failed\",\"params\":{\"detail\":\"" + secret + "\"}}}";
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        URI base = base(server);
+        var scope = ClusterHealthProbe.install(CASE, "local", "1");
+        try {
+            ClusterHealthProbe.bind(678, base);
+            ControlPlane control = new ControlPlane(base); control.login("fixture", "fixture");
+            assertThat(control.state(pipeline)).contains(io.tapstate.core.lifecycle.PipelineState.FAILED);
+            assertThat(statuses.get()).isEqualTo(1);
+        } finally { scope.close(); server.stop(0); }
+        Path file = scope.write(scratch, true);
+        Map<?, ?> capture = read(file);
+        List<?> samples = (List<?>) capture.get("pipeline_status");
+        assertThat(samples).hasSize(1);
+        Map<?, ?> sample = (Map<?, ?>) samples.getFirst();
+        assertThat(sample.get("failure_code")).isEqualTo("engine.job-failed");
+        assertThat(sample.get("state")).isEqualTo("FAILED");
+        assertThat(sample.get("pid")).isEqualTo(678L);
+        assertThat(sample.get("pipeline_sha256")).isEqualTo(ClusterHealthProbe.hash(pipeline));
+        assertThat(Files.readString(file)).doesNotContain(secret, pipeline, base.toString(), "fixture-token");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"engine-.job-failed,noncanonical", "engine--x.job-failed,noncanonical",
+        "engine.extra.job-failed,noncanonical", "unregistered.job-failed,noncanonical",
+        "connector.mongodb.read-failed,unsupported-namespace", "pdk.1001,unsupported-namespace"})
+    void malformedOrUnsupportedCodesLeaveTheSameFailedStateAndAnIncompleteProjection(String code, String expected) throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        HttpServer server = server(exchange -> {
+            String body;
+            if (exchange.getRequestURI().getPath().equals("/auth/login")) body = "{\"token\":\"fixture-token\"}";
+            else {
+                reads.incrementAndGet();
+                body = "{\"state\":\"FAILED\",\"failure\":{\"code\":\"" + code + "\"}}";
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        var scope = ClusterHealthProbe.install(CASE, "local", "1");
+        try {
+            URI base = base(server); ClusterHealthProbe.bind(890, base);
+            ControlPlane control = new ControlPlane(base); control.login("fixture", "fixture");
+            assertThat(control.state("fixture")).contains(io.tapstate.core.lifecycle.PipelineState.FAILED);
+            assertThat(reads.get()).isEqualTo(1);
+        } finally { scope.close(); server.stop(0); }
+        Map<?, ?> capture = read(scope.write(scratch, true));
+        assertThat(capture.get("capture_complete")).isEqualTo(false);
+        Map<?, ?> sample = (Map<?, ?>) ((List<?>) capture.get("pipeline_status")).getFirst();
+        assertThat(sample.get("failure_code")).isEqualTo(expected);
+    }
+
+    @Test void statusProjectionFailureOrMalformedCodeCannotReplaceTheOriginalReading() throws Exception {
+        URI base = URI.create("http://127.0.0.1:12345");
+        HttpRequest request = HttpRequest.newBuilder(base.resolve("/api/pipelines/private/status")).build();
+        var scope = ClusterHealthProbe.install(CASE, "local", "1");
+        try {
+            ClusterHealthProbe.bind(789, base);
+            assertThatCode(() -> ClusterHealthProbe.pipelineStatus(request, 200, "private-body", "private", java.util.Optional.of(io.tapstate.core.lifecycle.PipelineState.FAILED),
+                    () -> { throw new AssertionError("private-diagnostic-failure"); })).doesNotThrowAnyException();
+            ClusterHealthProbe.pipelineStatus(request, 200, "private-body", "private", java.util.Optional.of(io.tapstate.core.lifecycle.PipelineState.FAILED),
+                    () -> java.util.Optional.of("http://private-user:private-password@host"));
+        } finally { scope.close(); }
+        Path file = scope.write(scratch, true);
+        Map<?, ?> capture = read(file);
+        assertThat(capture.get("capture_complete")).isEqualTo(false);
+        List<?> samples = (List<?>) capture.get("pipeline_status");
+        assertThat(samples.stream().map(row -> ((Map<?, ?>) row).get("failure_code")).toList())
+                .isEqualTo(List.of("unavailable", "noncanonical"));
+        assertThat(Files.readString(file)).doesNotContain("private-", "private-body", "http://", "127.0.0.1");
     }
 
     @Test void retainsConnectionFailureClassesAndStillReturnsTheOriginalFalse() throws Exception {

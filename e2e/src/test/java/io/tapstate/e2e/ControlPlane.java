@@ -1315,8 +1315,13 @@ final class ControlPlane {
      * its whole bound before saying so.
      */
     Optional<PipelineState> state(String pipelineId) {
-        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
-        return interpretState(response.statusCode(), response.body(), pipelineId);
+        HttpRequest request = authedGet("/api/pipelines/" + pipelineId + "/status");
+        HttpResponse<String> response = send(request);
+        Optional<PipelineState> state = interpretState(response.statusCode(), response.body(), pipelineId);
+        ClusterHealthProbe.pipelineStatus(request, response.statusCode(), response.body(), pipelineId,
+                state,
+                () -> interpretFailureCode(response.statusCode(), response.body(), pipelineId));
+        return state;
     }
 
     /**
