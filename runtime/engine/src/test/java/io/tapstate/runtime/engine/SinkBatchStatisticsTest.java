@@ -62,6 +62,28 @@ class SinkBatchStatisticsTest {
     }
 
     @Test
+    void a_write_distribution_whose_buckets_disagree_with_its_count_is_absent() {
+        Map<String, List<Long>> parts = new LinkedHashMap<>();
+        parts.put(JetSinkUseGauge.ISSUED, List.of(4L));
+        parts.put(JetSinkUseGauge.RECORDS, List.of(8L));
+        parts.put(JetSinkUseGauge.LARGEST, List.of(2L));
+        parts.put(JetSinkUseGauge.PENDING, List.of(1L));
+        parts.put(JetSinkUseGauge.LIMIT, List.of(1L));
+        parts.put(JetSinkUseGauge.BACKPRESSURED, List.of(0L));
+        parts.put(JetSinkUseGauge.SINCE, List.of(1_700_000_000_000L));
+        parts.put(JetSinkUseGauge.WRITE + JetSinkUseGauge.COUNT, List.of(4L));
+        parts.put(JetSinkUseGauge.WRITE + JetSinkUseGauge.SUM_MICROS, List.of(400_000L));
+        for (int index = 0; index < HistogramBounds.SINK_BATCH_WRITE_DURATION.buckets(); index++) {
+            parts.put(JetSinkUseGauge.WRITE + JetSinkUseGauge.BUCKET + index, index == 7 ? List.of(3L) : List.of(0L));
+        }
+
+        SinkBatchReading read = Engine.sinkBatchReadingIn(collected(parts));
+
+        assertThat(read.issuedBatches()).isEqualTo(4L);
+        assertThat(read.writeDuration()).isNull();
+    }
+
+    @Test
     void a_partial_distribution_is_absent_while_other_measured_batch_facts_remain() {
         Map<String, List<Long>> parts = new LinkedHashMap<>();
         parts.put(JetSinkUseGauge.ISSUED, List.of(1L));

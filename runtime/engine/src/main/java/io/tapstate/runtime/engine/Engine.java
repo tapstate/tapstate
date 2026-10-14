@@ -952,9 +952,10 @@ public final class Engine {
 
     /**
      * The delivery-duration distributions in {@code collected}, by table. A table is read back only when
-     * all three of its parts are present and its buckets are as many as the registered bounds need: a
-     * distribution with a bucket missing is not a distribution short one bucket, it is a collection that
-     * caught a sink half-way through reporting, and it is left out rather than read as a shape.
+     * all three of its parts are present, its buckets are as many as the registered bounds need and they add
+     * up to its count: a distribution with a bucket missing is not a distribution short one bucket, and one
+     * counted ahead of its buckets is not a larger one; each is a collection that caught a sink half-way
+     * through reporting, and it is left out rather than read as a shape.
      */
     static Map<String, HistogramValue> settledDurationsIn(JobMetrics collected) {
         HistogramBounds bounds = HistogramBounds.RECORD_DELIVERY_DURATION;
@@ -991,7 +992,7 @@ public final class Engine {
         counts.forEach((table, count) -> {
             long[] perBucket = buckets.get(table);
             if (perBucket == null || bucketsSeen.getOrDefault(table, 0) != bounds.buckets()
-                    || !sums.containsKey(table)) {
+                    || !sums.containsKey(table) || !bucketsAddUpTo(perBucket, count)) {
                 return;
             }
             List<Long> bucketCounts = new ArrayList<>(perBucket.length);
@@ -1680,20 +1681,39 @@ public final class Engine {
             return null;
         }
         List<Long> buckets = new ArrayList<>(bounds.buckets());
+        long[] perBucket = new long[bounds.buckets()];
         for (int index = 0; index < bounds.buckets(); index++) {
             OptionalLong bucket = sumIn(collected, prefix + JetSinkUseGauge.BUCKET + index);
             if (bucket.isEmpty()) {
                 return null;
             }
             buckets.add(bucket.getAsLong());
+            perBucket[index] = bucket.getAsLong();
         }
-        return bounds.value(count.getAsLong(), sum.getAsLong() / 1_000_000.0, buckets);
+        return bucketsAddUpTo(perBucket, count.getAsLong())
+                ? bounds.value(count.getAsLong(), sum.getAsLong() / 1_000_000.0, buckets) : null;
+    }
+
+    /**
+     * Whether a distribution's buckets hold exactly the observations its count says. A processor writes its
+     * count, sum and buckets as separate statistics, and a collection reads them one at a time, so it can
+     * catch units already counted but not yet bucketed. Such a reading is left out, the way a missing bucket
+     * is: published as read, its count would contradict its own buckets, and an exporter's count would
+     * disagree with its overflow bucket.
+     */
+    private static boolean bucketsAddUpTo(long[] buckets, long count) {
+        long total = 0;
+        for (long bucket : buckets) {
+            total += bucket;
+        }
+        return total == count;
     }
 
     /**
      * The stage distributions in {@code collected}. A stage is read back only when its count, its sum and
-     * every bucket are present — a distribution caught with a bucket missing is a collection that caught a
-     * processor half-way through reporting, and it is left out rather than read as a shape.
+     * every bucket are present and the buckets add up to the count — a distribution caught with a bucket
+     * missing, or counted ahead of its buckets, is a collection that caught a processor half-way through
+     * reporting, and it is left out rather than read as a shape.
      */
     static StageReading stageDurationsIn(JobMetrics collected) {
         HistogramBounds bounds = HistogramBounds.PROCESS_DURATION;
@@ -1738,7 +1758,7 @@ public final class Engine {
         counts.forEach((stage, count) -> {
             long[] perBucket = buckets.get(stage);
             if (perBucket == null || bucketsSeen.getOrDefault(stage, 0) != bounds.buckets()
-                    || !sums.containsKey(stage)) {
+                    || !sums.containsKey(stage) || !bucketsAddUpTo(perBucket, count)) {
                 return;
             }
             List<Long> bucketCounts = new ArrayList<>(perBucket.length);

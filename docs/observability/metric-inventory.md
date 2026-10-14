@@ -24,7 +24,9 @@ measurement since its local account began; it is not a histogram or a counter. R
 measurement time instead of assigning the whole observation's timestamp to cached or collected readings.
 
 An unwired or unavailable source is absent. Quiet distributions and quantities with no observations can
-also be absent. A wired queue, initialized counter, or measured Boolean may legitimately be zero; that
+also be absent. A distribution collected while its count and buckets were being updated is left out of
+that collection rather than published with a count its buckets do not hold; the last known cumulative
+point is retained with its own measurement time. A wired queue, initialized counter, or measured Boolean may legitimately be zero; that
 does not authorize a client to fill an absent measurement with zero. A counter's start is the data job,
 worker, sampler, JVM, or export stream that owns it, as identified below.
 

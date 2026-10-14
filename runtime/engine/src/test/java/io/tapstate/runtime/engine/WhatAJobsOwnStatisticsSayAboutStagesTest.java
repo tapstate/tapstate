@@ -117,6 +117,21 @@ class WhatAJobsOwnStatisticsSayAboutStagesTest {
     }
 
     @Test
+    @DisplayName("a stage caught between its count and its buckets is left out, and its neighbour stays")
+    void aStageWhoseBucketsDisagreeWithItsCountIsLeftOut() {
+        // A processor writes the count before the buckets, and the collection reads the parts one by one, so
+        // it can catch three units already counted but not yet bucketed. Published as read, the count would
+        // contradict the distribution it describes: an exporter's _count would exceed its +Inf bucket.
+        Map<String, List<Long>> parts = aStage("sink", 4_039L, 2_150_000L, 0, List.of(1L), List.of(1L));
+        parts.put("stage.sink.count", List.of(4_042L));
+        parts.putAll(aStage("source", 5L, 100L, 0, List.of(1L), List.of(1L)));
+
+        StageReading read = Engine.stageDurationsIn(statistics(parts));
+
+        assertThat(read.durationByStage()).containsOnlyKeys("source");
+    }
+
+    @Test
     @DisplayName("the delivery names beside these are not read as stages")
     void theStageReadbackTakesItsOwnFamilyOfNames() {
         JobMetrics collected = statistics(new LinkedHashMap<>(Map.of(

@@ -190,6 +190,15 @@ class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
     }
 
     @Test
+    @DisplayName("a distribution caught between its count and its buckets is left out")
+    void aDistributionWhoseBucketsDisagreeWithItsCountIsLeftOut() {
+        Map<String, List<Long>> parts = aDistribution("orders", 7L, 2_100L, 5, List.of(1L));
+        parts.put("outDeliveryCount.orders", List.of(9L));
+
+        assertThat(Engine.settledDurationsIn(statistics(parts))).isEmpty();
+    }
+
+    @Test
     @DisplayName("a dotted table name is not split by the duration readback either")
     void aDottedTableNameSurvivesTheDurationReadback() {
         JobMetrics collected = statistics(aDistribution("shop.orders", 1L, 40L, 2, List.of(1L)));
