@@ -373,6 +373,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     /** Queues {@code row} to be emitted, and counts it as the kind of row it is. */
     private void take(Envelope row) {
+        // The capture names its physical table; this job may qualify that table to keep sources apart.
+        if (!row.src().equals(src)) {
+            ChainPosition position = row.position();
+            row = new Envelope(row.op(), row.ts(), src, row.before(), row.after(), row.schema(),
+                    position == null ? Map.of() : Map.of(src, position), row.removed());
+        }
         pending.add(row);
         if (isLoadRow(row)) {
             // Rows to emit means a bound to promise once they have left. A declared load owes one already, rows
