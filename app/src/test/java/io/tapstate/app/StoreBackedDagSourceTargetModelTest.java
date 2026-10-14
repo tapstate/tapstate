@@ -445,6 +445,44 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
+    void qualified_sync_renames_keep_same_table_sources_in_distinct_targets() {
+        for (List<String> sourceIds : List.of(List.of("left", "right"), List.of("right", "left"))) {
+            InMemoryStorePort store = new InMemoryStorePort();
+            for (String sourceId : sourceIds) {
+                store.artifacts().save(new SourceResource(sourceId, null, "mysql", Map.of("host", "h"),
+                        SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
+                store.schemas().save(discovered(sourceId, "mysql", new SourceTable("orders",
+                        List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+            }
+            store.artifacts().save(new SourceResource("dest", null, "mongodb", Map.of("uri", "u"),
+                    null, null, null, null));
+            SyncElement sync = new SyncElement("sync_1", "dest", null,
+                    new RenameSpec(Map.of("left.orders", "left_orders", "right.orders", "right_orders"),
+                            null, null, null), null);
+            store.artifacts().save(new PipelineResource("p", null,
+                    sourceIds.stream().<SourceRef>map(SourceRef::bare).toList(),
+                    List.of(Step.inline("merged", FromClause.list(
+                                    FromRef.literal("left.orders"), FromRef.literal("right.orders")),
+                            new TransformBody.Union(), null)), null,
+                    new ServeBlock.Inline(null, FromRef.literal("merged"), List.of(sync), null, null),
+                    null, null));
+            OpenRingGenerations.forSources(store, "left", "right");
+            Map<String, TargetTable> bound = new LinkedHashMap<>();
+
+            DagSource.PlannedDag planned = new StoreBackedDagSource(store, capturingMapBinder(bound))
+                    .plannedDagFor("p", null);
+
+            assertThat(planned.shape().sinkTargetsOf(PipelineDagBuilder.serveVertex(sync, 0)))
+                    .as("source order: %s", sourceIds)
+                    .isEqualTo(Map.of("left.orders", new SinkTarget("left_orders", List.of("id")),
+                            "right.orders", new SinkTarget("right_orders", List.of("id"))));
+            assertThat(bound).containsOnlyKeys("left.orders", "right.orders");
+            assertThat(bound.get("left.orders").name()).isEqualTo("left_orders");
+            assertThat(bound.get("right.orders").name()).isEqualTo("right_orders");
+        }
+    }
+
+    @Test
     void a_legacy_qualified_rename_cannot_choose_between_two_sources_of_the_same_table() {
         InMemoryStorePort store = new InMemoryStorePort();
         for (String sourceId : List.of("mysql_a", "mysql_b")) {

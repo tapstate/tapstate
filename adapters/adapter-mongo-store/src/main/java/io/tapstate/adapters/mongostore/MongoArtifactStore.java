@@ -54,6 +54,7 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
+    private static final int SOURCE_WRITE_ATTEMPTS = 8;
 
     private final MongoClient client;
     private final MongoCollection<Document> collection;
@@ -168,11 +169,19 @@ public final class MongoArtifactStore implements ArtifactStore {
     }
 
     private static <T> T retryTransaction(boolean fenced, Supplier<T> transaction) {
-        for (int attempt = 0; attempt < 3; attempt++) {
+        for (int attempt = 0; attempt < SOURCE_WRITE_ATTEMPTS; attempt++) {
             try {
                 return transaction.get();
             } catch (RuntimeException error) {
-                if (!fenced || attempt == 2 || !retryableKeyringWrite(error)) throw error;
+                if (!fenced || attempt == SOURCE_WRITE_ATTEMPTS - 1 || !retryableKeyringWrite(error)) throw error;
+                // Concurrent Source writes share the keyring fence. Immediate retries can all fail
+                // before its holder commits; allow it to finish, with at most 3.175 seconds of backoff.
+                try {
+                    Thread.sleep(25L << attempt);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw error;
+                }
             }
         }
         throw new IllegalStateException("transaction attempts must return or throw");
