@@ -1192,12 +1192,17 @@ class ClusterRecoveryStoreIT {
                 }
                 int attempt = item.attempt();
                 long frontier = item.executionFrontier();
+                Document originalQueueItem = fixture.queue.find().first();
+                assertThat(originalQueueItem).isNotNull();
+                assertThat(fixture.queue.countDocuments()).isEqualTo(1);
                 WorkloadClaimFence oldRecovery = WorkloadClaimFence.from(fixture.recovery);
                 assertThat(fixture.workloads.release(fixture.recovery)).isTrue();
                 fixture.recovery = fixture.workloads.acquire(recoveryKey(), new WorkloadOwner("b", "boot-b"), 2, TTL).claim();
                 item = fixture.store.resumePermit(fixture.fence(item), item.permit().reservationId(), PERMIT_TTL).item();
                 assertThat(item.attempt()).isEqualTo(attempt);
                 assertThat(item.executionFrontier()).isEqualTo(frontier);
+                assertThat(item.enqueueSequence()).isEqualTo(((Number) originalQueueItem.get("enqueueSequence")).longValue());
+                assertSameDurableQueueItem(fixture, originalQueueItem);
                 ClusterRecoveryFence staleOwner = new ClusterRecoveryFence(item.event().key(), item.itemRevision(),
                         item.event().intentFingerprint(), item.targetProfile(), item.executionFrontier(), oldRecovery);
                 assertThat(fixture.store.complete(staleOwner).outcome()).isEqualTo(ClusterRecoveryMutation.STALE_RECOVERY_CLAIM);
@@ -1219,8 +1224,18 @@ class ClusterRecoveryStoreIT {
                 assertThat(fixture.workloads.read(pipeline.claim.key()).orElseThrow().claim().executionGeneration()).isEqualTo(2);
                 assertThat(recovered.item().attempt()).isEqualTo(1);
                 assertThat(fixture.capacity.occupied("east")).isEqualTo(DEMAND);
+                assertSameDurableQueueItem(fixture, originalQueueItem);
             }
         }
+    }
+
+    private static void assertSameDurableQueueItem(Fixture fixture, Document original) {
+        assertThat(fixture.queue.countDocuments()).as("handover retains one durable queue row").isEqualTo(1);
+        Document current = fixture.queue.find(new Document("_id", original.get("_id"))).first();
+        assertThat(current).isNotNull()
+                .containsEntry("_id", original.get("_id"))
+                .containsEntry("enqueueSequence", original.get("enqueueSequence"))
+                .containsEntry("enqueuedAt", original.get("enqueuedAt"));
     }
 
     @Test
