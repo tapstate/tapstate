@@ -508,14 +508,15 @@ jobs:
           fetch-depth: 0
       - name: CI evidence and durable receipt controls
         run: |
-          shellcheck .github/scripts/ci-evidence.sh .github/scripts/ci-evidence-smoke.sh .github/scripts/ci-receipt.sh .github/scripts/ci-receipt-smoke.sh .github/scripts/ci-pr-groups.sh .github/scripts/ci-pr-groups-smoke.sh .github/scripts/ci-variants.sh .github/scripts/ci-variants-smoke.sh .github/scripts/ci-source-projection.sh .github/scripts/ci-source-projection-smoke.sh .github/scripts/ci-archive-inputs.sh .github/scripts/ci-archive-inputs-smoke.sh
-          python3 -m py_compile .github/scripts/_ci-evidence.py .github/scripts/_ci-receipt.py .github/scripts/_ci-pr-groups.py .github/scripts/_ci-variants.py .github/scripts/_ci-source-projection.py .github/scripts/_ci-archive-inputs.py .github/scripts/_ci-archive-inputs-smoke.py
+          shellcheck .github/scripts/ci-evidence.sh .github/scripts/ci-evidence-smoke.sh .github/scripts/ci-receipt.sh .github/scripts/ci-receipt-smoke.sh .github/scripts/ci-pr-groups.sh .github/scripts/ci-pr-groups-smoke.sh .github/scripts/ci-variants.sh .github/scripts/ci-variants-smoke.sh .github/scripts/ci-source-projection.sh .github/scripts/ci-source-projection-smoke.sh .github/scripts/ci-archive-inputs.sh .github/scripts/ci-archive-inputs-smoke.sh .github/scripts/ci-archive-cases.sh .github/scripts/ci-archive-cases-smoke.sh
+          python3 -m py_compile .github/scripts/_ci-evidence.py .github/scripts/_ci-receipt.py .github/scripts/_ci-pr-groups.py .github/scripts/_ci-variants.py .github/scripts/_ci-source-projection.py .github/scripts/_ci-archive-inputs.py .github/scripts/_ci-archive-inputs-smoke.py .github/scripts/_ci-archive-cases.py .github/scripts/_ci-archive-cases-smoke.py
           bash .github/scripts/ci-evidence-smoke.sh
           bash .github/scripts/ci-receipt-smoke.sh
           bash .github/scripts/ci-pr-groups-smoke.sh
           bash .github/scripts/ci-variants-smoke.sh
           bash .github/scripts/ci-source-projection-smoke.sh
           bash .github/scripts/ci-archive-inputs-smoke.sh
+          bash .github/scripts/ci-archive-cases-smoke.sh
       - name: shellcheck the catalog scripts
         # One invocation over all four rather than a line each: a `run: |` block runs under bash -e,
         # so the first script to report anything aborts the step and the ones after it are never

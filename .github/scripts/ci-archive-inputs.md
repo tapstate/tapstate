@@ -14,6 +14,10 @@ these artifacts. Effective models, compiler/plugin/processor realms and generate
 inputs are still unproven. All whole-input, whole-build, first complete PR sample
 and performance acceptance flags remain false.
 
+`ci-archive-cases.sh` independently parses the verified checkout as data and
+replays source case subsets against original worker members. Its computed provider
+and remaining whole-input gaps stay explicit; see `ci-archive-cases.md`.
+
 ## Request and command
 
 The request has exactly `schema: 1`, `type: archive-inputs-request` and `source`,
