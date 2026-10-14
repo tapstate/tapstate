@@ -9,6 +9,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /**
  * Renews one capture claim from the moment it is taken, and stops its local capture immediately when
@@ -29,6 +30,7 @@ final class CaptureClaimLease implements AutoCloseable {
     private Runnable lost;
     /** Whether the claim was lost while nothing was bound to answer for it yet. Guarded by this. */
     private boolean lostUnanswered;
+    private volatile BooleanSupplier needed = () -> true;
 
     private CaptureClaimLease() {
         this.ownership = null;
@@ -82,11 +84,31 @@ final class CaptureClaimLease implements AutoCloseable {
         }
     }
 
+    /** An opened capture outlives its opener only while it still serves a pipeline driven here. */
+    void whileNeeded(BooleanSupplier needed) {
+        this.needed = Objects.requireNonNull(needed, "needed");
+    }
+
+    /** Reserves an attachment before its potentially blocking open, atomically with retiring this lease. */
+    synchronized boolean retain(Runnable reserve) {
+        if (renewer != null && closed.get()) {
+            return false;
+        }
+        reserve.run();
+        return true;
+    }
+
     void renew() {
         if (closed.get()) {
             return;
         }
         try {
+            if (!needed.getAsBoolean()) {
+                lose(true);
+                if (closed.get()) {
+                    return;
+                }
+            }
             ownership.renew(current.get()).ifPresentOrElse(
                     current::set,
                     this::lose);
@@ -102,17 +124,29 @@ final class CaptureClaimLease implements AutoCloseable {
      * fenced-out tail half stopped. Nothing is renewed in between, since {@code closed} is already set.
      */
     private void lose() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
+        lose(false);
+    }
+
+    private void lose(boolean release) {
         Runnable action;
         synchronized (this) {
+            // A new driven attachment may have reserved the tail since the renewer's first look.
+            if ((release && needed.getAsBoolean()) || !closed.compareAndSet(false, true)) {
+                return;
+            }
             action = lost;
             lostUnanswered = action == null;
         }
         try {
-            if (action != null) {
-                action.run();
+            try {
+                // Release before cleanup waits on an opening connector or another pipeline's coordinator lock.
+                if (release) {
+                    ownership.release(current.get());
+                }
+            } finally {
+                if (action != null) {
+                    action.run();
+                }
             }
         } finally {
             renewer.shutdownNow();

@@ -51,6 +51,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -112,6 +114,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     /** Looks for ownerless captures and maintains shared readers, including durable-log retirement. */
     private ScheduledExecutorService takeovers;
+    private volatile Predicate<String> drivesPipeline = pipelineId -> true;
 
     /** How far each running pipeline's load has got, keyed by pipeline; dropped when it stops. */
     private final Map<String, PipelineLoad> loadsByPipeline = new ConcurrentHashMap<>();
@@ -164,6 +167,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
+    public synchronized void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
+        this.drivesPipeline = Objects.requireNonNull(drivesPipeline, "drivesPipeline");
+    }
+
+    @Override
     public synchronized void startCapture(String pipelineId) {
         startCapture(pipelineId, artifacts());
     }
@@ -213,9 +221,17 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
-                        serveFromTheReaderHere(existing, spec);
-                        run = captureAttacher.start(spec.withCaptureFence(existing.permit.fence()), handoff, false);
-                        existing.pipelines.add(pipelineId);
+                        if (!existing.lease.retain(() -> existing.pipelines.add(pipelineId))) {
+                            throw new TapstateException(CaptureError.CLAIM_LOST,
+                                    Map.of("captureId", captureId.value()), null);
+                        }
+                        try {
+                            serveFromTheReaderHere(existing, spec);
+                            run = captureAttacher.start(spec.withCaptureFence(existing.permit.fence()), handoff, false);
+                        } catch (RuntimeException | Error failure) {
+                            existing.pipelines.remove(pipelineId);
+                            throw failure;
+                        }
                     } else {
                         CaptureOwnership.Permit permit = permits.get(captureId);
                         if (permit.acquired()) {
@@ -469,10 +485,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /** {@code permit} as taken: an acquired claim is renewed from now on, until it is opened or let go. */
-    private CaptureOwnership.Permit renewedFromNow(CaptureId captureId, CaptureOwnership.Permit permit) {
+    private CaptureOwnership.Permit renewedFromNow(
+            CaptureId captureId, CaptureOwnership.Permit permit, BooleanSupplier needed) {
         if (permit.acquired() && permit.claim() != null) {
-            CaptureClaimLease replaced = openingLeases.put(
-                    captureId, new CaptureClaimLease(ownership, permit.claim(), claimRenewInterval));
+            CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), claimRenewInterval);
+            lease.whileNeeded(needed);
+            CaptureClaimLease replaced = openingLeases.put(captureId, lease);
             if (replaced != null) {
                 replaced.close();
             }
@@ -513,7 +531,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private static final class OwnedCapture {
         private final CaptureRun run;
         private final CaptureOwnership.Permit permit;
-        private final Set<String> pipelines = new LinkedHashSet<>();
+        private final Set<String> pipelines = ConcurrentHashMap.newKeySet();
         private CaptureClaimLease lease;
 
         private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, Collection<String> pipelines) {
@@ -561,6 +579,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 : new CaptureClaimLease(ownership, permit.claim(), claimRenewInterval);
         // Bound last, once the capture is recorded as owned: a claim lost while it was being opened is
         // answered right here, and the answer has to find the capture it stops.
+        owned.lease.whileNeeded(() -> owned.pipelines.isEmpty()
+                || owned.pipelines.stream().anyMatch(drivesPipeline));
         owned.lease.onLost(() -> captureClaimLost(captureId, owned));
     }
 
@@ -590,7 +610,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             if (stillLoading(capture.pipelines.keySet())) {
                 continue;
             }
-            CaptureOwnership.Permit permit = renewedFromNow(entry.getKey(), ownership.acquire(entry.getKey()));
+            Set<String> pipelines = Set.copyOf(capture.pipelines.keySet());
+            if (pipelines.stream().noneMatch(drivesPipeline)) {
+                continue;
+            }
+            CaptureOwnership.Permit permit = renewedFromNow(entry.getKey(), ownership.acquire(entry.getKey()),
+                    () -> pipelines.stream().anyMatch(drivesPipeline));
             if (!permit.acquired()) {
                 continue;
             }
@@ -698,7 +723,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * pipeline's load only sits lower -- beneath changes it would have sat beneath anyway.
      */
     private CaptureOwnership.Permit permitOrNotYet(String pipelineId, CaptureId captureId, CaptureRunSpec spec) {
-        CaptureOwnership.Permit permit = renewedFromNow(captureId, ownership.acquire(captureId));
+        CaptureOwnership.Permit permit = renewedFromNow(captureId, ownership.acquire(captureId),
+                () -> drivesPipeline.test(pipelineId));
         if (permit.acquired() || spec.readMode() == ReadMode.SNAPSHOT_ONLY
                 || aRingIsOpen(spec.miningChainId().value())) {
             ringWaits.remove(captureId);

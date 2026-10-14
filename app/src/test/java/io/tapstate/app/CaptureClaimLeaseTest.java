@@ -20,10 +20,38 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class CaptureClaimLeaseTest {
+
+    @Test
+    void anAttachmentThatPreventsRetirementStillGetsTheRenewalDueOnThatPass() {
+        InMemoryWorkloadClaimStore raw = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        Duration ttl = Duration.ofSeconds(15);
+        CaptureOwnership ownership = new CaptureOwnership("cluster-a", new WorkloadOwner("node-a", "boot-a"),
+                gate, new ClusterWorkloadClaims(raw, gate), ttl);
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        AtomicBoolean lost = new AtomicBoolean();
+        CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), Duration.ofHours(1),
+                () -> lost.set(true));
+        AtomicInteger looks = new AtomicInteger();
+        // A driven attachment reserves the tail between the first look and the retirement's locked recheck.
+        lease.whileNeeded(() -> looks.incrementAndGet() > 1);
+        try {
+            raw.elapse(Duration.ofSeconds(10));
+            lease.renew();
+            raw.elapse(Duration.ofSeconds(10));
+
+            assertThat(raw.read(permit.claim().key()).orElseThrow().leased())
+                    .as("declining retirement must still renew before the next interval passes the old TTL").isTrue();
+            assertThat(lost).isFalse();
+        } finally {
+            lease.close();
+        }
+    }
 
     @Test
     void aRenewalThatNoLongerMatchesStopsTheCaptureWithoutReleasingTheNewOwner() {
