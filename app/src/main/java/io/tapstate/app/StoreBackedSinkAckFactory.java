@@ -450,6 +450,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 return true;
             }
             Landed now = answer.get();
+            // A held load can cap progress in the previous generation. That constructed bound is not a
+            // ring position: only progress at or beyond the recorded load may become a recovery cursor.
+            if (run.snapshotEpoch() != null && !SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
+                return true;
+            }
             Landed before = landed.get(chain);
             // Every writer reports on its own, so this may land after a later report of the table's - which the
             // store, comparing the two, leaves standing.
