@@ -452,6 +452,7 @@ def inputs(args):
              'source_tree': git(root, 'rev-parse', 'HEAD^{tree}'), 'event': os.getenv('GITHUB_EVENT_NAME', 'local'),
              'run_id': os.getenv('GITHUB_RUN_ID', 'local'), 'run_attempt': os.getenv('GITHUB_RUN_ATTEMPT', '1'),
              'captured_at': datetime.now(timezone.utc).isoformat(), 'phase': args.phase,
+             'runner_context': input_runner_snapshot(os.environ, getattr(args, 'shard_id', None)),
              'source_files': source_files, 'production_files': production, 'production_class_ids': class_ids,
              'production_class_access_flags': class_flags, 'jacoco_version': shards.pom(root / 'pom.xml').findtext('properties/plugin.jacoco.version'),
              'test_files': test_files, 'test_class_ids': test_ids,
@@ -480,6 +481,55 @@ BUILD_INPUT_FIELDS = (
     'production_class_access_flags', 'test_files', 'test_class_ids',
     'packaged_outputs', 'resolved_test_classpaths', 'jacoco_version', 'toolchain',
 )
+
+
+def input_runner_snapshot(environment, shard):
+    repository = environment.get('GITHUB_REPOSITORY')
+    if repository is not None:
+        require(isinstance(repository, str) and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository),
+                'invalid input runner repository')
+    if shard is not None:
+        require(isinstance(shard, str) and re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', shard), 'invalid input runner shard')
+    return {'repository': repository, 'shard_id': shard,
+            'workflow_source': workflow_source_snapshot(environment, repository or '')}
+
+
+def input_runner_context(value, name, repository=None):
+    if 'runner_context' not in value:
+        return None
+    context = value['runner_context']
+    require(isinstance(context, dict) and set(context) == {'repository', 'shard_id', 'workflow_source'},
+            'invalid input runner context')
+    repo, shard = context['repository'], context['shard_id']
+    require(repo is None or isinstance(repo, str) and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo),
+            'invalid input runner repository')
+    require(repository is None or repo is None or repo == repository, 'input runner repository differs')
+    require(shard is None or shard == name, 'input runner shard differs: ' + name)
+    require(isinstance(context['workflow_source'], dict), 'invalid input runner workflow object')
+    workflow = workflow_source_fact(context['workflow_source'], repo or '')
+    if workflow['snapshot'] == 'captured':
+        require(repo is not None and shard == name, 'captured input runner requires repository/shard identity')
+        require(workflow['workflow_path'] == '.github/workflows/ci.yml'
+                and workflow['job'] == ('build' if name == 'build' else 'test-shards'),
+                'input runner workflow path/job differs: ' + name)
+    return {**context, 'workflow_source': workflow}
+
+
+def compare_runner_contexts(aggregate, workers):
+    values = {'build': aggregate, **workers}
+    if not any('runner_context' in value for value in values.values()):
+        return None
+    require(all('runner_context' in value for value in values.values()), 'input runner context missing from a current peer')
+    contexts = {name: input_runner_context(value, name) for name, value in values.items()}
+    repositories = {c['repository'] for c in contexts.values() if c['repository'] is not None}
+    require(len(repositories) <= 1, 'input runner repositories differ')
+    captured = [c['workflow_source'] for c in contexts.values() if c['workflow_source']['snapshot'] == 'captured']
+    require(not captured or len(captured) == len(contexts), 'input runner workflow capture missing from a current peer')
+    if captured:
+        fields = ('workflow_ref', 'workflow_sha', 'workflow_path')
+        require(len({tuple(c[k] for k in fields) for c in captured}) == 1, 'input runner workflow declarations differ')
+    return {'status': 'consistent-declarations' if captured else 'unknown-workflow-source',
+            'contexts': contexts, 'source_bytes_verified': False, 'all_workflow_jobs_recorded': False}
 
 
 def compare_input_snapshots(plan, aggregate, workers):
@@ -512,11 +562,15 @@ def compare_input_snapshots(plan, aggregate, workers):
         for path in aggregate['dependency_repository_files'].keys() & available.keys():
             require(aggregate['dependency_repository_files'][path] == available[path],
                     'available dependency bytes differ: ' + name)
-    return dict(schema=1, type='independent-build-input-hashes', source_sha=source,
+    runner = compare_runner_contexts(aggregate, workers)
+    result = dict(schema=1, type='independent-build-input-hashes', source_sha=source,
                 source_tree=aggregate['source_tree'], run_id=run, run_attempt=attempt,
                 cohort_hash=plan['cohort_hash'], shards=ids, compared_fields=list(BUILD_INPUT_FIELDS),
                 declared_input_hashes_equal=True, whole_build_provenance_complete=False,
                 ability_proven=False, raw_bytes_uploaded=False)
+    if runner is not None:
+        result['runner_context'] = runner
+    return result
 
 
 def worker_input_paths(plan, worker_root):
@@ -982,6 +1036,7 @@ def main():
     p.add_argument('--resolve-classpath', action='store_true')
     p.add_argument('--phase', choices=['pre-test-after-install', 'post-test-before-pack'], default='pre-test-after-install')
     p.add_argument('--runtime-class-dir', help='private existing-JaCoCo class dumps in the worker input sibling')
+    p.add_argument('--shard-id', help='explicit current CI shard, or build for the aggregate')
     p = commands.add_parser('compare-inputs')
     p.add_argument('--root', default='.')
     p.add_argument('--plan', required=True)

@@ -64,6 +64,21 @@ The reader requires the current artifact layout:
   merge semantics, stable parameter/provider and ledger identity replay still
   need their dedicated comparison; presence alone cannot certify them.
 
+Current worker and aggregate snapshots also retain `runner_context`: the original
+repository, distinct workflow ref/commit/job declaration, and explicit `shard_id`.
+Both worker phases must keep the same context. Captured contexts require the
+original CI path and producer job (`test-shards` or `build`), distinct matrix IDs,
+and a common workflow ref/commit. Independent archive readback binds the repository
+and shard against its scoped API/plan records. These are runner declarations,
+not proof of workflow bytes, all workflow jobs, or effective compiler inputs.
+
+Legacy snapshots without this field retain their original comparator output so
+sealed records remain replayable. New peers cannot omit one context or replace
+one captured workflow with unknown. Local snapshots missing runner variables stay
+explicitly unknown; do not infer workflow commits from checkout SHA or shard IDs
+from artifact names. Existing install/verify steps and evidence artifacts retain
+their layout, permissions and triggers.
+
 ZIP names are canonical, unique and bounded. Only regular files/directories are
 accepted; links, special modes, encryption, traversal and file-as-parent entries
 reject. The evidence reference reader bounds each raw input to 64 MiB. ZIPs allow

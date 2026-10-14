@@ -301,9 +301,13 @@ def project(refs, root, request):
         inputs = archive.artifact('ci-inputs-' + name)
         raw[name] = inputs['build-inputs.json']
         pre[name] = snapshot(g.json_bytes(raw[name]), scope, checkout, tree, sources, 'pre-test-after-install')
+        g.receipt.input_runner_context(pre[name], name, scope['repository'])
         if name != 'build':
             post[name] = snapshot(g.json_bytes(inputs['post-test-inputs.json']), scope, checkout, tree, sources,
                                   'post-test-before-pack')
+            g.receipt.input_runner_context(post[name], name, scope['repository'])
+            require(pre[name].get('runner_context') == post[name].get('runner_context'),
+                    'post-test runner context differs: ' + name)
             for field in ('production_files', 'production_class_ids', 'resolved_test_classpaths', 'toolchain'):
                 require(pre[name][field] == post[name][field], 'post-test production/dependency/toolchain differs: ' + field)
     equality = g.receipt.compare_input_snapshots(plan, pre['build'], {n: v for n, v in pre.items() if n != 'build'})

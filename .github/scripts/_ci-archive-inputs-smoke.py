@@ -278,6 +278,16 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                 artifacts[artifact][path][field] = value
                 reseal()
 
+            # Post-test records cannot substitute a foreign or partial runner declaration.
+            for context, reason in [(None, 'invalid input runner context'),
+                    ({'repository': 'foreign/project', 'shard_id': 'rest',
+                      'workflow_source': {'snapshot': 'unknown', 'source_bytes_verified': False}}, 'repository differs'),
+                    ({'repository': None, 'shard_id': 'engine',
+                      'workflow_source': {'snapshot': 'unknown', 'source_bytes_verified': False}}, 'shard differs'),
+                    ({'repository': None, 'shard_id': 'rest',
+                      'workflow_source': {'snapshot': 'unknown', 'source_bytes_verified': False}}, 'post-test runner context differs')]:
+                artifacts['ci-inputs-rest']['post-test-inputs.json']['runner_context'] = context
+                reseal(); rejected(project, reason); reset()
             mutate('ci-inputs-rest', 'build-inputs.json', 'source_sha', anchor)
             rejected(project, 'checkout/run/attempt differs')
             reset()

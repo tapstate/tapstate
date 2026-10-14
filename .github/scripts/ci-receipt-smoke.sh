@@ -191,6 +191,8 @@ with tempfile.TemporaryDirectory() as tmp:
         out=timing_root/'inputs.json'
         m.inputs(argparse.Namespace(root=str(timing_root),repo_local=str(repository),output=str(out),resolve_classpath=False,phase='post-test-before-pack',runtime_class_dir=None))
         check(json.loads(out.read_text())['elapsed_seconds']==0.5,'phase timing includes all runtime metadata collection')
+        check(isinstance(json.loads(out.read_text()).get('runner_context'),dict),
+              'actual input recorder must retain the original runner context separately')
     finally:
         m.git,m.command,m.subprocess.run,m.time.monotonic_ns,m.runtime_class_metadata=originals
     # Equal source labels and totals do not excuse different current build bytes.
@@ -244,6 +246,43 @@ with tempfile.TemporaryDirectory() as tmp:
     worker_inputs['rest']['dependency_repository_files']['unused/provider.jar'] = 'e'*64
     check(compare_current()['declared_input_hashes_equal'], 'unused incoming cache extras are disclosed by scope and do not pretend to be resolved inputs')
     worker_inputs = copy.deepcopy(original_workers)
+    # Original job declarations distinguish matrix legs without replacing source identity.
+    legacy_result=compare_current()
+    check('runner_context' not in legacy_result, 'legacy comparator output remains replay-compatible')
+    context_env={'GITHUB_REPOSITORY':'example/project',
+        'GITHUB_WORKFLOW_REF':'example/project/.github/workflows/ci.yml@refs/pull/7/merge',
+        'GITHUB_WORKFLOW_SHA':'d'*40,'GITHUB_JOB':'build'}
+    enriched=copy.deepcopy(prepared);enriched['runner_context']=m.input_runner_snapshot(context_env,'build')
+    enriched_workers=copy.deepcopy(worker_inputs)
+    for name,value in enriched_workers.items():
+        value['runner_context']=m.input_runner_snapshot(dict(context_env,GITHUB_JOB='test-shards'),name)
+    def compare_enriched():return m.compare_input_snapshots(input_plan,enriched,enriched_workers)
+    current=compare_enriched()
+    check(current['runner_context']['status']=='consistent-declarations'
+          and current['runner_context']['contexts']['e2e-1']['shard_id']=='e2e-1'
+          and current['runner_context']['contexts']['engine']['shard_id']=='engine',
+          'matrix legs retain their explicit identities despite sharing the same job ID')
+    check(current['source_sha']=='a'*40 and current['runner_context']['contexts']['build']['workflow_source']['workflow_sha']=='d'*40
+          and not current['runner_context']['source_bytes_verified'] and not current['whole_build_provenance_complete'],
+          'consistent workflow declarations do not alias checkout or certify source bytes')
+    pristine=copy.deepcopy(enriched_workers)
+    for field,wrong in [('shard_id','e2e-1'),('repository','foreign/project'),('workflow_source',None)]:
+        enriched_workers['engine']['runner_context'][field]=wrong
+        rejected(compare_enriched,'foreign or malformed input runner context rejects: '+field)
+        enriched_workers=copy.deepcopy(pristine)
+    for field,wrong in [('workflow_sha','e'*40),('job','build'),('workflow_path','.github/workflows/other.yml')]:
+        enriched_workers['engine']['runner_context']['workflow_source'][field]=wrong
+        rejected(compare_enriched,'different current workflow declaration rejects: '+field)
+        enriched_workers=copy.deepcopy(pristine)
+    enriched_workers['engine'].pop('runner_context')
+    rejected(compare_enriched,'a current producer cannot lose only one peer context')
+    enriched_workers=copy.deepcopy(pristine)
+    enriched_workers['engine']['runner_context']['workflow_source']={'snapshot':'unknown','source_bytes_verified':False}
+    rejected(compare_enriched,'a current producer cannot replace one captured peer with unknown')
+    local=copy.deepcopy(prepared);local['runner_context']=m.input_runner_snapshot({},None)
+    unknown=m.compare_input_snapshots(input_plan,local,{name:copy.deepcopy(local) for name in worker_inputs})
+    check(unknown['runner_context']['status']=='unknown-workflow-source', 'local missing runner declarations stay unknown')
+    rejected(lambda:m.input_runner_snapshot({},'../foreign'),'invalid explicit shard cannot enter input metadata')
     # File selection must distinguish a retained aggregate from current workers.
     worker_root = root / 'worker-inputs'; worker_root.mkdir()
     for shard in input_plan['shards']:

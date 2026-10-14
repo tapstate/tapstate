@@ -45,6 +45,8 @@ def check(workflows, contexts, inputs):
         'build must compare every independent worker input snapshot before report admission'
     shards = ci.get('test-shards', '')
     assert 'fail-fast: false' in shards, 'collect evidence from every shard on failure'
+    assert shards.count('--shard-id "${{ matrix.shard }}"') == 2, 'both input snapshots must declare the actual matrix shard'
+    assert '--shard-id build' in build, 'aggregate inputs must declare their own producer role'
     assert 'ci-shard.sh run' in shards and 'ci-aggregate.sh pack' in shards
     assert 'install' in shards and '-DskipTests' in shards and 'RUNNER_TEMP/m2' in shards
     assert 'if-no-files-found: error' in shards, 'missing shard artifact must fail'
@@ -113,6 +115,8 @@ for original, replacement in [
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
     ('ci-receipt.sh compare-inputs', 'echo input-comparison-removed'),
+    ('--shard-id "${{ matrix.shard }}"', '--shard-id omitted'),
+    ('--shard-id build', '--shard-id omitted'),
     ('pattern: ci-inputs-*', 'pattern: no-worker-inputs'),
     ('    name: sonarqube', '    name: sonar-renamed'),
     ('  test-shards:', '  test-shards:\n    env:\n      CLOUD_SDK_REVISION: unpublished'),
