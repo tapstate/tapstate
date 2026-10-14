@@ -59,6 +59,8 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -83,6 +85,7 @@ import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.mockito.ArgumentMatchers.any;
@@ -234,6 +237,66 @@ class CaptureOwnershipTest {
             assertThat(claims.read(capture).orElseThrow().claim().leaseUntil()).isAfter(before);
             assertThat(a.tailsClosed).as("q still reads the shared tail").hasValue(0);
             assertThat(a.captures.captureFailure("q")).isEmpty();
+        } finally {
+            a.captures.stopCapture("p", false);
+            a.captures.stopCapture("q", false);
+            a.captures.close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aFailedSharedAttachmentDoesNotKeepItsOwnersTailAlive(boolean fatal) {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        Member a = new Member("node-a", store, claims, TTL, new ArrayList<>());
+        try {
+            a.captures.startCapture("p");
+            a.whileOpening = () -> {
+                if (fatal) {
+                    throw new AssertionError("attachment failed");
+                }
+                throw new IllegalStateException("attachment failed");
+            };
+            assertThatThrownBy(() -> a.captures.startCapture("q"))
+                    .isInstanceOf(fatal ? AssertionError.class : IllegalStateException.class)
+                    .hasMessage("attachment failed");
+            assertThat(a.captures.isCapturing("q")).isFalse();
+            assertThat(a.captures.captureFailure("p")).isEmpty();
+            assertThat(a.tailsClosed).hasValue(0);
+
+            a.captures.stopCapture("p", false);
+
+            assertThat(a.tailsClosed).as("the failed attachment no longer retains the tail").hasValue(1);
+            assertThat(claims.read(captureKey(store, "p")).orElseThrow().leased()).isFalse();
+        } finally {
+            a.captures.stopCapture("p", false);
+            a.captures.stopCapture("q", false);
+            a.captures.close();
+        }
+    }
+
+    @Test
+    void anAttachmentCannotOpenOnARetiredTailWhileItsCleanupWaitsForTheCoordinator() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        Member a = new Member("node-a", store, claims, TTL, Duration.ofMillis(20), new ArrayList<>());
+        try {
+            a.captures.startCapture("p");
+            WorkloadClaimKey capture = captureKey(store, "p");
+            synchronized (a.captures) {
+                // Retirement releases the lease before cleanup can enter this monitor.
+                a.captures.runOnlyWhileDriving("q"::equals);
+                awaitCaptureCondition(() -> !claims.read(capture).orElseThrow().leased());
+
+                assertThatThrownBy(() -> a.captures.startCapture("q"))
+                        .isInstanceOfSatisfying(TapstateException.class, refused ->
+                                assertThat(refused.code()).isEqualTo(CaptureError.CLAIM_LOST));
+                assertThat(a.starts).containsExactly("node-a p opened the tail");
+                assertThat(a.captures.isCapturing("q")).isFalse();
+            }
+            awaitCaptureCondition(() -> a.tailsClosed.get() == 1);
+            assertThat(a.captures.captureFailure("p")).isPresent();
         } finally {
             a.captures.stopCapture("p", false);
             a.captures.stopCapture("q", false);
@@ -413,11 +476,8 @@ class CaptureOwnershipTest {
         assertThat(actuation.permit(pipelineId).granted()).isFalse();
     }
 
-    private static void awaitCaptureCondition(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(1).toNanos();
-        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
-            Thread.sleep(2);
-        }
+    private static void awaitCaptureCondition(BooleanSupplier condition) {
+        await().atMost(Duration.ofSeconds(1)).pollInterval(Duration.ofMillis(2)).until(condition::getAsBoolean);
     }
 
     @Test

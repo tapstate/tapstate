@@ -30,7 +30,7 @@ final class CaptureClaimLease implements AutoCloseable {
     private Runnable lost;
     /** Whether the claim was lost while nothing was bound to answer for it yet. Guarded by this. */
     private boolean lostUnanswered;
-    private volatile BooleanSupplier needed = () -> true;
+    private final AtomicReference<BooleanSupplier> needed = new AtomicReference<>(() -> true);
 
     private CaptureClaimLease() {
         this.ownership = null;
@@ -86,7 +86,7 @@ final class CaptureClaimLease implements AutoCloseable {
 
     /** An opened capture outlives its opener only while it still serves a pipeline driven here. */
     void whileNeeded(BooleanSupplier needed) {
-        this.needed = Objects.requireNonNull(needed, "needed");
+        this.needed.set(Objects.requireNonNull(needed, "needed"));
     }
 
     /** Reserves an attachment before its potentially blocking open, atomically with retiring this lease. */
@@ -103,7 +103,7 @@ final class CaptureClaimLease implements AutoCloseable {
             return;
         }
         try {
-            if (!needed.getAsBoolean()) {
+            if (!needed.get().getAsBoolean()) {
                 lose(true);
                 if (closed.get()) {
                     return;
@@ -131,7 +131,7 @@ final class CaptureClaimLease implements AutoCloseable {
         Runnable action;
         synchronized (this) {
             // A new driven attachment may have reserved the tail since the renewer's first look.
-            if ((release && needed.getAsBoolean()) || !closed.compareAndSet(false, true)) {
+            if ((release && needed.get().getAsBoolean()) || !closed.compareAndSet(false, true)) {
                 return;
             }
             action = lost;

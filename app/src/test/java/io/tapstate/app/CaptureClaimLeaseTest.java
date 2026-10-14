@@ -27,6 +27,44 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CaptureClaimLeaseTest {
 
     @Test
+    void aRetiredLeaseRefusesAttachmentsAndCannotRenewItsReleasedClaim() {
+        InMemoryWorkloadClaimStore raw = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership("cluster-a", new WorkloadOwner("node-a", "boot-a"),
+                gate, new ClusterWorkloadClaims(raw, gate), Duration.ofSeconds(30));
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        AtomicInteger stopped = new AtomicInteger();
+        AtomicBoolean reserved = new AtomicBoolean();
+        CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), Duration.ofHours(1),
+                stopped::incrementAndGet);
+        try {
+            lease.whileNeeded(() -> false);
+            lease.renew();
+
+            assertThat(raw.read(permit.claim().key()).orElseThrow().leased()).isFalse();
+            assertThat(lease.retain(() -> reserved.set(true))).isFalse();
+            assertThat(reserved).as("a retired tail cannot reserve a new attachment").isFalse();
+            lease.whileNeeded(() -> true);
+            lease.renew();
+            assertThat(raw.read(permit.claim().key()).orElseThrow().leased())
+                    .as("a later ownership observation cannot revive a retired lease").isFalse();
+            assertThat(stopped).hasValue(1);
+        } finally {
+            lease.close();
+        }
+    }
+
+    @Test
+    void anUnfencedTailCanReserveAttachmentsWithoutAClusterLease() {
+        CaptureClaimLease lease = CaptureClaimLease.unfenced();
+        AtomicBoolean reserved = new AtomicBoolean();
+
+        assertThat(lease.retain(() -> reserved.set(true))).isTrue();
+        assertThat(reserved).isTrue();
+        lease.close();
+    }
+
+    @Test
     void anAttachmentThatPreventsRetirementStillGetsTheRenewalDueOnThatPass() {
         InMemoryWorkloadClaimStore raw = new InMemoryWorkloadClaimStore();
         ClusterMembershipGate gate = eligibleGate();
