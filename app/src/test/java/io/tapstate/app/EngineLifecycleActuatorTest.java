@@ -242,6 +242,71 @@ class EngineLifecycleActuatorTest {
         }
     }
 
+    @Test
+    void aCaptureWaitDoesNotHideAFailedRunSubmittedByAnotherOwner() {
+        Engine engine = new Engine(member);
+        DAG failingDag = new DAG();
+        failingDag.newVertex("serve.sync_1", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of(() -> {
+                    throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
+                            Map.of("pipeline", PIPE), null);
+                })));
+        engine.submit(PIPE, failingDag);
+        Job previous = member.getJet().getJob(PIPE);
+        awaitStatus(previous, JobStatus.FAILED);
+
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        AtomicLong nanos = new AtomicLong();
+        PipelineActuationOwnership ownerA = clusteredOwnership(claims, nanos::get, "node-a");
+        PipelineActuationOwnership ownerB = clusteredOwnership(claims, nanos::get, "node-b");
+        RecordingCaptureCoordinator captures = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
+        captures.givesTheStartBack = true;
+        List<String> events = new CopyOnWriteArrayList<>();
+        EngineLifecycleActuator actuatorA = new EngineLifecycleActuator(
+                engine, new RecordingDagSource(events), captures, teardown(), ownerA);
+        InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
+        Clock clock = Clock.systemUTC();
+        store.state().create(PIPE, StateJson.of(PipelineState.STOPPED), clock.instant());
+        store.desired().save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        PipelineConverger converger = new PipelineConverger(store.desired(), store.state(), actuatorA, clock);
+
+        assertThat(ownerA.permit(PIPE).granted()).isTrue();
+        ConvergeResult waiting = converger.converge(PIPE);
+        assertThat(StateJson.parse(waiting.checkpoint().orElseThrow().stateJson()))
+                .isEqualTo(PipelineState.RUNNING);
+        assertThat(actuatorA.failure(PIPE)).as("the deferred start ignores the previous job").isEmpty();
+        assertThat(events).as("A submitted no replacement job").isEmpty();
+        long waitingGeneration = ownerA.heldExecutionGeneration(PIPE);
+
+        // A's lease expires, B takes the claim and submits a different run under the same pipeline name.
+        Duration expiry = Duration.ofSeconds(31);
+        claims.elapse(expiry);
+        nanos.addAndGet(expiry.toNanos());
+        assertThat(ownerB.permit(PIPE).granted()).isTrue();
+        assertThat(ownerA.permit(PIPE).granted()).isFalse();
+        assertThat(ownerB.beginExecution(PIPE).allowed()).isTrue();
+        engine.submit(PIPE, failingDag);
+        Job replacement = member.getJet().getJob(PIPE);
+        assertThat(replacement.getId()).isNotEqualTo(previous.getId());
+        awaitStatus(replacement, JobStatus.FAILED);
+
+        // A takes B's execution back without a local submission or stop to clear its capture wait.
+        claims.elapse(expiry);
+        nanos.addAndGet(expiry.toNanos());
+        assertThat(ownerA.permit(PIPE).granted()).isTrue();
+        assertThat(ownerA.heldExecutionGeneration(PIPE)).isGreaterThan(waitingGeneration);
+        ConvergeResult failed = converger.converge(PIPE);
+
+        assertThat(failed.failure()).as("B's failure must reach the current driver")
+                .hasValueSatisfying(cause -> assertThat(cause)
+                        .hasMessageContaining(EngineError.EXECUTION_NOT_AUTHORIZED.code()));
+        assertThat(StateJson.parse(store.state().read(PIPE).orElseThrow().stateJson()))
+                .isEqualTo(PipelineState.FAILED);
+        assertThat(events).as("A must report failure instead of retrying the start").isEmpty();
+        assertThat(member.getJet().getJobs()).extracting(Job::getId)
+                .containsExactlyInAnyOrder(previous.getId(), replacement.getId());
+    }
+
     /**
      * A start on a member that still has a capture open for the pipeline, with no job carrying it, closes that
      * capture before it opens one. The capture was left by a run that ended without a stop -- a job lost with a

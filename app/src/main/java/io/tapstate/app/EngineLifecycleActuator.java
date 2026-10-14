@@ -64,7 +64,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final ExecutionPlanRecorder plans;
     private final Clock clock;
     private final ConnectorReadiness connectors;
-    private final Set<String> waitingForCapture = ConcurrentHashMap.newKeySet();
+    private final Map<String, Long> waitingForCapture = new ConcurrentHashMap<>();
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
@@ -172,7 +172,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
             // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
             // being opened on another member, and how long that may take is bounded where it is decided.
-            waitingForCapture.add(pipelineId);
+            waitingForCapture.put(pipelineId,
+                    execution.fence() == null ? 0L : execution.fence().executionGeneration());
             return;
         }
         // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
@@ -271,10 +272,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public Optional<Throwable> failure(String pipelineId) {
-        // A deferred start submitted no job of its own. Jet still names the previous terminal job, whose
-        // failure cannot end this start's capture wait. Capture failures and a lost engine still surface.
-        if (waitingForCapture.contains(pipelineId) && !engine.isLost()) {
+        // A deferred start submitted no job of its own. Ignore the previous terminal job only while the
+        // claim still carries that start's execution: another holder's replacement run can fail normally.
+        // Capture failures and a lost engine still surface.
+        Long waitingGeneration = waitingForCapture.get(pipelineId);
+        if (waitingGeneration != null && waitingGeneration == actuation.heldExecutionGeneration(pipelineId)
+                && !engine.isLost()) {
             return captureCoordinator.captureFailure(pipelineId);
+        }
+        if (waitingGeneration != null) {
+            waitingForCapture.remove(pipelineId, waitingGeneration);
         }
         // A pipeline fails two ways the converge loop must see as one: the Jet job itself dies (engine), or the
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
