@@ -508,10 +508,11 @@ jobs:
           fetch-depth: 0
       - name: CI evidence and durable receipt controls
         run: |
-          shellcheck .github/scripts/ci-evidence.sh .github/scripts/ci-evidence-smoke.sh .github/scripts/ci-receipt.sh .github/scripts/ci-receipt-smoke.sh
-          python3 -m py_compile .github/scripts/_ci-evidence.py .github/scripts/_ci-receipt.py
+          shellcheck .github/scripts/ci-evidence.sh .github/scripts/ci-evidence-smoke.sh .github/scripts/ci-receipt.sh .github/scripts/ci-receipt-smoke.sh .github/scripts/ci-pr-groups.sh .github/scripts/ci-pr-groups-smoke.sh
+          python3 -m py_compile .github/scripts/_ci-evidence.py .github/scripts/_ci-receipt.py .github/scripts/_ci-pr-groups.py
           bash .github/scripts/ci-evidence-smoke.sh
           bash .github/scripts/ci-receipt-smoke.sh
+          bash .github/scripts/ci-pr-groups-smoke.sh
       - name: shellcheck the catalog scripts
         # One invocation over all four rather than a line each: a `run: |` block runs under bash -e,
         # so the first script to report anything aborts the step and the ones after it are never
