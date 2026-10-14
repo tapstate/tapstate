@@ -1428,6 +1428,16 @@ jobs:
           node scripts/seal-cloud-artifact.mjs open \
             --input "$RUNNER_TEMP/cloud-image/cloud-image.enc" \
             --output "$RUNNER_TEMP/cloud-image/cloud-image.tar" --context "$ARTIFACT_CONTEXT"
+      # An explicitly selected release source can predate this workflow's notification helper.
+      - name: load Cloud notification tooling from the workflow revision
+        if: needs.version.outputs.is_latest == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: cloud-release-tooling
+          sparse-checkout: scripts/notify-cloud-release.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: publish the checked public Cloud release image
         id: image
         env:
@@ -1462,7 +1472,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/notify-cloud-release.mjs | tee -a "$GITHUB_STEP_SUMMARY"
+          node cloud-release-tooling/scripts/notify-cloud-release.mjs | tee -a "$GITHUB_STEP_SUMMARY"
 
 
   roadmap:

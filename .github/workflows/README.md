@@ -42,6 +42,9 @@ the image and release have already been published at that point. The API is
 not idempotent: a timeout may have committed, and a 409 requires reconciling the
 existing catalog entry before retrying. The notification never retries a POST
 or treats a 409 as success without comparing the existing entry.
+The helper is loaded from the workflow's commit in a separate sparse checkout,
+so selecting an earlier product commit does not lose the notification tooling.
+The approved image and its source revision still come from the selected release.
 
 Choose a location for new work before adding a workflow:
 
