@@ -95,15 +95,29 @@ class PipelineStatusResponseTest {
     }
 
     @Test
-    void usesTheDesiredStateUntilTheRuntimePublishesAnObservation() {
+    void usesNewStateUntilTheRuntimePublishesAnObservation() {
         PipelineCatalogItem item = catalogItem(PipelineCatalogItem.UiState.STARTING,
                 PipelineState.RUNNING, null);
 
         PipelineStatusResponse response = PipelineStatusResponse.of(item, catalog);
 
-        assertThat(response.state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(response.state()).isEqualTo(PipelineState.NEW);
         assertThat(response.desiredState()).isEqualTo(PipelineState.RUNNING);
         assertThat(response.observedState()).isNull();
+        assertThat(response.observedAt()).isNull();
+        assertThat(response.observedAgeMillis()).isNull();
+    }
+
+    @Test
+    void catalogProjectionPreservesTheAgeOfAnExistingObservation() {
+        PipelineCatalogItem item = catalogItem(PipelineCatalogItem.UiState.RUNNING,
+                PipelineState.RUNNING, PipelineState.RUNNING);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(item, catalog,
+                Clock.fixed(OBSERVED_AT.plusSeconds(30), ZoneOffset.UTC));
+
+        assertThat(response.observedAt()).isEqualTo(OBSERVED_AT);
+        assertThat(response.observedAgeMillis()).isEqualTo(30_000L);
     }
 
     @Test
@@ -121,7 +135,8 @@ class PipelineStatusResponseTest {
     private static PipelineCatalogItem catalogItem(PipelineCatalogItem.UiState displayState,
             PipelineState desiredState, PipelineState observedState) {
         PipelineCatalogItem.Status status = new PipelineCatalogItem.Status(
-                PipelineCatalogItem.DisplayState.NEW, displayState, desiredState, observedState, null, OBSERVED_AT);
+                PipelineCatalogItem.DisplayState.NEW, displayState, desiredState, observedState, null,
+                observedState == null ? null : OBSERVED_AT);
         return new PipelineCatalogItem("orders", "Orders", null, "cdc", null, OBSERVED_AT,
                 "content-hash", false, status);
     }

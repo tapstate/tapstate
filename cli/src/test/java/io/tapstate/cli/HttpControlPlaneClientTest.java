@@ -1661,6 +1661,34 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void aggregateStatusUsesObservedStateInsteadOfTheCatalogState() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"displayState\":\"PAUSED\","
+                        + "\"desiredState\":\"PAUSED\",\"observedState\":\"RUNNING\",\"hasArtifact\":true}",
+                new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new StatusOutcome.Found("pl1", "RUNNING"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aggregateStatusWithNoObservationDoesNotFabricateARuntimeState() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"displayState\":\"STARTING\","
+                        + "\"desiredState\":\"RUNNING\",\"hasArtifact\":true}",
+                new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new StatusOutcome.NoObservation());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void statusCarriesTheCodedFailureOfAPipelineWhoseJobDied() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/status", 200,

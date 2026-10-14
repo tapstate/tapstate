@@ -15,8 +15,9 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * The wire shape of the latest actual Pipeline observation. Optional UI metadata qualifies the observation
- * while state, failure, and observation time remain the runtime facts consumed by existing clients.
+ * The wire shape of a Pipeline status read. {@code state}, failure, and observation time describe runtime
+ * facts; before the first runtime observation, state is {@code NEW} and {@code observedState} is absent.
+ * {@code desiredState} and {@code displayState} separately describe lifecycle intent and its UI projection.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record PipelineStatusResponse(
@@ -67,18 +68,18 @@ record PipelineStatusResponse(
                 runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance());
     }
 
-    /** Builds a merged status for an authoring or applied Pipeline before its first runtime observation. */
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
+        return of(item, catalog, Clock.systemUTC());
+    }
+
+    /** Builds a catalog status without inventing a runtime observation when none has been published yet. */
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock) {
         PipelineCatalogItem.Status status = item.status();
-        PipelineState state = PipelineState.NEW;
-        if (status.desiredState() != null) {
-            state = status.desiredState();
-        }
-        if (status.observedState() != null) {
-            state = status.observedState();
-        }
+        PipelineState state = status.observedState() == null ? PipelineState.NEW : status.observedState();
+        Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(item.id(), state, status.displayState(),
-                failure(status.failure(), catalog), status.observedAt(), null,
+                failure(status.failure(), catalog), observedAt, observedAt == null ? null
+                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 status.desiredState(), status.observedState(), item.hasArtifact(), null, null);
     }
 

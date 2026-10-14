@@ -102,12 +102,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * server prints, and a document sent back with most of it left out still binds. Every other case for that
  * face constructs the record in memory, where both of those are true by construction.
  *
- * <p>The original three:
- * status / metrics / snapshot, each a {@code GET} on a pipeline instance ({@code GET
- * /api/pipelines/{id}/status}). It proves the reads round-trip through the real query service (over an
- * in-memory observation store), that a read of a pipeline that has published no observation surfaces as a
- * 404 with the {@code monitor.no-observation} coded body rather than a bare 500, that the interceptor
- * guards a read like any other verb, and that the three read endpoints are a derivation of the registry.
+ * <p>Status returns a catalog projection for a known authoring draft or applied pipeline, with {@code state}
+ * remaining the observed runtime state (or {@code NEW} before the first observation). Metrics, snapshot, and
+ * explanation still return {@code monitor.no-observation} when runtime data is not yet available. The tests
+ * prove the reads round-trip through the real query service, that an unknown id returns the permanent coded
+ * error, that the interceptor guards a read like any other verb, and that read endpoints derive from the registry.
  * The context is booted programmatically so the module stays on the reactor's JUnit line; it imports the
  * read controller with the path configuration and the interceptor, so it exercises the guarded read path.
  */
@@ -573,6 +572,8 @@ class PipelineObservationApiTest {
 
     @Test
     void aReadOfAPipelineThatWasNeverAppliedIsNotFoundAndSaysSo() {
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        observations.clear();
         ApiError body = client().get().uri("/api/pipelines/ghost/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .exchange((request, response) -> {
@@ -584,10 +585,11 @@ class PipelineObservationApiTest {
         // wait out its whole bound on what is almost always a mistyped id.
         assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
         assertThat(body.params()).containsEntry("pipeline", "ghost");
+        assertThat(observations.reads()).isEqualTo(1);
     }
 
     @Test
-    void aReadOfAnAppliedPipelineThatHasNotConvergedReturnsItsMergedStartingState() {
+    void aReadOfAnAppliedPipelineThatHasNotConvergedKeepsStateUnobservedAndShowsStarting() {
         context.getBean(FakeObservationStore.class).clear();
         context.getBean(FakeStoppedPipelines.class).intent("pl1", PipelineState.RUNNING);
 
@@ -595,11 +597,25 @@ class PipelineObservationApiTest {
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .retrieve().body(new ParameterizedTypeReference<>() {});
 
-        assertThat(body).containsEntry("state", "RUNNING")
+        assertThat(body).containsEntry("state", "NEW")
                 .containsEntry("displayState", "STARTING")
                 .containsEntry("desiredState", "RUNNING")
                 .containsEntry("hasArtifact", true)
                 .doesNotContainKey("observedState");
+    }
+
+    @Test
+    void aCatalogStatusUsesItsCarriedObservationWithoutReadingItAgain() {
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        observations.clear();
+        observations.save(PL1);
+
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<>() {});
+
+        assertThat(body).containsEntry("state", "RUNNING").containsEntry("observedState", "RUNNING");
+        assertThat(observations.reads()).isEqualTo(1);
     }
 
     @Test
@@ -791,6 +807,8 @@ class PipelineObservationApiTest {
 
     /** An in-memory observation store, last write wins per pipeline id, seedable. */
     static final class FakeObservationStore implements ObservationStore {
+        private int readCount;
+
         @Override
         public void delete(String pipelineId) {
             throw new UnsupportedOperationException("removal is not exercised by this double");
@@ -800,6 +818,11 @@ class PipelineObservationApiTest {
 
         void clear() {
             byId.clear();
+            readCount = 0;
+        }
+
+        int reads() {
+            return readCount;
         }
 
         @Override
@@ -809,6 +832,7 @@ class PipelineObservationApiTest {
 
         @Override
         public Optional<Observation> read(String pipelineId) {
+            readCount++;
             return Optional.ofNullable(byId.get(pipelineId));
         }
     }

@@ -91,11 +91,26 @@ public final class PipelineObservationQueryService {
     /** Returns an observed status with its current execution plan, without requiring an observation to exist. */
     public Optional<PipelineStatus> findStatusWithPlan(String pipelineId) {
         Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
-        return observations.read(pipelineId).map(observation -> {
-            ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
-            return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
-                    observation.observedAt(), plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
-        });
+        return observations.read(pipelineId).map(observation -> withCurrentPlan(
+                new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
+                        observation.observedAt()), pipelineId));
+    }
+
+    /** Returns the status already carried by a catalog item with the current run plan, without rereading it. */
+    public Optional<PipelineStatus> findStatusWithPlan(PipelineCatalogItem item) {
+        Objects.requireNonNull(item, "item");
+        PipelineCatalogItem.Status status = item.status();
+        if (status.observedState() == null) {
+            return Optional.empty();
+        }
+        return Optional.of(withCurrentPlan(new PipelineStatus(item.id(), status.observedState(), status.failure(),
+                status.observedAt()), item.id()));
+    }
+
+    private PipelineStatus withCurrentPlan(PipelineStatus status, String pipelineId) {
+        ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+        return new PipelineStatus(status.pipelineId(), status.state(), status.failure(), status.observedAt(), plan,
+                plan == null ? List.of() : plan.notPlannedFor(members.get()));
     }
 
     /**

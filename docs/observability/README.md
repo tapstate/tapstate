@@ -22,13 +22,20 @@ pipeline. The history and explanation responses, including coded errors, carry
 
 | Question | REST | CLI | MCP |
 |---|---|---|---|
-| What lifecycle state was last observed? | `GET /api/pipelines/{id}/status` | `status <id>` | `pipeline_status` |
+| What runtime state was last observed, and what is the current intent? | `GET /api/pipelines/{id}/status` | `status <id>` | `pipeline_status` |
 | What are the current counters and positions? | `GET /api/pipelines/{id}/metrics` | `metrics <id>` | `pipeline_metrics` |
 | How far has the initial snapshot loaded? | `GET /api/pipelines/{id}/snapshot` | `snapshot <id>` | `pipeline_snapshot` |
 | What did this node log for the pipeline? | `GET /api/pipelines/{id}/logs` | `logs <id>` | `pipeline_logs` |
 | How did output rate and selected table lag change? | `GET /api/pipelines/{id}/metrics/history` | `metrics <id> --from ... --to ...` | `pipeline_metrics_history` |
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
 | How wide does each node of the current run run, and why? | `plan` in `GET /api/pipelines/{id}/status` or `.../explain` | `explain <id>` or `status <id>` | `pipeline_status` or `pipeline_explain` |
+
+The status response keeps `state` tied to runtime observation. Before the first observation, a known
+pipeline returns `state: "NEW"` and omits `observedState`; `desiredState` carries the requested lifecycle
+target and `displayState` may say `STARTING`, `PAUSING`, or another in-progress presentation. A saved draft
+also has a status response, with `displayState: "DRAFT"` and `hasArtifact: false`. Reads that need runtime
+data, such as metrics, snapshot, and explain, continue to return `monitor.no-observation` until the first
+observation is published.
 
 The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
 confirmed progress even when it skips reading that table again. Once the target confirms the load,
@@ -327,7 +334,7 @@ Every coded REST error is `{code, params, message}` and carries `Cache-Control: 
 | 400 | `monitor.query-budget-exceeded` | Narrow the range or select fewer table series. |
 | 401/403 | `control.unauthenticated` / `control.forbidden` | Supply a valid read-scoped credential. |
 | 404 | `lifecycle.unknown-pipeline` | Check the id and apply the pipeline first. |
-| 404 | `monitor.no-observation` | The pipeline exists; wait for its first observation and retry current reads. |
+| 404 | `monitor.no-observation` | The pipeline exists; wait for its first observation before retrying reads that require runtime data. |
 | 410 | `monitor.cursor-expired` | Start a new history query; do not resume the old walk. |
 
 A 200 `NO_RETAINED_SAMPLES` history response is different from every error above. So is an absent

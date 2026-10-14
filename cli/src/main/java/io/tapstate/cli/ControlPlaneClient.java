@@ -227,9 +227,9 @@ interface ControlPlaneClient extends AutoCloseable {
 
     /**
      * Reads a pipeline's lifecycle state via {@code GET {baseUrl}/api/pipelines/{pipelineId}/status},
-     * authenticated by the bearer {@code credential}: the state on success, a coded rejection when the
-     * server refuses (a pipeline with no published observation is {@code monitor.no-observation}), or
-     * unreachable on any I/O failure. Never throws.
+     * authenticated by the bearer {@code credential}: the observed state on success, no-observation when a
+     * known aggregate status has not yet published runtime state, a coded rejection when the server refuses,
+     * or unreachable on any I/O failure. Never throws.
      */
     StatusOutcome status(URI baseUrl, String credential, String pipelineId);
 

@@ -54,6 +54,18 @@ class ControlPlaneTest {
     }
 
     @Test
+    void absentObservationTimeAndAgeAreEmptyOnAggregateStatus() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "NEW",
+                "displayState", "STARTING",
+                "desiredState", "RUNNING"));
+
+        assertThat(ControlPlane.interpretObservedAt(200, body, PIPELINE)).isEmpty();
+        assertThat(ControlPlane.interpretObservedAgeMillis(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
     void readsTheProductsOwnNoObservationCodeAsNothingPublishedYet() {
         assertThat(ControlPlane.interpretState(404, coded(MonitorError.NO_OBSERVATION.code()), PIPELINE))
                 .isEmpty();
@@ -423,7 +435,8 @@ class ControlPlaneTest {
     }
 
     private static String status(String state) {
-        return JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", state));
+        return JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", state,
+                "displayState", state, "observedState", state));
     }
 
     private static String metrics(long errorCount) {

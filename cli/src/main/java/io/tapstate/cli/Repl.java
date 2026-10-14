@@ -1527,6 +1527,7 @@ final class Repl {
                 }
             }
             if (outcome instanceof StatusOutcome.Rejected
+                    || outcome instanceof StatusOutcome.NoObservation
                     || System.nanoTime() - deadline >= 0
                     || !sleepUnlessCancelled(PAUSE_SETTLE_POLL)) {
                 return seen;
@@ -1681,8 +1682,16 @@ final class Repl {
         return switch (outcome) {
             case StatusOutcome.Found found -> carryOnFrom(id, found.state());
             case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case StatusOutcome.NoObservation ignored -> reportNoObservationForRestart(id);
             case StatusOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    private int reportNoObservationForRestart(String id) {
+        PrintWriter err = commandLine.getErr();
+        err.println("restart: " + id + " has not published a runtime state yet; retry after its first observation");
+        err.flush();
+        return Cli.EXIT_DIAGNOSTIC;
     }
 
     /** The plain restart, once the pipeline's state says which sequence carrying on actually is. */

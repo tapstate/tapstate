@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.messages.MessageCatalog;
@@ -58,6 +59,7 @@ public class PipelineStreamConfiguration {
     WebSocketConfigurer pipelineStreamEndpoints(
             TaskScheduler pipelineStreamScheduler,
             PipelineObservationQueryService observations,
+            PipelineCatalogService pipelines,
             PipelineLogQueryService logs,
             CredentialAuthenticator credentials,
             MessageCatalog catalog,
@@ -65,7 +67,9 @@ public class PipelineStreamConfiguration {
         return registry -> {
             registry.addHandler(
                             new PipelineStatusWatchHandler(
-                                    observations, catalog, pipelineStreamScheduler, pollInterval),
+                                    observations,
+                                    id -> pipelines.find(id).filter(item -> !item.hasArtifact()).isPresent(),
+                                    catalog, pipelineStreamScheduler, pollInterval),
                             "/api/pipelines/*/status/watch")
                     .addInterceptors(new PipelineStreamHandshakeInterceptor(
                             credentials, ControlOperations.PIPELINE_STATUS));
