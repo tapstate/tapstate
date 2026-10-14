@@ -129,3 +129,9 @@ using this as an impact review input.
 This helper performs no source recovery. Use [ci-variants](ci-variants.md) for
 ordinary-commit construction, serial archive readback and owned-source recovery.
 Real case/control and final native verification remain separate steps.
+
+The separate [PR instance candidate archive](ci-pr-instances.md) preserves frozen
+head and bounded PR-target run/attempt/job/check records by ID, with independent
+raw JSON replay. Matching PR refs and same-name contexts still do not prove
+original event membership or trigger applicability; all R/G and sample proof
+flags remain false.
