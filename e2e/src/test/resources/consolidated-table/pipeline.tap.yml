@@ -1,0 +1,12 @@
+version: tapstate/v1
+kind: pipeline
+id: consolidated_orders
+source: [ src_left, src_right ]
+transforms:
+  - id: consolidate
+    from: [ src_left.orders, src_right.orders ]
+    type: union
+view:
+  id: orders_all
+  from: consolidate
+  primary_key: id

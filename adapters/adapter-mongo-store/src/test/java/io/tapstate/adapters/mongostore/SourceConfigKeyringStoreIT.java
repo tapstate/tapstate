@@ -6,9 +6,9 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoException;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandFailedEvent;
-import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
@@ -18,6 +18,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -92,6 +93,91 @@ class SourceConfigKeyringStoreIT {
         String encrypted = firstCipher.encrypt("orders", "mysql", "{\"password\":\"secret\"}");
         assertThat(secondCipher.decrypt("orders", "mysql", encrypted))
                 .isEqualTo("{\"password\":\"secret\"}");
+    }
+
+    @Test
+    void concurrentSourceCreatesWaitForTheKeyringFenceWithoutReplacingTheWinner() throws Exception {
+        MongoDatabase database = freshDatabase("keyring_source_create_race");
+        new SourceConfigKeyringStore(client, database).loadOrCreateCipher();
+        CountDownLatch fenced = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch conflicts = new CountDownLatch(3);
+        AtomicInteger fenceRequest = new AtomicInteger(-1);
+        AtomicReference<Throwable> hookFailure = new AtomicReference<>();
+        CommandListener holdFence = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (!"update".equals(event.getCommandName())) return;
+                var update = event.getCommand().getArray("updates").get(0).asDocument().getDocument("u");
+                if (update.containsKey("$inc") && update.getDocument("$inc").containsKey("sourceWriteFence")) {
+                    fenceRequest.set(event.getRequestId());
+                }
+            }
+
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                if (event.getRequestId() != fenceRequest.get()) return;
+                fenced.countDown();
+                try {
+                    if (!release.await(10, TimeUnit.SECONDS)) throw new AssertionError("Source fence was not released");
+                } catch (Throwable failure) {
+                    hookFailure.set(failure);
+                    if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+                }
+            }
+        };
+        CommandListener observeConflicts = new CommandListener() {
+            @Override public void commandFailed(CommandFailedEvent event) {
+                if (event.getThrowable() instanceof MongoException error && error.getCode() == 112
+                        && error.hasErrorLabel("TransientTransactionError")) {
+                    conflicts.countDown();
+                }
+            }
+        };
+        String uri = REPLICA_SET.getReplicaSetUrl(database.getName());
+        MongoClientSettings holdingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(uri)).addCommandListener(holdFence).build();
+        MongoClientSettings waitingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(uri)).addCommandListener(observeConflicts).build();
+        Resource winnerSource = new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: managed_views
+                connector: mongodb
+                config: { uri: winner-config-sentinel }
+                """);
+        Resource losingSource = new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: managed_views
+                connector: mongodb
+                config: { uri: losing-config-sentinel }
+                """);
+        try (MongoClient holding = MongoClients.create(holdingSettings);
+                MongoClient waiting = MongoClients.create(waitingSettings)) {
+            MongoDatabase holdingDatabase = holding.getDatabase(database.getName());
+            MongoDatabase waitingDatabase = waiting.getDatabase(database.getName());
+            MongoArtifactStore winner = new MongoArtifactStore(holding, SystemCollections.ARTIFACTS.on(holdingDatabase),
+                    new SourceConfigKeyringHandle(new SourceConfigKeyringStore(holding, holdingDatabase)));
+            MongoArtifactStore loser = new MongoArtifactStore(waiting, SystemCollections.ARTIFACTS.on(waitingDatabase),
+                    new SourceConfigKeyringHandle(new SourceConfigKeyringStore(waiting, waitingDatabase)));
+            CompletableFuture<ArtifactMutation> creating = CompletableFuture.supplyAsync(() -> winner.create(winnerSource));
+            CompletableFuture<ArtifactMutation> contending = null;
+            try {
+                assertThat(fenced.await(5, TimeUnit.SECONDS)).as("the first Source transaction owns the fence").isTrue();
+                contending = CompletableFuture.supplyAsync(() -> loser.create(losingSource));
+                // Keep the real write conflict alive across the former retry limit, then let the holder commit.
+                assertThat(conflicts.await(5, TimeUnit.SECONDS)).as("three real transient write conflicts occurred").isTrue();
+                release.countDown();
+                assertThat(creating.get(5, TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.CREATED);
+                assertThat(contending.get(5, TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+                assertThat(loser.get(winnerSource.id())).contains(winnerSource);
+                assertThat(SystemCollections.ARTIFACTS.on(database).countDocuments()).isEqualTo(1);
+                assertThat(hookFailure.get()).isNull();
+            } finally {
+                release.countDown();
+                creating.handle((result, failure) -> null).get(5, TimeUnit.SECONDS);
+                if (contending != null) contending.handle((result, failure) -> null).get(5, TimeUnit.SECONDS);
+            }
+        }
     }
 
     @Test

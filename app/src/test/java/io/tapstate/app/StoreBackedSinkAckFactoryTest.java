@@ -89,6 +89,40 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
+    void qualifiedStreamsKeepIndependentProgressUnderTheirPhysicalTableNames() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-left", null);
+        store.create("mc-right", null);
+        String left = SrsConsumerId.of("pipe", "left").value();
+        String right = SrsConsumerId.of("pipe", "right").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "left.orders", new StoreBackedSinkAckFactory.SourceProgress(
+                        "mc-left", left, ConsumerProgressKind.SRS, "orders"),
+                "left.items", new StoreBackedSinkAckFactory.SourceProgress(
+                        "mc-left", left, ConsumerProgressKind.SRS, "items"),
+                "right.orders", new StoreBackedSinkAckFactory.SourceProgress(
+                        "mc-right", right, ConsumerProgressKind.SRS, "orders"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, "pipe", "run");
+        factory.beginRun(member, Map.of("left.orders", List.of("view"), "left.items", List.of("view"),
+                "right.orders", List.of("view")));
+        assertThat(store.writerRun("mc-left", left).orElseThrow().expected())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", List.of("view"), "items", List.of("view")));
+        SinkAck ack = factory.resolve(member).forWriter("view");
+
+        ack.advance("left.orders", at(7, "left-7"));
+        assertThat(store.ringDoneThrough("mc-left", left)).containsExactlyEntriesOf(Map.of("orders", 7L));
+        assertThat(store.ringDoneThrough("mc-right", right)).isEmpty();
+        ack.advance("right.orders", at(3, "right-3"));
+
+        assertThat(store.ringDoneThrough("mc-left", left)).containsExactlyEntriesOf(Map.of("orders", 7L));
+        assertThat(store.ringDoneThrough("mc-right", right)).containsExactlyEntriesOf(Map.of("orders", 3L));
+        var floor = new StoreBackedReplayFloorFactory(progress).resolve(member);
+        assertThat(floor.of("left.orders")).contains(at(7, "left-7").order());
+        assertThat(floor.of("right.orders")).contains(at(3, "right-3").order());
+    }
+
+    @Test
     void anUnusedTableMappingDoesNotHoldASingleTableLegacyCheckpoint() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);

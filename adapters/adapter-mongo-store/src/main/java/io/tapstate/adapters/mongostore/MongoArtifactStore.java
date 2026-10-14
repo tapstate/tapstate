@@ -27,7 +27,6 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
 
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -37,7 +36,6 @@ import java.util.Set;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
@@ -64,8 +62,7 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
-    /** How long a fenced Source write keeps retrying a transaction that lost a write conflict. */
-    private static final Duration CONFLICT_RETRY_WINDOW = Duration.ofSeconds(2);
+    private static final int SOURCE_WRITE_ATTEMPTS = 8;
     private static final TransactionOptions DURABLE_WRITE = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
 
@@ -187,31 +184,23 @@ public final class MongoArtifactStore implements ArtifactStore {
     }
 
     private static <T> T retryTransaction(boolean fenced, Supplier<T> transaction) {
-        long started = System.nanoTime();
-        int keyringNotReady = 0;
-        int conflicts = 0;
-        while (true) {
+        for (int attempt = 0; attempt < SOURCE_WRITE_ATTEMPTS; attempt++) {
             try {
                 return transaction.get();
             } catch (RuntimeException error) {
-                if (!fenced) throw error;
-                if (!transientConflict(error)) {
-                    if (!keyringNotReady(error) || ++keyringNotReady == 3) throw error;
-                    continue;
-                }
-                // Every fenced Source write touches the one keyring record, so members writing even
-                // different Sources at once conflict. Give the competing transaction time to commit.
-                long remaining = CONFLICT_RETRY_WINDOW.toNanos() - (System.nanoTime() - started);
-                if (remaining <= 0 || Thread.currentThread().isInterrupted()) throw error;
-                long delay = TimeUnit.MILLISECONDS.toNanos(Math.min(50L, 5L << Math.min(conflicts++, 4)));
+                if (!fenced || attempt == SOURCE_WRITE_ATTEMPTS - 1
+                        || !(transientConflict(error) || keyringNotReady(error))) throw error;
+                // Concurrent Source writes share the keyring fence. Immediate retries can all fail
+                // before its holder commits; allow it to finish, with at most 3.175 seconds of backoff.
                 try {
-                    TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
+                    Thread.sleep(25L << attempt);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     throw error;
                 }
             }
         }
+        throw new IllegalStateException("transaction attempts must return or throw");
     }
 
     /** Rewrites only the observed Source envelope, preserving all unrelated raw document fields. */
