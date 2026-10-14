@@ -160,7 +160,10 @@ def validate_recipe(refs, root, recipe):
     commit_sha(root, recipe['anchor_commit'])
     require(text(root, 'rev-parse', recipe['anchor_commit'] + '^{tree}') == recipe['anchor_tree'], 'anchor tree differs')
     require(set(recipe['variant_trees']) == set(recipe['source_digests']) == {'A', 'B', 'C'}, 'prepared variant set differs')
-    owned = {path_name(value) for value in recipe['owned_paths']}
+    require(len(set(recipe['variant_trees'].values())) == 3, 'prepared source trees must be distinct')
+    paths = recipe['owned_paths']
+    require(isinstance(paths, list) and paths and len(set(paths)) == len(paths), 'empty or duplicate owned paths')
+    owned = {path_name(value) for value in paths}
     original = tree_files(root, recipe['anchor_tree'])
     for name, tree in recipe['variant_trees'].items():
         raw, unused = refs.blob(recipe['patch_files'][name])
