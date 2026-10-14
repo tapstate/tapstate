@@ -57,6 +57,21 @@ class PublishedConnectorArtifactsTest {
     }
 
     @Test
+    void db2ForIDownloadIsPinnedToTheVerifiedPreviewBytes() throws Exception {
+        URI source = PublishedConnectorArtifacts.artifact("db2i", ignored -> null);
+        assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
+                + "connectors-preview/db2i-connector.jar"));
+        byte[] bytes = {1, 2, 3};
+        assertThat(PublishedConnectorArtifacts.download("db2i", source, (from, expected) -> {
+            assertThat(from).isEqualTo(source);
+            assertThat(expected.bytes()).isEqualTo(34_343_764);
+            assertThat(expected.sha256()).isEqualTo(
+                    "510a34799ee3dc8d55a5f8205d1a96209b45679d68eed4f5283b87289e1848ff");
+            return PublishedConnectorArtifacts.Fetched.verified(bytes);
+        })).isEqualTo(bytes);
+    }
+
+    @Test
     void theHttpFetcherReturnsACompleteSuccessfulBody() throws Exception {
         byte[] jar = completeJar();
         HttpServer server = server(200, jar);
