@@ -12,6 +12,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,6 +39,9 @@ class InitialClusterFailureCleanupIT {
         List<ClusterLifecycleProbe.Event> events = new ArrayList<>();
         Map<String, ProcessHandle> handles = new LinkedHashMap<>();
         AtomicBoolean injected = new AtomicBoolean();
+        Set<Integer> priorReservations = reservedPorts();
+        Set<Integer> allocatedReservations = new LinkedHashSet<>();
+        Set<Integer> allocatedLinks = new LinkedHashSet<>();
         String store = SharedMongo.replicaSetUrl(
                 "e2e_initial_failure_" + UUID.randomUUID().toString().replace("-", ""));
         Set<String> priorLogDirectories = memberLogDirectories().stream()
@@ -51,6 +55,17 @@ class InitialClusterFailureCleanupIT {
                 ProcessHandle owned = ProcessHandle.of(event.pid())
                         .orElseThrow(() -> new AssertionError("the owned initial launch is not observable"));
                 handles.put(event.launch(), owned);
+                Set<Integer> currentReservations = reservedPorts();
+                currentReservations.removeAll(priorReservations);
+                allocatedReservations.addAll(currentReservations);
+                String prefix = "--tapstate.hz.discovery.tcp-ip.seeds=";
+                for (String argument : owned.info().arguments().orElseThrow(
+                        () -> new AssertionError("the owned child arguments are unavailable"))) {
+                    if (!argument.startsWith(prefix)) continue;
+                    for (String seed : argument.substring(prefix.length()).split(",")) {
+                        allocatedLinks.add(Integer.parseInt(seed.substring(seed.lastIndexOf(':') + 1)));
+                    }
+                }
                 if (event.node().equals("node-b")) {
                     if (!injected.compareAndSet(false, true)) {
                         throw new AssertionError("the scoped second-member fault was injected twice");
@@ -72,10 +87,10 @@ class InitialClusterFailureCleanupIT {
                     .filter(event -> event.phase() == PREPARED).toList();
             List<ClusterLifecycleProbe.Event> launched = events.stream()
                     .filter(event -> event.phase() == LAUNCHED).toList();
-            assertThat(prepared).hasSize(3);
-            assertThat(launched).hasSize(3);
+            assertThat(prepared).hasSize(2);
+            assertThat(launched).hasSize(2);
             assertThat(prepared.stream().map(ClusterLifecycleProbe.Event::node).toList())
-                    .containsExactlyElementsOf(nodes);
+                    .containsExactlyElementsOf(nodes.subList(0, 2));
             assertThat(launched.stream().map(ClusterLifecycleProbe.Event::launch).toList())
                     .containsExactlyElementsOf(prepared.stream().map(ClusterLifecycleProbe.Event::launch).toList());
             assertThat(events.stream().filter(event -> event.phase() == HEALTH_PASSED)
@@ -106,6 +121,16 @@ class InitialClusterFailureCleanupIT {
                     assertThat(link.getLocalPort()).isEqualTo(event.ownedLinkPort());
                 }
             }
+            assertThat(allocatedLinks).hasSize(nodes.size());
+            assertThat(allocatedReservations).isNotEmpty();
+            Set<Integer> allObservedPorts = new LinkedHashSet<>(allocatedReservations);
+            allObservedPorts.addAll(allocatedLinks);
+            for (int port : allObservedPorts) {
+                try (var released = releasedPort(port)) {
+                    assertThat(released.getLocalPort()).isEqualTo(port);
+                }
+            }
+            assertThat(reservedPorts()).containsExactlyInAnyOrderElementsOf(priorReservations);
             assertThat(foreign.isAlive()).isTrue();
             assertThat(foreign.stagingDirectory()).isDirectory();
         }
@@ -119,6 +144,24 @@ class InitialClusterFailureCleanupIT {
         for (ProcessHandle process : owned) {
             process.onExit().get(20, TimeUnit.SECONDS);
             assertThat(process.isAlive()).as("the captured test child actually exited").isFalse();
+        }
+    }
+
+    /** Captures live reservations; closed history prevents reuse but owns no OS port. */
+    private static Set<Integer> reservedPorts() {
+        synchronized (RealProcessServer.class) {
+            try {
+                var field = RealProcessServer.class.getDeclaredField("PORT_RESERVATIONS");
+                field.setAccessible(true);
+                Map<?, ?> reservations = (Map<?, ?>) field.get(null);
+                Set<Integer> ports = new LinkedHashSet<>();
+                for (var entry : reservations.entrySet()) {
+                    if (!((java.net.Socket) entry.getValue()).isClosed()) ports.add((Integer) entry.getKey());
+                }
+                return ports;
+            } catch (ReflectiveOperationException failure) {
+                throw new AssertionError("the owned port reservations could not be observed", failure);
+            }
         }
     }
 

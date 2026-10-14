@@ -21,7 +21,7 @@ class InitialClusterLifecycleIT {
     }
 
     @Test
-    void theRealTwoMemberFixturePreparesAndLaunchesBothBeforeAnyHealthWait() {
+    void theRealTwoMemberFixtureStartsEachMemberAfterPreviousHealthAndClosesSequentially() {
         List<ClusterLifecycleProbe.Event> events = new ArrayList<>();
         Map<String, ProcessHandle> processes = new LinkedHashMap<>();
         String id;
@@ -37,11 +37,12 @@ class InitialClusterLifecycleIT {
                 assertThat(cluster.second().healthy()).isTrue();
             }
         }
-        assertLifecycle(events, processes, id, List.of(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B));
+        assertLifecycle(events, processes, id, List.of(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B),
+                List.of(TwoMemberCluster.NODE_B, TwoMemberCluster.NODE_A));
     }
 
     @Test
-    void theRealThreeMemberFixturePreparesAndLaunchesAllBeforeAnyHealthWait() {
+    void theRealThreeMemberFixtureStartsEachMemberAfterPreviousHealthAndClosesSequentially() {
         List<String> nodes = List.of("node-a", "node-b", "node-c");
         List<ClusterLifecycleProbe.Event> events = new ArrayList<>();
         Map<String, ProcessHandle> processes = new LinkedHashMap<>();
@@ -59,7 +60,7 @@ class InitialClusterLifecycleIT {
                 assertThat(cluster.unattributedConnections()).isZero();
             }
         }
-        assertLifecycle(events, processes, id, nodes);
+        assertLifecycle(events, processes, id, nodes, nodes);
     }
 
     private static void collect(ClusterLifecycleProbe.Event event, List<ClusterLifecycleProbe.Event> events,
@@ -72,7 +73,7 @@ class InitialClusterLifecycleIT {
     }
 
     private static void assertLifecycle(List<ClusterLifecycleProbe.Event> events, Map<String, ProcessHandle> processes,
-            String clusterId, List<String> nodes) {
+            String clusterId, List<String> nodes, List<String> closeOrder) {
         String clusterHash = ClusterLifecycleProbe.hash(clusterId);
         assertThat(events).isNotEmpty().allSatisfy(event -> assertThat(event.cluster()).isEqualTo(clusterHash));
         List<ClusterLifecycleProbe.Event> prepared = phase(events, PREPARED);
@@ -92,12 +93,23 @@ class InitialClusterLifecycleIT {
             assertThat(selected.stream().map(ClusterLifecycleProbe.Event::launch).toList())
                     .containsExactlyInAnyOrderElementsOf(prepared.stream().map(ClusterLifecycleProbe.Event::launch).toList());
         }
-        assertThat(last(events, PREPARED)).as("every descriptor exists before the first actual launch")
-                .isLessThan(first(events, LAUNCHED));
-        assertThat(last(events, LAUNCHED)).as("every actual JVM starts before the first health wait")
-                .isLessThan(first(events, HEALTH_STARTED));
-        assertThat(last(events, QUIT_REQUESTED)).as("all final quit requests precede the first confirmed exit")
-                .isLessThan(first(events, EXIT_CONFIRMED));
+        assertThat(prepared.stream().map(ClusterLifecycleProbe.Event::node).toList())
+                .containsExactlyElementsOf(nodes);
+        for (int index = 1; index < nodes.size(); index++) {
+            String previous = prepared.get(index - 1).launch();
+            String next = prepared.get(index).launch();
+            assertThat(position(events, HEALTH_PASSED, previous))
+                    .as("the previous member answers health before the next member is prepared")
+                    .isLessThan(position(events, PREPARED, next));
+        }
+        List<ClusterLifecycleProbe.Event> quit = phase(events, QUIT_REQUESTED);
+        assertThat(quit.stream().map(ClusterLifecycleProbe.Event::node).toList())
+                .containsExactlyElementsOf(closeOrder);
+        for (int index = 1; index < quit.size(); index++) {
+            assertThat(position(events, EXIT_CONFIRMED, quit.get(index - 1).launch()))
+                    .as("the previous owned member exits before the next final quit request")
+                    .isLessThan(position(events, QUIT_REQUESTED, quit.get(index).launch()));
+        }
         for (ClusterLifecycleProbe.Event event : prepared) {
             assertThat(event.httpPort()).isPositive();
             assertThat(event.memberPort()).isPositive();
@@ -125,14 +137,13 @@ class InitialClusterLifecycleIT {
         return events.stream().filter(event -> event.phase() == phase).toList();
     }
 
-    private static int first(List<ClusterLifecycleProbe.Event> events, ClusterLifecycleProbe.Phase phase) {
-        for (int index = 0; index < events.size(); index++) if (events.get(index).phase() == phase) return index;
-        throw new AssertionError("missing fixture phase " + phase);
-    }
-
-    private static int last(List<ClusterLifecycleProbe.Event> events, ClusterLifecycleProbe.Phase phase) {
-        for (int index = events.size() - 1; index >= 0; index--) if (events.get(index).phase() == phase) return index;
-        throw new AssertionError("missing fixture phase " + phase);
+    private static int position(List<ClusterLifecycleProbe.Event> events,
+            ClusterLifecycleProbe.Phase phase, String launch) {
+        for (int index = 0; index < events.size(); index++) {
+            var event = events.get(index);
+            if (event.phase() == phase && event.launch().equals(launch)) return index;
+        }
+        throw new AssertionError("missing fixture phase " + phase + " for " + launch);
     }
 
     private static String database(String name) {

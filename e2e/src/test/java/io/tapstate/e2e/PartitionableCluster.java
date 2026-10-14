@@ -136,9 +136,10 @@ final class PartitionableCluster implements AutoCloseable {
             for (String nodeId : nodeIds) {
                 prepared.put(nodeId,
                         RealProcessServer.prepare(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
+                RealProcessServer server = prepared.get(nodeId).launch();
+                servers.put(nodeId, server);
+                server.awaitHealthy();
             }
-            for (String nodeId : nodeIds) servers.put(nodeId, prepared.get(nodeId).launch());
-            servers.values().forEach(RealProcessServer::awaitHealthy);
         } catch (RuntimeException | Error failure) {
             startingFailure = failure;
             Map<String, Path> launchedLogs = new LinkedHashMap<>();
@@ -295,7 +296,7 @@ final class PartitionableCluster implements AutoCloseable {
         closeOwned(servers, Map.of(), links, clusterId, logs);
     }
 
-    /** Final fixture cleanup signals every owned process before waiting for any one of them. */
+    /** Closes each owned member before the next, preserving failure aggregation and link cleanup. */
     private static void closeOwned(Map<String, RealProcessServer> servers,
             Map<String, RealProcessServer.PreparedLaunch> prepared, Map<String, CuttableLink> links,
             String clusterId, Map<String, Path> logs) {
@@ -306,8 +307,6 @@ final class PartitionableCluster implements AutoCloseable {
             } catch (RuntimeException | Error failure) {
                 failures.add(failure);
             }
-        }
-        for (RealProcessServer server : servers.values()) {
             try {
                 server.awaitClosed();
             } catch (RuntimeException | Error failure) {

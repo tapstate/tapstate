@@ -139,10 +139,12 @@ final class TwoMemberCluster implements AutoCloseable {
                     clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
             prepared.put(NODE_A, RealProcessServer.prepare(
                     storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
+            first = prepared.get(NODE_A).launch();
+            if (!concurrent) first.awaitHealthy();
             prepared.put(NODE_B, RealProcessServer.prepare(
                     storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
-            first = prepared.get(NODE_A).launch();
             second = prepared.get(NODE_B).launch();
+            if (!concurrent) second.awaitHealthy();
         } catch (RuntimeException | Error failure) {
             startingFailure = failure;
             try { closeOwned(first, second, prepared, clusterId); }
@@ -175,9 +177,6 @@ final class TwoMemberCluster implements AutoCloseable {
             if (concurrent) {
                 first.awaitReady();
                 second.awaitReady();
-            } else {
-                first.awaitHealthy();
-                second.awaitHealthy();
             }
             if (existingAdministrator) cluster.a.login(ADMIN, PASSWORD);
             else cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
@@ -291,7 +290,7 @@ final class TwoMemberCluster implements AutoCloseable {
         closeOwned(first, second, Map.of(), clusterId);
     }
 
-    /** Final fixture cleanup requests both exits before waiting, without changing proof actions. */
+    /** Closes owned members in their original order and retains every cleanup failure. */
     private static void closeOwned(RealProcessServer first, RealProcessServer second,
             Map<String, RealProcessServer.PreparedLaunch> prepared, String clusterId) {
         Map<String, RealProcessServer> owned = new LinkedHashMap<>();
@@ -304,8 +303,6 @@ final class TwoMemberCluster implements AutoCloseable {
             } catch (RuntimeException | Error failure) {
                 failures.add(failure);
             }
-        }
-        for (RealProcessServer server : owned.values()) {
             try {
                 server.awaitClosed();
             } catch (RuntimeException | Error failure) {

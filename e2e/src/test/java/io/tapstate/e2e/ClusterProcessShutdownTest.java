@@ -22,13 +22,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Real child hooks prove shutdown order; synthetic Process cases isolate unobservable OS failures. */
 class ClusterProcessShutdownTest {
     @Test
-    void everyQuitIsRequestedBeforeWaitingForEitherPeersShutdownHook(@TempDir Path scratch) throws Exception {
-        Path enteredA = scratch.resolve("a.entered");
-        Path enteredB = scratch.resolve("b.entered");
-        Path completedA = scratch.resolve("a.completed");
-        Path completedB = scratch.resolve("b.completed");
-        try (RealProcessServer a = child(scratch, "a", "wait-peer", enteredA, completedA, enteredB);
-             RealProcessServer b = child(scratch, "b", "wait-peer", enteredB, completedB, enteredA);
+    void sequentialCleanupRetiresRealOwnedChildrenAndPreservesTheirLogsAndForeignChildren(@TempDir Path scratch) throws Exception {
+        try (RealProcessServer a = child(scratch, "a", "quiet", null, null, null);
+             RealProcessServer b = child(scratch, "b", "quiet", null, null, null);
              RealProcessServer foreign = child(scratch, "foreign", "quiet", null, null, null)) {
             Map<String, RealProcessServer> owned = new LinkedHashMap<>();
             owned.put("a", a);
@@ -36,8 +32,8 @@ class ClusterProcessShutdownTest {
             String runId = closePartitionBatch(owned);
             assertThat(a.isAlive()).isFalse();
             assertThat(b.isAlive()).isFalse();
-            assertThat(completedA).isRegularFile();
-            assertThat(completedB).isRegularFile();
+            assertThat(a.stagingDirectory()).doesNotExist();
+            assertThat(b.stagingDirectory()).doesNotExist();
             assertThat(Files.readString(savedLog(runId, "a")))
                     .contains("control child pid=" + a.pid());
             assertThat(Files.readString(savedLog(runId, "b")))
@@ -110,6 +106,33 @@ class ClusterProcessShutdownTest {
             assertThat(good.stagingDirectory()).doesNotExist();
             assertThat(bad.stagingDirectory()).isDirectory();
             assertThat(foreign.isAlive()).isTrue();
+        }
+    }
+
+    @Test
+    void aFailedQuitRequestStillWaitsForOwnedExitAndContinuesOtherCleanup(@TempDir Path scratch) throws Exception {
+        RuntimeException primary = new IllegalStateException("synthetic quit request failed");
+        class FailedRequest extends UnknownExit {
+            boolean awaited;
+            @Override public void destroy() { throw primary; }
+            @Override public boolean waitFor(long timeout, TimeUnit unit) { awaited = true; return true; }
+            @Override public boolean isAlive() { return !awaited; }
+            @Override public int exitValue() { return 0; }
+        }
+        FailedRequest process = new FailedRequest();
+        RealProcessServer bad = synthetic(process, scratch);
+        try (RealProcessServer good = child(scratch, "good", "quiet", null, null, null);
+             RealProcessServer foreign = child(scratch, "foreign", "quiet", null, null, null)) {
+            Map<String, RealProcessServer> owned = new LinkedHashMap<>();
+            owned.put("bad", bad);
+            owned.put("good", good);
+            assertThatThrownBy(() -> closePartitionBatch(owned)).isSameAs(primary);
+            assertThat(process.awaited).as("a failed quit request does not skip exit confirmation").isTrue();
+            assertThat(bad.stagingDirectory()).doesNotExist();
+            assertThat(good.isAlive()).isFalse();
+            assertThat(good.stagingDirectory()).doesNotExist();
+            assertThat(foreign.isAlive()).isTrue();
+            assertThat(foreign.stagingDirectory()).isDirectory();
         }
     }
 
