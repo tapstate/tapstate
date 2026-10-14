@@ -67,3 +67,8 @@ The offline smoke uses actual Git/source/ZIP anchors and controlled JSON API
 responses. It exercises same-name failures, attempt-specific suites, target and
 foreign namespaces, pagination/caps, missing anchors, independent archive replay
 and corruption. It starts no workflow, JVM or Docker and measures no performance.
+
+The separate [native instance snapshot](ci-instance-evidence.md) retains bounded
+original attempt logs and run-level artifact ZIP bytes for these candidates. It
+replays this source and candidate chain; original event membership, artifact
+attempts and all complete-PR/performance proof flags remain unverified.

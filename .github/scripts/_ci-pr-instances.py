@@ -281,6 +281,34 @@ def summarize(anchor_value, read):
                                       'raw_logs_artifacts_and_complete_execution_provenance'], 'used_files': sorted(used)}
 
 
+def seal_snapshot(directory, metadata):
+    destination = directory / 'receipt.json'
+    require(not destination.exists() and not destination.is_symlink(), 'snapshot receipt already exists')
+    files = {path.relative_to(directory).as_posix(): {'sha256': r.digest(path), 'size': path.stat().st_size}
+             for path in r.safe_files(directory) if path != destination}
+    g.write_new(destination, {**metadata, 'files': files})
+
+
+def read_candidate(refs, expected, reference):
+    archived, path = refs.read(reference)
+    require(archived.get('type') == 'PR-instance-candidate-archive' and archived.get('archive_complete') is True,
+            'invalid instance candidate archive')
+    actual = {p.relative_to(path.parent).as_posix(): {'sha256': r.digest(p), 'size': p.stat().st_size}
+              for p in r.safe_files(path.parent) if p != path}
+    require(actual == archived['files'], 'candidate archive file set or hash differs')
+
+    def read(name):
+        require(name in archived['files'], 'mandatory candidate record missing')
+        return refs.read({'path': (path.parent / name).relative_to(refs.root).as_posix(),
+                          'sha256': archived['files'][name]['sha256']})[0]
+
+    require(read('anchor.json') == expected, 'candidate anchor differs from original source')
+    answer = summarize(expected, read)
+    require(read('observation.json') == answer, 'candidate observation differs from independent replay')
+    require(set(archived['files']) == set(answer['used_files']) | {'anchor.json', 'observation.json'}, 'unused or foreign candidate archive files')
+    return answer, path, archived
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('collect', 'project'))
@@ -303,27 +331,12 @@ def main():
                     'R_G_complete': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
                     'collected_at': datetime.now(timezone.utc).isoformat(), 'external_collection_seconds': time.monotonic() - started,
                     'input_files': refs.finish()}
-        r.manifest(output, metadata)
+        seal_snapshot(output, metadata)
         print(json.dumps({'archive': str(output), 'candidate_JSON_archive_complete': True, 'R_G_complete': False}))
     else:
         require(args.archive is not None, 'project requires archive reference')
         reference = g.load(Path(args.archive))
-        archived, path = refs.read(reference)
-        require(archived.get('type') == 'PR-instance-candidate-archive' and archived.get('archive_complete') is True,
-                'invalid instance candidate archive')
-        actual = {p.relative_to(path.parent).as_posix(): {'sha256': r.digest(p), 'size': p.stat().st_size}
-                  for p in r.safe_files(path.parent) if p != path}
-        require(actual == archived['files'], 'candidate archive file set or hash differs')
-
-        def read(name):
-            require(name in archived['files'], 'mandatory candidate record missing')
-            return refs.read({'path': (path.parent / name).relative_to(refs.root).as_posix(),
-                              'sha256': archived['files'][name]['sha256']})[0]
-
-        require(read('anchor.json') == expected, 'candidate anchor differs from original source')
-        answer = summarize(expected, read)
-        require(read('observation.json') == answer, 'candidate observation differs from independent replay')
-        require(set(archived['files']) == set(answer['used_files']) | {'anchor.json', 'observation.json'}, 'unused or foreign candidate archive files')
+        answer, unused_path, unused_archive = read_candidate(refs, expected, reference)
         answer['input_files'] = refs.finish()
         g.write_new(output, answer)
         print(json.dumps({'output': str(output), 'raw_JSON_readback_verified': True, 'R_G_complete': False}))

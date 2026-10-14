@@ -73,8 +73,13 @@ def load(path):
 
 
 def write_new(path, value):
+    payload = (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n').encode()
+    write_new_bytes(path, payload)
+
+
+def write_new_bytes(path, payload):
     # Walk directory descriptors without following symlinks, then create exclusively.
-    payload = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n'
+    require(isinstance(payload, bytes), 'exclusive archive payload must be bytes')
     path = path.absolute()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     directory = os.open(path.anchor, flags)
@@ -92,7 +97,7 @@ def write_new(path, value):
             directory = child
         descriptor = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                              0o600, dir_fd=directory)
-        with os.fdopen(descriptor, 'w') as stream:
+        with os.fdopen(descriptor, 'wb') as stream:
             stream.write(payload)
     finally:
         os.close(directory)

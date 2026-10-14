@@ -93,7 +93,7 @@ def data(anchor):
     return request, runs, endpoints, check_rows
 
 
-def controls(f):
+def prepare_anchor(f):
     event = copy.deepcopy(f['event'])
     event.update(event_payload_complete=True, pull_request={
         'number': 7, 'action': 'synchronize', 'head_sha': f['anchor'], 'base_sha': f['base'], 'head_ref': 'ws/fixture',
@@ -109,6 +109,11 @@ def controls(f):
     source_ref = f['save']('instance-source.json', f['source_request'])
     request = {'schema': 1, 'type': 'pr-instance-request', 'source': source_ref,
                'target_created': {'start': '2026-10-14T09:00:00Z', 'end': '2026-10-14T11:00:00Z'}}
+    return request
+
+
+def controls(f):
+    request = prepare_anchor(f)
     original = m.anchor(m.g.References(f['evidence']), f['work'], request)
     check(original['original_action'] == 'synchronize', 'original action comes from indexed event artifact')
     check(original['original_labels']['snapshot'] == 'unknown', 'legacy missing labels remain unknown')
@@ -233,5 +238,6 @@ def controls(f):
     check(child.returncode != 0 and 'independent replay' in child.stderr, 'resealed fabricated applicability cannot replace raw instance replay')
 
 
-fixture.run(controls, only_callback=True)
-print('pr-instance controls passed: ' + str(count))
+if __name__ == '__main__':
+    fixture.run(controls, only_callback=True)
+    print('pr-instance controls passed: ' + str(count))
