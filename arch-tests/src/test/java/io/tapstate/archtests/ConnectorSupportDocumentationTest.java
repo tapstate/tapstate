@@ -67,13 +67,15 @@ class ConnectorSupportDocumentationTest {
                             "Db2 is supported as a source only", "refused on-prem as well as in",
                             "DATA CAPTURE CHANGES", "useNativeMiner: true", "Linux x86_64",
                             "db2-native-runtime-setup.sh", "raw log server",
+                            "Db2 for i is supported as a source only", "a `serve.sync` naming a `db2i` connection",
+                            "`journalLibraryName`", "`QSYS2.DISPLAY_JOURNAL`",
                             "remain the operator's responsibility",
                             "This deployment allowance is not a",
                             "certification claim",
                             "Applying a cloud pipeline",
                             "whose sync names another connector is refused",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",
-                            "17 connector ids", "16 across these five database kinds",
+                            "18 connector ids", "16 across these five database kinds",
                             "managed variants", "Except for `mongodb-atlas`",
                             "live-verified individually", "Atlas connector was verified",
                             "`aws-rds-mysql`", "unverified preview",
@@ -82,9 +84,10 @@ class ConnectorSupportDocumentationTest {
                             "server's actual accepted set", "including any additional ids",
                             "separate assets", "`connectors-preview`", "versioned Tapstate releases",
                             "register oracle", "register sqlserver", "register mongodb-atlas",
-                            "register aws-rds-mysql", "register db2", "Oracle Free Use Terms",
+                            "register aws-rds-mysql", "register db2", "register db2i", "Oracle Free Use Terms",
                             "Microsoft JDBC Driver 12.2.0", "IBM Data Server Driver for JDBC and SQLJ 4.25.13",
-                            "International Program License Agreement", "no LICENSE file");
+                            "International Program License Agreement", "IBM Public License 1.0",
+                            "no LICENSE file");
             assertThat(text).as("certification remains narrower than allowed deployment targets in %s", document)
                     .containsPattern("this preview certifies MongoDB write\\s+support only")
                     .containsPattern("real Atlas deployment in both cloud\\s+and on-prem runtimes")
