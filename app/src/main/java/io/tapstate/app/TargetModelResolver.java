@@ -352,9 +352,10 @@ final class TargetModelResolver {
         for (String sourceTable : sourceTables) {
             TargetTable target = Objects.requireNonNull(
                     targets.get(sourceTable), "no discovered target model for served stream '" + sourceTable + "'");
-            // An assembled stream is keyed by its step id, while its model keeps the root table name.
+            // A qualified stream identifies its own source even when physical table names repeat.
+            // An assembled stream falls back to its model's root table name rather than its step id.
             // Older Wizard artifacts stored the qualified source reference as their rename-map key.
-            String sourceId = sourceIdByTable.get(target.name());
+            String sourceId = sourceIdByTable.getOrDefault(sourceTable, sourceIdByTable.get(target.name()));
             String qualified = sourceId == null ? null : sourceId + "." + target.name();
             String legacyName = rename == null || rename.map() == null || qualified == null
                     || rename.map().containsKey(target.name()) ? null : rename.map().get(qualified);
