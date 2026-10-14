@@ -93,10 +93,14 @@ final class ControlPlane {
 
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
+        HttpRequest request = get("/healthz");
+        long started = ClusterHealthProbe.started();
         try {
-            HttpResponse<String> response = send(get("/healthz"));
+            HttpResponse<String> response = send(request);
+            ClusterHealthProbe.response(request, response.statusCode(), response.body(), started);
             return response.statusCode() == 200 && "ok".equals(response.body());
         } catch (UncheckedIOException e) {
+            ClusterHealthProbe.failure(request, e, started);
             return false;
         }
     }

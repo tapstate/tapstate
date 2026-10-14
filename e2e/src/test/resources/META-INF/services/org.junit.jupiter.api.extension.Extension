@@ -1,1 +1,2 @@
 io.tapstate.e2e.ClusterFixtureTimingExtension
+io.tapstate.e2e.ClusterHealthProbeExtension

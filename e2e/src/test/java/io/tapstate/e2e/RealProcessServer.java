@@ -371,6 +371,7 @@ final class RealProcessServer implements ServerHandle {
                         storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments);
                 if (processes != null) processes.launched(unhandedProcess);
                 ClusterFixtureTiming.spawned(httpPort, unhandedProcess);
+                ClusterHealthProbe.bind(unhandedProcess.pid(), baseUrl);
                 RealProcessServer server = new RealProcessServer(
                         unhandedProcess, baseUrl, output, stagingDirectory, ownsStagingDirectory);
                 server.lifecycle = lifecycle;
