@@ -111,7 +111,7 @@ final class SharedOracle {
                       IF SQLCODE != -65019 THEN RAISE; END IF;
                     END;
                     /
-                    PROMPT ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+                    PROMPT Enabling minimal supplemental logging;
                     ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
                     PROMPT ALTER DATABASE FORCE LOGGING;
                     ALTER DATABASE FORCE LOGGING;
@@ -190,6 +190,8 @@ final class SharedOracle {
         try {
             Thread.ofVirtual().name("oracle-state-capture").start(capture);
             var state = capture.get(15, TimeUnit.SECONDS);
+            failure.addSuppressed(new EnvelopeException("Oracle initialization state (SQL*Plus exit "
+                    + state.getExitCode() + "):\n" + state.getStdout() + state.getStderr()));
             System.err.printf("Oracle initialization state before cleanup (SQL*Plus exit %d):%n%s%s",
                     state.getExitCode(), state.getStdout(), state.getStderr());
         } catch (InterruptedException interrupted) {
