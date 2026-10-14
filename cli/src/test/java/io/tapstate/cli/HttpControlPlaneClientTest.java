@@ -1689,6 +1689,19 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void hasArtifactAloneDoesNotMarkAStatusAsAnAggregateProjection() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"hasArtifact\":true}",
+                new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new StatusOutcome.Found("pl1", "RUNNING"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void statusCarriesTheCodedFailureOfAPipelineWhoseJobDied() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/status", 200,

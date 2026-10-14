@@ -28,14 +28,14 @@ final class PipelineStatusWatchHandler extends PollingStreamHandler {
     private static final String LAST_STATE = "tapstate.stream.lastState";
 
     private final PipelineObservationQueryService observations;
-    private final Predicate<String> knownDraft;
+    private final Predicate<String> knownPipeline;
     private final MessageCatalog catalog;
 
-    PipelineStatusWatchHandler(PipelineObservationQueryService observations, Predicate<String> knownDraft,
+    PipelineStatusWatchHandler(PipelineObservationQueryService observations, Predicate<String> knownPipeline,
             MessageCatalog catalog, TaskScheduler scheduler, Duration interval) {
         super(scheduler, interval);
         this.observations = Objects.requireNonNull(observations, "observations");
-        this.knownDraft = Objects.requireNonNull(knownDraft, "knownDraft");
+        this.knownPipeline = Objects.requireNonNull(knownPipeline, "knownPipeline");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
     }
 
@@ -50,8 +50,8 @@ final class PipelineStatusWatchHandler extends PollingStreamHandler {
                 return;
             }
             if (coded.code() == LifecycleError.UNKNOWN_PIPELINE) {
-                if (knownDraft.test(pipelineId)) {
-                    // A saved draft is visible to the one-shot aggregate status but has no runtime stream yet.
+                if (knownPipeline.test(pipelineId)) {
+                    // The catalog may see a pipeline published after this observation read began.
                     return;
                 }
             }

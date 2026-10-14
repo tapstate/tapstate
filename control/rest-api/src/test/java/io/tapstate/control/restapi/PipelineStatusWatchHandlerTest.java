@@ -43,9 +43,9 @@ class PipelineStatusWatchHandlerTest {
     }
 
     private static PipelineStatusWatchHandler handler(
-            PipelineObservationQueryService observations, Predicate<String> knownDraft) {
+            PipelineObservationQueryService observations, Predicate<String> knownPipeline) {
         return new PipelineStatusWatchHandler(
-                observations, knownDraft, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+                observations, knownPipeline, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
     }
 
     private static PipelineObservationQueryService serviceWith(ObservationStore observations, String... pipelineIds) {
@@ -121,12 +121,12 @@ class PipelineStatusWatchHandlerTest {
     }
 
     @Test
-    void aKnownDraftKeepsTheObservationOnlyWatchOpen() {
+    void aPipelineThatBecomesKnownBeforeTheUnknownCheckKeepsTheWatchOpen() {
         PipelineObservationQueryService observations = serviceWith(emptyObservations());
-        PipelineStatusWatchHandler handler = handler(observations, "draft-only"::equals);
+        PipelineStatusWatchHandler handler = handler(observations, "published"::equals);
         FakeWebSocketSession session = new FakeWebSocketSession();
 
-        handler.poll(session, "draft-only");
+        handler.poll(session, "published");
 
         assertThat(session.closeStatus).isNull();
         assertThat(session.sent).isEmpty();

@@ -16,6 +16,8 @@ import org.springframework.web.socket.config.annotation.EnableWebSocket;
 import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 
 import java.time.Duration;
+import java.util.Objects;
+import java.util.function.Predicate;
 
 /**
  * Mounts the two thin streaming read channels on the same HTTP face as the one-shot verbs: a status
@@ -40,6 +42,11 @@ public class PipelineStreamConfiguration {
 
     /** The poll cadence for both stream channels, ISO-8601 duration; a working single-node default. */
     private static final String DEFAULT_POLL_INTERVAL = "PT1S";
+
+    static Predicate<String> knownPipeline(PipelineCatalogService pipelines) {
+        Objects.requireNonNull(pipelines, "pipelines");
+        return id -> pipelines.find(id).isPresent();
+    }
 
     /**
      * A small dedicated scheduler for the stream poll loops, kept off the request-serving threads. Managed
@@ -68,7 +75,7 @@ public class PipelineStreamConfiguration {
             registry.addHandler(
                             new PipelineStatusWatchHandler(
                                     observations,
-                                    id -> pipelines.find(id).filter(item -> !item.hasArtifact()).isPresent(),
+                                    knownPipeline(pipelines),
                                     catalog, pipelineStreamScheduler, pollInterval),
                             "/api/pipelines/*/status/watch")
                     .addInterceptors(new PipelineStreamHandshakeInterceptor(

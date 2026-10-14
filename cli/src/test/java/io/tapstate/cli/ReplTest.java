@@ -4305,12 +4305,17 @@ class ReplTest {
     void restartDoesNotStartOrPauseWhenAggregateStatusHasNoRuntimeObservation() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.NoObservation();
+        client.explainOutcome = new ExplainOutcome.Rejected(
+                "monitor.no-observation", "No observation is available for pipeline pl1.");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         h.repl().dispatch("restart pl1");
 
         assertThat(client.lifecycleCalls).isEmpty();
-        assertThat(h.sink().toString()).contains("has not published a runtime state yet");
+        assertThat(client.explainCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+        assertThat(h.sink().toString())
+                .contains("monitor.no-observation")
+                .contains("No observation is available for pipeline pl1.");
     }
 
     @Test

@@ -1682,16 +1682,17 @@ final class Repl {
         return switch (outcome) {
             case StatusOutcome.Found found -> carryOnFrom(id, found.state());
             case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
-            case StatusOutcome.NoObservation ignored -> reportNoObservationForRestart(id);
+            case StatusOutcome.NoObservation ignored -> handleNoObservationForRestart(id);
             case StatusOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 
-    private int reportNoObservationForRestart(String id) {
-        PrintWriter err = commandLine.getErr();
-        err.println("restart: " + id + " has not published a runtime state yet; retry after its first observation");
-        err.flush();
-        return Cli.EXIT_DIAGNOSTIC;
+    private int handleNoObservationForRestart(String id) {
+        return switch (readExplanation(id)) {
+            case ExplainOutcome.Found found -> carryOnFrom(id, found.state());
+            case ExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ExplainOutcome.Unreachable ignored -> reportRequestFailed();
+        };
     }
 
     /** The plain restart, once the pipeline's state says which sequence carrying on actually is. */

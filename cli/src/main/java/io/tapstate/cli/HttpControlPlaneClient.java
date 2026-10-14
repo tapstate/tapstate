@@ -1642,7 +1642,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
                 && m.get("pipelineId") instanceof String id
                 && m.get("state") instanceof String state) {
-            boolean aggregate = m.containsKey("observedState") || m.containsKey("hasArtifact")
+            boolean aggregate = m.containsKey("observedState")
                     || m.containsKey("desiredState") || m.containsKey("displayState");
             if (aggregate) {
                 Object observed = m.get("observedState");
