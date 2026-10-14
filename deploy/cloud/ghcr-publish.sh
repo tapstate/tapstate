@@ -3,7 +3,12 @@ set -euo pipefail
 umask 077
 
 fail() { printf 'Cloud GHCR publication refused: %s\n' "$1" >&2; exit 1; }
-[[ "${1:-}" == publish ]] || fail 'usage: ghcr-publish.sh publish --archive FILE --version VERSION --expected-digest SHA256'
+mode="${1:-}"
+case "$mode" in
+    publish) package=tapstate-cloud ;;
+    publish-dev) package=tapstate-cloud-dev ;;
+    *) fail 'usage: ghcr-publish.sh <publish|publish-dev> --archive FILE --version VERSION --expected-digest SHA256' ;;
+esac
 shift
 archive='' version='' expected_digest=''
 while [[ $# -gt 0 ]]; do
@@ -32,8 +37,8 @@ for tool in docker gh jq curl sha256sum tar; do
     command -v "$tool" >/dev/null 2>&1 || fail "required command is unavailable: $tool"
 done
 
-image=ghcr.io/tapstate/tapstate-cloud
-endpoint=orgs/tapstate/packages/container/tapstate-cloud
+image="ghcr.io/tapstate/$package"
+endpoint="orgs/tapstate/packages/container/$package"
 scratch="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tapstate-ghcr-publish.XXXXXX")"
 cleanup() { rm -rf -- "$scratch"; }
 trap cleanup EXIT
@@ -86,13 +91,13 @@ check_public before
 existing="$(gh api --paginate "$endpoint/versions?per_page=100" \
     --jq ".[] | select((.metadata.container.tags // []) | index(\"$version\")) | .name" \
     2>"$scratch/api-error")" || fail 'existing Cloud release tags could not be read'
-[[ -z "$existing" || "$existing" == "$expected_digest" ]] \
+[[ "$mode" == publish-dev || -z "$existing" || "$existing" == "$expected_digest" ]] \
     || fail 'the release version already names different bytes; overwriting is forbidden'
 
 printf '%s' "$CLOUD_GHCR_TOKEN" \
     | docker login ghcr.io --username "$CLOUD_GHCR_USERNAME" --password-stdin \
         >"$scratch/login-out" 2>"$scratch/login-error" || fail 'GHCR login failed'
-if [[ -z "$existing" ]]; then
+if [[ -z "$existing" || ( "$mode" == publish-dev && "$existing" != "$expected_digest" ) ]]; then
     docker buildx imagetools create --tag "$image:$version" \
         "oci-layout://$scratch/layout@$expected_digest" \
         >"$scratch/push-out" 2>"$scratch/push-error" || fail 'GHCR image push failed'
@@ -108,7 +113,7 @@ check_public after
 # identity. Keep that token out of command arguments and all diagnostic output.
 curl --disable --silent --show-error --fail --connect-timeout 10 --max-time 30 \
     --proto '=https' --output "$scratch/anonymous-token.json" \
-    'https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/tapstate-cloud:pull' \
+    "https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/$package:pull" \
     2>"$scratch/anonymous-error" || fail 'anonymous pull authorization is unavailable'
 anonymous_token="$(jq -er '
     .token | select(type == "string" and length > 0 and length <= 16384)
@@ -121,7 +126,7 @@ curl --disable --silent --show-error --fail --connect-timeout 10 --max-time 30 \
     --proto '=https' --header "@$scratch/anonymous-header" \
     --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
     --output "$scratch/anonymous-manifest.json" \
-    "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$expected_digest" \
+    "https://ghcr.io/v2/tapstate/$package/manifests/$expected_digest" \
     2>"$scratch/anonymous-error" || fail 'the published Cloud image could not be read anonymously'
 anonymous_digest="sha256:$(sha256sum "$scratch/anonymous-manifest.json" | awk '{print $1}')"
 [[ "$anonymous_digest" == "$expected_digest" ]] \

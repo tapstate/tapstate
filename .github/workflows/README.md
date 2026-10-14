@@ -21,6 +21,34 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Cloud cluster dev images
+
+`cloud-cluster-dev.yml` is manual-only and must be dispatched on `main`. Select
+`minor`, `patch`, or `major`; it uses the release version calculator against the
+current main history. Dev runs create no Git tags or releases, so new main commits
+can rebuild the same candidate version until that version is formally released.
+
+| Lane | Image | Version tag policy |
+| --- | --- | --- |
+| Cloud dev | `ghcr.io/tapstate/tapstate-cloud-dev:<version>` | Replaced by another dev build of that version |
+| Cloud release | `ghcr.io/tapstate/tapstate-cloud:<version>` | Independently rebuilt by release; different bytes cannot overwrite an existing tag |
+
+Configure the `cloud-ghcr-dev` environment for the `main` branch with the dev
+`VITE_CLOUD_CONSOLE_URL`. The existing repository `RELEASE_SATELLITE_TOKEN` reads
+Web main. Publishing uses the workflow token with package write permission, or
+the environment's `CLOUD_GHCR_USERNAME` / `CLOUD_GHCR_TOKEN` when explicitly set.
+Initialize `tapstate-cloud-dev` as a Public package and grant the publishing
+repository Actions access before the first run; the publisher refuses missing or
+non-public packages. Package setup follows the
+[GitHub package access and visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+
+The lane builds only the Cloud Web/Boot JAR and dual-platform image, verifies its
+locked inputs, and uploads the checked OCI digest. It deploys no environment.
+Use the digest reference in the run summary for dev validation; a numeric dev
+tag can point to different bytes after a rebuild. Release rebuilds independently
+with its own environment configuration and approval. This lane adds no automatic
+PR/main test suite; its runner cost is incurred only on explicit dispatch.
+
 Choose a location for new work before adding a workflow:
 
 - Add ordinary unit, integration, or specification tests to the existing
