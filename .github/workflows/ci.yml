@@ -43,12 +43,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Record the original event and actual checkout identities
+        run: .github/scripts/ci-receipt.sh event-inputs --root . --output "$RUNNER_TEMP/ci-event-inputs.json"
       - name: Derive every test from the current reactor
         run: .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
       - uses: actions/upload-artifact@v4
         with:
           name: ci-shard-plan
-          path: ${{ runner.temp }}/shards.json
+          path: |
+            ${{ runner.temp }}/shards.json
+            ${{ runner.temp }}/ci-event-inputs.json
           if-no-files-found: error
           retention-days: 7
 

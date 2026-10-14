@@ -31,6 +31,9 @@ def jobs(text):
 
 def check(workflows, contexts, inputs):
     ci = jobs(workflows['ci.yml'])
+    plan = ci.get('shard-plan', '')
+    assert 'ci-receipt.sh event-inputs' in plan and '${{ runner.temp }}/ci-event-inputs.json' in plan, \
+        'the original event and actual checkout must be retained with the shard plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
     assert not re.search(r'^\s+matrix:', build, re.M), 'build must not be a matrix'
@@ -104,6 +107,8 @@ assert contexts, 'required context list is empty'
 check(workflows, contexts, inputs)
 mutations = 0
 for original, replacement in [
+    ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
+    ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),

@@ -7,6 +7,7 @@ import argparse
 import copy
 import os
 import struct
+import subprocess
 from types import SimpleNamespace
 import importlib.util
 import io
@@ -15,6 +16,7 @@ from pathlib import Path
 import tempfile
 import zipfile
 import sys
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('receipt', Path(sys.argv[1]) / '_ci-receipt.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
@@ -301,6 +303,176 @@ with tempfile.TemporaryDirectory() as tmp:
               'equal wrong attempts must reject against current execution identity, not worker disagreement')
     else:
         raise AssertionError('equal wrong attempts escaped current execution identity admission')
+    # Event-time merge input comes from the original runner payload, not current PR state.
+    checkout=root/'event-checkout'; checkout.mkdir()
+    environment=dict(os.environ)
+    for key in ('GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_PREFIX','GIT_QUARANTINE_PATH'):
+        environment.pop(key,None)
+    environment.update(GIT_AUTHOR_NAME='Fixture',GIT_COMMITTER_NAME='Fixture',
+                       GIT_AUTHOR_EMAIL='fixture@example.test',GIT_COMMITTER_EMAIL='fixture@example.test')
+    def fixture_git(*args, input=None):
+        result=subprocess.run(['git','-C',str(checkout),*args],input=input,env=environment,
+                              capture_output=True,text=True)
+        assert result.returncode==0,result.stderr
+        return result.stdout.strip()
+    fixture_git('init','-q')
+    (checkout/'source.txt').write_text('base')
+    fixture_git('add','source.txt'); fixture_git('commit','-qm','Fixture base')
+    base=fixture_git('rev-parse','HEAD')
+    (checkout/'source.txt').write_text('head')
+    fixture_git('commit','-qam','Fixture head'); head=fixture_git('rev-parse','HEAD')
+    tree=fixture_git('rev-parse','HEAD^{tree}')
+    merge=fixture_git('commit-tree',tree,'-p',base,'-p',head,input='Fixture merge\n')
+    fixture_git('checkout','-q','--detach',merge)
+    # The real default checkout is shallow. Parent proof must read the commit object.
+    (checkout/'.git/shallow').write_text(merge+'\n')
+    check(fixture_git('show','-s','--format=%P','HEAD')=='','depth-one fixture hides traversal parents')
+    runner=dict(environment,GITHUB_REPOSITORY='example/project',GITHUB_EVENT_NAME='pull_request',
+                GITHUB_SHA=merge,GITHUB_RUN_ID='100',GITHUB_RUN_ATTEMPT='1',
+                GITHUB_REF='refs/pull/7/merge',GITHUB_HEAD_REF='ws/fixture',GITHUB_BASE_REF='main')
+    payload=dict(repository={'full_name':'example/project'},number=7,action='synchronize',
+                 pull_request=dict(number=7,title='private-event-sentinel',body='private-event-sentinel',
+                    head=dict(sha=head,ref='ws/fixture',repo={'full_name':'example/project'}),
+                    base=dict(sha=base,ref='main',repo={'full_name':'example/project'})))
+    captured=m.event_snapshot(checkout,payload,runner)
+    run=dict(id=100,repository={'full_name':'example/project'},event='pull_request',run_attempt=1,
+             status='completed',path='.github/workflows/ci.yml',head_branch='ws/fixture',
+             head_sha=head,pull_requests=[],conclusion='success')
+    commit=dict(sha=merge,tree={'sha':tree},parents=[{'sha':base},{'sha':head}])
+    def reconcile(value=captured, actual=run):
+        return m.reconcile_pr_identity(actual,value,commit,'example/project',7,head,'ws/fixture')
+    identity=reconcile()
+    check(identity['checkout_sha']==merge and identity['head_sha']==head
+          and identity['base_sha']==base,'original PR identity binds distinct head/base/merge in a shallow checkout')
+    check(not identity['first_complete_pr_sample_proven'] and not identity['group_equivalence_proven'],
+          'identity consistency alone never proves a complete first sample or group equivalence')
+    check('private-event-sentinel' not in json.dumps(captured),'event text and user data are excluded')
+    failed=copy.deepcopy(run); failed['conclusion']='failure'
+    check(reconcile(actual=failed)['conclusion']=='failure','failed first attempts retain identity instead of being selected away')
+    def rejects_identity(value, actual, reason):
+        try: reconcile(value,actual)
+        except ValueError as error:
+            check(reason in str(error),'identity rejects for expected reason: '+reason)
+        else: raise AssertionError('identity mutation escaped: '+reason)
+    for field,wrong,reason in [('checkout_sha','f'*40,'archived Git commit'),
+            ('checkout_parents',[base,'f'*40],'original base/head'),
+            ('ref','refs/pull/8/merge','PR merge ref'),('run_id',101,'run ID'),
+            ('run_attempt',2,'attempt 1'),('event','workflow_dispatch','pull_request'),
+            ('repository','foreign/project','repository')]:
+        bad=copy.deepcopy(captured);bad[field]=wrong;rejects_identity(bad,run,reason)
+    for field,wrong,reason in [('number',8,'foreign PR'),('head_sha','f'*40,'PR head'),
+            ('base_sha','f'*40,'original PR input'),('head_repository','foreign/project','expected repository'),
+            ('head_ref','ws/foreign','branch'),('base_ref','release','branch')]:
+        bad=copy.deepcopy(captured);bad['pull_request'][field]=wrong;rejects_identity(bad,run,reason)
+    for field,wrong,reason in [('head_sha','f'*40,'PR head'),('run_attempt',2,'attempt 1'),
+            ('status','in_progress','not complete'),('event','workflow_dispatch','pull_request')]:
+        bad=copy.deepcopy(run);bad[field]=wrong;rejects_identity(captured,bad,reason)
+    association=dict(number=7,head={'sha':head},base={'sha':base})
+    populated=copy.deepcopy(run);populated['pull_requests']=[association]
+    check(reconcile(actual=populated)['pr_event_identity_consistent'],'matching API association corroborates original event')
+    populated['pull_requests'][0]['base']['sha']='f'*40
+    rejects_identity(captured,populated,'association differs')
+    missing=m.event_snapshot(checkout,{},runner)
+    check(missing['event_payload_complete'] is False,'missing fork or historical payload is recorded without changing original CI execution')
+    rejects_identity(missing,run,'payload is incomplete')
+    for event,ref in [('push','refs/heads/main'),('push','refs/tags/v1.0.0'),('workflow_dispatch','refs/heads/ws/fixture')]:
+        nonpr=dict(runner,GITHUB_EVENT_NAME=event,GITHUB_REF=ref)
+        original=dict(repository={'full_name':'example/project'},ref=ref,after=merge,inputs={'ignored':'private-event-sentinel'})
+        saved=m.event_snapshot(checkout,original,nonpr)
+        check(saved['event_payload_complete'] and saved['event']==event and saved['checkout_sha']==merge,
+              'original '+event+' '+ref+' preserves its checkout identity')
+        check('private-event-sentinel' not in json.dumps(saved),'arbitrary dispatch inputs never enter event receipt')
+    deletion=m.event_snapshot(checkout,dict(repository={'full_name':'example/project'},deleted=True,after='0'*40),
+                             dict(runner,GITHUB_EVENT_NAME='push',GITHUB_REF='refs/tags/v1.0.0'))
+    check(deletion['ref_deleted'] and not deletion['event_payload_complete'] and deletion['checkout_sha']==merge,
+          'deleted push keeps checkout identity without treating an absent after commit as the PR source')
+    wrong_payload=copy.deepcopy(payload);wrong_payload['pull_request']['base']['sha']='f'*40
+    rejected(lambda:m.event_snapshot(checkout,wrong_payload,runner),'capture rejects wrong base against real Git commit parents')
+    for field,wrong in [('sha','f'*40),('tree',{'sha':'f'*40}),('parents',[{'sha':'f'*40},{'sha':head}])]:
+        changed=copy.deepcopy(commit);changed[field]=wrong
+        rejected(lambda:m.reconcile_pr_identity(run,captured,changed,'example/project',7,head,'ws/fixture'),
+                 'independent Git commit mutation rejects: '+field)
+    event_file=root/'event.json';event_file.write_text(json.dumps(payload))
+    runner['GITHUB_EVENT_PATH']=str(event_file)
+    snapshot_file=root/'event-inputs.json';run_file=root/'pr-run.json';run_file.write_text(json.dumps(run))
+    commit_file=root/'checkout-commit.json';commit_file.write_text(json.dumps(commit))
+    script=str(Path(sys.argv[1])/'_ci-receipt.py')
+    result=subprocess.run([sys.executable,script,'event-inputs','--root',str(checkout),'--output',str(snapshot_file)],
+                          env=runner,capture_output=True,text=True)
+    check(result.returncode==0,result.stderr)
+    result=subprocess.run([sys.executable,script,'pr-identity','--run-json',str(run_file),
+        '--event-inputs',str(snapshot_file),'--checkout-commit',str(commit_file),'--repo','example/project','--pr','7','--head',head,
+        '--branch','ws/fixture','--output',str(root/'pr-identity.json')],env=environment,capture_output=True,text=True)
+    check(result.returncode==0,result.stderr)
+    check(json.loads((root/'pr-identity.json').read_text())['event_inputs_sha256']==m.digest(snapshot_file),
+          'CLI identity binds the exact archived event bytes')
+    # The collector keeps head source and actual merge source distinct.
+    archive_bytes=io.BytesIO()
+    with zipfile.ZipFile(archive_bytes,'w') as archive:
+        archive.writestr('ci-event-inputs.json',json.dumps(captured))
+        archive.writestr('shards.json',json.dumps(dict(source_sha=merge,shards=[{'id':'rest'}])))
+    log_bytes=io.BytesIO()
+    with zipfile.ZipFile(log_bytes,'w') as archive: archive.writestr('job.txt','original log fixture')
+    collected_run=dict(run,created_at='2026-10-14T03:00:00Z')
+    original_api,original_command=m.api,m.command
+    def collector_api(endpoint):
+        if endpoint.endswith('/rulesets'): return []
+        if '/git/commits/' in endpoint: return commit
+        if '/commits/' in endpoint and '/check-runs?' not in endpoint: return {'sha':head}
+        if '/artifacts?' in endpoint:
+            return {'total_count':1,'artifacts':[dict(id=1,name='ci-shard-plan',expired=False)]}
+        if '/jobs?' in endpoint: return {'total_count':0,'jobs':[]}
+        if '/check-runs?' in endpoint: return {'total_count':0,'check_runs':[]}
+        return collected_run
+    def collector_command(args,binary=False,cwd=None):
+        if args[:2]==['gh','api']:
+            return archive_bytes.getvalue() if '/artifacts/' in args[2] else log_bytes.getvalue()
+        return original_command(args,binary=binary,cwd=cwd)
+    m.api,m.command=collector_api,collector_command
+    try:
+        scoped=argparse.Namespace(repo='example/project',run=100,archive_root=str(root/'scoped-archive'),
+            source_root=str(checkout),cache_condition='unknown',pr=7,head=head,branch='ws/fixture')
+        check(m.collect(scoped)==2,'missing full artifacts keep collector receipt incomplete')
+        archived=root/'scoped-archive/run-100/attempt-1'
+        result=json.loads((archived/'receipt.json').read_text())
+        check(result['source_sha']==head and result['checkout_sha']==merge
+              and (archived/'checkout-source.tar').is_file(),'collector archives both PR head and actual merge checkout')
+        check(result['pr_event_identity_verified'] and not result['first_complete_pr_sample_proven'],
+              'collector joins explicit PR scope without claiming full first-attempt acceptance')
+        scoped.archive_root=str(root/'unscoped-archive');scoped.pr=None
+        check(m.collect(scoped)==2,'unscoped PR collection cannot become complete')
+        incomplete=json.loads((root/'unscoped-archive/run-100/attempt-1/receipt.json').read_text())
+        check(not incomplete['pr_event_identity_verified']
+              and any('explicit --pr/--head/--branch' in gap for gap in incomplete['gaps']),
+              'collector never infers the experiment PR from a potentially foreign artifact')
+        wrong_event=copy.deepcopy(captured);wrong_event['run_attempt']=2
+        for label,member,reason in [('missing',None,'missing or ambiguous'),
+                ('malformed','not JSON','event capture unreadable'),('nonobject','[]','event capture must be an object'),
+                ('old-attempt',json.dumps(wrong_event),'current run/attempt')]:
+            archive_bytes=io.BytesIO()
+            with zipfile.ZipFile(archive_bytes,'w') as archive:
+                archive.writestr('shards.json',json.dumps(dict(source_sha=merge,shards=[{'id':'rest'}])))
+                if member is not None: archive.writestr('ci-event-inputs.json',member)
+            scoped.archive_root=str(root/(label+'-archive'));scoped.pr=7
+            check(m.collect(scoped)==2,label+' event must retain an incomplete receipt')
+            incomplete=json.loads((root/(label+'-archive')/'run-100/attempt-1/receipt.json').read_text())
+            check(not incomplete['pr_event_identity_verified'] and not incomplete['archive_complete']
+                  and incomplete['checkout_sha'] is None and any(reason in gap for gap in incomplete['gaps']),
+                  label+' event never falls back to PR head or loses its final manifest')
+            rejected(lambda:m.verify(argparse.Namespace(directory=str(root/(label+'-archive')/'run-100/attempt-1'))),
+                     label+' archived raw bytes remain readable but cannot establish completeness')
+        for label,ids,reason in [('null-id',[None],'invalid shard ID'),
+                ('unsafe-id',['../rest'],'invalid shard ID'),('duplicate-id',['rest','rest'],'duplicate shard ID')]:
+            archive_bytes=io.BytesIO()
+            with zipfile.ZipFile(archive_bytes,'w') as archive:
+                archive.writestr('ci-event-inputs.json',json.dumps(captured))
+                archive.writestr('shards.json',json.dumps(dict(source_sha=merge,shards=[{'id':n} for n in ids])))
+            scoped.archive_root=str(root/(label+'-archive'))
+            check(m.collect(scoped)==2,label+' plan must retain an incomplete receipt')
+            incomplete=json.loads((root/(label+'-archive')/'run-100/attempt-1/receipt.json').read_text())
+            check(not incomplete['archive_complete'] and any(reason in gap for gap in incomplete['gaps']),
+                  label+' cannot escape plan parsing recovery')
+    finally: m.api,m.command=original_api,original_command
     # First-attempt provenance is validated independently of successful conclusion.
     original_api = m.api
     m.api = lambda endpoint: {'id': 10, 'run_attempt': 1, 'status': 'in_progress', 'repository': {'full_name': 'example/project'}}

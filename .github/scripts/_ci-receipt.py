@@ -573,6 +573,119 @@ def compare_inputs(args):
     print('independent build input hashes agree; whole-build provenance is not established')
 
 
+def sha(value, label):
+    require(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{40}', value), 'invalid SHA: ' + label)
+    return value
+
+
+def event_snapshot(root, payload, environment):
+    # Retain event identities only, never issue text, user details or arbitrary inputs.
+    repository = environment['GITHUB_REPOSITORY']
+    event = environment['GITHUB_EVENT_NAME']
+    require(event in ('pull_request', 'push', 'workflow_dispatch'), 'unsupported CI event')
+    require(isinstance(payload, dict), 'invalid event payload')
+    if payload.get('repository'):
+        require(payload['repository']['full_name'] == repository, 'event repository differs')
+    checkout = sha(git(root, 'rev-parse', 'HEAD'), 'checkout')
+    require(checkout == sha(environment['GITHUB_SHA'], 'GITHUB_SHA'), 'checkout differs from event SHA')
+    # cat-file exposes the original parent headers even in a depth-one checkout.
+    headers = git(root, 'cat-file', '-p', checkout).split('\n\n', 1)[0].splitlines()
+    parents = [sha(line[7:], 'parent') for line in headers if line.startswith('parent ')]
+    tree = sha(git(root, 'rev-parse', 'HEAD^{tree}'), 'checkout tree')
+    run_id, attempt = int(environment['GITHUB_RUN_ID']), int(environment['GITHUB_RUN_ATTEMPT'])
+    require(run_id > 0 and attempt > 0, 'invalid run identity')
+    value = dict(schema=1, repository=repository, event=event, run_id=run_id, run_attempt=attempt,
+                 ref=environment['GITHUB_REF'], checkout_sha=checkout, checkout_tree=tree,
+                 checkout_parents=parents)
+    if event == 'pull_request':
+        if not payload.get('pull_request'):
+            return dict(value, event_payload_complete=False,
+                        gap='original PR payload unavailable; event identity remains unproven')
+        pr = payload['pull_request']
+        number = payload['number']
+        require(type(number) is int and number > 0 and pr['number'] == number, 'PR number differs')
+        require(payload['action'] in ('opened', 'synchronize', 'reopened'), 'unexpected PR action')
+        head, base = pr['head'], pr['base']
+        require(base['repo']['full_name'] == repository, 'PR base repository differs')
+        require(environment['GITHUB_HEAD_REF'] == head['ref'] and environment['GITHUB_BASE_REF'] == base['ref'],
+                'PR event refs differ from runner refs')
+        require(value['ref'] == f'refs/pull/{number}/merge', 'PR checkout is not the merge ref')
+        require(parents == [sha(base['sha'], 'PR base'), sha(head['sha'], 'PR head')],
+                'checkout parents differ from original PR base/head')
+        value['pull_request'] = dict(number=number, action=payload['action'], head_sha=head['sha'],
+                                     base_sha=base['sha'], head_ref=head['ref'], base_ref=base['ref'],
+                                     head_repository=head['repo']['full_name'], base_repository=repository)
+    else:
+        if event == 'push' and payload.get('deleted') is True:
+            return dict(value, event_payload_complete=False, ref_deleted=True,
+                        gap='deleted ref has no after commit; checkout identity is retained separately')
+        if event == 'push':
+            require(payload['ref'] == value['ref'], 'event ref differs from runner ref')
+            require(payload['after'] == checkout, 'push after differs from checkout')
+    return dict(value, event_payload_complete=True)
+
+
+def event_inputs(args):
+    path = Path(os.environ['GITHUB_EVENT_PATH'])
+    value = event_snapshot(Path(args.root).resolve(), json.loads(path.read_text()), os.environ)
+    write(Path(args.output), value)
+
+
+def reconcile_pr_identity(run, event, commit, repository, number, head, branch):
+    # This binds identities, not full execution, group equivalence or performance.
+    sha(head, 'expected head')
+    require(type(number) is int and number > 0 and branch, 'explicit PR scope is required')
+    require(event.get('event_payload_complete') is True, 'original PR payload is incomplete')
+    require(event.get('schema') == 1 and run['event'] == event['event'] == 'pull_request',
+            'not an original pull_request event')
+    require(run['repository']['full_name'] == event['repository'] == repository, 'PR repository differs')
+    require(type(run['id']) is int and run['id'] == event['run_id'], 'PR run ID differs')
+    require(type(run['run_attempt']) is int and type(event['run_attempt']) is int
+            and run['run_attempt'] == event['run_attempt'] == 1, 'PR first-attempt identity requires attempt 1')
+    require(run['status'] == 'completed', 'PR run is not complete')
+    require(run['path'] == '.github/workflows/ci.yml', 'unexpected PR workflow')
+    pr = event['pull_request']
+    require(pr['number'] == number and type(pr['number']) is int, 'foreign PR number')
+    require(pr['action'] in ('opened', 'synchronize', 'reopened'), 'not an original PR update action')
+    require(pr['head_repository'] == pr['base_repository'] == repository,
+            'experiment PR must belong to the expected repository')
+    require(pr['base_ref'] == 'main' and pr['head_ref'] == run['head_branch'] == branch, 'PR branch differs')
+    require(sha(pr['head_sha'], 'event head') == sha(run['head_sha'], 'run head') == head, 'PR head differs')
+    base = sha(pr['base_sha'], 'event base')
+    checkout = sha(event['checkout_sha'], 'checkout')
+    sha(event['checkout_tree'], 'checkout tree')
+    require(sha(commit['sha'], 'API checkout') == checkout, 'checkout differs from archived Git commit')
+    require(sha(commit['tree']['sha'], 'API tree') == event['checkout_tree']
+            and [sha(parent['sha'], 'API parent') for parent in commit['parents']] == [base, head],
+            'archived Git commit tree/parents differ from original PR input')
+    require(event['checkout_parents'] == [base, head] and checkout not in (base, head),
+            'PR merge checkout does not bind the original base/head')
+    require(event['ref'] == f'refs/pull/{number}/merge', 'PR merge ref differs')
+    # Historical Actions payloads can have an empty association after a PR closes.
+    # A populated association is corroboration and must never contradict the capture.
+    associations = run['pull_requests']
+    require(isinstance(associations, list), 'invalid run PR associations')
+    for association in associations:
+        require(association['number'] == number and association['head']['sha'] == head
+                and association['base']['sha'] == base, 'run PR association differs from original event')
+    return dict(schema=1, repository=repository, run_id=run['id'], run_attempt=1, pull_request=number,
+                head_sha=head, base_sha=base, checkout_sha=checkout, checkout_tree=event['checkout_tree'],
+                conclusion=run['conclusion'], pr_event_identity_consistent=True,
+                first_attempt_identity_consistent=True, first_complete_pr_sample_proven=False,
+                group_equivalence_proven=False)
+
+
+def pr_identity(args):
+    value = reconcile_pr_identity(json.loads(Path(args.run_json).read_text()),
+                                  json.loads(Path(args.event_inputs).read_text()),
+                                  json.loads(Path(args.checkout_commit).read_text()), args.repo,
+                                  args.pr, args.head, args.branch)
+    value['checkout_commit_sha256'] = digest(Path(args.checkout_commit))
+    value['run_json_sha256'] = digest(Path(args.run_json))
+    value['event_inputs_sha256'] = digest(Path(args.event_inputs))
+    write(Path(args.output), value)
+
+
 def resources(args):
     value = {'schema': 1, 'run_id': os.getenv('GITHUB_RUN_ID', 'local'),
              'run_attempt': os.getenv('GITHUB_RUN_ATTEMPT', '1'),
@@ -703,13 +816,59 @@ def collect(args):
         except (ValueError, zipfile.BadZipFile):
             gaps.append('artifact unavailable or invalid: ' + artifact['name'])
     write(directory / 'artifact-members.json', member_index)
+    checkout_sha = None if run['event'] == 'pull_request' else run['head_sha']
+    pr_identity_verified = False
+    event_records = []
+    for path in (directory / 'artifacts').glob('*-ci-shard-plan.zip'):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                if 'ci-event-inputs.json' in archive.namelist():
+                    captured = json.loads(archive.read('ci-event-inputs.json'))
+                    require(isinstance(captured, dict), 'event capture must be an object')
+                    event_records.append(captured)
+        except (ValueError, OSError, zipfile.BadZipFile) as error:
+            gaps.append('event capture unreadable: ' + str(error))
+    if len(event_records) == 1:
+        event = event_records[0]
+        write(directory / 'event-inputs.json', event)
+        try:
+            require(event['repository'] == args.repo and event['event'] == run['event']
+                    and event['run_id'] == args.run and event['run_attempt'] == run['run_attempt'],
+                    'event capture differs from current run/attempt')
+            candidate_sha = sha(event['checkout_sha'], 'captured checkout')
+            commit = api(f'{prefix}/git/commits/{candidate_sha}')
+            write(directory / 'checkout-commit.json', commit)
+            require(commit['sha'] == candidate_sha and commit['tree']['sha'] == event['checkout_tree']
+                    and [parent['sha'] for parent in commit['parents']] == event['checkout_parents'],
+                    'event checkout differs from independent Git commit')
+            checkout_sha = candidate_sha
+            command(['git', '-C', str(source), 'archive', '--format=tar', checkout_sha,
+                     '-o', str(directory / 'checkout-source.tar')])
+            if run['event'] == 'pull_request':
+                scope = [getattr(args, name, None) for name in ('pr', 'head', 'branch')]
+                require(all(scope), 'explicit --pr/--head/--branch scope is required for PR identity')
+                identity = reconcile_pr_identity(run, event, commit, args.repo, *scope)
+                write(directory / 'pr-identity.json', identity)
+                pr_identity_verified = True
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            gaps.append('event identity incomplete: ' + str(error))
+    elif run['event'] == 'pull_request':
+        gaps.append('original PR event capture missing or ambiguous')
     shard_ids = []
     for path in (directory / 'artifacts').glob('*-ci-shard-plan.zip'):
-        with zipfile.ZipFile(path) as archive:
-            if 'shards.json' in archive.namelist():
-                plan = json.loads(archive.read('shards.json'))
-                require(plan['source_sha'] == run['head_sha'], 'plan belongs to another source')
-                shard_ids = [s['id'] for s in plan['shards']]
+        try:
+            with zipfile.ZipFile(path) as archive:
+                if 'shards.json' in archive.namelist():
+                    plan = json.loads(archive.read('shards.json'))
+                    require(checkout_sha and plan['source_sha'] == checkout_sha,
+                            'plan checkout source is unproven or differs')
+                    candidate_ids = [s['id'] for s in plan['shards']]
+                    require(all(isinstance(name, str) and re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', name)
+                                for name in candidate_ids), 'invalid shard ID')
+                    require(len(set(candidate_ids)) == len(candidate_ids), 'duplicate shard ID')
+                    shard_ids = candidate_ids
+        except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as error:
+            gaps.append('shard plan identity incomplete: ' + str(error))
     if not shard_ids:
         gaps.append('source-bound shard plan unavailable')
     expected = ['ci-shard-plan', 'ci-aggregate'] + ['ci-test-results-' + n for n in shard_ids]
@@ -732,7 +891,9 @@ def collect(args):
                 'collected_at': datetime.now(timezone.utc).isoformat(), 'archive_complete': not gaps,
                 'equivalence_proven': False, 'gaps': gaps, 'unknown': unknown,
                 'workflow_wall_seconds': wall, 'runner_seconds_all_attempts': runner_seconds,
-                'first_attempt': run['run_attempt'] == 1, 'cache_condition_claim': args.cache_condition, 'cache_condition_verified': False,
+                'first_attempt': run['run_attempt'] == 1,
+                'checkout_sha': checkout_sha, 'pr_event_identity_verified': pr_identity_verified,
+                'first_complete_pr_sample_proven': False, 'cache_condition_claim': args.cache_condition, 'cache_condition_verified': False,
                 'external_collection_seconds': (time.monotonic_ns() - external_start) / 1e9,
                 'cost_scope': 'all jobs and attempts; includes build/transfer/admission/Sonar; external collection separately measured'}
     manifest(directory, metadata)
@@ -757,6 +918,18 @@ def main():
     p.add_argument('--inputs-root', required=True)
     p.add_argument('--aggregate-inputs', required=True)
     p.add_argument('--output', required=True)
+    p = commands.add_parser('event-inputs')
+    p.add_argument('--root', default='.')
+    p.add_argument('--output', required=True)
+    p = commands.add_parser('pr-identity')
+    p.add_argument('--run-json', required=True)
+    p.add_argument('--event-inputs', required=True)
+    p.add_argument('--checkout-commit', required=True, help='archived Git commits API response for the actual checkout')
+    p.add_argument('--repo', required=True)
+    p.add_argument('--pr', type=int, required=True)
+    p.add_argument('--head', required=True)
+    p.add_argument('--branch', required=True)
+    p.add_argument('--output', required=True)
     p = commands.add_parser('resources')
     p.add_argument('--root', default='.')
     p.add_argument('--output', required=True)
@@ -767,6 +940,9 @@ def main():
     p.add_argument('--run', type=int, required=True)
     p.add_argument('--archive-root', required=True)
     p.add_argument('--source-root', required=True)
+    p.add_argument('--pr', type=int, help='expected experiment PR number')
+    p.add_argument('--head', help='expected original PR head SHA')
+    p.add_argument('--branch', help='expected experiment head branch')
     p.add_argument('--cache-condition', choices=['warm', 'cold', 'unknown'], default='unknown')
     p = commands.add_parser('verify')
     p.add_argument('--directory', required=True)
@@ -775,6 +951,10 @@ def main():
         inputs(args)
     elif args.command == 'compare-inputs':
         compare_inputs(args)
+    elif args.command == 'event-inputs':
+        event_inputs(args)
+    elif args.command == 'pr-identity':
+        pr_identity(args)
     elif args.command == 'resources':
         resources(args)
     elif args.command == 'collect':
