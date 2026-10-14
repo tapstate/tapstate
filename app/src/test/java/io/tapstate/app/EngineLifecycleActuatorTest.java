@@ -7,7 +7,12 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.core.ProcessorMetaSupplier;
+import com.hazelcast.jet.core.ProcessorSupplier;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -19,7 +24,10 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRun;
@@ -28,12 +36,15 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +57,7 @@ import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.SoftAssertions.assertSoftly;
 
 /**
  * The assembly-layer binding from the lifecycle actuator seam to the Jet engine and the capture coordinator,
@@ -137,6 +149,97 @@ class EngineLifecycleActuatorTest {
         assertThat(events).containsExactly("startCapture:" + PIPE);
         assertThat(member.getJet().getJob(PIPE)).as("no job was submitted").isNull();
         assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
+    }
+
+    @Test
+    void aStartWaitingForAnotherMembersCaptureIsNotFailedByThePreviousJob() {
+        Engine engine = new Engine(member);
+        DAG previousDag = new DAG();
+        previousDag.newVertex("serve.sync_1", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of(() -> {
+                    throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
+                            Map.of("pipeline", PIPE), null);
+                })));
+        engine.submit(PIPE, previousDag);
+        Job previous = member.getJet().getJob(PIPE);
+        awaitStatus(previous, JobStatus.FAILED);
+        assertThat(engine.failureOf(PIPE)).as("the previous run died before the restart")
+                .hasValueSatisfying(cause -> assertThat(cause)
+                        .hasMessageContaining(EngineError.EXECUTION_NOT_AUTHORIZED.code()));
+
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(new PipelineResource(PIPE, null, List.of(SourceRef.spec("orders_src", true)), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(new SyncElement("sync_1", "target", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        WorkloadClaimKey captureKey = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE,
+                new StoreBackedPipelineCaptures(store).captureIds(PIPE).getFirst());
+        assertThat(claims.acquire(captureKey, new WorkloadOwner("node-a", "boot-node-a"),
+                7, Duration.ofMinutes(5)).acquired()).isTrue();
+
+        ClusterProperties properties = new ClusterProperties();
+        properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+        ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
+        gate.canCommit(Set.of("node-a", "node-b"));
+        CaptureOwnership captureOwnership = new CaptureOwnership("cluster-a",
+                new WorkloadOwner("node-c", "boot-node-c"), gate,
+                new ClusterWorkloadClaims(claims, gate), Duration.ofMinutes(5));
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> {
+            throw new AssertionError("the remote holder has not opened its ring, so no capture can attach");
+        };
+        List<String> events = new CopyOnWriteArrayList<>();
+        PipelineActuationOwnership ownership = clusteredOwnership(claims, () -> 0L, "node-c");
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        assertThat(ownership.beginExecution(PIPE).allowed()).isTrue();
+        Clock clock = Clock.systemUTC();
+        StoreBackedPipelineCaptureCoordinator captures = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer(),
+                captureOwnership, Duration.ofHours(1));
+        try {
+            EngineLifecycleActuator actuator = new EngineLifecycleActuator(
+                    engine, new RecordingDagSource(events), captures, teardown(), ownership);
+            PipelineConverger converger = new PipelineConverger(store.desired(), store.state(), actuator, clock);
+
+            // The operator stops the failed pipeline; Jet retains its terminal job under the same name.
+            store.state().create(PIPE, StateJson.of(PipelineState.FAILED), clock.instant());
+            store.desired().save(new DesiredState(PIPE, PipelineState.STOPPED, "rev-1"));
+            assertThat(converger.converge(PIPE).failure()).isEmpty();
+            assertThat(StateJson.parse(store.state().read(PIPE).orElseThrow().stateJson()))
+                    .isEqualTo(PipelineState.STOPPED);
+            assertThat(engine.failureOf(PIPE)).as("the old failed job remains discoverable by name")
+                    .hasValueSatisfying(cause -> assertThat(cause)
+                            .hasMessageContaining(EngineError.EXECUTION_NOT_AUTHORIZED.code()));
+            assertThatThrownBy(() -> captures.startCapture(PIPE)).isInstanceOf(RingNotOpenYet.class);
+
+            store.desired().save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+            ConvergeResult started = converger.converge(PIPE);
+            assertThat(started.failure()).as("waiting for the capture is a normal start return").isEmpty();
+            assertThat(StateJson.parse(started.checkpoint().orElseThrow().stateJson()))
+                    .isEqualTo(PipelineState.RUNNING);
+            assertThat(ownership.heldExecutionGeneration(PIPE)).isEqualTo(2);
+            assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
+            assertThat(events).as("the deferred start has built no replacement DAG").isEmpty();
+
+            ConvergeResult next = converger.converge(PIPE);
+
+            assertThat(member.getJet().getJobs()).extracting(Job::getId).containsExactly(previous.getId());
+            assertThat(events).as("neither pass submitted a replacement run").isEmpty();
+            assertSoftly(softly -> {
+                softly.assertThat(StateJson.parse(store.state().read(PIPE).orElseThrow().stateJson()))
+                        .as("a start waiting for a remote capture must remain RUNNING without a submitted job")
+                        .isEqualTo(PipelineState.RUNNING);
+                softly.assertThat(next.failure())
+                        .as("the previous job's failure must not fail a run that has not been submitted")
+                        .isEmpty();
+            });
+        } finally {
+            captures.close();
+        }
     }
 
     /**
