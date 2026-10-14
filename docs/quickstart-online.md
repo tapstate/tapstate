@@ -84,8 +84,9 @@ published server image runs as a non-root user and is not prepared for this mode
 production use, where the native mode is the one to run.
 
 Db2 for i (IBM i, formerly AS/400) is accepted as a source-only **preview** under the id
-`db2i`, outside the certified table: no release lane reads a live IBM i system, and no
-snapshot or change-capture run against one has been completed through Tapstate yet.
+`db2i`, outside the certified table: no release lane reads a live IBM i system. Snapshot, journal
+capture of inserts, updates and deletes, and continuation across a server restart were verified
+by hand against IBM i 7.4.
 Db2 for i is supported as a source only. Its connector can write, but its catalog row is not
 sink-capable, so a `serve.sync` naming a `db2i` connection is refused on-prem as well as in
 the cloud profile. Reads take a snapshot through the IBM Toolbox for Java JDBC driver and then

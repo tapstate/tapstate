@@ -68,7 +68,7 @@ class ConnectorSupportDocumentationTest {
                             "DATA CAPTURE CHANGES", "useNativeMiner: true", "Linux x86_64",
                             "db2-native-runtime-setup.sh", "raw log server",
                             "Db2 for i is supported as a source only", "a `serve.sync` naming a `db2i` connection",
-                            "`journalLibraryName`", "`QSYS2.DISPLAY_JOURNAL`",
+                            "`journalLibraryName`", "`QSYS2.DISPLAY_JOURNAL`", "by hand against IBM i 7.4",
                             "remain the operator's responsibility",
                             "This deployment allowance is not a",
                             "certification claim",
