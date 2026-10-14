@@ -77,14 +77,23 @@ final class PipelineFailures {
         Optional<Throwable> lost = engine.lost(pipelineId).map(Throwable.class::cast);
         if (lost.isPresent()) { return lost; }
         if (claim == null || claim.profileGeneration() == 0) {
-            return engine.failureOf(pipelineId).or(() -> captures.captureFailure(pipelineId));
+            return engine.failureOf(pipelineId).or(() -> captureCurrent(pipelineId, claim, fenced, captures));
         }
-        return captures.captureFailure(pipelineId, WorkloadClaimFence.from(claim)).or(() ->
+        return captureCurrent(pipelineId, claim, fenced, captures).or(() ->
                 engine.nativeRun(pipelineId)
                         .filter(run -> run.claimGeneration() == claim.claimGeneration()
                                 && run.executionGeneration() == claim.executionGeneration()
                                 && run.profileGeneration() == claim.profileGeneration())
                         .flatMap(run -> engine.failureOf(pipelineId)));
+    }
+
+    /** A deferred submission still observes capture failures through the current claim's scope. */
+    static Optional<Throwable> captureCurrent(String pipelineId, WorkloadClaim claim, boolean fenced,
+            PipelineCaptureCoordinator captures) {
+        if (claim == null && fenced) { return Optional.empty(); }
+        return claim == null || claim.profileGeneration() == 0
+                ? captures.captureFailure(pipelineId)
+                : captures.captureFailure(pipelineId, WorkloadClaimFence.from(claim));
     }
 
     /** A new controller may report only the failed native job named by the retained execution receipt. */

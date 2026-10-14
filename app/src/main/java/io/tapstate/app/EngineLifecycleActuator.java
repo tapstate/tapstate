@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Binds the converge loop's lifecycle actuator seam to the Jet execution engine and the source-side capture
@@ -67,6 +68,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final Clock clock;
     private final ConnectorReadiness connectors;
     private final PipelineExecutionAdmission admission;
+    private final Map<String, Long> waitingForCapture = new ConcurrentHashMap<>();
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
@@ -204,6 +206,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
                 // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
                 // being opened on another member, and how long that may take is bounded where it is decided.
+                waitingForCapture.put(pipelineId,
+                        execution.fence() == null ? 0L : execution.fence().executionGeneration());
                 return;
             }
             // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
@@ -236,9 +240,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 String nativeJobId = engine.submitFenced(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
                         execution.fence().claimGeneration(), execution.fence().executionGeneration(),
                         execution.fence().profileGeneration());
+                waitingForCapture.remove(pipelineId);
                 admission.submitted(pipelineId, execution, nativeJobId);
             } else {
                 engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+                waitingForCapture.remove(pipelineId);
             }
         } catch (TapstateException failed) {
             admission.failedAfterAllocation(pipelineId, execution, failed);
@@ -286,6 +292,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 case WAIT -> { return; }
                 case HELD -> {
                     WorkloadClaim original = receipt.originalClaim();
+                    waitingForCapture.remove(pipelineId);
                     engine.resume(pipelineId, receipt.originalNativeJobId(), original.claimGeneration(),
                             original.executionGeneration(), original.profileGeneration(), receipt.originalRuntimeExecutionId());
                     return;
@@ -305,6 +312,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             start(pipelineId);
             return;
         }
+        waitingForCapture.remove(pipelineId);
         engine.resume(pipelineId);
     }
 
@@ -322,6 +330,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     private boolean stopResumeExecution(String pipelineId, PendingPipelineResume receipt) {
+        waitingForCapture.remove(pipelineId);
         WorkloadClaim original = receipt.originalClaim();
         boolean over = engine.cancelAndAwaitTerminal(pipelineId, receipt.originalNativeJobId(), original.claimGeneration(),
                 original.executionGeneration(), original.profileGeneration(), JOB_TEARDOWN_BUDGET);
@@ -335,6 +344,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     @Override
     public void stop(String pipelineId, boolean purgeState) {
         WorkloadClaim stoppedClaim = actuation.currentClaim(pipelineId).orElse(null);
+        waitingForCapture.remove(pipelineId);
         engine.cancel(pipelineId);
         if (!engine.isLost()) {
             // A plan is kept on the engine's member, and a member shut down for want of memory refuses to be asked
@@ -369,10 +379,22 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public Optional<Throwable> failure(String pipelineId) {
+        // A deferred start submitted no job of its own. Ignore the previous terminal job only while the
+        // claim still carries that start's execution: another holder's replacement run can fail normally.
+        // Capture failures and a lost engine still surface.
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
+        Long waitingGeneration = waitingForCapture.get(pipelineId);
+        if (waitingGeneration != null && waitingGeneration == actuation.heldExecutionGeneration(pipelineId)
+                && !engine.isLost()) {
+            return PipelineFailures.captureCurrent(pipelineId, current, actuation.isFenced(), captureCoordinator)
+                    .or(() -> admission.inheritedFailure(pipelineId, current));
+        }
+        if (waitingGeneration != null) {
+            waitingForCapture.remove(pipelineId, waitingGeneration);
+        }
         // A pipeline fails two ways the converge loop must see as one: the Jet job itself dies (engine), or the
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
         // Either surfaces here so the converge side drives the pipeline into the observable FAILED state.
-        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
         return PipelineFailures.current(pipelineId, current, actuation.isFenced(), engine, captureCoordinator)
                 .or(() -> admission.inheritedFailure(pipelineId, current));
     }
