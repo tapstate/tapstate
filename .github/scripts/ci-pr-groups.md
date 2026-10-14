@@ -109,5 +109,6 @@ tip success. Confirm that the projections include new cases, dependency bytes,
 production changes, workflow/resource/caching changes and candidate changes before
 using this as an impact review input.
 
-This helper performs no source recovery. Ordinary-commit variant construction,
-owned-hunk recovery and final source/control verification remain separate steps.
+This helper performs no source recovery. Use [ci-variants](ci-variants.md) for
+ordinary-commit construction, serial archive readback and owned-source recovery.
+Real case/control and final native verification remain separate steps.

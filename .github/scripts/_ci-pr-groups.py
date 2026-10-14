@@ -105,7 +105,7 @@ class References:
         self.root = root
         self.files = {}
 
-    def read(self, reference):
+    def blob(self, reference):
         require(isinstance(reference, dict) and set(reference) == {'path', 'sha256'}, 'invalid file reference')
         name, expected = reference['path'], reference['sha256']
         require(isinstance(name, str) and name and '\\' not in name, 'invalid reference path')
@@ -118,12 +118,15 @@ class References:
             path /= part
             require(not path.is_symlink(), 'symlink reference path')
         raw = file_bytes(path)
-        value = json_bytes(raw)
         actual = checksum(raw)
         require(actual == expected, 'referenced input hash differs')
         require(name not in self.files or self.files[name] == actual, 'reference changed while reading')
         self.files[name] = actual
-        return value, path
+        return raw, path
+
+    def read(self, reference):
+        raw, path = self.blob(reference)
+        return json_bytes(raw), path
 
     def finish(self):
         for name, expected in self.files.items():
@@ -355,6 +358,7 @@ def head_status(scope, contract, request):
             and all(final_pr[side]['repo']['full_name'] == pr[side]['repo']['full_name'] for side in ('head', 'base')),
             'PR head or merge scope changed during inspection')
     return {'schema': 1, 'type': 'read-only-pr-head-status', 'scope': scope, 'merge_sha': merge,
+            'base_sha': pr['base']['sha'],
             'can_advance_after_archiving': not reasons, 'reasons': reasons,
             'runs': [{key: run[key] for key in ('id', 'path', 'run_attempt', 'status', 'conclusion')} for run in runs],
             'checks': [{key: check[key] for key in ('id', 'name', 'head_sha', 'status', 'conclusion')} for check in observed],
