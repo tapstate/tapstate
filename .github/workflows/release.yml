@@ -1398,7 +1398,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: cloud-ghcr-release
     concurrency:
-      group: tapstate-cloud-${{ needs.version.outputs.version }}
+      # Cloud's default version follows insertion order, so publication and registration
+      # share one cross-version queue through the final catalog receipt.
+      group: tapstate-cloud-release-publication
+      queue: max
       cancel-in-progress: false
     permissions:
       contents: read
@@ -1442,6 +1445,24 @@ jobs:
         run: |
           test -n "$IMAGE"
           echo "Cloud image: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: register the latest published Cloud version
+        if: needs.version.outputs.is_latest == 'true'
+        env:
+          CLOUD_RELEASE_API_URL: ${{ vars.CLOUD_RELEASE_API_URL }}
+          CLOUD_RELEASE_CODE: ${{ vars.CLOUD_RELEASE_CODE }}
+          CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: ${{ secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_SHA: ${{ needs.version.outputs.sha }}
+          RELEASE_BRANCH: ${{ github.event.repository.default_branch }}
+          CLOUD_IMAGE: ${{ steps.image.outputs.image }}
+          CLOUD_IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          CLOUD_IMAGE_DIGEST: ${{ needs.cloud-image.outputs.digest }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/notify-cloud-release.mjs | tee -a "$GITHUB_STEP_SUMMARY"
 
 
   roadmap:
