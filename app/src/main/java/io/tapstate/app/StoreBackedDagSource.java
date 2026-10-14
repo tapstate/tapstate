@@ -370,14 +370,14 @@ final class StoreBackedDagSource implements DagSource {
 
     /** Join plans compiled from the candidate pipeline and its current discovered source schemas. */
     Map<String, CompiledJoin> previewCompiledJoins(PipelineResource pipeline) {
-        return compiledJoins(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+        return compiledJoins(pipeline, sourceTablesByName(sourceVertices(pipeline)));
     }
 
     /** Ephemeral operator maps created by the preview topology, for teardown after the job ends. */
     Set<String> previewStateMapNames(PipelineResource pipeline) {
         Set<String> namespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
         Map<String, NestTable> tables = nestTablesByAlias(
-                pipeline, sourceIdByTable(sourceVertices(pipeline)));
+                pipeline, sourceTablesByName(sourceVertices(pipeline)));
         namespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, tables::get));
         return Set.copyOf(namespaces);
     }
@@ -389,8 +389,8 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
         Set<String> stepIds = stepIds(pipeline);
-        Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
-        Map<String, CompiledJoin> compiled = compiledJoins(pipeline, sourceIdByTable);
+        Map<String, SourceVertex> sourceTables = sourceTablesByName(vertices);
+        Map<String, CompiledJoin> compiled = compiledJoins(pipeline, sourceTables);
         Map<String, List<String>> outputKeys = previewTargetKeys(pipeline, vertices,
                 sourceKeyByTable, sourceKeysById, stepIds, compiled);
         boolean viewOutput = pipeline.view() instanceof ViewBlock.Inline;
@@ -406,14 +406,14 @@ final class StoreBackedDagSource implements DagSource {
                 sourceKeysById::get,
                 view -> new PreviewMaterializerSinkWriterFactory(
                         materializerMap, viewKeys, io.tapstate.spi.sink.WriteMode.UPSERT),
-                previewNestBinding(pipeline, sourceIdByTable),
+                previewNestBinding(pipeline, sourceTables),
                 compiled.isEmpty() ? null : joinBinding(compiled));
         return PipelineDagBuilder.build(pipeline, bindings, null, null, trace);
     }
 
     private NestBinding previewNestBinding(
-            PipelineResource pipeline, Map<String, String> sourceIdByTable) {
-        Map<String, NestTable> tables = nestTablesByAlias(pipeline, sourceIdByTable);
+            PipelineResource pipeline, Map<String, SourceVertex> sourceTables) {
+        Map<String, NestTable> tables = nestTablesByAlias(pipeline, sourceTables);
         return new NestBinding(tables::get, NestBinding.onMap(),
                 (NestDeadLetter) (from, released) -> { },
                 PipelineDagBuilder.nestSettings(pipeline, tables::get, nestSettings), true);
@@ -564,7 +564,7 @@ final class StoreBackedDagSource implements DagSource {
         // Compiled once, here, and handed to both the targets below and the join binding. Compiling it
         // twice would mean two answers to the same question with nothing comparing them.
         Map<String, CompiledJoin> compiledJoins =
-                compiledJoins(pipeline, sourceIdByTable(sourceVertices));
+                compiledJoins(pipeline, sourceTablesByName(sourceVertices));
         // Held to the columns it was last recorded producing, before anything is built out of them. A
         // join's output columns follow from the SELECT and from what the sources say their columns are,
         // so the same pipeline can start one day producing a differently shaped row than the day before
@@ -639,7 +639,7 @@ final class StoreBackedDagSource implements DagSource {
                         keyColumnsOf(bySourceTable),
                         keyColumnsOf(assembled),
                         PipelineDagBuilder.nestBlockingVertices(pipeline,
-                                nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
+                                nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices))::get),
                         sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
         return fence -> {
@@ -763,7 +763,7 @@ final class StoreBackedDagSource implements DagSource {
         // and reverse indexes when the sources behind the query have gone undiscoverable.
         Set<String> operatorNamespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
         if (PipelineDagBuilder.hasNest(pipeline)) {
-            Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices(pipeline)));
             operatorNamespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get));
             operatorNamespaces.add(StoreBackedNestStateLedger.namespaceOf(pipelineId));
         }
@@ -793,7 +793,7 @@ final class StoreBackedDagSource implements DagSource {
         Set<String> routedNestNamespaces = new LinkedHashSet<>();
         if (PipelineDagBuilder.hasNest(pipeline)) {
             Map<String, NestTable> byAlias = nestTablesByAlias(
-                    pipeline, sourceIdByTable(sourceVertices(pipeline)));
+                    pipeline, sourceTablesByName(sourceVertices(pipeline)));
             Map<String, String> mapDatabases = PipelineDagBuilder.nestStateDatabases(
                     pipeline, byAlias::get, defaultDatabase);
             mapDatabases.forEach((namespace, database) -> {
@@ -939,9 +939,8 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * The source id behind each table the pipeline's sources read. The nest side resolves an alias by asking
-     * the store for that source's discovered model, so it needs the source itself - which a vertex key no
-     * longer names once a source reading several tables keys its vertices by table.
+     * The source id behind each physical table and stream identity the pipeline reads, used to resolve
+     * source-qualified target names.
      */
     private static Map<String, String> sourceIdByTable(Map<String, SourceVertex> sourceVertices) {
         Map<String, String> byTable = new LinkedHashMap<>();
@@ -950,6 +949,16 @@ final class StoreBackedDagSource implements DagSource {
             byTable.put(vertex.stream(), vertex.sourceId());
         }
         return byTable;
+    }
+
+    /** Keeps physical table names and stream identities attached to their explicit source selection. */
+    private static Map<String, SourceVertex> sourceTablesByName(Map<String, SourceVertex> sourceVertices) {
+        Map<String, SourceVertex> byName = new LinkedHashMap<>();
+        for (SourceVertex vertex : sourceVertices.values()) {
+            byName.putIfAbsent(vertex.table(), vertex);
+            byName.put(vertex.stream(), vertex);
+        }
+        return byName;
     }
 
     /**
@@ -1034,7 +1043,7 @@ final class StoreBackedDagSource implements DagSource {
         if (pipeline.transforms() == null) {
             return assembled;
         }
-        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices));
+        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices));
         for (Step step : pipeline.transforms()) {
             if (!(step instanceof Step.Inline inline)) {
                 continue;
@@ -1302,7 +1311,7 @@ final class StoreBackedDagSource implements DagSource {
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
                     && inputsOf(refsOf(inline.from()), vertices, keysByTable, keysBySource, steps,
                             Map.of(), vertex -> copiedColumns(pipelineId, vertex), incomplete) != null) {
-                compiled.put(step.id(), compileJoin(inline, join, sourceIdByTable(vertices), steps));
+                compiled.put(step.id(), compileJoin(inline, join, sourceTablesByName(vertices), steps));
             }
         }
         recordStepSchemas(pipelineId, deriveSteps(pipeline, vertices, keysByTable, keysBySource,
@@ -1320,7 +1329,7 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
         Map<String, NodeColumns> steps = deriveSteps(pipeline, sourceVertices,
                 sourceKeyByTable(sourceVertices), sourceKeysById(sourceVertices), stepIds(pipeline),
-                compiledJoins(pipeline, sourceIdByTable(sourceVertices)), this::discoveredColumns)
+                compiledJoins(pipeline, sourceTablesByName(sourceVertices)), this::discoveredColumns)
                 .columns();
         Map<String, NodeColumns> nodes = new LinkedHashMap<>();
         for (SourceVertex vertex : sourceVertices.values()) {
@@ -1774,7 +1783,7 @@ final class StoreBackedDagSource implements DagSource {
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
                         viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices)), fence),
-                nestBinding(pipeline, sourceIdByTable(sourceVertices)),
+                nestBinding(pipeline, sourceTablesByName(sourceVertices)),
                 joinBinding(compiledJoins));
     }
 
@@ -2612,7 +2621,7 @@ final class StoreBackedDagSource implements DagSource {
         if (!PipelineDagBuilder.hasNest(pipeline)) {
             return NestCapacity.none();
         }
-        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices(pipeline)));
         var stores = storePort.operatorStateStores();
         String defaultDatabase = stores.defaultDatabase();
         Map<String, String> databases = PipelineDagBuilder.nestStateDatabases(
@@ -2654,19 +2663,19 @@ final class StoreBackedDagSource implements DagSource {
     Map<String, CompiledJoin> compiledJoinsOf(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
-        return compiledJoins(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+        return compiledJoins(pipeline, sourceTablesByName(sourceVertices(pipeline)));
     }
 
     /** Every join step of this pipeline, compiled, keyed by step id; empty where there is no join. */
     private Map<String, CompiledJoin> compiledJoins(
-            PipelineResource pipeline, Map<String, String> sourceIdByTable) {
+            PipelineResource pipeline, Map<String, SourceVertex> sourceTables) {
         Map<String, CompiledJoin> byStep = new LinkedHashMap<>();
         if (pipeline.transforms() != null) {
             Set<String> stepIds = stepIds(pipeline);
             for (Step step : pipeline.transforms()) {
                 if (step instanceof Step.Inline inline
                         && inline.body() instanceof TransformBody.Join join) {
-                    byStep.put(step.id(), compileJoin(inline, join, sourceIdByTable, stepIds));
+                    byStep.put(step.id(), compileJoin(inline, join, sourceTables, stepIds));
                 }
             }
         }
@@ -2694,7 +2703,7 @@ final class StoreBackedDagSource implements DagSource {
      * NULL for a column that turns out to hold one is the direction that produces a wrong promise.
      */
     private CompiledJoin compileJoin(Step.Inline step, TransformBody.Join join,
-            Map<String, String> sourceIdByTable, Set<String> stepIds) {
+            Map<String, SourceVertex> sourceTables, Set<String> stepIds) {
         Map<String, List<String>> keyByTable = new LinkedHashMap<>();
         Map<String, String> tableByName = new LinkedHashMap<>();
         List<io.tapstate.core.sql.SourceTable> tables = new ArrayList<>();
@@ -2708,9 +2717,9 @@ final class StoreBackedDagSource implements DagSource {
                     throw new TapstateException(ActuationError.JOIN_INPUT_NOT_A_TABLE,
                             Map.of("step", step.id(), "alias", alias, "ref", literal.ref()), null);
                 }
-                NestTable resolved = nestTable(ref, sourceIdByTable);
+                NestTable resolved = nestTable(ref, sourceTables);
                 List<io.tapstate.core.sql.SourceColumn> columns =
-                        columnsOf(resolved.name(), sourceIdByTable);
+                        columnsOf(resolved.name(), sourceTables);
                 keyByTable.put(resolved.name(), resolved.primaryKey());
                 keyByTable.put(alias, resolved.primaryKey());
                 // Both spellings answer with the real table, because the plan calls a source whichever
@@ -2815,16 +2824,15 @@ final class StoreBackedDagSource implements DagSource {
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */
     private List<io.tapstate.core.sql.SourceColumn> columnsOf(String table,
-            Map<String, String> sourceIdByTable) {
-        String sourceId = sourceIdByTable.get(table);
-        if (sourceId == null) {
+            Map<String, SourceVertex> sourceTables) {
+        SourceVertex sourceTable = sourceTables.get(table);
+        if (sourceTable == null) {
             return List.of();
         }
-        String physicalTable = table.startsWith(sourceId + ".") ? table.substring(sourceId.length() + 1) : table;
-        return storePort.schemas().get(sourceId)
+        return storePort.schemas().get(sourceTable.sourceId())
                 .map(DiscoveredSourceModel::model)
                 .flatMap(model -> model.tables().stream()
-                        .filter(t -> t.name().equals(physicalTable)).findFirst())
+                        .filter(t -> t.name().equals(sourceTable.table())).findFirst())
                 .map(t -> t.fields().stream()
                         .map(f -> new io.tapstate.core.sql.SourceColumn(f.name(), f.type(), true))
                         .toList())
@@ -2857,8 +2865,8 @@ final class StoreBackedDagSource implements DagSource {
         }
     }
 
-    private NestBinding nestBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {
-        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable);
+    private NestBinding nestBinding(PipelineResource pipeline, Map<String, SourceVertex> sourceTables) {
+        Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceTables);
         var operatorStateStores = storePort.operatorStateStores();
         return new NestBinding(byAlias::get, NestBinding.onMap(),
                 new LoggingNestDeadLetter(new DurableNestDeadLetter()),
@@ -2887,7 +2895,7 @@ final class StoreBackedDagSource implements DagSource {
      * different tables cannot both be answered. That is refused rather than silently resolved one way.
      */
     private Map<String, NestTable> nestTablesByAlias(
-            PipelineResource pipeline, Map<String, String> sourceIdByTable) {
+            PipelineResource pipeline, Map<String, SourceVertex> sourceTables) {
         Map<String, NestTable> byAlias = new LinkedHashMap<>();
         if (pipeline.transforms() == null) {
             return byAlias;
@@ -2900,7 +2908,7 @@ final class StoreBackedDagSource implements DagSource {
                 continue;
             }
             aliases.aliases().forEach((alias, ref) -> {
-                NestTable resolved = nestTable(ref, sourceIdByTable);
+                NestTable resolved = nestTable(ref, sourceTables);
                 NestTable existing = byAlias.putIfAbsent(alias, resolved);
                 if (existing != null && !existing.name().equals(resolved.name())) {
                     throw new IllegalStateException("alias '" + alias + "' names table '" + existing.name()
@@ -2913,31 +2921,31 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /** One alias's table: its discovered key when the reference names a table, no key otherwise. */
-    private NestTable nestTable(FromRef ref, Map<String, String> sourceIdByTable) {
+    private NestTable nestTable(FromRef ref, Map<String, SourceVertex> sourceTables) {
         if (!(ref instanceof FromRef.Literal literal)) {
             // A regex names many upstreams and so no single table key; an embed over one declares its own.
             return new NestTable(String.valueOf(ref), List.of());
         }
         String table = literal.ref();
-        String sourceId = sourceIdByTable.get(table);
-        if (sourceId == null) {
+        SourceVertex sourceTable = sourceTables.get(table);
+        if (sourceTable == null) {
             int separator = table.indexOf('.');
             if (separator > 0 && separator + 1 < table.length()) {
                 String candidate = table.substring(separator + 1);
-                String owner = sourceIdByTable.get(candidate);
-                if (table.substring(0, separator).equals(owner)) {
+                SourceVertex candidateTable = sourceTables.get(candidate);
+                if (candidateTable != null && table.substring(0, separator).equals(candidateTable.sourceId())) {
                     table = candidate;
-                    sourceId = owner;
+                    sourceTable = candidateTable;
                 }
             }
         }
-        if (sourceId == null) {
+        if (sourceTable == null) {
             // A step id: the stream is another step's output, which has no table key to fall back on.
             return new NestTable(table, List.of());
         }
         String resolvedTable = table;
-        String physicalTable = table.startsWith(sourceId + ".") ? table.substring(sourceId.length() + 1) : table;
-        return storePort.schemas().get(sourceId)
+        String physicalTable = sourceTable.table();
+        return storePort.schemas().get(sourceTable.sourceId())
                 .map(DiscoveredSourceModel::model)
                 .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(physicalTable)).findFirst())
                 .map(discovered -> new NestTable(
