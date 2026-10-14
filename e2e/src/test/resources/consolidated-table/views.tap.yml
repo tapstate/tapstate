@@ -1,0 +1,5 @@
+version: tapstate/v1
+kind: source
+id: views
+connector: e2e_file
+config: { uri: "${TGT_DIR}" }
