@@ -5,6 +5,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 python3 - "$here" <<'PY'
 import argparse
 import copy
+import hashlib
 import os
 import struct
 import subprocess
@@ -347,6 +348,34 @@ with tempfile.TemporaryDirectory() as tmp:
     check(not identity['first_complete_pr_sample_proven'] and not identity['group_equivalence_proven'],
           'identity consistency alone never proves a complete first sample or group equivalence')
     check('private-event-sentinel' not in json.dumps(captured),'event text and user data are excluded')
+    labeled=copy.deepcopy(payload)
+    labeled['pull_request']['labels']=[{'name':'UPGRADE-LANE','description':'private-event-sentinel'},
+                                      {'name':'private-event-sentinel','color':'abcdef'}]
+    label_capture=m.event_snapshot(checkout,labeled,runner)['pull_request']
+    check(label_capture.get('labels_snapshot_complete') is True,
+          'original event label snapshot must be retained before labels change')
+    check(label_capture['label_name_sha256']==sorted(hashlib.sha256(name.encode()).hexdigest()
+          for name in ['UPGRADE-LANE','private-event-sentinel']), 'label identities are hash-only event facts')
+    check(label_capture['label_ascii_lower_sha256']==sorted(hashlib.sha256(name.lower().encode()).hexdigest()
+          for name in ['UPGRADE-LANE','private-event-sentinel']) and label_capture['label_ascii_case_complete'] is True,
+          'ASCII case-insensitive expression inputs preserve their own lower-case hashes')
+    check('private-event-sentinel' not in json.dumps(label_capture) and 'UPGRADE-LANE' not in json.dumps(label_capture),
+          'no raw label name or description leaks into captured metadata')
+    absent_labels=m.event_snapshot(checkout,payload,runner)['pull_request']
+    check(absent_labels['labels_snapshot_complete'] is False and absent_labels['label_name_sha256'] is None,
+          'historical missing labels stay unknown, not an invented empty set')
+    empty_labels=copy.deepcopy(labeled);empty_labels['pull_request']['labels']=[]
+    empty=m.event_snapshot(checkout,empty_labels,runner)['pull_request']
+    check(empty['labels_snapshot_complete'] is True and empty['label_name_sha256']==[]
+          and empty['label_ascii_case_complete'] is True, 'observed empty labels are distinct from absent labels')
+    unicode_labels=copy.deepcopy(labeled);unicode_labels['pull_request']['labels']=[{'name':'\u00e9'}]
+    unicode_capture=m.event_snapshot(checkout,unicode_labels,runner)['pull_request']
+    check(unicode_capture['labels_snapshot_complete'] is True and unicode_capture['label_ascii_lower_sha256']==[]
+          and unicode_capture['label_ascii_case_complete'] is False,
+          'non-ASCII matching semantics are explicitly outside the supported case-fold projection')
+    for bad in [None,{},[{}],[{'name':123}],[{'name':''}],[{'name':'same'},{'name':'same'}]]:
+        malformed=copy.deepcopy(labeled);malformed['pull_request']['labels']=bad
+        rejected(lambda:m.event_snapshot(checkout,malformed,runner),'malformed label snapshot rejects')
     failed=copy.deepcopy(run); failed['conclusion']='failure'
     check(reconcile(actual=failed)['conclusion']=='failure','failed first attempts retain identity instead of being selected away')
     def rejects_identity(value, actual, reason):

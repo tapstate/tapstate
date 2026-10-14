@@ -32,6 +32,19 @@ reconciled using the existing identity checker. CI attempt 1 must have completed
 successfully. Reused heads/runs and overlapping CI event runs are rejected. This
 CI ordering alone does not establish that every other applicable workflow ended.
 
+The original CI event recorder also retains hash-only PR label facts. Missing
+event labels have `labels_snapshot_complete: false` and null hash lists; an observed
+empty list is a complete empty snapshot. `label_name_sha256` preserves UTF-8 name
+identities. `label_ascii_lower_sha256` supplies membership hashes for supported
+ASCII case-insensitive expressions; `label_ascii_case_complete` is false when any
+name is non-ASCII. No names, descriptions or event text enter the metadata.
+GitHub's [expression functions](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions)
+compare `contains` values without case sensitivity. Unknown non-ASCII matching
+semantics remain outside this limited projection. Preserve these original facts
+when deriving historical label applicability; current labels cannot replace a
+missing event snapshot. Identity/capture completeness alone does not establish R,
+all applicable workflow results or a first complete performance sample.
+
 Each component file has schema `1`, type `declared-group-component`, a matching
 `name`, a `binding` of `{run_id, run_attempt: 1, source_sha}` for the actual merge
 checkout, and a nonempty structured `payload`. Payloads are canonicalized and

@@ -578,8 +578,26 @@ def sha(value, label):
     return value
 
 
+def event_labels(pr):
+    if 'labels' not in pr:
+        return dict(labels_snapshot_complete=False, label_name_sha256=None,
+                    label_ascii_lower_sha256=None, label_ascii_case_complete=False)
+    labels = pr['labels']
+    require(isinstance(labels, list) and len(labels) <= 4096, 'invalid original label snapshot')
+    names = []
+    for label in labels:
+        require(isinstance(label, dict) and isinstance(label.get('name'), str)
+                and 0 < len(label['name']) <= 1024, 'invalid original label name')
+        names.append(label['name'])
+    require(len(set(names)) == len(names), 'duplicate original label name')
+    hashed = lambda name: hashlib.sha256(name.encode('utf-8')).hexdigest()
+    return dict(labels_snapshot_complete=True, label_name_sha256=sorted(hashed(name) for name in names),
+                label_ascii_lower_sha256=sorted({hashed(name.lower()) for name in names if name.isascii()}),
+                label_ascii_case_complete=all(name.isascii() for name in names))
+
+
 def event_snapshot(root, payload, environment):
-    # Retain event identities only, never issue text, user details or arbitrary inputs.
+    # Retain event identities and hash-only labels, never issue text or user details.
     repository = environment['GITHUB_REPOSITORY']
     event = environment['GITHUB_EVENT_NAME']
     require(event in ('pull_request', 'push', 'workflow_dispatch'), 'unsupported CI event')
@@ -614,7 +632,8 @@ def event_snapshot(root, payload, environment):
                 'checkout parents differ from original PR base/head')
         value['pull_request'] = dict(number=number, action=payload['action'], head_sha=head['sha'],
                                      base_sha=base['sha'], head_ref=head['ref'], base_ref=base['ref'],
-                                     head_repository=head['repo']['full_name'], base_repository=repository)
+                                     head_repository=head['repo']['full_name'], base_repository=repository,
+                                     **event_labels(pr))
     else:
         if event == 'push' and payload.get('deleted') is True:
             return dict(value, event_payload_complete=False, ref_deleted=True,
