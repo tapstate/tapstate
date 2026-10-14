@@ -45,6 +45,10 @@ when deriving historical label applicability; current labels cannot replace a
 missing event snapshot. Identity/capture completeness alone does not establish R,
 all applicable workflow results or a first complete performance sample.
 
+`ci-trigger-basis.sh` reads the original workflow source blocks, hash-only label
+facts and ruleset records from the archive chain. See `ci-trigger-basis.md`; raw
+source readback remains distinct from R/G applicability and actual execution.
+
 Each component file has schema `1`, type `declared-group-component`, a matching
 `name`, a `binding` of `{run_id, run_attempt: 1, source_sha}` for the actual merge
 checkout, and a nonempty structured `payload`. Payloads are canonicalized and
