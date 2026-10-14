@@ -478,8 +478,11 @@ public final class CaptureRunUnit {
         boolean switched = meta.read(other.value()).map(record -> record.consumerOffsets().stream()
                 .anyMatch(offset -> (offset.pipelineId().equals(spec.consumerId())
                         || offset.pipelineId().equals(spec.pipelineId())) && hasRecoveryState(offset))).orElse(false);
+        // A position move drops the order and stamps the token. An orderless legacy checkpoint has
+        // no stamp proving an explicit move. Legacy consumer state is still refused independently.
         boolean unsafeCheckpoint = plan.sharedRing() && retained.filter(record ->
-                record.sourceRead() != null && !record.sourceReadDurable()).isPresent();
+                record.sourceRead() != null && !record.sourceReadDurable()
+                        && (record.sourceRead().order() != null || record.sourceReadAt() == null)).isPresent();
         SharedTail localTail = sharedTails.get(chain.value());
         boolean restartingSharedProducer = plan.sharedRing() && spec.readMode() == ReadMode.CDC_ONLY
                 && startTail && (localTail == null || localTail.closed);

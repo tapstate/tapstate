@@ -18,10 +18,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Isolated("Owns process standard input and logging properties")
 class TapstateMcpApplicationTest {
 
-    private final InputStream processInput = System.in;
+    private InputStream processInput;
 
     @BeforeEach
     void isolateStdioInput() {
+        processInput = System.in;
         // The default stdio transport still starts when stdio=false. It must not read
         // Surefire's command pipe or prevent the test JVM from exiting and writing coverage.
         System.setIn(InputStream.nullInputStream());

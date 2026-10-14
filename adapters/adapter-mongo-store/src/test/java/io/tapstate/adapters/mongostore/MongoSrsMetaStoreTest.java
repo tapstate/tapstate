@@ -21,6 +21,7 @@ import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -141,6 +142,27 @@ class MongoSrsMetaStoreTest {
         assertThat(document.get("consumerOffsets", Document.class)).isEmpty();
         assertThat(document.getList("schemaHistory", Document.class)).isEmpty();
         assertThat(MongoSrsMetaStore.toMeta(document)).isEqualTo(seed);
+    }
+
+    @Test
+    void anOrderlessTokenRetainsOnlyItsRecordedWriteEvidence() {
+        Document legacy = new Document("_id", "chain")
+                .append("sourceReadOffset", "legacy-checkpoint")
+                .append("epoch", 1L)
+                .append("consumerOffsets", new Document())
+                .append("schemaHistory", List.of());
+
+        SrsMeta decoded = MongoSrsMetaStore.toMeta(legacy);
+
+        assertThat(decoded).isEqualTo(new SrsMeta("chain", new ChainPosition(null, "legacy-checkpoint"),
+                List.of(), List.of(), null, 1L));
+        assertThat(decoded.sourceReadDurable()).isFalse();
+        assertThat(decoded.sourceReadAt()).isNull();
+
+        Document moved = new Document(legacy).append("sourceReadAt", 42L);
+        assertThat(MongoSrsMetaStore.toMeta(moved)).isEqualTo(new SrsMeta("chain",
+                new ChainPosition(null, "legacy-checkpoint"), List.of(), List.of(), null, 1L,
+                Instant.ofEpochMilli(42L), false));
     }
 
     @Test
