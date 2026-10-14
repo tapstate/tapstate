@@ -17,6 +17,8 @@ import io.tapstate.spi.store.SourceTable;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * A join whose SQL cannot be resolved when the pipeline is assembled is refused with a code, so the
@@ -114,6 +116,32 @@ class AJoinThatCannotResolveItsInputsIsRefusedWithACodeTest {
                 .doesNotThrowAnyException();
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aJoinPreservesPhysicalTableNamesStartingWithTheSourceId(boolean sharedTable) {
+        String dimensionTable = sharedTable ? "public.orders" : "order_items";
+        String pipeline = joinPipeline("SELECT o.id AS order_id, i.id AS item_id")
+                .replace("orders_src", "public")
+                .replace("o: orders", "o: public.public.orders")
+                .replace("i: order_items", "i: items_src." + dimensionTable);
+        List<String> documents = List.of(
+                SOURCE.replace("orders_src", "public")
+                        .replace("tables: [ orders ]", "tables: [ public.orders ]"),
+                ITEMS_SOURCE.replace("tables: [ order_items ]", "tables: [ " + dimensionTable + " ]"),
+                TARGET, pipeline);
+        InMemoryStorePort store = stored(true, documents, "public");
+        discovered(store, "public", "public.orders");
+        discovered(store, "items_src", dimensionTable);
+        StoreBackedDagSource source = new StoreBackedDagSource(store, discardingBinder());
+
+        StoreBackedDagSource.CompiledJoin compiled = source.compiledJoinsOf("wide").get("widen");
+
+        assertThat(compiled.factTable()).isEqualTo(sharedTable ? "public.public.orders" : "public.orders");
+        assertThat(compiled.factKeyColumns()).containsExactly("id");
+        assertThat(compiled.dimensionRowKeyColumns()).containsEntry("i", List.of("id"));
+        assertThatCode(() -> source.dagFor("wide")).doesNotThrowAnyException();
+    }
+
     @Test
     void aJoinReadingAStepIsRefusedWithACodeNamingTheStep() {
         InMemoryStorePort store = discovered(stored(false, JOIN_OVER_A_STEP));
@@ -154,9 +182,13 @@ class AJoinThatCannotResolveItsInputsIsRefusedWithACodeTest {
 
     /** Parses and stores the pipeline with its sources, through the product's own gate when asked to. */
     private static InMemoryStorePort stored(boolean validate, String pipeline) {
+        return stored(validate, List.of(SOURCE, ITEMS_SOURCE, TARGET, pipeline), "orders_src");
+    }
+
+    private static InMemoryStorePort stored(boolean validate, List<String> documents, String factSource) {
         DslParser parser = new DslParser();
         List<Resource> resources = new ArrayList<>();
-        for (String document : List.of(SOURCE, ITEMS_SOURCE, TARGET, pipeline)) {
+        for (String document : documents) {
             resources.add(parser.parse(document));
         }
         if (validate) {
@@ -164,7 +196,7 @@ class AJoinThatCannotResolveItsInputsIsRefusedWithACodeTest {
         }
         InMemoryStorePort store = new InMemoryStorePort();
         resources.forEach(store.artifacts()::save);
-        OpenRingGenerations.forSources(store, "orders_src");
+        OpenRingGenerations.forSources(store, factSource);
         return store;
     }
 
