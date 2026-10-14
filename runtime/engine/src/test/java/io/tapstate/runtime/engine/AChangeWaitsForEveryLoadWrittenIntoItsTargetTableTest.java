@@ -8,6 +8,7 @@ import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.processor.Processors;
+import com.hazelcast.jet.impl.util.WrappingProcessorMetaSupplier;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.lifecycle.NodeParallelism;
@@ -66,7 +67,7 @@ class AChangeWaitsForEveryLoadWrittenIntoItsTargetTableTest {
         assertThat(awaitedBy(dag, "c_src"))
                 .as("a table alone in its target waits for its own load")
                 .containsExactly(new AwaitedLoad("serve.s", "c", SPREADING_WRITERS));
-        assertThat(dag.getVertex("d_src").getMetaSupplier())
+        assertThat(undecorated(dag, "d_src"))
                 .as("a table written into a target with no key goes to one writer in order, and waits for nothing")
                 .isNotInstanceOf(LoadGatedSource.class);
     }
@@ -109,7 +110,7 @@ class AChangeWaitsForEveryLoadWrittenIntoItsTargetTableTest {
                 new FrontierBinding(Map.of("customers", "customers", "orders", "orders")), shape);
 
         for (String source : List.of("customers", "orders")) {
-            assertThat(dag.getVertex(source).getMetaSupplier()).as(source).isNotInstanceOf(LoadGatedSource.class);
+            assertThat(undecorated(dag, source)).as(source).isNotInstanceOf(LoadGatedSource.class);
         }
     }
 
@@ -118,7 +119,7 @@ class AChangeWaitsForEveryLoadWrittenIntoItsTargetTableTest {
         DAG dag = PipelineDagBuilder.build(pipeline(), bindings(), new NoAcks(), FRONTIER, ExecutionShape.totalOne());
 
         for (String source : List.of("a_src", "b_src", "c_src", "d_src")) {
-            assertThat(dag.getVertex(source).getMetaSupplier()).as(source).isNotInstanceOf(LoadGatedSource.class);
+            assertThat(undecorated(dag, source)).as(source).isNotInstanceOf(LoadGatedSource.class);
         }
     }
 
@@ -127,14 +128,26 @@ class AChangeWaitsForEveryLoadWrittenIntoItsTargetTableTest {
         DAG dag = PipelineDagBuilder.build(pipeline(), bindings(), null, FRONTIER, shape());
 
         for (String source : List.of("a_src", "b_src", "c_src", "d_src")) {
-            assertThat(dag.getVertex(source).getMetaSupplier()).as(source).isNotInstanceOf(LoadGatedSource.class);
+            assertThat(undecorated(dag, source)).as(source).isNotInstanceOf(LoadGatedSource.class);
         }
     }
 
     private static List<AwaitedLoad> awaitedBy(DAG dag, String source) {
-        ProcessorMetaSupplier supplier = dag.getVertex(source).getMetaSupplier();
+        ProcessorMetaSupplier supplier = undecorated(dag, source);
         assertThat(supplier).as("the supplier of %s", source).isInstanceOf(LoadGatedSource.class);
         return ((LoadGatedSource) supplier).gate().awaited();
+    }
+
+    /**
+     * A source's supplier beneath its output-pressure decoration. The decoration goes on last, outside any load
+     * gate, so the gate still binds the real source processors; checking the outermost supplier for a gate would
+     * find the decoration and prove nothing either way.
+     */
+    private static ProcessorMetaSupplier undecorated(DAG dag, String source) {
+        ProcessorMetaSupplier supplier = dag.getVertex(source).getMetaSupplier();
+        assertThat(supplier).as("the output-pressure decoration of %s", source)
+                .isInstanceOf(WrappingProcessorMetaSupplier.class);
+        return ((WrappingProcessorMetaSupplier) supplier).getWrapped();
     }
 
     /** Four tables into two serve elements: {@code s} spreads loads over its writers, {@code t} is one writer. */
