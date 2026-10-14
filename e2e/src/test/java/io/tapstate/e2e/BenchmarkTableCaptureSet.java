@@ -68,7 +68,13 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
     }
 
     long awaitMeasured(BenchmarkWorkloadDefinitions.Workload workload, String phase) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofMinutes(5).toNanos();
+        return awaitMeasured(workload, phase, Duration.ofMinutes(5));
+    }
+
+    /** The same with a longer budget, for a phase whose whole backlog is written before its pipelines run. */
+    long awaitMeasured(BenchmarkWorkloadDefinitions.Workload workload, String phase, Duration budget)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + budget.toNanos();
         for (var chain : workload.sourceChains()) {
             if (BenchmarkMeasuredEndMarkers.forChain(workload, chain).containsKey(phase)) {
                 await(chain, chain.id() + "/" + phase, deadline);

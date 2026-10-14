@@ -94,6 +94,21 @@ final class BenchmarkWorkloadDefinitions {
                 original.pipelineIds(), original.sourceChains(), original.setupSql(), phases);
     }
 
+    /**
+     * The steady pilot with each measured phase issued as one unpaced backlog. Source statements, coverage
+     * and target answers stay those of the steady pilot; only the offer interval becomes zero, because a
+     * drain fork writes the whole phase while its pipelines hold and then measures how fast they catch up.
+     */
+    static Workload drainPilot(String id) {
+        Workload original = steadyPilot(id);
+        List<Phase> phases = original.phases().stream().map(phase -> phase.measured()
+                ? new Phase(phase.id(), phase.stage(), true, phase.expectedLogicalOutputChanges(),
+                        phase.sql(), phase.statementsPerBatch(), Duration.ZERO,
+                        phase.expectedLogicalCoverage(), phase.targets()) : phase).toList();
+        return new Workload(original.id(), original.seed(), original.rows(), original.database(),
+                original.pipelineIds(), original.sourceChains(), original.setupSql(), phases);
+    }
+
     enum Database {
         MYSQL,
         POSTGRES

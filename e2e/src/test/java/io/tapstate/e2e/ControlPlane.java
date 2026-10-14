@@ -1745,6 +1745,14 @@ final class ControlPlane {
         return interpretRecordsOut(response.statusCode(), response.body(), pipelineId);
     }
 
+    /** One whole read of the metrics face, as answered, for a reader that keeps every typed fact. */
+    record MetricsAnswer(int status, String body) {}
+
+    MetricsAnswer metricsAnswer(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        return new MetricsAnswer(response.statusCode(), response.body());
+    }
+
     /** What a metrics answer says about rows that reached a target, read by exact name. */
     static Optional<Long> interpretRecordsOut(int status, String body, String pipelineId) {
         return interpretMetricByName(status, body, pipelineId, RECORDS_OUT_METRIC);

@@ -312,16 +312,47 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private final List<Evidence> evidence = new ArrayList<>();
     private final BenchmarkForkEnvironment.BootLauncher launcher;
     private final BenchmarkReturnForkBridge returnBridge;
+    private final FactRegime factRegime;
+    private final java.util.OptionalInt processFactsPort;
+    private final List<Map<String, Object>> phaseFactEvidence = new ArrayList<>();
+
+    /** Whether a fork also records published facts around its measured phases, and under which load. */
+    enum FactRegime { NONE, FIXED_OFFER, BACKLOG_DRAIN }
 
     RealBenchmarkForkDriver() { this(BenchmarkForkEnvironment.OwnedBoot::plain); }
 
     RealBenchmarkForkDriver(BenchmarkForkEnvironment.BootLauncher launcher) { this(launcher, null); }
     RealBenchmarkForkDriver(BenchmarkForkEnvironment.BootLauncher launcher, BenchmarkReturnForkBridge returnBridge) {
+        this(launcher, returnBridge, FactRegime.NONE, java.util.OptionalInt.empty());
+    }
+
+    /**
+     * A fork that records published facts around each measured phase. Under {@code BACKLOG_DRAIN} each measured
+     * phase is written as one backlog while its pipelines hold, then measured as it catches up. It never runs
+     * under the return method: its readings come from target operations and published facts.
+     */
+    static RealBenchmarkForkDriver recordingFacts(BenchmarkForkEnvironment.BootLauncher launcher, FactRegime regime,
+            java.util.OptionalInt processFactsPort) {
+        if (regime == FactRegime.NONE) { throw new IllegalArgumentException("a fact-recording fork names its regime"); }
+        return new RealBenchmarkForkDriver(launcher, null, regime, processFactsPort);
+    }
+
+    private RealBenchmarkForkDriver(BenchmarkForkEnvironment.BootLauncher launcher, BenchmarkReturnForkBridge returnBridge,
+            FactRegime factRegime, java.util.OptionalInt processFactsPort) {
         this.launcher = Objects.requireNonNull(launcher); this.returnBridge = returnBridge;
+        this.factRegime = Objects.requireNonNull(factRegime); this.processFactsPort = Objects.requireNonNull(processFactsPort);
+        if (factRegime != FactRegime.NONE && returnBridge != null) {
+            throw new IllegalArgumentException("a fact-recording fork cannot run the return method");
+        }
     }
 
     List<Evidence> evidence() {
         return List.copyOf(evidence);
+    }
+
+    /** Each measured phase's held/settled facts, gauge samples and process facts, in phase order. */
+    List<Map<String, Object>> phaseFactEvidence() {
+        return List.copyOf(phaseFactEvidence);
     }
 
     static BenchmarkReturnClockSampler.Mode writeReturnClockMode(String value, boolean diagnostics, boolean pilot) {
@@ -757,11 +788,17 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         workload, workload.phases().get(phaseIndex), fork);
                      BenchmarkTableCaptureSet tables = BenchmarkTableCaptureSet.open(workload, fork)) {
                     fork.beginTelemetryCapture();
+                    BenchmarkPhaseFacts phaseFacts = factRegime == FactRegime.NONE ? null : new BenchmarkPhaseFacts(
+                            workload, fork.control(), processFactsPort, factRegime == FactRegime.BACKLOG_DRAIN);
                     for (BenchmarkWorkloadDefinitions.Phase phase : workload.phases().subList(phaseIndex,
                             workload.phases().size())) {
                         if (phase.measured()) {
+                            if ((factRegime == FactRegime.BACKLOG_DRAIN) != phase.batchInterval().isZero()) {
+                                throw new AssertionError("phase " + phase.id() + " is not issued as its regime requires: " + factRegime);
+                            }
                             PhaseWindow window = runMeasuredPhase(workload, fork, phase,
-                                    captures, positionCoverage, targets, tables, returnCounters, acknowledgedBoundaryAt, returnBridge);
+                                    captures, positionCoverage, targets, tables, returnCounters, acknowledgedBoundaryAt, returnBridge,
+                                    phaseFacts);
                             measured.add(window.measurement());
                             allDurations.addAll(window.deliveryDurations());
                             resourceWindows.add(window.resources());
@@ -783,6 +820,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     }
                     observedTargetCoverage = targets.observedCoverage();
                     tableReceipts = tables.receipts();
+                    if (phaseFacts != null) { phaseFactEvidence.addAll(phaseFacts.evidence()); }
                 }
                 if (terminal == null || chains == null
                         || resourceWindows.isEmpty() || commandWindows.isEmpty()) {
@@ -900,14 +938,15 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
             CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
             TargetWatchSet targets, BenchmarkTableCaptureSet tables, BenchmarkNativeQueueProbe returnCounters,
-            long acknowledgedBoundaryAt, BenchmarkReturnForkBridge returnBridge) throws Exception {
+            long acknowledgedBoundaryAt, BenchmarkReturnForkBridge returnBridge, BenchmarkPhaseFacts facts) throws Exception {
         var rootCpu = openRootCpuDiagnostics(Boolean.getBoolean(ROOT_CPU_DIAGNOSTICS_PROPERTY), () ->
                 BenchmarkRootCpuEnvelope.open(java.util.Set.of("MEASURED_COMMON_COLLECTION"), java.util.Set.of(
                         "CAPTURE_TAIL", "SAMPLER_NATIVE_TAIL", "ORACLE_ASSOCIATION_TAIL")));
         try {
             return runMeasuredPhase(workload, fork, phase, captures, positionCoverage, targets, tables,
-                    returnCounters, acknowledgedBoundaryAt, rootCpu, returnBridge);
+                    returnCounters, acknowledgedBoundaryAt, rootCpu, returnBridge, facts);
         } catch (Exception | Error failure) {
+            if (facts != null) { facts.abandon(); }
             if (rootCpu != null) {
                 try {
                     Map<String, Object> requests = BenchmarkWriteReturnCapture.retainedClockRequests(failure);
@@ -932,7 +971,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
             CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
             TargetWatchSet targets, BenchmarkTableCaptureSet tables, BenchmarkNativeQueueProbe returnCounters,
-            long acknowledgedBoundaryAt, BenchmarkRootCpuEnvelope rootCpu, BenchmarkReturnForkBridge returnBridge) throws Exception {
+            long acknowledgedBoundaryAt, BenchmarkRootCpuEnvelope rootCpu, BenchmarkReturnForkBridge returnBridge,
+            BenchmarkPhaseFacts facts) throws Exception {
+        boolean draining = facts != null && facts.draining();
         boolean compilationDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics");
         if (compilationDiagnostics && !workload.pilotProfile()) {
             throw new AssertionError("compilation diagnostics require the declared steady pilot profile");
@@ -1025,8 +1066,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         }
         try (BenchmarkResourceSampler resourceSampler = workload.pilotProfile()
                 // Retain reads across the whole fixed offer as well as the ACK wait that follows it.
-                ? BenchmarkResourceSampler.openForPhaseBudget(fork.server().pid(), RESOURCE_INTERVAL,
-                        ACK_WAIT.plus(phase.batchInterval().multipliedBy(phase.sql().size() / phase.statementsPerBatch())))
+                ? BenchmarkResourceSampler.openForPhaseBudget(fork.server().pid(), RESOURCE_INTERVAL, draining
+                        ? BenchmarkPhaseFacts.DRAIN_WAIT
+                        : ACK_WAIT.plus(phase.batchInterval().multipliedBy(phase.sql().size() / phase.statementsPerBatch())))
                 : BenchmarkResourceSampler.open(fork.server().pid(), RESOURCE_INTERVAL);
              BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri());
              BenchmarkTargetClockSampler clockSampler = targetClockBefore == null ? null
@@ -1083,6 +1125,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                         System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY), true, workload.pilotProfile()),
                                 Boolean.getBoolean(WRITE_RETURN_COST_STAGES_PROPERTY)) : null) {
                     try {
+                        if (facts != null) { facts.beforeIssue(); }
                         issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
                             for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
                                 List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes = plan.forBatch(batchIndex);
@@ -1096,10 +1139,13 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         if (issued.batches().isEmpty()) {
                             throw new AssertionError("measured phase has no source batches: " + phase.id());
                         }
+                        if (facts != null) { facts.afterIssue(); }
                         sourceMarkerWaitStartedAt = BenchmarkReturnWorkBudget.rootNanoTime();
                         captures.awaitMeasuredSourceMarkers(workload, phase);
                         sourceMarkerWaitCompletedAt = BenchmarkReturnWorkBudget.rootNanoTime();
-                        completedAckAt = tables.awaitMeasured(workload, phase.id());
+                        completedAckAt = draining ? tables.awaitMeasured(workload, phase.id(), BenchmarkPhaseFacts.DRAIN_WAIT)
+                                : tables.awaitMeasured(workload, phase.id());
+                        if (facts != null) { facts.acknowledged(completedAckAt); }
                         if (collectorCalibration != null) {
                             collectorCalibrationEvidence.put("fourWriterTableAckAtNanos", completedAckAt);
                             collectorCalibrationEvidence.put("sourceIssue", retainedSourceIssue);
@@ -1539,6 +1585,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             clockProof.put("nativeCounterBaselineAfter", counterAfter.evidence());
             clockProof.put("reportedRecordsOutScope", "FRESH_NATIVE_AND_FLAT_CORRESPONDING_BASELINES");
         }
+        if (facts != null) { facts.settle(phase.id()); }
         long firstIssued = issued.batches().getFirst().issuedAtNanos();
         long expectedSourceChanges = phase.expectedLogicalCoverage().values().stream()
                 .mapToLong(Long::longValue).sum();

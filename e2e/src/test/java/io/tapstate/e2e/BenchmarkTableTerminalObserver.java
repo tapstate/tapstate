@@ -197,9 +197,12 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
         }
     }
 
+    /** Bounds one wait; a drain of the largest fixed backlog at its slowest rate fits inside it. */
+    static final Duration MAX_WAIT = Duration.ofMinutes(30);
+
     synchronized Point await(String markerId, Duration timeout) throws InterruptedException {
         if (!markers.containsKey(markerId) || timeout == null || timeout.isZero() || timeout.isNegative()
-                || timeout.compareTo(Duration.ofMinutes(5)) > 0) {
+                || timeout.compareTo(MAX_WAIT) > 0) {
             throw new IllegalArgumentException("registered marker and positive bounded wait required");
         }
         long deadline = System.nanoTime() + timeout.toNanos();

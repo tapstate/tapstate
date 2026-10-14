@@ -138,6 +138,30 @@ class BenchmarkWorkloadDefinitionsTest {
         }
     }
 
+    @Test
+    void aDrainForkWritesTheSameMeasuredChangesAsOneUnpacedBacklog() {
+        for (String id : List.of("copy", "stateless", "stateful")) {
+            var original = BenchmarkWorkloadDefinitions.steadyPilot(id);
+            var drain = BenchmarkWorkloadDefinitions.drainPilot(id);
+            assertThat(drain.rows()).isEqualTo(original.rows());
+            assertThat(drain.setupSql()).isEqualTo(original.setupSql());
+            assertThat(drain.sourceChains()).isEqualTo(original.sourceChains());
+            assertThat(drain.pipelineIds()).isEqualTo(original.pipelineIds());
+            assertThat(drain.phases()).hasSameSizeAs(original.phases());
+            for (int i = 0; i < drain.phases().size(); i++) {
+                var before = original.phases().get(i);
+                var after = drain.phases().get(i);
+                assertThat(after.id()).isEqualTo(before.id());
+                assertThat(after.measured()).isEqualTo(before.measured());
+                assertThat(after.sql()).isEqualTo(before.sql());
+                assertThat(after.expectedLogicalOutputChanges()).isEqualTo(before.expectedLogicalOutputChanges());
+                assertThat(after.expectedLogicalCoverage()).isEqualTo(before.expectedLogicalCoverage());
+                assertThat(after.targets()).isEqualTo(before.targets());
+                assertThat(after.batchInterval()).isEqualTo(before.measured() ? Duration.ZERO : before.batchInterval());
+            }
+        }
+    }
+
     private static final Map<String, Object> SOURCE = Map.of(
             "host", "127.0.0.1", "port", 3306, "database", "bench_fork",
             "username", "bench", "password", "bench-password");
