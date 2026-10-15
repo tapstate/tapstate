@@ -59,14 +59,14 @@ def project(refs, request):
             and len({value['owned_recipe_digest'] for value in source_facts.values()}) == 1,
             'case partition preserved source or recipe differs')
     inventories = {name: value['source_inventory'] for name, value in facts.items()}
-    complete = all(value['all_source_cases_statically_parsed'] and not inventories[name]['unresolved']
+    complete = all(value.get('all_source_cases_resolved', value['all_source_cases_statically_parsed']) and not inventories[name]['unresolved']
                    for name, value in facts.items())
     result = partition(inventories) if complete else {'original_cases': None, 'additions': None}
     return {'schema': 1, 'type': 'archived-original-case-partition',
             'variant_bindings': {name: {'scope': value['scope'], 'checkout': value['checkout'],
                 'source_inventory_digest': value['source_inventory_digest']} for name, value in facts.items()},
             **result, 'known_source_cases': {name: value['cases'] for name, value in inventories.items()},
-            'known_static_subset_partitioned': complete, 'original_case_partition_verified': complete,
+            'known_static_subset_partitioned': all(value['all_source_cases_statically_parsed'] for value in facts.values()), 'original_case_partition_verified': complete,
             'unresolved': {name: value['unresolved'] for name, value in inventories.items()},
             'original_assertions_verified': False, 'normalized_original_inputs_verified': False,
             'whole_build_provenance_complete': False, 'first_complete_PR_sample': False,

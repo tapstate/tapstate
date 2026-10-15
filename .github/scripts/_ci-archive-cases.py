@@ -3,9 +3,10 @@
 
 Only trusted reader code runs. Archived regular files are copied as non-executable
 data into a fresh temporary directory; links and archived code execution are forbidden.
-Unresolved computed providers remain unknown rather than borrowing their declarations.
+Computed providers remain unknown without separately bound replay result records.
 """
 import argparse
+import copy
 from collections import Counter
 from contextlib import redirect_stdout
 import importlib.util
@@ -112,8 +113,48 @@ def published_observations(inv, cases, ledger):
     require(Counter(ledger) == Counter(expected_ledger), 'published ledger differs from source executed cases')
 
 
+def provider_inventory(refs, root, request, inventory, scope, workers):
+    references = request.get('provider_replays')
+    if references is None:
+        return inventory, None
+    require(isinstance(references, dict) and set(references) == set(workers), 'provider case replay worker set differs')
+    replay = g.module('case_provider_replay', '_ci-provider-replay-readback.py')
+    methods, bindings = None, {}
+    for worker, reference in sorted(references.items()):
+        audit_request, unused = refs.read(reference)
+        audited = replay.audit(refs, root, audit_request)
+        value, unused = refs.read(audit_request['replay'])
+        original, unused = refs.read(value['request'])
+        require(audited['original_scope'] == scope and audited['worker'] == worker
+                and original['archive_inputs']['sha256'] == request['archive_inputs']['sha256'],
+                'provider case replay belongs to another source/run/input request')
+        current = audited['reconstructed_methods']
+        require(methods is None or g.canonical(methods) == g.canonical(current), 'provider case identities differ between workers')
+        methods = current
+        bindings[worker] = {'request': reference, 'replay_receipt_sha256': audited['replay_receipt_sha256'],
+                            'method_count': audited['method_count'], 'case_count': audited['case_count']}
+    result = copy.deepcopy(inventory)
+    by_key = {ev.method_key(row): row for row in result['methods']}
+    require(len(by_key) == len(result['methods']), 'duplicate provider source method identity')
+    resolved = set()
+    for method in methods or []:
+        key = ev.method_key(method)
+        require(key in by_key and key not in resolved and by_key[key]['parameters'] is None
+                and by_key[key]['source'] == method['source'], 'provider case replay replaces a static or foreign method')
+        by_key[key].update({field: value for field, value in method.items() if field not in ('lane','module','kind','class','method','source')})
+        resolved.add(key)
+    pairs = {(by_key[key]['source'], by_key[key]['method']) for key in resolved}
+    pairs = {pair for pair in pairs if all(row['parameters'] is not None for row in result['methods']
+             if (row['source'], row['method']) == pair)}
+    result['unresolved'] = [gap for gap in result['unresolved'] if (gap.get('source'), gap.get('method')) not in pairs]
+    result['cases'] = sorted([{**{field: method[field] for field in ('lane','module','kind','class','method')}, 'parameter': parameter}
+        for method in result['methods'] for parameter in method['parameters'] or []], key=ev.identity)
+    result['complete'] = not result['unresolved'] and all(row['parameters'] is not None for row in result['methods'])
+    return result, bindings
+
+
 def project(refs, root, request):
-    require(isinstance(request, dict) and set(request) == {'schema', 'type', 'archive_inputs'}
+    require(isinstance(request, dict) and set(request) in ({'schema', 'type', 'archive_inputs'}, {'schema', 'type', 'archive_inputs', 'provider_replays'})
             and type(request['schema']) is int and request['schema'] == 1
             and request['type'] == 'archive-cases-request', 'invalid archived case request')
     input_request, unused = refs.read(request['archive_inputs'])
@@ -126,6 +167,7 @@ def project(refs, root, request):
     observed, gaps = [], []
     reader_paths = ['_ci-archive-cases.py', '_ci-archive-inputs.py', '_ci-source-projection.py',
                     '_ci-variants.py', '_ci-pr-groups.py', '_ci-evidence.py', '_ci-shards.py', '_ci-receipt.py', '_ci-provider-readback.py']
+    if 'provider_replays' in request: reader_paths.append('_ci-provider-replay-readback.py')
     reader_hashes = {name: g.checksum(Path(__file__).with_name(name).read_bytes()) for name in reader_paths}
     worker_reads = {}
     with tempfile.TemporaryDirectory(prefix='ci-case-data-') as temporary:
@@ -140,6 +182,9 @@ def project(refs, root, request):
                 'source-discovered class cohort differs from archived plan')
         inv_path = data_root / 'source-inventory.json'
         inv, environment = source_inventory(tree, checkout, g.checksum(source_raw), 'ci', inv_path)
+        statically_complete = inv['complete']
+        inv, provider_bindings = provider_inventory(refs, root, request, inv, readback['scope'], [row['id'] for row in plan['shards']])
+        if provider_bindings is not None: ev.output(inv_path, inv)
         hash_path = data_root / 'source-case-hashes.json'
         with redirect_stdout(io.StringIO()):
             ev.export_hashes(SimpleNamespace(input=str(inv_path), output=str(hash_path)))
@@ -240,7 +285,8 @@ def project(refs, root, request):
             'trusted case reader changed during replay')
     return {'schema': 1, 'type': 'archived-case-readback', 'scope': readback['scope'], 'checkout': readback['checkout'],
             'source_class_cohort_verified': True, 'source_case_subset_verified': bool(inv['cases']),
-            'all_source_cases_statically_parsed': fully_parsed,
+            'all_source_cases_statically_parsed': fully_parsed and statically_complete,
+            **({'all_source_cases_resolved': fully_parsed, 'provider_case_inputs': provider_bindings} if provider_bindings is not None else {}),
             'source_inventory': inventory, 'source_inventory_digest': g.checksum(g.canonical(inventory)),
             'workers': worker_reads, 'unverified_components': sorted(set(readback['unverified_components'])
                            | ({'computed_provider_identities'} if not fully_parsed else set())),

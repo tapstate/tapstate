@@ -39,7 +39,7 @@ RESOURCE_BYTES = b'original resource protocol fixture\n'
 CODE = '''package io.tapstate.fixture;
 class SampleTest {
   @Test void holds() {}
-  @ParameterizedTest @MethodSource("values") void computed(String value) {}
+  @ParameterizedTest @MethodSource("values") void computed(int value) {}
   static Stream<Arguments> values() {
     return java.util.stream.IntStream.range(0, 2).mapToObj(index -> Arguments.of(index));
   }

@@ -70,6 +70,7 @@ def audit(refs,root,request):
     calls=value['invocations']
     require(isinstance(calls,list) and len(calls)==len(capture['invocations'])>0,'provider replay invocation set differs')
     method_count,case_count=0,0
+    reconstructed=[]
     for original,call in zip(capture['invocations'],calls):
         require(isinstance(call,dict) and set(call)==CALL_FIELDS and call['module']==original['module']
                 and type(call['exit_code']) is int and call['exit_code']==0
@@ -85,6 +86,17 @@ def audit(refs,root,request):
                 and call['result_records_sha256']==checked['result_records_sha256'], 'provider replay result detail differs from independent projection')
         require(type(call['original_result_records_hash_equal']) is bool and call['original_result_records_hash_equal']
                 ==(checked['result_records_sha256']==original['result_records_sha256']),'provider replay original result-hash declaration differs')
+        original_methods={(row['class'],row['method']):row for row in capture['resolved_methods'] if row['module']==call['module']}
+        for row in call['result_records']:
+            method=original_methods[(row['class'],row['test_method'])]
+            mapping=method['mapping']
+            field={'dynamic-marker':'display_name_digest','named-carrier-marker':'first_string_digest',
+                   'argument-marker':'argument_digest'}[mapping]
+            parameters=sorted(case[field] for case in row['cases'])
+            projected={key:method[key] for key in ('lane','module','kind','class','method','source','mapping','provider_contract')}
+            projected.update(parameters=parameters,argument_digests=parameters if mapping=='argument-marker' else None)
+            if mapping=='named-carrier-marker':projected['projection_types']=['java.lang.String','java.util.function.BiFunction']
+            reconstructed.append(projected)
         method_count+=checked['method_count'];case_count+=checked['case_count']
     require(type(value['method_count']) is int and value['method_count']==method_count and type(value['case_count']) is int
             and value['case_count']==case_count,'provider replay summary counts differ')
@@ -93,6 +105,7 @@ def audit(refs,root,request):
     for name,entry in chain_files.items():refs.blob({'path':name,'sha256':entry['sha256']})
     return {'schema':1,'type':'provider-replay-readback','original_scope':basis['scope'],'worker':worker,
             'replay_receipt_sha256':request['replay']['sha256'],
+            'reconstructed_methods':sorted(reconstructed,key=lambda row:tuple(row[key] for key in ('lane','module','kind','class','method'))),
             'method_count':method_count,'case_count':case_count,'original_capture_case_multisets_equal':True,
             'local_result_records_read_back':True,'receipt_reference_chain_consistent':True,
             'local_process_execution_proven':False,'local_stage_byte_attestation_proven':False,

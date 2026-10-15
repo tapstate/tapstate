@@ -53,6 +53,9 @@ def project(refs, root, request):
         'spec': {'toolchain': input_facts['observed_toolchain'], 'jacoco_version': observed['jacoco_version'],
                  'runtime_spec_complete': False},
     }
+    if 'all_source_cases_resolved' in case_facts:
+        payloads['I']['all_source_cases_resolved'] = case_facts['all_source_cases_resolved']
+        payloads['I']['provider_case_inputs'] = case_facts['provider_case_inputs']
     if 'observed_test_resource_files' in input_facts:
         payloads['I']['test_resource_files']=input_facts['observed_test_resource_files']
     binding = {'run_id': scope['run_id'], 'run_attempt': scope['run_attempt'],

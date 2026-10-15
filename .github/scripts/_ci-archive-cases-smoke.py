@@ -42,11 +42,14 @@ def rejected(call, message):
         raise AssertionError('expected rejection: ' + message)
 
 
-def prepare_cases(f):
+def prepare_cases(f, transform_inventory=None):
     data = f['root'] / 'producer-data'
     data.mkdir()
     inv_path = data / 'inventory.json'
     inv, unused = m.source_inventory(f['work'], f['merge'], g.checksum(fixture.v.git(f['work'], 'archive', '--format=tar', f['merge']).stdout), 'ci', inv_path)
+    if transform_inventory is not None:
+        inv = transform_inventory(inv)
+        ev.output(inv_path, inv)
     expected_path = data / 'expected.json'
     with redirect_stdout(io.StringIO()):
         ev.export_hashes(SimpleNamespace(input=str(inv_path), output=str(expected_path)))
