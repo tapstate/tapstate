@@ -466,6 +466,21 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     meta.settleDirectBatches(source.miningChainId(), source.consumerId());
                 }
             }
+            if (!advanceResumableProgress(source, run, now, before, fence)) {
+                return false;
+            }
+            if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
+                if (!markSnapshotComplete(source, table, fence)) {
+                    return false;
+                }
+                loaded.add(chain);
+            }
+            landed.put(chain, now);
+            return true;
+        }
+
+        private boolean advanceResumableProgress(SourceProgress source, WriterRun run, Landed now, Landed before,
+                WorkloadClaimFence fence) {
             ChainPosition resumable = now.resumableAt();
             if (resumable != null && (before == null || before.resumableAt() == null
                     || resumable.order().compareTo(before.resumableAt().order()) > 0)) {
@@ -480,13 +495,6 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     recordHowFarTheSourceHasBeenRead(meta, source.miningChainId(), resumable, recordedRead);
                 }
             }
-            if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
-                if (!markSnapshotComplete(source, table, fence)) {
-                    return false;
-                }
-                loaded.add(chain);
-            }
-            landed.put(chain, now);
             return true;
         }
 
