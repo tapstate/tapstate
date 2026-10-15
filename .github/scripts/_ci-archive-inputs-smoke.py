@@ -47,7 +47,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -72,6 +72,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                 assert re.fullmatch(r'[A-Za-z0-9_.-]+\.yml', name), name
                 (main / '.github/workflows' / name).write_text(text)
         (main / 'product.txt').write_text('preserved product fix\n')
+        for name, raw0 in (extra_source_files or {}).items():
+            path0=main/name;path0.parent.mkdir(parents=True,exist_ok=True);path0.write_bytes(raw0 if isinstance(raw0,bytes) else raw0.encode())
         observer_source = main / 'test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java'
         observer_source.parent.mkdir(parents=True)
         observer_source.write_text('package io.tapstate.testsupport; class CiCaseEvidence {}\n')
@@ -241,6 +243,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         originals = copy.deepcopy(artifacts)
         record_originals = copy.deepcopy(records)
 
+        archive_extra_files = {}
+
         def archive():
             values = {'run.json': {'id': run_id, 'run_attempt': 1, 'head_sha': anchor, 'head_branch': scope['branch'],
                                   'event': scope['event'], 'repository': {'full_name': scope['repository']},
@@ -251,6 +255,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             if base_source:
                 values.update({'base-commit.json': commit(base),
                     'base-source.tar': v.git(work, 'archive', '--format=tar', base).stdout})
+            values.update(archive_extra_files)
             index = {}
             for record in records:
                 name = str(record['id']) + '-' + record['name'] + '.zip'

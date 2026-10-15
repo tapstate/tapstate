@@ -125,7 +125,7 @@ def project(refs, root, request):
     plan = readback['plan']
     observed, gaps = [], []
     reader_paths = ['_ci-archive-cases.py', '_ci-archive-inputs.py', '_ci-source-projection.py',
-                    '_ci-variants.py', '_ci-pr-groups.py', '_ci-evidence.py', '_ci-shards.py', '_ci-receipt.py']
+                    '_ci-variants.py', '_ci-pr-groups.py', '_ci-evidence.py', '_ci-shards.py', '_ci-receipt.py', '_ci-provider-readback.py']
     reader_hashes = {name: g.checksum(Path(__file__).with_name(name).read_bytes()) for name in reader_paths}
     worker_reads = {}
     with tempfile.TemporaryDirectory(prefix='ci-case-data-') as temporary:

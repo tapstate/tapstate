@@ -8,6 +8,7 @@ import argparse
 from collections import Counter
 import csv
 from decimal import Decimal
+from datetime import datetime, timezone
 import hashlib
 import os
 import json
@@ -18,6 +19,7 @@ import sys
 import textwrap
 import tarfile
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -1866,9 +1868,111 @@ def artifacts(args):
     output(args.output, dict(schema=SCHEMA, type='artifact-admission', complete=True, binding=binding, files=actual))
 
 
+def provider_record(pairs):
+    value = {}
+    for key, field in pairs:
+        require(key not in value, 'duplicate provider result JSON field')
+        value[key] = field
+    return value
+
+
+def validate_provider_record(row, wanted, inputs, module):
+    require(isinstance(row, dict) and set(row) == {'schema', 'class', 'test_method', 'provider', 'kind', 'provider_class_sha256', 'cases'}
+            and type(row['schema']) is int and row['schema'] == 1, 'invalid provider result schema')
+    require(all(isinstance(row[field], str) for field in ('class', 'test_method', 'provider', 'kind', 'provider_class_sha256')), 'invalid provider result identity scalar')
+    request = wanted.get((row['class'], row['test_method']))
+    require(request is not None and (row['provider'], row['kind']) == request,
+            'provider result differs from the source-approved request')
+    class_path = module + '/target/test-classes/' + row['class'].replace('.', '/') + '.class'
+    require(row['provider_class_sha256'] == inputs.get('test_files', {}).get(class_path),
+            'provider class differs from prepared bytecode')
+    require(isinstance(row['cases'], list) and 0 < len(row['cases']) <= 4096, 'empty or unbounded source provider')
+    hex_digest = lambda value: isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
+    for case in row['cases']:
+        require(isinstance(case, dict) and type(case.get('stable')) is bool, 'invalid provider case scalar')
+        if row['kind'] == 'dynamic':
+            require(set(case) == {'stable', 'display_name_digest'} and case['stable'] is True
+                    and hex_digest(case['display_name_digest']), 'invalid dynamic provider hashes')
+        else:
+            require(set(case) == {'stable', 'argument_digest', 'first_string_digest', 'argument_descriptors'}
+                    and hex_digest(case['argument_digest']) and (case['first_string_digest'] is None or hex_digest(case['first_string_digest']))
+                    and isinstance(case['argument_descriptors'], list), 'invalid argument provider hashes')
+            for position, descriptor in enumerate(case['argument_descriptors']):
+                require(isinstance(descriptor, dict) and set(descriptor) == {'position', 'stable', 'digest'}
+                        and type(descriptor['position']) is int and descriptor['position'] == position
+                        and type(descriptor['stable']) is bool and hex_digest(descriptor['digest']), 'invalid argument descriptor hashes')
+            require(case['stable'] == all(descriptor['stable'] for descriptor in case['argument_descriptors']),
+                    'provider case stability differs from its argument descriptors')
+            if case['first_string_digest'] is not None:
+                require(case['argument_descriptors'] and case['argument_descriptors'][0]['stable'] is True
+                        and case['first_string_digest'] == case['argument_descriptors'][0]['digest'],
+                        'provider first-string digest differs from its stable first argument')
+    return class_path
+
+
+def provider_invocation_receipt(root, inv, inputs, args, helper_hashes, invocations):
+    contract_path = Path(args.contracts).resolve()
+    require(contract_path.is_relative_to(root), 'provider receipt contracts must belong to the prepared checkout')
+    relative = contract_path.relative_to(root).as_posix()
+    contracts_hash = digest(contract_path.read_bytes())
+    require(inputs.get('source_files', {}).get(relative) == contracts_hash,
+            'provider receipt contracts differ from prepared inputs')
+    probe = inv['provider_probe']
+    resolved_keys = {(module, row['class'], row['test_method']) for module, rows in probe['module_records'].items() for row in rows}
+    methods = []
+    for method in inv['methods']:
+        if (method['module'], method['class'], method['method']) not in resolved_keys:
+            continue
+        cases = [{field: method[field] for field in ('lane', 'module', 'kind', 'class', 'method')} | {'parameter': parameter}
+                 for parameter in method['parameters']]
+        methods.append({field: method[field] for field in ('lane', 'module', 'kind', 'class', 'method', 'source', 'mapping')} |
+                       {'provider_contract': method['provider_contract'], 'case_digests': sorted(case_hash(case) for case in cases)})
+    require(len(methods) == sum(call['requested_method_count'] for call in invocations),
+            'provider receipt method count differs from successful invocations')
+    context = inputs.get('runner_context')
+    require(isinstance(context, dict), 'provider receipt requires explicit prepared runner context')
+    return {'schema': 1, 'type': 'provider-probe-receipt',
+            'binding': {field: inputs.get(field) for field in ('source_sha', 'source_tree', 'run_id', 'run_attempt', 'event')},
+            'runner_context': context, 'lane': inv['lane'], 'original_source_sha': inv['source_sha'],
+            'original_inventory_sha256': probe['original_inventory_sha256'],
+            'producer_script_sha256': probe['producer_script_sha256'],
+            'producer_prepared_source_bound': inputs.get('source_files', {}).get('.github/scripts/_ci-evidence.py') == probe['producer_script_sha256'],
+            'build_inputs_sha256': probe['inputs_sha256'], 'contracts': {'path': relative, 'sha256': contracts_hash},
+            'helper_class_hashes': helper_hashes, 'resolved_classpaths': probe['resolved_classpaths'],
+            'resource_hashes': probe['resource_hashes'], 'invocations': invocations, 'resolved_methods': methods,
+            'resolved_method_count': len(methods), 'resolved_case_count': sum(len(m['case_digests']) for m in methods),
+            'capture_status': 'diagnostic' if probe['diagnostic'] else ('success' if invocations else 'not-required'),
+            'inventory_complete': inv['complete'], 'before_test_selection': True,
+            'project_original': bool(args.project_original), 'independent_provider_replay_proven': False,
+            'ability_proven': False, 'whole_build_provenance_complete': False}
+
+
 def resolve_providers(args):
     root, repository = Path(args.root).resolve(), Path(args.repo_local).resolve()
-    inv, inputs, contracts = load(args.inventory), load(args.inputs), load(args.contracts)
+    receipt_path = getattr(args, 'probe_receipt', None)
+    if receipt_path:
+        target = Path(receipt_path)
+        require(not target.exists() and not target.is_symlink(), 'provider receipt must be a new file')
+        require(target.resolve() != Path(args.output).resolve(), 'provider receipt and inventory outputs must differ')
+        resolved_output = Path(args.output)
+        require(not resolved_output.exists() and not resolved_output.is_symlink(), 'provider resolved inventory must be a new file')
+        require(all(not path.resolve().is_relative_to(location) for path in (target, resolved_output) for location in (root, repository)),
+                'provider capture outputs must stay outside the prepared checkout and dependency repository')
+    inventory_raw, inputs_raw, contracts_raw = (Path(path).read_bytes() for path in (args.inventory, args.inputs, args.contracts))
+    inv, inputs, contracts = (json.loads(raw) for raw in (inventory_raw, inputs_raw, contracts_raw))
+    if receipt_path:
+        actual_source = current_sha(root)
+        require(isinstance(actual_source, str) and re.fullmatch(r'[0-9a-f]{40}', actual_source) is not None
+                and inputs.get('source_sha') == actual_source, 'provider prepared inputs differ from the actual checkout')
+        tree = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+        require(inputs.get('source_tree') == tree, 'provider prepared tree differs from the actual checkout')
+        for field, variable in (('run_id', 'GITHUB_RUN_ID'), ('run_attempt', 'GITHUB_RUN_ATTEMPT'), ('event', 'GITHUB_EVENT_NAME'), ('source_sha', 'GITHUB_SHA')):
+            if variable in os.environ:
+                require(str(inputs.get(field)) == os.environ[variable], 'provider prepared runner identity differs: ' + field)
+        contract_path = Path(args.contracts).resolve()
+        require(contract_path.is_relative_to(root)
+                and inputs.get('source_files', {}).get(contract_path.relative_to(root).as_posix()) == digest(contracts_raw),
+                'provider receipt contracts differ from prepared checkout inputs')
     require(inv['type'] == 'source-inventory' and contracts.get('schema') == 1, 'invalid provider inventory/contract schema')
     require(inputs.get('schema') == 1 and inputs.get('phase') == 'pre-test-after-install', 'provider probe requires pre-test prepared inputs')
     if inputs.get('source_sha') != inv.get('source_sha'):
@@ -1876,7 +1980,8 @@ def resolve_providers(args):
         require(inv.get('original_product_sources'), 'original product input hashes are missing')
         for relative, expected in inv['original_product_sources'].items():
             require(inputs.get('source_files', {}).get(relative) == expected and (root / relative).is_file() and digest((root / relative).read_bytes()) == expected, 'original product source changed during HOW projection: ' + relative)
-    original_sha = digest(Path(args.inventory).read_bytes())
+    original_sha = digest(inventory_raw)
+    producer_sha = digest(Path(__file__).read_bytes())
     problems = []
     for relative, expected in inv['sources'].items():
         path = root / relative
@@ -1913,7 +2018,9 @@ def resolve_providers(args):
         if inputs.get('test_files', {}).get(relative) != digest(path.read_bytes()):
             problems.append('provider helper not bound to prepared inputs: ' + relative)
     require(args.diagnostic or not problems, 'provider helper lacks prepared input provenance')
+    helper_hashes = {path.relative_to(root).as_posix(): digest(path.read_bytes()) for path in helper_files}
     observed, resource_hashes, classpath_bindings = {}, {}, {}
+    invocations, module_records = [], {}
     with tempfile.TemporaryDirectory() as temporary:
         temp = Path(temporary)
         helper = temp / 'provider-helper.jar'
@@ -1943,16 +2050,34 @@ def resolve_providers(args):
                     require(not path.is_symlink(), 'symlink provider resource')
                     if path.is_file():
                         resource_hashes[path.relative_to(root).as_posix()] = digest(path.read_bytes())
-            run = subprocess.run([args.java, '-cp', os.pathsep.join(classpath), 'io.tapstate.testsupport.CiProviderInventory', str(requests), str(result)],
-                                 cwd=root / module, capture_output=True, text=True, timeout=120)
+            started_at, started_ns = datetime.now(timezone.utc).isoformat(), time.monotonic_ns()
+            command = [args.java, '-cp', os.pathsep.join(classpath), 'io.tapstate.testsupport.CiProviderInventory', str(requests), str(result)]
+            run = subprocess.run(command, cwd=root / module, capture_output=True, text=True, timeout=120)
+            elapsed_ns, ended_at = time.monotonic_ns() - started_ns, datetime.now(timezone.utc).isoformat()
             require(run.returncode == 0 and result.is_file(), 'bounded provider enumeration failed for module ' + module)
-            for line in result.read_text().splitlines():
-                row = json.loads(line)
-                key = (inv['lane'], module, next(method['kind'] for method, _, _, _ in rows if method['class'] == row['class'] and method['method'] == row['test_method']), row['class'], row['test_method'])
-                require(key not in observed and key in selected and row.get('schema') == 1, 'duplicate or foreign provider probe record')
-                class_path = module + '/target/test-classes/' + row['class'].replace('.', '/') + '.class'
-                require(row['provider_class_sha256'] == inputs.get('test_files', {}).get(class_path), 'provider class differs from prepared bytecode')
+            result_raw = result.read_bytes()
+            require(len(result_raw) <= 64 * 1024 * 1024, 'provider result exceeds metadata budget')
+            invocations.append({'module': module, 'requested_methods': [
+                {'class': method['class'], 'method': method['method'], 'kind': method['kind'], 'provider': name, 'provider_kind': kind}
+                for method, name, kind, _ in rows], 'requested_method_count': len(rows),
+                'request_sha256': digest(requests.read_bytes()), 'result_sha256': digest(result_raw),
+                'helper_jar_sha256': digest(helper.read_bytes()), 'helper_entry_hashes_sha256': digest(json.dumps(helper_hashes, sort_keys=True, separators=(',', ':')).encode()),
+                'stdout_sha256': digest(run.stdout.encode()), 'stderr_sha256': digest(run.stderr.encode()),
+                'java_command_sha256': digest(args.java.encode()), 'exit_code': run.returncode,
+                'started_at': started_at, 'ended_at': ended_at, 'elapsed_ns': elapsed_ns})
+            module_records[module] = []
+            wanted = {(method['class'], method['method']): (name, kind) for method, name, kind, _ in rows}
+            require(len(wanted) == len(rows), 'duplicate source provider request')
+            test_kinds = {(method['class'], method['method']): method['kind'] for method, *_ in rows}
+            for line in result_raw.decode('utf-8').splitlines():
+                row = json.loads(line, object_pairs_hook=provider_record)
+                validate_provider_record(row, wanted, inputs, module)
+                key = (inv['lane'], module, test_kinds[(row['class'], row['test_method'])], row['class'], row['test_method'])
+                require(key not in observed and key in selected, 'duplicate or foreign provider probe record')
                 observed[key] = row
+                module_records[module].append(row)
+            invocations[-1]['result_record_count'] = len(module_records[module])
+            invocations[-1]['result_records_sha256'] = digest(json.dumps(module_records[module], sort_keys=True, separators=(',', ':')).encode())
     require(set(observed) == set(selected), 'provider probe set differs from independent source requests')
     resolved = []
     for method in inv['methods']:
@@ -1985,11 +2110,30 @@ def resolve_providers(args):
     inv['cases'] = sorted([dict((field, method[field]) for field in ('lane', 'module', 'kind', 'class', 'method')) | dict(parameter=parameter)
                            for method in inv['methods'] for parameter in method['parameters'] or []], key=identity)
     inv['complete'] = not inv['unresolved']
-    inv['provider_probe'] = dict(schema=1, original_inventory_sha256=original_sha, inputs_sha256=digest(Path(args.inputs).read_bytes()),
-                                 contracts_sha256=digest(Path(args.contracts).read_bytes()), before_test_selection=True,
-                                 resolved_records=list(observed.values()), resource_hashes=resource_hashes,
+    inv['provider_probe'] = dict(schema=1, producer_script_sha256=producer_sha, original_inventory_sha256=original_sha, inputs_sha256=digest(inputs_raw),
+                                 contracts_sha256=digest(contracts_raw), before_test_selection=True,
+                                 resolved_records=list(observed.values()), module_records=module_records, resource_hashes=resource_hashes,
                                  resolved_classpaths=classpath_bindings, diagnostic=bool(problems), actual_source_sha=inputs['source_sha'], original_source_sha=inv['source_sha'], project_original=bool(args.project_original))
-    output(args.output, inv)
+    if receipt_path:
+        require(digest(Path(__file__).read_bytes()) == producer_sha, 'provider producer source changed during enumeration')
+        require(all(digest(Path(path).read_bytes()) == digest(raw) for path, raw in
+                    ((args.inventory, inventory_raw), (args.inputs, inputs_raw), (args.contracts, contracts_raw))),
+                'provider frozen input changed during enumeration')
+        capture = provider_invocation_receipt(root, inv, inputs, args, helper_hashes, invocations)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, 'w') as stream:
+            stream.write(json.dumps(capture, indent=2, sort_keys=True) + '\n')
+        inv['provider_probe']['receipt_sha256'] = digest(target.read_bytes())
+        print('CI_PROVIDER_PROBE_RECEIPT_SHA256 ' + inv['provider_probe']['receipt_sha256'], flush=True)
+    if receipt_path:
+        resolved_target = Path(args.output)
+        resolved_target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(resolved_target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, 'w') as stream:
+            stream.write(json.dumps(inv, indent=2, sort_keys=True) + '\n')
+    else:
+        output(args.output, inv)
     print(json.dumps(dict(resolved_methods=len(resolved), unresolved=len(inv['unresolved']), stable_cases=len(inv['cases']), complete=inv['complete']), sort_keys=True))
 
 
@@ -2045,6 +2189,8 @@ def export_hashes(args):
                   source_origin=({field: value['source_origin'][field] for field in ('kind', 'source_sha', 'source_archive_sha256', 'source_receipt_sha256') if field in value['source_origin']} if value.get('source_origin') else None), actual_source_sha=value.get('provider_probe', {}).get('actual_source_sha'),
                   original_source_sha=value.get('provider_probe', {}).get('original_source_sha'),
                   provider_probe_sha256=digest(json.dumps(value.get('provider_probe'), sort_keys=True, separators=(',', ':')).encode()),
+                  provider_probe_receipt_sha256=value.get('provider_probe', {}).get('receipt_sha256'),
+                  original_inventory_sha256=value.get('provider_probe', {}).get('original_inventory_sha256'),
                   input_binding=value.get('input_binding'), inputs_sha256=value.get('inputs_sha256'), class_gate_files=value.get('class_gate_files', {}), actual_xml_case_count=value.get('actual_xml_case_count'), source_not_applicable_count=value.get('source_not_applicable_count'), ledger_digests=[digest(entry.encode()) for entry in value.get('canonical_ledger', [])], raw_ledger_digests=[digest(entry.encode()) for entry in value.get('ledger', [])], ledger_selector_sha256=digest(json.dumps(value.get('ledger_selector'), sort_keys=True).encode()), methods=methods, cases=cases, case_count=len(cases), unresolved_count=len(value.get('unresolved', [])), ability_proven=False)
     output(args.output, public)
 
@@ -2125,6 +2271,7 @@ def main():
     resolve.add_argument('--project-original', action='store_true', help='Project authenticated unchanged original WHAT/product inputs onto a different HOW input commit')
     resolve.add_argument('--diagnostic', action='store_true', help='Keep unbound local probe observations explicitly incomplete')
     resolve.add_argument('--output', required=True)
+    resolve.add_argument('--probe-receipt', help='Write a new hash-only receipt and resolved inventory outside prepared inputs; not independent semantic replay')
     export = sub.add_parser('export-hashes')
     export.add_argument('--input', required=True)
     export.add_argument('--output', required=True)

@@ -297,8 +297,11 @@ def project(refs, root, request):
     require({n for n in archive.artifacts if n.startswith('ci-test-results-')}
             == {'ci-test-results-' + n for n in worker_names}, 'result artifact shard set differs')
     pre, post, raw, results = {}, {}, {}, {}
+    provider_members, result_payloads = {}, {}
     for name in ['build', *[w['id'] for w in plan['shards']]]:
         inputs = archive.artifact('ci-inputs-' + name)
+        if name != 'build':
+            provider_members[name] = inputs
         raw[name] = inputs['build-inputs.json']
         pre[name] = snapshot(g.json_bytes(raw[name]), scope, checkout, tree, sources, 'pre-test-after-install')
         g.receipt.input_runner_context(pre[name], name, scope['repository'])
@@ -322,7 +325,10 @@ def project(refs, root, request):
     binding = {'execution': 'github-actions', 'run_id': str(scope['run_id']), 'run_attempt': scope['run_attempt']}
     for worker in plan['shards']:
         name = worker['id']
-        results[name] = result_read(archive.artifact('ci-test-results-' + name), worker, plan, binding, raw[name], post[name])
+        result_payloads[name] = archive.artifact('ci-test-results-' + name)
+        results[name] = result_read(result_payloads[name], worker, plan, binding, raw[name], post[name])
+    provider = g.module('provider_archive_readback', '_ci-provider-readback.py').project(
+        archive, plan, pre, post, provider_members, result_payloads, sources, archive.raw('checkout-source.tar'), zip_read)
     aggregate = archive.artifact('ci-aggregate')
     # The aggregate is retained in the readback chain, but merged report semantics
     # and complete provider identities still require their dedicated comparator.
@@ -332,7 +338,17 @@ def project(refs, root, request):
     missing = set(basis['unverified_components']) | {'effective_build_model', 'generator_processor_realms',
                'actual_dependency_bytes_readback', 'production_byte_readback', 'source_derived_case_inventory', 'resolved_provider_replay',
                'aggregate_report_replay', 'R', 'G_v', 'runtime_spec'}
-    return {'schema': 1, 'type': 'archived-input-readback', 'scope': scope, 'checkout': basis['checkout'],
+    if provider is not None:
+        missing.add('provider_raw_result_readback')
+        if any(not value['prepared_resource_hashes_complete'] for value in provider.values()):
+            missing.add('provider_prepared_resource_hashes')
+        if any(not value['helper_class_bytes_read_back'] for value in provider.values()):
+            missing.add('provider_helper_byte_readback')
+        if any(value['provider_class_bytes_read_back'] is False for value in provider.values()):
+            missing.add('provider_class_byte_readback')
+        if any(not value['workflow_source_is_archived_checkout'] for value in provider.values()):
+            missing.add('provider_workflow_source_readback')
+    result = {'schema': 1, 'type': 'archived-input-readback', 'scope': scope, 'checkout': basis['checkout'],
             'source_basis': {'preserved_source_digest': basis['preserved_source_digest'],
                              'owned_recipe_digest': basis['owned_recipe_digest']},
             'observed_production': production, 'observed_production_digest': g.checksum(g.canonical(production)),
@@ -343,6 +359,9 @@ def project(refs, root, request):
             'archived_input_members_verified': True, 'whole_build_provenance_complete': False,
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
             'unverified_components': sorted(missing), 'input_files': refs.finish()}
+    if provider is not None:
+        result['provider_captures'] = provider
+    return result
 
 
 def main():

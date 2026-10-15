@@ -74,6 +74,9 @@ def check(workflows, contexts, inputs):
     assert "format('run-{0}-{1}', github.run_id, github.run_attempt)" in worker_lock
     assert 'github.event.pull_request.head.repo.full_name == github.repository' in worker_lock
     assert 'python3 .github/scripts/_ci-pr-work-smoke.py' in ci.get('catalog-scripts', ''), 'owned work controls must run in CI'
+    assert '--probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"' in shards, 'provider capture must stay in the original input artifact'
+    assert 'python3 .github/scripts/_ci-provider-receipt-smoke.py' in ci.get('catalog-scripts', ''), 'provider capture controls must run in CI'
+    assert 'python3 .github/scripts/_ci-provider-readback-smoke.py' in ci.get('catalog-scripts', ''), 'provider archive controls must run in CI'
     assert 'fail-fast: false' in shards, 'collect evidence from every shard on failure'
     assert shards.count('--shard-id "${{ matrix.shard }}"') == 3, 'both input snapshots and the preparation observer must declare the actual matrix shard'
     assert '--shard-id build' in build, 'aggregate inputs must declare their own producer role'
@@ -146,6 +149,9 @@ for original, replacement in [
     ('matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}', 'matrix: {shard: [rest]}'),
     ('name: test-shards (${{ matrix.shard }})', 'name: unrelated-worker'),
     ('if: matrix.prepare_cloud_inputs', "if: matrix.shard == 'rest'"),
+    ('--probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"', '--probe-receipt unrelated-file.json'),
+    ('python3 .github/scripts/_ci-provider-receipt-smoke.py', 'echo provider-controls-removed'),
+    ('python3 .github/scripts/_ci-provider-readback-smoke.py', 'echo archive-provider-controls-removed'),
     ('--phase prepare -- .github/scripts/ci-build-observation.sh', '--phase prepare -- unrelated-observer.sh'),
     ('--phase verify -- .github/scripts/ci-shard.sh run', '--phase verify -- unrelated-shards.sh run'),
     ('--event-inputs "$RUNNER_TEMP/ci-event-inputs.json"', '--event-inputs unrelated-event.json'),
