@@ -290,11 +290,12 @@ def read_capture(archive, worker, members, before, after, source, source_hashes,
     wanted_resources={}
     for module in index:
         prefixes=tuple(module+'/'+folder+'/' for folder in ('src/test/resources','src/main/resources','target/test-classes','target/classes'))
-        for field in ('source_files','production_files','test_files'):
-            wanted_resources.update({path:checksum for path,checksum in before[field].items() if path.startswith(prefixes)})
+        for field in ('source_files','production_files','test_files','test_resource_files'):
+            wanted_resources.update({path:checksum for path,checksum in before.get(field,{}).items() if path.startswith(prefixes)})
     require(all(resource_hashes.get(path)==checksum for path,checksum in wanted_resources.items()),
             'provider resource set differs from prepared source/classes')
     unbound_resources=sorted(set(resource_hashes)-set(wanted_resources))
+    require('test_resource_files' not in before or not unbound_resources, 'provider resource missing from prepared resource capture')
     require(all(any(path.startswith(module+'/target/test-classes/') for module in index) and not path.endswith('.class')
                 for path in unbound_resources), 'provider extra resource is outside class-only test input gap')
     for path,checksum in resource_hashes.items():

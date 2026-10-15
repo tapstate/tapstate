@@ -6,7 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import re
 import stat
@@ -379,7 +379,7 @@ def inputs(args):
         command(['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()),
                  'dependency:build-classpath', '-DincludeScope=test',
                  '-Dmdep.outputFile=target/ci-dependency-classpath.txt'], cwd=root)
-    production, class_ids, test_files, test_ids, outputs, classpaths = {}, {}, {}, {}, {}, {}
+    production, class_ids, test_files, test_ids, outputs, classpaths, test_resources = {}, {}, {}, {}, {}, {}, {}
     jar_classes, class_flags = {}, {}
     for module, _ in shards.reactor(root):
         target = shards.owned_path(root, (Path(module) / 'target').as_posix())
@@ -430,6 +430,8 @@ def inputs(args):
                     relative = path.relative_to(root).as_posix()
                     test_files[relative] = digest(path)
                     test_ids[relative] = crc64(path.read_bytes())
+                else:
+                    test_resources[path.relative_to(root).as_posix()] = digest(path)
         if target.exists():
             for path in sorted(target.iterdir()):
                 if path.is_file() and path.name.endswith(('.jar', '.tar.gz', '.zip', '.pom')):
@@ -456,7 +458,7 @@ def inputs(args):
              'runner_context': input_runner_snapshot(os.environ, getattr(args, 'shard_id', None)),
              'source_files': source_files, 'production_files': production, 'production_class_ids': class_ids,
              'production_class_access_flags': class_flags, 'jacoco_version': shards.pom(root / 'pom.xml').findtext('properties/plugin.jacoco.version'),
-             'test_files': test_files, 'test_class_ids': test_ids,
+             'test_files': test_files, 'test_class_ids': test_ids, 'test_resource_files': test_resources,
              'packaged_outputs': outputs, 'dependency_repository_files': dependencies,
              'dependency_coordinate_models': models, 'dependency_producer_facts': producers,
              'dependency_scope': 'conservative available JAR/POM byte binding plus independently resolved ordered test classpaths',
@@ -607,6 +609,22 @@ def compare_runner_contexts(aggregate, workers):
             'contexts': contexts, 'source_bytes_verified': False, 'all_workflow_jobs_recorded': False}
 
 
+def test_resource_snapshot(value):
+    if 'test_resource_files' not in value:
+        return None
+    files=value['test_resource_files']
+    require(isinstance(files,dict), 'invalid test resource hash map')
+    for name,checksum in files.items():
+        require(isinstance(name,str) and name and '\\' not in name and not any(ord(c)<32 for c in name),
+                'invalid test resource path')
+        path=PurePosixPath(name)
+        require(not path.is_absolute() and '..' not in path.parts and '.git' not in path.parts
+                and path.as_posix()==name and re.fullmatch(r'(?:.+/)?target/test-classes/.+',name)
+                and not name.endswith('.class'), 'invalid test resource path')
+        require(isinstance(checksum,str) and re.fullmatch(r'[0-9a-f]{64}',checksum), 'invalid test resource hash')
+    return files
+
+
 def compare_input_snapshots(plan, aggregate, workers):
     require(isinstance(plan, dict) and isinstance(aggregate, dict) and isinstance(workers, dict),
             'invalid independent input snapshot objects')
@@ -637,6 +655,11 @@ def compare_input_snapshots(plan, aggregate, workers):
         for path in aggregate['dependency_repository_files'].keys() & available.keys():
             require(aggregate['dependency_repository_files'][path] == available[path],
                     'available dependency bytes differ: ' + name)
+    resource_sets=[test_resource_snapshot(value) for value in [aggregate,*workers.values()]]
+    has_resources=any(value is not None for value in resource_sets)
+    if has_resources:
+        require(all(value is not None for value in resource_sets), 'test resource capture missing from a current peer')
+        require(all(value==resource_sets[0] for value in resource_sets), 'independent test resource hashes differ')
     runner = compare_runner_contexts(aggregate, workers)
     maven = compare_maven_observations(aggregate, workers)
     result = dict(schema=1, type='independent-build-input-hashes', source_sha=source,
@@ -644,6 +667,8 @@ def compare_input_snapshots(plan, aggregate, workers):
                 cohort_hash=plan['cohort_hash'], shards=ids, compared_fields=list(BUILD_INPUT_FIELDS),
                 declared_input_hashes_equal=True, whole_build_provenance_complete=False,
                 ability_proven=False, raw_bytes_uploaded=False)
+    if has_resources:
+        result['compared_fields'].append('test_resource_files')
     if runner is not None:
         result['runner_context'] = runner
     if maven is not None:

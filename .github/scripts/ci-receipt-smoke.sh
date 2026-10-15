@@ -37,7 +37,9 @@ def rejected(fn, message):
     else:
         raise AssertionError(message)
 
-with tempfile.TemporaryDirectory() as tmp:
+# Synthetic archive fixtures need a temporary parent outside the production
+# collector's rejected scratch-path names; this is never real durable evidence.
+with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
     root = Path(tmp)
     raw = root / 'XML'
     raw.mkdir()
@@ -175,6 +177,10 @@ with tempfile.TemporaryDirectory() as tmp:
     # Deterministic clock accounting must include the runtime collector, without duration gates.
     timing_root=root/'timing-checkout'; timing_root.mkdir(); (timing_root/'pom.xml').write_text('<project><properties><plugin.jacoco.version>0.8.13</plugin.jacoco.version></properties></project>')
     compiled=timing_root/'target/classes/sample/Fixture.class';compiled.parent.mkdir(parents=True);compiled.write_bytes(b'\xca\xfe\xba\xbe\x00\x00\x00\x41\x00\x01\x00\x01')
+    resource=timing_root/'target/test-classes/corpus/golden.txt'
+    resource.parent.mkdir(parents=True);resource.write_bytes(b'prepared resource fixture\n')
+    test_class=timing_root/'target/test-classes/sample/FixtureTest.class'
+    test_class.parent.mkdir(parents=True);test_class.write_bytes(compiled.read_bytes())
     originals=(m.git,m.command,m.subprocess.run,m.time.monotonic_ns,m.runtime_class_metadata)
     clock=[1_000_000_000]
     try:
@@ -191,6 +197,8 @@ with tempfile.TemporaryDirectory() as tmp:
         m.runtime_class_metadata=collector_boundary
         out=timing_root/'inputs.json'
         m.inputs(argparse.Namespace(root=str(timing_root),repo_local=str(repository),output=str(out),resolve_classpath=False,phase='post-test-before-pack',runtime_class_dir=None))
+        check(json.loads(out.read_text()).get('test_resource_files')=={'target/test-classes/corpus/golden.txt':m.digest(resource)},
+              'actual input recorder must retain non-class test-resource hashes separately')
         check(json.loads(out.read_text())['elapsed_seconds']==0.5,'phase timing includes all runtime metadata collection')
         check(isinstance(json.loads(out.read_text()).get('runner_context'),dict),
               'actual input recorder must retain the original runner context separately')
@@ -247,6 +255,28 @@ with tempfile.TemporaryDirectory() as tmp:
     worker_inputs['rest']['dependency_repository_files']['unused/provider.jar'] = 'e'*64
     check(compare_current()['declared_input_hashes_equal'], 'unused incoming cache extras are disclosed by scope and do not pretend to be resolved inputs')
     worker_inputs = copy.deepcopy(original_workers)
+    # Optional additive metadata stays compatible with old archives, but one
+    # current peer cannot silently omit or alter an observed resource set.
+    resource_name='core/target/test-classes/corpus/golden.txt'
+    modern=copy.deepcopy(prepared);modern['test_resource_files']={resource_name:'a'*64}
+    modern_workers={name:copy.deepcopy(modern) for name in worker_inputs}
+    def compare_resources():return m.compare_input_snapshots(input_plan,modern,modern_workers)
+    check('test_resource_files' in compare_resources()['compared_fields'], 'current peers compare non-class resource hashes')
+    for replacement in ({}, {resource_name:'b'*64}, {resource_name:'a'*64,'core/target/test-classes/extra.txt':'c'*64}):
+        modern_workers['engine']['test_resource_files']=replacement
+        rejected(compare_resources,'different, missing or extra current test resources reject')
+    modern_workers={name:copy.deepcopy(modern) for name in worker_inputs}
+    modern_workers['engine'].pop('test_resource_files')
+    rejected(compare_resources,'a current peer cannot omit resource capture')
+    modern_workers={name:copy.deepcopy(modern) for name in worker_inputs}
+    for bad in (None, {'../target/test-classes/x':'a'*64}, {'/target/test-classes/x':'a'*64},
+                {'core/target/test-classes/X.class':'a'*64}, {'core/target/test-classes//x':'a'*64},
+                {'core/target/classes/x':'a'*64}, {resource_name:True}):
+        modern_workers['engine']['test_resource_files']=bad
+        rejected(compare_resources,'malformed current resource capture rejects')
+    empty=copy.deepcopy(prepared);empty['test_resource_files']={}
+    check('test_resource_files' in m.compare_input_snapshots(input_plan,empty,{name:copy.deepcopy(empty) for name in worker_inputs})['compared_fields'],
+          'an explicitly recorded empty resource set is distinct from missing legacy metadata')
     # Original job declarations distinguish matrix legs without replacing source identity.
     legacy_result=compare_current()
     check('runner_context' not in legacy_result, 'legacy comparator output remains replay-compatible')

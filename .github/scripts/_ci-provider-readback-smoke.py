@@ -239,6 +239,46 @@ def controls(f):
     reseal(False); rejected(project, 'provider step not completed successfully'); reset()
     artifacts['ci-inputs-rest'].pop(r.MEMBER)
     reseal(False); rejected(project, 'receipt set differs'); reset()
+    # A new prepared capture binds copied test resources without changing the
+    # legacy fixture above or claiming complete build/provider semantics.
+    for artifact_name in ('ci-inputs-rest','ci-inputs-build'):
+        for member_name in ('build-inputs.json','post-test-inputs.json'):
+            if member_name in artifacts[artifact_name]:
+                artifacts[artifact_name][member_name]['test_resource_files']={COPIED_RESOURCE:g.checksum(RESOURCE_BYTES)}
+    current_pre=artifacts['ci-inputs-rest']['build-inputs.json']
+    aggregate_pre=artifacts['ci-inputs-build']['build-inputs.json']
+    equality=g.receipt.compare_input_snapshots(f['plan'],aggregate_pre,{'rest':current_pre})
+    equality['input_files']={'build':g.checksum(fmod.encode(aggregate_pre)),'rest':g.checksum(fmod.encode(current_pre))}
+    artifacts['ci-inputs-build']['build-input-equivalence.json']=equality
+    artifacts['ci-inputs-rest'][r.MEMBER]['build_inputs_sha256']=g.checksum(fmod.encode(current_pre))
+    current_manifest=artifacts['ci-test-results-rest']['rest/manifest.json']
+    current_manifest['provenance']['case_observer']['build_inputs_sha256']=g.checksum(fmod.encode(current_pre))
+    raw_marker=fmod.encode(current_manifest['provenance'])
+    artifacts['ci-test-results-rest']['rest/files/'+f['marker']]=raw_marker
+    current_manifest['files'][f['marker']]=g.checksum(raw_marker)
+    artifacts['ci-aggregate']['target/ci-shards/rest/run.json']=raw_marker
+    reseal()
+    modern=copy.deepcopy(artifacts),copy.deepcopy(extras),copy.deepcopy(logs)
+    def reset_modern():
+        artifacts.clear();artifacts.update(copy.deepcopy(modern[0]))
+        extras.clear();extras.update(copy.deepcopy(modern[1]))
+        logs.clear();logs.update(copy.deepcopy(modern[2]));reseal()
+    modern_answer=project();modern_capture=modern_answer['provider_captures']['rest']
+    check(modern_capture['resources_without_prepared_hash']==[] and modern_capture['prepared_resource_hashes_complete']
+          and 'provider_prepared_resource_hashes' not in modern_answer['unverified_components'], 'new prepared input binds the copied test resource hash')
+    check(modern_answer['observed_test_resource_files']=={COPIED_RESOURCE:g.checksum(RESOURCE_BYTES)}
+          and not modern_capture['independent_provider_replay_proven'] and not modern_answer['whole_input_projection_verified'],
+          'recorded resource bytes do not certify provider semantics or whole provenance')
+    artifacts['ci-inputs-rest']['post-test-inputs.json']['test_resource_files'][COPIED_RESOURCE]='f'*64
+    reseal();rejected(project,'post-test resource hashes differ');reset_modern()
+    artifacts['ci-test-results-rest']['rest/files/'+COPIED_RESOURCE]=b'changed copied resource'
+    artifacts['ci-test-results-rest']['rest/manifest.json']['files'][COPIED_RESOURCE]=g.checksum(b'changed copied resource')
+    reseal();rejected(project,'result test resource differs');reset_modern()
+    artifacts['ci-test-results-rest'].pop('rest/files/'+COPIED_RESOURCE)
+    artifacts['ci-test-results-rest']['rest/manifest.json']['files'].pop(COPIED_RESOURCE)
+    reseal();rejected(project,'result test resource set differs');reset_modern()
+    artifacts['ci-inputs-rest'][r.MEMBER]['resource_hashes']['fixture/target/test-classes/unbound.txt']='f'*64
+    reseal();rejected(project,'provider resource missing from prepared resource capture');reset_modern()
     check(before == (fmod.v.text(f['work'], 'rev-parse', 'HEAD'), fmod.v.git(f['work'], 'write-tree').stdout)
           and not fmod.v.git(f['work'], 'status', '--porcelain').stdout, 'all passive archive reads leave the worktree unchanged')
 

@@ -174,6 +174,7 @@ def snapshot(value, scope, checkout, tree, sources, phase):
         require(isinstance(ids, dict) and set(ids) == {p for p in value[files] if p.endswith('.class')}
                 and all(isinstance(v, str) and re.fullmatch(r'[0-9a-f]{16}', v) for v in ids.values()),
                 'class ID map differs: ' + field)
+    g.receipt.test_resource_snapshot(value)
     paths = value.get('resolved_test_classpaths')
     require(isinstance(paths, dict) and paths, 'resolved classpaths unavailable')
     for module, entries in paths.items():
@@ -240,6 +241,8 @@ def result_read(files, worker, plan, binding, pre_raw, post):
                 require(post['test_files'].get(name) == digest
                         and post['test_class_ids'].get(name) == g.receipt.crc64(data),
                         'result test bytecode differs from post-test input')
+            elif 'test_resource_files' in post:
+                require(post['test_resource_files'].get(name)==digest, 'result test resource differs from post-test input')
         elif match[5]:
             require(data, 'empty result exec')
             execs.add(name)
@@ -270,6 +273,12 @@ def result_read(files, worker, plan, binding, pre_raw, post):
             and manifest['report_classes'] == sorted(c for m, k, c in reports), 'result declared statistics differ')
     require(all(t['module'] + '/target/test-classes/' + t['class'].replace('.', '/') + '.class' in declared
                 for t in worker['tests']), 'result compiled selected class missing')
+    if 'test_resource_files' in post:
+        resource_set={name:checksum for name,checksum in post['test_resource_files'].items()
+                      if any(name.startswith(module+'/target/test-classes/') for module in modules)}
+        actual_resources={name:checksum for name,checksum in declared.items()
+                          if any(name.startswith(module+'/target/test-classes/') for module in modules) and not name.endswith('.class')}
+        require(resource_set==actual_resources, 'result test resource set differs from post-test inputs')
     return {'manifest_sha256': g.checksum(files[prefix + 'manifest.json']), 'files': declared,
             'xml_rows': sorted(rows, key=lambda v: g.canonical(v)),
             'statistics': manifest['statistics'], 'test_execution_proven': False,
@@ -313,6 +322,8 @@ def project(refs, root, request):
             g.receipt.maven_observation_fact(post[name], name, scope['repository'])
             require(pre[name].get('maven_execution_observation') == post[name].get('maven_execution_observation'),
                     'post-test Maven observation differs: ' + name)
+            require(g.receipt.test_resource_snapshot(pre[name])==g.receipt.test_resource_snapshot(post[name]),
+                    'post-test resource hashes differ from prepared inputs')
             require(pre[name].get('runner_context') == post[name].get('runner_context'),
                     'post-test runner context differs: ' + name)
             for field in ('production_files', 'production_class_ids', 'resolved_test_classpaths', 'toolchain'):
@@ -359,6 +370,8 @@ def project(refs, root, request):
             'archived_input_members_verified': True, 'whole_build_provenance_complete': False,
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
             'unverified_components': sorted(missing), 'input_files': refs.finish()}
+    if 'test_resource_files' in observed:
+        result['observed_test_resource_files']=observed['test_resource_files']
     if provider is not None:
         result['provider_captures'] = provider
     return result
