@@ -159,7 +159,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                                                        'own_classes': {}}]},
                'toolchain': {'java': '21', 'maven': '3.9.9', 'os': 'fixture', 'architecture': 'aarch64', 'cpu_count': 2}}
         if dependency_metadata:
-            pre.update(dependency_coordinate_models={}, dependency_producer_facts={})
+            pre.update(copy.deepcopy(dependency_metadata) if isinstance(dependency_metadata, dict)
+                       else dict(dependency_coordinate_models={}, dependency_producer_facts={}))
         observer_class = 'test-support/target/test-classes/io/tapstate/testsupport/CiCaseEvidence.class'
         pre['test_files'][observer_class] = g.checksum(b'observer fixture')
         pre['test_class_ids'][observer_class] = g.receipt.crc64(b'observer fixture')

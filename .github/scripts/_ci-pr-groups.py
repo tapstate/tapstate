@@ -274,8 +274,17 @@ def group_inputs(refs, value):
             'mixed variant component capture')
     require(len({entry['identity']['head_sha'] for entry in variants.values()}) == 3
             and len({entry['identity']['run_id'] for entry in variants.values()}) == 3, 'reused variant head or run')
-    require(all(entry['components'] == variants['A']['components'] for entry in variants.values()),
-            'group P/I/D/R/U/spec declaration differs')
+    equal = all(entry['components'] == variants['A']['components'] for entry in variants.values())
+    delta = None
+    if 'normalization' in value:
+        request = value['normalization']
+        require(isinstance(request, dict) and set(request) == {'partition_request', 'review_policy'},
+                'invalid group normalization request')
+        adapter = module('group_delta_replay', '_ci-group-delta.py')
+        delta = adapter.project(refs, {'schema': 1, 'type': 'archived-group-delta-request', **request})
+        adapter.bind_group(delta, scope, variants)
+    else:
+        require(equal, 'group P/I/D/R/U/spec declaration differs')
     for previous, current in zip(value['order'], value['order'][1:]):
         require(timestamp(variants[previous]['ci_terminal_observed_at']) <= timestamp(variants[current]['ci_created_at']),
                 'CI event runs overlap or were reordered')
@@ -287,20 +296,26 @@ def group_inputs(refs, value):
         key = (entry['after'], entry['lane'], request['kind'])
         require(key not in seen, 'duplicate group comparison')
         seen.add(key)
+        if delta is not None and request['kind'] == 'tests':
+            adapter.bind_test_inputs(refs, request, delta, entry['after'])
         result = comparison(refs, request, variants['A']['binding'], variants[entry['after']]['binding'], entry['lane'])
         comparisons.append({'before': 'A', 'after': entry['after'], 'lane': entry['lane'], **result})
     require(seen and all({kind for after, observed_lane, kind in seen if after == candidate and observed_lane == lane}
                             == {'tests', 'coverage', 'gates'}
                         for candidate in ('B', 'C') for lane in {entry['lane'] for entry in value['comparisons']}),
             'missing tests/coverage/gates comparison for a declared lane')
-    return {'schema': 1, 'type': 'pr-group-input-reconciliation', 'scope': scope, 'variants': variants,
+    result = {'schema': 1, 'type': 'pr-group-input-reconciliation', 'scope': scope, 'variants': variants,
             'cache_condition_claim': value['cache_condition'], 'cache_condition_verified': False,
-            'declared_component_payloads_equal': True, 'comparisons_replayed': comparisons,
+            'declared_component_payloads_equal': equal, 'comparisons_replayed': comparisons,
             'first_complete_pr_sample_proven': False, 'group_equivalence_proven': False,
             'whole_build_provenance_complete': False, 'latest_tip_verified': False, 'performance_accepted': False,
             'limits': ['component payloads are declared normalized inputs, not independent producer proof',
                        'CI event order does not prove every applicable workflow was awaited',
                        'all-workflow applicability, byte provenance, cache and original assertion proof remain required']}
+    if delta is not None:
+        result['archived_group_delta'] = delta
+        result['limits'][0] = 'full archived fingerprints retained; declared source deltas are not semantic equivalence proof'
+    return result
 
 
 def impact(refs, value):

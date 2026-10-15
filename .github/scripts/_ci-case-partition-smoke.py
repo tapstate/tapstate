@@ -92,18 +92,27 @@ def pure_controls(inventories):
     rejected(lambda: m.partition(changed), 'empty original inventory')
 
 
-def controls(root, contexts, complete, added):
+def prepare_request(root, contexts, customize=None):
     request = {'schema': 1, 'type': 'archived-original-case-partition-request', 'variants': {}}
     inventories = {}
     original_archive_hashes = {}
     for name, context in contexts.items():
+        if customize:
+            customize(name, context, None)
         case_request, inventories[name] = case_fixture.prepare_cases(context)
+        if customize:
+            customize(name, context, case_request)
         reference = context['save']('partition-cases-request.json', case_request)
         for path in (context['evidence'] / 'run').rglob('*'):
             if path.is_file():
                 original_archive_hashes[path] = g.checksum(path.read_bytes())
         reference = rebase_reference(reference, context['evidence'], root, {})
         request['variants'][name] = {'archive_cases': reference, 'source_root': str(context['work'])}
+    return request, inventories, original_archive_hashes
+
+
+def controls(root, contexts, complete, added):
+    request, inventories, original_archive_hashes = prepare_request(root, contexts)
     answer = m.project(g.References(root), request)
     check(answer['original_case_partition_verified'] is complete, 'only fully parsed source authorizes a partition')
     check(answer['known_static_subset_partitioned'] is complete, 'partial inventories never claim a partition')
@@ -147,17 +156,17 @@ def controls(root, contexts, complete, added):
           'exclusive output preserves prior evidence')
 
 
-def cohort(source_case=None, complete=True, added=False):
+def cohort(source_case=None, complete=True, added=False, callback=controls, dependency_metadata=False):
     with tempfile.TemporaryDirectory(prefix='ci-case-partition-') as temporary:
         root, contexts = Path(temporary).resolve(), {}
 
         def enter(index):
             if index == 3:
-                controls(root, contexts, complete, added)
+                callback(root, contexts, complete, added)
                 return
             name = 'ABC'[index]
 
-            def callback(context):
+            def accept_context(context):
                 contexts[name] = context
                 enter(index + 1)
 
@@ -166,8 +175,8 @@ def cohort(source_case=None, complete=True, added=False):
                 original = 'package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n'
                 candidate = original.replace('void holds() {}', 'void holds() {} @Test void added() {}')
                 options['case_variants'] = {'A': original, 'B': candidate, 'C': candidate}
-            fixture.run(callback, only_callback=True, variant=name, run_id=40 + index,
-                        temporary_parent=root, **options)
+            fixture.run(accept_context, only_callback=True, variant=name, run_id=40 + index,
+                        temporary_parent=root, dependency_metadata=dependency_metadata, **options)
 
         # Independent Git fixtures must share the same original base commit.
         with patch.dict(os.environ, GIT_AUTHOR_DATE='2026-10-14T00:00:00+00:00',
@@ -175,13 +184,14 @@ def cohort(source_case=None, complete=True, added=False):
             enter(0)
 
 
-cohort()
-cohort(added=True)
-cohort('''package io.tapstate.fixture;
+if __name__ == '__main__':
+    cohort()
+    cohort(added=True)
+    cohort('''package io.tapstate.fixture;
 class SampleTest {
  @Test void holds() {}
  @ParameterizedTest @MethodSource("computed") void dynamic(int value) {}
  static Stream<Integer> computed() { return external(); }
 }
 ''', complete=False)
-print('CI archived original case partition controls passed:', count)
+    print('CI archived original case partition controls passed:', count)

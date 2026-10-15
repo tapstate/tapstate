@@ -65,6 +65,13 @@ projections: independently producing and reviewing these values remains required
 Only the explicitly reviewed owned changes may be normalized away; never exclude
 all tests or restore a historical product tree.
 
+For archive-replayed components, an optional `normalization` map with
+`partition_request` and `review_policy` references enables the bounded
+`ci-group-delta.sh` adapter. It preserves unequal full fingerprints and all hard
+constraints, binds source-derived original/additional cases to the existing
+comparators, and keeps semantic and acceptance proof flags false. See
+`ci-group-delta.md` for its exact declaration schema and unresolved boundaries.
+
 Every declared lane needs tests, coverage and gates comparisons for A-to-B and
 A-to-C. Each comparison entry has `before: "A"`, `after: "B"` or `"C"`, `lane`
 and a `request` reference. Comparison request files have schema `1`, `kind` and
