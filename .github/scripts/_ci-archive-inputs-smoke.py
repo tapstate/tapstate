@@ -46,7 +46,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-') as temporary:
@@ -69,6 +69,11 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         observer_source = main / 'test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java'
         observer_source.parent.mkdir(parents=True)
         observer_source.write_text('package io.tapstate.testsupport; class CiCaseEvidence {}\n')
+        if maven_source:
+            directory = main / '.github/scripts/maven-inputs'
+            directory.mkdir(parents=True)
+            for name in ('BuildInputSpy.java', 'ConfiguredBuildInputListener.java', 'components.xml'):
+                (directory / name).write_bytes(Path(__file__).with_name('maven-inputs').joinpath(name).read_bytes())
         v.git(main, 'add', '.')
         v.git(main, 'commit', '-qm', 'Original source')
         base = v.text(main, 'rev-parse', 'HEAD')

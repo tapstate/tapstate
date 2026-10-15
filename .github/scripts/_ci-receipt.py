@@ -3,6 +3,7 @@
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -464,6 +465,19 @@ def inputs(args):
                            'maven': command(['mvn', '--version']), 'os': platform.platform(), 'architecture': platform.machine(),
                            'cpu_count': os.cpu_count()},
              'elapsed_seconds': None}
+    observation = getattr(args, 'maven_observation', None)
+    if observation:
+        path = Path(observation)
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 64 * 1024 * 1024,
+                'unsafe Maven observation summary')
+        def unique_observation_object(pairs):
+            result = {}
+            for key, field in pairs:
+                require(key not in result, 'duplicate Maven observation key')
+                result[key] = field
+            return result
+        value['maven_execution_observation'] = json.loads(path.read_text(), object_pairs_hook=unique_observation_object)
+        maven_observation_fact(value, getattr(args, 'shard_id', None))
     value['runtime_class_capture'], value['runtime_generated_classes'] = runtime_class_metadata(args, value)
     if args.resolve_classpath:
         expected_modules = {t['module'] for t in shards.discover(root)}
@@ -515,6 +529,67 @@ def input_runner_context(value, name, repository=None):
     return {**context, 'workflow_source': workflow}
 
 
+def maven_observation_fact(value, name, repository=None):
+    if 'maven_execution_observation' not in value:
+        return None
+    fact = value['maven_execution_observation']
+    require(isinstance(fact, dict) and type(fact.get('schema')) is int and fact['schema'] == 1
+            and fact.get('type') == 'maven-execution-observation-summary'
+            and fact.get('capture_status') == 'captured', 'invalid Maven execution observation')
+    require(name is not None and fact.get('source_sha') == value.get('source_sha')
+            and fact.get('source_tree') == value.get('source_tree')
+            and fact.get('run_id') == value.get('run_id')
+            and str(fact.get('run_attempt')) == str(value.get('run_attempt'))
+            and fact.get('event') == value.get('event'), 'Maven observation source/run/attempt/event differs')
+    context = input_runner_context(value, name, repository)
+    require(context is not None and fact.get('runner_context') == value.get('runner_context'),
+            'Maven observation runner scope differs')
+    for field in ('observer_source_sha256', 'observer_jar_sha256', 'event_stream_sha256', 'observation_metadata_sha256'):
+        require(isinstance(fact.get(field), str) and re.fullmatch(r'[0-9a-f]{64}', fact[field]),
+                'invalid Maven observation digest')
+    source_files = value.get('source_files')
+    require(isinstance(source_files, dict), 'Maven observer source bytes unavailable')
+    paths = ['.github/scripts/maven-inputs/' + name for name in
+             ('BuildInputSpy.java', 'ConfiguredBuildInputListener.java', 'components.xml')]
+    require(all(path in source_files for path in paths), 'Maven observer source files missing')
+    identities = {Path(path).name: source_files[path] for path in paths}
+    expected = hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()
+    require(fact['observer_source_sha256'] == expected, 'Maven observer source identity differs')
+    observation_module = importlib.util.spec_from_file_location('maven_observation_reader',
+            Path(__file__).with_name('_ci-build-observation.py'))
+    reader = importlib.util.module_from_spec(observation_module)
+    observation_module.loader.exec_module(reader)
+    metadata = fact.get('observation_metadata')
+    require(isinstance(metadata, dict), 'Maven observation metadata missing')
+    raw = json.dumps(metadata, sort_keys=True, separators=(',', ':')).encode()
+    replay = reader.observation_summary(raw)
+    require(set(fact) == set(replay) | {'schema', 'type', 'capture_status', 'source_sha', 'source_tree',
+            'run_id', 'run_attempt', 'event', 'runner_context', 'observer_source_sha256', 'observer_jar_sha256'},
+            'invalid Maven observation summary fields')
+    for field in replay:
+        if field != 'event_stream_sha256':
+            require(field in fact and type(fact[field]) is type(replay[field]) and fact[field] == replay[field],
+                    'Maven observation projection differs: ' + field)
+    return {'status': 'scoped-execution-facts', 'source_sha': fact['source_sha'],
+            'runner_context': context, 'event_count': fact['event_count'],
+            'goal_executions': fact['goal_executions'],
+            'observation_metadata_sha256': fact['observation_metadata_sha256'],
+            'observer_source_sha256': fact['observer_source_sha256'],
+            'compiler_inputs_verified': False, 'whole_build_provenance_complete': False,
+            'raw_event_replay_verified': False}
+
+
+def compare_maven_observations(aggregate, workers):
+    values = {'build': aggregate, **workers}
+    if not any('maven_execution_observation' in value for value in values.values()):
+        return None
+    require(all('maven_execution_observation' in value for value in values.values()),
+            'Maven observation missing from a current peer')
+    return {'status': 'scoped-execution-facts',
+            'roles': {name: maven_observation_fact(value, name) for name, value in values.items()},
+            'compiler_inputs_verified': False, 'whole_build_provenance_complete': False}
+
+
 def compare_runner_contexts(aggregate, workers):
     values = {'build': aggregate, **workers}
     if not any('runner_context' in value for value in values.values()):
@@ -563,6 +638,7 @@ def compare_input_snapshots(plan, aggregate, workers):
             require(aggregate['dependency_repository_files'][path] == available[path],
                     'available dependency bytes differ: ' + name)
     runner = compare_runner_contexts(aggregate, workers)
+    maven = compare_maven_observations(aggregate, workers)
     result = dict(schema=1, type='independent-build-input-hashes', source_sha=source,
                 source_tree=aggregate['source_tree'], run_id=run, run_attempt=attempt,
                 cohort_hash=plan['cohort_hash'], shards=ids, compared_fields=list(BUILD_INPUT_FIELDS),
@@ -570,6 +646,8 @@ def compare_input_snapshots(plan, aggregate, workers):
                 ability_proven=False, raw_bytes_uploaded=False)
     if runner is not None:
         result['runner_context'] = runner
+    if maven is not None:
+        result['maven_execution_observation'] = maven
     return result
 
 
@@ -1037,6 +1115,7 @@ def main():
     p.add_argument('--phase', choices=['pre-test-after-install', 'post-test-before-pack'], default='pre-test-after-install')
     p.add_argument('--runtime-class-dir', help='private existing-JaCoCo class dumps in the worker input sibling')
     p.add_argument('--shard-id', help='explicit current CI shard, or build for the aggregate')
+    p.add_argument('--maven-observation', help='scoped hash-only Maven execution observation summary')
     p = commands.add_parser('compare-inputs')
     p.add_argument('--root', default='.')
     p.add_argument('--plan', required=True)

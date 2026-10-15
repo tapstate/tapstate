@@ -44,8 +44,16 @@ def check(workflows, contexts, inputs):
     assert 'ci-receipt.sh compare-inputs' in build and 'pattern: ci-inputs-*' in build, \
         'build must compare every independent worker input snapshot before report admission'
     shards = ci.get('test-shards', '')
+    for role in ('test-shards', 'build'):
+        block = ci[role]
+        assert block.count('ci-build-observation.sh') == 1, 'each original prepare must capture one observation'
+        assert ' -- mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install' in block, 'original full prepare command changed'
+        assert '--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"' in block, 'prepare observation is not bound to the input snapshot'
+    assert shards.count('--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"') == 2, 'both worker snapshots must retain the same prepare observation'
+    assert build.count('--shard-id build') == 2, 'aggregate prepare and input snapshot must both declare build'
+
     assert 'fail-fast: false' in shards, 'collect evidence from every shard on failure'
-    assert shards.count('--shard-id "${{ matrix.shard }}"') == 2, 'both input snapshots must declare the actual matrix shard'
+    assert shards.count('--shard-id "${{ matrix.shard }}"') == 3, 'both input snapshots and the preparation observer must declare the actual matrix shard'
     assert '--shard-id build' in build, 'aggregate inputs must declare their own producer role'
     assert 'ci-shard.sh run' in shards and 'ci-aggregate.sh pack' in shards
     assert 'install' in shards and '-DskipTests' in shards and 'RUNNER_TEMP/m2' in shards
@@ -77,7 +85,7 @@ def check(workflows, contexts, inputs):
             '-DskipSdkGeneration=true', 'client/java', 'install:install-file')), \
             f'{job} must not inject an unpublished or fake Cloud SDK'
     for job in ('test-shards', 'build'):
-        assert re.search(r'run: mvn -B -Dmaven\.repo\.local="\$RUNNER_TEMP/m2" -DskipTests install',
+        assert re.search(r'(?:run: | -- )mvn -B -Dmaven\.repo\.local="\$RUNNER_TEMP/m2" -DskipTests install',
                          ci[job]), f'{job} must resolve published dependencies in its isolated Maven build'
     assert 'bash deploy/docker/image-smoke.sh --build' in ci['image-smoke'] \
         and 'mvn -q -pl app -am -DskipTests package' in inputs['deploy/docker/image-smoke.sh'], \
@@ -120,8 +128,10 @@ for original, replacement in [
     ('pattern: ci-inputs-*', 'pattern: no-worker-inputs'),
     ('    name: sonarqube', '    name: sonar-renamed'),
     ('  test-shards:', '  test-shards:\n    env:\n      CLOUD_SDK_REVISION: unpublished'),
-    ('run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install',
-     'run: echo Maven-resolution-removed'),
+    (' -- mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install',
+     ' -- echo Maven-resolution-removed'),
+    ('ci-build-observation.sh', 'observation-removed.sh'),
+    ('--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"', '--maven-observation omitted'),
 ]:
     assert original in workflows['ci.yml'], f'mutation target absent: {original}'
     mutated = {**workflows, 'ci.yml': workflows['ci.yml'].replace(original, replacement, 1)}

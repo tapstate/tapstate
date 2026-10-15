@@ -71,6 +71,16 @@ for wrapped in ["bash -c 'mvn -B verify'", 'timeout 30m mvn verify', 'nice -n 5 
                 'stdbuf -o0 mvn verify', 'env -i mvn verify']:
     cases.append(('one wrapped call: '+wrapped, {'one.yml': workflow(wrapped)}, True, ['found 1']))
 cases.append(('quoted shell diagnostic', {'one.yml': workflow("bash -c 'echo mvn verify'\nmvn verify")}, True, ['found 1']))
+observer='.github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/observation" --output "$RUNNER_TEMP/observation/summary.json" --shard-id build -- '
+cases.extend([
+    ('observed skipped install', {'one.yml':workflow(observer+'mvn -B -DskipTests install\nmvn verify')}, True, ['found 1']),
+    ('observed full suite', {'one.yml':workflow(observer+'mvn -B verify')}, True, ['found 1']),
+    ('observed duplicate suite', {'one.yml':workflow(observer+'mvn -B verify\nmvn verify')}, False, ['found 2']),
+    ('observed suite under shell', {'one.yml':workflow('bash '+observer+'mvn verify\nmvn verify')}, False, ['found 2']),
+    ('observer missing separator', {'one.yml':workflow(observer.replace(' -- ', ' ')+'mvn verify')}, False, ['unsupported']),
+    ('observer missing scope', {'one.yml':workflow(observer.replace(' --shard-id build', '')+'mvn verify')}, False, ['incomplete']),
+    ('observer unknown option', {'one.yml':workflow(observer.replace(' -- ', ' --other hidden -- ')+'mvn verify')}, False, ['unsupported']),
+])
 # Prove that the wrapper fixture executes a second suite using a harmless recorder.
 # This is an independent shell observation, not a prediction from the gate parser.
 with tempfile.TemporaryDirectory() as temporary:
