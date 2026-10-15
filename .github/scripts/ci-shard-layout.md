@@ -1,9 +1,12 @@
 # Source-bound CI shard layouts
 
-The default-reactor planner reads `.github/ci-shard-layout.json`. It keeps two
-E2E IT workers plus `engine` and `rest` by default. E2E counts 2, 4 and 6 are
-supported for ordinary source-commit comparisons; there is no separate workflow
-or benchmark entry point. Changing layout is not a performance adoption result.
+The default-reactor planner reads `.github/ci-shard-layout.json`. The checked-in
+configuration records the current comparison candidate: four E2E IT workers,
+two whole-class App workers, a complete E2E unit-module worker, `engine` and
+`rest`. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
+counts 2, 4 and 6 are supported for ordinary source-commit comparisons; there is
+no separate workflow or benchmark entry point. A staged layout is not a
+performance adoption result.
 
 The configuration requires `schema: 1`, `e2e_shards`, `rest_modules` and
 `new_test_seconds`. The optional `app_shards` field accepts 2 or 4; omitting it
@@ -31,7 +34,7 @@ for the same source class stay on one worker; nested report classes remain
 owned by that outer class. The other residual groups still move whole modules.
 App cannot also appear in `rest_modules`, whose names cannot occupy `app-` in
 this mode. There must be enough distinct App classes for nonempty workers and
-a nonempty `rest` group. The original default layout remains unchanged.
+a nonempty `rest` group. Omitting the optional App field preserves the legacy App module assignment.
 
 Every App worker executes the original independent full pre-test install and
 its selected verify, with original class-owned fixtures, real processes and
@@ -67,10 +70,13 @@ reject.
 
 The plan retains layout and duration-input hashes. Timing provenance and timer
 aggregation limits accompany the duration map; nested suite timers can overlap.
-The provenance file also lists any module-specific updates independently of
-its base run. The current App update uses all 190 source-unit reports from a
-failed workflow's diagnostic artifact, with the unchanged App tree checked.
-That provides weights; it does not turn the failed workflow into acceptance.
+The current provenance records all 1,283 source units from one original CI
+run. All four selected Maven verify commands succeeded, and the source-unit
+sets and current test-source bytes were checked. The residual worker failed
+later during identity export, so its XML comes from the original diagnostic
+artifact; the other workers retain their validated packs. The whole workflow
+failed. These weights do not turn that failure into acceptance or a successful
+performance sample.
 
 Source discovery and the exact multiset assignment remain authoritative for
 which tests run. Estimated balancing, historical main timings and a valid
