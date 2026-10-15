@@ -56,7 +56,7 @@ def prepare_cases(f):
         m.data_file(target, 'files/' + name, raw)
     manifest_path = m.data_file(target, 'manifest.json', fixture.encode(f['manifest']))
     input_path = m.data_file(data, 'inputs.json', fixture.encode(f['pre']))
-    binding_path = m.data_file(data, 'binding.json', fixture.encode({'source_sha': f['merge'], 'run_id': 42, 'attempt': 1}))
+    binding_path = m.data_file(data, 'binding.json', fixture.encode({'source_sha': f['merge'], 'run_id': f['scope']['run_id'], 'attempt': 1}))
     gates = data / 'gates'
     gates.mkdir()
     obs_path = data / 'observations.json'

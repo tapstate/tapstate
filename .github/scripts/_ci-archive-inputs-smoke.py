@@ -47,10 +47,10 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None):
     global count
     count = 0
-    with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
         root = Path(temporary).resolve()
         main, work, evidence = root / 'main', root / 'owned', root / 'evidence'
         evidence.mkdir()
@@ -61,7 +61,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         (main / 'pom.xml').write_text('<project><modelVersion>4.0.0</modelVersion><groupId>io.tapstate</groupId><artifactId>parent</artifactId><version>1</version><packaging>pom</packaging><modules><module>fixture</module></modules></project>')
         (main / 'fixture/src/test/java/io/tapstate/fixture').mkdir(parents=True)
         (main / 'fixture/pom.xml').write_text('<project><modelVersion>4.0.0</modelVersion><groupId>io.tapstate</groupId><artifactId>fixture</artifactId><version>1</version></project>')
-        (main / 'fixture/src/test/java/io/tapstate/fixture/SampleTest.java').write_text(source_case)
+        case_path = 'fixture/src/test/java/io/tapstate/fixture/SampleTest.java'
+        (main / case_path).write_text(case_variants['A'] if case_variants else source_case)
         if two_workers:
             (main / 'fixture/src/test/java/io/tapstate/fixture/OtherTest.java').write_text('package io.tapstate.fixture; class OtherTest { @Test void holds() {} }\n')
         (main / '.github/workflows').mkdir(parents=True)
@@ -83,6 +84,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         v.git(main, 'commit', '-qm', 'Original source')
         base = v.text(main, 'rev-parse', 'HEAD')
         (main / 'fixture.cfg').write_text('C\n')
+        if case_variants:
+            (main / case_path).write_text(case_variants['C'])
         v.git(main, 'add', '.')
         v.git(main, 'commit', '-qm', 'Reviewed source')
         anchor, tree = v.text(main, 'rev-parse', 'HEAD'), v.text(main, 'rev-parse', 'HEAD^{tree}')
@@ -105,22 +108,31 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             blob.write_text(label + '\n')
             oid = v.text(work, 'hash-object', '-w', str(blob))
             v.git(work, 'update-index', '--cacheinfo', '100644', oid, 'fixture.cfg', index=index)
+            if case_variants:
+                blob.write_text(case_variants[label])
+                oid = v.text(work, 'hash-object', '-w', str(blob))
+                v.git(work, 'update-index', '--cacheinfo', '100644', oid, case_path, index=index)
             target = v.text(work, 'write-tree', index=index)
             return v.diff_patch(work, tree, target)
 
         recipe = v.prepare(g.References(evidence), work,
                            {'schema': 1, 'type': 'variant-recipe-request', 'anchor_commit': anchor,
                             'scope': {'repository': scope['repository'], 'branch': scope['branch'], 'worktree': str(work)},
-                            'owned_paths': ['fixture.cfg'],
+                            'owned_paths': ['fixture.cfg'] + ([case_path] if case_variants else []),
                             'patches': {x: save(x + '.patch', patch(x) if x != 'C' else b'') for x in 'ABC'}})
         recipe_ref = save('recipe.json', recipe)
+        if variant != 'C':
+            tree = recipe['variant_trees'][variant]
+            anchor = v.text(work, 'commit-tree', tree, '-p', base, '-m', 'Reviewed variant ' + variant)
+            v.git(work, 'read-tree', '--reset', '-u', tree)
+        scope.update(variant=variant, run_id=run_id, head_sha=anchor)
         merge = v.text(work, 'commit-tree', tree, '-p', base, '-p', anchor, '-m', 'Original PR checkout')
 
         def commit(sha):
             return {'sha': sha, 'tree': {'sha': v.text(work, 'rev-parse', sha + '^{tree}')},
                     'parents': [{'sha': p} for p in v.text(work, 'rev-list', '--parents', '-n', '1', sha).split()[1:]]}
 
-        event = {'repository': scope['repository'], 'event': scope['event'], 'run_id': 42, 'run_attempt': 1,
+        event = {'repository': scope['repository'], 'event': scope['event'], 'run_id': run_id, 'run_attempt': 1,
                  'checkout_sha': merge, 'checkout_tree': tree, 'checkout_parents': [base, anchor]}
         test = {'module': 'fixture', 'kind': 'unit', 'class': 'io.tapstate.fixture.SampleTest'}
         worker = {'id': 'rest', 'tests': [test], 'estimated_seconds': 1, 'required_exec': s.execs([test])}
@@ -137,7 +149,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         prod = 'fixture/target/classes/io/tapstate/fixture/Product.class'
         sources = {n: g.checksum((work / n).read_bytes()) for n in v.text(work, 'ls-files').splitlines()}
         dep = 'example/lib/1/lib-1.jar'
-        pre = {'schema': 1, 'source_sha': merge, 'source_tree': tree, 'event': scope['event'], 'run_id': '42', 'run_attempt': '1',
+        pre = {'schema': 1, 'source_sha': merge, 'source_tree': tree, 'event': scope['event'], 'run_id': str(run_id), 'run_attempt': '1',
                'phase': 'pre-test-after-install', 'source_files': sources, 'production_files': {prod: 'a' * 64},
                'production_class_ids': {prod: 'a' * 16}, 'production_class_access_flags': {prod: 1},
                'test_files': {compiled: g.checksum(bytecode)}, 'test_class_ids': {compiled: g.receipt.crc64(bytecode)},
@@ -157,7 +169,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             pre['test_class_ids'][other_compiled] = g.receipt.crc64(b'other protocol class')
         post = copy.deepcopy(pre)
         post['phase'] = 'post-test-before-pack'
-        binding = {'execution': 'github-actions', 'run_id': '42', 'run_attempt': 1}
+        binding = {'execution': 'github-actions', 'run_id': str(run_id), 'run_attempt': 1}
         provenance = {'schema': 1, 'source_sha': merge, 'cohort_hash': plan['cohort_hash'], 'shard_id': 'rest',
                       **binding, 'status': 'success', 'invocation_id': '1' * 32,
                       'case_observer': {'enabled': True, 'providers': [s.OBSERVER], 'build_inputs_sha256': g.checksum(encode(pre)),
@@ -169,13 +181,17 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                                  'event': 'end', 'started_monotonic_ns': start, 'monotonic_ns': end, 'elapsed_ns': end - start,
                                  'utc': '2026-10-14T10:00:00+00:00', 'ended_utc': '2026-10-14T10:00:01+00:00'}
         xml_path = 'fixture/target/surefire-reports/TEST-io.tapstate.fixture.SampleTest.xml'
-        xml = b'<testsuite name="io.tapstate.fixture.SampleTest" tests="1" skipped="0" errors="0" failures="0"><testcase classname="io.tapstate.fixture.SampleTest" name="holds"/></testsuite>'
+        fixture_methods = re.findall(r'@Test\s+void\s+(\w+)\s*\(', (work / case_path).read_text())
+        xml = ('<testsuite name="io.tapstate.fixture.SampleTest" tests="' + str(len(fixture_methods))
+               + '" skipped="0" errors="0" failures="0">' + ''.join(
+                   '<testcase classname="io.tapstate.fixture.SampleTest" name="' + method + '"/>'
+                   for method in fixture_methods) + '</testsuite>').encode()
         marker = s.provenance_path(worker).as_posix()
         result_files = {compiled: bytecode, xml_path: xml, worker['required_exec'][0]: b'coverage protocol fixture', marker: encode(provenance)}
         manifest = {'schema': 2, 'source_sha': merge, 'cohort_hash': plan['cohort_hash'], 'shard_id': 'rest',
                     'tests': [test], 'required_exec': worker['required_exec'], 'provenance': provenance,
                     'provenance_path': marker, 'witness_ledgers': [], 'files': {n: g.checksum(b) for n, b in result_files.items()},
-                    'statistics': {'reported_classes': 1, 'tests': 1, 'skipped': 0, 'zero_case_classes': 0},
+                    'statistics': {'reported_classes': 1, 'tests': len(fixture_methods), 'skipped': 0, 'zero_case_classes': 0},
                     'report_classes': [test['class']]}
         worker_pre = {'rest': pre}
         if two_workers:
@@ -219,13 +235,13 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             artifacts['ci-aggregate']['target/ci-shards/engine/run.json'] = encode(other_provenance)
         artifacts = {name: copy.deepcopy(members) for name, members in artifacts.items()}
         records = [{'id': n, 'name': name, 'expired': False,
-                    'workflow_run': {'id': 42, 'head_sha': anchor, 'head_branch': scope['branch']}}
+                    'workflow_run': {'id': run_id, 'head_sha': anchor, 'head_branch': scope['branch']}}
                    for n, name in enumerate(artifacts, 1)]
         originals = copy.deepcopy(artifacts)
         record_originals = copy.deepcopy(records)
 
         def archive():
-            values = {'run.json': {'id': 42, 'run_attempt': 1, 'head_sha': anchor, 'head_branch': scope['branch'],
+            values = {'run.json': {'id': run_id, 'run_attempt': 1, 'head_sha': anchor, 'head_branch': scope['branch'],
                                   'event': scope['event'], 'repository': {'full_name': scope['repository']},
                                   'pull_requests': [{'number': 7, 'head': {'sha': anchor}, 'base': {'sha': base}}]},
                       'commit.json': commit(anchor), 'source.tar': v.git(work, 'archive', '--format=tar', anchor).stdout,
@@ -256,7 +272,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             files = {p.relative_to(directory).as_posix(): {'size': p.stat().st_size, 'sha256': g.checksum(p.read_bytes())}
                      for p in directory.rglob('*') if p.is_file() and p.name != 'receipt.json'}
             return save('run/receipt.json', {'schema': 1, 'archive_root': str(directory), 'repository': scope['repository'],
-                        'run_id': 42, 'run_attempt': 1, 'event': scope['event'], 'source_sha': anchor,
+                        'run_id': run_id, 'run_attempt': 1, 'event': scope['event'], 'source_sha': anchor,
                         'checkout_sha': merge, 'archive_complete': True, 'gaps': [],
                         'purpose': 'offline archive protocol fixture, not CI success or producer proof', 'files': files})
 
