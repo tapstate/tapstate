@@ -315,7 +315,7 @@ time.sleep(30)
     parent_driver = root / 'parent-driver.py'
     leaf = root / 'abandoned-command'
     leader = root / 'abandoned-leader'
-    parent_driver.write_text('import importlib.util,os,sys,time\nfrom pathlib import Path\n'
+    parent_driver.write_text('import importlib.util,os,sys,time\nsys.dont_write_bytecode=True\nfrom pathlib import Path\n'
         + 'spec=importlib.util.spec_from_file_location("work",'+repr(str(HERE/'_ci-pr-work.py'))+')\n'
         + 'work=importlib.util.module_from_spec(spec); spec.loader.exec_module(work)\n'
         + 'command=[sys.executable,"-c","import os,sys,time; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)",sys.argv[1]]\n'
