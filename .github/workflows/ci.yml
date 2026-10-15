@@ -509,6 +509,10 @@ jobs:
         run: bash deploy/cloud/ghcr-publish-smoke.sh
       - name: Authenticated Cloud artifact cases
         run: node --test scripts/seal-cloud-artifact.test.mjs
+      - name: Cloud release registration cases
+        run: node --test scripts/notify-cloud-release.test.mjs
+      - name: Cloud dev version notification cases
+        run: node --test scripts/notify-cloud-dev.test.mjs
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
 
