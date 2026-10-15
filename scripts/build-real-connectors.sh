@@ -67,7 +67,7 @@ readonly CONNECTOR_SETTINGS
 
 # The witness lane's connectors, as the specifications name them, paired with the module that builds
 # each one. This is the default rather than the only option - see --modules above.
-readonly DEFAULT_MODULES="mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector"
+readonly DEFAULT_MODULES="mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector,mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector"
 
 modules_arg=""
 checkout=""
@@ -309,8 +309,7 @@ fi
 # by the "-v" the shade plugin puts before the version. Matching on the connector id alone would take
 # both, and the witnesses refuse an ambiguous match - so the selector has to be this specific.
 #
-# Staging the whole build output would break them the same way, on the sibling connectors that share a
-# prefix: mysql-pxc, mongodb-atlas.
+# Sibling connector ids may share a prefix; stage only the selected module's shaded jar.
 for index in "${!CONNECTOR_IDS[@]}"; do
     id="${CONNECTOR_IDS[$index]}"
     module="${CONNECTOR_MODULES[$index]}"
@@ -342,11 +341,13 @@ for id in "${CONNECTOR_IDS[@]}"; do
     fi
 done
 
-# Witnesses use a broader id prefix. Refuse sibling ambiguity in the default
-# witness dist; a catalog refresh deliberately stages such siblings together.
+# Match the witness resolver's exact id and its legacy aliases. A sibling such
+# as mongodb-atlas must not make mongodb ambiguous, but two jars for one id must.
 if [ -z "$modules_arg" ]; then
     for id in "${CONNECTOR_IDS[@]}"; do
-        staged="$(find "$destination" -maxdepth 1 -name "$id*.jar" -type f | wc -l | tr -d ' ')"
+        staged="$(find "$destination" -maxdepth 1 -type f \
+            \( -name "$id.jar" -o -name "$id-connector.jar" -o -name "$id-connector-*.jar" \) \
+            | wc -l | tr -d ' ')"
         if [ "$staged" -ne 1 ]; then
             echo "$destination resolves $staged jars for '$id', and the witnesses require exactly one" >&2
             exit 1

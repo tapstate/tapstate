@@ -14,7 +14,15 @@ def check(text):
     text='\n'.join(line.split('#',1)[0] for line in text.splitlines() if not line.lstrip().startswith('#'))
     starts=list(re.finditer(r'^  ([\w-]+):\s*$',text,re.M))
     jobs={m.group(1):text[m.end():starts[i+1].start() if i+1<len(starts) else len(text)] for i,m in enumerate(starts)}
-    aggregate=jobs['real-connectors']; witness=jobs['connector-witnesses']; jars=jobs['connector-jars']
+    aggregate=jobs['real-connectors']; witness=jobs['connector-witnesses']; jars=jobs['connector-jars']; plan=jobs['connector-plan']
+    assert 'needs: connector-plan' in jars
+    for name in ('TAPSTATE_ATLAS_TEST_URI', 'TAPSTATE_ATLAS_STANDARD_URI'):
+        binding = name + ': ${{ secrets.' + name + ' }}'
+        assert binding in plan and binding in witness
+        assert 'test -n "$' + name + '"' in plan
+    assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in witness
+    assert 'echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"' in witness
+    assert witness.index('prepare-test-inputs.py') < witness.index('connector-witnesses.sh run --plan')
     assert 'matrix:' not in aggregate and 'if: always()' in aggregate
     assert 'needs: [connector-plan, connector-witnesses]' in aggregate
     assert 'connector-witnesses.sh verify --plan' in aggregate and 'merge-multiple: true' in aggregate
@@ -60,11 +68,16 @@ for before,after in [
     ('path: ${{ runner.temp }}/connector-m2/io/tapdata', 'path: ~/.m2/repository'),
     ('pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-', 'pdk-inputs-${{ runner.os }}-'),
     ('-${{ steps.source.outputs.enterprise_sha }}-', '-'),
-    (' --checkout "$RUNNER_TEMP/connector-enterprise-source"', '')]:
+    (' --checkout "$RUNNER_TEMP/connector-enterprise-source"', ''),
+    ('    needs: connector-plan', '    needs: []'),
+    ('TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}', 'TAPSTATE_ATLAS_TEST_URI: ""'),
+    ('TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}', 'TAPSTATE_ATLAS_STANDARD_URI: ""'),
+    ('prepare-test-inputs.py --output', 'true --output'),
+    ('echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=', 'echo "UNUSED_CLOUD_RELEASE_DIR=')]:
     mutated=workflow.replace(before,after)
     assert mutated!=workflow
     try: check(mutated)
     except (AssertionError,KeyError,ValueError): pass
     else: raise AssertionError('workflow mutation survived: '+before)
-print('connector-workflow smoke: fixed check name, complete admission and 9 mutations passed')
+print('connector-workflow smoke: fixed check name, complete fixtures/admission and 14 mutations passed')
 PY

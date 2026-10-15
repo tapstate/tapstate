@@ -21,6 +21,32 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Real connector fixture inputs
+
+The scheduled/manual Real connectors lane builds seven checked connector kinds,
+including `mongodb-atlas` and `aws-rds-mysql`. Connector production uses Maven
+3.9.16 with a verified distribution checksum. Its snapshot manifest, sealed JAR
+set and witness admission must agree; adding unchecked files to a cache is not
+a replacement for building the selected artifacts.
+
+Configure these repository Actions secrets before dispatching the lane:
+
+- `TAPSTATE_ATLAS_TEST_URI`: a controlled real Atlas test deployment URI for
+  managed-store, recovery and pipeline witnesses.
+- `TAPSTATE_ATLAS_STANDARD_URI`: the standard MongoDB connection URI for the
+  same controlled Atlas fixture, with the resolved hosts and connection options
+  required by the source HTTP witness.
+
+The planning job rejects missing inputs before connector production starts.
+Each witness shard also stages the locked public Cloud release inputs and sets
+`TAPSTATE_TEST_CLOUD_RELEASE_DIR`; this directory is prepared by CI, not supplied
+as a secret. Zero-test and skipped witnesses remain admission failures.
+
+Use a dedicated test deployment with room for the approximately 423 MB connector
+release plus concurrent witness databases. A 512 MB shared deployment has
+exhausted its quota during these tests. The lane does not provision or resize
+an Atlas deployment.
+
 ## Cloud release version registration
 
 The release workflow registers the current Cloud runtime version only after the

@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory() as temporary:
     (enterprise / 'pom.xml').write_text('<project/>')
     subprocess.run(['git', '-C', str(enterprise), 'add', '.'], check=True)
     subprocess.run(['git', '-C', str(enterprise), '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'enterprise fixture'], check=True)
-    for module in ('mysql', 'mongodb', 'postgres'):
+    for module in ('mysql', 'mongodb', 'postgres', 'mongodb-atlas', 'aws-rds-mysql'):
         (checkout / 'connectors' / (module + '-connector')).mkdir(parents=True)
     for module in ('oracle', 'mssql'):
         (enterprise / 'connectors' / (module + '-connector')).mkdir(parents=True)
@@ -30,6 +30,8 @@ def value(prefix): return next(x[len(prefix):] for x in args if x.startswith(pre
 repo = pathlib.Path(value('-Dmaven.repo.local='))
 stamp = os.environ.get('SNAPSHOT_BUILD', '20260908.010203-1')
 if any('effective-pom' in arg for arg in args):
+    owner = pathlib.Path(args[args.index('-f') + 1]).parent.name
+    (repo / f'{owner}-modules.json').write_text(json.dumps(args[args.index('-pl') + 1].split(',')))
     projects = ET.Element('projects')
     for module, version, kind in [('mysql', '2.0-SNAPSHOT', 'jar'), ('mongodb', '2.1-SNAPSHOT', 'jar'), ('postgres', '2.1-SNAPSHOT', 'test-jar')]:
         project = ET.SubElement(projects, 'project')
@@ -97,6 +99,8 @@ else:
         ['io.tapdata', 'tapdata-pdk-api', '2.2-SNAPSHOT', 'jar', ''],
     ]
     evidence = json.loads(manifest.read_text())
+    selected = set(json.loads((repo / 'checkout-modules.json').read_text())) | set(json.loads((repo / 'enterprise-modules.json').read_text()))
+    assert {'connectors/mongodb-atlas-connector', 'connectors/aws-rds-mysql-connector'} <= selected, 'selected managed connector reactors missing from snapshot resolution'
     assert evidence['roots'] == expected_roots, 'effective POM root versions or classifiers lost'
     assert json.loads((repo / 'resolution-invocations.json').read_text()) == [entry + [True] for entry in expected_roots], 'resolver omitted roots, versions, classifiers, or transitive closure'
     expected_aliases = {
@@ -129,13 +133,19 @@ else:
     assert first != second, 'republished PDK did not invalidate key'
     prepare()
     call('prepare', '--checkout', checkout, '--checkout', enterprise, '--repo-local', repo, '--output', manifest, extra={'METADATA_WARNING':'1'}, ok=False)
-    for name in ('mysql', 'mongodb', 'postgres', 'oracle', 'sqlserver'): (jars / f'{name}-connector-v1.jar').write_bytes(b'connector')
+    for name in ('mysql', 'mongodb', 'postgres', 'oracle', 'sqlserver', 'mongodb-atlas', 'aws-rds-mysql'): (jars / f'{name}-connector-v1.jar').write_bytes(b'connector')
     # Locally installed prerequisites have no remote timestamp metadata; their source
     # revisions bind them instead. They must not poison the remote snapshot stamp.
     local = repo / 'io/tapdata/sql-core/1.0-SNAPSHOT'
     local.mkdir(parents=True)
     (local / 'sql-core-1.0-SNAPSHOT.jar').write_bytes(b'local build')
     call('seal', '--checkout', checkout, '--checkout', enterprise, '--manifest', manifest, '--repo-local', repo, '--jars', jars)
+    call('verify', '--manifest', manifest, '--jars', jars)
+    for name in ('mongodb-atlas', 'aws-rds-mysql'):
+        managed_jar = jars / f'{name}-connector-v1.jar'
+        managed_jar.unlink()
+        call('verify', '--manifest', manifest, '--jars', jars, ok=False)
+        managed_jar.write_bytes(b'connector')
     call('verify', '--manifest', manifest, '--jars', jars)
     # A different probe must never accept an older restored cache.
     call('verify', '--manifest', root / 'new.json', '--jars', jars, ok=False)

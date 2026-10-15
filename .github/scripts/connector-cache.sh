@@ -18,7 +18,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(sys.argv[1])
-MODULES = 'mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector'
+MODULES = 'mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector,mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector'
 KINDS = [module.split('=', 1)[0] for module in MODULES.split(',')]
 MODULE_PATHS = ','.join(module.split('=', 1)[1] for module in MODULES.split(','))
 STAMP = 'connector-cache-manifest.json'

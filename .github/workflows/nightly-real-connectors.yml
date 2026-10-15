@@ -16,6 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Require controlled Atlas fixture inputs
+        env:
+          TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}
+          TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}
+        run: |
+          test -n "$TAPSTATE_ATLAS_TEST_URI" || { echo "Missing required Actions secret: TAPSTATE_ATLAS_TEST_URI" >&2; exit 1; }
+          test -n "$TAPSTATE_ATLAS_STANDARD_URI" || { echo "Missing required Actions secret: TAPSTATE_ATLAS_STANDARD_URI" >&2; exit 1; }
       - name: Plan all source-selected connector witnesses
         run: .github/scripts/connector-witnesses.sh plan --durations .github/connector-test-durations.json --output "$RUNNER_TEMP/connector-shards.json"
       - uses: actions/upload-artifact@v4
@@ -25,6 +32,7 @@ jobs:
           if-no-files-found: error
 
   connector-jars:
+    needs: connector-plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -135,6 +143,8 @@ jobs:
         shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]
     env:
       SHARD: ${{ matrix.shard }}
+      TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}
+      TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -152,6 +162,10 @@ jobs:
           path: ${{ runner.temp }}/connectors
       - name: Seed isolated Maven dependencies
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - name: Prepare pinned public inputs for Cloud connector witnesses
+        run: |
+          python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
+          echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
       - name: Install the reactor without executing tests
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Run this exact connector witness shard

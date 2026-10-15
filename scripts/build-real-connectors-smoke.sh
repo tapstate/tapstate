@@ -96,13 +96,13 @@ STUB
   printf '%s' "$shim"
 }
 
-# A checkout with the three default modules plus one extra, so a case can ask for something outside
+# A checkout with the default OSS modules plus one extra, so a case can ask for something outside
 # the default list and be seen to get it.
 fresh_checkout() {
   rm -rf "${scratch:?}/checkout" "${scratch:?}/enterprise" "${scratch:?}/dest"
   mkdir -p "$scratch/enterprise/connectors/oracle-connector" "$scratch/enterprise/connectors/mssql-connector"
   : > "$scratch/enterprise/pom.xml"
-  for module in mysql-connector mongodb-connector postgres-connector redis-connector; do
+  for module in mysql-connector mongodb-connector postgres-connector mongodb-atlas-connector aws-rds-mysql-connector redis-connector; do
     mkdir -p "$scratch/checkout/connectors/$module/src/main/resources"
   done
   mkdir -p "$scratch/checkout/connectors-common/debezium-bucket/debezium-bom"
@@ -233,7 +233,7 @@ fresh_checkout
 expect "the default list still builds the witness lane's connectors" 0 "Connector jars staged" \
   --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 expect_modules "the default list, by name and in order" \
-  $'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector\nconnectors/oracle-connector,connectors/mssql-connector'
+  $'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector,connectors/mongodb-atlas-connector,connectors/aws-rds-mysql-connector\nconnectors/oracle-connector,connectors/mssql-connector'
 
 fresh_checkout
 expect "a named list is built instead of the default" 0 "Connector jars staged" \
@@ -374,13 +374,21 @@ expect "SQL Server stages by connector id" 0 "Staged sqlserver-connector-v1.0.0.
   --modules "sqlserver=connectors/mssql-connector" \
   --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 
-# The other rule still has to hold for the lane that uses it: the witnesses take the default list and
-# resolve by id, so a sibling sharing an id's prefix makes their lookup ambiguous.
+# Witnesses resolve exact public ids, so a sibling connector can share a prefix.
 fresh_checkout
 mkdir -p "$scratch/dest"
 : > "$scratch/dest/mysql-pxc-connector-v1.0.0.jar"
-expect "a sibling jar makes the witnesses' id lookup ambiguous" 1 "require exactly one" \
+expect "a sibling connector does not collide with the exact public id" 0 "Connector jars staged" \
   --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+
+# Both legacy aliases still collide with the staged runtime jar for the same id.
+for alias in mysql.jar mysql-connector.jar; do
+  fresh_checkout
+  mkdir -p "$scratch/dest"
+  : > "$scratch/dest/$alias"
+  expect "legacy alias $alias remains ambiguous" 1 "require exactly one" \
+    --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+done
 
 # The destination is not cleared, so a jar left there by an earlier run with a different version can
 # sit beside the one just staged - and derive's rule fails loud on two, which is a refusal this
