@@ -71,6 +71,13 @@ Reuse the existing Public `tapstate-cloud` package and its workflow write access
 the publisher refuses missing or non-public packages. Package access follows the
 [GitHub package access and visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
 
+Workflow-token authentication checks that the installation can access
+`tapstate/tapstate`, reading every repository-list page before registry login.
+It does not rely on personal `permissions.pull` flags in public repository
+metadata. API errors or missing installation access fail closed; repository
+lists and credentials are never logged. Explicit personal publishing credentials
+retain their account-identity verification.
+
 Version registration uses these additional `cloud-ghcr-dev` environment settings:
 
 | Setting | Kind | Value |
