@@ -23,6 +23,55 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  registry-access-probe:
+    if: github.repository == 'tapstate/tapstate' && github.ref == 'refs/heads/ws/cloud-cluster-dev-ci'
+    runs-on: ubuntu-latest
+    environment: cloud-ghcr-dev
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: check registry authorization without publishing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api orgs/tapstate/packages/container/tapstate-cloud \
+            --jq '{public_package: (.visibility == "public"), linked_to_expected_repository: (.repository.full_name == "tapstate/tapstate")}'
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          credentials = (os.environ['GITHUB_ACTOR'] + ':' + os.environ['GITHUB_TOKEN']).encode()
+          authorization = 'Basic ' + base64.b64encode(credentials).decode()
+          for actions in ('pull', 'pull,push'):
+              query = urllib.parse.urlencode({'service': 'ghcr.io',
+                  'scope': 'repository:tapstate/tapstate-cloud:' + actions})
+              request = urllib.request.Request('https://ghcr.io/token?' + query,
+                  headers={'Authorization': authorization})
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      body = json.load(response)
+                      result = {'requested_actions': actions, 'http_status': response.status,
+                          'token_present': isinstance(body.get('token'), str) and bool(body['token'])}
+              except urllib.error.HTTPError as error:
+                  result = {'requested_actions': actions, 'http_status': error.code}
+                  try:
+                      body = json.load(error)
+                      result['denied'] = any(item.get('code') in ('DENIED', 'UNAUTHORIZED')
+                          for item in body.get('errors', []))
+                  except (ValueError, TypeError, AttributeError):
+                      result['denied'] = False
+              except Exception:
+                  result = {'requested_actions': actions, 'transport_failed': True}
+              print(json.dumps(result))
+          PY
+
   image:
     if: github.repository == 'tapstate/tapstate' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
