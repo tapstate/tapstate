@@ -109,6 +109,30 @@ def label_fact(pr):
     return {'snapshot': 'captured', **{k: pr[k] for k in fields}, 'workflow_guard_applicability_verified': False}
 
 
+def default_branch_fact(event):
+    if 'repository_default_branch' not in event:
+        return {'snapshot': 'unknown'}
+    value = event['repository_default_branch']
+    require(isinstance(value, dict), 'invalid original default branch snapshot')
+    if value.get('snapshot') == 'unknown':
+        require(set(value) == {'snapshot'}, 'unknown default branch has captured fields')
+    else:
+        require(set(value) == {'snapshot', 'name'} and value['snapshot'] == 'captured'
+                and isinstance(value['name'], str) and 0 < len(value['name']) <= 1024
+                and not any(ord(char) < 32 for char in value['name']), 'invalid original default branch name')
+    return value
+
+
+def workflow_sources(raw):
+    workflows = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tree:
+        for member in tree:
+            if re.fullmatch(r'\.github/workflows/[^/]+\.ya?ml', member.name):
+                require(member.isfile(), 'workflow source cannot be a link')
+                workflows[member.name] = workflow_fact(tree.extractfile(member).read())
+    return workflows
+
+
 def project(refs, root, request):
     require(isinstance(request, dict) and set(request) == {'schema', 'type', 'source'}
             and type(request['schema']) is int and request['schema'] == 1
@@ -123,12 +147,7 @@ def project(refs, root, request):
                           'sha256': archive['files'][name]['sha256']})[0]
 
     require(basis['checkout'] is not None, 'trigger basis requires original checkout source')
-    workflows = {}
-    with tarfile.open(fileobj=io.BytesIO(raw('checkout-source.tar')), mode='r:') as tree:
-        for member in tree:
-            if re.fullmatch(r'\.github/workflows/[^/]+\.ya?ml', member.name):
-                require(member.isfile(), 'workflow source cannot be a link')
-                workflows[member.name] = workflow_fact(tree.extractfile(member).read())
+    workflows = workflow_sources(raw('checkout-source.tar'))
     require(workflows, 'original workflow sources are absent')
     event = g.json_bytes(raw('event-inputs.json'))
     original = archive_inputs.Archive(refs, source_request['archive'], basis['scope'])
@@ -165,7 +184,7 @@ def project(refs, root, request):
             require(isinstance(value, dict) and type(value.get('id')) is int
                     and name == 'ruleset-' + str(value['id']) + '.json', 'ruleset identity differs')
             rulesets.append({'file': name, 'sha256': g.checksum(data), 'value': value})
-    return {'schema': 1, 'type': 'archived-trigger-source-basis', 'scope': basis['scope'], 'checkout': basis['checkout'],
+    result = {'schema': 1, 'type': 'archived-trigger-source-basis', 'scope': basis['scope'], 'checkout': basis['checkout'],
             'workflows': workflows, 'runner_workflow_source': workflow_readback,
             'original_labels': labels, 'ruleset_records': rulesets,
             'source_blocks_readback_verified': True, 'R_G_complete': False,
@@ -174,6 +193,12 @@ def project(refs, root, request):
                                      'historical_ruleset_applicability_and_completeness', 'all_workflow_run_check_instances',
                                      'pull_request_target_base_source', 'R_G_execution_results'],
             'input_files': refs.finish()}
+    if 'base_source' in basis:
+        result['base_source'] = {**basis['base_source'], 'workflows': workflow_sources(raw('base-source.tar')),
+                                'repository_default_branch': default_branch_fact(event),
+                                'target_definition_used_by_backend_verified': False}
+        result['input_files'] = refs.finish()
+    return result
 
 
 def main():

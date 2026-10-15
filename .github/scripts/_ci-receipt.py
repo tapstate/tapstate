@@ -795,6 +795,11 @@ def event_snapshot(root, payload, environment):
     value = dict(schema=1, repository=repository, event=event, run_id=run_id, run_attempt=attempt,
                  ref=environment['GITHUB_REF'], checkout_sha=checkout, checkout_tree=tree,
                  checkout_parents=parents, workflow_source=workflow_source_snapshot(environment, repository))
+    default_branch = (payload.get('repository') or {}).get('default_branch')
+    require(default_branch is None or isinstance(default_branch, str) and 0 < len(default_branch) <= 1024
+            and not any(ord(char) < 32 for char in default_branch), 'invalid original default branch')
+    value['repository_default_branch'] = ({'snapshot': 'unknown'} if default_branch is None
+        else {'snapshot': 'captured', 'name': default_branch})
     if event == 'pull_request':
         if not payload.get('pull_request'):
             return dict(value, event_payload_complete=False,
@@ -1052,6 +1057,13 @@ def collect(args):
                 identity = reconcile_pr_identity(run, event, commit, args.repo, *scope)
                 write(directory / 'pr-identity.json', identity)
                 pr_identity_verified = True
+                if event.get('repository_default_branch', {}).get('snapshot') == 'captured':
+                    base_sha = sha(event['pull_request']['base_sha'], 'original PR base')
+                    base_commit = api(f'{prefix}/git/commits/{base_sha}')
+                    require(base_commit['sha'] == base_sha, 'original base API source differs')
+                    write(directory / 'base-commit.json', base_commit)
+                    command(['git', '-C', str(source), 'archive', '--format=tar', base_sha,
+                             '-o', str(directory / 'base-source.tar')])
         except (ValueError, KeyError, TypeError, OSError) as error:
             gaps.append('event identity incomplete: ' + str(error))
     elif run['event'] == 'pull_request':

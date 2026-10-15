@@ -38,9 +38,9 @@ def scalar(text):
     return value
 
 
-def event_options(block):
+def event_options(block, event_name='pull_request'):
     lines = block.splitlines()
-    if not lines or not re.fullmatch(r'  pull_request:\s*', lines[0]):
+    if not lines or not re.fullmatch(r'  ' + re.escape(event_name) + r':\s*', lines[0]):
         raise Unsupported('unsupported ordinary event structure')
     options, current = {}, None
     for line in lines[1:]:
@@ -112,12 +112,12 @@ def complete_event_mapping(fact):
         raise Unsupported('incomplete workflow event mapping')
 
 
-def trigger(fact, action, base_ref, changed_paths):
+def trigger(fact, action, base_ref, changed_paths, event_name='pull_request'):
     complete_event_mapping(fact)
-    block = fact['event_blocks'].get('pull_request')
+    block = fact['event_blocks'].get(event_name)
     if block is None:
         return False
-    options = event_options(block['source'])
+    options = event_options(block['source'], event_name)
     for name in ('branches', 'branches-ignore', 'paths', 'paths-ignore'):
         for pattern in options.get(name, []):
             if name.endswith('-ignore') and pattern.startswith('!'):
@@ -215,16 +215,41 @@ def project(refs, root, request):
         except (Unsupported, json.JSONDecodeError) as error:
             row['gap'] = str(error)
             unknown.append(path + ': ' + str(error))
-        if 'pull_request_target' in fact['event_blocks']:
-            row['target_trigger'] = 'unknown'
-            row['target_gap'] = 'checkout workflow bytes cannot establish original target workflow source'
-            unknown.append(path + ': original target workflow source and event membership unverified')
         workflows[path] = row
+    target_workflows = {}
+    base = basis.get('base_source')
+    default = {} if base is None else base['repository_default_branch']
+    base_eligible = (base is not None and base['source_readback_verified'] is True
+        and base['sha'] == scope['base_sha'] and default.get('snapshot') == 'captured'
+        and default.get('name') == pr['base_ref'])
+    if not base_eligible:
+        unknown.append('original default/base branch source is unavailable or differs; target applicability unknown')
+        for path, fact in basis['workflows'].items():
+            if 'pull_request_target' in fact['event_blocks']:
+                workflows[path]['target_trigger'] = 'unknown'
+                workflows[path]['target_gap'] = 'checkout bytes cannot substitute for original default/base source'
+    else:
+        for path, fact in sorted(base['workflows'].items()):
+            target = {'source_sha256': fact['source_sha256'], 'source_commit': base['sha'],
+                      'target_trigger': 'unknown', 'backend_definition_used_verified': False}
+            try:
+                applies = trigger(fact, pr['action'], pr['base_ref'], paths, 'pull_request_target')
+                target['target_trigger'] = applies
+                if applies:
+                    unknown.append(path + ': triggered target event membership and execution remain unverified')
+            except (Unsupported, json.JSONDecodeError) as error:
+                target['gap'] = str(error)
+                unknown.append(path + ': target source policy: ' + str(error))
+            target_workflows[path] = target
+            if path in workflows:
+                workflows[path]['target_trigger'] = target['target_trigger']
     require(workflows.get('.github/workflows/ci.yml', {}).get('ordinary_trigger') is not False,
             'original CI event contradicts its source trigger policy')
     return {'schema': 1, 'type': 'source-derived-trigger-contract', 'scope': scope,
             'checkout': basis['checkout'], 'event_action': pr['action'], 'base_ref': pr['base_ref'],
             'changed_paths': diff, 'workflows': workflows,
+            'target_workflows': target_workflows,
+            'original_default_base_source_eligible': base_eligible,
             'ordinary_applicable_workflows': sorted(path for path, fact in workflows.items() if fact['ordinary_trigger'] is True),
             'minimum_required_checks': sorted(g.REQUIRED_CHECKS),
             'source_policy_eligible': not unknown, 'unknown': unknown,

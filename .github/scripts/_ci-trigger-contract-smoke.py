@@ -66,6 +66,7 @@ check(m.guard_fact(fact(guard='    if: ${{ always() }}\n')['job_guard_blocks'][0
 
 def seed(context):
     event = context['event']
+    event['repository_default_branch'] = {'snapshot': 'captured', 'name': 'main'}
     event['pull_request'] = {'number': 7, 'action': 'synchronize', 'head_sha': context['anchor'],
         'base_sha': context['base'], 'head_ref': 'ws/fixture', 'base_ref': 'main',
         'head_repository': 'example/project', 'base_repository': 'example/project',
@@ -182,7 +183,7 @@ def controls(context):
     context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(event)
     context['reseal'](); request['source'] = context['save']('trigger-contract-source.json', context['source_request'])
     check(not project()['source_policy_eligible'], 'separate workflow source cannot authorize a policy')
-    event.clear(); event.update(original)
+    event.clear(); event.update(copy.deepcopy(original))
     event['pull_request'].update(labels_snapshot_complete=False, label_name_sha256=None,
         label_ascii_lower_sha256=None, label_ascii_case_complete=False)
     context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(event)
@@ -190,7 +191,7 @@ def controls(context):
     check(not project()['source_policy_eligible'], 'missing original labels leave conditional policy ineligible')
 
 
-fixture.run(controls, only_callback=True, workflow_sources={
+fixture.run(controls, only_callback=True, base_source=True, workflow_sources={
     'ci.yml': workflow('    branches: [main]\n', '    if: ${{ always() }}\n'),
     'conditional.yml': workflow('    paths: [fixture.cfg]\n'),
     'excluded.yml': workflow('    paths: ["docs/**"]\n'),
@@ -227,5 +228,61 @@ fixture.run(quoted_controls, only_callback=True, workflow_sources={
     'ci.yml': workflow('    branches: [main]\n'),
     'quoted-ordinary.yml': "on:\n  push:\n  'pull_request':\njobs:\n  ordinary:\n    steps: []\n",
     'quoted-target.yml': 'on:\n  pull_request:\n  "pull_request_target":\njobs:\n  target:\n    steps: []\n',
+})
+
+
+def base_target_controls(context):
+    request = seed(context)
+    event = context['event']
+
+    def project():
+        return m.project(m.g.References(context['evidence']), context['work'], request)
+
+    def reseal():
+        context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(event)
+        context['reseal']()
+        request['source'] = context['save']('trigger-contract-source.json', context['source_request'])
+
+    def reindex():
+        context['source_request']['archive'] = context['seal']()
+        request['source'] = context['save']('trigger-contract-source.json', context['source_request'])
+
+    answer = project()
+    check(answer['original_default_base_source_eligible'] and answer['source_policy_eligible'],
+          'independent original default/base bytes support bounded target nonapplicability')
+    for name in ['opened-target.yml', 'closed-target.yml']:
+        fact = answer['target_workflows']['.github/workflows/' + name]
+        check(fact['target_trigger'] is False and fact['source_commit'] == context['base']
+              and fact['backend_definition_used_verified'] is False, 'synchronize does not match original opened/closed target source')
+    check(not answer['R_G_complete'] and not answer['backend_applicability_observed'], 'base source never supplies complete backend proof')
+    original = copy.deepcopy(event)
+    for default in [{'snapshot': 'unknown'}, {'snapshot': 'captured', 'name': 'different'}]:
+        event['repository_default_branch'] = default; reseal()
+        check(not project()['source_policy_eligible'], 'unknown/different default branch cannot supply target policy')
+    event.clear(); event.update(copy.deepcopy(original))
+    event['pull_request']['action'] = 'opened'; reseal()
+    answer = project()
+    check(answer['target_workflows']['.github/workflows/opened-target.yml']['target_trigger'] is True
+          and not answer['source_policy_eligible'], 'actually applicable target retains unresolved membership/execution')
+    event.clear(); event.update(copy.deepcopy(original)); reseal()
+    base_commit = context['evidence'] / 'run/base-commit.json'
+    value = m.g.load(base_commit); original_commit = copy.deepcopy(value)
+    value['sha'] = context['anchor']; context['save']('run/base-commit.json', value); reindex()
+    try: project()
+    except ValueError as error: check('source commit/tree differs' in str(error), 'wrong original base commit rejects')
+    else: raise AssertionError('wrong base source accepted')
+    context['save']('run/base-commit.json', original_commit)
+    archive = context['evidence'] / 'run/base-source.tar'; raw = archive.read_bytes(); archive.unlink(); reindex()
+    try: project()
+    except ValueError as error: check('base source is incomplete' in str(error), 'partial original base source rejects')
+    else: raise AssertionError('partial base source accepted')
+    context['save']('run/base-source.tar', raw); reindex()
+    check(project()['source_policy_eligible'], 'restored original base data remains readable')
+
+
+fixture.run(base_target_controls, only_callback=True, base_source=True, workflow_sources={
+    'ci.yml': workflow('    branches: [main]\n'),
+    'opened-target.yml': 'on:\n  pull_request_target:\n    types: [opened]\njobs:\n  target:\n    steps: []\n',
+    'closed-target.yml': 'on:\n  pull_request_target:\n    types: [closed]\njobs:\n  target:\n    steps: []\n',
 })
 print('CI trigger contract controls passed:', count)

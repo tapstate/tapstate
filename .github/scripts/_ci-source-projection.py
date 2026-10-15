@@ -152,7 +152,7 @@ def project(refs, root, request):
     owned = set(recipe['owned_paths'])
     preserved = {name: entry for name, entry in files.items() if name not in owned}
     require(variants.source_digest(preserved) == recipe['preserved_source_digest'], 'preserved source differs')
-    checkout = None
+    checkout, base_source = None, None
     if scope['event'] == 'pull_request':
         event = groups.json_bytes(raw('event-inputs.json'))
         require(isinstance(event, dict), 'invalid checkout event source')
@@ -174,6 +174,13 @@ def project(refs, root, request):
         checkout_files = source('checkout-commit.json', 'checkout-source.tar', checkout_sha, tree)
         require(checkout_files == files, 'head and checkout source differ')
         checkout = {'sha': checkout_sha, 'tree': tree, 'source_digest': variants.source_digest(checkout_files)}
+        base_pair = {'base-commit.json', 'base-source.tar'} & set(archive['files'])
+        require(not base_pair or len(base_pair) == 2, 'original base source is incomplete')
+        if base_pair:
+            base_tree = variants.text(root, 'rev-parse', scope['base_sha'] + '^{tree}')
+            base_files = source('base-commit.json', 'base-source.tar', scope['base_sha'], base_tree)
+            base_source = {'sha': scope['base_sha'], 'tree': base_tree,
+                           'source_digest': variants.source_digest(base_files), 'source_readback_verified': True}
     else:
         if archive.get('checkout_sha') is None:
             missing.append('receipt_checkout_binding')
@@ -206,7 +213,7 @@ def project(refs, root, request):
         owned_variants[name] = {path: entries.get(path) for path in sorted(owned)}
     basis = {'owned_paths': sorted(owned), 'variants': owned_variants}
     inputs = refs.finish()
-    return {'schema': 1, 'type': 'archived-source-projection', 'scope': scope,
+    result = {'schema': 1, 'type': 'archived-source-projection', 'scope': scope,
             'head': {'sha': scope['head_sha'], 'tree': tree, 'source_digest': variants.source_digest(files),
                      'file_count': len(files)}, 'checkout': checkout,
             'preserved_source_digest': variants.source_digest(preserved),
@@ -214,6 +221,9 @@ def project(refs, root, request):
             'archived_source_readback_verified': True, 'unverified_components': sorted(missing),
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False,
             'performance_accepted': False, 'input_files': inputs}
+    if base_source is not None:
+        result['base_source'] = base_source
+    return result
 
 
 def main():

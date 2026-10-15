@@ -15,6 +15,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import tarfile
 import zipfile
 import sys
 sys.dont_write_bytecode = True
@@ -377,6 +378,13 @@ with tempfile.TemporaryDirectory() as tmp:
                     head=dict(sha=head,ref='ws/fixture',repo={'full_name':'example/project'}),
                     base=dict(sha=base,ref='main',repo={'full_name':'example/project'})))
     captured=m.event_snapshot(checkout,payload,runner)
+    check(captured['repository_default_branch']=={'snapshot':'unknown'}, 'missing original default branch remains unknown')
+    default_payload=copy.deepcopy(payload);default_payload['repository']['default_branch']='main'
+    default_capture=m.event_snapshot(checkout,default_payload,runner)
+    check(default_capture['repository_default_branch']=={'snapshot':'captured','name':'main'}, 'original default branch is captured independently of current repository state')
+    for invalid_default in ['', 'main\n', 1]:
+        invalid_payload=copy.deepcopy(default_payload);invalid_payload['repository']['default_branch']=invalid_default
+        rejected(lambda:m.event_snapshot(checkout,invalid_payload,runner),'invalid original default branch rejects')
     check(captured.get('workflow_source') == {'snapshot':'unknown','source_bytes_verified':False},
           'absent workflow runner fields stay explicitly unknown')
     workflow_runner=dict(runner,GITHUB_WORKFLOW_REF='example/project/.github/workflows/ci.yml@refs/heads/main',
@@ -543,6 +551,20 @@ with tempfile.TemporaryDirectory() as tmp:
               and (archived/'checkout-source.tar').is_file(),'collector archives both PR head and actual merge checkout')
         check(result['pr_event_identity_verified'] and not result['first_complete_pr_sample_proven'],
               'collector joins explicit PR scope without claiming full first-attempt acceptance')
+        original_artifact_bytes=archive_bytes
+        archive_bytes=io.BytesIO()
+        with zipfile.ZipFile(archive_bytes,'w') as archive:
+            archive.writestr('ci-event-inputs.json',json.dumps(default_capture))
+            archive.writestr('shards.json',json.dumps(dict(source_sha=merge,shards=[{'id':'rest'}])))
+        base_commit={'sha':base,'tree':{'sha':fixture_git('show','-s','--format=%T',base)},'parents':[]}
+        m.api=lambda endpoint:base_commit if endpoint.endswith('/git/commits/'+base) else collector_api(endpoint)
+        with_base=copy.copy(scoped);with_base.archive_root=str(root/'with-base-source')
+        check(m.collect(with_base)==2,'retained incomplete run can still preserve original base source')
+        directory=root/'with-base-source/run-100/attempt-1'
+        check(json.loads((directory/'base-commit.json').read_text())['sha']==base,'base API source binds original event base')
+        with tarfile.open(directory/'base-source.tar','r:') as source_archive:
+            check(source_archive.pax_headers.get('comment')==base,'actual Git base archive is retained separately from checkout')
+        archive_bytes=original_artifact_bytes;m.api=collector_api
         scoped.archive_root=str(root/'unscoped-archive');scoped.pr=None
         check(m.collect(scoped)==2,'unscoped PR collection cannot become complete')
         incomplete=json.loads((root/'unscoped-archive/run-100/attempt-1/receipt.json').read_text())

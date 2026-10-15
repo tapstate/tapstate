@@ -34,11 +34,18 @@ or unsupported label/guard facts stay unknown. A false job predicate is retained
 separately: it does not remove a triggered workflow from the expected run set.
 
 The checkout cannot establish the original definition or membership of a
-`pull_request_target` workflow. Target source remains unknown and makes this
-policy ineligible until separate original target evidence is supplied. Historical
-ruleset applicability, backend filter execution and complete event membership
-are also separate evidence. The required-name list is the existing minimum
-check contract, not a claim about every historical ruleset.
+`pull_request_target` workflow. The original event separately captures the
+repository's default branch name. When that name equals the original PR base
+ref, the collector retains the independently API-bound base commit and Git
+source archive. This supplies a bounded original default/base source policy:
+for example, `synchronize` does not match a definition limited to `opened` or
+`closed`. Missing or different default/base source remains unknown and ineligible.
+An applicable target still needs its own event membership and execution evidence
+and prevents advancing. Base readback never claims that the backend's actual
+target definition or filtering was observed. Historical ruleset applicability,
+backend execution and complete event membership remain separate evidence. The
+required-name list is the existing minimum check contract, not every historical
+ruleset.
 
 A source-aware `ci-variants` transition adds `trigger_policy` with exactly
 `request` (the hash-bound request reference) and `source_root` (the independent

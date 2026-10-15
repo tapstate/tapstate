@@ -47,7 +47,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-') as temporary:
@@ -231,6 +231,9 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                       'commit.json': commit(anchor), 'source.tar': v.git(work, 'archive', '--format=tar', anchor).stdout,
                       'checkout-commit.json': commit(merge), 'checkout-source.tar': v.git(work, 'archive', '--format=tar', merge).stdout,
                       'event-inputs.json': event, 'artifacts-1.json': {'total_count': len(records), 'artifacts': records}}
+            if base_source:
+                values.update({'base-commit.json': commit(base),
+                    'base-source.tar': v.git(work, 'archive', '--format=tar', base).stdout})
             index = {}
             for record in records:
                 name = str(record['id']) + '-' + record['name'] + '.zip'

@@ -25,6 +25,15 @@ applicability, complete per-job provenance or R/G outcomes. Target workflows ret
 their existing no-checkout boundary and are not routed through this Git-dependent
 ordinary-event producer.
 
+The original event also retains a bounded `repository_default_branch` snapshot;
+missing legacy data stays unknown. When captured, the run collector separately
+saves `base-commit.json` and `base-source.tar` for the original PR base. Source
+projection checks that API commit/tree/parents and complete archived Git files
+match the exact original base objects. The trigger reader keeps these workflow
+bytes separate from checkout workflow bytes. Matching original default/base
+branch names supplies a source policy expectation, not proof of the actual
+backend target definition or original target run membership.
+
 This is raw source readback. It does not evaluate YAML, actions, dynamic expressions
 or backend path filters. Each workflow retains its byte digest, raw top-level
 `on` block, indented event declaration blocks and job-level `if` source blocks.
