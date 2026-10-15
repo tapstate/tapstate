@@ -62,6 +62,18 @@ def check(workflows, contexts, inputs):
     assert shards.count('--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"') == 2, 'both worker snapshots must retain the same prepare observation'
     assert build.count('--shard-id build') == 2, 'aggregate prepare and input snapshot must both declare build'
 
+    assert 'ci-pr-work.sh' not in build, 'aggregate and Sonar must not be interrupted by the test supervisor'
+    assert shards.count('ci-pr-work.sh') == 2, 'both worker preparation and selected verify must supervise their owned command'
+    assert '--phase prepare -- .github/scripts/ci-build-observation.sh' in shards
+    assert '--phase verify -- .github/scripts/ci-shard.sh run' in shards
+    assert shards.count('--event-inputs "$RUNNER_TEMP/ci-event-inputs.json"') == 2, 'both phases must bind the original event'
+    worker_lock = shards.split('    concurrency:\n', 1)[1].split('    strategy:', 1)[0]
+    assert '      cancel-in-progress: false' in worker_lock and '      queue: max' in worker_lock
+    assert "format('ci-test-{0}-{1}'" in worker_lock and 'matrix.shard' in worker_lock
+    assert "format('pr-{0}', github.event.pull_request.number)" in worker_lock
+    assert "format('run-{0}-{1}', github.run_id, github.run_attempt)" in worker_lock
+    assert 'github.event.pull_request.head.repo.full_name == github.repository' in worker_lock
+    assert 'python3 .github/scripts/_ci-pr-work-smoke.py' in ci.get('catalog-scripts', ''), 'owned work controls must run in CI'
     assert 'fail-fast: false' in shards, 'collect evidence from every shard on failure'
     assert shards.count('--shard-id "${{ matrix.shard }}"') == 3, 'both input snapshots and the preparation observer must declare the actual matrix shard'
     assert '--shard-id build' in build, 'aggregate inputs must declare their own producer role'
@@ -134,6 +146,13 @@ for original, replacement in [
     ('matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}', 'matrix: {shard: [rest]}'),
     ('name: test-shards (${{ matrix.shard }})', 'name: unrelated-worker'),
     ('if: matrix.prepare_cloud_inputs', "if: matrix.shard == 'rest'"),
+    ('--phase prepare -- .github/scripts/ci-build-observation.sh', '--phase prepare -- unrelated-observer.sh'),
+    ('--phase verify -- .github/scripts/ci-shard.sh run', '--phase verify -- unrelated-shards.sh run'),
+    ('--event-inputs "$RUNNER_TEMP/ci-event-inputs.json"', '--event-inputs unrelated-event.json'),
+    ("format('ci-test-{0}-{1}'", "format('unrelated-{0}-{1}'"),
+    ('matrix.shard) }}', 'matrix.other) }}'),
+    ("format('run-{0}-{1}', github.run_id, github.run_attempt)", "format('shared-unknown')"),
+    ('python3 .github/scripts/_ci-pr-work-smoke.py', 'echo work-controls-removed'),
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),

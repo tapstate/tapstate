@@ -229,6 +229,23 @@ def full_suite(arguments):
         return full_suite(args)
     if executable == 'ci-shard.sh':
         return 'shards' if len(arguments) > 1 and arguments[1] == 'run' else False
+    if executable == 'ci-pr-work.sh':
+        args = list(arguments[1:])
+        options = {'--root', '--event-inputs', '--output', '--phase'}
+        seen = set()
+        while args and args[0] != '--':
+            option = args.pop(0)
+            if option not in options or option in seen:
+                raise ValueError('unsupported PR work option: ' + option)
+            seen.add(option)
+            if not args or args[0].startswith('--'):
+                raise ValueError('missing PR work option value')
+            value = args.pop(0)
+            if not value or option == '--phase' and value not in ('prepare', 'verify'):
+                raise ValueError('invalid PR work option value')
+        if seen != options or not args or len(args) < 2:
+            raise ValueError('incomplete PR work wrapper')
+        return full_suite(args[1:])
     if executable == 'ci-build-observation.sh':
         args = list(arguments[1:])
         options = {'--root', '--work-dir', '--output', '--shard-id'}

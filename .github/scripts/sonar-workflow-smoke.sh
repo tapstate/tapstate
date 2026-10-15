@@ -57,7 +57,11 @@ for target, original, replacement in [
 ]:
     original_text=text if target=='ci' else manual
     assert original in original_text
-    changed=original_text.replace(original,replacement,1)
+    if target=='ci' and original in ('      cancel-in-progress: false', '      queue: max'):
+        before_build, build_and_tail=original_text.split('  build:\n',1)
+        changed=before_build+'  build:\n'+build_and_tail.replace(original,replacement,1)
+    else:
+        changed=original_text.replace(original,replacement,1)
     try:
         analysis_locks(changed if target=='ci' else text,changed if target=='manual' else manual)
     except AssertionError:
@@ -145,6 +149,11 @@ esac
     curl.chmod(0o755)
     gh=tmp/'gh'
     gh.write_text('''#!/usr/bin/env bash
+if [[ "$*" == *"/pulls/"* ]]; then
+  [[ "${LIVE_HEAD_FAIL:-false}" != true ]] || exit 1
+  printf '%s\n' "${LIVE_HEAD_SHA:-$EXPECTED_HEAD_SHA}"
+  exit 0
+fi
 for arg in "$@"; do
   case "$arg" in
     body=*) printf '%s' "${arg#body=}" > "$CAPTURED_COMMENT" ;;
@@ -156,11 +165,12 @@ done
     curl_urls=tmp/'curl-urls'
     env=dict(os.environ,PATH=str(tmp)+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',
              SONAR_HOST_URL='https://sonar.example.invalid',GH_TOKEN='token',PR_NUMBER='540',
-             GITHUB_REPOSITORY='tapstate/tapstate',CAPTURED_COMMENT=str(captured),
+             GITHUB_REPOSITORY='tapstate/tapstate',EXPECTED_HEAD_SHA='a'*40,GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',CAPTURED_COMMENT=str(captured),
              CAPTURED_CURL_URLS=str(curl_urls))
     run=subprocess.run(['bash','-e','-c',script(comment)],env=env,cwd=tmp,capture_output=True,text=True)
     assert run.returncode==0,run.stdout+run.stderr
     body=captured.read_text()
+    assert 'Analyzed PR head `'+('a'*40)+'`' in body and '/actions/runs/123/attempts/1' in body
     assert 'Open unresolved issues:' in body
     for finding in ['java:S1000','java:S1099','java:S2095','java:S3649']:
         assert finding in body, 'PR comment omitted '+finding
@@ -168,6 +178,10 @@ done
     assert len(issue_requests)==2, issue_requests
     assert issue_requests[0].endswith('&p=1'), issue_requests
     assert issue_requests[1].endswith('&p=2'), issue_requests
+    for extra in ({'LIVE_HEAD_SHA': 'b'*40}, {'LIVE_HEAD_FAIL': 'true'}):
+        captured.unlink(missing_ok=True)
+        run=subprocess.run(['bash','-e','-c',script(comment)],env={**env,**extra},cwd=tmp,capture_output=True,text=True)
+        assert run.returncode==0 and not captured.exists(), 'old or unknown head must not replace the current PR decoration'
 command=script(step(reporter,'Report analysis outcome'))
 with tempfile.TemporaryDirectory() as tmp:
     for build_result, enabled, outcome, expect in [
@@ -222,5 +236,5 @@ with tempfile.TemporaryDirectory() as tmp:
     recorder.write_text('#!/usr/bin/env bash\nexit 23\n')
     run=subprocess.run(['bash','-e','-c',script(analyze)],env=env,capture_output=True,text=True)
     assert run.returncode!=0, 'scanner failure was suppressed before the required check could see it'
-print(f'sonar-workflow smoke: 7 event/ref cases, 18 runtime cases and {lock_mutations} lock mutations passed, including 102 paginated issues')
+print(f'sonar-workflow smoke: 7 event/ref cases, 20 runtime cases and {lock_mutations} lock mutations passed, including 102 paginated issues')
 PY
