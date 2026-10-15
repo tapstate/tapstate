@@ -24,6 +24,19 @@ elif [[ "$2" == repos/tapstate/tapstate ]]; then
     [[ "${STUB_WORKFLOW_API_FAIL:-false}" != true ]] || exit 1
     printf '{"full_name":"%s","permissions":{"pull":%s}}\n' \
         "${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}" "${STUB_WORKFLOW_PULL:-true}"
+elif [[ "$2" == --paginate && "$3" == 'installation/repositories?per_page=100' ]]; then
+    [[ "${STUB_WORKFLOW_API_FAIL:-false}" != true ]] || exit 1
+    query="${*: -1}"
+    if [[ "${STUB_WORKFLOW_ACCESS:-true}" == true ]]; then
+        repository="${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}"
+    else
+        repository=tapstate/other
+    fi
+    if [[ "${STUB_WORKFLOW_SECOND_PAGE:-false}" == true ]]; then
+        printf '{"repositories":[]}' | jq -r "$query"
+    fi
+    jq -n --arg repository "$repository" '{repositories:[{full_name:$repository}]}' | jq -r "$query"
+    [[ "${STUB_WORKFLOW_LAST_PAGE_FAIL:-false}" != true ]] || exit 1
 elif [[ "$2" == --paginate ]]; then
     printf '%s' "${STUB_EXISTING_DIGEST:-}"
 elif [[ "${STUB_MISSING:-false}" == true && ! -f "$STUB_PUSHED" ]]; then
@@ -81,7 +94,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$output" ]]
 case "$url" in
-    'https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/tapstate-cloud:pull')
+    "https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/$STUB_PACKAGE:pull")
         [[ -z "$header_file" && "${STUB_ANONYMOUS_TOKEN_FAIL:-false}" != true ]]
         case "${STUB_ANONYMOUS_TOKEN_INVALID:-false}" in
             true) printf '{"token":null}' > "$output" ;;
@@ -92,7 +105,7 @@ case "$url" in
             *) printf '{"token":"%s"}' "$STUB_ANONYMOUS_TOKEN_VALUE" > "$output" ;;
         esac
         ;;
-    "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$STUB_DIGEST")
+    "https://ghcr.io/v2/tapstate/$STUB_PACKAGE/manifests/$STUB_DIGEST")
         [[ "${STUB_ANONYMOUS_READ_FAIL:-false}" != true ]]
         [[ -n "$header_file" && "$(cat "$header_file")" == "Authorization: Bearer $STUB_ANONYMOUS_TOKEN_VALUE" ]]
         [[ -z "$(find "$header_file" ! -perm 0600 -print)" ]]
@@ -117,6 +130,9 @@ run_publish() {
         STUB_WORKFLOW_API_FAIL="${STUB_WORKFLOW_API_FAIL:-false}" \
         STUB_WORKFLOW_REPOSITORY="${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}" \
         STUB_WORKFLOW_PULL="${STUB_WORKFLOW_PULL:-true}" \
+        STUB_WORKFLOW_ACCESS="${STUB_WORKFLOW_ACCESS:-true}" \
+        STUB_WORKFLOW_SECOND_PAGE="${STUB_WORKFLOW_SECOND_PAGE:-false}" \
+        STUB_WORKFLOW_LAST_PAGE_FAIL="${STUB_WORKFLOW_LAST_PAGE_FAIL:-false}" \
         STUB_TOKEN="$TOKEN" STUB_ACTOR="${STUB_ACTOR:-publisher}" \
         STUB_LOG="$WORK/commands.log" STUB_PUSHED="$WORK/pushed" STUB_MANIFEST="$WORK/manifest.json" \
         STUB_MISSING="${STUB_MISSING:-false}" STUB_API_FAIL="${STUB_API_FAIL:-false}" \
@@ -125,13 +141,13 @@ run_publish() {
         STUB_REPOSITORY="${STUB_REPOSITORY:-null}" STUB_EXISTING_DIGEST="${STUB_EXISTING_DIGEST:-}" \
         STUB_LOGIN_FAIL="${STUB_LOGIN_FAIL:-false}" STUB_PUSH_FAIL="${STUB_PUSH_FAIL:-false}" \
         STUB_READ_FAIL="${STUB_READ_FAIL:-false}" STUB_DIGEST_MISMATCH="${STUB_DIGEST_MISMATCH:-false}" \
-        STUB_DIGEST="$DIGEST" \
+        STUB_DIGEST="$DIGEST" STUB_PACKAGE=tapstate-cloud \
         STUB_ANONYMOUS_TOKEN_FAIL="${STUB_ANONYMOUS_TOKEN_FAIL:-false}" \
         STUB_ANONYMOUS_TOKEN_VALUE="${STUB_ANONYMOUS_TOKEN_VALUE:-anonymous-pull-sentinel}" \
         STUB_ANONYMOUS_TOKEN_INVALID="${STUB_ANONYMOUS_TOKEN_INVALID:-false}" \
         STUB_ANONYMOUS_READ_FAIL="${STUB_ANONYMOUS_READ_FAIL:-false}" \
         STUB_ANONYMOUS_DIGEST_MISMATCH="${STUB_ANONYMOUS_DIGEST_MISMATCH:-false}" \
-        bash "$PUBLISHER" publish --archive "$WORK/cloud-image.tar" \
+        bash "$PUBLISHER" "${TEST_MODE:-publish}" --archive "$WORK/cloud-image.tar" \
             --version "${TEST_VERSION:-0.6.0}" --expected-digest "${TEST_DIGEST:-$DIGEST}"
 }
 
@@ -156,7 +172,7 @@ TEST_TOKEN='' expect_failure 'missing dedicated credentials are refused' 'userna
 STUB_ACTOR=other expect_failure 'publishing identity must match the configured account' 'differs'
 if TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" TEST_USERNAME=unused-personal-account \
         run_publish > "$WORK/out" 2> "$WORK/err" \
-        && grep -qF 'gh api repos/tapstate/tapstate' "$WORK/commands.log" \
+        && grep -qF 'gh api --paginate installation/repositories?per_page=100' "$WORK/commands.log" \
         && ! grep -qF 'gh api user' "$WORK/commands.log" \
         && grep -qF 'docker login ghcr.io --username publisher' "$WORK/commands.log"; then
     ok 'Actions reuses the workflow token and actor without a new personal token'
@@ -174,15 +190,28 @@ TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_API_F
 if ! grep -qF 'docker login' "$WORK/commands.log"; then
     ok 'workflow authentication refusal causes no registry login or write'
 else bad 'workflow authentication refusal causes no registry login or write'; fi
-TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_PULL=false \
-    expect_failure 'unauthorized workflow repository metadata fails closed' 'workflow repository authentication'
+if TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_PULL=false \
+        run_publish > "$WORK/out" 2> "$WORK/err"; then
+    ok 'installation access does not depend on personal repository permission flags'
+else bad 'installation access does not depend on personal repository permission flags'; fi
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_ACCESS=false \
+    expect_failure 'public repository metadata cannot substitute for installation access' 'workflow repository authentication'
+if ! grep -qF 'docker login' "$WORK/commands.log"; then
+    ok 'missing installation access causes no registry login or write'
+else bad 'missing installation access causes no registry login or write'; fi
+if TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_SECOND_PAGE=true \
+        run_publish > "$WORK/out" 2> "$WORK/err"; then
+    ok 'installation access can be confirmed on a later page'
+else bad 'installation access can be confirmed on a later page'; fi
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_LAST_PAGE_FAIL=true \
+    expect_failure 'a failed installation page is not hidden by an earlier match' 'workflow repository authentication'
 TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_REPOSITORY=tapstate/other \
     expect_failure 'workflow API must confirm the intended publishing repository' 'workflow repository authentication'
 TEST_USERNAME='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" \
     expect_failure 'an incomplete configured personal credential never falls back' 'username and token'
 if TEST_ACTIONS=true TEST_WORKFLOW_TOKEN=unused-workflow-sentinel run_publish > "$WORK/out" 2> "$WORK/err" \
         && grep -qF 'gh api user' "$WORK/commands.log" \
-        && ! grep -qF 'gh api repos/tapstate/tapstate' "$WORK/commands.log"; then
+        && ! grep -qF 'installation/repositories' "$WORK/commands.log"; then
     ok 'configured personal credentials retain their existing account verification'
 else bad 'configured personal credentials retain their existing account verification'; fi
 if ! grep -qE "$TOKEN|unused-workflow-sentinel" "$WORK/out" "$WORK/err" "$WORK/commands.log"; then
@@ -238,8 +267,37 @@ if TEST_GITHUB_OUTPUT="$WORK/action-output" run_publish > "$WORK/out" 2> "$WORK/
         && grep -qxF 'tag=ghcr.io/tapstate/tapstate-cloud:0.6.0' "$WORK/action-output"; then
     ok 'successful authenticated and anonymous verification emits exact deployment outputs'
 else bad 'successful authenticated and anonymous verification emits exact deployment outputs'; fi
+
+: > "$WORK/action-output"
+if TEST_MODE=publish-dev TEST_VERSION=0.7.0 STUB_EXISTING_DIGEST=sha256:previous-dev-build \
+        TEST_GITHUB_OUTPUT="$WORK/action-output" run_publish > "$WORK/out" 2> "$WORK/err" \
+        && grep -qF 'imagetools create --tag ghcr.io/tapstate/tapstate-cloud:0.7.0-dev ' "$WORK/commands.log" \
+        && grep -qF 'index("0.7.0-dev")' "$WORK/commands.log" \
+        && grep -qxF "image=ghcr.io/tapstate/tapstate-cloud@$DIGEST" "$WORK/action-output" \
+        && grep -qxF 'tag=ghcr.io/tapstate/tapstate-cloud:0.7.0-dev' "$WORK/action-output" \
+        && ! grep -qE 'tapstate-cloud:0[.]7[.]0([[:space:]]|$)' "$WORK/commands.log"; then
+    ok 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'
+else bad 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'; fi
+if grep -qF "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$DIGEST" "$WORK/commands.log"; then
+    ok 'dev availability is also verified anonymously by digest'
+else bad 'dev availability is also verified anonymously by digest'; fi
+if TEST_MODE=publish-dev STUB_EXISTING_DIGEST="$DIGEST" run_publish > "$WORK/out" 2> "$WORK/err" \
+        && ! grep -qF 'imagetools create' "$WORK/commands.log"; then
+    ok 'a matching dev digest is idempotent'
+else bad 'a matching dev digest is idempotent'; fi
+TEST_MODE=publish-dev STUB_VISIBILITY=private \
+    expect_failure 'dev cannot silently switch to private distribution' 'must be Public'
+if [[ ! -f "$WORK/pushed" ]]; then ok 'private dev packages cause no registry write'; else bad 'private dev packages cause no registry write'; fi
+TEST_MODE=publish-dev TEST_VERSION=latest expect_failure 'dev still requires a numeric version' 'numeric release version'
+TEST_MODE=publish-dev STUB_PUSH_FAIL=true expect_failure 'failed dev replacement cannot report success' 'push failed'
+: > "$WORK/action-output"
+TEST_MODE=publish-dev TEST_GITHUB_OUTPUT="$WORK/action-output" STUB_ANONYMOUS_DIGEST_MISMATCH=true \
+    expect_failure 'dev also refuses wrong anonymous bytes' 'anonymous manifest digest differs'
+if [[ ! -s "$WORK/action-output" ]]; then ok 'dev readback failure emits no deployment output'; else bad 'dev readback failure emits no deployment output'; fi
+TEST_MODE=publish-prod expect_failure 'an unknown mode cannot choose a package' 'usage:'
+if [[ ! -s "$WORK/commands.log" ]]; then ok 'an unknown mode performs no external operation'; else bad 'an unknown mode performs no external operation'; fi
 if [[ ! -e "$ROOT/.github/workflows/cloud-ecr.yml" ]]; then
-    ok 'the independent upload workflow is removed'
-else bad 'the independent upload workflow is removed'; fi
+    ok 'the retired ECR upload workflow stays removed'
+else bad 'the retired ECR upload workflow stays removed'; fi
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [[ "$failed" -eq 0 ]]

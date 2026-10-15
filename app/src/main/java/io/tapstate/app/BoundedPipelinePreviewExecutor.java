@@ -333,6 +333,9 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 }
             }
             try {
+                if (!retainLease) {
+                    releaseLease();
+                }
                 if (cancelled.get()) {
                     return;
                 }
@@ -352,9 +355,6 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                         "truncated", false));
                 emit("run.completed", Map.of("rowCount", documents.size()));
             } finally {
-                if (!retainLease) {
-                    releaseLease();
-                }
                 finished.set(true);
             }
         }

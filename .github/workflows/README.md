@@ -21,6 +21,93 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Cloud release version registration
+
+The release workflow registers the current Cloud runtime version only after the
+Cloud image publisher verifies the public registry digest. Configure the two
+variables in the `cloud-ghcr-release` environment and the production token in
+the repository's Actions secrets before using that notification:
+
+- Variable `CLOUD_RELEASE_API_URL`: the HTTPS endpoint ending in
+  `/v1/api/cluster-versions`.
+- Variable `CLOUD_RELEASE_CODE`: `ALPHA`, `BETA`, `RC`, or `STABLE`.
+- Repository secret `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD`: the operator
+  token configured on the production Cloud control plane. The release workflow
+  reads only this production key; `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV`
+  is reserved for other CI workflows.
+
+The request carries the version and source revision; `git.extra` records the
+image tag, immutable image reference, digest, release URL, and workflow URL.
+Cloud provisioning continues to select the image by its version tag. Publication
+and registration share a cross-version concurrency queue so a delayed older
+insert cannot overtake the newer version's registration. Older
+release lines and releases already overtaken when the notification checks
+GitHub's latest marker are skipped. HTTP errors fail the notification visibly;
+the image and release have already been published at that point. The API is
+not idempotent: a timeout may have committed, and a 409 requires reconciling the
+existing catalog entry before retrying. The notification never retries a POST
+or treats a 409 as success without comparing the existing entry.
+The helper is loaded from the workflow's commit in a separate sparse checkout,
+so selecting an earlier product commit does not lose the notification tooling.
+The approved image and its source revision still come from the selected release.
+
+## Cloud cluster dev images
+
+`cloud-cluster-dev.yml` is manual-only and must be dispatched on `main`. Select
+`minor`, `patch`, or `major`; it uses the release version calculator against the
+current main history. Dev runs create no Git tags or releases, so new main commits
+can rebuild the same candidate version until that version is formally released.
+
+| Lane | Image | Version tag policy |
+| --- | --- | --- |
+| Cloud dev | `ghcr.io/tapstate/tapstate-cloud:<version>-dev` | Replaced by another dev build of that version |
+| Cloud release | `ghcr.io/tapstate/tapstate-cloud:<version>` | Independently rebuilt by release; different bytes cannot overwrite an existing tag |
+
+Configure the `cloud-ghcr-dev` environment for the `main` branch with the dev
+`VITE_CLOUD_CONSOLE_URL`. The existing repository `RELEASE_SATELLITE_TOKEN` reads
+Web main. Publishing uses the workflow token with package write permission, or
+the environment's `CLOUD_GHCR_USERNAME` / `CLOUD_GHCR_TOKEN` when explicitly set.
+Reuse the existing Public `tapstate-cloud` package and its workflow write access;
+the publisher refuses missing or non-public packages. Package access follows the
+[GitHub package access and visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+
+Workflow-token authentication checks that the installation can access
+`tapstate/tapstate`, reading every repository-list page before registry login.
+It does not rely on personal `permissions.pull` flags in public repository
+metadata. API errors or missing installation access fail closed; repository
+lists and credentials are never logged. Explicit personal publishing credentials
+retain their account-identity verification.
+
+Version registration uses these additional `cloud-ghcr-dev` environment settings:
+
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `CLOUD_RELEASE_API_URL` | Variable | `https://dev.cloud.tapstate.com/v1/api/cluster-versions` |
+| `CLOUD_RELEASE_CODE` | Variable | `BETA` (or `ALPHA` / `RC`) |
+| `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` | Repository or environment Secret | The same static token configured on the dev Cloud control plane |
+
+The workflow validates this configuration before building the image. After a
+successful public push and digest readback, it registers `<version>-dev` with the
+main and Web revisions, image tag, digest reference, and workflow run URL. The
+caller rejects production endpoints and checks the returned record against the
+published image. It never follows redirects, logs credential-bearing response
+bodies, or retries a write whose delivery is uncertain. The API returns HTTP 409
+with `cluster.version-duplicate` for an existing version; the dev caller reports
+that it kept the first catalog record and completes without updating it. Other
+conflicts and authentication failures still fail the workflow. Rebuilds can
+replace the image tag while the catalog retains the first registration's Git
+and image metadata; use the current run summary for the rebuilt image's digest.
+The workflow maps `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` into the caller's
+`CLOUD_CLUSTER_VERSION_RELEASE_TOKEN` environment variable. A GitHub Secret alone
+does not configure the control plane's token.
+
+The lane builds only the Cloud Web/Boot JAR and dual-platform image, verifies its
+locked inputs, and uploads the checked OCI digest. It deploys no environment.
+Use the digest reference in the run summary for dev validation; a numeric dev
+tag can point to different bytes after a rebuild. Release rebuilds independently
+with its own environment configuration and approval. This lane adds no automatic
+PR/main test suite; its runner cost is incurred only on explicit dispatch.
+
 Choose a location for new work before adding a workflow:
 
 - Add ordinary unit, integration, or specification tests to the existing
