@@ -14,8 +14,6 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -25,7 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
 /** Installs selected samples in the background and exposes actual stage transitions. */
 @RestController
 final class SampleInstallJobController implements AutoCloseable {
-    private static final Logger LOG = LoggerFactory.getLogger(SampleInstallJobController.class);
+    private static final System.Logger LOG = System.getLogger(SampleInstallJobController.class.getName());
     private static final long JOB_RETENTION_MS = 24L * 60 * 60 * 1000;
     private static final int MAX_RETAINED_JOBS = 64;
     record Request(List<String> ids) { }
@@ -109,7 +107,7 @@ final class SampleInstallJobController implements AutoCloseable {
             }
         } catch (RuntimeException | Error defect) {
             // Preserve programmer defects for the owner's next GET and the existing global error boundary.
-            LOG.error("Sample installation job {} failed unexpectedly", job.id, defect);
+            LOG.log(System.Logger.Level.ERROR, "Sample installation job " + job.id + " failed unexpectedly", defect);
             job.defect(defect);
         } finally {
             job.finish();

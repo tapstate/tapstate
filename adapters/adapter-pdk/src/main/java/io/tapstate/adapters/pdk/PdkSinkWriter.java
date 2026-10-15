@@ -155,7 +155,7 @@ final class PdkSinkWriter implements SinkWriter {
             if (closed) {
                 throw new IllegalStateException("write called after the sink writer was closed");
             }
-            // Cancellation releases the caller's batch even while its interrupted callback unwinds.
+            // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
             List<Envelope> batch = List.copyOf(records);
             CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> deliver(batch), writes);
             pending.add(result);
@@ -257,8 +257,8 @@ final class PdkSinkWriter implements SinkWriter {
         try {
             letGo.run();
         } finally {
-            // Release connector resources before notifying handlers; a blocked call may need both signals.
-            // Tasks removed from the queue still owe a result when connector cleanup fails.
+            // Release the connector before notifying handlers; a blocked call may need that release to exit.
+            // Tasks removed from the executor's queue still owe a result even when connector cleanup fails.
             abandoned.forEach(result -> result.cancel(false));
         }
     }

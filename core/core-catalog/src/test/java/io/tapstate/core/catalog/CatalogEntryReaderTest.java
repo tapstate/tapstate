@@ -3,6 +3,10 @@ package io.tapstate.core.catalog;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 import org.junit.jupiter.api.Test;
 
 import io.tapstate.core.model.SourceMode;
@@ -90,6 +94,32 @@ class CatalogEntryReaderTest {
 
         assertThat(entry.sink().capable()).isTrue();
         assertThat(entry.sink().writeSemantics()).containsExactly(WriteMode.UPSERT, WriteMode.APPEND);
+    }
+
+    @Test
+    void readingALegacySourceOnlyRowWithdrawsItsSinkWithoutChangingTheDocument() {
+        Map<String, Object> legacy = CatalogEntryWriter.toTree(CatalogEntryReader.read(MYSQL_ENTRY));
+        legacy.put("id", "db2");
+
+        ConnectorCatalogEntry entry = CatalogEntryReader.fromTree(legacy);
+
+        assertThat(entry.sink().capable()).isFalse();
+        assertThat(entry.sink().writeSemantics()).isEmpty();
+        Map<String, Object> expected = new LinkedHashMap<>(legacy);
+        expected.put("sink", Map.of("capable", false, "writeSemantics", List.of()));
+        assertThat(CatalogEntryWriter.toTree(entry)).isEqualTo(expected);
+        assertThat(legacy.get("sink"))
+                .isEqualTo(Map.of("capable", true, "writeSemantics", List.of("upsert", "append")));
+    }
+
+    @Test
+    void aSourceOnlyPolicyDoesNotHideAnUnreadableStoredSink() {
+        String unreadable = MYSQL_ENTRY.replace("\"id\": \"mysql\"", "\"id\": \"db2\"")
+                .replace("\"capable\": true", "\"capable\": \"true\"");
+
+        assertThatThrownBy(() -> CatalogEntryReader.read(unreadable))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must be a boolean");
     }
 
     @Test

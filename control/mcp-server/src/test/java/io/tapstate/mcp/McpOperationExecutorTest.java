@@ -29,6 +29,30 @@ import static org.assertj.core.api.Assertions.assertThat;
 class McpOperationExecutorTest {
 
     @Test
+    void connectionOperationsWaitForTheConnectorBeyondTheHeavyBudget() throws Exception {
+        HttpServer server = server(exchange -> {
+            try {
+                Thread.sleep(Duration.ofMillis(300));
+                answer(exchange, 200, "{\"finished\":true}");
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(5), Duration.ofMillis(100))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+            Map<String, Object> connection = Map.of("id", "orders", "connectorId", "db2", "settings", Map.of());
+            for (Operation operation : List.of(
+                    ControlOperations.CONNECTION_TEST, ControlOperations.CONNECTION_DISCOVER_SCHEMA)) {
+                McpResult result = executor.execute(operation, connection);
+                assertThat(result.error()).as("%s must wait for the connector's answer", operation.id()).isFalse();
+                assertThat(result.body()).containsEntry("finished", true);
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void routesEveryMcpOperationThroughTheHttpControlContract() throws Exception {
         List<String> paths = Collections.synchronizedList(new ArrayList<>());
         HttpServer server = server(exchange -> {

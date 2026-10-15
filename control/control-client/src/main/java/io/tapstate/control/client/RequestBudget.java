@@ -1,7 +1,20 @@
 package io.tapstate.control.client;
 
-/** Request timeout class for light control reads and heavier probe/apply operations. */
+import java.time.Duration;
+import java.util.Optional;
+
+/** Request budget for control reads, bounded writes, and live database operations. */
 public enum RequestBudget {
     LIGHT,
-    HEAVY
+    HEAVY,
+    /** Connector initialization and discovery have no predictable read deadline. */
+    CONNECTION;
+
+    public Optional<Duration> timeout(Duration lightTimeout, Duration heavyTimeout) {
+        return switch (this) {
+            case LIGHT -> Optional.of(lightTimeout);
+            case HEAVY -> Optional.of(heavyTimeout);
+            case CONNECTION -> Optional.empty();
+        };
+    }
 }

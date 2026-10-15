@@ -281,6 +281,16 @@ class CloudExternalConfigStartupIT {
                 assertThat(cloudRequests.get()).isZero();
                 gate.release();
                 running.awaitReady();
+                // Keep the original launch-to-readiness bound; later C2 and database observations
+                // have their own bounds and must not retroactively make a healthy startup late.
+                Duration readyElapsed = Duration.ofNanos(System.nanoTime() - started);
+                System.out.println("Delayed hello " + distribution + " Ready after "
+                        + readyElapsed);
+                assertThat(readyElapsed)
+                        .withFailMessage("Packaged %s startup took %s before Ready and HTTP health; "
+                                        + "expected less than 90 seconds. Child output:%n%s",
+                                distribution, readyElapsed, running.safeOutput())
+                        .isLessThan(Duration.ofSeconds(90));
                 assertVersion(running);
                 if (distribution == Distribution.CLOUD) awaitStatusReport(0, running);
                 else assertThat(cloudRequests.get()).isZero();
@@ -293,7 +303,8 @@ class CloudExternalConfigStartupIT {
                     else assertDefaultOnPremSource(raw.getDatabase(database));
                 }
                 assertSafeOutput(running, uri);
-                assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(90));
+                System.out.println("Delayed hello " + distribution + " observations complete after "
+                        + Duration.ofNanos(System.nanoTime() - started));
             } finally {
                 running.close();
             }
@@ -658,11 +669,35 @@ class CloudExternalConfigStartupIT {
         }
 
         String safeOutput() throws IOException {
-            String value = output();
+            return redact(output());
+        }
+
+        private String redact(String value) {
             for (String secret : sensitive) {
                 if (!secret.isEmpty()) value = value.replace(secret, "<redacted>");
             }
             return value;
+        }
+
+        private String threadDiagnostic() throws IOException, InterruptedException {
+            if (!process.isAlive()) return "Child process already exited; no live thread dump is available.";
+            Path tool = Path.of(System.getProperty("java.home"), "bin", "jcmd");
+            if (!Files.isExecutable(tool)) return "JDK thread diagnostic tool is unavailable.";
+            Path dump = log.resolveSibling("startup-threads.log");
+            Process diagnostic = new ProcessBuilder(tool.toString(), Long.toString(process.pid()), "Thread.print")
+                    .redirectErrorStream(true).redirectOutput(dump.toFile()).start();
+            try {
+                if (!diagnostic.waitFor(5, TimeUnit.SECONDS)) {
+                    return "Owned child thread diagnostic exceeded its five-second bound.";
+                }
+                return redact(Files.readString(dump));
+            } finally {
+                // Stop only this owned diagnostic command, never the child under observation.
+                if (diagnostic.isAlive()) {
+                    diagnostic.destroyForcibly();
+                    diagnostic.waitFor(5, TimeUnit.SECONDS);
+                }
+            }
         }
 
         HttpResponse<String> get(String path) throws Exception {
@@ -698,8 +733,20 @@ class CloudExternalConfigStartupIT {
                 }
                 LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(40));
             }
-            throw withMongoDiagnostic(new AssertionError(
-                    "Boot process did not finish startup and become healthy: " + safeOutput()));
+            AssertionError failure = new AssertionError(
+                    "Boot process did not finish startup and become healthy: " + safeOutput());
+            if (process.isAlive()) {
+                try {
+                    failure.addSuppressed(new AssertionError("Owned child thread diagnostic: " + threadDiagnostic()));
+                } catch (IOException unavailable) {
+                    failure.addSuppressed(new AssertionError("Owned child thread diagnostic unavailable: "
+                            + unavailable.getClass().getSimpleName()));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    failure.addSuppressed(new AssertionError("Owned child thread diagnostic was interrupted."));
+                }
+            }
+            throw withMongoDiagnostic(failure);
         }
 
         void awaitMongoSelection() throws Exception {

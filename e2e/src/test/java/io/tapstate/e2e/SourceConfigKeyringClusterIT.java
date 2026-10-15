@@ -1,11 +1,15 @@
 package io.tapstate.e2e;
 
+import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.MongoWorkloadClaimStore;
 import io.tapstate.adapters.mongostore.SourceConfigCipher;
 import io.tapstate.adapters.mongostore.SourceConfigKeyringHandle;
 import io.tapstate.adapters.mongostore.SourceConfigKeyringStore;
@@ -18,14 +22,21 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -41,11 +52,130 @@ class SourceConfigKeyringClusterIT {
     private static final String JOINING = "node-c";
 
     @Test
+    void aLocallyVisibleAcknowledgementDoesNotSatisfyTheRotationBarrier() throws Exception {
+        String name = databaseName("keyring_ack_visibility");
+        String clusterId = "visibility-cluster";
+        try (MongoDBContainer mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                .withCommand("--replSet", "docker-rs", "--bind_ip_all",
+                        "--setParameter", "enableTestCommands=1")) {
+            mongo.start();
+            String uri = mongo.getReplicaSetUrl(name);
+            try (MongoClient raw = MongoClients.create(uri);
+                    MongoConnection writerConnection = maintenance(uri);
+                    MongoConnection rotationConnection = maintenance(uri)) {
+                MongoDatabase database = metadataDatabase(raw, name);
+                MongoDatabase local = raw.getDatabase(name).withReadConcern(ReadConcern.LOCAL)
+                        .withReadPreference(ReadPreference.primary());
+                SourceConfigKeyringHandle writer = writerConnection.sourceConfigKeyring();
+                SourceConfigKeyringHandle rotation = rotationConnection.sourceConfigKeyring();
+                WorkloadClaim node = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database))
+                        .acquire(new WorkloadClaimKey(clusterId, WorkloadClaimType.NODE_SESSION, TwoMemberCluster.NODE_A),
+                                new WorkloadOwner(TwoMemberCluster.NODE_A, "visibility-boot"), 0, LEASE)
+                        .claim();
+                writer.acknowledge(node, LEASE);
+                assertThat(rotation.prepareRotation()).isEqualTo(2);
+
+                MongoDatabase admin = raw.getDatabase("admin");
+                // Keep the committed ACK at epoch 1 while the real epoch-2 ACK becomes locally
+                // visible. Its majority commit is still pending, so it cannot authorize rotation.
+                admin.runCommand(new Document("configureFailPoint", "disableSnapshotting")
+                        .append("mode", "alwaysOn"));
+                CompletableFuture<Void> committed = CompletableFuture.runAsync(() -> writer.acknowledge(node, LEASE));
+                try (AutoCloseable pausedSnapshot = () -> {
+                    admin.runCommand(new Document("configureFailPoint", "disableSnapshotting")
+                            .append("mode", "off"));
+                    // A new write resumes committed-snapshot publication after the failpoint.
+                    SystemCollections.SYSTEM_META.on(local).withWriteConcern(WriteConcern.W1)
+                            .insertOne(new Document("_id", "visibility-resumed"));
+                    committed.get(10, TimeUnit.SECONDS);
+                }) {
+                    Await.until("the epoch-2 ACK to become locally visible before its majority commit",
+                            Duration.ofSeconds(10),
+                            () -> liveAcknowledgement(local, clusterId, TwoMemberCluster.NODE_A, 2) != null,
+                            () -> "the local ACK has not advanced to epoch 2");
+                    assertThat(committed.isDone()).as("the majority ACK is still held by the server").isFalse();
+                    assertThatThrownBy(rotation::activatePrepared)
+                            .isInstanceOfSatisfying(TapstateException.class,
+                                    error -> assertThat(error.code())
+                                            .isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED));
+                    assertThat(liveAcknowledgement(database, clusterId, TwoMemberCluster.NODE_A, 2))
+                            .as("the test barrier must not run ahead of the production rotation gate")
+                            .isNull();
+                }
+                awaitAcknowledgements(database, clusterId, 2, TwoMemberCluster.NODE_A);
+                assertThat(rotation.activatePrepared()).isEqualTo(3);
+            }
+        }
+    }
+
+    @Test
+    void threeAckWriteConflictsDoNotFenceARealMemberOrStopItsRenewals() {
+        String name = databaseName("keyring_ack_conflicts");
+        String application = "ack-conflicts-" + UUID.randomUUID();
+        // A private replica set keeps the server failpoint away from every other E2E witness.
+        try (MongoDBContainer mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                .withCommand("--replSet", "docker-rs", "--bind_ip_all",
+                        "--setParameter", "enableTestCommands=1")) {
+            mongo.start();
+            String uri = mongo.getReplicaSetUrl(name);
+            String memberUri = uri + (uri.contains("?") ? "&" : "?") + "appName=" + application;
+            try (MongoClient raw = MongoClients.create(uri);
+                    TwoMemberCluster cluster = TwoMemberCluster.start(memberUri, "keyring-ack-conflicts", LEASE)) {
+                MongoDatabase database = metadataDatabase(raw, name);
+                String clusterId = cluster.first().clusterId();
+                assertThat(cluster.awaitBothMembers()).hasSize(2);
+                awaitAcknowledgements(database, clusterId, 1, TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+                Resource readable = source("survives_ack_conflict", "ack-conflict-whole-config-sentinel");
+                cluster.first().apply(Map.of("ack.tap.yml", WRITER.write(readable)));
+                Document owner = liveClaim(database, clusterId, TwoMemberCluster.NODE_A);
+                assertThat(owner).isNotNull();
+                MongoDatabase admin = raw.getDatabase("admin");
+                // Match this boot's complete driver application name: three failures split between
+                // members would not discriminate the old three-attempt limit. An idle member's
+                // update is its ACK fence; lease and ACK ownership writes use findAndModify.
+                Document armed = admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 3))
+                        .append("data", new Document("failCommands", List.of("update"))
+                                .append("appName", application + " "
+                                        + MongoConnection.processTag(owner.getString("ownerBootId")))
+                                .append("errorCode", 112)
+                                .append("errorLabels", List.of("TransientTransactionError"))));
+                long entered = armed.get("count", Number.class).longValue();
+                try {
+                    admin.runCommand(new Document("waitForFailPoint", "failCommand")
+                            .append("timesEntered", entered + 3).append("maxTimeMS", WAIT.toMillis()));
+                    Document afterConflicts = acknowledgement(database, clusterId, TwoMemberCluster.NODE_A);
+                    assertThat(afterConflicts).isNotNull();
+                    // Read the baseline after all three injected conflicts, so an ACK published
+                    // between arming the failpoint and its first error cannot satisfy the witness.
+                    Await.until("the real member to keep acknowledging after three write conflicts", WAIT, () -> {
+                        assertThat(cluster.first().clusterMembers()).hasSize(2);
+                        Document ack = liveAcknowledgement(database, clusterId, TwoMemberCluster.NODE_A, 1);
+                        return ack != null && ack.getDate("leaseUntil")
+                                .after(afterConflicts.getDate("leaseUntil"));
+                    }, () -> "the original member has not published a later live acknowledgement");
+                    Document renewed = liveClaim(database, clusterId, TwoMemberCluster.NODE_A);
+                    assertThat(renewed).isNotNull();
+                    assertThat(renewed.getString("ownerBootId")).isEqualTo(owner.getString("ownerBootId"));
+                    assertThat(renewed.get("claimGeneration")).isEqualTo(owner.get("claimGeneration"));
+                    assertThat(cluster.processCarrying(TwoMemberCluster.NODE_A).isAlive()).isTrue();
+                    assertSource(database, cluster.first(), readable, keyring(database).getString("activeKeyId"));
+                } finally {
+                    Document disabled = admin.runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", "off"));
+                    assertThat(disabled.get("count", Number.class).longValue() - entered)
+                            .as("all three server-side ACK write conflicts were consumed").isEqualTo(3);
+                }
+            }
+        }
+    }
+
+    @Test
     void concurrentFirstBootAndWholeClusterRestartKeepOneKeyringAndReadableSources() {
         String name = databaseName("keyring_restart");
         String uri = SharedMongo.replicaSetUrl(name);
         try (MongoClient raw = MongoClients.create(uri)) {
-            MongoDatabase database = raw.getDatabase(name);
+            MongoDatabase database = metadataDatabase(raw, name);
             TwoMemberCluster original = TwoMemberCluster.startConcurrently(uri, "keyring-first", LEASE);
             Document keyring;
             EndingSession firstEnding;
@@ -99,7 +229,7 @@ class SourceConfigKeyringClusterIT {
         try (MongoClient raw = MongoClients.create(uri);
                 TwoMemberCluster cluster = TwoMemberCluster.start(uri, "keyring-join", LEASE);
                 MongoConnection maintenance = maintenance(uri)) {
-            MongoDatabase database = raw.getDatabase(name);
+            MongoDatabase database = metadataDatabase(raw, name);
             assertThat(cluster.awaitBothMembers()).hasSize(2);
             String clusterId = cluster.first().clusterId();
             Resource beforeRotation = source("before_rotation", "rotation-whole-config-sentinel");
@@ -108,7 +238,8 @@ class SourceConfigKeyringClusterIT {
             String initialKey = keyring(database).getString("activeKeyId");
             assertThat(keys.prepareRotation()).isEqualTo(2);
 
-            try (RealProcessServer joining = cluster.launching(JOINING)) {
+            RealProcessServer joining = cluster.launching(JOINING);
+            try (joining) {
                 joining.awaitReady();
                 assertThat(liveAcknowledgement(database, clusterId, JOINING, 2))
                         .as("the ready joining process holds a matching live acknowledgement of the prepared epoch")
@@ -136,6 +267,8 @@ class SourceConfigKeyringClusterIT {
                 String finalKey = keyring(database).getString("activeKeyId");
                 assertEverySourceUses(database, finalKey);
                 assertSource(database, added, afterRotation, finalKey);
+            } finally {
+                FailureScene.writeMemberLogs(clusterId, Map.of(JOINING, joining.output()));
             }
         }
     }
@@ -147,7 +280,7 @@ class SourceConfigKeyringClusterIT {
         try (MongoClient raw = MongoClients.create(uri);
                 TwoMemberCluster cluster = TwoMemberCluster.start(uri, "keyring-crash", LEASE);
                 MongoConnection maintenance = maintenance(uri)) {
-            MongoDatabase database = raw.getDatabase(name);
+            MongoDatabase database = metadataDatabase(raw, name);
             assertThat(cluster.awaitBothMembers()).hasSize(2);
             String clusterId = cluster.first().clusterId();
             awaitAcknowledgements(database, clusterId, 1, TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
@@ -338,5 +471,11 @@ class SourceConfigKeyringClusterIT {
 
     private static String databaseName(String prefix) {
         return prefix + "_" + UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private static MongoDatabase metadataDatabase(MongoClient client, String name) {
+        // Observe the same durable view as rotation; a local ACK can precede its majority commit.
+        return client.getDatabase(name).withReadPreference(ReadPreference.primary())
+                .withReadConcern(ReadConcern.MAJORITY);
     }
 }

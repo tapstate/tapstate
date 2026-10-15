@@ -4,13 +4,17 @@ import com.hazelcast.jet.core.Processor;
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
+import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.SettledPositions;
+import io.tapstate.runtime.engine.LevelBounds;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -49,6 +53,7 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
 
     private final JoinDriver driver;
     private final Map<Integer, String> sourceByOrdinal;
+    private final LevelBounds bounds;
 
     /**
      * @param sourceByOrdinal which source arrives on which inbound edge. It comes from whoever drew the
@@ -57,8 +62,13 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
      *                        under two aliases, and then one stream is two sources
      */
     public JoinProcessor(JoinDriver driver, Map<Integer, String> sourceByOrdinal) {
+        this(driver, sourceByOrdinal, null);
+    }
+
+    JoinProcessor(JoinDriver driver, Map<Integer, String> sourceByOrdinal, LevelBounds bounds) {
         this.driver = Objects.requireNonNull(driver, "driver");
         this.sourceByOrdinal = Map.copyOf(Objects.requireNonNull(sourceByOrdinal, "sourceByOrdinal"));
+        this.bounds = bounds;
     }
 
     /**
@@ -74,6 +84,7 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
 
     /** How many arrivals before the next settlement marker have already been taken into the state. */
     private int taken;
+    private final Map<String, ChainPosition> takenPositions = new LinkedHashMap<>();
 
     /**
      * Takes in each run of rows before a settlement marker, then sends what the outbox will hold.
@@ -123,7 +134,9 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
                     if (item instanceof SettledPositions) {
                         break;
                     }
-                    changes.add(new SourceChange(source, (Envelope) item));
+                    Envelope event = (Envelope) item;
+                    changes.add(new SourceChange(source, event));
+                    SettledPositions.fold(takenPositions, event.positions());
                 }
                 driver.absorb(changes);
                 taken = changes.size();
@@ -131,6 +144,12 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
             if (!driver.drainUpdates(this::tryEmit)) {
                 return;
             }
+            // Dimensions with no referrers and unmatched inner facts still have landed in join state.
+            // Confirm the delivery only behind its entire fan-out, including any refused output.
+            if (!takenPositions.isEmpty() && !tryEmit(new SettledPositions(takenPositions))) {
+                return;
+            }
+            takenPositions.clear();
             for (int i = 0; i < taken; i++) {
                 inbox.poll();
             }
@@ -155,5 +174,17 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
     @Override
     public boolean complete() {
         return driver.drainUpdates(this::tryEmit);
+    }
+
+    /** A table's bound is combined only across the inputs that carry that table. */
+    @Override
+    public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        return bounds == null || (driver.drainUpdates(this::tryEmit)
+                && bounds.advance(ordinal, watermark, this::tryEmit));
+    }
+
+    @Override
+    public boolean tryProcessWatermark(Watermark watermark) {
+        return bounds != null || super.tryProcessWatermark(watermark);
     }
 }

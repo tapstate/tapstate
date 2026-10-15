@@ -450,7 +450,8 @@ public final class PipelineDagBuilder {
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             bindings.join().stores(), bindings.join().displaced(),
-                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn)));
+                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn), axes,
+                            chains == null ? null : alias -> chains.union(aliasUpstream(inline.from(), alias, bindings))));
                     attachTraceInputs(dag, step.id(), inline.from(), bindings, byKey, trace,
                             outboundOrdinal, inboundOrdinal, shape);
                     attachTrace(dag, step.id(), byKey.get(step.id()), trace, outboundOrdinal, inboundOrdinal, shape);
@@ -649,7 +650,7 @@ public final class PipelineDagBuilder {
                 : () -> new LevelBounds(Map.of(SinkRouter.SPREAD, carried, SinkRouter.BY_KEY, carried), axes,
                         LevelBounds.HOLDS_NOTHING);
         ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
-                sinkAck, () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
+                sinkAck, () -> SettledFloor.forRoutedWriter(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
                 shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis()),
                 sink);
         if (startsTheRun != null) {

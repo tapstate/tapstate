@@ -1,23 +1,35 @@
 package io.tapstate.mcp;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
 import org.springframework.context.ConfigurableApplicationContext;
 
+import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+@Isolated("Owns process standard input and logging properties")
 class TapstateMcpApplicationTest {
 
-    private static final String STDIO_PROPERTY = "spring.ai.mcp.server.stdio";
+    private InputStream processInput;
+
+    @BeforeEach
+    void isolateStdioInput() {
+        processInput = System.in;
+        // The default stdio transport still starts when stdio=false. It must not read
+        // Surefire's command pipe or prevent the test JVM from exiting and writing coverage.
+        System.setIn(InputStream.nullInputStream());
+    }
 
     @AfterEach
     void clearProcessProperties() {
+        System.setIn(processInput);
         System.clearProperty(TapstateMcpApplication.AOT_PROCESSING_PROPERTY);
         System.clearProperty(TapstateMcpApplication.LOGBACK_STATUS_LISTENER_PROPERTY);
-        System.clearProperty(STDIO_PROPERTY);
     }
 
     @Test
@@ -38,7 +50,6 @@ class TapstateMcpApplicationTest {
 
     @Test
     void startsAsAStdioOnlyApplicationAndRegistersTheConfiguredToolSurface() {
-        System.setProperty(STDIO_PROPERTY, "false");
         try (ConfigurableApplicationContext context = TapstateMcpApplication.start(
                 new String[] {"--server", "http://127.0.0.1:1", "--allow-write"},
                 Map.of("TAPSTATE_TOKEN", "machine-token"))) {
