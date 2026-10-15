@@ -99,6 +99,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         this.plans = Objects.requireNonNull(plans, "plans");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.connectors = Objects.requireNonNull(connectors, "connectors");
+        captureCoordinator.runOnlyWhileDriving(actuation::isDriving);
     }
 
     @Override
