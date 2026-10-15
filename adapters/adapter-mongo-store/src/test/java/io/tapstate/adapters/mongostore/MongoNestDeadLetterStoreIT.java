@@ -8,7 +8,9 @@ import io.tapstate.spi.store.NestDeadLetterRecord;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.util.List;
 import java.util.Map;
@@ -31,13 +33,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoNestDeadLetterStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
     private static final String NAMESPACE = "nest.orders_to_docs.assemble.policies";
     private static final String SIBLING = "nest.orders_to_docs.assemble.orders";
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoNestDeadLetterStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
     void whatWasDiscardedComesBackAsItWent() {
@@ -175,7 +177,7 @@ class MongoNestDeadLetterStoreIT {
 
     private static void withStore(Consumer<MongoNestDeadLetterStore> test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate"))
+            MongoCollection<Document> collection = client.getDatabase("tapstate")
                     .getCollection(MongoStorePort.NEST_DEAD_LETTERS);
             collection.drop();
             test.accept(new MongoNestDeadLetterStore(collection));

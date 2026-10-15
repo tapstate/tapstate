@@ -1,12 +1,9 @@
 # Source-bound CI shard layouts
 
-The default-reactor planner reads `.github/ci-shard-layout.json`. The checked-in
-configuration records the current comparison candidate: four E2E IT workers,
-two whole-class App workers, a complete E2E unit-module worker, `engine` and
-`rest`. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
-counts 2, 4 and 6 are supported for ordinary source-commit comparisons; there is
-no separate workflow or benchmark entry point. A staged layout is not a
-performance adoption result.
+The default-reactor planner reads `.github/ci-shard-layout.json`. This ordinary
+comparison commit keeps the fixed four-worker layout: two E2E IT workers,
+`engine` and `rest`. The optional layouts described below remain available;
+a source recipe and valid matrix are not performance acceptance.
 
 The configuration requires `schema: 1`, `e2e_shards`, `rest_modules` and
 `new_test_seconds`. The optional `app_shards` field accepts 2 or 4; omitting it
@@ -70,16 +67,18 @@ reject.
 
 The plan retains layout and duration-input hashes. Timing provenance and timer
 aggregation limits accompany the duration map; nested suite timers can overlap.
-The current provenance records all 1,285 source units from one complete,
-successful manual CI run. All nine original selected verify commands and
-validated worker packs retain their original source/run bindings. The 1,290
-XML reports include five additional nested-container suites; their times are
-summed under the owning source outer class. The source-unit set and test-source
-bytes match the recorded run. Of these source classes, 98 have no testcase rows
-(including 97 E2E classes), and ten have zero aggregate suite time. These reports
-remain visible; report presence or zero time cannot establish executed cases.
-The weights are estimates from that run, not an observed four-versus-six
-comparison, input equivalence, or PR performance acceptance.
+The timing provenance records 1,285 source units from one complete,
+successful optimized-source manual CI run. Its nine original selected verify
+commands and validated worker packs retain their original source/run bindings.
+The 1,290 XML reports include five additional nested-container suites; their
+times are summed under the owning source outer class. This rollback recipe
+selects 1,281 source units and reverses owned fixture mechanisms and added
+controls. Its source-unit set and test-source bytes differ from that recorded
+run; those records remain unchanged. The captured run includes 98 source
+classes with no testcase rows (97 E2E) and ten with zero aggregate suite time.
+Report presence or zero time cannot establish executed cases. These weights
+are scheduling estimates, not an observed four-versus-six comparison, current
+input equivalence, or PR performance acceptance.
 
 Source discovery and the exact multiset assignment remain authoritative for
 which tests run. Estimated balancing, historical main timings and a valid

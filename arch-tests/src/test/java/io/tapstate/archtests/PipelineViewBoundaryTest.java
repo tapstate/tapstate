@@ -1,6 +1,8 @@
 package io.tapstate.archtests;
 
 import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.spi.store.ArtifactStore;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -23,7 +25,9 @@ class PipelineViewBoundaryTest {
 
     @BeforeAll
     static void importProductionClasses() {
-        tapstateClasses = ProductionClassImports.packages("io.tapstate.control.core");
+        tapstateClasses = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("io.tapstate.control.core");
     }
 
     @Test

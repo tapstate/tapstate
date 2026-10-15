@@ -1,7 +1,5 @@
 package io.tapstate.adapters.mongostore.migration;
 
-import io.tapstate.adapters.mongostore.SharedMongoCase;
-
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -21,9 +19,11 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -39,20 +39,16 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class SchemaModelMigrationIT {
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(SchemaModelMigrationIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET =
+            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     private static MongoClient client;
 
-    @AfterEach
-    void closeClient() {
-        try {
-            if (client != null) {
-                client.close();
-            }
-        } finally {
-            client = null;
+    @AfterAll
+    static void closeClient() {
+        if (client != null) {
+            client.close();
         }
     }
 
@@ -421,7 +417,7 @@ class SchemaModelMigrationIT {
         if (client == null) {
             client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
         }
-        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
+        MongoDatabase database = client.getDatabase(name);
         database.drop();
         SystemCollections.SYSTEM_META.on(database).insertOne(new Document("_id", "schema").append("installedVersion", 4));
         return database;

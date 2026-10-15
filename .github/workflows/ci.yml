@@ -28,6 +28,12 @@ on:
 
   workflow_dispatch:
 
+# Keep analyses serialized with manual pull-request analysis. In-flight server
+# analyses must finish; subsequent PR updates wait for the active run.
+concurrency:
+  group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   pull-requests: write
@@ -59,12 +65,6 @@ jobs:
   test-shards:
     name: test-shards (${{ matrix.shard }})
     needs: shard-plan
-    # Queue each PR's corresponding worker. It stops only its own obsolete work;
-    # a delayed old arrival must never cancel a newer head's worker.
-    concurrency:
-      group: ${{ format('ci-test-{0}-{1}', github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt), matrix.shard) }}
-      cancel-in-progress: false
-      queue: max
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}
@@ -89,7 +89,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/maven-observation"
-          .github/scripts/ci-pr-work.sh --root . --event-inputs "$RUNNER_TEMP/ci-event-inputs.json" --output "$RUNNER_TEMP/ci-inputs/pr-work-prepare.json" --phase prepare -- .github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/maven-observation" --output "$RUNNER_TEMP/maven-observation/summary.json" --shard-id "${{ matrix.shard }}" -- mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+          .github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/maven-observation" --output "$RUNNER_TEMP/maven-observation/summary.json" --shard-id "${{ matrix.shard }}" -- mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Prepare pinned public inputs for Cloud startup witnesses
         if: matrix.prepare_cloud_inputs
         run: |
@@ -107,7 +107,7 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           GH_TOKEN: ${{ github.token }}
-        run: .github/scripts/ci-pr-work.sh --root . --event-inputs "$RUNNER_TEMP/ci-event-inputs.json" --output "$RUNNER_TEMP/ci-inputs/pr-work-verify.json" --phase verify -- .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --class-gate-dir "$RUNNER_TEMP/ci-inputs/class-gates" --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode"
+        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --class-gate-dir "$RUNNER_TEMP/ci-inputs/class-gates" --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode"
       - name: Record the observed test identity hashes
         if: always()
         run: |
@@ -163,12 +163,6 @@ jobs:
   # This stable, non-matrix name is the required check. It admits the union,
   # including every shard's declared report and coverage files, before reporting green.
   build:
-    # Only this job contacts Sonar; tests for later updates can proceed independently.
-    # Match the manual analysis group and retain pending analyses while one runs.
-    concurrency:
-      group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}
-      cancel-in-progress: false
-      queue: max
     outputs:
       sonar-enabled: ${{ steps.guard.outputs.run }}
       sonar-outcome: ${{ steps.analyze.outcome }}
@@ -239,7 +233,7 @@ jobs:
       - name: Prepare local artifacts for report generation
         run: |
           mkdir -p "$RUNNER_TEMP/maven-observation"
-          .github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/maven-observation" --output "$RUNNER_TEMP/maven-observation/summary.json" --shard-id build -- mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+          .github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/maven-observation" --output "$RUNNER_TEMP/maven-observation/summary.json" --shard-id build -- mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Record the aggregate build inputs
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --resolve-classpath --output "$RUNNER_TEMP/ci-inputs/build-inputs.json" --shard-id build --maven-observation "$RUNNER_TEMP/maven-observation/summary.json"
       - uses: actions/download-artifact@v4
@@ -598,7 +592,6 @@ jobs:
           bash .github/scripts/ci-maven-cache-smoke.sh
           bash .github/scripts/sonar-inputs-smoke.sh
           bash .github/scripts/sonar-workflow-smoke.sh
-          python3 .github/scripts/_ci-pr-work-smoke.py
           python3 .github/scripts/sonar-main-gate-timeout-test.py
           bash .github/scripts/sonar-cache-smoke.sh
       - name: CI timing cases

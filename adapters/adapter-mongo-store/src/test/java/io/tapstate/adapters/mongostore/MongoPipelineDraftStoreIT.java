@@ -11,7 +11,9 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
@@ -26,16 +28,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoPipelineDraftStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoPipelineDraftStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
     void publishesArtifactAndMarkersTogetherAndRejectsAStaleArtifact() {
         String uri = REPLICA_SET.getReplicaSetUrl();
         try (MongoClient client = MongoClients.create(uri)) {
-            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
             var drafts = database.getCollection("pipeline_drafts");
             var artifacts = database.getCollection("artifacts");
             drafts.drop();
@@ -73,7 +75,7 @@ class MongoPipelineDraftStoreIT {
     @Test
     void createListReplaceAndDeleteUseRevisionAndModePreconditions() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
             var drafts = database.getCollection("pipeline_drafts");
             var artifacts = database.getCollection("artifacts");
             drafts.drop();
@@ -121,7 +123,7 @@ class MongoPipelineDraftStoreIT {
     @Test
     void rebaseChangesOnlyThePublicationBaseWithThePriorBaseAsPrecondition() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_rebase_it"));
+            var database = client.getDatabase("tapstate_pipeline_draft_rebase_it");
             var drafts = database.getCollection("pipeline_drafts");
             var artifacts = database.getCollection("artifacts");
             drafts.drop();
@@ -147,7 +149,7 @@ class MongoPipelineDraftStoreIT {
     @Test
     void publishDistinguishesMissingAndStaleDraftRevisions() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
             var drafts = database.getCollection("pipeline_drafts");
             var artifacts = database.getCollection("artifacts");
             drafts.drop();
@@ -171,7 +173,7 @@ class MongoPipelineDraftStoreIT {
     @Test
     void publishRejectsDependenciesThatChangedAfterValidation() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
             var drafts = database.getCollection("pipeline_drafts");
             var artifacts = database.getCollection("artifacts");
             drafts.drop();
@@ -195,7 +197,7 @@ class MongoPipelineDraftStoreIT {
     @Test
     void refusesToReplaceAnArtifactOfAnotherKind() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
             var drafts = database.getCollection("pipeline_drafts");
             var artifacts = database.getCollection("artifacts");
             drafts.drop();
@@ -218,7 +220,7 @@ class MongoPipelineDraftStoreIT {
     @Test
     void replacesAStoredDraftAfterComparingItsMigratedModeAndSkipsUnreadableRowsInLists() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
             var drafts = database.getCollection("pipeline_drafts");
             var artifacts = database.getCollection("artifacts");
             drafts.drop();
