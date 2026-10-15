@@ -81,7 +81,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$output" ]]
 case "$url" in
-    'https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/tapstate-cloud:pull')
+    "https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/$STUB_PACKAGE:pull")
         [[ -z "$header_file" && "${STUB_ANONYMOUS_TOKEN_FAIL:-false}" != true ]]
         case "${STUB_ANONYMOUS_TOKEN_INVALID:-false}" in
             true) printf '{"token":null}' > "$output" ;;
@@ -92,7 +92,7 @@ case "$url" in
             *) printf '{"token":"%s"}' "$STUB_ANONYMOUS_TOKEN_VALUE" > "$output" ;;
         esac
         ;;
-    "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$STUB_DIGEST")
+    "https://ghcr.io/v2/tapstate/$STUB_PACKAGE/manifests/$STUB_DIGEST")
         [[ "${STUB_ANONYMOUS_READ_FAIL:-false}" != true ]]
         [[ -n "$header_file" && "$(cat "$header_file")" == "Authorization: Bearer $STUB_ANONYMOUS_TOKEN_VALUE" ]]
         [[ -z "$(find "$header_file" ! -perm 0600 -print)" ]]
@@ -125,13 +125,13 @@ run_publish() {
         STUB_REPOSITORY="${STUB_REPOSITORY:-null}" STUB_EXISTING_DIGEST="${STUB_EXISTING_DIGEST:-}" \
         STUB_LOGIN_FAIL="${STUB_LOGIN_FAIL:-false}" STUB_PUSH_FAIL="${STUB_PUSH_FAIL:-false}" \
         STUB_READ_FAIL="${STUB_READ_FAIL:-false}" STUB_DIGEST_MISMATCH="${STUB_DIGEST_MISMATCH:-false}" \
-        STUB_DIGEST="$DIGEST" \
+        STUB_DIGEST="$DIGEST" STUB_PACKAGE=tapstate-cloud \
         STUB_ANONYMOUS_TOKEN_FAIL="${STUB_ANONYMOUS_TOKEN_FAIL:-false}" \
         STUB_ANONYMOUS_TOKEN_VALUE="${STUB_ANONYMOUS_TOKEN_VALUE:-anonymous-pull-sentinel}" \
         STUB_ANONYMOUS_TOKEN_INVALID="${STUB_ANONYMOUS_TOKEN_INVALID:-false}" \
         STUB_ANONYMOUS_READ_FAIL="${STUB_ANONYMOUS_READ_FAIL:-false}" \
         STUB_ANONYMOUS_DIGEST_MISMATCH="${STUB_ANONYMOUS_DIGEST_MISMATCH:-false}" \
-        bash "$PUBLISHER" publish --archive "$WORK/cloud-image.tar" \
+        bash "$PUBLISHER" "${TEST_MODE:-publish}" --archive "$WORK/cloud-image.tar" \
             --version "${TEST_VERSION:-0.6.0}" --expected-digest "${TEST_DIGEST:-$DIGEST}"
 }
 
@@ -238,8 +238,37 @@ if TEST_GITHUB_OUTPUT="$WORK/action-output" run_publish > "$WORK/out" 2> "$WORK/
         && grep -qxF 'tag=ghcr.io/tapstate/tapstate-cloud:0.6.0' "$WORK/action-output"; then
     ok 'successful authenticated and anonymous verification emits exact deployment outputs'
 else bad 'successful authenticated and anonymous verification emits exact deployment outputs'; fi
+
+: > "$WORK/action-output"
+if TEST_MODE=publish-dev TEST_VERSION=0.7.0 STUB_EXISTING_DIGEST=sha256:previous-dev-build \
+        TEST_GITHUB_OUTPUT="$WORK/action-output" run_publish > "$WORK/out" 2> "$WORK/err" \
+        && grep -qF 'imagetools create --tag ghcr.io/tapstate/tapstate-cloud:0.7.0-dev ' "$WORK/commands.log" \
+        && grep -qF 'index("0.7.0-dev")' "$WORK/commands.log" \
+        && grep -qxF "image=ghcr.io/tapstate/tapstate-cloud@$DIGEST" "$WORK/action-output" \
+        && grep -qxF 'tag=ghcr.io/tapstate/tapstate-cloud:0.7.0-dev' "$WORK/action-output" \
+        && ! grep -qE 'tapstate-cloud:0[.]7[.]0([[:space:]]|$)' "$WORK/commands.log"; then
+    ok 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'
+else bad 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'; fi
+if grep -qF "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$DIGEST" "$WORK/commands.log"; then
+    ok 'dev availability is also verified anonymously by digest'
+else bad 'dev availability is also verified anonymously by digest'; fi
+if TEST_MODE=publish-dev STUB_EXISTING_DIGEST="$DIGEST" run_publish > "$WORK/out" 2> "$WORK/err" \
+        && ! grep -qF 'imagetools create' "$WORK/commands.log"; then
+    ok 'a matching dev digest is idempotent'
+else bad 'a matching dev digest is idempotent'; fi
+TEST_MODE=publish-dev STUB_VISIBILITY=private \
+    expect_failure 'dev cannot silently switch to private distribution' 'must be Public'
+if [[ ! -f "$WORK/pushed" ]]; then ok 'private dev packages cause no registry write'; else bad 'private dev packages cause no registry write'; fi
+TEST_MODE=publish-dev TEST_VERSION=latest expect_failure 'dev still requires a numeric version' 'numeric release version'
+TEST_MODE=publish-dev STUB_PUSH_FAIL=true expect_failure 'failed dev replacement cannot report success' 'push failed'
+: > "$WORK/action-output"
+TEST_MODE=publish-dev TEST_GITHUB_OUTPUT="$WORK/action-output" STUB_ANONYMOUS_DIGEST_MISMATCH=true \
+    expect_failure 'dev also refuses wrong anonymous bytes' 'anonymous manifest digest differs'
+if [[ ! -s "$WORK/action-output" ]]; then ok 'dev readback failure emits no deployment output'; else bad 'dev readback failure emits no deployment output'; fi
+TEST_MODE=publish-prod expect_failure 'an unknown mode cannot choose a package' 'usage:'
+if [[ ! -s "$WORK/commands.log" ]]; then ok 'an unknown mode performs no external operation'; else bad 'an unknown mode performs no external operation'; fi
 if [[ ! -e "$ROOT/.github/workflows/cloud-ecr.yml" ]]; then
-    ok 'the independent upload workflow is removed'
-else bad 'the independent upload workflow is removed'; fi
+    ok 'the retired ECR upload workflow stays removed'
+else bad 'the retired ECR upload workflow stays removed'; fi
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
