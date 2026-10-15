@@ -22,14 +22,17 @@ Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
 The release workflow registers the current Cloud runtime version only after the
-Cloud image publisher verifies the public registry digest. Configure these in
-the `cloud-ghcr-release` environment before using that notification:
+Cloud image publisher verifies the public registry digest. Configure the two
+variables in the `cloud-ghcr-release` environment and the production token in
+the repository's Actions secrets before using that notification:
 
 - Variable `CLOUD_RELEASE_API_URL`: the HTTPS endpoint ending in
   `/v1/api/cluster-versions`.
 - Variable `CLOUD_RELEASE_CODE`: `ALPHA`, `BETA`, `RC`, or `STABLE`.
-- Secret `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN`: the operator token configured
-  on that Cloud control plane.
+- Repository secret `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD`: the operator
+  token configured on the production Cloud control plane. The release workflow
+  reads only this production key; `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV`
+  is reserved for other CI workflows.
 
 The request carries the version and source revision; `git.extra` records the
 image tag, immutable image reference, digest, release URL, and workflow URL.
