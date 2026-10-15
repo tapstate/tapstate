@@ -20,19 +20,45 @@ bash .github/scripts/ci-group-delta.sh \
 The policy has exactly `schema: 1`, `type: declared-group-delta-policy` and
 `entries`. Each entry has `component`, `field`, `hashes` (exact A/B/C SHA-256
 values), a nonempty `reason` and a nonempty `evidence` reference list. Only
-I methods/class_contracts/sources/entry_contract and R workflows can be declared
+I methods/class_contracts/sources/entry_contract/test_packaged_outputs and R workflows can be declared
 expected differences. The values are hashes of canonical JSON from the original
 replay. There are no ignore paths, wildcard rules or hard-constraint waivers.
 Duplicate, unused, stale or unsupported policy entries reject. Evidence bytes
 are bound and retained; a declaration does not prove its semantic explanation.
 
-P preserved source, production bytes/class IDs/access flags and all packaged
-outputs must match exactly, including test-JARs. U, observed toolchain/coverage
-specification, original label facts and ruleset records also remain exact.
-The adapter deliberately does not resolve legitimate packaged-output changes
-without further evidence. D ordered resolved classpaths must be equal before
-comparison readiness; different actual dependencies remain `needs_review` and
-cannot be waived by this policy. Peer cache/model/producer observation deltas
+P preserved source and production bytes/class IDs/access flags remain exact.
+Ordinary JAR, Boot, distribution and other production packaged outputs remain
+exact too. U, observed toolchain/coverage specification, original label facts and
+ruleset records remain exact. Missing or unknown output roles use the legacy
+strict comparison, including changed test-JARs.
+
+For source-bound default `maven-jar-plugin:test-jar` producers only, current input
+capture adds hash-only `packaged_test_outputs`. The capture checks actual JAR
+members against the complete captured test-class/resource tree and separates the
+three standard Maven metadata members. Archived readback replays the original
+local-parent POM coordinates and helper source hashes, the original owner ZIP's
+complete test tree, goal implementation, descriptor artifacts, direct plugin realm
+URLs and resolved consumer test scope. Maven file version references are checked
+and dereferenced to content hashes and sizes. Direct plugin realm URL order is
+retained. Inherited loaders, import package prefixes and actual class consumption
+remain unproven; their original observations stay in the input archive. The
+archive contains the original capture's JAR/member hashes, not raw test-JAR bytes,
+so this is bounded source/capture/owner replay, not independent JAR extraction or
+whole-build attestation.
+
+Only outputs with this replay can be partitioned into test inputs. Their raw full
+P output and D classpath fingerprints are retained with an explicit
+`replayed_test_input_partition` row. The derived production output set, producer
+POM/model, metadata, output mode, descriptor and direct realm byte facts remain
+hard equal. Changed test members and their classpath aliases become the explicit
+I `test_packaged_outputs` delta, requiring exact hashes, reason and evidence.
+No filename, caller glob or P/D policy can grant a role. Custom/profile-specific
+producers and missing observations stay unresolved or strict. New test identities,
+original assertions and coverage continue through their separate comparators.
+
+D ordered resolved classpaths must otherwise be equal before comparison readiness;
+different actual dependencies remain `needs_review` and cannot be waived by this
+policy. Peer cache/model/producer observation deltas
 remain explicit side facts only after the actually resolved entries have been
 checked. External repository JARs require hash-bound captured model coordinates
 and verified archive/producer identity from every peer; missing or false facts

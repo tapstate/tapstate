@@ -62,6 +62,8 @@ def check(workflows, contexts, inputs):
     assert shards.count('--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"') == 2, 'both worker snapshots must retain the same prepare observation'
     assert build.count('--shard-id build') == 2, 'aggregate prepare and input snapshot must both declare build'
 
+    assert 'python3 .github/scripts/_ci-test-jar-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'test-JAR role controls must run in every recipe'
+    assert 'python3 -m py_compile .github/scripts/_ci-test-jar-inputs.py .github/scripts/_ci-test-jar-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'test-JAR capture and controls must compile'
     assert 'ci-pr-work.sh' not in build, 'aggregate and Sonar must not be interrupted by the test supervisor'
     assert shards.count('ci-pr-work.sh') == 2, 'both worker preparation and selected verify must supervise their owned command'
     assert '--phase prepare -- .github/scripts/ci-build-observation.sh' in shards
@@ -153,6 +155,7 @@ for original, replacement in [
     ('name: test-shards (${{ matrix.shard }})', 'name: unrelated-worker'),
     ('if: matrix.prepare_cloud_inputs', "if: matrix.shard == 'rest'"),
     ('--probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"', '--probe-receipt unrelated-file.json'),
+    ('python3 .github/scripts/_ci-test-jar-inputs-smoke.py', 'echo test-jar-controls-removed'),
     ('python3 .github/scripts/_ci-provider-receipt-smoke.py', 'echo provider-controls-removed'),
     ('python3 .github/scripts/_ci-provider-readback-smoke.py', 'echo archive-provider-controls-removed'),
     ('python3 .github/scripts/_ci-provider-replay-smoke.py', 'echo active-provider-controls-removed'),

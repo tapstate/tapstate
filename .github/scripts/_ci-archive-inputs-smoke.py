@@ -47,7 +47,77 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None):
+def packaged_test_fixture(pre, work, bytecode):
+    """Protocol bytes and native-shaped observations; this does not run Maven or compile Java."""
+    roles = m.test_jars
+    path = 'fixture/target/fixture-1-tests.jar'
+    support_path = 'fixture/target/test-classes/io/tapstate/fixture/Support.class'
+    support = b'nonselected producer helper protocol bytes'
+    pre['test_files'][support_path] = g.checksum(support)
+    pre['test_class_ids'][support_path] = g.receipt.crc64(support)
+    members = {'io/tapstate/fixture/SampleTest.class': bytecode, 'io/tapstate/fixture/Support.class': support,
+               'META-INF/MANIFEST.MF': b'Manifest-Version: 1.0\r\nCreated-By: Maven JAR Plugin 3.4.2\r\nBuild-Jdk-Spec: 21\r\n\r\n',
+               'META-INF/maven/io.tapstate/fixture/pom.xml': b'<project><groupId>io.tapstate</groupId><artifactId>fixture</artifactId><version>1</version></project>',
+               'META-INF/maven/io.tapstate/fixture/pom.properties': b'artifactId=fixture\ngroupId=io.tapstate\nversion=1\n'}
+    raw = zipped(members)
+    pre['packaged_outputs'][path] = dict(sha256=g.checksum(raw), size=len(raw), mode=420)
+    own = {name.removesuffix('.class'): dict(sha256=g.checksum(data), class_id=g.receipt.crc64(data))
+           for name, data in members.items() if name.endswith('.class')}
+    pre['resolved_test_classpaths']['consumer'] = [dict(identity='repository/io/tapstate/fixture/1/fixture-1-tests.jar',
+                                                       sha256=g.checksum(raw), size=len(raw), own_classes=own)]
+    files = {}
+    def reference(data, label):
+        sha, identity = g.checksum(data), g.checksum(label.encode())
+        key = g.checksum((identity + ':' + str(len(data)) + ':' + sha).encode())
+        files[key] = dict(state='observed-file', size=len(data), sha256=sha, path_identity_sha256=identity)
+        return key
+    plugin_bytes = b'bounded plugin protocol fixture'
+    plugin_file, output_file = reference(plugin_bytes, 'plugin.jar'), reference(raw, 'fixture-tests.jar')
+    plugin_path = 'org/apache/maven/plugins/maven-jar-plugin/3.4.2/maven-jar-plugin-3.4.2.jar'
+    pre['dependency_repository_files'][plugin_path] = g.checksum(plugin_bytes)
+    artifact = dict(group='org.apache.maven.plugins', artifact='maven-jar-plugin', version='3.4.2', type='maven-plugin',
+                    classifier=None, scope=None, resolved=True, file=plugin_file)
+    dependency = dict(group='io.tapstate', artifact='fixture', version='1', type='test-jar', classifier='tests',
+                      scope='test', resolved=True, file=output_file)
+    runtime = dict(maven_jvm_version='21', java_vendor='Fixture', java_home_identity_sha256='7' * 64,
+                   maven_core={'file': plugin_file}, major_jvm_file_identities={n: {'file': plugin_file}
+                   for n in ('release', 'bin/java', 'lib/modules', 'lib/ct.sym')}, capture_phase='first-configured-mojo',
+                   whole_JDK_installation_proven=False, selected_or_forked_compiler_proven=False)
+    rows = []
+    for project, execution, goal, implementation, dependencies in [
+            ('io.tapstate:fixture:1', 'test-jar', 'test-jar', 'TestJarMojo', []),
+            ('io.tapstate:consumer:1', 'default-jar', 'jar', 'JarMojo', [dependency])]:
+        common = dict(project=project, execution=execution, goal=goal,
+                      plugin='org.apache.maven.plugins:maven-jar-plugin:3.4.2', fully_injected_parameter_values='not-observed')
+        ordinary = dict(merged_xml_config_sha256='5' * 64, project_artifacts_at_event=dependencies)
+        rows.extend([{**common, **ordinary, 'event': 'MojoStarted', 'nanos': len(rows) + 1},
+            {**common, 'event': 'MojoConfigured', 'nanos': len(rows) + 2,
+             'configured_implementation': 'org.apache.maven.plugins.jar.' + implementation,
+             'effective_model_sha256': '8' * 64, 'active_profile_identities': [],
+             'registered_compile_source_roots': [], 'registered_test_source_roots': [], 'requested_concurrency': 1,
+             'runtime_identity': runtime, 'compiler_consumed_files': 'not-observed', 'selected_or_forked_compiler': 'not-observed'},
+            {**common, **ordinary, 'event': 'MojoSucceeded', 'nanos': len(rows) + 3, 'plugin_artifact': artifact,
+             'plugin_artifacts': [artifact], 'realm': dict(state='observed-realm-urls', id='e' * 64,
+                ordered_urls=[{'file': plugin_file}], parent=dict(state='not-observed', reason='no-realm'),
+                imports=[], import_package_prefixes='not-observed', opaque_parent_class=None)}])
+    metadata = dict(schema=3, type='local-configured-build-input-observation', events=None, event_records=rows,
+        files=files, failures=0, dropped_events=0, hashed_bytes=sum(v['size'] for v in files.values()),
+        java_version='21', java_vendor='Fixture', os_arch='fixture', annotation_processor_inputs='not-observed',
+        external_generator_inputs='not-observed', whole_build_provenance_complete=False, elapsed_nanos=7)
+    observer = g.module('test_jar_fixture_observation', '_ci-build-observation.py')
+    source_hash = g.checksum(json.dumps({Path(n).name: h for n, h in pre['source_files'].items()
+                                       if n.startswith('.github/scripts/maven-inputs/')}, sort_keys=True).encode())
+    pre['runner_context'] = g.receipt.input_runner_snapshot({'GITHUB_REPOSITORY': 'example/project',
+        'GITHUB_WORKFLOW_REF': 'example/project/.github/workflows/ci.yml@refs/pull/7/merge',
+        'GITHUB_WORKFLOW_SHA': 'e' * 40, 'GITHUB_JOB': 'test-shards'}, 'rest')
+    pre['maven_execution_observation'] = dict(schema=1, type='maven-execution-observation-summary', capture_status='captured',
+        **{k: pre[k] for k in ('source_sha', 'source_tree', 'run_id', 'run_attempt', 'event', 'runner_context')},
+        observer_source_sha256=source_hash, observer_jar_sha256='4' * 64,
+        **observer.observation_summary(json.dumps(metadata).encode()))
+    pre['packaged_test_outputs'] = roles.capture(lambda n: (work / n).read_bytes(), lambda n: raw if n == path else None, pre)
+
+
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -57,6 +127,24 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         subprocess.run(['git', 'init', '-q', str(main)], check=True)
         for key, value in [('user.name', 'Fixture'), ('user.email', 'fixture@example.test'), ('commit.gpgsign', 'false')]:
             v.git(main, 'config', key, value)
+        if test_jar:
+            assert not two_workers and test_resource_bytes is None, 'bounded test-JAR fixture uses one complete owner class'
+            maven_source = True
+            extra_source_files = dict(extra_source_files or {})
+            for name in m.test_jars.PRODUCERS:
+                extra_source_files[name] = Path(__file__).with_name(Path(name).name).read_bytes()
+            extra_source_files['pom.xml'] = ('<project><groupId>io.tapstate</groupId><artifactId>parent</artifactId>'
+                '<version>${revision}</version><properties><revision>1</revision></properties><packaging>pom</packaging>'
+                '<modules><module>fixture</module><module>consumer</module></modules><build><pluginManagement><plugins>'
+                '<plugin><artifactId>maven-jar-plugin</artifactId><version>3.4.2</version></plugin>'
+                '</plugins></pluginManagement></build></project>')
+            parent = '<parent><groupId>io.tapstate</groupId><artifactId>parent</artifactId><version>${revision}</version></parent>'
+            extra_source_files['fixture/pom.xml'] = ('<project>' + parent + '<artifactId>fixture</artifactId><build><plugins>'
+                '<plugin><artifactId>maven-jar-plugin</artifactId><executions><execution><id>test-jar</id>'
+                '<goals><goal>test-jar</goal></goals></execution></executions></plugin></plugins></build></project>')
+            extra_source_files['consumer/pom.xml'] = ('<project>' + parent + '<artifactId>consumer</artifactId><dependencies>'
+                '<dependency><groupId>io.tapstate</groupId><artifactId>fixture</artifactId><version>${revision}</version>'
+                '<type>test-jar</type><classifier>tests</classifier><scope>test</scope></dependency></dependencies></project>')
         (main / 'fixture.cfg').write_text('base\n')
         (main / 'pom.xml').write_text('<project><modelVersion>4.0.0</modelVersion><groupId>io.tapstate</groupId><artifactId>parent</artifactId><version>1</version><packaging>pom</packaging><modules><module>fixture</module></modules></project>')
         (main / 'fixture/src/test/java/io/tapstate/fixture').mkdir(parents=True)
@@ -148,6 +236,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             plan['cohort_hash'] = s.cohort(plan['expected'])
         compiled = 'fixture/target/test-classes/io/tapstate/fixture/SampleTest.class'
         bytecode = b'protocol fixture, not an actual compiled build'
+        if test_jar:
+            bytecode += g.checksum((work / case_path).read_bytes()).encode()
         prod = 'fixture/target/classes/io/tapstate/fixture/Product.class'
         sources = {n: g.checksum((work / n).read_bytes()) for n in v.text(work, 'ls-files').splitlines()}
         dep = 'example/lib/1/lib-1.jar'
@@ -172,6 +262,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             pre['test_class_ids'][other_compiled] = g.receipt.crc64(b'other protocol class')
         if test_resource_bytes is not None:
             pre['test_resource_files']={name:g.checksum(raw) for name,raw in test_resource_bytes.items()}
+        if test_jar:
+            packaged_test_fixture(pre, work, bytecode)
         post = copy.deepcopy(pre)
         post['phase'] = 'post-test-before-pack'
         binding = {'execution': 'github-actions', 'run_id': str(run_id), 'run_attempt': 1}
@@ -193,6 +285,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                    for method in fixture_methods) + '</testsuite>').encode()
         marker = s.provenance_path(worker).as_posix()
         result_files = {compiled: bytecode, xml_path: xml, worker['required_exec'][0]: b'coverage protocol fixture', marker: encode(provenance), **(test_resource_bytes or {})}
+        if test_jar:
+            result_files['fixture/target/test-classes/io/tapstate/fixture/Support.class'] = b'nonselected producer helper protocol bytes'
         manifest = {'schema': 2, 'source_sha': merge, 'cohort_hash': plan['cohort_hash'], 'shard_id': 'rest',
                     'tests': [test], 'required_exec': worker['required_exec'], 'provenance': provenance,
                     'provenance_path': marker, 'witness_ledgers': [], 'files': {n: g.checksum(b) for n, b in result_files.items()},
@@ -208,11 +302,16 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             result_files[marker] = encode(provenance)
             manifest['files'][marker] = g.checksum(result_files[marker])
             worker_pre['engine'] = other_pre
-        equality = g.receipt.compare_input_snapshots(plan, pre, worker_pre)
-        equality['input_files'] = {'build': g.checksum(encode(pre)), **{n: g.checksum(encode(v)) for n,v in worker_pre.items()}}
+        build_pre = copy.deepcopy(pre)
+        if test_jar:
+            build_pre['runner_context']['workflow_source']['job'] = 'build'
+            build_pre['runner_context']['shard_id'] = 'build'
+            build_pre['maven_execution_observation']['runner_context'] = copy.deepcopy(build_pre['runner_context'])
+        equality = g.receipt.compare_input_snapshots(plan, build_pre, worker_pre)
+        equality['input_files'] = {'build': g.checksum(encode(build_pre)), **{n: g.checksum(encode(v)) for n,v in worker_pre.items()}}
         artifacts = {'ci-shard-plan': {'shards.json': plan, 'ci-event-inputs.json': event},
                      'ci-inputs-rest': {'build-inputs.json': pre, 'post-test-inputs.json': post},
-                     'ci-inputs-build': {'build-inputs.json': pre, 'build-input-equivalence.json': equality},
+                     'ci-inputs-build': {'build-inputs.json': build_pre, 'build-input-equivalence.json': equality},
                      'ci-test-results-rest': {'rest/manifest.json': manifest,
                                              **{'rest/files/' + n: raw for n, raw in result_files.items()}},
                      'ci-aggregate': {xml_path: xml, 'target/ci-shards/rest/run.json': encode(provenance)}}
@@ -460,5 +559,41 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         print('CI archive input controls passed: ' + str(count))
 
 
+def packaged_archive_controls(context):
+    artifacts, project = context['artifacts'], context['project']
+    answer = project()
+    fact = answer['observed_packaged_test_outputs']
+    check(fact['original_owner_bytes_replayed'] and not fact['unverified'], 'complete original test-JAR owner bytes and native-shaped goal/scope replay')
+    check(not fact['whole_build_provenance_complete'] and not answer['whole_build_provenance_complete'],
+          'original archive protocol replay never becomes whole-build proof')
+    output, request_path = context['evidence'] / 'test-jar-cli.json', context['evidence'] / 'test-jar-request.json'
+    request_path.write_bytes(encode(context['request']))
+    child = subprocess.run(['bash', str(Path(__file__).with_name('ci-archive-inputs.sh')), '--manifest', str(request_path),
+                            '--evidence-root', str(context['evidence']), '--root', str(context['work']), '--output', str(output)],
+                           capture_output=True, text=True)
+    check(child.returncode == 0 and json.loads(output.read_bytes()) == answer, 'test-JAR original archive CLI: ' + child.stderr)
+    support_path = 'fixture/target/test-classes/io/tapstate/fixture/Support.class'
+    artifacts['ci-test-results-rest'].pop('rest/files/' + support_path)
+    artifacts['ci-test-results-rest']['rest/manifest.json']['files'].pop(support_path)
+    context['reseal']()
+    rejected(project, 'test-JAR members differ from original owner ZIP bytes')
+    context['reset']()
+    path = 'fixture/target/fixture-1-tests.jar'
+    for field, mutation, reason in [
+        ('members', lambda x: x.pop('io/tapstate/fixture/Support.class'), 'test-JAR member binding differs'),
+        ('output', lambda x: x.update(sha256='e' * 64), 'test-JAR model/output binding differs'),
+        ('model', lambda x: x.update(classifier='foreign'), 'test-JAR model/output binding differs')]:
+        packet = artifacts['ci-inputs-rest']['build-inputs.json']['packaged_test_outputs']
+        mutation(packet['outputs'][path][field])
+        context['reseal'](); rejected(project, reason); context['reset']()
+    for key in ('pom_sources',):
+        artifacts['ci-inputs-rest']['build-inputs.json']['packaged_test_outputs']['outputs'][path]['model'][key]['fixture/pom.xml'] = 'f' * 64
+        context['reseal'](); rejected(project, 'test-JAR model/output binding differs'); context['reset']()
+    artifacts['ci-inputs-rest']['build-inputs.json']['packaged_test_outputs']['producer_sources'][m.test_jars.PRODUCERS[0]] = 'f' * 64
+    context['reseal'](); rejected(project, 'test-JAR capture helper source binding missing'); context['reset']()
+
+
 if __name__ == '__main__':
     run()
+    run(packaged_archive_controls, test_jar=True, only_callback=True)
+    print('CI packaged test archive controls passed:', count)

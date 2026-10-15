@@ -24,6 +24,7 @@ source = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(source)
 g, require = source.groups, source.require
 shards = g.module('archive_shards', '_ci-shards.py')
+test_jars = g.module('archive_test_jars', '_ci-test-jar-inputs.py')
 MAX_MEMBER = 64 * 1024 * 1024
 MAX_TOTAL = 512 * 1024 * 1024
 
@@ -137,6 +138,16 @@ def checkout_hashes(raw):
     return hashes
 
 
+def checkout_poms(raw):
+    poms = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as archive:
+        for item in archive:
+            if item.isfile() and (item.name == 'pom.xml' or item.name.endswith('/pom.xml') or item.name in test_jars.PRODUCERS):
+                require(item.size <= 1024 * 1024, 'test-JAR source POM exceeds budget')
+                poms[item.name] = archive.extractfile(item).read()
+    return poms
+
+
 def plan_read(value, checkout):
     require(type(value.get('schema')) is int and value['schema'] == 1 and value.get('source_sha') == checkout,
             'shard plan checkout differs')
@@ -161,7 +172,7 @@ def plan_read(value, checkout):
     return value
 
 
-def snapshot(value, scope, checkout, tree, sources, phase):
+def snapshot(value, scope, checkout, tree, sources, phase, poms=None):
     require(isinstance(value, dict) and type(value.get('schema')) is int and value['schema'] == 1
             and value.get('phase') == phase and value.get('event') == scope['event'], 'invalid input snapshot phase/event')
     require(g.origin(value) == {'source_sha': checkout, 'run_id': scope['run_id'], 'run_attempt': scope['run_attempt']}
@@ -175,6 +186,9 @@ def snapshot(value, scope, checkout, tree, sources, phase):
                 and all(isinstance(v, str) and re.fullmatch(r'[0-9a-f]{16}', v) for v in ids.values()),
                 'class ID map differs: ' + field)
     g.receipt.test_resource_snapshot(value)
+    if 'packaged_test_outputs' in value:
+        require(poms is not None, 'original test-JAR POM bytes unavailable')
+        test_jars.validate(value['packaged_test_outputs'], value, lambda name: poms[name])
     paths = value.get('resolved_test_classpaths')
     require(isinstance(paths, dict) and paths, 'resolved classpaths unavailable')
     for module, entries in paths.items():
@@ -285,6 +299,46 @@ def result_read(files, worker, plan, binding, pre_raw, post):
             'raw_witness_ledgers': {n: declared[n] for n in manifest['witness_ledgers']}}
 
 
+def test_jar_readback(plan, pre, post, results, poms):
+    if not any('packaged_test_outputs' in value for value in pre.values()):
+        return None
+    require(all('packaged_test_outputs' in value for value in [*pre.values(), *post.values()]),
+            'test-JAR capture missing from an original peer')
+    packet = pre['build']['packaged_test_outputs']
+    missing, outputs = [], {}
+    for path, record in packet['outputs'].items():
+        model = record['model']
+        runtime_inputs = []
+        for name, snapshot in [*pre.items(), *[(name + '/post', value) for name, value in post.items()]]:
+            require(snapshot['packaged_test_outputs'] == packet, 'original test-JAR capture differs across peers/phases')
+            runtime = test_jars.execution_inputs(snapshot, model)
+            if runtime is None:
+                missing.append(name + ':' + path + ': original goal not observed')
+            else:
+                runtime_inputs.append(runtime)
+        if runtime_inputs:
+            require(all(value == runtime_inputs[0] for value in runtime_inputs), 'test-JAR producer runtime bytes differ')
+        outputs[path] = {**record, 'producer_runtime_inputs': runtime_inputs[0] if runtime_inputs else None}
+        owners = [worker['id'] for worker in plan['shards']
+                  if model['module'] in {test['module'] for test in worker['tests']}]
+        if not owners:
+            missing.append(path + ': no archived test byte owner')
+        prefix = model['module'] + '/target/test-classes/'
+        for owner in owners:
+            members = {name.removeprefix(prefix): checksum for name, checksum in results[owner]['files'].items()
+                       if name.startswith(prefix)}
+            require(members == record['members'], 'test-JAR members differ from original owner ZIP bytes')
+        for name, snapshot in pre.items():
+            for consumer, entries in snapshot['resolved_test_classpaths'].items():
+                for entry in entries:
+                    if test_jars.classpath_role(entry, {path: record}) is not None:
+                        if not test_jars.observed_test_scope(snapshot, consumer, record, lambda name: poms[name]):
+                            missing.append(name + ':' + path + ': original consumer scope not observed')
+    return {'schema': 1, 'outputs': outputs, 'producer_sources': packet['producer_sources'],
+            'original_owner_bytes_replayed': not missing, 'unverified': sorted(set(missing)),
+            'whole_build_provenance_complete': False}
+
+
 def project(refs, root, request):
     require(isinstance(request, dict) and set(request) == {'schema', 'type', 'source'}
             and type(request['schema']) is int and request['schema'] == 1
@@ -296,6 +350,7 @@ def project(refs, root, request):
     require(basis['checkout'] is not None, 'actual checkout archive required')
     checkout, tree = basis['checkout']['sha'], basis['checkout']['tree']
     sources = checkout_hashes(archive.raw('checkout-source.tar'))
+    poms = checkout_poms(archive.raw('checkout-source.tar'))
     plan_files = archive.artifact('ci-shard-plan')
     require(set(plan_files) == {'shards.json', 'ci-event-inputs.json'}, 'shard plan artifact members differ')
     require(g.json_bytes(plan_files['ci-event-inputs.json']) == archive.json('event-inputs.json'), 'raw event artifact differs')
@@ -312,18 +367,20 @@ def project(refs, root, request):
         if name != 'build':
             provider_members[name] = inputs
         raw[name] = inputs['build-inputs.json']
-        pre[name] = snapshot(g.json_bytes(raw[name]), scope, checkout, tree, sources, 'pre-test-after-install')
+        pre[name] = snapshot(g.json_bytes(raw[name]), scope, checkout, tree, sources, 'pre-test-after-install', poms)
         g.receipt.input_runner_context(pre[name], name, scope['repository'])
         g.receipt.maven_observation_fact(pre[name], name, scope['repository'])
         if name != 'build':
             post[name] = snapshot(g.json_bytes(inputs['post-test-inputs.json']), scope, checkout, tree, sources,
-                                  'post-test-before-pack')
+                                  'post-test-before-pack', poms)
             g.receipt.input_runner_context(post[name], name, scope['repository'])
             g.receipt.maven_observation_fact(post[name], name, scope['repository'])
             require(pre[name].get('maven_execution_observation') == post[name].get('maven_execution_observation'),
                     'post-test Maven observation differs: ' + name)
             require(g.receipt.test_resource_snapshot(pre[name])==g.receipt.test_resource_snapshot(post[name]),
                     'post-test resource hashes differ from prepared inputs')
+            require(pre[name].get('packaged_test_outputs') == post[name].get('packaged_test_outputs'),
+                    'post-test test-JAR capture differs: ' + name)
             require(pre[name].get('runner_context') == post[name].get('runner_context'),
                     'post-test runner context differs: ' + name)
             for field in ('production_files', 'production_class_ids', 'resolved_test_classpaths', 'toolchain'):
@@ -338,6 +395,7 @@ def project(refs, root, request):
         name = worker['id']
         result_payloads[name] = archive.artifact('ci-test-results-' + name)
         results[name] = result_read(result_payloads[name], worker, plan, binding, raw[name], post[name])
+    test_jar_facts = test_jar_readback(plan, pre, post, results, poms)
     provider = g.module('provider_archive_readback', '_ci-provider-readback.py').project(
         archive, plan, pre, post, provider_members, result_payloads, sources, archive.raw('checkout-source.tar'), zip_read)
     aggregate = archive.artifact('ci-aggregate')
@@ -370,6 +428,8 @@ def project(refs, root, request):
             'archived_input_members_verified': True, 'whole_build_provenance_complete': False,
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
             'unverified_components': sorted(missing), 'input_files': refs.finish()}
+    if test_jar_facts is not None:
+        result['observed_packaged_test_outputs'] = test_jar_facts
     if 'test_resource_files' in observed:
         result['observed_test_resource_files']=observed['test_resource_files']
     if provider is not None:

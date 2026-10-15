@@ -79,6 +79,16 @@ explicitly unknown; do not infer workflow commits from checkout SHA or shard IDs
 from artifact names. Existing install/verify steps and evidence artifacts retain
 their layout, permissions and triggers.
 
+When `packaged_test_outputs` is present, every original peer and phase must
+retain it. Readback binds its producer model to the original POM and capture helper
+sources, checks the complete producer test tree against each owning result ZIP,
+and replays the original goal, descriptor artifacts, ordered direct plugin realm
+URLs and consumer test scope. The optional field never adds raw build artifacts
+to CI transfers. JAR/member hashes come from source-bound capture; original owner
+class/resource bytes are independently read from result ZIPs. Inherited loaders,
+actual class consumption and whole-build provenance stay unproven. See
+`ci-group-delta.md` for the bounded test-input partition and strict fallback.
+
 ZIP names are canonical, unique and bounded. Only regular files/directories are
 accepted; links, special modes, encryption, traversal and file-as-parent entries
 reject. The evidence reference reader bounds each raw input to 64 MiB. ZIPs allow

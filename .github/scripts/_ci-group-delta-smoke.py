@@ -72,7 +72,7 @@ def controls(root, contexts, unused_complete, unused_added):
     payloads = {name: value['payloads'] for name, value in facts.items()}
     entries = []
     for component, field in sorted(m.POLICY_FIELDS):
-        values = {name: (value['I']['source_inventory'][field] if component == 'I' else value[component][field])
+        values = {name: ((value['I']['source_inventory'].get(field, value['I'].get(field))) if component == 'I' else value[component][field])
                   for name, value in payloads.items()}
         observed = m.hashes(values)
         if len(set(observed.values())) != 1:
@@ -129,7 +129,7 @@ def controls(root, contexts, unused_complete, unused_added):
           'changed metadata for a used dependency is not an unused-cache difference')
     reactor = copy.deepcopy(payloads['A'])
     identity = 'repository/io/tapstate/fixture/1/fixture-1-tests.jar'
-    reactor['D']['resolved_test_classpaths']['fixture'] = [{'identity': identity, 'sha256': 'b' * 64, 'size': 10, 'own_classes': {}}]
+    reactor['D']['resolved_test_classpaths'] = {'fixture': [{'identity': identity, 'sha256': 'b' * 64, 'size': 10, 'own_classes': {}}]}
     reactor['P']['packaged_outputs'] = {'fixture/target/fixture-1-tests.jar': {'sha256': 'b' * 64, 'size': 10, 'mode': 420}}
     check(not m.resolved_dependency_facts(reactor)['unknown'], 'reactor test-JAR binds its unique recorded packaged output')
     for label, mutate in [
@@ -239,5 +239,8 @@ dependency_metadata = {
         'gav': ['example', 'lib', '1'], 'sha256': 'c' * 64, 'pom_path': 'example/lib/1/lib-1.pom', 'pom_sha256': 'd' * 64,
         'archive_type_verified': True, 'producer_identity_verified': True,
         'producer_identity_source': 'synthetic-protocol-fixture', 'runtime_realm_proven': False}}}
-fixture.cohort(added=True, callback=controls, dependency_metadata=dependency_metadata)
-print('CI archived group delta controls passed:', count)
+if __name__ == '__main__':
+    fixture.cohort(added=True, callback=controls, dependency_metadata=dependency_metadata)
+    print('CI archived group delta controls passed:', count)
+    fixture.cohort(added=True, callback=controls, dependency_metadata=dependency_metadata, test_jar=True)
+    print('CI archived test-JAR group delta controls passed:', count)

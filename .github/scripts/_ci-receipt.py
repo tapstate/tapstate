@@ -363,6 +363,13 @@ def runtime_class_metadata(args, value):
     return capture, sorted(candidates,key=lambda r:(r['name'],r['class_id']))
 
 
+def test_jar_inputs_module():
+    spec = importlib.util.spec_from_file_location('receipt_test_jar_inputs', Path(__file__).with_name('_ci-test-jar-inputs.py'))
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
 def inputs(args):
     root = Path(args.root).resolve()
     require(Path(git(root, 'rev-parse', '--show-toplevel')).resolve() == root, 'input root must be the actual product checkout')
@@ -481,6 +488,12 @@ def inputs(args):
         value['maven_execution_observation'] = json.loads(path.read_text(), object_pairs_hook=unique_observation_object)
         maven_observation_fact(value, getattr(args, 'shard_id', None))
     value['runtime_class_capture'], value['runtime_generated_classes'] = runtime_class_metadata(args, value)
+    roles = test_jar_inputs_module()
+    if all(name in source_files for name in roles.PRODUCERS):
+        value['packaged_test_outputs'] = roles.capture(
+            lambda name: shards.owned_path(root, name).read_bytes(),
+            lambda name: shards.owned_path(root, name).read_bytes(), value)
+        roles.validate(value['packaged_test_outputs'], value, lambda name: shards.owned_path(root, name).read_bytes())
     if args.resolve_classpath:
         expected_modules = {t['module'] for t in shards.discover(root)}
         require(expected_modules <= set(classpaths), 'selected test module classpaths missing: ' + str(sorted(expected_modules - set(classpaths))))
@@ -660,6 +673,11 @@ def compare_input_snapshots(plan, aggregate, workers):
     if has_resources:
         require(all(value is not None for value in resource_sets), 'test resource capture missing from a current peer')
         require(all(value==resource_sets[0] for value in resource_sets), 'independent test resource hashes differ')
+    test_packages = [value.get('packaged_test_outputs') for value in [aggregate, *workers.values()]]
+    has_test_packages = any(value is not None for value in test_packages)
+    if has_test_packages:
+        require(all(value is not None for value in test_packages), 'test-JAR capture missing from a current peer')
+        require(all(value == test_packages[0] for value in test_packages), 'independent test-JAR captures differ')
     runner = compare_runner_contexts(aggregate, workers)
     maven = compare_maven_observations(aggregate, workers)
     result = dict(schema=1, type='independent-build-input-hashes', source_sha=source,
@@ -669,6 +687,8 @@ def compare_input_snapshots(plan, aggregate, workers):
                 ability_proven=False, raw_bytes_uploaded=False)
     if has_resources:
         result['compared_fields'].append('test_resource_files')
+    if has_test_packages:
+        result['compared_fields'].append('packaged_test_outputs')
     if runner is not None:
         result['runner_context'] = runner
     if maven is not None:

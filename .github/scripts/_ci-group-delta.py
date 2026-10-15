@@ -12,7 +12,8 @@ partition = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(partition)
 g, require = partition.g, partition.require
 components = g.module('delta_components', '_ci-group-components.py')
-POLICY_FIELDS = {('I', field) for field in ('methods', 'class_contracts', 'sources', 'entry_contract')} | {('R', 'workflows')}
+test_jars = g.module('delta_test_jars', '_ci-test-jar-inputs.py')
+POLICY_FIELDS = {('I', field) for field in ('methods', 'class_contracts', 'sources', 'entry_contract', 'test_packaged_outputs')} | {('R', 'workflows')}
 
 
 def hashes(values):
@@ -42,7 +43,7 @@ def policy_entries(refs, reference):
     return entries
 
 
-def resolved_dependency_facts(payload):
+def resolved_dependency_facts(payload, test_outputs=None):
     dependencies, outputs = payload['D'], payload['P']['packaged_outputs']
     used, facts, gaps = {}, {}, []
     for entries in dependencies['resolved_test_classpaths'].values():
@@ -56,6 +57,13 @@ def resolved_dependency_facts(payload):
         path = identity.removeprefix('repository/')
         if not path.endswith('.jar'):
             gaps.append(identity + ': unsupported repository classpath entry')
+            continue
+        role = test_jars.classpath_role(entry, test_outputs or {})
+        if role is not None:
+            record = test_outputs[role]
+            facts[identity] = {'recorded_test_fixture_output': {'path': role, 'model': record['model'],
+                'metadata': record['metadata'], 'mode': record['output']['mode'],
+                'producer_runtime_inputs': record['producer_runtime_inputs']}}
             continue
         if path.startswith('io/tapstate/'):
             matches = {name: value for name, value in outputs.items()
@@ -92,6 +100,29 @@ def resolved_dependency_facts(payload):
     return {'resolved': facts, 'unknown': gaps}
 
 
+def test_output_projection(payload):
+    """This receives independently replayed component facts, never caller ignore paths."""
+    fact = payload['I'].get('test_packaged_outputs')
+    if fact is None or fact.get('original_owner_bytes_replayed') is not True or fact.get('unverified'):
+        return None
+    require(isinstance(fact.get('outputs'), dict), 'replayed test-JAR outputs unavailable')
+    records = fact['outputs']
+    for path, record in records.items():
+        require(payload['P']['packaged_outputs'].get(path) == record.get('output')
+                and isinstance(record.get('producer_runtime_inputs'), dict), 'replayed test-JAR output/runtime binding differs')
+    production = {name: value for name, value in payload['P']['packaged_outputs'].items() if name not in records}
+    metadata = {name: {'model': value['model'], 'metadata': value['metadata'], 'mode': value['output']['mode'],
+                       'producer_runtime_inputs': value['producer_runtime_inputs']} for name, value in records.items()}
+    classpaths = {}
+    for consumer, entries in payload['D']['resolved_test_classpaths'].items():
+        classpaths[consumer] = []
+        for entry in entries:
+            role = test_jars.classpath_role(entry, records)
+            classpaths[consumer].append(entry if role is None else
+                {'identity': entry['identity'], 'replayed_test_fixture_output': role, 'producer': metadata[role]})
+    return {'outputs': records, 'production': production, 'metadata': metadata, 'classpaths': classpaths}
+
+
 def compare_payloads(payloads, case_partition, policy):
     """Hard constraints cannot be waived by a declared source-delta policy."""
     rows, used = [], set()
@@ -109,12 +140,32 @@ def compare_payloads(payloads, case_partition, policy):
         require(status != 'reject', 'hard group input differs: ' + component + '.' + field)
         rows.append(row)
 
-    for field in ('preserved_source_digest', 'production', 'packaged_outputs'):
+    projections = {name: test_output_projection(value) for name, value in payloads.items()}
+    replayed_test_inputs = all(value is not None for value in projections.values())
+    for field in ('preserved_source_digest', 'production'):
         record('P', field, {name: value['P'][field] for name, value in payloads.items()})
+    if replayed_test_inputs:
+        record('P', 'production_packaged_outputs', {name: value['production'] for name, value in projections.items()})
+        record('P', 'test_producer_metadata', {name: value['metadata'] for name, value in projections.items()})
+        record('P', 'packaged_outputs', {name: value['P']['packaged_outputs'] for name, value in payloads.items()},
+               'replayed_test_input_partition')
+        record('I', 'test_packaged_outputs', {name: value['I']['test_packaged_outputs'] for name, value in payloads.items()},
+               'needs_review')
+    else:
+        record('P', 'packaged_outputs', {name: value['P']['packaged_outputs'] for name, value in payloads.items()})
+        if any('test_packaged_outputs' in value['I'] for value in payloads.values()):
+            rows.append({'component': 'I', 'field': 'test_packaged_outputs', 'status': 'unknown',
+                         'hashes': hashes({name: value['I'].get('test_packaged_outputs') for name, value in payloads.items()})})
     record('U', 'owned_recipe_digest', {name: value['U']['owned_recipe_digest'] for name, value in payloads.items()})
     record('spec', 'observed', {name: value['spec'] for name, value in payloads.items()})
-    record('D', 'resolved_test_classpaths', {name: value['D']['resolved_test_classpaths'] for name, value in payloads.items()}, 'needs_review')
-    identities = {name: resolved_dependency_facts(value) for name, value in payloads.items()}
+    normalized = {name: value['classpaths'] for name, value in projections.items()} if replayed_test_inputs else None
+    if normalized is not None:
+        record('D', 'resolved_production_classpaths', normalized, 'needs_review')
+    raw_status = ('replayed_test_input_partition' if normalized is not None and len(set(hashes(normalized).values())) == 1
+                  else 'needs_review')
+    record('D', 'resolved_test_classpaths', {name: value['D']['resolved_test_classpaths'] for name, value in payloads.items()}, raw_status)
+    identities = {name: resolved_dependency_facts(value, projections[name]['outputs'] if replayed_test_inputs else None)
+                  for name, value in payloads.items()}
     if any(value['unknown'] for value in identities.values()):
         rows.append({'component': 'D', 'field': 'resolved_dependency_identities', 'status': 'unknown',
                      'hashes': hashes(identities), 'facts': identities})
@@ -148,7 +199,7 @@ def project(refs, request):
                     == case_partition['variant_bindings'][name]['source_inventory_digest'], 'delta component/partition source differs')
     rows = compare_payloads({name: value['payloads'] for name, value in facts.items()}, case_partition,
                             policy_entries(refs, request['review_policy']))
-    ready = all(row['status'] in ('equal', 'source_partition', 'declared_expected_delta', 'side_observation_delta') for row in rows)
+    ready = all(row['status'] in ('equal', 'source_partition', 'declared_expected_delta', 'side_observation_delta', 'replayed_test_input_partition') for row in rows)
     return {'schema': 1, 'type': 'archived-group-delta-report', 'fields': rows,
             'variant_bindings': {name: {'scope': value['scope'], 'binding': value['binding'],
                 'component_hashes': value['component_hashes']} for name, value in facts.items()},

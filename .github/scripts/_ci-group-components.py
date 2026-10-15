@@ -56,6 +56,8 @@ def project(refs, root, request):
     if 'all_source_cases_resolved' in case_facts:
         payloads['I']['all_source_cases_resolved'] = case_facts['all_source_cases_resolved']
         payloads['I']['provider_case_inputs'] = case_facts['provider_case_inputs']
+    if 'observed_packaged_test_outputs' in input_facts:
+        payloads['I']['test_packaged_outputs'] = input_facts['observed_packaged_test_outputs']
     if 'observed_test_resource_files' in input_facts:
         payloads['I']['test_resource_files']=input_facts['observed_test_resource_files']
     binding = {'run_id': scope['run_id'], 'run_attempt': scope['run_attempt'],
