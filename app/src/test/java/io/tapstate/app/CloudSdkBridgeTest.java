@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudRuntimeStatus;
+import io.tapstate.control.core.CloudEgressAddress;
 import io.tapstate.control.core.Scope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
@@ -17,6 +18,41 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CloudSdkBridgeTest {
+
+    @Test
+    void optionalEgressMetadataSupportsBothSdkGenerations() {
+        assertThat(CloudSdkBridge.optionalExchangeField(new LegacyExchange("jwt"), "ec2PublicIp")).isNull();
+        assertThat(CloudSdkBridge.optionalExchangeField(new LegacyExchange("jwt"), "egressAddressStatus")).isNull();
+        var current = new EgressExchange("203.0.113.42", "STABLE");
+        assertThat(CloudSdkBridge.optionalExchangeField(current, "ec2PublicIp")).isEqualTo("203.0.113.42");
+        assertThat(CloudSdkBridge.optionalExchangeField(current, "egressAddressStatus")).isEqualTo("STABLE");
+        var context = new CloudSdkBridge.ExchangeResult("jwt", "org", "cluster", "Org", "Cluster", "us-east-1",
+                "203.0.113.42", "STABLE").context();
+        assertThat(context.ec2PublicIp()).isEqualTo("203.0.113.42");
+        assertThat(context.egressAddressStatus()).isEqualTo("STABLE");
+        assertThat(new CloudSdkBridge.ExchangeResult("jwt", "org", "cluster", "Org", "Cluster", "us-east-1")
+                .context().ec2PublicIp()).isNull();
+    }
+
+    public record LegacyExchange(String jwt) { }
+    public record EgressExchange(String ec2PublicIp, String egressAddressStatus) { }
+
+    @Test
+    void currentAddressIsOptionalForOlderSdksAndBoundToTheConfiguredCluster() {
+        assertThat(CloudSdkBridge.optionalCurrentEgressAddress(new LegacyExchange("jwt"))).isNull();
+        CloudEgressAddress address = new CloudEgressAddress("org-one", "cluster-one", "203.0.113.42", "STABLE");
+        assertThat(CloudSdkBridge.optionalCurrentEgressAddress(new AddressSdk(address))).isEqualTo(address);
+        sdk.address = address;
+        assertThat(bridge.currentEgressAddress("cluster-one")).contains(address);
+        assertThat(bridge.currentEgressAddress("other-cluster")).isEmpty();
+        sdk.address = new CloudEgressAddress("org-one", "other-cluster", "203.0.113.99", "STABLE");
+        assertThat(bridge.currentEgressAddress("cluster-one")).isEmpty();
+        sdk.addressFailure = true;
+        assertThat(bridge.currentEgressAddress("cluster-one")).isEmpty();
+        assertThat(bridge.exchange("code", "cluster-one")).isEqualTo("signed-jwt");
+    }
+
+    public record AddressSdk(CloudEgressAddress currentEgressAddress) { }
 
     @Test
     void reportableFailureCodesKeepTheBoundedAsciiGrammarWithoutRecursiveMatching() {
@@ -192,6 +228,12 @@ class CloudSdkBridgeTest {
     }
 
     private static final class ControlledSdk implements CloudSdkBridge.SdkRuntime {
+        CloudEgressAddress address;
+        boolean addressFailure;
+        @Override public CloudEgressAddress currentEgressAddress() {
+            if (addressFailure) throw new CloudSdkBridge.ProviderFailure();
+            return address;
+        }
         private CloudSdkBridge.VerifiedClaims claims = claims(
                 "cluster-one", "https://cloud.example", AUDIENCE,
                 List.of("workload:read", "workload:write"));
