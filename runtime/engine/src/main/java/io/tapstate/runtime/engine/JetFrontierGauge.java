@@ -23,12 +23,19 @@ final class JetFrontierGauge implements FrontierGauge {
 
     @Override
     public void trailing(Map<String, Long> gapsByChain) {
+        gaugesByChain.forEach((chain, metric) -> {
+            if (!gapsByChain.containsKey(chain)) metric.set(0L);
+        });
         gapsByChain.forEach((chain, gap) ->
                 gaugesByChain.computeIfAbsent(chain, JetFrontierGauge::gapMetricFor).set(gap));
     }
 
     @Override
     public void pinned(Map<String, Long> millisByChain) {
+        // Job metrics retain their last value; an absent chain in a fresh reading is no longer pinned.
+        stallsByChain.forEach((chain, metric) -> {
+            if (!millisByChain.containsKey(chain)) metric.set(0L);
+        });
         millisByChain.forEach((chain, millis) ->
                 stallsByChain.computeIfAbsent(chain, JetFrontierGauge::stallMetricFor).set(millis));
     }
