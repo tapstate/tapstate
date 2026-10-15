@@ -96,6 +96,19 @@ def controls(root, contexts, unused_complete, unused_added):
     check(any(row['status'] == 'needs_review' for row in rows), 'unreviewed source changes remain visible')
     rejected(lambda: m.bind_group(dict(report, comparison_ready=False), {}, {}), 'pending deltas block group reconciliation')
     parsed_policy = m.policy_entries(g.References(root), request['review_policy'])
+    resources = copy.deepcopy(payloads)
+    for value in resources.values():
+        value['I']['test_resource_files'] = {'fixture/target/test-classes/generated.properties': '1' * 64}
+    check(any(row['component'] == 'I' and row['field'] == 'test_resource_files' and row['status'] == 'equal'
+              for row in m.compare_payloads(resources, report['case_partition'], parsed_policy)),
+          'equal original prepared test-resource maps are compared')
+    resources['B']['I']['test_resource_files']['fixture/target/test-classes/generated.properties'] = '2' * 64
+    rejected(lambda: m.compare_payloads(resources, report['case_partition'], parsed_policy),
+             'different prepared test resources')
+    resources['B']['I'].pop('test_resource_files')
+    check(any(row['component'] == 'I' and row['field'] == 'test_resource_files' and row['status'] == 'unknown'
+              for row in m.compare_payloads(resources, report['case_partition'], parsed_policy)),
+          'a missing peer resource capture stays unknown')
     for component, field in [('P', 'production'), ('P', 'packaged_outputs'), ('P', 'preserved_source_digest'),
                              ('U', 'owned_recipe_digest'), ('spec', 'toolchain'), ('R', 'original_labels'), ('R', 'ruleset_records')]:
         changed = copy.deepcopy(payloads)

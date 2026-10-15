@@ -32,6 +32,11 @@ exact too. U, observed toolchain/coverage specification, original label facts an
 ruleset records remain exact. Missing or unknown output roles use the legacy
 strict comparison, including changed test-JARs.
 
+Prepared I `test_resource_files` maps are hard-compared when captured. A changed
+resource rejects; a missing peer map remains unknown. This field has no policy
+waiver. Legacy archives that all lack the field keep their bounded shape and
+do not acquire resource evidence from matching source or component hashes.
+
 For source-bound default `maven-jar-plugin:test-jar` producers only, current input
 capture adds hash-only `packaged_test_outputs`. The capture checks actual JAR
 members against the complete captured test-class/resource tree and separates the

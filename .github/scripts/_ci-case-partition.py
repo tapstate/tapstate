@@ -13,13 +13,13 @@ spec.loader.exec_module(reader)
 g, require, ev = reader.g, reader.require, reader.ev
 
 
-def partition(inventories):
-    require(set(inventories) == {'A', 'B', 'C'}, 'case partition requires A/B/C')
+def _partition(inventories, variants):
+    require(set(inventories) == set(variants), 'case partition variant set differs')
     original = Counter(ev.identity(case) for case in inventories['A']['cases'])
     require(original and all(count == 1 for count in original.values()), 'empty or duplicate original source cases')
     original_methods = {ev.method_key(row) for row in inventories['A']['methods']}
     result = {'original_cases': inventories['A']['cases'], 'additions': {}}
-    for name in ('B', 'C'):
+    for name in variants[1:]:
         candidate = Counter(ev.identity(case) for case in inventories[name]['cases'])
         require(all(count == 1 for count in candidate.values()), 'duplicate candidate source cases')
         require(not original - candidate, 'candidate source omits original cases')
@@ -30,6 +30,16 @@ def partition(inventories):
         require(candidate == original + Counter(ev.identity(case) for case in result['additions'][name]),
                 'source partition is incomplete')
     return result
+
+
+def partition(inventories):
+    require(set(inventories) == {'A', 'B', 'C'}, 'case partition requires A/B/C')
+    return _partition(inventories, ('A', 'B', 'C'))
+
+
+def mechanism_partition(inventories):
+    require(set(inventories) == {'A', 'B'}, 'mechanism case partition requires A/B')
+    return _partition(inventories, ('A', 'B'))
 
 
 def project(refs, request):

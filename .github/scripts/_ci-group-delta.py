@@ -21,11 +21,11 @@ def hashes(values):
     return {name: g.checksum(g.canonical(value)) for name, value in values.items()}
 
 
-def policy_entries(refs, reference):
+def _policy_entries(refs, reference, policy_type, variants):
     value, unused = refs.read(reference)
     require(isinstance(value, dict) and set(value) == {'schema', 'type', 'entries'}
             and type(value['schema']) is int and value['schema'] == 1
-            and value['type'] == 'declared-group-delta-policy' and isinstance(value['entries'], list),
+            and value['type'] == policy_type and isinstance(value['entries'], list),
             'invalid group delta policy')
     entries = {}
     for entry in value['entries']:
@@ -33,7 +33,7 @@ def policy_entries(refs, reference):
                 'invalid delta policy entry')
         key = (entry['component'], entry['field'])
         require(key in POLICY_FIELDS and key not in entries, 'unsupported or duplicate delta policy field')
-        require(isinstance(entry['hashes'], dict) and set(entry['hashes']) == {'A', 'B', 'C'}
+        require(isinstance(entry['hashes'], dict) and set(entry['hashes']) == set(variants)
                 and all(isinstance(v, str) and re.fullmatch(r'[0-9a-f]{64}', v) for v in entry['hashes'].values()),
                 'invalid delta policy hashes')
         require(isinstance(entry['reason'], str) and entry['reason'].strip() and len(entry['reason']) <= 4096
@@ -42,6 +42,14 @@ def policy_entries(refs, reference):
             refs.blob(reference)
         entries[key] = entry
     return entries
+
+
+def policy_entries(refs, reference):
+    return _policy_entries(refs, reference, 'declared-group-delta-policy', ('A', 'B', 'C'))
+
+
+def mechanism_policy_entries(refs, reference):
+    return _policy_entries(refs, reference, 'declared-mechanism-delta-policy', ('A', 'B'))
 
 
 def original_resolved_identities(snapshot, consumers, entry, gav, kind):
@@ -226,6 +234,12 @@ def compare_payloads(payloads, case_partition, policy):
         record('R', field, {name: value['R'][field] for name, value in payloads.items()})
     record('R', 'workflows', {name: value['R']['workflows'] for name, value in payloads.items()}, 'needs_review')
     inventories = {name: value['I']['source_inventory'] for name, value in payloads.items()}
+    if any('test_resource_files' in value['I'] for value in payloads.values()):
+        resources = {name: value['I'].get('test_resource_files') for name, value in payloads.items()}
+        if all(isinstance(value, dict) for value in resources.values()):
+            record('I', 'test_resource_files', resources)
+        else:
+            rows.append({'component': 'I', 'field': 'test_resource_files', 'status': 'unknown', 'hashes': hashes(resources)})
     for field in ('methods', 'class_contracts', 'sources', 'entry_contract'):
         record('I', field, {name: value[field] for name, value in inventories.items()}, 'needs_review')
     rows.append({'component': 'I', 'field': 'cases', 'status': 'source_partition' if case_partition['original_case_partition_verified'] else 'unknown',

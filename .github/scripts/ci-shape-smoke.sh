@@ -66,6 +66,8 @@ def check(workflows, contexts, inputs):
     assert 'python3 -m py_compile .github/scripts/_ci-maven-artifacts.py .github/scripts/_ci-maven-artifacts-smoke.py' in ci.get('catalog-scripts', ''), 'Maven artifact capture and controls must compile'
     assert 'python3 .github/scripts/_ci-test-jar-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'test-JAR role controls must run in every recipe'
     assert 'python3 -m py_compile .github/scripts/_ci-test-jar-inputs.py .github/scripts/_ci-test-jar-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'test-JAR capture and controls must compile'
+    assert 'python3 .github/scripts/_ci-mechanism-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'manual mechanism archive controls must run in every recipe'
+    assert 'python3 -m py_compile .github/scripts/_ci-mechanism-inputs.py .github/scripts/_ci-mechanism-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'manual mechanism archive readers and controls must compile'
     assert 'ci-pr-work.sh' not in build, 'aggregate and Sonar must not be interrupted by the test supervisor'
     assert shards.count('ci-pr-work.sh') == 2, 'both worker preparation and selected verify must supervise their owned command'
     assert '--phase prepare -- .github/scripts/ci-build-observation.sh' in shards
@@ -159,6 +161,8 @@ for original, replacement in [
     ('--probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"', '--probe-receipt unrelated-file.json'),
     ('python3 .github/scripts/_ci-maven-artifacts-smoke.py', 'echo artifact-identity-controls-removed'),
     ('python3 .github/scripts/_ci-test-jar-inputs-smoke.py', 'echo test-jar-controls-removed'),
+    ('python3 .github/scripts/_ci-mechanism-inputs-smoke.py', 'echo mechanism-input-controls-removed'),
+    ('python3 -m py_compile .github/scripts/_ci-mechanism-inputs.py .github/scripts/_ci-mechanism-inputs-smoke.py', 'echo mechanism-input-compilation-removed'),
     ('python3 .github/scripts/_ci-provider-receipt-smoke.py', 'echo provider-controls-removed'),
     ('python3 .github/scripts/_ci-provider-readback-smoke.py', 'echo archive-provider-controls-removed'),
     ('python3 .github/scripts/_ci-provider-replay-smoke.py', 'echo active-provider-controls-removed'),

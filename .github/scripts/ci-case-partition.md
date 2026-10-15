@@ -6,6 +6,9 @@ replayed through the existing archived case, input, source, recipe, original
 receipt and indexed Git/ZIP chain. It never executes archived code or changes
 a checkout, workflow or PR.
 
+Manual two-variant mechanism archives use `ci-mechanism-inputs.sh`. The original
+PR partition keeps its three-variant, pull-request-only request contract.
+
 The request has exactly `schema: 1`,
 `type: archived-original-case-partition-request` and `variants`. The variant map
 has exactly A, B and C; each entry has `archive_cases`, a relative path/SHA-256

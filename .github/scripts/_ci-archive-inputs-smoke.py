@@ -142,7 +142,7 @@ def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False, maven_s
     return raw
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False, maven_schema=3, event_name='pull_request'):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False, maven_schema=3, event_name='pull_request', source_setup=None):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -201,6 +201,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             directory.mkdir(parents=True)
             for name in ('BuildInputSpy.java', 'ConfiguredBuildInputListener.java', 'components.xml'):
                 (directory / name).write_bytes(Path(__file__).with_name('maven-inputs').joinpath(name).read_bytes())
+        if source_setup is not None:
+            source_setup(main)
         v.git(main, 'add', '.')
         v.git(main, 'commit', '-qm', 'Original source')
         base = v.text(main, 'rev-parse', 'HEAD')
