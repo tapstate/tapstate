@@ -253,6 +253,22 @@ def transition(refs, value, request):
     before = groups.head_status(scope, value['contract'], request)
     require(before['can_advance_after_archiving'] and before['base_sha'] == value['expected_base_sha'],
             'previous published head is unfinished or its base changed')
+    policy_reader, policy, policy_before = None, None, None
+    if 'trigger_policy' in value:
+        reference = value['trigger_policy']
+        require(isinstance(reference, dict) and set(reference) == {'request', 'source_root'}
+                and isinstance(reference['source_root'], str), 'invalid transition trigger policy reference')
+        policy_reader = groups.module('transition_trigger_contract', '_ci-trigger-contract.py')
+        policy_request, unused = refs.read(reference['request'])
+        policy = policy_reader.project(refs, reference['source_root'], policy_request)
+        require(all(policy['scope'][name] == scope[name] for name in ('repository', 'pr', 'branch', 'head_sha'))
+                and policy['scope']['base_sha'] == value['expected_base_sha'], 'transition trigger policy scope differs')
+        require(set(policy['ordinary_applicable_workflows']) == set(value['contract']['applicable_workflows']),
+                'declared workflow set differs from original trigger policy')
+        policy_before = policy_reader.policy_head_status(policy, request)
+        require(policy_before['can_advance_after_archiving'], 'original trigger policy is unknown or unfinished')
+        require(policy_before['runs'] == before['runs'] and policy_before['checks'] == before['checks'],
+                'head instances changed during trigger policy join')
     archives = value['archives']
     require(isinstance(archives, list) and len({entry['run_id'] for entry in archives}) == len(archives)
             and {entry['run_id'] for entry in archives} == {run['id'] for run in before['runs']},
@@ -283,10 +299,16 @@ def transition(refs, value, request):
             'raw check instances differ from original API')
     after = groups.head_status(scope, value['contract'], request)
     require(before == after, 'published head changed during archive readback')
+    if policy is not None:
+        require(policy_reader.policy_head_status(policy, request) == policy_before,
+                'head trigger policy instances changed during archive readback')
     refs.finish()
-    return {'schema': 1, 'type': 'serial-transition-readback', 'snapshot': after, 'archives': readback,
+    result = {'schema': 1, 'type': 'serial-transition-readback', 'snapshot': after, 'archives': readback,
             'archive_readback_verified': True, 'first_complete_pr_sample_proven': False,
             'performance_accepted': False}
+    if policy_before is not None:
+        result['source_trigger_policy'] = policy_before
+    return result
 
 
 def reserve_journal(directory, plan):

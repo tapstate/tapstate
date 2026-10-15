@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,7 +47,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-') as temporary:
@@ -65,6 +66,10 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             (main / 'fixture/src/test/java/io/tapstate/fixture/OtherTest.java').write_text('package io.tapstate.fixture; class OtherTest { @Test void holds() {} }\n')
         (main / '.github/workflows').mkdir(parents=True)
         (main / '.github/workflows/ci.yml').write_text('jobs:\n  test:\n    run: |\n      .github/scripts/ci-evidence.sh inventory --root . --lane ci --published-connectors absent --native-cli-presence absent --output source-inventory.json\n')
+        if workflow_sources is not None:
+            for name, text in workflow_sources.items():
+                assert re.fullmatch(r'[A-Za-z0-9_.-]+\.yml', name), name
+                (main / '.github/workflows' / name).write_text(text)
         (main / 'product.txt').write_text('preserved product fix\n')
         observer_source = main / 'test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java'
         observer_source.parent.mkdir(parents=True)
