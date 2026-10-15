@@ -28,12 +28,6 @@ on:
 
   workflow_dispatch:
 
-# Keep analyses serialized with manual pull-request analysis. In-flight server
-# analyses must finish; subsequent PR updates wait for the active run.
-concurrency:
-  group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}
-  cancel-in-progress: false
-
 permissions:
   contents: read
   pull-requests: write
@@ -160,6 +154,12 @@ jobs:
   # This stable, non-matrix name is the required check. It admits the union,
   # including every shard's declared report and coverage files, before reporting green.
   build:
+    # Only this job contacts Sonar; tests for later updates can proceed independently.
+    # Match the manual analysis group and retain pending analyses while one runs.
+    concurrency:
+      group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}
+      cancel-in-progress: false
+      queue: max
     outputs:
       sonar-enabled: ${{ steps.guard.outputs.run }}
       sonar-outcome: ${{ steps.analyze.outcome }}

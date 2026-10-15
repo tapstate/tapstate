@@ -25,8 +25,45 @@ assert 'pull_request:' in text and '- main' in text
 assert 'matrix:' not in build and 'matrix:' not in reporter
 assert re.search(r'^    name: sonarqube$',reporter,re.M), 'native check name must be sonarqube'
 assert 'SONAR_REQUIRED' not in text and 'ci-summary' not in text, 'dead branch-push analysis path remains'
-assert "group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}" in text
-assert '  cancel-in-progress: false' in text, 'in-flight server analysis must finish'
+def analysis_locks(ci_text, manual):
+    assert not re.search(r'^concurrency:', ci_text, re.M), 'Sonar lock must not serialize the entire CI workflow'
+    ci_build=block(ci_text,r'^  build:\n',r'^  [\w-]+:')
+    lock=block(ci_build,r'^    concurrency:\n',r'^    \S')
+    assert "      group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}" in lock
+    assert re.search(r'^      cancel-in-progress: false$', lock, re.M), 'in-flight server analysis must finish'
+    assert re.search(r'^      queue: max$', lock, re.M), 'multiple pending analyses must not replace each other'
+    assert not re.search(r'^concurrency:', manual, re.M), 'manual analysis must lock its analysis job'
+    manual_job=block(manual,r'^  analyze:\n',r'^  [\w-]+:')
+    manual_lock=block(manual_job,r'^    concurrency:\n',r'^    \S')
+    assert re.search(r'^      group: sonarqube-\$\{\{ inputs.pr \}\}$', manual_lock, re.M)
+    assert re.search(r'^      cancel-in-progress: false$', manual_lock, re.M)
+    assert re.search(r'^      queue: max$', manual_lock, re.M), 'manual analysis must retain the same queue policy'
+    for name in ('shard-plan', 'test-shards', 'sonarqube'):
+        body=block(ci_text,r'^  '+name+r':\n',r'^  [\w-]+:')
+        assert 'sonarqube-' not in body, 'tests and outcome reporting must not acquire the analysis lock'
+manual=(root/'sonar-pr.yml').read_text()
+analysis_locks(text,manual)
+lock_mutations=0
+for target, original, replacement in [
+    ('ci', "      group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}", '      group: unrelated-analysis'),
+    ('ci', '      cancel-in-progress: false', '      cancel-in-progress: true'),
+    ('ci', '      queue: max', '      queue: single'),
+    ('ci', 'permissions:', 'concurrency: sonarqube-global\npermissions:'),
+    ('ci', '  test-shards:', '  test-shards:\n    concurrency: sonarqube-workers'),
+    ('manual', '      group: sonarqube-${{ inputs.pr }}', '      group: unrelated-analysis'),
+    ('manual', '      cancel-in-progress: false', '      cancel-in-progress: true'),
+    ('manual', '      queue: max', '      queue: single'),
+    ('manual', 'permissions:', 'concurrency: sonarqube-global\npermissions:'),
+]:
+    original_text=text if target=='ci' else manual
+    assert original in original_text
+    changed=original_text.replace(original,replacement,1)
+    try:
+        analysis_locks(changed if target=='ci' else text,changed if target=='manual' else manual)
+    except AssertionError:
+        lock_mutations+=1
+    else:
+        raise AssertionError('escaped analysis lock mutation: '+replacement)
 # Bind cases to the actual subscribed event/ref set; ws pushes must not be a test-only lane.
 trigger=block(text,r'^on:\n',r'^\S')
 assert re.search(r'^  push:\n    branches:\n      - main\n',trigger,re.M)
@@ -139,6 +176,10 @@ with tempfile.TemporaryDirectory() as tmp:
         ('success','true','skipped',1),
         ('success','','',1),
         ('failure','false','skipped',1),
+        ('cancelled','true','success',1),
+        ('cancelled','false','skipped',1),
+        ('skipped','false','skipped',1),
+        ('success','true','cancelled',1),
         ('success','false','skipped',0),
     ]:
         summary=Path(tmp)/'summary'; summary.write_text('')
@@ -181,5 +222,5 @@ with tempfile.TemporaryDirectory() as tmp:
     recorder.write_text('#!/usr/bin/env bash\nexit 23\n')
     run=subprocess.run(['bash','-e','-c',script(analyze)],env=env,capture_output=True,text=True)
     assert run.returncode!=0, 'scanner failure was suppressed before the required check could see it'
-print('sonar-workflow smoke: 7 event/ref cases and 14 runtime cases passed, including 102 paginated issues')
+print(f'sonar-workflow smoke: 7 event/ref cases, 18 runtime cases and {lock_mutations} lock mutations passed, including 102 paginated issues')
 PY
