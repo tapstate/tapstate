@@ -1,8 +1,11 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
@@ -97,8 +100,8 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * other. Host, credentials and every option are carried across, because whatever it took to reach the
      * one database is what it takes to reach the other on the same server.
      *
-     * <p>Which is why the database is not the only thing the path decides. With no explicit
-     * {@code authSource}, the connection string spec authenticates against the database named in the URI
+     * <p>For an ordinary {@code mongodb} URI, the database is not the only thing the path decides. With
+     * no explicit {@code authSource}, the driver authenticates against the database named in the URI
      * -- so rewriting the path alone moves the authentication database too, and a deployment whose
      * credentials live in the control-plane database would derive a URI that authenticates against one
      * where that user does not exist. The store would be registered and permanently unusable, and the
@@ -109,6 +112,10 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * falls back to {@code admin} only because no database was named -- which stops being true of the
      * derived URI the moment this method names one, so an inherited default would land on the view store
      * exactly as a rewritten path does.
+     *
+     * <p>An SRV URI may instead authenticate against a database supplied by DNS TXT records. For a
+     * credential-bearing SRV URI without an explicit source, the driver resolves the effective source
+     * before it is pinned; the original path alone does not determine where those credentials live.
      */
     static String viewsUri(String serverStoreUri) {
         return viewsUri(serverStoreUri, ViewTargetResolver.STATE_STORE_SOURCE_ID);
@@ -125,7 +132,8 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
         String authority = path < 0 ? beforeQuery : beforeQuery.substring(0, path);
         String originalDatabase = path < 0 ? "" : beforeQuery.substring(path + 1);
         return authority + "/" + database
-                + withAuthSource(fromQuery, originalDatabase, carriesCredentials(authority, authorityStart));
+                + withAuthSource(serverStoreUri, fromQuery, originalDatabase,
+                        carriesCredentials(authority, authorityStart));
     }
 
     /** Whether the URI carries credentials at all -- userinfo ahead of the host list. */
@@ -141,13 +149,17 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * but only for a URI that actually carries credentials, since the option means nothing otherwise and
      * would have to be explained to whoever reads the seeded resource.
      */
-    private static String withAuthSource(String query, String originalDatabase, boolean carriesCredentials) {
+    private static String withAuthSource(
+            String serverStoreUri, String query, String originalDatabase, boolean carriesCredentials) {
         if (namesAuthSource(query)) {
             return query;
         }
         String source = originalDatabase.isEmpty()
                 ? (carriesCredentials ? SPEC_DEFAULT_AUTH_SOURCE : "")
                 : originalDatabase;
+        if (carriesCredentials && serverStoreUri.startsWith("mongodb+srv://")) {
+            source = URLEncoder.encode(MongoConnection.authenticationSource(serverStoreUri), StandardCharsets.UTF_8);
+        }
         if (source.isEmpty()) {
             return query;
         }
