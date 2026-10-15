@@ -69,7 +69,7 @@ public final class CloudAuthenticationService {
     public Optional<CloudClusterContextView> clusterContextView(String cookie) {
         return clusterContext(cookie).map(context -> new CloudClusterContextView(
                 context.organizationId(), context.clusterId(), context.organizationName(),
-                context.clusterName(), context.region()));
+                context.clusterName(), context.region(), context.ec2PublicIp(), context.egressAddressStatus()));
     }
 
     public boolean logout(String cookie) {
