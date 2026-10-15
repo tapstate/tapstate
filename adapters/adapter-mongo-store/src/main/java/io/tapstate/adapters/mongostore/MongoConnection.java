@@ -203,6 +203,12 @@ public final class MongoConnection implements AutoCloseable {
         }
     }
 
+    /** The driver's effective authentication database, including SRV/TXT, or null without credentials. */
+    public static String authenticationSource(String uri) {
+        var credential = parseConnectionString(uri, ConnectionString::new).getCredential();
+        return credential == null ? null : credential.getSource();
+    }
+
     private static String safeHost(String uri) {
         try {
             String host = URI.create(uri).getHost();
