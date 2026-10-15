@@ -4,7 +4,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export SHARD_GATE="$here/ci-shard.sh"
 python3 - <<'PY'
-import hashlib, json, os, pathlib, shutil, subprocess, tempfile, zipfile
+import hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile, zipfile
+sys.dont_write_bytecode = True
 from collections import Counter
 with tempfile.TemporaryDirectory() as tmp:
     root = pathlib.Path(tmp)
