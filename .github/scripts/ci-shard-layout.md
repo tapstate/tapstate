@@ -70,13 +70,16 @@ reject.
 
 The plan retains layout and duration-input hashes. Timing provenance and timer
 aggregation limits accompany the duration map; nested suite timers can overlap.
-The current provenance records all 1,283 source units from one original CI
-run. All four selected Maven verify commands succeeded, and the source-unit
-sets and current test-source bytes were checked. The residual worker failed
-later during identity export, so its XML comes from the original diagnostic
-artifact; the other workers retain their validated packs. The whole workflow
-failed. These weights do not turn that failure into acceptance or a successful
-performance sample.
+The current provenance records all 1,285 source units from one complete,
+successful manual CI run. All nine original selected verify commands and
+validated worker packs retain their original source/run bindings. The 1,290
+XML reports include five additional nested-container suites; their times are
+summed under the owning source outer class. The source-unit set and test-source
+bytes match the recorded run. Of these source classes, 98 have no testcase rows
+(including 97 E2E classes), and ten have zero aggregate suite time. These reports
+remain visible; report presence or zero time cannot establish executed cases.
+The weights are estimates from that run, not an observed four-versus-six
+comparison, input equivalence, or PR performance acceptance.
 
 Source discovery and the exact multiset assignment remain authoritative for
 which tests run. Estimated balancing, historical main timings and a valid
