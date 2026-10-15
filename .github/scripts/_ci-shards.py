@@ -178,21 +178,42 @@ def layout_config(args, root, name=None):
     else:
         require(name == LAYOUT_PATH, 'layout file missing')
         value = {'schema': 1, 'e2e_shards': 2, 'rest_modules': {}, 'new_test_seconds': 1.0}
-    require(isinstance(value, dict) and set(value) == {'schema', 'e2e_shards', 'rest_modules', 'new_test_seconds'}
+    require(isinstance(value, dict) and set(value) in ({'schema', 'e2e_shards', 'rest_modules', 'new_test_seconds'},
+            {'schema', 'e2e_shards', 'rest_modules', 'new_test_seconds', 'app_shards'})
             and type(value['schema']) is int and value['schema'] == 1
             and type(value['e2e_shards']) is int and value['e2e_shards'] in (2, 4, 6)
             and isinstance(value['rest_modules'], dict), 'invalid shard layout')
     require(seconds(value['new_test_seconds']) > 0, 'new-test fallback must be positive')
+    require('app_shards' not in value or (type(value['app_shards']) is int and value['app_shards'] in (2, 4)),
+            'invalid App class shard count')
     assigned = set()
     for worker, modules in value['rest_modules'].items():
         require(isinstance(worker, str) and re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', worker)
-                and worker not in ('build', 'engine', 'rest') and not worker.startswith('e2e-'), 'reserved or invalid module shard name')
+                and worker not in ('build', 'engine', 'rest') and not worker.startswith('e2e-')
+                and not ('app_shards' in value and worker.startswith('app-')), 'reserved or invalid module shard name')
         require(isinstance(modules, list) and modules and all(isinstance(module, str) for module in modules), 'invalid module shard list')
         for module in modules:
             safe_path(module)
+            require(module != 'app' or 'app_shards' not in value, 'App classes already have dedicated shards')
             require(module not in assigned, 'module assigned more than once')
             assigned.add(module)
     return value, source
+
+
+
+def balance_classes(tests, count, hints, fallback):
+    """Keep every source class, including all of its unit/IT entries, on one worker."""
+    families = {}
+    for test in tests:
+        families.setdefault((test['module'], test['class']), []).append(test)
+    require(len(families) >= count, 'too few App source classes for nonempty shards')
+    weights = {name: sum(seconds(hints.get(test['module'] + '/' + hint_key(test),
+                hints.get(hint_key(test), fallback))) for test in family) for name, family in families.items()}
+    bins, totals = [[] for _ in range(count)], [0.0] * count
+    for name in sorted(families, key=lambda name: (-weights[name], name)):
+        slot = min(range(count), key=lambda index: (totals[index], len(bins[index]), index))
+        bins[slot].extend(families[name]); totals[slot] += weights[name]
+    return [(sorted(tests, key=key), total) for tests, total in zip(bins, totals)]
 
 
 def default_groups(tests, hints, layout):
@@ -202,6 +223,11 @@ def default_groups(tests, hints, layout):
     fallback = layout['new_test_seconds']
     groups = [(f'e2e-{i+1}', ts, total) for i, (ts, total) in enumerate(balance(e2e, layout['e2e_shards'], hints, fallback))]
     groups.append(('engine', *balance(engine, 1, hints, fallback)[0]))
+    if 'app_shards' in layout:
+        app = [test for test in rest if test['module'] == 'app']
+        rest = [test for test in rest if test['module'] != 'app']
+        groups += [(f'app-{i+1}', tests, total) for i, (tests, total) in
+                   enumerate(balance_classes(app, layout['app_shards'], hints, fallback))]
     known = {t['module'] for t in rest}
     moved = set()
     for name, modules in sorted(layout['rest_modules'].items()):
@@ -210,7 +236,7 @@ def default_groups(tests, hints, layout):
         groups.append((name, *balance(chosen, 1, hints, fallback)[0]))
         moved.update(modules)
     rest = [t for t in rest if t['module'] not in moved]
-    require(rest or not layout['rest_modules'], 'module grouping must retain a nonempty rest shard')
+    require(rest or not (layout['rest_modules'] or 'app_shards' in layout), 'module grouping must retain a nonempty rest shard')
     groups.append(('rest', *balance(rest, 1, hints, fallback)[0]))
     return groups
 
@@ -221,11 +247,20 @@ def matrix(plan):
     require([row[0] for row in expected] == [shard['id'] for shard in plan['shards']], 'matrix shard IDs differ from layout')
     for (name, tests, unused), shard in zip(expected, plan['shards']):
         # E2E balancing may move complete source classes between E2E bins.
-        if not name.startswith('e2e-'):
+        if name.startswith('app-') and 'app_shards' in plan['layout']:
+            require(all(test['module'] == 'app' for test in shard['tests']), 'matrix App shard contains a foreign test')
+        elif not name.startswith('e2e-'):
             require(Counter(key(t) for t in tests) == Counter(key(t) for t in shard['tests']), 'matrix module assignment differs from layout')
         else:
             require(all(t['module'] == 'e2e' and t['kind'] == 'it' for t in shard['tests']), 'matrix E2E shard contains a foreign test')
         require(shard['tests'], 'matrix contains an empty shard')
+    if 'app_shards' in plan['layout']:
+        owners = {}
+        for shard in plan['shards']:
+            for test in shard['tests']:
+                if test['module'] != 'app': continue
+                family = (test['module'], test['class'])
+                require(owners.setdefault(family, shard['id']) == shard['id'], 'App source class is split across shards')
     return {'include': [{'shard': shard['id'], 'prepare_cloud_inputs': any(
         not (test['module'] == 'e2e' and test['kind'] == 'it') and test['module'] != 'runtime/engine'
         for test in shard['tests'])} for shard in plan['shards']]}
@@ -288,6 +323,7 @@ def load_plan(args, root):
         layout, source = layout_config(args, root, plan['layout_source']['path'])
         require(json.dumps([layout, source], sort_keys=True) == json.dumps([plan['layout'], plan['layout_source']], sort_keys=True),
                 'layout changed after planning')
+        matrix(plan)
     return plan
 
 

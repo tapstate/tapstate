@@ -3,8 +3,8 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export SHARD_GATE="$here/ci-shard.sh" AGGREGATE_GATE="$here/ci-aggregate.sh"
-for layout_count in 2 4 6; do
-CI_LAYOUT_E2E_COUNT="$layout_count" python3 - <<'PY'
+for layout_case in 2:0 4:0 6:0 4:2 6:4; do
+CI_LAYOUT_E2E_COUNT="${layout_case%%:*}" CI_LAYOUT_APP_COUNT="${layout_case##*:}" python3 - <<'PY'
 import hashlib, json, os, pathlib, shutil, subprocess, tempfile
 from collections import Counter
 import xml.etree.ElementTree as ET
@@ -16,11 +16,15 @@ with tempfile.TemporaryDirectory() as tmp:
     for module in ['e2e','runtime/engine','core','app']:
         put(module+'/pom.xml','<project><build><plugins><plugin><artifactId>maven-failsafe-plugin</artifactId><executions><execution><goals><goal>integration-test</goal></goals></execution></executions></plugin></plugins></build></project>')
     seeded = [('e2e', name, 'it') for name in ['OneIT','TwoIT','ThreeIT','FourIT','FiveIT','SixIT']] + [
-        ('e2e','UnitTest','unit'),('runtime/engine','EngineTest','unit'),('core','DisabledTest','unit'),('app','AppTest','unit')]
+        ('e2e','UnitTest','unit'),('runtime/engine','EngineTest','unit'),('core','DisabledTest','unit'),('app','AppTest','unit'),('app','AppOtherTest','unit'),
+        ('app','AppOuterIT','it'),('app','AppSmallIT','it')]
     for module,name,kind in seeded:
         put(module+'/src/test/java/sample/'+name+'.java','package sample; class '+name+' {}')
     workers=int(os.environ['CI_LAYOUT_E2E_COUNT'])
-    put('.github/ci-shard-layout.json',json.dumps({'schema':1,'e2e_shards':workers,'rest_modules':{'app':['app']} if workers==4 else {},'new_test_seconds':30}))
+    bundles=int(os.environ['CI_LAYOUT_APP_COUNT'])
+    layout={'schema':1,'e2e_shards':workers,'rest_modules':{'app':['app']} if workers==4 and not bundles else {},'new_test_seconds':30}
+    if bundles:layout['app_shards']=bundles
+    put('.github/ci-shard-layout.json',json.dumps(layout))
     subprocess.run([os.environ['SHARD_GATE'],'plan','--root',tmp,'--output',str(root/'plan.json')],check=True)
     plan=json.loads((root/'plan.json').read_text())
     assert Counter((t['module'],t['kind'],t['class']) for t in plan['expected'])==Counter((m,k,'sample.'+n) for m,n,k in seeded)
@@ -34,6 +38,11 @@ with tempfile.TemporaryDirectory() as tmp:
             shutil.rmtree(root/module/'target',ignore_errors=True)
             put(module+'/target/classes/sample/Production.class','bytecode')
             put(module+'/target/test-classes/sample/Helper.class','helper-bytecode')
+            if module=='app':
+                # Independent prepares compile the full module on every App worker.
+                for m,n,k in seeded:
+                    if m=='app':put('app/target/test-classes/sample/'+n+'.class','test-bytecode')
+                put('app/target/test-classes/sample/AppOuterIT$Nested.class','nested-test-bytecode')
         # The real helper owns reset and records a successful selected verify.
         subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),
                         '--shard',shard['id'],'--repo-local',str(root/'m2')],check=True,capture_output=True)
@@ -46,7 +55,7 @@ with tempfile.TemporaryDirectory() as tmp:
             put(test['module']+'/target/test-classes/'+name.replace('.', '/')+'.class','test-bytecode')
             report=f'<testsuite name="{name}" tests="{count}" failures="0" errors="0" skipped="0"><testcase classname="{name}" name="ok"/></testsuite>' if count=='1' else f'<testsuite name="{name}" tests="0" failures="0" errors="0" skipped="0"/>'
             put(test['module']+'/target/'+phase+'-reports/TEST-'+name+'.xml',report)
-            if name.endswith(('EngineTest', 'OneIT', 'TwoIT')):
+            if name.endswith(('EngineTest', 'OneIT', 'TwoIT', 'AppOuterIT')):
                 put(test['module']+'/target/'+phase+'-reports/TEST-'+name+'$Nested.xml',f'<testsuite name="{name}$Nested" tests="1" failures="0" errors="0"><testcase classname="{name}$Nested" name="nested"/></testsuite>')
         for path in shard['required_exec']: put(path,'execution-data')
         subprocess.run([os.environ['AGGREGATE_GATE'],'pack','--root',tmp,'--plan',str(root/'plan.json'),'--shard',shard['id'],'--output',str(artifacts/shard['id'])],check=True)
@@ -70,7 +79,7 @@ with tempfile.TemporaryDirectory() as tmp:
         return Counter((ET.parse(p).getroot().get('name'),c.get('classname'),c.get('name'))
                        for p in paths for c in ET.parse(p).getroot().findall('testcase'))
     assert case_counts(artifacts.rglob('TEST-*.xml'))==case_counts((root/'restored').rglob('TEST-*.xml'))
-    assert len(list((root/'restored').rglob('TEST-*.xml')))==len(seeded)+3
+    assert len(list((root/'restored').rglob('TEST-*.xml')))==len(seeded)+4
     assert len(list((root/'restored/target/ci-shards').rglob('run.json')))==len(plan['shards'])
     for shard_id in e2e_ids:
         raw=root/'restored/target/ci-shards'/shard_id/'e2e/target'

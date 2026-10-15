@@ -49,6 +49,8 @@ with tempfile.TemporaryDirectory(prefix='ci-layout-controls-') as temporary:
     seed = [('e2e', 'Example' + str(i) + 'IT', 'it') for i in range(1, 7)] + [
         ('e2e', 'SelectorTest', 'unit'), ('runtime/engine', 'EngineTest', 'unit'),
         ('app', 'AppTest', 'unit'), ('app', 'AppFixtureIT', 'it'),
+        ('app', 'TestBothIT', 'unit'), ('app', 'TestBothIT', 'it'),
+        ('app', 'AppSlowIT', 'it'), ('app', 'AppTinyTest', 'unit'),
         ('core', 'CoreTest', 'unit'), ('arch-tests', 'RulesTest', 'unit')]
     for module, name, unused in seed:
         put(module + '/src/test/java/sample/' + name + '.java', 'package sample; class ' + name + ' {}')
@@ -125,6 +127,48 @@ with tempfile.TemporaryDirectory(prefix='ci-layout-controls-') as temporary:
     foreign = copy.deepcopy(grouped)
     foreign['shards'].append({'id': 'extra', 'tests': [], 'estimated_seconds': 0, 'required_exec': []})
     check(matrix(foreign).returncode != 0, 'unplanned empty worker cannot expand the matrix')
+    for bundles in (2,4):
+        app_layout={'schema':1,'e2e_shards':4,'rest_modules':{},'new_test_seconds':30,'app_shards':bundles}
+        bundled=plan(app_layout); result=matrix()
+        check(result.returncode==0,'whole App class matrix succeeds: '+result.stderr)
+        check([row['shard'] for row in json.loads(result.stdout)['include']]==
+              ['e2e-1','e2e-2','e2e-3','e2e-4','engine']+['app-'+str(i+1) for i in range(bundles)]+['rest'],
+              'matrix IDs derive only from source layout')
+        owners={}
+        for shard in bundled['shards']:
+            for test in shard['tests']:
+                if test['module']=='app':owners.setdefault(test['class'],set()).add(shard['id'])
+            if shard['id'].startswith('app-'):
+                check(shard['tests'] and all(t['module']=='app' for t in shard['tests']),'App workers contain complete App source units only')
+                check(shard['required_exec']==s.execs(shard['tests']),'each App worker retains its own required coverage files')
+            check(shard['estimated_seconds']==sum(hints.get(t['module']+'/'+s.hint_key(t),hints.get(s.hint_key(t),30)) for t in shard['tests']),
+                  'class-group estimates preserve the independent source duration weights')
+        check(all(len(v)==1 and next(iter(v)).startswith('app-') for v in owners.values()),'unit and IT selections of one top-level class stay together')
+        check(sum(row['prepare_cloud_inputs'] for row in json.loads(result.stdout)['include'])==bundles+1,
+              'every independent App/rest worker retains original Cloud preparation')
+        foreign=copy.deepcopy(bundled)
+        owner=next(sh for sh in foreign['shards'] if any(t['class']=='sample.TestBothIT' for t in sh['tests']))
+        target=next(sh for sh in foreign['shards'] if sh['id'].startswith('app-') and sh is not owner)
+        unit=next(t for t in owner['tests'] if t['class']=='sample.TestBothIT' and t['kind']=='unit')
+        owner['tests'].remove(unit);target['tests'].append(unit)
+        owner['required_exec'],target['required_exec']=s.execs(owner['tests']),s.execs(target['tests'])
+        result=matrix(foreign)
+        check(result.returncode!=0 and 'source class is split' in result.stderr,'exact-cohort split across App workers rejects')
+        foreign=copy.deepcopy(bundled);foreign['shards'][5]['id']='app-extra'
+        check(matrix(foreign).returncode!=0,'unconfigured App worker ID rejects')
+        for label,change in [('bad App count',{'app_shards':3}),('boolean App count',{'app_shards':True}),
+                             ('explicit singleton App count',{'app_shards':1}),
+                             ('App module double assignment',{'rest_modules':{'isolated':['app']}}),
+                             ('App namespace collision',{'rest_modules':{'app-1':['core']}})]:
+            put(s.LAYOUT_PATH,dict(app_layout,**change))
+            rejected(lambda:s.default_groups(s.discover(root),hints,s.layout_config(type('Args',(),{'layout':s.LAYOUT_PATH})(),root)[0]),label)
+        rejected(lambda:s.balance_classes([t for t in s.discover(root) if t['module']=='app' and t['class']=='sample.TestBothIT'],2,hints,30),
+                 'two unit/IT entries of one source class cannot fill two App shards')
+    zero_tests=[{'module':'app','kind':'it','class':'sample.Zero'+str(i)+'IT'} for i in range(4)]
+    zero_groups=s.balance_classes(zero_tests,4,{test['class']:0 for test in zero_tests},30)
+    check(all(tests for tests,total in zero_groups) and sum(len(tests) for tests,total in zero_groups)==4,
+          'legitimate zero-time hints still produce all nonempty App workers')
+    put(s.LAYOUT_PATH,layout)
     for label, change in [
         ('unsupported count', {'e2e_shards': 3}), ('boolean count', {'e2e_shards': True}),
         ('zero fallback', {'new_test_seconds': 0}), ('nonfinite fallback', {'new_test_seconds': float('inf')}),
