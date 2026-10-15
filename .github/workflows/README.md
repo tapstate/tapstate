@@ -21,6 +21,8 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Cloud release version registration
+
 The release workflow registers the current Cloud runtime version only after the
 Cloud image publisher verifies the public registry digest. Configure the two
 variables in the `cloud-ghcr-release` environment and the production token in
@@ -48,6 +50,56 @@ or treats a 409 as success without comparing the existing entry.
 The helper is loaded from the workflow's commit in a separate sparse checkout,
 so selecting an earlier product commit does not lose the notification tooling.
 The approved image and its source revision still come from the selected release.
+
+## Cloud cluster dev images
+
+`cloud-cluster-dev.yml` is manual-only and must be dispatched on `main`. Select
+`minor`, `patch`, or `major`; it uses the release version calculator against the
+current main history. Dev runs create no Git tags or releases, so new main commits
+can rebuild the same candidate version until that version is formally released.
+
+| Lane | Image | Version tag policy |
+| --- | --- | --- |
+| Cloud dev | `ghcr.io/tapstate/tapstate-cloud:<version>-dev` | Replaced by another dev build of that version |
+| Cloud release | `ghcr.io/tapstate/tapstate-cloud:<version>` | Independently rebuilt by release; different bytes cannot overwrite an existing tag |
+
+Configure the `cloud-ghcr-dev` environment for the `main` branch with the dev
+`VITE_CLOUD_CONSOLE_URL`. The existing repository `RELEASE_SATELLITE_TOKEN` reads
+Web main. Publishing uses the workflow token with package write permission, or
+the environment's `CLOUD_GHCR_USERNAME` / `CLOUD_GHCR_TOKEN` when explicitly set.
+Reuse the existing Public `tapstate-cloud` package and its workflow write access;
+the publisher refuses missing or non-public packages. Package access follows the
+[GitHub package access and visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+
+Version registration uses these additional `cloud-ghcr-dev` environment settings:
+
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `CLOUD_RELEASE_API_URL` | Variable | `https://dev.cloud.tapstate.com/v1/api/cluster-versions` |
+| `CLOUD_RELEASE_CODE` | Variable | `BETA` (or `ALPHA` / `RC`) |
+| `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` | Repository or environment Secret | The same static token configured on the dev Cloud control plane |
+
+The workflow validates this configuration before building the image. After a
+successful public push and digest readback, it registers `<version>-dev` with the
+main and Web revisions, image tag, digest reference, and workflow run URL. The
+caller rejects production endpoints and checks the returned record against the
+published image. It never follows redirects, logs credential-bearing response
+bodies, or retries a write whose delivery is uncertain. The API returns HTTP 409
+with `cluster.version-duplicate` for an existing version; the dev caller reports
+that it kept the first catalog record and completes without updating it. Other
+conflicts and authentication failures still fail the workflow. Rebuilds can
+replace the image tag while the catalog retains the first registration's Git
+and image metadata; use the current run summary for the rebuilt image's digest.
+The workflow maps `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` into the caller's
+`CLOUD_CLUSTER_VERSION_RELEASE_TOKEN` environment variable. A GitHub Secret alone
+does not configure the control plane's token.
+
+The lane builds only the Cloud Web/Boot JAR and dual-platform image, verifies its
+locked inputs, and uploads the checked OCI digest. It deploys no environment.
+Use the digest reference in the run summary for dev validation; a numeric dev
+tag can point to different bytes after a rebuild. Release rebuilds independently
+with its own environment configuration and approval. This lane adds no automatic
+PR/main test suite; its runner cost is incurred only on explicit dispatch.
 
 Choose a location for new work before adding a workflow:
 
