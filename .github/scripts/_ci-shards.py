@@ -392,6 +392,9 @@ def validate_provenance(value, plan, shard):
         require(isinstance(hashes, dict) and set(hashes) == set(OBSERVER_FILES)
                 and all(isinstance(h, str) and re.fullmatch(r'[0-9a-f]{64}', h) for h in hashes.values()),
                 'invalid case observer class/service binding')
+        validate_fixture_extensions(observer.get('fixture_extensions', {}))
+        require(set(observer.get('fixture_extensions', {})) <= {test['module'] for test in shard['tests']},
+                'fixture extensions belong to another shard')
         scopes = observer.get('checked_scopes')
         require(isinstance(scopes, list) and all(isinstance(scope, dict) for scope in scopes),
                 'invalid case observer checked scopes')
@@ -444,6 +447,7 @@ def ledger_paths(root, shard):
 
 
 OBSERVER = 'io.tapstate.testsupport.CiCaseEvidence'
+FIXTURE_PROVIDERS = ('io.tapstate.e2e.ClusterFixtureTimingExtension', 'io.tapstate.e2e.ClusterHealthProbeExtension')
 EXTENSION_SERVICE = 'META-INF/services/org.junit.jupiter.api.extension.Extension'
 OBSERVER_PREFIX = 'test-support/target/test-classes/'
 OBSERVER_FILES = [OBSERVER_PREFIX + 'io/tapstate/testsupport/CiCaseEvidence.class',
@@ -543,6 +547,74 @@ def nonarchive_classpath_pom(scope, relative, path):
             'nonarchive classpath POM coordinates differ from Maven repository path')
 
 
+def validate_fixture_extensions(facts):
+    require(isinstance(facts, dict) and set(facts) <= {'e2e'}, 'invalid fixture extension module set')
+    for module, fact in facts.items():
+        require(isinstance(fact, dict) and set(fact) == {'providers', 'files'}
+                and fact['providers'] == sorted(FIXTURE_PROVIDERS) and isinstance(fact['files'], dict),
+                'invalid fixture extension provider binding')
+        required = {'e2e/src/test/resources/' + EXTENSION_SERVICE, 'e2e/target/test-classes/' + EXTENSION_SERVICE}
+        for provider in FIXTURE_PROVIDERS:
+            relative = provider.replace('.', '/')
+            required.update({'e2e/src/test/java/' + relative + '.java', 'e2e/target/test-classes/' + relative + '.class'})
+        require(required <= set(fact['files']) and all(name in required or any(
+                re.fullmatch(re.escape('e2e/target/test-classes/' + provider.replace('.', '/'))
+                    + r'\$[A-Za-z0-9_$]+\.class', name) for provider in FIXTURE_PROVIDERS) for name in fact['files'])
+                and all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) for value in fact['files'].values()),
+                'invalid fixture extension source/class/service files')
+
+
+def fixture_extensions(root, module, inputs):
+    if module != 'e2e':
+        return None
+    source = module + '/src/test/resources/' + EXTENSION_SERVICE
+    source_path = owned_path(root, source, 'fixture extension')
+    copied = module + '/target/test-classes/' + EXTENSION_SERVICE
+    if not source_path.exists():
+        require(source not in inputs.get('source_files', {}) and copied not in inputs.get('test_resource_files', {}),
+                'captured fixture extension registration is missing')
+        return None
+    require(source_path.is_file() and extension_providers(source_path.read_bytes()) == set(FIXTURE_PROVIDERS),
+            'fixture extension source service differs')
+    copied_path = owned_path(root, copied, 'fixture extension')
+    require(copied_path.is_file() and copied_path.read_bytes() == source_path.read_bytes(),
+            'fixture extension prepared service differs')
+    require(inputs.get('source_files', {}).get(source) == inputs.get('test_resource_files', {}).get(copied),
+            'fixture extension prepared service differs from captured source')
+    files = {}
+
+    def bound(name, field):
+        path = owned_path(root, name, 'fixture extension')
+        require(path.is_file(), 'fixture extension differs from captured ' + field)
+        actual = file_digest(path)
+        require(inputs.get(field, {}).get(name) == actual, 'fixture extension differs from captured ' + field)
+        files[name] = actual
+
+    bound(source, 'source_files'); bound(copied, 'test_resource_files')
+    production_service = owned_path(root, module + '/target/classes/' + EXTENSION_SERVICE, 'fixture extension')
+    require(not production_service.exists() or (production_service.is_file()
+            and not extension_providers(production_service.read_bytes()).intersection(FIXTURE_PROVIDERS)),
+            'fixture extension service shadowed in production output')
+    for provider in FIXTURE_PROVIDERS:
+        relative = provider.replace('.', '/')
+        bound(module + '/src/test/java/' + relative + '.java', 'source_files')
+        compiled = module + '/target/test-classes/' + relative + '.class'
+        directory = owned_path(root, str(Path(compiled).parent), 'fixture extension')
+        current = {compiled} | {path.relative_to(root).as_posix() for path in directory.glob(Path(compiled).stem + '$*.class')}
+        prefix = compiled.removesuffix('.class')
+        captured = {name for name in inputs.get('test_files', {}) if name == compiled
+                    or (name.startswith(prefix + '$') and name.endswith('.class'))}
+        require(current == captured, 'fixture extension class family differs from captured inputs')
+        for name in sorted(current):
+            bound(name, 'test_files')
+        production = owned_path(root, module + '/target/classes/' + relative + '.class', 'fixture extension')
+        require(not production.exists() and not list(production.parent.glob(production.stem + '$*.class')),
+                'fixture extension class shadowed in production output')
+    fact = {'providers': sorted(FIXTURE_PROVIDERS), 'files': files}
+    validate_fixture_extensions({module: fact})
+    return fact
+
+
 def case_observer(args, root, plan, modules):
     if not args.case_evidence:
         require(args.build_inputs is None, '--build-inputs requires --case-evidence')
@@ -573,9 +645,12 @@ def case_observer(args, root, plan, modules):
     require(isinstance(classpaths, dict) and set(modules) <= set(classpaths),
             'case observer requires resolved test classpaths for every selected module')
     repository = Path(args.repo_local).resolve()
-    inspected, scopes = {}, []
+    inspected, scopes, fixture_facts = {}, [], {}
     shard = selected(plan, args.shard)
     for module in modules:
+        fixture = fixture_extensions(root, module, inputs)
+        if fixture is not None: fixture_facts[module] = fixture
+        expected_providers = {OBSERVER} | set(fixture['providers'] if fixture else [])
         providers = {OBSERVER}
         for directory in ['classes', 'test-classes']:
             relative = (Path(module) / 'target' / directory).as_posix()
@@ -593,7 +668,7 @@ def case_observer(args, root, plan, modules):
                     require(not candidate.exists() or file_digest(candidate) == observer_hashes[
                                 OBSERVER_PREFIX + 'io/tapstate/testsupport/' + observer_name],
                             'case observer class shadowed in prepared output')
-        require(providers == {OBSERVER}, 'unexpected extension provider in prepared module classes: ' + module)
+        require(providers == expected_providers, 'unexpected extension provider in prepared module classes: ' + module)
         kinds = sorted({test['kind'] for test in shard['tests'] if test['module'] == module})
         exclusions = {kind: classpath_exclusions(root, module, kind, inputs) for kind in kinds}
         entries = classpaths[module]
@@ -612,8 +687,8 @@ def case_observer(args, root, plan, modules):
             coordinate = classpath_coordinate(root, scope, relative, inputs) if any(exclusions.values()) else None
             active = [kind for kind in kinds if coordinate not in exclusions[kind]]
             if path not in inspected:
-                inspected[path] = [file_digest(path), path.stat().st_size, None]
-            actual_hash, actual_size, jar_providers = inspected[path]
+                inspected[path] = [file_digest(path), path.stat().st_size, None, set()]
+            actual_hash, actual_size, jar_providers, fixture_shadows = inspected[path]
             require(actual_hash == entry['sha256'] and actual_size == entry['size'],
                     'resolved test classpath bytes changed after input capture')
             if active and jar_providers is None and path.suffix == '.pom':
@@ -628,6 +703,10 @@ def case_observer(args, root, plan, modules):
                     if services:
                         require(services[0].file_size <= 65536, 'extension service registry exceeds audit bound')
                         jar_providers = extension_providers(archive.read(services[0]))
+                    fixture_shadows = {name for name in archive.namelist() if any(
+                        name == provider.replace('.', '/') + '.class' or (name.startswith(provider.replace('.', '/') + '$')
+                        and name.endswith('.class')) for provider in FIXTURE_PROVIDERS)}
+                    inspected[path][3] = fixture_shadows
                     for observer_name in ['CiCaseEvidence.class', 'CiCaseEvidence$Canonical.class']:
                         member = 'io/tapstate/testsupport/' + observer_name
                         if member in archive.namelist():
@@ -636,10 +715,13 @@ def case_observer(args, root, plan, modules):
                             require(hashlib.sha256(archive.read(member)).hexdigest() == observer_hashes[OBSERVER_PREFIX + member],
                                     'case observer class shadowed in active dependency')
                 inspected[path][2] = jar_providers
+            if active:
+                require(jar_providers <= {OBSERVER}, 'unexpected extension provider in actual selected test classpath: ' + module + '/' + ','.join(active))
+                require(not fixture or not fixture_shadows, 'fixture extension class shadowed in active dependency: ' + module)
             for kind in active:
                 active_providers[kind].update(jar_providers)
         for kind in kinds:
-            require(active_providers[kind] == {OBSERVER},
+            require(active_providers[kind] == expected_providers,
                     'unexpected extension provider in actual selected test classpath: ' + module + '/' + kind)
             scopes.append(dict(module=module, kind=kind, dependency_excludes=sorted(exclusions[kind])))
     if args.class_gate_dir:
@@ -650,6 +732,7 @@ def case_observer(args, root, plan, modules):
         directory = owned_path(manifest_path.resolve().parent, 'class-gates', 'observer ledger')
         require(not directory.exists(), 'class gate ledger directory must be fresh')
     return dict(enabled=True, providers=[OBSERVER], checked_scopes=scopes,
+                **({'fixture_extensions': fixture_facts} if fixture_facts else {}),
                 class_gate_ledger_enabled=bool(args.class_gate_dir),
                 build_inputs_sha256=file_digest(manifest_path), observer_files=observer_hashes,
                 audit_elapsed_ns=time.monotonic_ns()-started)
@@ -787,9 +870,12 @@ def pack(args, root, plan):
     provenance = read(marker)
     validate_provenance(provenance, plan, shard)
     if provenance['case_observer']['enabled']:
+        bindings = dict(provenance['case_observer']['observer_files'])
+        for fact in provenance['case_observer'].get('fixture_extensions', {}).values():
+            bindings.update(fact['files'])
         require(all(owned_path(root, name, 'observer').is_file()
                     and file_digest(owned_path(root, name, 'observer')) == digest
-                    for name, digest in provenance['case_observer']['observer_files'].items()),
+                    for name, digest in bindings.items()),
                 'case observer classes/service changed after selected verify')
     witness_ledgers = ledger_paths(root, shard)
     report_paths, statistics, report_classes = reports(root, shard)

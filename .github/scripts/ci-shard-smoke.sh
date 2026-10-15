@@ -104,7 +104,9 @@ with tempfile.TemporaryDirectory() as tmp:
         value=dict(schema=1,phase='pre-test-after-install',source_sha=added['source_sha'],
                    run_id=os.environ.get('GITHUB_RUN_ID','local'),run_attempt=os.environ.get('GITHUB_RUN_ATTEMPT','1'),
                    source_files={path.relative_to(root).as_posix():hashlib.sha256(path.read_bytes()).hexdigest()
-                                 for path in root.rglob('pom.xml')},
+                                 for path in root.rglob('*') if path.is_file() and (path.name=='pom.xml' or '/src/' in path.as_posix())},
+                   test_resource_files={path.relative_to(root).as_posix():hashlib.sha256(path.read_bytes()).hexdigest()
+                                 for path in root.rglob('*') if path.is_file() and '/target/test-classes/' in path.as_posix() and path.suffix!='.class'},
                    test_files={path.relative_to(root).as_posix():hashlib.sha256(path.read_bytes()).hexdigest()
                                for path in root.rglob('*.class') if '/target/test-classes/' in path.as_posix()},
                    resolved_test_classpaths={module:[dict(identity='repository/'+path.relative_to(root/'m2').as_posix(),
@@ -207,6 +209,98 @@ with tempfile.TemporaryDirectory() as tmp:
     jar(ordinary,shadow=True); build_inputs()
     reject_observer(opted,'shadowed in active dependency')
     jar(ordinary)
+    # These two module-owned callbacks observe fixtures; they are not third-party extensions.
+    fixture_providers=['io.tapstate.e2e.ClusterFixtureTimingExtension','io.tapstate.e2e.ClusterHealthProbeExtension']
+    fixture_service='e2e/src/test/resources/'+service_name
+    copied_service='e2e/target/test-classes/'+service_name
+    fixture_bytes='\n'.join(fixture_providers)+'\n'
+    put(fixture_service,fixture_bytes);put(copied_service,fixture_bytes)
+    fixture_sources=[];fixture_classes=[]
+    for provider in fixture_providers:
+        relative=provider.replace('.','/')
+        source='e2e/src/test/java/'+relative+'.java';fixture_sources.append(source)
+        put(source,'package io.tapstate.e2e; class '+provider.rsplit('.',1)[1]+' {}')
+        for suffix in ['', '$Capture']:
+            compiled='e2e/target/test-classes/'+relative+suffix+'.class';fixture_classes.append(compiled)
+            put(compiled,'owned fixture callback '+provider+suffix)
+    build_inputs()
+    fixture_result=subprocess.run(opted,env=environment,capture_output=True,text=True)
+    assert fixture_result.returncode==0, 'owned E2E fixture extensions must pass source-bound observer admission: '+fixture_result.stdout+fixture_result.stderr
+    fixture_receipt=json.loads((root/'target/ci-shards/run-rest.json').read_text())['case_observer']['fixture_extensions']['e2e']
+    assert fixture_receipt['providers']==sorted(fixture_providers) and len(fixture_receipt['files'])==8
+    extension_checks=1
+    def stale_fixture(path,reason):
+        global extension_checks
+        build_inputs(); original=(root/path).read_bytes(); (root/path).write_bytes(original+b'changed')
+        try:
+            reject_observer(opted,reason);extension_checks+=1
+        finally:
+            (root/path).write_bytes(original);build_inputs()
+    for path in fixture_sources:stale_fixture(path,'captured source_files')
+    for path in fixture_classes:stale_fixture(path,'captured test_files')
+    stale_fixture(copied_service,'prepared service differs')
+    for path in [name for name in fixture_classes if '$' in name]:
+        build_inputs();original=(root/path).read_bytes();(root/path).unlink()
+        try:
+            reject_observer(opted,'fixture extension class family differs from captured');extension_checks+=1
+        finally:(root/path).write_bytes(original);build_inputs()
+    build_inputs();source_bytes=(root/fixture_service).read_bytes();copied_bytes=(root/copied_service).read_bytes()
+    (root/fixture_service).unlink();(root/copied_service).unlink()
+    try:
+        reject_observer(opted,'captured fixture extension registration is missing');extension_checks+=1
+    finally:
+        (root/fixture_service).write_bytes(source_bytes);(root/copied_service).write_bytes(copied_bytes);build_inputs()
+    original_source_service=(root/fixture_service).read_bytes()
+    put(fixture_service,fixture_bytes+'foreign.ProjectExtension\n');put(copied_service,fixture_bytes+'foreign.ProjectExtension\n');build_inputs()
+    reject_observer(opted,'fixture extension source service differs');extension_checks+=1
+    put(fixture_service,original_source_service.decode());put(copied_service,fixture_bytes);build_inputs()
+    # Equal copied bytes still need their recorded prepared-resource binding.
+    changed=build_inputs();del changed['test_resource_files'][copied_service];put('build-inputs.json',json.dumps(changed))
+    reject_observer(opted,'prepared service differs from captured source');extension_checks+=1;build_inputs()
+    copied_production='e2e/target/classes/'+fixture_providers[0].replace('.','/')+'.class'
+    put(copied_production,'shadow callback');build_inputs()
+    reject_observer(opted,'shadowed in production output');extension_checks+=1;(root/copied_production).unlink();build_inputs()
+    jar(ordinary,fixture_bytes);build_inputs()
+    reject_observer(opted,'unexpected extension provider');extension_checks+=1
+    # The shared JAR is inspected in arch-tests before e2e; cached membership must still reject shadows.
+    for suffix in ['', '$Capture']:
+        jar(ordinary)
+        with zipfile.ZipFile(ordinary,'a') as archive:
+            archive.writestr(fixture_providers[0].replace('.','/')+suffix+'.class','shadow callback')
+        build_inputs();reject_observer(opted,'fixture extension class shadowed in active dependency');extension_checks+=1
+    jar(ordinary);build_inputs()
+    subprocess.run(opted,check=True,env=environment,capture_output=True)
+    # Real pack preflight must retain every source/service/primary/inner-class binding after verify.
+    import importlib.util
+    from types import SimpleNamespace
+    spec=importlib.util.spec_from_file_location('extension_pack_controls',str(pathlib.Path(os.environ['SHARD_GATE']).with_name('_ci-shards.py')))
+    pack_reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(pack_reader)
+    from unittest.mock import patch
+    hash_target=(root/fixture_sources[0]).resolve();original_hash_source=hash_target.read_bytes()
+    real_digest=pack_reader.file_digest;first_hash=True
+    def mutate_after_validated_hash(path):
+        global first_hash
+        result=real_digest(path)
+        if path.resolve()==hash_target and first_hash:
+            first_hash=False;hash_target.write_bytes(original_hash_source+b' changed after validated hash')
+        return result
+    try:
+        with patch.object(pack_reader,'file_digest',mutate_after_validated_hash):
+            try:fact=pack_reader.fixture_extensions(root.resolve(),'e2e',json.loads((root/'build-inputs.json').read_bytes()))
+            except ValueError:pass
+            else:assert fact['files'][fixture_sources[0]]==hashlib.sha256(original_hash_source).hexdigest(), 'provenance must store the hash validated against captured inputs'
+        extension_checks+=1
+    finally:hash_target.write_bytes(original_hash_source)
+    for path in fixture_receipt['files']:
+        original=(root/path).read_bytes();(root/path).write_bytes(original+b'post-verify mutation')
+        try:
+            pack_reader.pack(SimpleNamespace(shard='rest',output=str(root/'never-packed')),root.resolve(),json.loads((root/'plan.json').read_bytes()))
+        except ValueError as error:
+            assert 'changed after selected verify' in str(error),str(error)
+            assert not (root/'never-packed').exists();extension_checks+=1
+        else:raise AssertionError('pack accepted changed fixture extension input '+path)
+        finally:(root/path).write_bytes(original)
+    print('CI module-local fixture extension controls passed:',extension_checks)
     # The same foreign MCP provider is inactive for an explicitly excluded IT and active for unit tests.
     mcp=root/'m2/io/tapstate/mcp-server/1/mcp-server-1.jar'; mcp.parent.mkdir(parents=True)
     jar(mcp,'foreign.McpExtension\n')
