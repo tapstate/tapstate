@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -497,7 +498,7 @@ public final class CaptureRunUnit {
         }
         Optional<SrsMeta> retained = meta.read(chain.value());
         boolean legacy = retained.flatMap(record -> record.consumerOffset(spec.pipelineId()))
-                .map(CaptureRunUnit::hasRecoveryState).orElse(false);
+                .filter(offset -> !hasScopedSnapshotPath(spec, retained.orElseThrow(), offset)).isPresent();
         MiningChainId other = spec.srsEnabled()
                 ? MiningChainId.forChannel(spec.config(), spec.srsKey(), spec.pipelineId(), spec.sourceId())
                 : MiningChainId.resolve(spec.config(), spec.srsKey());
@@ -521,6 +522,31 @@ public final class CaptureRunUnit {
             throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
                     Map.of("pipeline", spec.pipelineId(), "source", spec.sourceId()), null);
         }
+    }
+
+    private boolean hasScopedSnapshotPath(CaptureRunSpec spec, SrsMeta retained, ConsumerOffset legacy) {
+        if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY || spec.pipelineSourceCount() != 1
+                || spec.config().streams().size() != 1 || !legacy.legacyReadCursorOnly()
+                || !legacy.perTableSeq().keySet().equals(Set.copyOf(spec.config().streams()))
+                || !spec.consumerId().equals(io.tapstate.spi.store.SrsConsumerId.of(spec.pipelineId(), spec.sourceId()).value())) {
+            return false;
+        }
+        boolean foreignScopedState = retained.consumerOffsets().stream().anyMatch(offset ->
+                io.tapstate.spi.store.SrsConsumerId.sourceOf(offset.pipelineId()).isPresent()
+                        && io.tapstate.spi.store.SrsConsumerId.pipelineOf(offset.pipelineId()).equals(spec.pipelineId())
+                        && !offset.pipelineId().equals(spec.consumerId()) && hasRecoveryState(offset));
+        if (foreignScopedState) { return false; }
+        ConsumerOffset own = retained.consumerOffset(spec.consumerId()).orElse(null);
+        boolean scopedSnapshot = own != null && own.cdcStartPosition() != null && !own.cdcStartPosition().isBlank()
+                && own.snapshotEpoch() > 0 && own.progressKind() != ConsumerProgressKind.DIRECT_SOURCE
+                && own.perTableSeq().keySet().equals(Set.copyOf(spec.config().streams()));
+        // Once this exact scoped load has a real seam, its physical tail may reopen without another
+        // snapshot. Before that, cursor-only state proves no native start and still owes the full load.
+        if (!scopedSnapshot && (spec.readMode() != ReadMode.SNAPSHOT_AND_CDC || retained.sourceRead() != null
+                || (own != null && hasRecoveryState(own)) || meta.captureReadState(retained.miningChainId()).isPresent())) {
+            return false;
+        }
+        return meta.legacyReadCursorOnly(retained.miningChainId(), legacy);
     }
 
     private static boolean hasRecoveryState(ConsumerOffset offset) {
@@ -597,7 +623,7 @@ public final class CaptureRunUnit {
                 SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ring)));
                 routes.put(table, new CdcPhase.TableRoute(
                         new CdcChain(gate, meta, chain, epoch, spec.schemaVer(), spec.captureFence()),
-                        () -> meta.consumerOffsets(chain), ignored -> { }));
+                        () -> meta.activeConsumerOffsets(chain), ignored -> { }));
             }
             CaptureConfig config = new CaptureConfig(spec.config().connectorId(), spec.config().settings(),
                     tables, spec.config().node()).sharing(sharedNotes(spec, chain));
@@ -648,7 +674,7 @@ public final class CaptureRunUnit {
                     return;
                 }
                 nextTrim = now + java.time.Duration.ofSeconds(1).toNanos();
-                Collection<ConsumerOffset> consumers = meta.consumerOffsets(chain);
+                Collection<ConsumerOffset> consumers = meta.activeConsumerOffsets(chain);
                 Map<String, Map<String, Long>> confirmations = new LinkedHashMap<>();
                 for (ConsumerOffset consumer : consumers) {
                     confirmations.put(consumer.pipelineId(), meta.ringDoneThrough(chain, consumer.pipelineId()));
@@ -740,7 +766,7 @@ public final class CaptureRunUnit {
             }
             // The cursors alone, not the whole record: this is read on every run of changes, and the
             // record also carries a schema history that grows per DDL and is never read here.
-            Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
+            Supplier<Collection<ConsumerOffset>> consumers = () -> meta.activeConsumerOffsets(cid);
             // What the acked position can be attributed to decides whether this chain's log can be
             // cut at all. A chain records one acked position for the whole chain, and the sequence in
             // it came from whichever table's ring held that change -- on a chain of one table there is

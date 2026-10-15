@@ -103,6 +103,68 @@ class MongoSrsMetaStoreIT {
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
+    void cursorOnlyLegacyEvidenceSurvivesTheScopedSeamAndActiveProjection() {
+        withCollection((store, collection) -> {
+            Document original = new Document("perTableSeq", new Document("orders", 1L));
+            collection.insertOne(new Document("_id", CHAIN).append("epoch", 1L)
+                    .append("consumerOffsets", new Document("old", original)).append("schemaHistory", List.of()));
+            ConsumerOffset legacy = store.read(CHAIN).orElseThrow().consumerOffset("old").orElseThrow();
+            assertThat(store.legacyReadCursorOnly(CHAIN, legacy)).isTrue();
+            String scoped = SrsConsumerId.of("old", "source").value();
+            store.advanceConsumerReadSeq(CHAIN, scoped, "orders", 50);
+            assertThat(store.activeConsumerOffsets(CHAIN)).hasSize(2);
+            store.setCdcStart(CHAIN, scoped, "actual-snapshot-seam", 2);
+            assertThat(store.activeConsumerOffsets(CHAIN)).extracting(ConsumerOffset::pipelineId).containsExactly(scoped);
+            assertThat(store.consumerOffsets(CHAIN)).contains(legacy);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("old")).contains(legacy);
+            assertThat(store.legacyReadCursorOnly(CHAIN, legacy)).isTrue();
+            assertThat(store.activeConsumerOffsets(CHAIN)).hasSize(1);
+        });
+    }
+
+    @Test
+    void aProjectedCursorCannotHideRetainedWriterStateFromTheUpgradeGuard() {
+        for (Document sequences : List.of(new Document("orders", 1L), new Document())) {
+            withCollection((store, collection) -> {
+                Document legacy = new Document("perTableSeq", sequences)
+                        .append("writerRun", new Document("id", "old-writers")
+                                .append("expected", new Document("orders", List.of("writer")))
+                                .append("progress", new Document()));
+                collection.insertOne(new Document("_id", CHAIN).append("epoch", 1L)
+                        .append("consumerOffsets", new Document("old", legacy)).append("schemaHistory", List.of()));
+                ConsumerOffset projected = store.read(CHAIN).orElseThrow().consumerOffset("old").orElseThrow();
+                assertThat(projected.legacyReadCursorOnly()).isEqualTo(!sequences.isEmpty());
+                assertThat(store.legacyReadCursorOnly(CHAIN, projected)).isFalse();
+                String scoped = SrsConsumerId.of("old", "source").value();
+                store.advanceConsumerReadSeq(CHAIN, scoped, "orders", 50);
+                store.setCdcStart(CHAIN, scoped, "actual-snapshot-seam", 2);
+                assertThat(store.activeConsumerOffsets(CHAIN)).hasSize(2);
+                assertThat(store.legacyReadCursorOnly(CHAIN, projected)).isFalse();
+            });
+        }
+    }
+
+    @Test
+    void aLossyNumericProjectionCannotQualifyLegacyCursorEvidence() {
+        for (Number sequence : List.<Number>of(1.5d, Double.NaN, -1.5d, -2L)) {
+            withCollection((store, collection) -> {
+                Document legacy = new Document("perTableSeq", new Document("orders", sequence));
+                collection.insertOne(new Document("_id", CHAIN).append("epoch", 1L)
+                        .append("consumerOffsets", new Document("old", legacy)).append("schemaHistory", List.of()));
+                ConsumerOffset projected = store.read(CHAIN).orElseThrow().consumerOffset("old").orElseThrow();
+                assertThat(store.legacyReadCursorOnly(CHAIN, projected)).as("raw sequence %s", sequence).isFalse();
+                assertThat(collection.find(new Document("_id", CHAIN)).first()
+                        .get("consumerOffsets", Document.class).get("old")).isEqualTo(legacy);
+                String scoped = SrsConsumerId.of("old", "source").value();
+                store.advanceConsumerReadSeq(CHAIN, scoped, "orders", 50);
+                store.setCdcStart(CHAIN, scoped, "actual-snapshot-seam", 2);
+                assertThat(store.activeConsumerOffsets(CHAIN)).hasSize(2);
+                assertThat(store.legacyReadCursorOnly(CHAIN, projected)).isFalse();
+            });
+        }
+    }
+
+    @Test
     void createSeedsAnEmptyRecordAndReadReturnsIt() {
         withStore(store -> {
             store.create(CHAIN, "7d");

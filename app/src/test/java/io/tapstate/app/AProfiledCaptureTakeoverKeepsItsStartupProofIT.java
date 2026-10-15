@@ -161,6 +161,24 @@ class AProfiledCaptureTakeoverKeepsItsStartupProofIT {
         }
     }
 
+    @Test
+    void aScopedSnapshotCanTakeOverItsTailWhileCursorOnlyLegacyEvidenceRemains() {
+        try (Fixture fixture = new Fixture(false, true, ReadMode.SNAPSHOT_AND_CDC)) {
+            fixture.meta.advanceConsumerReadSeq(fixture.chain, PIPELINE, TABLE, 1);
+            ConsumerOffset legacy = fixture.meta.read(fixture.chain).orElseThrow().consumerOffset(PIPELINE).orElseThrow();
+            assertThat(legacy.legacyReadCursorOnly()).isTrue();
+            assertThat(fixture.meta.read(fixture.chain).orElseThrow().consumerOffset(SrsConsumerId.of(PIPELINE, SOURCE).value()))
+                    .hasValueSatisfying(offset -> assertThat(offset.cdcStartPosition()).isEqualTo("initial"));
+            fixture.takeOver();
+            fixture.port.deliver();
+            await().atMost(Duration.ofSeconds(10)).until(() -> fixture.meta.captureReadState(fixture.chain)
+                    .map(CaptureReadState::accepted).orElse(false));
+            assertThat(fixture.coordinator.startupProofs(PIPELINE, fixture.pipelineFence())).containsKey(SOURCE);
+            assertThat(fixture.meta.read(fixture.chain).orElseThrow().consumerOffset(PIPELINE)).contains(legacy);
+            fixture.assertSamePipelineExecution();
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl());
         final String database = "takeover_" + UUID.randomUUID().toString().substring(0, 8);
@@ -181,11 +199,15 @@ class AProfiledCaptureTakeoverKeepsItsStartupProofIT {
         final String chain;
         final long initialEpoch;
         final boolean shared;
+        final ReadMode readMode;
 
         Fixture(boolean reject) { this(reject, true); }
 
-        Fixture(boolean reject, boolean shared) {
+        Fixture(boolean reject, boolean shared) { this(reject, shared, ReadMode.CDC_ONLY); }
+
+        Fixture(boolean reject, boolean shared, ReadMode readMode) {
             this.shared = shared;
+            this.readMode = readMode;
             try {
                 WorkloadOwner local = new WorkloadOwner("node-a", "boot-a");
                 WorkloadOwner remote = new WorkloadOwner("node-c", "boot-c");
@@ -196,7 +218,7 @@ class AProfiledCaptureTakeoverKeepsItsStartupProofIT {
                         WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE), local, 1, TTL).claim();
                 pipeline = workloads.advanceExecution(acquired, 1, Set.of(local.nodeId())).orElseThrow();
                 currentPipeline = pipeline;
-                InMemoryStorePort backing = new InMemoryStorePort(artifacts(shared), log);
+                InMemoryStorePort backing = new InMemoryStorePort(artifacts(shared, readMode), log);
                 store = mock(StorePort.class, delegatesTo(backing));
                 doReturn(meta).when(store).meta();
                 doReturn(log).when(store).srsLog();
@@ -238,7 +260,7 @@ class AProfiledCaptureTakeoverKeepsItsStartupProofIT {
                 assertThat(meta.recordCaptureFirstDelivery(remoteReader)).isTrue();
                 coordinator.startCapture(PIPELINE, store.artifacts(), Map.of(), pipelineFence());
                 assertThat(port.start).isNull();
-                assertThat(coordinator.startupProofs(PIPELINE, pipelineFence())).containsKey(SOURCE);
+                await().atMost(Duration.ofSeconds(10)).until(() -> coordinator.startupProofs(PIPELINE, pipelineFence()).containsKey(SOURCE));
                 if (shared) meta.advanceCaptureCheckpoint(chain,
                         new ChainPosition(new SourceOrder(initialEpoch, 20), "latest"), List.of(TABLE));
                 else meta.advanceSourceReadOffset(chain, new ChainPosition(new SourceOrder(initialEpoch, 20), "latest"));
@@ -258,7 +280,7 @@ class AProfiledCaptureTakeoverKeepsItsStartupProofIT {
         }
 
         WorkloadClaim prepareAnother(String id) {
-            store.artifacts().save(pipeline(id, shared));
+            store.artifacts().save(pipeline(id, shared, readMode));
             WorkloadClaim acquired = workloads.acquire(new WorkloadClaimKey(CLUSTER,
                     WorkloadClaimType.PIPELINE_ACTUATION, id), pipeline.owner(), 1, TTL).claim();
             WorkloadClaim other = workloads.advanceExecution(acquired, 1, Set.of(pipeline.owner().nodeId())).orElseThrow();
@@ -308,19 +330,19 @@ class AProfiledCaptureTakeoverKeepsItsStartupProofIT {
         return config;
     }
 
-    private static InMemoryArtifactStore artifacts(boolean shared) {
+    private static InMemoryArtifactStore artifacts(boolean shared, ReadMode readMode) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE, null, "controlled", Map.of("host", "fixture"),
                 SourceMode.CDC, List.of(TableRef.literal(TABLE)), null, null));
-        artifacts.save(pipeline(PIPELINE, shared));
+        artifacts.save(pipeline(PIPELINE, shared, readMode));
         return artifacts;
     }
 
-    private static PipelineResource pipeline(String id, boolean shared) {
+    private static PipelineResource pipeline(String id, boolean shared, ReadMode readMode) {
         return new PipelineResource(id, null, List.of(SourceRef.spec(SOURCE, shared)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal(SOURCE),
                         List.of(new SyncElement("sync", "target", null, null, null)), null, null),
-                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);
+                new Settings(null, null, null, null, readMode, "earliest"), null);
     }
 
     private static final class ControlledSource implements CapturePort {
@@ -328,7 +350,15 @@ class AProfiledCaptureTakeoverKeepsItsStartupProofIT {
         CaptureStart start;
         CaptureListener listener;
         ControlledSource(boolean reject) { this.reject = reject; }
-        @Override public CaptureBatch snapshot(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        @Override public CaptureBatch snapshot(CaptureConfig config) {
+            var rows = List.of(Envelope.read(1, TABLE, Map.of("id", 1L), Map.of())).iterator();
+            return new CaptureBatch() {
+                @Override public boolean hasNext() { return rows.hasNext(); }
+                @Override public Envelope next() { return rows.next(); }
+                @Override public Optional<SourcePosition> seam() { return Optional.of(new SourcePosition("initial")); }
+                @Override public void close() { }
+            };
+        }
         @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             this.start = start;
             this.listener = listener;

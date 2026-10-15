@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.UnaryOperator;
@@ -130,6 +131,7 @@ class UpgradeFromPublishedImageIT {
 
             try (MongoClient client = MongoClients.create(mongo.uriForThisHost(UPGRADED))) {
                 MongoDatabase store = client.getDatabase(UPGRADED);
+                retainContinuityEvidence(store, "published-before-migration");
 
                 // The premise, asserted rather than assumed: what the released build left really is the
                 // older shape. Without this the whole case still passes if that build already wrote what
@@ -159,7 +161,13 @@ class UpgradeFromPublishedImageIT {
                     // The pipeline the released build left behind is still running, and still reading.
                     // A row put in after the upgrade is the only thing that separates a pipeline that
                     // resumed from one that merely still has a row count from before it.
-                    upgraded.rowInsertedAfterTheUpgradeCrosses(upgrading);
+                    retainContinuityEvidence(store, "migrated-before-continuation");
+                    try { upgraded.rowInsertedAfterTheUpgradeCrosses(upgrading); }
+                    catch (RuntimeException | AssertionError failure) {
+                        try { retainContinuityEvidence(store, "continuation-failed"); }
+                        catch (RuntimeException | AssertionError diagnosticFailure) { failure.addSuppressed(diagnosticFailure); }
+                        throw failure;
+                    }
                 }
             }
 
@@ -194,10 +202,13 @@ class UpgradeFromPublishedImageIT {
 
         private final Path sourceDirectory;
         private final Path targetDirectory;
+        private final Path readWitness;
+        private Set<String> previousStarts = Set.of();
 
         private Example(String name) {
             this.sourceDirectory = directory(name + "-source");
             this.targetDirectory = directory(name + "-target");
+            this.readWitness = directory(name + "-reader");
         }
 
         private void driveThrough(ServerHandle server) {
@@ -214,6 +225,7 @@ class UpgradeFromPublishedImageIT {
             try {
                 new E2eExecutor(binding(control), new FilePipelineLoader(workspace), TIMEOUT, POLL)
                         .execute(EnvelopeParser.parse(specification()));
+                previousStarts = sourceStarts();
             } catch (RuntimeException | AssertionError e) {
                 // A server in a container says why it could not do something in its own log, and nothing
                 // else here reads it. Without this the failure is only ever "the rows did not arrive",
@@ -236,6 +248,7 @@ class UpgradeFromPublishedImageIT {
         private void rowInsertedAfterTheUpgradeCrosses(ServerHandle server) {
             FileEndpoints files = new FileEndpoints();
             EndpointAddress target = EndpointAddress.uri(targetDirectory.toString());
+            awaitCurrentReader();
             long before = files.count(target, "orders");
             files.cdc(EndpointAddress.uri(sourceDirectory.toString()), "orders", CdcOp.INSERT, 2);
             Await.until("a row written after the upgrade to reach the target", TIMEOUT,
@@ -248,9 +261,38 @@ class UpgradeFromPublishedImageIT {
             Map<String, String> environment = new LinkedHashMap<>();
             environment.put("SRC_DIR", sourceDirectory.toString());
             environment.put("TGT_DIR", targetDirectory.toString());
+            environment.put("READ_WITNESS", readWitness.toString());
             UnaryOperator<String> env = environment::get;
             return new HttpTierBinding(
-                    control, workspace, Map.of(E2eConnectorJar.CONNECTOR_ID, new FileEndpoints()), env);
+                    control, workspace, Map.of(E2eConnectorJar.CONNECTOR_ID, new ReadyFiles()), env);
+        }
+        private Set<String> sourceStarts() {
+            try (Stream<Path> files = Files.list(readWitness)) {
+                Set<String> starts = new TreeSet<>();
+                for (Path file : files.filter(path -> path.getFileName().toString().startsWith("positions-")).toList()) {
+                    Files.readAllLines(file).stream().filter(line -> line.contains("\tSTART\torders\t")).forEach(starts::add);
+                }
+                return Set.copyOf(starts);
+            } catch (IOException failure) { throw new UncheckedIOException(failure); }
+        }
+
+        private void awaitCurrentReader() {
+            Await.until("the actual source reader to sample its start before the change", TIMEOUT,
+                    () -> sourceStarts().stream().anyMatch(start -> !previousStarts.contains(start)),
+                    () -> "observed source starts=" + sourceStarts());
+        }
+
+        /** Delays only the generated change until the existing SDK journal proves its reader is open. */
+        private final class ReadyFiles implements Endpoints {
+            private final FileEndpoints files = new FileEndpoints();
+            @Override public void seed(EndpointAddress a, String t, List<Map<String, Object>> r) { files.seed(a, t, r); }
+            @Override public void cdc(EndpointAddress a, String t, CdcOp op, long n) { awaitCurrentReader(); files.cdc(a, t, op, n); }
+            @Override public void update(EndpointAddress a, String t, Map<String, Object> w, Map<String, Object> v) { files.update(a, t, w, v); }
+            @Override public void delete(EndpointAddress a, String t, Map<String, Object> w) { files.delete(a, t, w); }
+            @Override public void insert(EndpointAddress a, String t, List<Map<String, Object>> r) { files.insert(a, t, r); }
+            @Override public Optional<Map<String, Object>> fetch(EndpointAddress a, String t, Map<String, Object> w) { return files.fetch(a, t, w); }
+            @Override public long count(EndpointAddress a, String t) { return files.count(a, t); }
+            @Override public void close() { files.close(); }
         }
     }
 
@@ -262,6 +304,9 @@ class UpgradeFromPublishedImageIT {
                 Files.copy(file, workspace.resolve(file.getFileName()),
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
+            Path sourceFile = workspace.resolve("src_file.tap.yml");
+            String body = Files.readString(sourceFile);
+            Files.writeString(sourceFile, body.replace("uri: \"${SRC_DIR}\"", "uri: \"${SRC_DIR}\", read_witness: \"${READ_WITNESS}\""));
             return Files.readString(source.resolve("spec.e2e.yml"));
         } catch (IOException e) {
             throw new UncheckedIOException("could not read the example at " + source, e);
@@ -273,6 +318,23 @@ class UpgradeFromPublishedImageIT {
             return Files.createDirectories(workspace.resolve(name));
         } catch (IOException e) {
             throw new UncheckedIOException("could not make " + name + " under " + workspace, e);
+        }
+    }
+
+    /** Retains actual published/migrated recovery inputs without changing either store or assertions. */
+    private static void retainContinuityEvidence(MongoDatabase store, String phase) {
+        Path directory = Path.of(System.getProperty("tapstate.e2e.build-directory", "target"))
+                .resolve("failure-scenes").resolve("upgrade-continuity").resolve(phase + "-" + java.util.UUID.randomUUID());
+        try {
+            Files.createDirectories(directory);
+            for (String name : List.of("srs_meta", "srs_consumer_offsets", "pipeline_state", "pipeline_desired",
+                    "pipeline_observation", "system_meta", "connector_state")) {
+                List<Document> documents = store.getCollection(name).find().limit(20).into(new ArrayList<>());
+                Files.writeString(directory.resolve(name + ".json"), new Document("phase", phase)
+                        .append("collection", name).append("documents", documents).toJson());
+            }
+        } catch (IOException failure) {
+            throw new AssertionError("cannot retain upgrade continuity evidence at " + directory, failure);
         }
     }
 

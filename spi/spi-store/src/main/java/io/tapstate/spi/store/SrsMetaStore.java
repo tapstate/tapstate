@@ -166,6 +166,17 @@ public interface SrsMetaStore {
         return read(miningChainId).map(SrsMeta::consumerOffsets).orElse(List.of());
     }
 
+    /** Active flow-control consumers; raw cursor evidence remains available through {@link #consumerOffsets}. */
+    default List<ConsumerOffset> activeConsumerOffsets(String miningChainId) {
+        return ConsumerOffset.activeForFlow(consumerOffsets(miningChainId),
+                legacy -> legacyReadCursorOnly(miningChainId, legacy));
+    }
+
+    /** Proves the exact raw legacy record has no sink/writer state hidden by its value projection. */
+    default boolean legacyReadCursorOnly(String miningChainId, ConsumerOffset expected) {
+        return false;
+    }
+
     /**
      * Seeds a mining chain's first record — no offsets, no consumers, no schema history, carrying only
      * the pass-through {@code retention} config (which may be absent). Insert-only: it must not overwrite

@@ -332,7 +332,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             SourceModel model = SourceDiscovery.model(storePort, source);
             SourceCaptureResolution.forPipeline(pipeline, source, model).ifPresent(resolution -> {
                 CaptureRunSpec spec = deriveSpec(pipelineId, pipeline.settings(), source, resolution,
-                        srsSwitchOf(pipelineId, ref), 1L);
+                        srsSwitchOf(pipelineId, ref), 1L).withPipelineSourceCount(pipeline.sources().size());
                 found.put(ref.id(), spec);
             });
         }
@@ -561,7 +561,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 SourceCaptureResolution resolution = selected.orElseThrow();
                 CaptureRunSpec spec = deriveSpec(
                         pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
-                        snapshotEpoch);
+                        snapshotEpoch).withPipelineSourceCount(pipeline.sources().size());
                 CaptureId captureId = CaptureId.of(spec);
                 if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
                     permits.put(captureId, permitOrNotYet(pipelineId, captureId, spec));
@@ -751,7 +751,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
                     joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
                     joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch())
-                    .withConsumerId(joinedWith.consumerId());
+                    .withConsumerId(joinedWith.consumerId()).withPipelineSourceCount(joinedWith.pipelineSourceCount());
             pipelines.putIfAbsent(joinedWith.pipelineId(), new JoinedPipeline(tailSpec, joinedWith, passthrough));
         }
     }

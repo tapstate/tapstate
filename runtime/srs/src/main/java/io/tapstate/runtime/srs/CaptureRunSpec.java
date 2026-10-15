@@ -49,7 +49,17 @@ public record CaptureRunSpec(
         String consumerId,
         CaptureResumeWitness resumeWitness,
         WorkloadClaimFence pipelineFence,
-        List<CaptureResumePreparation> startupAttachments) {
+        List<CaptureResumePreparation> startupAttachments,
+        int pipelineSourceCount) {
+
+    public CaptureRunSpec(CaptureConfig config, ReadMode readMode, String srsKey, boolean srsEnabled,
+            String sourceId, String pipelineId, StartFrom startFrom, String retention, long schemaVer,
+            long snapshotEpoch, WorkloadClaimFence captureFence, String consumerId,
+            CaptureResumeWitness resumeWitness, WorkloadClaimFence pipelineFence,
+            List<CaptureResumePreparation> startupAttachments) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId, startFrom, retention, schemaVer,
+                snapshotEpoch, captureFence, consumerId, resumeWitness, pipelineFence, startupAttachments, 0);
+    }
 
     public CaptureRunSpec(CaptureConfig config, ReadMode readMode, String srsKey, boolean srsEnabled,
             String sourceId, String pipelineId, StartFrom startFrom, String retention, long schemaVer,
@@ -126,14 +136,14 @@ public record CaptureRunSpec(
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
                 startFrom, retention, schemaVer, snapshotEpoch, fence, consumerId, resumeWitness, pipelineFence,
-                startupAttachments);
+                startupAttachments, pipelineSourceCount);
     }
 
     /** The same run using {@code id} as this source node's independent progress record. */
     public CaptureRunSpec withConsumerId(String id) {
         return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
                 startFrom, retention, schemaVer, snapshotEpoch, captureFence, id, resumeWitness, pipelineFence,
-                startupAttachments);
+                startupAttachments, pipelineSourceCount);
     }
 
     /** Freeze the exact pre-open source truth and successor authority for this run. */
@@ -146,14 +156,21 @@ public record CaptureRunSpec(
         }
         return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
                 startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, witness, pipeline,
-                startupAttachments);
+                startupAttachments, pipelineSourceCount);
     }
 
     /** Account for existing consumers without replacing the physical reader's current durable request. */
     public CaptureRunSpec withStartupAttachments(List<CaptureResumePreparation> attachments) {
         return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
                 startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, resumeWitness, pipelineFence,
-                attachments);
+                attachments, pipelineSourceCount);
+    }
+
+    /** Carry the frozen pipeline source cardinality; zero means the caller supplied no whole-pipeline facts. */
+    public CaptureRunSpec withPipelineSourceCount(int count) {
+        return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, resumeWitness, pipelineFence,
+                startupAttachments, count);
     }
 
     /** Shared capture state follows the physical source; direct recovery state follows its own channel. */
@@ -190,6 +207,9 @@ public record CaptureRunSpec(
         consumerId = consumerId == null ? pipelineId : consumerId;
         if (consumerId.isBlank()) {
             throw new IllegalArgumentException("a source consumer id must be non-blank");
+        }
+        if (pipelineSourceCount < 0) {
+            throw new IllegalArgumentException("pipeline source count must not be negative");
         }
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException(

@@ -798,14 +798,42 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      */
     @Override
     public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+        return readConsumers(miningChainId, false);
+    }
+
+    @Override
+    public List<ConsumerOffset> activeConsumerOffsets(String miningChainId) {
+        return readConsumers(miningChainId, true);
+    }
+
+    private List<ConsumerOffset> readConsumers(String miningChainId, boolean activeOnly) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
-                .projection(Projections.include("consumerOffsets"))
-                .first());
-        if (document == null) {
-            return List.of();
-        }
-        return mergedConsumers(document);
+                .projection(Projections.include("consumerOffsets")).first());
+        return document == null ? List.of() : mergedConsumers(document, activeOnly);
+    }
+
+    @Override
+    public boolean legacyReadCursorOnly(String miningChainId, ConsumerOffset expected) {
+        if (!expected.legacyReadCursorOnly()) { return false; }
+        return StoreIo.call(() -> {
+            Document raw = consumers.find(consumerKey(miningChainId, expected.pipelineId())).first();
+            if (raw == null) {
+                Document root = collection.find(new Document("_id", miningChainId))
+                        .projection(Projections.include("consumerOffsets")).first();
+                if (root != null && root.get("consumerOffsets") instanceof Document embedded
+                        && embedded.get(expected.pipelineId()) instanceof Document legacy) { raw = legacy; }
+            }
+            return raw != null && rawReadCursorOnly(raw)
+                    && expected.equals(consumerFromDocument(expected.pipelineId(), raw));
+        });
+    }
+
+    private static boolean rawReadCursorOnly(Document raw) {
+        if (!Set.of("_id", "miningChainId", "pipelineId", "perTableSeq").containsAll(raw.keySet())
+                || !(raw.get("perTableSeq") instanceof Document sequences) || sequences.isEmpty()) { return false; }
+        return sequences.values().stream().allMatch(value ->
+                (value instanceof Long || value instanceof Integer) && ((Number) value).longValue() >= -1);
     }
 
     @Override
@@ -2347,6 +2375,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /** Reads legacy and split cursors, with the split document winning during an interrupted migration. */
     private List<ConsumerOffset> mergedConsumers(Document root) {
+        return mergedConsumers(root, false);
+    }
+
+    private List<ConsumerOffset> mergedConsumers(Document root, boolean activeOnly) {
         String miningChainId = root.getString("_id");
         Object raw = root.get("consumerOffsets");
         if (miningChainId == null || !(raw instanceof Document embedded)) {
@@ -2355,9 +2387,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                             "field", miningChainId == null ? "_id" : "consumerOffsets"), null);
         }
         Map<String, ConsumerOffset> merged = new LinkedHashMap<>();
+        Set<String> cursorOnly = new java.util.HashSet<>();
         for (Map.Entry<String, Object> entry : embedded.entrySet()) {
-            merged.put(entry.getKey(),
-                    consumerFromDocument(entry.getKey(), asDocument(entry.getValue(), miningChainId)));
+            Document rawConsumer = asDocument(entry.getValue(), miningChainId);
+            merged.put(entry.getKey(), consumerFromDocument(entry.getKey(), rawConsumer));
+            if (rawReadCursorOnly(rawConsumer)) { cursorOnly.add(entry.getKey()); }
         }
         List<Document> split = StoreIo.call(() -> consumers.find(consumersOfChain(miningChainId))
                 .into(new ArrayList<>()));
@@ -2368,8 +2402,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                         Map.of("id", String.valueOf(document.get("_id")), "field", "pipelineId"), null);
             }
             merged.put(pipelineId, consumerFromDocument(pipelineId, document));
+            if (rawReadCursorOnly(document)) { cursorOnly.add(pipelineId); }
+            else { cursorOnly.remove(pipelineId); }
         }
-        return List.copyOf(merged.values());
+        List<ConsumerOffset> rawConsumers = List.copyOf(merged.values());
+        return activeOnly ? ConsumerOffset.activeForFlow(rawConsumers,
+                legacy -> cursorOnly.contains(legacy.pipelineId())) : rawConsumers;
     }
 
     /** The collision-free id of one cursor document; chain roots keep scalar string ids. */

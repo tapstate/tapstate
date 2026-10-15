@@ -147,22 +147,28 @@ final class PublishedImageServer implements ServerHandle {
         // A fresh store answers 204 and one already bootstrapped refuses as closed; both mean an admin
         // exists by the time this returns. Anything else - including the 403 an outside caller draws -
         // is a real failure and exits non-zero with the status named.
-        String script = "code=$(curl -s -o /dev/null -w '%{http_code}' -X POST"
+        String script = "code=$(curl -s --max-time " + BOOTSTRAP_BUDGET.toSeconds() + " -o /dev/null -w '%{http_code}' -X POST"
                 + " http://127.0.0.1:" + SERVER_PORT + "/auth/bootstrap"
                 + " -H 'Content-Type: application/json' -d '" + body + "');"
                 + " case \"$code\" in 204|409) echo \"bootstrap: $code\" ;;"
                 + " *) echo \"bootstrap failed with HTTP $code\" >&2; exit 1 ;; esac";
         try (GenericContainer<?> bootstrap = new GenericContainer<>(BOOTSTRAP_IMAGE)
                 .withNetworkMode("container:" + container.getContainerId())
-                // Entrypoint and command are both set here rather than through withCommand, which
-                // splits a single string on spaces: the script would arrive as fifty arguments and the
-                // shell would run the first word of it. That failure reports only that the container
-                // did not start, which says nothing about a script never having been run.
-                .withCreateContainerCmdModifier(
-                        command -> command.withEntrypoint("/bin/sh", "-c").withCmd(script))
-                .withStartupCheckStrategy(new OneShotStartupCheckStrategy()
-                        .withTimeout(BOOTSTRAP_BUDGET))) {
+                // Keep this owned helper alive while its exec result is read. A one-shot container can
+                // disappear after exit before polling observes the successful status.
+                .withCreateContainerCmdModifier(command -> command.withEntrypoint("/bin/sh", "-c")
+                        .withCmd("while :; do sleep 1; done"))
+                .withStartupTimeout(BOOTSTRAP_BUDGET)) {
             bootstrap.start();
+            var result = bootstrap.execInContainer("/bin/sh", "-c", script);
+            if (result.getExitCode() != 0) {
+                throw new AssertionError("published bootstrap failed: " + result.getStdout() + result.getStderr());
+            }
+        } catch (IOException failure) {
+            throw new UncheckedIOException("could not bootstrap the published image", failure);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("published image bootstrap was interrupted", interrupted);
         }
     }
 
