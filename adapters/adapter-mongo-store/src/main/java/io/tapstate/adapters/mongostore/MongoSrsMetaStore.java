@@ -106,7 +106,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         return sourceProof(session -> {
             Document root = collection.find(session, new Document("_id", chain)).projection(new Document("epoch", 1)
                     .append("sourceReadOffset", 1).append("sourceReadEpoch", 1).append("sourceReadSeq", 1)
-                    .append("sourceReadDurable", 1).append("consumerOffsets", 1).append(READ_ATTEMPT, 1)).first();
+                    .append("sourceReadDurable", 1).append("sourceReadAt", 1).append("consumerOffsets", 1).append(READ_ATTEMPT, 1)).first();
             Document consumer = consumers.find(session, consumerKey(chain, consumerId)).first();
             if (consumer == null && root != null && root.get("consumerOffsets") instanceof Document legacy) {
                 Object found = legacy.get(consumerId);
@@ -119,7 +119,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                     offset == null ? List.of() : offset.snapshotCompletedTables(), offset == null ? null : offset.cdcStartPosition(),
                     offset == null ? 0 : offset.snapshotEpoch(), offset == null ? null : offset.progressKind(),
                     offset == null ? null : offset.sinkAcked(), offset == null ? Map.of() : offset.sinkAckedByTable(),
-                    root == null ? null : CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class)));
+                    root == null ? null : CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class)),
+                    root == null ? null : sourceReadAtFrom(root));
         });
     }
 
@@ -183,6 +184,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             List<Document> conditions = new ArrayList<>();
             conditions.add(eqDefault("epoch", witness.chainEpoch(), 0L));
             conditions.add(eqDefault("sourceReadDurable", witness.sourceReadDurable(), false));
+            conditions.add(eqDefault("sourceReadAt", witness.sourceReadAt() == null ? null : witness.sourceReadAt().toEpochMilli(), null));
             if (!Objects.equals(CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class)), witness.priorReader())) {
                 return false;
             }

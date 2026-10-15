@@ -17,6 +17,26 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CaptureStartupDocumentsTest {
     @Test
+    void anExplicitPositionStampSurvivesPersistenceAndIsNotInventedForOlderWitnesses() {
+        var at = java.time.Instant.parse("2026-10-15T01:00:00Z");
+        var consumer = new io.tapstate.spi.store.ConsumerOffset("consumer", Map.of(), null, List.of("orders"),
+                "old-seam", 2, Map.of(), ConsumerProgressKind.SRS);
+        var record = new io.tapstate.spi.store.SrsMeta("chain", new ChainPosition(null, "moved"),
+                List.of(consumer), List.of(), null, 3, at, false);
+        var witness = CaptureResumeWitness.from("source", "mongo", "chain", "consumer", ReadMode.CDC_ONLY,
+                true, List.of("orders"), java.util.Optional.of(record));
+        Document stored = CaptureStartupDocuments.witness(witness);
+        var decoded = CaptureStartupDocuments.witness(stored);
+        assertThat(decoded).isEqualTo(witness);
+        assertThat(decoded.sourceReadAt()).isEqualTo(at);
+        assertThat(decoded.requestedPosition("capture").orElseThrow().position().token()).isEqualTo("moved");
+        stored.remove("sourceReadAt");
+        var legacy = CaptureStartupDocuments.witness(stored);
+        assertThat(legacy.sourceReadAt()).isNull();
+        assertThat(legacy.requestedPosition("capture").orElseThrow().position().token()).isEqualTo("old-seam");
+    }
+
+    @Test
     void frozenSnapshotAndConsumerCoordinatesRoundTripWithoutReadingNewerTruth() {
         var witness = new CaptureResumeWitness("source", "mongo", "chain", "consumer", ReadMode.SNAPSHOT_AND_CDC,
                 true, List.of("orders", "customers"), true, 4,

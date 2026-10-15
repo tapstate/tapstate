@@ -38,7 +38,8 @@ final class CaptureStartupDocuments {
                 .append("cdcStartPosition", witness.cdcStartPosition()).append("snapshotEpoch", witness.snapshotEpoch())
                 .append("progressKind", witness.progressKind() == null ? null : witness.progressKind().name())
                 .append("sinkAcked", position(witness.sinkAcked())).append("sinkAckedByTable", tables)
-                .append("priorReader", reader(witness.priorReader()));
+                .append("priorReader", reader(witness.priorReader()))
+                .append("sourceReadAt", witness.sourceReadAt() == null ? null : Date.from(witness.sourceReadAt()));
     }
 
     static CaptureResumeWitness witness(Document stored) {
@@ -53,7 +54,8 @@ final class CaptureStartupDocuments {
                     stored.getBoolean("sourceReadDurable"), stored.getBoolean("consumerPresent"),
                     stored.getList("snapshotCompletedTables", String.class), stored.getString("cdcStartPosition"),
                     number(stored, "snapshotEpoch"), kind == null ? null : ConsumerProgressKind.valueOf(kind),
-                    position(stored.get("sinkAcked", Document.class)), tables, reader(stored.get("priorReader", Document.class)));
+                    position(stored.get("sinkAcked", Document.class)), tables, reader(stored.get("priorReader", Document.class)),
+                    stored.getDate("sourceReadAt") == null ? null : stored.getDate("sourceReadAt").toInstant());
         } catch (RuntimeException invalid) {
             throw unreadable("witness", invalid);
         }

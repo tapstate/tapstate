@@ -15,6 +15,37 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CaptureResumeWitnessTest {
     @Test
+    void aStampedExplicitMoveOutranksTheCompletedSharedConsumersOlderSeam() {
+        ChainPosition moved = new ChainPosition(null, "explicitly-selected");
+        var consumer = new ConsumerOffset("qualified-consumer", Map.of(), null, List.of("orders"),
+                "old-load-seam", 3, Map.of(), ConsumerProgressKind.SRS);
+        var record = new SrsMeta("chain", moved, List.of(consumer), List.of(), null, 4,
+                Instant.parse("2026-10-15T01:00:00Z"), false);
+        for (ReadMode mode : List.of(ReadMode.CDC_ONLY, ReadMode.SNAPSHOT_AND_CDC)) {
+            var witness = CaptureResumeWitness.from("orders", "mongo", "chain", "qualified-consumer",
+                    mode, true, List.of("orders"), java.util.Optional.of(record));
+            assertThat(witness.requestedPosition("capture").orElseThrow().position())
+                    .as("a profiled start freezes the explicit move rather than the old load seam: %s", mode)
+                    .isEqualTo(moved);
+        }
+    }
+
+    @Test
+    void aLegacyOrOrderedUnprovenReadCannotMasqueradeAsAnExplicitMove() {
+        var consumer = new ConsumerOffset("qualified-consumer", Map.of(), null, List.of("orders"),
+                "old-load-seam", 3, Map.of(), ConsumerProgressKind.SRS);
+        for (SrsMeta record : List.of(
+                new SrsMeta("chain", new ChainPosition(null, "unstamped"), List.of(consumer), List.of(), null, 4),
+                new SrsMeta("chain", new ChainPosition(new SourceOrder(4, 20), "ordered-unproven"),
+                        List.of(consumer), List.of(), null, 4, Instant.parse("2026-10-15T01:00:00Z"), false))) {
+            var witness = CaptureResumeWitness.from("orders", "mongo", "chain", "qualified-consumer",
+                    ReadMode.CDC_ONLY, true, List.of("orders"), java.util.Optional.of(record));
+            assertThat(witness.requestedPosition("capture").orElseThrow().position().token())
+                    .isEqualTo("old-load-seam");
+        }
+    }
+
+    @Test
     void aFreshFullSnapshotCannotBorrowAnotherReadersCheckpointAsItsOwnSeam() {
         var witness = witness(ReadMode.SNAPSHOT_AND_CDC, true, null, 0, null,
                 new ChainPosition(new SourceOrder(4, 200), "physical-reader-200"));

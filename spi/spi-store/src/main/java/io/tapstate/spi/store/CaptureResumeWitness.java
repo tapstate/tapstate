@@ -3,6 +3,7 @@ package io.tapstate.spi.store;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.ReadMode;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -15,7 +16,19 @@ public record CaptureResumeWitness(
         boolean chainPresent, long chainEpoch, ChainPosition sourceRead, boolean sourceReadDurable,
         boolean consumerPresent, List<String> snapshotCompletedTables, String cdcStartPosition,
         long snapshotEpoch, ConsumerProgressKind progressKind,
-        ChainPosition sinkAcked, Map<String, ChainPosition> sinkAckedByTable, CaptureReadState priorReader) {
+        ChainPosition sinkAcked, Map<String, ChainPosition> sinkAckedByTable, CaptureReadState priorReader,
+        Instant sourceReadAt) {
+    public CaptureResumeWitness(String sourceId, String connectorId, String miningChainId, String consumerId,
+            ReadMode readMode, boolean srsEnabled, List<String> tables, boolean chainPresent, long chainEpoch,
+            ChainPosition sourceRead, boolean sourceReadDurable, boolean consumerPresent,
+            List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch,
+            ConsumerProgressKind progressKind, ChainPosition sinkAcked, Map<String, ChainPosition> sinkAckedByTable,
+            CaptureReadState priorReader) {
+        this(sourceId, connectorId, miningChainId, consumerId, readMode, srsEnabled, tables, chainPresent, chainEpoch,
+                sourceRead, sourceReadDurable, consumerPresent, snapshotCompletedTables, cdcStartPosition, snapshotEpoch,
+                progressKind, sinkAcked, sinkAckedByTable, priorReader, null);
+    }
+
     public CaptureResumeWitness(String sourceId, String connectorId, String miningChainId, String consumerId,
             ReadMode readMode, boolean srsEnabled, List<String> tables, boolean chainPresent, long chainEpoch,
             ChainPosition sourceRead, boolean sourceReadDurable, boolean consumerPresent,
@@ -41,7 +54,7 @@ public record CaptureResumeWitness(
         if (sourceId.isBlank() || connectorId.isBlank() || miningChainId.isBlank() || consumerId.isBlank()
                 || tables.isEmpty() || chainEpoch < 0 || snapshotEpoch < 0
                 || (consumerPresent && progressKind == null)
-                || (!chainPresent && (chainEpoch != 0 || sourceRead != null || sourceReadDurable))
+                || (!chainPresent && (chainEpoch != 0 || sourceRead != null || sourceReadDurable || sourceReadAt != null))
                 || (!consumerPresent && (!snapshotCompletedTables.isEmpty() || cdcStartPosition != null
                         || snapshotEpoch != 0 || sinkAcked != null || !sinkAckedByTable.isEmpty()))) {
             throw new IllegalArgumentException("capture resume witness must contain only actual source facts");
@@ -57,7 +70,8 @@ public record CaptureResumeWitness(
                 consumer == null ? List.of() : consumer.snapshotCompletedTables(),
                 consumer == null ? null : consumer.cdcStartPosition(), consumer == null ? 0L : consumer.snapshotEpoch(),
                 consumer == null ? null : consumer.progressKind(), consumer == null ? null : consumer.sinkAcked(),
-                consumer == null ? Map.of() : consumer.sinkAckedByTable());
+                consumer == null ? Map.of() : consumer.sinkAckedByTable(), null,
+                record.map(SrsMeta::sourceReadAt).orElse(null));
     }
 
     public boolean snapshotOwed() {
@@ -83,11 +97,16 @@ public record CaptureResumeWitness(
             return Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,
                     ClusterRecoveryPosition.Kind.SNAPSHOT_REQUIRED, null, "mongo-new-snapshot", reference));
         }
-        ChainPosition checkpoint = srsEnabled ? (sourceReadDurable ? sourceRead : null) : confirmedDirectPosition();
+        // An explicit move is persisted without an order and with its write stamp. It is an exact
+        // requested token, not evidence that an old SRS batch became recoverable.
+        boolean explicitlyMoved = srsEnabled && sourceRead != null && !sourceReadDurable
+                && sourceRead.order() == null && sourceReadAt != null;
+        ChainPosition checkpoint = srsEnabled ? (sourceReadDurable || explicitlyMoved ? sourceRead : null) : confirmedDirectPosition();
         if (checkpoint != null && checkpoint.token() != null) {
             return Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,
                     ClusterRecoveryPosition.Kind.DURABLE_POSITION, checkpoint,
-                    srsEnabled ? "mongo-source-checkpoint" : "mongo-consumer-confirmed-prefix", reference));
+                    srsEnabled ? (explicitlyMoved ? "mongo-explicit-source-position" : "mongo-source-checkpoint")
+                            : "mongo-consumer-confirmed-prefix", reference));
         }
         if (cdcStartPosition != null) {
             return Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,

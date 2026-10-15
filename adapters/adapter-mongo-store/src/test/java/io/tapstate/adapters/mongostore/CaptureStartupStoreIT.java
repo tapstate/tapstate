@@ -38,6 +38,43 @@ class CaptureStartupStoreIT {
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     @Test
+    void anExplicitMoveKeepsItsExactTokenThroughProfiledPreparationAndReaderAcceptance() {
+        try (Fixture fixture = new Fixture()) {
+            fixture.meta.markSnapshotComplete("chain", fixture.consumer, "orders");
+            fixture.meta.setCdcStart("chain", fixture.consumer, "old-load-seam", fixture.epoch);
+            fixture.meta.rewindSourceReadOffset("chain", "explicitly-selected");
+            CaptureResumeWitness witness = fixture.prepare(ReadMode.SNAPSHOT_AND_CDC);
+            assertThat(witness.sourceReadDurable()).isFalse();
+            assertThat(witness.sourceReadAt()).isNotNull();
+            assertThat(witness.requestedPosition("capture").orElseThrow().position())
+                    .isEqualTo(new ChainPosition(null, "explicitly-selected"));
+            var persisted = fixture.meta.captureResumePreparation(fixture.pipelineFence(), "chain", fixture.consumer).orElseThrow();
+            assertThat(persisted.witness()).isEqualTo(witness);
+            assertThat(persisted.requestedPosition().position().token()).isEqualTo("explicitly-selected");
+            CaptureReadAttempt attempt = fixture.begin("explicitly-selected");
+            assertThat(fixture.meta.bindCaptureReadAttempt(fixture.pipelineFence(), witness, attempt, false)).isTrue();
+            assertThat(fixture.meta.recordCaptureAttachment(fixture.pipelineFence(), witness, fixture.epoch)).isTrue();
+            assertThat(fixture.meta.recordCaptureAnchor(attempt, "explicitly-selected")).isTrue();
+            assertThat(fixture.meta.recordCaptureFirstDelivery(attempt)).isTrue();
+            var proof = fixture.meta.captureStartupProof(fixture.pipelineFence(), witness).orElseThrow();
+            assertThat(proof.requestedPosition().position().token()).isEqualTo("explicitly-selected");
+            assertThat(proof.acceptedPosition().position().token()).isEqualTo("explicitly-selected");
+        }
+    }
+
+    @Test
+    void removingOnlyTheExplicitMoveStampRefusesAStalePreparedWitness() {
+        try (Fixture fixture = new Fixture()) {
+            fixture.meta.rewindSourceReadOffset("chain", "explicitly-selected");
+            CaptureResumeWitness witness = fixture.witness(ReadMode.CDC_ONLY);
+            fixture.client.getDatabase(fixture.database).getCollection("meta").updateOne(new Document("_id", "chain"),
+                    new Document("$unset", new Document("sourceReadAt", "")));
+            assertThat(fixture.meta.prepareCaptureResume(fixture.pipelineFence(), witness,
+                    witness.requestedPosition("capture").orElseThrow(), Set.of("source"))).isFalse();
+        }
+    }
+
+    @Test
     void anchorAloneIsUnprovenAndLaterCheckpointMovementDoesNotChangeThePreparedRequest() {
         try (Fixture fixture = new Fixture()) {
             CaptureResumeWitness witness = fixture.prepare(ReadMode.CDC_ONLY);
