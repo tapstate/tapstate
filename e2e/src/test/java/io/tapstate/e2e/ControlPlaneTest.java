@@ -66,6 +66,18 @@ class ControlPlaneTest {
     }
 
     @Test
+    void missingAgeRemainsUnknownEvenWhenTheStatusCarriesAnObservationTime() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "RUNNING",
+                "observedAt", "2026-01-01T00:00:00Z"));
+
+        assertThat(ControlPlane.interpretObservedAt(200, body, PIPELINE))
+                .contains(java.time.Instant.parse("2026-01-01T00:00:00Z"));
+        assertThat(ControlPlane.interpretObservedAgeMillis(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
     void readsTheProductsOwnNoObservationCodeAsNothingPublishedYet() {
         assertThat(ControlPlane.interpretState(404, coded(MonitorError.NO_OBSERVATION.code()), PIPELINE))
                 .isEmpty();

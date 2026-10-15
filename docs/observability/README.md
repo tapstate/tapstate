@@ -22,7 +22,9 @@ pipeline. The history and explanation responses, including coded errors, carry
 
 | Question | REST | CLI | MCP |
 |---|---|---|---|
-| What runtime state was last observed, and what is the current intent? | `GET /api/pipelines/{id}/status` | `status <id>` | `pipeline_status` |
+| What runtime state was last observed? | `GET /api/pipelines/{id}/status` | `status <id>` | `pipeline_status` |
+| What lifecycle target was requested? | `desiredState` in `GET /api/pipelines/{id}/status` | — | `desiredState` in `pipeline_status` |
+| How can I follow runtime state changes? | WebSocket `/api/pipelines/{id}/status/watch` | `status <id> --watch` | — |
 | What are the current counters and positions? | `GET /api/pipelines/{id}/metrics` | `metrics <id>` | `pipeline_metrics` |
 | How far has the initial snapshot loaded? | `GET /api/pipelines/{id}/snapshot` | `snapshot <id>` | `pipeline_snapshot` |
 | What did this node log for the pipeline? | `GET /api/pipelines/{id}/logs` | `logs <id>` | `pipeline_logs` |
@@ -31,11 +33,15 @@ pipeline. The history and explanation responses, including coded errors, carry
 | How wide does each node of the current run run, and why? | `plan` in `GET /api/pipelines/{id}/status` or `.../explain` | `explain <id>` or `status <id>` | `pipeline_status` or `pipeline_explain` |
 
 The status response keeps `state` tied to runtime observation. Before the first observation, a known
-pipeline returns `state: "NEW"` and omits `observedState`; `desiredState` carries the requested lifecycle
-target and `displayState` may say `STARTING`, `PAUSING`, or another in-progress presentation. A saved draft
-also has a status response, with `displayState: "DRAFT"` and `hasArtifact: false`. Reads that need runtime
-data, such as metrics, snapshot, and explain, continue to return `monitor.no-observation` until the first
-observation is published.
+pipeline returns `state: "NEW"` and omits `observedState`, `observedAt`, and `observedAgeMillis`;
+`desiredState` carries the requested lifecycle target and `displayState` may say `STARTING`, `PAUSING`, or
+another in-progress presentation. When an observation exists, `state`, `observedState`, and `observedAt`
+come from the same catalog snapshot, and `observedAgeMillis` is calculated from that observation time. A
+saved draft also has a status response, with `displayState: "DRAFT"` and `hasArtifact: false`. The status
+watch sends observed state changes only. It stays open without frames while a known pipeline or saved draft
+has no observation, and closes an id that is not known with `lifecycle.unknown-pipeline`. Reads that need
+runtime data, such as metrics, snapshot, and explain, continue to return `monitor.no-observation` until the
+first observation is published.
 
 The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
 confirmed progress even when it skips reading that table again. Once the target confirms the load,

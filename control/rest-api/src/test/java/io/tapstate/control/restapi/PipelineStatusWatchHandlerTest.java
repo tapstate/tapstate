@@ -121,12 +121,12 @@ class PipelineStatusWatchHandlerTest {
     }
 
     @Test
-    void aPipelineThatBecomesKnownBeforeTheUnknownCheckKeepsTheWatchOpen() {
+    void aKnownDraftWithoutAnObservationKeepsTheWatchOpen() {
         PipelineObservationQueryService observations = serviceWith(emptyObservations());
-        PipelineStatusWatchHandler handler = handler(observations, "published"::equals);
+        PipelineStatusWatchHandler handler = handler(observations, "draft-only"::equals);
         FakeWebSocketSession session = new FakeWebSocketSession();
 
-        handler.poll(session, "published");
+        handler.poll(session, "draft-only");
 
         assertThat(session.closeStatus).isNull();
         assertThat(session.sent).isEmpty();
