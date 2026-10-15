@@ -103,6 +103,14 @@ public final class CdcRecoveryFixture {
         }
     }
 
+    static long heldWrites(Path signals) {
+        try (var files = Files.list(signals)) {
+            return files.filter(path -> path.getFileName().toString().startsWith("waiting-")).count();
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
+        }
+    }
+
     private static void put(JarOutputStream out, String name, byte[] bytes) throws IOException {
         out.putNextEntry(new JarEntry(name));
         out.write(bytes);
@@ -118,6 +126,18 @@ public final class CdcRecoveryFixture {
         @Override
         public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
             super.registerCapabilities(functions, codecs);
+            var write = functions.getWriteRecordFunction();
+            functions.supportWriteRecord((context, events, table, result) -> {
+                Object configured = context.getConnectionConfig().getObject("hold_writes");
+                if (configured != null) {
+                    Path signals = Path.of(String.valueOf(configured));
+                    if (!Files.exists(signals.resolve("release"))) {
+                        // Identify each call entering the existing hold without changing its release or interrupt checks.
+                        Files.writeString(signals.resolve("waiting-" + Thread.currentThread().threadId()), "");
+                    }
+                }
+                write.writeRecord(context, events, table, result);
+            });
             functions.supportTimestampToStreamOffset((context, startTime) -> positionAt(context, startTime))
                     .supportStreamRead((context, tables, offset, size, consumer) ->
                             tail(context, tables, offset, size, consumer));
