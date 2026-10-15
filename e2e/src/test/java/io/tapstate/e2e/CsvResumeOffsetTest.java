@@ -14,6 +14,8 @@ import io.tapstate.e2e.connector.CsvConnector;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -21,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -29,6 +32,50 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CsvResumeOffsetTest {
     private static final String TABLE = "orders";
+
+    @Test void aMissingLookupDuringReplacementStillReadsTheCompleteTable(@TempDir Path directory) throws IOException {
+        Path file = directory.resolve("orders.csv");
+        List<String> expected = List.of("id,seq", "1,1", "2,2");
+        Files.write(file, expected);
+        AtomicInteger calls = new AtomicInteger();
+        assertThat(CsvConnector.readPublishedTable(file, path -> {
+            if (calls.getAndIncrement() == 0) { throw new NoSuchFileException(path.toString()); }
+            return Files.readAllLines(path);
+        }, TimeUnit.SECONDS.toNanos(1))).containsExactlyElementsOf(expected);
+        assertThat(calls.get()).isEqualTo(2);
+    }
+
+    @Test void aPermanentlyMissingPublishedTableStillFails() {
+        Path file = Path.of("never-published.csv");
+        NoSuchFileException missing = new NoSuchFileException(file.toString());
+        assertThatThrownBy(() -> CsvConnector.readPublishedTable(file, path -> { throw missing; },
+                TimeUnit.MILLISECONDS.toNanos(20))).isInstanceOf(UncheckedIOException.class).hasCause(missing);
+    }
+
+    @Test void aDifferentReadFailureIsNeverRetried() {
+        Path file = Path.of("denied.csv");
+        AccessDeniedException denied = new AccessDeniedException(file.toString());
+        AtomicInteger calls = new AtomicInteger();
+        assertThatThrownBy(() -> CsvConnector.readPublishedTable(file, path -> {
+            calls.incrementAndGet(); throw denied;
+        }, TimeUnit.SECONDS.toNanos(1))).isInstanceOf(UncheckedIOException.class).hasCause(denied);
+        assertThat(calls.get()).isEqualTo(1);
+    }
+
+    @Test void cancellationDuringTheReplacementPauseNeverStartsAnotherRead() {
+        Path file = Path.of("replaced.csv");
+        NoSuchFileException missing = new NoSuchFileException(file.toString());
+        AtomicInteger calls = new AtomicInteger();
+        try {
+            assertThatThrownBy(() -> CsvConnector.readPublishedTable(file, path -> {
+                if (calls.getAndIncrement() == 0) { throw missing; }
+                return List.of("id,seq", "1,1");
+            }, TimeUnit.SECONDS.toNanos(1), nanos -> Thread.currentThread().interrupt()))
+                    .isInstanceOf(UncheckedIOException.class).hasCause(missing);
+            assertThat(calls.get()).isEqualTo(1);
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally { Thread.interrupted(); }
+    }
 
     @Test void aRegisteredStreamResumesAfterItsActualRetainedOffset(@TempDir Path directory) throws Throwable {
         FileEndpoints files = new FileEndpoints();

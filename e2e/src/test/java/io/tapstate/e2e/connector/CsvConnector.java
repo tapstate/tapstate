@@ -35,6 +35,7 @@ import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -55,6 +56,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import java.util.stream.Stream;
 
 /**
@@ -1095,10 +1097,39 @@ public class CsvConnector implements TapConnector {
         if (!Files.isRegularFile(file)) {
             return List.of();
         }
-        try {
-            return Files.readAllLines(file);
-        } catch (IOException e) {
-            throw new UncheckedIOException("cannot read the table at " + file, e);
+        return readPublishedTable(file, Files::readAllLines, TimeUnit.SECONDS.toNanos(1));
+    }
+
+    @FunctionalInterface
+    public interface TableRead {
+        List<String> read(Path file) throws IOException;
+    }
+
+    /** Reads complete published bytes; the I/O boundary is supplied for filesystem race controls. */
+    public static List<String> readPublishedTable(Path file, TableRead reader, long retryNanos) {
+        return readPublishedTable(file, reader, retryNanos, LockSupport::parkNanos);
+    }
+
+    /** The pause boundary permits a deterministic cancellation control without changing file bytes. */
+    public static List<String> readPublishedTable(Path file, TableRead reader, long retryNanos, LongConsumer pause) {
+        long began = System.nanoTime();
+        for (;;) {
+            try {
+                return reader.read(file);
+            } catch (NoSuchFileException missing) {
+                // A shared mount may briefly lose a name during atomic replacement. Never report that
+                // interval as an empty table, or hide a permanent deletion or another kind of failure.
+                long remaining = retryNanos - (System.nanoTime() - began);
+                if (remaining <= 0 || Thread.currentThread().isInterrupted()) {
+                    throw new UncheckedIOException("cannot read the table at " + file, missing);
+                }
+                pause.accept(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(1)));
+                if (Thread.currentThread().isInterrupted() || System.nanoTime() - began >= retryNanos) {
+                    throw new UncheckedIOException("cannot read the table at " + file, missing);
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException("cannot read the table at " + file, e);
+            }
         }
     }
 
