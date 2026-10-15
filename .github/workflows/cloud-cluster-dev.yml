@@ -26,12 +26,12 @@ jobs:
   registry-access-probe:
     if: github.repository == 'tapstate/tapstate' && github.ref == 'refs/heads/ws/cloud-cluster-dev-ci'
     runs-on: ubuntu-latest
-    # This read-only repository-token probe consumes no environment credentials.
+    # This repository-token probe consumes no environment credentials or image bytes.
     permissions:
       contents: read
       packages: write
     steps:
-      - name: check registry authorization without publishing
+      - name: check registry authorization without publishing an image
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
@@ -59,6 +59,29 @@ jobs:
                       body = json.load(response)
                       result = {'requested_actions': actions, 'http_status': response.status,
                           'token_present': isinstance(body.get('token'), str) and bool(body['token'])}
+                  if actions == 'pull,push' and result['token_present']:
+                      class NoRedirect(urllib.request.HTTPRedirectHandler):
+                          def redirect_request(self, req, fp, code, msg, headers, newurl):
+                              return None
+                      opener = urllib.request.build_opener(NoRedirect())
+                      headers = {'Authorization': 'Bearer ' + body['token']}
+                      upload_url = 'https://ghcr.io/v2/tapstate/tapstate-cloud/blobs/uploads/'
+                      upload = urllib.request.Request(upload_url, data=b'', headers=headers, method='POST')
+                      try:
+                          with opener.open(upload, timeout=30) as response:
+                              result['empty_upload_start_status'] = response.status
+                              location = urllib.parse.urljoin(upload_url, response.headers['Location'])
+                          parsed = urllib.parse.urlsplit(location)
+                          if (parsed.scheme != 'https' or parsed.netloc != 'ghcr.io'
+                                  or not parsed.path.startswith('/v2/tapstate/tapstate-cloud/blobs/uploads/')):
+                              raise ValueError('Unexpected upload location')
+                          cleanup = urllib.request.Request(location, headers=headers, method='DELETE')
+                          with opener.open(cleanup, timeout=30) as response:
+                              result['empty_upload_cleanup_status'] = response.status
+                      except urllib.error.HTTPError as error:
+                          result['empty_upload_http_error'] = error.code
+                      except Exception:
+                          result['empty_upload_probe_failed'] = True
               except urllib.error.HTTPError as error:
                   result = {'requested_actions': actions, 'http_status': error.code}
                   try:
