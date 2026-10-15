@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
+from types import SimpleNamespace
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('groups', Path(sys.argv[1]) / '_ci-pr-groups.py')
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -103,6 +105,24 @@ with tempfile.TemporaryDirectory(prefix='ci-pr-group-smoke-') as temporary:
     check(not any(good[key] for key in ['first_complete_pr_sample_proven','group_equivalence_proven','whole_build_provenance_complete','latest_tip_verified','performance_accepted']),
           'declared equality and replayed comparisons never certify a whole sample or performance')
     check(not good['cache_condition_verified'],'a warm label is not independent cache evidence')
+    # Comparison and archive bindings have separate controls; isolate only the cross-variant time join here.
+    serial_group=copy.deepcopy(group)
+    serial_group['serial_readbacks']={name:{'fixture':name} for name in ('A','B','C')}
+    timeline={name:{'workflow_created_at':entry['ci_created_at'],
+                    'workflow_terminal_observed_at':entry['ci_terminal_observed_at']}
+              for name,entry in good['variants'].items()}
+    def join_times():
+        boundary=SimpleNamespace(bind=lambda refs,reference,*args:copy.deepcopy(timeline[reference['fixture']]))
+        with patch.object(m,'group_inputs',return_value=copy.deepcopy(good)), patch.object(m,'module',return_value=boundary):
+            return m.serial_group_inputs(m.References(root),serial_group)
+    check(join_times()['source_bound_serial_transitions_replayed'],'all-workflow serial windows can join')
+    original=copy.deepcopy(timeline)
+    timeline['A']['workflow_terminal_observed_at']='2026-01-01T00:12:00Z'
+    rejected(join_times,'applicable workflow timelines overlap or were reordered')
+    timeline=copy.deepcopy(original)
+    timeline['B']['workflow_created_at']='2026-01-01T00:09:00Z'
+    rejected(join_times,'applicable workflow timelines overlap or were reordered')
+    timeline=original
     for change,reason in [({'cache_condition':'unknown'},'unknown group cache'),({'order':['A','C','B']},'overlap or were reordered'),
                           ({'order':['A','B','B']},'exactly once'),({'schema':True},'unsupported PR group')]:
         rejected(lambda change=change:reconcile(dict(group,**change)),reason)

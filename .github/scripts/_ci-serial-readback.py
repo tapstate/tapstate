@@ -82,6 +82,54 @@ def readback(refs, value):
     return expected['readback']
 
 
+
+def workflow_window(refs, captured, result):
+    """Read terminal workflow intervals from the exact archives and recorded API data."""
+    intervals = []
+    for entry in result['archives']:
+        archive, path = refs.read(entry['receipt'])
+
+        def raw(name):
+            require(name in archive['files'], 'serial workflow timeline input is missing')
+            return refs.read({'path': (path.parent / name).relative_to(refs.root).as_posix(),
+                              'sha256': archive['files'][name]['sha256']})[0]
+
+        run, attempt = raw('run.json'), raw('attempt-1/run.json')
+        endpoint = f"repos/{result['snapshot']['scope']['repository']}/actions/runs/{entry['run_id']}/attempts/1"
+        responses = [row['response'] for row in captured['api_trace'] if row['endpoint'] == endpoint]
+        listings = [run for row in captured['api_trace'] if '/actions/runs?' in row['endpoint']
+                    for run in row['response']['workflow_runs'] if run['id'] == entry['run_id']]
+        require(responses and listings, 'serial workflow timeline lacks recorded original API data')
+        for value, originals in ((run, listings), (attempt, responses)):
+            require(all(isinstance(value.get(key), str) for key in ('created_at', 'updated_at')),
+                    'serial workflow timeline timestamp is missing')
+            require(all(all(value[key] == original.get(key) for key in ('created_at', 'updated_at'))
+                        for original in originals), 'serial workflow timeline differs from recorded original API')
+            require(g.timestamp(value['created_at']) <= g.timestamp(value['updated_at']),
+                    'serial workflow timeline is reversed')
+        require(run['created_at'] == attempt['created_at'], 'serial workflow creation differs across original views')
+        start = run['created_at']
+        end = max((run['updated_at'], attempt['updated_at']), key=g.timestamp)
+        for name in archive['files']:
+            if not name.startswith('attempt-1/jobs-') or not name.endswith('.json'):
+                continue
+            for job in raw(name)['jobs']:
+                begin, finish = job['started_at'], job['completed_at']
+                if begin is None and finish is None and job['conclusion'] == 'skipped':
+                    continue
+                require(isinstance(begin, str) and isinstance(finish, str),
+                        'serial job timeline timestamp is missing')
+                require(g.timestamp(start) <= g.timestamp(begin) <= g.timestamp(finish)
+                        and all(g.timestamp(finish) <= g.timestamp(view['updated_at']) for view in (run, attempt)),
+                        'serial job timeline is outside its workflow interval')
+        intervals.append({'run_id': run['id'], 'workflow': run['path'],
+                          'created_at': start, 'terminal_observed_at': end})
+    require(intervals, 'serial workflow timeline is empty')
+    return {'workflow_created_at': min((row['created_at'] for row in intervals), key=g.timestamp),
+            'workflow_terminal_observed_at': max((row['terminal_observed_at'] for row in intervals), key=g.timestamp),
+            'workflow_intervals': sorted(intervals, key=lambda row: row['run_id'])}
+
+
 def bind(refs, reference, scope, variant, archive_reference):
     value, unused = refs.read(reference)
     result = readback(refs, value)
@@ -100,4 +148,5 @@ def bind(refs, reference, scope, variant, archive_reference):
             and all(check['status'] == 'completed' and check['conclusion'] in ('success', 'neutral', 'skipped')
                     for check in snapshot['checks']), 'serial group has a failed or retried original instance')
     return {'capture': reference, 'snapshot': snapshot, 'source_trigger_policy': result['source_trigger_policy'],
+            **workflow_window(refs, value, result),
             'recorded_transition_replayed': True, 'backend_response_attestation_proven': False}

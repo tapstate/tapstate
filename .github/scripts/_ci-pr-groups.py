@@ -327,6 +327,11 @@ def serial_group_inputs(refs, value):
     result['serial_readbacks'] = {name: serial.bind(refs, reference, value['scope'],
             result['variants'][name], value['variants'][name]['archive'])
             for name, reference in value['serial_readbacks'].items()}
+    for previous, current in zip(value['order'], value['order'][1:]):
+        require(timestamp(result['serial_readbacks'][previous]['workflow_terminal_observed_at'])
+                <= timestamp(result['serial_readbacks'][current]['workflow_created_at']),
+                'applicable workflow timelines overlap or were reordered')
+    result['archived_all_workflow_timeline_consistent'] = True
     result['source_bound_serial_transitions_replayed'] = True
     result['backend_response_attestation_proven'] = False
     result['limits'][1] = 'recorded source-bound serial traces are replayed; backend attestation and full sample acceptance remain unknown'

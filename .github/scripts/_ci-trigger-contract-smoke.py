@@ -108,8 +108,11 @@ def controls(context):
     association = {'number': 7, 'head': {'sha': scope['head_sha']}, 'base': {'sha': scope['base_sha']}}
     runs = [{'id': number + 42, 'path': path, 'run_attempt': 1, 'status': 'completed', 'conclusion': 'success',
         'head_sha': scope['head_sha'], 'head_branch': scope['branch'], 'event': 'pull_request',
-        'repository': {'full_name': scope['repository']}, 'pull_requests': [association]}
+        'repository': {'full_name': scope['repository']}, 'pull_requests': [association],
+        'created_at': '2026-01-01T10:00:00Z', 'updated_at': '2026-01-01T10:01:00Z'}
         for number, path in enumerate(answer['ordinary_applicable_workflows'])]
+    jobs = {run['id']: [] for run in runs}
+    attempt_views = {}
 
     def api(endpoint):
         if endpoint.endswith('/pulls/7'):
@@ -125,10 +128,11 @@ def controls(context):
                 'conclusion': 'success', 'pull_requests': [association]} for number, name in enumerate(answer['minimum_required_checks'])]
             return {'total_count': len(rows), 'check_runs': rows}
         if '/attempts/1/jobs?' in endpoint:
-            return {'total_count': 0, 'jobs': []}
+            identity = int(endpoint.split('/actions/runs/', 1)[1].split('/', 1)[0])
+            return {'total_count': len(jobs[identity]), 'jobs': copy.deepcopy(jobs[identity])}
         if '/attempts/1' in endpoint:
             identity = int(endpoint.split('/actions/runs/', 1)[1].split('/', 1)[0])
-            return copy.deepcopy(next(run for run in runs if run['id'] == identity))
+            return copy.deepcopy(attempt_views.get(identity, next(run for run in runs if run['id'] == identity)))
         raise AssertionError('unexpected API: ' + endpoint)
 
     check(m.policy_head_status(answer, api)['can_advance_after_archiving'], 'fresh head inventory agrees with original source policy')
@@ -224,6 +228,84 @@ def controls(context):
                          {'identity': identity}, archives[0]['receipt'])
     check(joined['recorded_transition_replayed'] and not joined['backend_response_attestation_proven'],
           'group identity binds exact original receipt to independently replayed serial evidence')
+    check(joined['workflow_created_at']=='2026-01-01T10:00:00Z'
+          and joined['workflow_terminal_observed_at']=='2026-01-01T10:01:00Z'
+          and len(joined['workflow_intervals'])==3, 'all applicable archived workflows contribute to the interval')
+    # Keep the raw archive and live boundary responses consistent while a non-CI workflow finishes later.
+    late = runs[1]
+    late['updated_at']='2026-01-01T10:03:00Z'
+    def reseal_timeline():
+        for run in runs:
+            prefix='transition/'+str(run['id'])+'/'
+            context['save'](prefix+'run.json',run)
+            context['save'](prefix+'attempt-1/run.json',attempt_views.get(run['id'],run))
+            context['save'](prefix+'attempt-1/jobs-1.json',{'total_count':len(jobs[run['id']]),'jobs':jobs[run['id']]})
+            directory=context['evidence']/prefix
+            m.g.receipt.manifest(directory, {'archive_root':str(directory),'archive_complete':True,
+                'purpose':'offline raw workflow evidence','gaps':[]})
+            next(entry for entry in archives if entry['run_id']==run['id'])['receipt']['sha256']=m.g.checksum((directory/'receipt.json').read_bytes())
+        request_ref=context['save']('serial-request.json',transition)
+        return serial.capture(m.g.References(context['evidence']),request_ref,api)
+    late_capture=reseal_timeline()
+    late_ref=context['save']('serial-late-workflow.json',late_capture)
+    late_joined=serial.bind(m.g.References(context['evidence']),late_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+    check(late_joined['workflow_terminal_observed_at']=='2026-01-01T10:03:00Z',
+          'a later non-CI workflow controls the complete group interval')
+    # A resealed, internally valid archive cannot disagree with the original recorded API timeline.
+    for filename in ['run.json','attempt-1/run.json']:
+        prefix='transition/'+str(late['id'])+'/'
+        changed=copy.deepcopy(late);changed['updated_at']='2026-01-01T10:02:00Z'
+        context['save'](prefix+filename,changed)
+        directory=context['evidence']/prefix
+        m.g.receipt.manifest(directory,{'archive_root':str(directory),'archive_complete':True,'gaps':[]})
+        # Re-capture the transition: legacy identity/status checks accept it; strict binding must reject its times.
+        next(entry for entry in archives if entry['run_id']==late['id'])['receipt']['sha256']=m.g.checksum((directory/'receipt.json').read_bytes())
+        candidate=serial.capture(m.g.References(context['evidence']),context['save']('serial-request.json',transition),api)
+        candidate_ref=context['save']('serial-time-mismatch.json',candidate)
+        try:
+            serial.bind(m.g.References(context['evidence']),candidate_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+        except ValueError as error:
+            check('timeline differs from recorded original API' in str(error),'raw/recorded workflow time contradiction rejected')
+        else:raise AssertionError('accepted raw/recorded workflow time contradiction')
+        context['save'](prefix+filename,late)
+    late['updated_at']='2026-01-01T10:01:00Z'
+    run = runs[0]
+    jobs[run['id']] = [{'id':999,'run_id':run['id'],'run_attempt':1,'name':'fixture','status':'completed',
+        'conclusion':'success','started_at':'2026-01-01T10:00:10Z','completed_at':'2026-01-01T10:00:30Z','steps':[]}]
+    valid=reseal_timeline()
+    valid_ref=context['save']('serial-real-job.json',valid)
+    check(serial.bind(m.g.References(context['evidence']),valid_ref,group_scope,{'identity':identity},archives[0]['receipt'])['workflow_terminal_observed_at']=='2026-01-01T10:01:00Z',
+          'bound original jobs fit every completed workflow view')
+    # Both API views are recorded faithfully, but the root view contradicts its own job completion.
+    attempt_views[run['id']]=dict(run,updated_at='2026-01-01T10:03:00Z')
+    jobs[run['id']][0]['completed_at']='2026-01-01T10:02:00Z'
+    contradictory=reseal_timeline()
+    contradictory_ref=context['save']('serial-contradictory-completed-views.json',contradictory)
+    try:
+        serial.bind(m.g.References(context['evidence']),contradictory_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+    except ValueError as error:
+        check('job timeline is outside its workflow interval' in str(error),'each completed workflow view must cover its own jobs')
+    else:raise AssertionError('accepted contradictory completed workflow views')
+    jobs[run['id']][0]['completed_at']='2026-01-01T10:00:30Z'
+    valid=reseal_timeline()
+    valid_ref=context['save']('serial-later-metadata-view.json',valid)
+    check(serial.bind(m.g.References(context['evidence']),valid_ref,group_scope,{'identity':identity},archives[0]['receipt'])['workflow_terminal_observed_at']=='2026-01-01T10:03:00Z',
+          'a later metadata update remains a conservative bound when both completed views cover every job')
+    attempt_views.clear()
+    baseline_run=copy.deepcopy(run);baseline_job=copy.deepcopy(jobs[run['id']][0])
+    for label,change,reason in [
+            ('missing-run-time',lambda:run.update(created_at=None),'workflow timeline timestamp is missing'),
+            ('reversed-run',lambda:run.update(updated_at='2026-01-01T09:59:00Z'),'workflow timeline is reversed'),
+            ('missing-job-time',lambda:jobs[run['id']][0].update(started_at=None),'job timeline timestamp is missing'),
+            ('reversed-job',lambda:jobs[run['id']][0].update(started_at='2026-01-01T10:00:40Z'),'job timeline is outside its workflow interval')]:
+        change();candidate=reseal_timeline();candidate_ref=context['save']('serial-'+label+'.json',candidate)
+        try:serial.bind(m.g.References(context['evidence']),candidate_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+        except ValueError as error:check(reason in str(error),'specific invalid workflow/job timeline rejection: '+str(error))
+        else:raise AssertionError('accepted '+label)
+        run.clear();run.update(copy.deepcopy(baseline_run));jobs[run['id']][0]=copy.deepcopy(baseline_job)
+    jobs[run['id']]=[]
+    captured=reseal_timeline()
+    capture_ref=context['save']('serial-capture.json',captured)
     for changed_identity, archive_ref, reason in [
             (dict(identity, head_sha='f' * 40), archives[0]['receipt'], 'another variant scope'),
             (dict(identity, checkout_sha='f' * 40), archives[0]['receipt'], 'another variant scope'),
