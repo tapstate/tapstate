@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
+import com.hazelcast.map.IMap;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
@@ -34,6 +35,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
@@ -42,10 +44,50 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
 
 class BoundedPipelinePreviewExecutorTest {
+
+    @Test
+    void failureIsNotPublishedWhileItsPipelineLeaseIsStillBeingReleased() throws Exception {
+        HazelcastInstance member = member("preview-lease-release");
+        HazelcastInstance observedMember = spy(member);
+        IMap<String, String> leases = member.getMap(BoundedPipelinePreviewExecutor.LEASE_MAP);
+        IMap<String, String> observedLeases = spy(leases);
+        when(observedMember.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP))
+                .thenReturn(observedLeases);
+        CountDownLatch releasing = new CountDownLatch(1);
+        CountDownLatch allowRelease = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            releasing.countDown();
+            if (!allowRelease.await(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("the test did not allow the preview lease to be released");
+            }
+            return leases.remove(invocation.getArgument(0), invocation.getArgument(1));
+        }).when(observedLeases).remove(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        BoundedPipelinePreviewExecutor executor = executor(observedMember);
+        try {
+            var stream = executor.preview(new PipelinePreviewRequest(
+                    "run-release", "author", "pipeline", "output", 3, "sample", "candidate-hash",
+                    List.of("not: a tapstate resource"), Instant.now().plusSeconds(30)));
+
+            assertThat(releasing.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(leases.size()).isEqualTo(1);
+            java.util.concurrent.BlockingQueue<PipelinePreviewEvent> events = getField(stream, "events");
+            assertThat(events).isEmpty();
+
+            allowRelease.countDown();
+            assertThat(stream.next().kind()).isEqualTo("run.failed");
+            assertThat(leases.size()).isZero();
+        } finally {
+            allowRelease.countDown();
+            executor.close();
+            member.shutdown();
+        }
+    }
 
     @Test
     void interruptedCleanupWaitPreservesTheWorkerInterruptAndDefersMapCleanup() throws Exception {
