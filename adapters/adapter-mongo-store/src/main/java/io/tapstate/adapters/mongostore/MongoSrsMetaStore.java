@@ -974,10 +974,22 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
         Objects.requireNonNull(offset, "offset");
         migrateLegacyConsumers(miningChainId, true);
-        writeConsumer(miningChainId, session -> consumers.replaceOne(session,
-                consumerKey(miningChainId, offset.pipelineId()),
-                consumerDocument(miningChainId, offset),
-                new ReplaceOptions().upsert(true)));
+        writeConsumer(miningChainId, session -> {
+            Document key = consumerKey(miningChainId, offset.pipelineId());
+            Document replacement = consumerDocument(miningChainId, offset);
+            if (offset.sinkAcked() != null || !offset.sinkAckedByTable().isEmpty()
+                    || !offset.snapshotCompletedTables().isEmpty()) {
+                Document held = consumers.find(session, key).projection(Projections.include(WRITER_RUN)).first();
+                if (held != null) {
+                    // Retained sink state still needs evidence that its writers were accounted for
+                    // separately. Keep their expected set under a fresh identity with no old progress:
+                    // a writer from the replaced run must not be able to acknowledge the moved position.
+                    writerRunOf(held).ifPresent(run -> replacement.append(WRITER_RUN,
+                            writerRunDocument(java.util.UUID.randomUUID().toString(), run.expected())));
+                }
+            }
+            consumers.replaceOne(session, key, replacement, new ReplaceOptions().upsert(true));
+        });
     }
 
     @Override
