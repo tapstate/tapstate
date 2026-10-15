@@ -142,7 +142,9 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
                     .append("clusterId", context.clusterId())
                     .append("organizationName", context.organizationName())
                     .append("clusterName", context.clusterName())
-                    .append("region", context.region()));
+                    .append("region", context.region())
+                    .append("ec2PublicIp", context.ec2PublicIp())
+                    .append("egressAddressStatus", context.egressAddressStatus()));
         }
         return document;
     }
@@ -180,7 +182,8 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
         }
         try {
             return new CloudSessionContext(text(document, "organizationId"), text(document, "clusterId"),
-                    text(document, "organizationName"), text(document, "clusterName"), text(document, "region"));
+                    text(document, "organizationName"), text(document, "clusterName"), text(document, "region"),
+                    optionalText(document, "ec2PublicIp"), optionalText(document, "egressAddressStatus"));
         } catch (IllegalArgumentException invalid) {
             throw unreadable("clusterContext");
         }
@@ -216,6 +219,13 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
         if (!(value instanceof String text) || text.isBlank()) {
             throw unreadable(field);
         }
+        return text;
+    }
+
+    private static String optionalText(Document document, String field) {
+        Object value = document.get(field);
+        if (value == null) return null;
+        if (!(value instanceof String text) || text.isBlank()) throw unreadable(field);
         return text;
     }
 

@@ -218,15 +218,22 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
 
     record ExchangeResult(
             String jwt, String organizationId, String clusterId,
-            String organizationName, String clusterName, String region) {
+            String organizationName, String clusterName, String region,
+            String ec2PublicIp, String egressAddressStatus) {
         ExchangeResult(String jwt) {
-            this(jwt, null, null, null, null, null);
+            this(jwt, null, null, null, null, null, null, null);
+        }
+
+        ExchangeResult(String jwt, String organizationId, String clusterId,
+                String organizationName, String clusterName, String region) {
+            this(jwt, organizationId, clusterId, organizationName, clusterName, region, null, null);
         }
 
         ExchangeResult {
             if (!text(jwt)) throw new ProviderFailure();
             boolean noContext = organizationId == null && clusterId == null
-                    && organizationName == null && clusterName == null && region == null;
+                    && organizationName == null && clusterName == null && region == null
+                    && ec2PublicIp == null && egressAddressStatus == null;
             boolean completeContext = text(organizationId) && text(clusterId)
                     && text(organizationName) && text(clusterName) && text(region);
             if (!noContext && !completeContext) throw new ProviderFailure();
@@ -234,7 +241,8 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
 
         CloudSessionContext context() {
             return organizationId == null ? null
-                    : new CloudSessionContext(organizationId, clusterId, organizationName, clusterName, region);
+                    : new CloudSessionContext(organizationId, clusterId, organizationName, clusterName, region,
+                            ec2PublicIp, egressAddressStatus);
         }
     }
 
@@ -273,12 +281,13 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 String organizationName = exchanged.organizationName();
                 String clusterName = exchanged.clusterName();
                 String region = exchanged.region();
+                String ec2PublicIp = exchanged.ec2PublicIp();
                 if (!text(exchanged.orgId()) || !text(exchanged.clusterId())
                         || !text(organizationName) || !text(clusterName) || !text(region)) {
                     throw new ProviderFailure();
                 }
                 return new ExchangeResult(exchanged.jwt(), exchanged.orgId(), exchanged.clusterId(),
-                        organizationName, clusterName, region);
+                        organizationName, clusterName, region, ec2PublicIp, exchanged.egressAddressStatus());
             } catch (CloudControlPlaneException failure) {
                 logExchangeFailure(failure);
                 throw new ProviderFailure();
