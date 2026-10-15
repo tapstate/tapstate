@@ -100,6 +100,142 @@ class PublishedExamplesIT {
     assert len(value_method['parameters'])==4 and len(set(value_method['argument_digests']))==4
     null_digest=evidence.argument_digest([['null']]);empty_digest=evidence.argument_digest([['java.lang.String','']])
     assert null_digest in value_method['argument_digests'] and empty_digest in value_method['argument_digests']
+    def csv_controls():
+        global checks
+        # Quoted empty strings are values; unquoted empty cells remain null. These
+        # expected arguments are independent of the source parser and marker producer.
+        csv_source=root/'csv-source';csv_reports=root/'csv-reports'
+        put(csv_source,'pom.xml','<project><modules><module>core</module></modules></project>')
+        put(csv_source,'core/pom.xml',(source/'core/pom.xml').read_text())
+        csv_file=put(csv_source,'core/src/test/java/sample/CsvTest.java',"""package sample;
+    class CsvTest {
+      @ParameterizedTest @CsvSource(value = {
+        "'', metadata, metadata", "'', '', admin", ", metadata, metadata",
+        "'  padded  ', value, other", "'a,b','it''s',x", "'NULL', normal, tail"
+      }, nullValues = "NULL")
+      void csv(String first, String second, String third) {}
+    }""")
+        csv_inventory=root/'csv-inventory.json'
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(csv_inventory)])
+        csv_inv=json.loads(csv_inventory.read_text());csv_method=csv_inv['methods'][0]
+        golden=[['','metadata','metadata'],['','','admin'],[None,'metadata','metadata'],
+                ['  padded  ','value','other'],['a,b',"it's",'x'],[None,'normal','tail']]
+        golden_digests=[evidence.argument_digest([evidence.canonical_literal(value,'String') for value in row]) for row in golden]
+        assert csv_inv['complete'] and csv_method['argument_digests']==golden_digests
+        assert len(set(golden_digests))==6
+        csv_cases=[]
+        for number,arg in enumerate(golden_digests,1):
+            element=ET.Element('testcase',classname='sample.CsvTest',name=f'csv(String, String, String)[{number}]')
+            marker=dict(schema=1,phase='start',unique_id='csv-'+str(number),stable=True,**{'class':'sample.CsvTest'},method='csv',argument_digest=arg)
+            ET.SubElement(element,'system-out').text='tapstate.ci-case='+json.dumps(marker)+'\n'+'tapstate.ci-case='+json.dumps(marker|dict(phase='finish',status='executed'))+'\n'
+            csv_cases.append(element)
+        csv_suite=ET.Element('testsuite',name='sample.CsvTest',tests='6',failures='0',errors='0',skipped='0');csv_suite.extend(csv_cases)
+        csv_xml=put(csv_reports,'core/target/surefire-reports/TEST-sample.CsvTest.xml',ET.tostring(csv_suite,encoding='unicode'))
+        csv_observation=root/'csv-observation.json'
+        csv_command=['reports','--root',str(csv_reports),'--lane','ci','--inventory',str(csv_inventory),'--output',str(csv_observation)]
+        run(csv_command);assert json.loads(csv_observation.read_text())['complete']
+        run(['export-hashes','--input',str(csv_observation),'--output',str(root/'csv-hashes.json')])
+        pristine_csv=csv_xml.read_text();csv_before=save('csv-before.json',json.loads(csv_observation.read_text()))
+        csv_xml.write_text(pristine_csv.replace(golden_digests[0],golden_digests[2]))
+        run(csv_command)
+        run(['compare','--inventory',str(csv_inventory),'--before',str(csv_before),'--after',str(csv_observation),
+             '--output',str(root/'csv-comparison.json')],False,'case multiset differs')
+        csv_xml.write_text(pristine_csv.replace(golden_digests[0],'0'*64))
+        run(csv_command);assert not json.loads(csv_observation.read_text())['complete']
+        run(['export-hashes','--input',str(csv_observation),'--output',str(root/'bad-csv-hashes.json')],False,'unresolved case')
+        for record in ["'unterminated", "'value'garbage,other", '']:
+            try:evidence.csv_record(record,',')
+            except ValueError:checks+=1
+            else:raise AssertionError('accepted malformed/blank CSV record')
+        assert evidence.csv_record("''|  bare  |' a|b '",'|')==['','bare',' a|b ']
+        try:evidence.csv_record('one two',' ')
+        except ValueError:checks+=1
+        else:raise AssertionError('accepted unsupported whitespace delimiter')
+        original_csv_source=csv_file.read_text()
+        csv_file.write_text('package sample; class CsvTest { @ParameterizedTest @CsvSource("'
+            +chr(92)+'u005ctext,x") void csv(String first, String second) {} }')
+        target=root/'unicode-literal-csv.json'
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(target)])
+        assert not json.loads(target.read_text())['complete']
+        csv_file.write_text(original_csv_source)
+        csv_file.write_text(original_csv_source.replace('class CsvTest {','class CsvTest { static final String NIL = "NULL";')
+                            .replace('nullValues = "NULL"','nullValues = NIL'))
+        constant_csv=root/'constant-null-csv.json'
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(constant_csv)])
+        assert not json.loads(constant_csv.read_text())['complete']
+        csv_file.write_text(original_csv_source.replace('class CsvTest {',
+            'class CsvTest { static final String NIL = "NULL"; static class Inner { static final String NIL = "OTHER"; }')
+            .replace('nullValues = "NULL"','nullValues = NIL'))
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(root/'ambiguous-null-csv.json')])
+        assert not json.loads((root/'ambiguous-null-csv.json').read_text())['complete']
+        for impostor in ['// NIL = "OTHER";\n',
+                         'static final String NOTE = "NIL = \\"OTHER\\";";\n',
+                         'static final String NOTE = """\nNIL = "OTHER";\n""";\n']:
+            csv_file.write_text(original_csv_source.replace('class CsvTest {',
+                'class CsvTest {\n'+impostor+'static final String NIL = "NULL";')
+                .replace('nullValues = "NULL"','nullValues = NIL'))
+            target=root/'impostor-null-csv.json'
+            run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(target)])
+            value=json.loads(target.read_text())
+            assert not value['complete']
+        put(csv_source,'core/src/test/java/sample/Constants.java','package sample; class Constants { static final String NIL = "NULL"; }')
+        csv_file.write_text('package sample; import static sample.Constants.NIL; class CsvTest { '
+            '@ParameterizedTest @CsvSource(value={"NULL,x"}, nullValues=NIL) void csv(String first, String second) {} '
+            'void unrelated(){ String NIL="OTHER"; } }')
+        target=root/'unrelated-local-csv.json'
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(target)])
+        assert not json.loads(target.read_text())['complete']
+        csv_file.write_text('package sample; class CsvTest { static final String ROW="left,right"; '
+            '@ParameterizedTest @CsvSource(ROW) void csv(String first, String second) {} }')
+        target=root/'constant-row-csv.json'
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(target)])
+        assert not json.loads(target.read_text())['complete']
+        escaped_note='"""\n'+chr(92)+'"""\nNIL = "OTHER";\n"""'
+        csv_file.write_text('package sample; import static sample.Constants.NIL; class CsvTest { '
+            '@ParameterizedTest @CsvSource(value={"NULL,x"}, nullValues=NIL) void csv(String first, String second) {} '
+            'static final String NOTE = '+escaped_note+'; }')
+        target=root/'escaped-definition-csv.json'
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(target)])
+        value=json.loads(target.read_text())
+        assert not value['complete'] and any('CSV constant expressions' in gap.get('reason','') for gap in value['unresolved'])
+        csv_file.write_text(original_csv_source.replace('class CsvTest {',
+            'class CsvTest {\n// unicode escape '+chr(92)+'u0020\nstatic final String NIL="NULL";')
+            .replace('nullValues = "NULL"','nullValues = NIL'))
+        target=root/'unicode-preprocessing-csv.json'
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(target)])
+        assert not json.loads(target.read_text())['complete']
+        csv_file.write_text(original_csv_source.replace('nullValues = "NULL"','nullValues = Other.NIL'))
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(root/'unresolved-null-csv.json')])
+        assert not json.loads((root/'unresolved-null-csv.json').read_text())['complete']
+        csv_file.write_text(original_csv_source.replace('nullValues = "NULL"','emptyValue = "replacement"'))
+        run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(root/'unsupported-csv.json')])
+        assert not json.loads((root/'unsupported-csv.json').read_text())['complete']
+        for number,row in enumerate(["NIL, nullValues='NIL'", "left, delimiter='|'"]):
+            csv_file.write_text('package sample; class CsvTest { @ParameterizedTest @CsvSource('+json.dumps(row)+') void csv(String first, String second) {} }')
+            target=root/f'literal-csv-option-{number}.json'
+            run(['inventory','--root',str(csv_source),'--lane','ci','--output',str(target)])
+            value=json.loads(target.read_text())
+            expected=row.split(', ',1)
+            assert value['complete'] and value['methods'][0]['argument_digests']==[
+                evidence.argument_digest([['java.lang.String',item] for item in expected])]
+        block_source=root/'csv-block-source'
+        put(block_source,'pom.xml','<project><modules><module>core</module></modules></project>')
+        put(block_source,'core/pom.xml',(source/'core/pom.xml').read_text())
+        for number,text in enumerate(['"""\na,b\n #data,c\n"""','"""\n    a,b\n    #comment,ignored\n     #data,c\n    """']):
+            put(block_source,'core/src/test/java/sample/BlockTest.java',
+                'package sample; class BlockTest { @ParameterizedTest @CsvSource(textBlock = '+text+') void values(String first, String second) {} }')
+            target=root/f'csv-block-{number}.json'
+            run(['inventory','--root',str(block_source),'--lane','ci','--output',str(target)])
+            block_inv=json.loads(target.read_text())
+            assert block_inv['complete'] and block_inv['methods'][0]['argument_digests']==[
+                evidence.argument_digest([['java.lang.String','a'],['java.lang.String','b']]),
+                evidence.argument_digest([['java.lang.String','#data'],['java.lang.String','c']])]
+        escaped_block='"""\na,b\\s\n"""'
+        put(block_source,'core/src/test/java/sample/BlockTest.java',
+            'package sample; class BlockTest { @ParameterizedTest @CsvSource(textBlock = '+escaped_block+') void values(String first, String second) {} }')
+        run(['inventory','--root',str(block_source),'--lane','ci','--output',str(root/'escaped-csv-block.json')])
+        assert not json.loads((root/'escaped-csv-block.json').read_text())['complete']
+    csv_controls()
     omitted=json.loads(inventory.read_text())
     omitted_method=next(method for method in omitted['methods'] if method['method']=='values')
     omitted_method['parameters']=omitted_method['parameters'][:2];omitted_method['argument_digests']=omitted_method['argument_digests'][:2]

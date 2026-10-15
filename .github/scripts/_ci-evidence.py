@@ -6,7 +6,6 @@ missing provenance remain incomplete; existing shard and witness gates still run
 """
 import argparse
 from collections import Counter
-import csv
 from decimal import Decimal
 from datetime import datetime, timezone
 import hashlib
@@ -642,6 +641,76 @@ def published_policy(root, source, examples, sources, mode):
     return dict(cases=policies, ledger_serializer=dict(helper_sources=helper_sources, aliases=aliases), gate_sha256=gate_hash, published_source_sha256=digest(source.read_bytes()), synthetic_source_sha256=digest(synthetic_source.read_bytes()))
 
 
+def csv_literals(value):
+    """Admit literal strings only; Java constant scope requires independent enumeration."""
+    value = uncomment(value).strip()
+    if value.startswith('{') and value.endswith('}'):
+        value = value[1:-1]
+    entries = split_values(value)
+    require(all(re.fullmatch(r'"(?:\\.|[^"\\])*"', item) for item in entries),
+            'CSV constant expressions require independent enumeration')
+    return literals(value, '')
+
+
+def csv_record(row, delimiter):
+    """Preserve quoted empty/whitespace values while unquoted empty cells are null."""
+    whitespace = ''.join(chr(value) for value in range(33))
+    require(row.strip(whitespace) and len(delimiter) == 1 and delimiter not in whitespace and delimiter != "'",
+            'unsupported CSV record or delimiter')
+    cells, position = [], 0
+    while True:
+        start = position
+        while position < len(row) and row[position] in whitespace:
+            position += 1
+        if position < len(row) and row[position] == "'":
+            position += 1
+            value = []
+            while position < len(row):
+                char = row[position]; position += 1
+                if char == "'":
+                    if position < len(row) and row[position] == "'":
+                        value.append("'"); position += 1
+                    else:
+                        break
+                else:
+                    value.append(char)
+            else:
+                raise ValueError('unterminated CSV quoted field')
+            value = ''.join(value)
+            while position < len(row) and row[position] in whitespace:
+                position += 1
+            require(position == len(row) or row[position] == delimiter, 'unsupported CSV text after quoted field')
+        else:
+            while position < len(row) and row[position] != delimiter:
+                position += 1
+            raw = row[start:position]
+            require('\n' not in raw and '\r' not in raw, 'unquoted CSV newline requires independent enumeration')
+            value = raw.strip(whitespace) or None
+        cells.append(value)
+        if position == len(row):
+            return cells
+        position += 1
+
+
+def csv_text_block(value):
+    """Apply the bounded Java text-block indentation before default CSV comments."""
+    block = re.fullmatch(r'"""([\s\S]*?)"""', value)
+    require(block is not None, 'unsupported CSV text block')
+    raw = block.group(1).replace('\r\n', '\n').replace('\r', '\n')
+    opening = re.match(r'^[ \t]*\n', raw)
+    require(opening is not None and '\\' not in raw and
+            all(not char.isspace() or char in ' \t\n' for char in raw) and
+            all(ord(char) >= 32 or char in '\t\n' for char in raw),
+            'CSV text-block escapes or whitespace require independent enumeration')
+    lines = raw[opening.end():].split('\n')
+    indentation = [len(line) - len(line.lstrip(' \t')) for line in lines if line.strip(' \t')]
+    if not lines[-1].strip(' \t'):
+        indentation.append(len(lines[-1]))
+    common = min(indentation, default=0)
+    lines = [line[min(common, len(line) - len(line.lstrip(' \t'))):].rstrip(' \t') for line in lines]
+    return [line for line in lines if line.strip(' \t') and not line.startswith('#')]
+
+
 def source_parameters(root, source, declaration, sources):
     annotations, text = declaration['annotations'], source.read_text()
     if source.stem == 'PublishedExamplesIT' and declaration['method'] == 'thePublishedExampleRuns':
@@ -672,19 +741,26 @@ def source_parameters(root, source, declaration, sources):
         typename = dict(strings='String', booleans='boolean', ints='int', longs='long', doubles='double', floats='float', shorts='short', bytes='byte', chars='char').get(match.group(1))
         declaration['argument_digests'] = [argument_digest(with_injected([canonical_literal(v, typename)], declaration)) for v in raw_values]
     elif 'CsvSource' in annotations:
+        require('\\u' not in annotations['CsvSource'], 'CSV Unicode preprocessing requires independent enumeration')
         argument = uncomment(annotations['CsvSource']).strip()
-        delimiter = re.search(r"\bdelimiter\s*=\s*'(.)'", argument)
-        nulls = re.search(r'\bnullValues\s*=\s*(\{[\s\S]*?\}|"(?:\\.|[^"\\])*")', argument)
-        null_values = literals(nulls.group(1), text) if nulls else []
-        block = re.search(r'\btextBlock\s*=\s*"""([\s\S]*?)"""', argument)
-        if block:
-            rows = [line.strip() for line in block.group(1).splitlines() if line.strip() and not line.strip().startswith('#')]
+        entries = split_values(argument)
+        named = [re.fullmatch(r'(\w+)\s*=\s*([\s\S]+)', entry) for entry in entries]
+        require(not any(named) or all(named), 'mixed CSV annotation option forms')
+        options = {entry.group(1): entry.group(2) for entry in named if entry}
+        require(len(options) == sum(entry is not None for entry in named), 'duplicate CSV annotation option')
+        require(set(options) <= {'value', 'textBlock', 'delimiter', 'nullValues'},
+                'nondefault CSV options require independent enumeration')
+        delimiter = re.fullmatch(r"'(.)'", options['delimiter']) if 'delimiter' in options else None
+        require('delimiter' not in options or delimiter is not None, 'unsupported CSV delimiter literal')
+        null_values = csv_literals(options['nullValues']) if 'nullValues' in options else []
+        if 'textBlock' in options:
+            require('value' not in options, 'mixed CSV text block and value source')
+            rows = csv_text_block(options['textBlock'])
         else:
-            match = re.search(r'\bvalue\s*=\s*(\{[\s\S]*?\}|"(?:\\.|[^"\\])*")', argument)
-            rows = literals(match.group(1) if match else argument, text)
+            rows = csv_literals(options.get('value', argument))
         for row in rows:
-            parsed = next(csv.reader([row], delimiter=delimiter.group(1) if delimiter else ',', quotechar="'", skipinitialspace=True))
-            values.append([None if value.strip() in null_values or not value.strip() else value.strip() for value in parsed])
+            parsed = csv_record(row, delimiter.group(1) if delimiter else ',')
+            values.append([None if value in null_values else value for value in parsed])
         source_types = [typename for typename, injected in zip(declaration['parameter_types'], declaration['parameter_injected']) if not injected]
         require(all(len(row) == len(source_types) for row in values), 'CSV row and source parameter arity differs')
         declaration['argument_digests'] = [argument_digest(with_injected([canonical_literal(value, typename) for value, typename in zip(row, source_types)], declaration)) for row in values]
