@@ -3,6 +3,11 @@
 import copy
 import hashlib
 import importlib.util
+import json
+import subprocess
+import sys
+from unittest.mock import patch
+sys.dont_write_bytecode = True
 from pathlib import Path
 
 
@@ -166,6 +171,81 @@ def controls(context):
     result = m.basis_reader.source.variants.transition(m.g.References(context['evidence']), transition, api)
     check(result['source_trigger_policy']['trigger_policy_source_bound'] and result['archive_readback_verified'],
           'source-aware transition independently replays policy and raw archives')
+    serial = m.g.module('serial_fixture_readback', '_ci-serial-readback.py')
+    reference = context['save']('serial-request.json', transition)
+    captured = serial.capture(m.g.References(context['evidence']), reference, api)
+    compact = len(m.g.canonical(captured))
+    pretty = len((json.dumps(captured, indent=2, sort_keys=True) + '\n').encode())
+    check(pretty > compact, 'serialized receipt includes actual indentation cost')
+    with patch.object(serial, 'MAX_TRACE', (compact + pretty) // 2):
+        try:
+            serial.capture(m.g.References(context['evidence']), reference, api)
+        except ValueError as error:
+            check('serialized payload exceeds' in str(error), 'actual persisted size is bounded before writing')
+        else:
+            raise AssertionError('accepted indented serial receipt beyond its reader bound')
+    def passive(value=captured):
+        with patch.object(serial.v.groups.receipt, 'api', side_effect=AssertionError('passive consumer called GitHub')):
+            return serial.readback(m.g.References(context['evidence']), value)
+    check(passive() == captured['readback'] and captured['readback']['snapshot'] == result['snapshot'], 'passive trace independently reproduces source policy, original jobs/logs and terminal snapshot')
+    def refused(value, reason):
+        try:
+            passive(value)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            check(reason in str(error), 'specific serial readback rejection: ' + str(error))
+        else:
+            raise AssertionError('accepted serial capture mutation: ' + reason)
+    changed = copy.deepcopy(captured); changed['api_trace'].pop()
+    refused(changed, 'trace is incomplete')
+    changed = copy.deepcopy(captured); changed['api_trace'].append(copy.deepcopy(changed['api_trace'][0]))
+    refused(changed, 'unused responses')
+    changed = copy.deepcopy(captured); changed['api_trace'][0]['endpoint'] += '-foreign'
+    refused(changed, 'endpoint/order differs')
+    changed = copy.deepcopy(captured); changed['readback']['snapshot']['merge_sha'] = 'f' * 40
+    refused(changed, 'differs from independent replay')
+    changed = copy.deepcopy(captured); changed['input_files'].clear()
+    refused(changed, 'differs from independent replay')
+    changed = copy.deepcopy(captured); changed['request']['sha256'] = 'f' * 64
+    refused(changed, 'referenced input hash differs')
+    changed = copy.deepcopy(captured); changed['backend_response_attestation_proven'] = True
+    refused(changed, 'unsupported proof')
+    changed = copy.deepcopy(transition); changed.pop('trigger_policy')
+    try:
+        serial.capture(m.g.References(context['evidence']), context['save']('no-source-policy.json', changed), api)
+    except ValueError as error:
+        check('requires source-derived trigger policy' in str(error), 'unbound terminal declarations cannot be captured')
+    else:
+        raise AssertionError('captured an unbound serial transition')
+    capture_ref = context['save']('serial-capture.json', captured)
+    group_scope = {key: scope[key] for key in ('repository', 'pr', 'branch')}
+    identity = {**group_scope, 'head_sha': scope['head_sha'], 'base_sha': scope['base_sha'],
+                'checkout_sha': answer['checkout']['sha'], 'run_id': runs[0]['id']}
+    joined = serial.bind(m.g.References(context['evidence']), capture_ref, group_scope,
+                         {'identity': identity}, archives[0]['receipt'])
+    check(joined['recorded_transition_replayed'] and not joined['backend_response_attestation_proven'],
+          'group identity binds exact original receipt to independently replayed serial evidence')
+    for changed_identity, archive_ref, reason in [
+            (dict(identity, head_sha='f' * 40), archives[0]['receipt'], 'another variant scope'),
+            (dict(identity, checkout_sha='f' * 40), archives[0]['receipt'], 'another variant scope'),
+            (dict(identity, run_id=999999), archives[0]['receipt'], 'another archive or rerun'),
+            (identity, archives[-1]['receipt'], 'another archive or rerun')]:
+        try:
+            serial.bind(m.g.References(context['evidence']), capture_ref, group_scope,
+                        {'identity': changed_identity}, archive_ref)
+        except ValueError as error:
+            check(reason in str(error), 'serial group binding refuses wrong head/tree/run/receipt: ' + str(error))
+        else:
+            raise AssertionError('accepted foreign serial group binding')
+    manifest = context['evidence'] / capture_ref['path']
+    output = context['evidence'] / 'serial-passive-cli.json'
+    command = ['bash', str(Path(__file__).with_name('ci-variants.sh')), 'readback-transition',
+               '--manifest', str(manifest), '--evidence-root', str(context['evidence']), '--output', str(output)]
+    cli = subprocess.run(command, capture_output=True, text=True)
+    check(cli.returncode == 0 and json.loads(output.read_bytes())['snapshot'] == result['snapshot'],
+          'actual passive serial CLI succeeds: ' + cli.stderr)
+    original_output = output.read_bytes()
+    cli = subprocess.run(command, capture_output=True, text=True)
+    check(cli.returncode != 0 and output.read_bytes() == original_output, 'passive serial output is exclusive')
     missing = runs.pop()
     changed = copy.deepcopy(transition)
     changed['contract']['applicable_workflows'] = [run['path'] for run in runs]

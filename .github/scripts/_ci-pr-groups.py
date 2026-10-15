@@ -318,6 +318,21 @@ def group_inputs(refs, value):
     return result
 
 
+def serial_group_inputs(refs, value):
+    """Join the existing comparisons with mandatory source-bound serial evidence."""
+    require(isinstance(value.get('serial_readbacks'), dict) and set(value['serial_readbacks']) == {'A', 'B', 'C'},
+            'group requires serial readbacks for A/B/C')
+    result = group_inputs(refs, value)
+    serial = module('group_serial_readback', '_ci-serial-readback.py')
+    result['serial_readbacks'] = {name: serial.bind(refs, reference, value['scope'],
+            result['variants'][name], value['variants'][name]['archive'])
+            for name, reference in value['serial_readbacks'].items()}
+    result['source_bound_serial_transitions_replayed'] = True
+    result['backend_response_attestation_proven'] = False
+    result['limits'][1] = 'recorded source-bound serial traces are replayed; backend attestation and full sample acceptance remain unknown'
+    return result
+
+
 def impact(refs, value):
     require(value['group_state'] in ('pending', 'completed'), 'unknown group state')
     require(set(value['before']) == set(value['after']) == COMPONENTS, 'impact component set differs')
@@ -380,7 +395,7 @@ def head_status(scope, contract, request):
     require(commit['sha'] == merge and [parent['sha'] for parent in commit['parents']]
             == [pr['base']['sha'], scope['head_sha']], 'current merge parents differ')
     observed, check_ids = [], set()
-    for source in {scope['head_sha'], merge}:
+    for source in sorted({scope['head_sha'], merge}):
         for check in page_values(request, f'{prefix}/commits/{source}/check-runs?filter=all', 'check_runs'):
             require(check['head_sha'] == source, 'foreign check source')
             associations = check.get('pull_requests', [])
@@ -417,7 +432,7 @@ def head_status(scope, contract, request):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('group-inputs', 'compare-evidence', 'impact'):
+    for name in ('group-inputs', 'serial-group-inputs', 'compare-evidence', 'impact'):
         p = commands.add_parser(name)
         p.add_argument('--manifest', required=True)
         p.add_argument('--evidence-root', required=True)
@@ -436,7 +451,7 @@ def main():
         result = head_status(value['scope'], value['contract'], receipt.api)
     else:
         refs = References(args.evidence_root)
-        operation = {'group-inputs': group_inputs, 'compare-evidence': comparison, 'impact': impact}[args.command]
+        operation = {'group-inputs': group_inputs, 'serial-group-inputs': serial_group_inputs, 'compare-evidence': comparison, 'impact': impact}[args.command]
         result = operation(refs, value)
         result['input_files'] = refs.finish()
     require(checksum(manifest.read_bytes()) == manifest_hash, 'manifest changed during comparison')

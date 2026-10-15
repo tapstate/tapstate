@@ -98,6 +98,7 @@ with tempfile.TemporaryDirectory(prefix='ci-pr-group-smoke-') as temporary:
         next(entry for entry in group['comparisons'] if entry['after']==candidate and entry['request']['path']==request_path.name)['request']=updated
     def reconcile(value=group):return m.group_inputs(m.References(root),value)
     good=reconcile()
+    rejected(lambda:m.serial_group_inputs(m.References(root),group),'requires serial readbacks')
     check(good['declared_component_payloads_equal'] and len(good['comparisons_replayed'])==6,'A/B/C joins and replays all three existing comparators')
     check(not any(good[key] for key in ['first_complete_pr_sample_proven','group_equivalence_proven','whole_build_provenance_complete','latest_tip_verified','performance_accepted']),
           'declared equality and replayed comparisons never certify a whole sample or performance')
@@ -173,6 +174,9 @@ with tempfile.TemporaryDirectory(prefix='ci-pr-group-smoke-') as temporary:
     command=['bash',str(Path(sys.argv[1])/'ci-pr-groups.sh'),'group-inputs','--manifest',str(manifest),'--evidence-root',str(root),'--output',str(root/'result.json')]
     completed=subprocess.run(command,text=True,capture_output=True)
     check(completed.returncode==0,'CLI group join executes existing comparators: '+completed.stderr)
+    strict=command.copy();strict[strict.index('group-inputs')]='serial-group-inputs';strict[-1]=str(root/'strict.json')
+    denied=subprocess.run(strict,text=True,capture_output=True)
+    check(denied.returncode!=0 and 'requires serial readbacks' in denied.stderr,'strict CLI rejects a self-consistent group without serial source-policy proof')
     output=json.loads((root/'result.json').read_text())
     check(output['manifest_sha256']==hashlib.sha256(manifest.read_bytes()).hexdigest() and 'A/inventory.json' in output['input_files'],'CLI binds manifest and exact comparison inputs')
     completed=subprocess.run(command,text=True,capture_output=True)

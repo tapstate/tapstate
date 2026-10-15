@@ -445,10 +445,10 @@ def verify_source(refs, root, manifest, variant):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('prepare', 'verify-transition', 'switch', 'restore-local', 'rollback', 'verify-source'):
+    for name in ('prepare', 'verify-transition', 'switch', 'restore-local', 'rollback', 'verify-source', 'readback-transition'):
         p = commands.add_parser(name)
         p.add_argument('--manifest', required=True); p.add_argument('--evidence-root', required=True)
-        if name != 'verify-transition': p.add_argument('--root', required=True)
+        if name not in ('verify-transition', 'readback-transition'): p.add_argument('--root', required=True)
         if name in ('switch', 'restore-local'):
             p.add_argument('--journal', required=True)
         else: p.add_argument('--output', required=True)
@@ -457,7 +457,13 @@ def main():
     refs = groups.References(args.evidence_root)
     manifest = Path(args.manifest); raw = groups.file_bytes(manifest); value = groups.json_bytes(raw)
     if args.command == 'prepare': result = prepare(refs, args.root, value)
-    elif args.command == 'verify-transition': result = transition(refs, value, groups.receipt.api)
+    elif args.command in ('verify-transition', 'readback-transition'):
+        serial = groups.module('serial_transition_capture', '_ci-serial-readback.py')
+        require(manifest.absolute().is_relative_to(refs.root), 'serial manifest must be under the evidence root')
+        reference = {'path': manifest.absolute().relative_to(refs.root).as_posix(), 'sha256': groups.checksum(raw)}
+        refs.blob(reference)
+        result = (serial.capture(refs, reference, groups.receipt.api) if args.command == 'verify-transition'
+                  else serial.readback(refs, value))
     elif args.command == 'switch': result = operation(refs, args.root, value, args.variant, args.journal, groups.receipt.api)
     elif args.command == 'restore-local':
         result = restore_local(refs, args.root, value, args.journal, groups.receipt.api)
@@ -465,8 +471,11 @@ def main():
     else: result = verify_source(refs, args.root, value, args.variant)
     require(groups.checksum(manifest.read_bytes()) == groups.checksum(raw), 'manifest changed during operation')
     if args.command not in ('switch', 'restore-local'):
-        result['input_files'] = refs.finish(); result['manifest_sha256'] = groups.checksum(raw)
-        groups.write_new(Path(args.output), result)
+        if args.command == 'verify-transition':
+            groups.write_new_bytes(Path(args.output), serial.capture_bytes(result))
+        else:
+            result['input_files'] = refs.finish(); result['manifest_sha256'] = groups.checksum(raw)
+            groups.write_new(Path(args.output), result)
     print(json.dumps(result, sort_keys=True))
 
 
