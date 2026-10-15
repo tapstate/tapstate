@@ -74,11 +74,13 @@ jobs:
                           parsed = urllib.parse.urlsplit(location)
                           result['upload_location_is_ghcr'] = parsed.hostname == 'ghcr.io'
                           result['upload_location_is_package_storage'] = parsed.hostname == 'pkg-containers.githubusercontent.com'
+                          result['upload_location_is_singular'] = parsed.path.startswith('/v2/tapstate/tapstate-cloud/blobs/upload/')
+                          result['upload_location_is_plural'] = parsed.path.startswith('/v2/tapstate/tapstate-cloud/blobs/uploads/')
                           if (parsed.scheme != 'https' or parsed.username or parsed.password
                                   or parsed.port not in (None, 443)):
                               raise ValueError('Unexpected upload location')
                           if (parsed.hostname == 'ghcr.io'
-                                  and parsed.path.startswith('/v2/tapstate/tapstate-cloud/blobs/uploads/')):
+                                  and (result['upload_location_is_singular'] or result['upload_location_is_plural'])):
                               cleanup_headers = headers
                           elif parsed.hostname == 'pkg-containers.githubusercontent.com':
                               # Storage URLs carry their own authorization; never forward the registry token.
