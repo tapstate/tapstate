@@ -33,6 +33,8 @@ def project(refs, root, request):
                  for name in input_facts['input_member_hashes']}
     observed = snapshots['build']
     dependency_fields = ('dependency_repository_files', 'dependency_coordinate_models', 'dependency_producer_facts')
+    if 'observed_resolved_maven_artifacts' in input_facts:
+        dependency_fields += ('resolved_maven_artifacts',)
     require(all(all(isinstance(value.get(field), dict) for field in dependency_fields) for value in snapshots.values()),
             'component dependency fields missing')
     # Available cache extras can differ. The original input comparator above

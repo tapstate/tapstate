@@ -13,6 +13,7 @@ spec.loader.exec_module(partition)
 g, require = partition.g, partition.require
 components = g.module('delta_components', '_ci-group-components.py')
 test_jars = g.module('delta_test_jars', '_ci-test-jar-inputs.py')
+maven_artifacts = g.module('delta_maven_artifacts', '_ci-maven-artifacts.py')
 POLICY_FIELDS = {('I', field) for field in ('methods', 'class_contracts', 'sources', 'entry_contract', 'test_packaged_outputs')} | {('R', 'workflows')}
 
 
@@ -43,19 +44,42 @@ def policy_entries(refs, reference):
     return entries
 
 
+def original_resolved_identities(snapshot, consumers, entry, gav, kind):
+    packet, native = snapshot.get('resolved_maven_artifacts'), []
+    if packet is None:
+        return None
+    reactor = packet.get('reactor')
+    if not isinstance(reactor, dict) or reactor.get('unresolved') or maven_artifacts.is_reactor(reactor, gav):
+        return None
+    for consumer in sorted(consumers):
+        observed = maven_artifacts.consumer_identity(packet, consumer, entry['identity'])
+        artifact = observed.get('artifact') if observed is not None else None
+        if not (isinstance(artifact, dict) and artifact.get('gav') == gav
+                and artifact.get('type') == kind and artifact.get('classifier') is None
+                and artifact.get('sha256') == entry['sha256'] and artifact.get('size') == entry['size']
+                and isinstance(artifact.get('scopes'), list) and artifact['scopes']
+                and all(scope in maven_artifacts.SCOPES for scope in artifact['scopes'])):
+            return None
+        native.append({'consumer': consumer, **observed})
+    return native or None
+
+
 def resolved_dependency_facts(payload, test_outputs=None):
     dependencies, outputs = payload['D'], payload['P']['packaged_outputs']
-    used, facts, gaps = {}, {}, []
-    for entries in dependencies['resolved_test_classpaths'].values():
+    used, facts, gaps, consumers = {}, {}, [], {}
+    for consumer, entries in dependencies['resolved_test_classpaths'].items():
         for entry in entries:
             identity = entry['identity']
             if identity.startswith('repository/'):
                 if identity in used and g.canonical(used[identity]) != g.canonical(entry):
                     gaps.append(identity + ': conflicting module classpath bindings')
                 used[identity] = entry
+                consumers.setdefault(identity, set()).add(consumer)
+    has_native = any('resolved_maven_artifacts' in peer for peer in dependencies['peer_dependency_observations'].values())
     for identity, entry in sorted(used.items()):
         path = identity.removeprefix('repository/')
-        if not path.endswith('.jar'):
+        kind = 'pom' if path.endswith('.pom') else 'jar' if path.endswith('.jar') else None
+        if kind is None or kind == 'pom' and not has_native:
             gaps.append(identity + ': unsupported repository classpath entry')
             continue
         role = test_jars.classpath_role(entry, test_outputs or {})
@@ -65,34 +89,60 @@ def resolved_dependency_facts(payload, test_outputs=None):
                 'metadata': record['metadata'], 'mode': record['output']['mode'],
                 'producer_runtime_inputs': record['producer_runtime_inputs']}}
             continue
-        if path.startswith('io/tapstate/'):
+        first_party = path.startswith('io/tapstate/')
+        if first_party:
             matches = {name: value for name, value in outputs.items()
                        if Path(name).name == Path(path).name and value['sha256'] == entry['sha256']
                        and value['size'] == entry['size']}
-            if len(matches) == 1:
+            gav = maven_artifacts.repository_coordinates(path)
+            declared = (gav is not None and all(isinstance(value.get('resolved_maven_artifacts'), dict)
+                and maven_artifacts.is_reactor(value['resolved_maven_artifacts']['reactor'], gav)
+                for value in dependencies['peer_dependency_observations'].values())) if has_native else True
+            if len(matches) == 1 and declared:
                 facts[identity] = {'recorded_reactor_output': matches}
-            else:
+                continue
+            if not has_native:
                 gaps.append(identity + ': unique recorded reactor output missing')
-            continue
+                continue
         peers = []
         for peer, snapshot in sorted(dependencies['peer_dependency_observations'].items()):
-            producer = snapshot['dependency_producer_facts'].get(path)
-            pom_path = producer.get('pom_path') if isinstance(producer, dict) else None
+            producer = snapshot['dependency_producer_facts'].get(path) if kind == 'jar' else None
+            pom_path = producer.get('pom_path') if isinstance(producer, dict) else path if kind == 'pom' else None
             model = snapshot['dependency_coordinate_models'].get(pom_path)
             available = snapshot['dependency_repository_files']
-            verified = (isinstance(producer, dict) and isinstance(model, dict)
-                and producer.get('archive_type_verified') is True and producer.get('producer_identity_verified') is True
-                and model.get('coordinate_type_verified') is True and producer.get('gav') == model.get('gav')
+            model_bound = (isinstance(model, dict) and model.get('coordinate_type_verified') is True
                 and isinstance(model.get('gav'), list) and len(model['gav']) == 3
                 and all(isinstance(part, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+-]*', part) for part in model['gav'])
                 and pom_path == '/'.join([model['gav'][0].replace('.', '/'), model['gav'][1], model['gav'][2],
                                          model['gav'][1] + '-' + model['gav'][2] + '.pom'])
-                and available.get(path) == producer.get('sha256') == entry['sha256']
-                and available.get(pom_path) == producer.get('pom_sha256') == model.get('sha256')
+                and available.get(pom_path) == model.get('sha256')
                 and isinstance(model.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', model['sha256']))
+            parent = model.get('parent') if isinstance(model, dict) else None
+            parent_bound = parent is None or (isinstance(parent, dict) and isinstance(parent.get('gav'), list)
+                and len(parent['gav']) == 3 and all(isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+-]*', v) for v in parent['gav'])
+                and parent.get('path') == '/'.join([parent['gav'][0].replace('.', '/'), parent['gav'][1], parent['gav'][2],
+                    parent['gav'][1] + '-' + parent['gav'][2] + '.pom'])
+                and isinstance(parent.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', parent['sha256'])
+                and available.get(parent['path']) == parent['sha256'])
+            model_bound = model_bound and parent_bound
+            if kind == 'pom':
+                verified = model_bound and model.get('packaging') == 'pom' and model['sha256'] == entry['sha256']
+            else:
+                verified = (model_bound and isinstance(producer, dict) and producer.get('archive_type_verified') is True
+                    and producer.get('gav') == model['gav'] and available.get(path) == producer.get('sha256') == entry['sha256']
+                    and producer.get('pom_sha256') == model['sha256'])
+            native = None
+            if verified and (has_native or kind == 'pom' or first_party or producer.get('producer_identity_verified') is not True):
+                native = original_resolved_identities(snapshot, consumers[identity], entry, model['gav'], kind)
+                verified = native is not None
             if not verified:
-                gaps.append(identity + ': ' + peer + ' coordinate/producer identity missing or unverified')
-            peers.append({'producer': producer, 'model': model})
+                reason = ('coordinate/producer or original resolved identity missing or unverified'
+                          if 'resolved_maven_artifacts' in snapshot else 'coordinate/producer identity missing or unverified')
+                gaps.append(identity + ': ' + peer + ' ' + reason)
+            fact = {'producer': producer, 'model': model}
+            if verified and native:
+                fact['original_maven_resolved_identities'] = native
+            peers.append(fact)
         if not peers:
             gaps.append(identity + ': dependency peers missing')
         facts[identity] = sorted({g.canonical(value) for value in peers})

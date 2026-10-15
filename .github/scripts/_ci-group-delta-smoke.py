@@ -37,26 +37,27 @@ def rejected(call, message):
         raise AssertionError('accepted ' + message)
 
 
-def controls(root, contexts, unused_complete, unused_added):
-    def original_event(name, context, case_request):
-        if case_request is None:
-            scope = context['scope']
-            context['event'].update(schema=1, event_payload_complete=True, ref='refs/pull/7/merge', pull_request={
-                'number': 7, 'action': 'synchronize', 'head_repository': scope['repository'],
-                'base_repository': scope['repository'], 'head_ref': scope['branch'], 'base_ref': 'main',
-                'head_sha': scope['head_sha'], 'base_sha': scope['base_sha']})
-            context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(context['event'])
-            return
-        run = g.load(context['evidence'] / 'run/run.json')
-        index = 'ABC'.index(name)
-        run.update(status='completed', conclusion='success', path='.github/workflows/ci.yml',
-                   created_at='2026-10-14T00:0' + str(index * 2) + ':00Z',
-                   updated_at='2026-10-14T00:0' + str(index * 2 + 1) + ':00Z')
-        context['save']('run/run.json', run)
-        context['source_request']['archive'] = context['seal']()
-        context['request']['source'] = context['save']('source-request.json', context['source_request'])
-        case_request['archive_inputs'] = context['save']('input-request.json', context['request'])
+def original_event(name, context, case_request):
+    if case_request is None:
+        scope = context['scope']
+        context['event'].update(schema=1, event_payload_complete=True, ref='refs/pull/7/merge', pull_request={
+            'number': 7, 'action': 'synchronize', 'head_repository': scope['repository'],
+            'base_repository': scope['repository'], 'head_ref': scope['branch'], 'base_ref': 'main',
+            'head_sha': scope['head_sha'], 'base_sha': scope['base_sha']})
+        context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(context['event'])
+        return
+    run = g.load(context['evidence'] / 'run/run.json')
+    index = 'ABC'.index(name)
+    run.update(status='completed', conclusion='success', path='.github/workflows/ci.yml',
+               created_at='2026-10-14T00:0' + str(index * 2) + ':00Z',
+               updated_at='2026-10-14T00:0' + str(index * 2 + 1) + ':00Z')
+    context['save']('run/run.json', run)
+    context['source_request']['archive'] = context['seal']()
+    context['request']['source'] = context['save']('source-request.json', context['source_request'])
+    case_request['archive_inputs'] = context['save']('input-request.json', context['request'])
 
+
+def controls(root, contexts, unused_complete, unused_added):
     partition_request, inventories, unused = fixture.prepare_request(root, contexts, original_event)
 
     def save(name, value):

@@ -60,9 +60,40 @@ D ordered resolved classpaths must otherwise be equal before comparison readines
 different actual dependencies remain `needs_review` and cannot be waived by this
 policy. Peer cache/model/producer observation deltas
 remain explicit side facts only after the actually resolved entries have been
-checked. External repository JARs require hash-bound captured model coordinates
-and verified archive/producer identity from every peer; missing or false facts
-remain `unknown`, even when classpath bytes match across all variants. Reactor
+checked. External repository JARs require hash-bound captured model coordinates,
+verified archive type and matching recorded JAR/POM bytes from every peer. Their
+identity can come from verified embedded producer metadata or an original
+`resolved_maven_artifacts` capture independently replayed by the archive reader.
+The latter requires matching source-bound consumer coordinates and every observed
+resolved Maven artifact row for each actual classpath consumer: default JAR type (or aggregate POM type),
+null classifier, canonical coordinates, file version reference, content hash,
+size and recorded scopes. When any peer has this capture, all peers must retain
+these facts for every used non-reactor repository dependency, including JARs
+with verified embedded identity. A matching row cannot hide conflicting bytes.
+Captured external dependency scope differences remain input differences. This supports JARs without recognized
+embedded coordinates without changing their original
+`producer_identity_verified: false` fact. It proves recorded Maven resolution,
+not archive producer identity or actual class consumption.
+
+Actual aggregate POM classpath entries use a separate bounded path: the literal
+model must have POM packaging, its recorded bytes must match the classpath, and
+original resolved artifact records must declare POM type. They never acquire a
+JAR producer or ZIP claim. A first-party namespace alone does not establish a
+reactor producer. Current captures bind source-declared module coordinates
+(including literal profile module declarations) and observed Maven projects;
+a non-reactor repository dependency requires its own original resolved records.
+The recorder adds only the actually used non-reactor JAR/POM and literal parent
+POM hashes omitted by the legacy namespace filter. It neither builds that
+dependency nor follows repository URLs, evaluates dependency-model expressions or resolves an
+external effective model. Literal inherited coordinates retain their existing
+parent-byte requirement.
+
+The optional capture binds the recorder and both helper source files. Current
+peers/phases cannot omit it. Legacy captures without it retain their original
+component shape and strict unknowns; no caller flag, D policy or filename alone
+can supply the missing proof. Unsupported consumer/reactor models, classifier forms,
+coordinates or observations stay unknown. All repository dependency JAR and POM byte changes
+still block comparison readiness. Reactor
 JARs require a unique matching recorded packaged output by filename/hash/size.
 Changed facts for a used dependency remain `needs_review`. These are bounded
 captured identities; they do not prove complete build consumption or runtime

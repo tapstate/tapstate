@@ -10,6 +10,14 @@ The summary records configured implementation names, effective-model hashes, act
 
 Declared source/run scope is not independent proof of every consumed byte. Registered source roots do not prove compiler consumption. Fully injected parameter values, selected or forked compiler, annotation processors, external generators and whole JDK installation remain unverified. Missing nonregular-file identities remain explicit unknowns. The original raw event-byte hash is retained as a declaration; only the parsed metadata's canonical hash can be replayed from the summary. Whole-build provenance, capability, PR-first-sample and performance acceptance are never inferred from these facts.
 
+Current input recording can derive a hash-only `resolved_maven_artifacts` field
+from these existing observations when its source helpers are tracked. It matches
+each original consumer POM identity and resolved default JAR/aggregate-POM record to the ordered
+classpath's coordinates and bytes, retaining scopes and unresolved cases. Archive
+readback repeats this derivation from the original metadata and source files. This
+adds no observer event, Maven invocation or raw dependency upload; it does not
+claim embedded producer identity, actual consumption or whole provenance.
+
 For local use, create a task-owned work directory outside the checkout and dependency repository, then pass it as `--work-dir` with a new `--output` file and the explicit `--shard-id`. Pass the unchanged Maven command after `--`. The wrapper refuses narrowed reactor commands, extension overrides, dirty tracked source, reused output and incomplete or inconsistent event observations.
 
 `ci-build-observation-smoke.sh` exercises scoped producer/consumer validation and original Git/ZIP archive readback. Actual full-product and Linux runner behavior must be recorded separately; offline controls do not establish CI or performance acceptance.

@@ -156,7 +156,7 @@ def controls(root, contexts, complete, added):
           'exclusive output preserves prior evidence')
 
 
-def cohort(source_case=None, complete=True, added=False, callback=controls, dependency_metadata=False, test_jar=False):
+def cohort(source_case=None, complete=True, added=False, callback=controls, dependency_metadata=False, test_jar=False, resolved_artifacts=False):
     with tempfile.TemporaryDirectory(prefix='ci-case-partition-') as temporary:
         root, contexts = Path(temporary).resolve(), {}
 
@@ -176,7 +176,7 @@ def cohort(source_case=None, complete=True, added=False, callback=controls, depe
                 candidate = original.replace('void holds() {}', 'void holds() {} @Test void added() {}')
                 options['case_variants'] = {'A': original, 'B': candidate, 'C': candidate}
             fixture.run(accept_context, only_callback=True, variant=name, run_id=40 + index,
-                        temporary_parent=root, dependency_metadata=dependency_metadata, test_jar=test_jar, **options)
+                        temporary_parent=root, dependency_metadata=dependency_metadata, test_jar=test_jar, resolved_artifacts=resolved_artifacts, **options)
 
         # Independent Git fixtures must share the same original base commit.
         with patch.dict(os.environ, GIT_AUTHOR_DATE='2026-10-14T00:00:00+00:00',

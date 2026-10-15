@@ -89,6 +89,19 @@ class/resource bytes are independently read from result ZIPs. Inherited loaders,
 actual class consumption and whole-build provenance stay unproven. See
 `ci-group-delta.md` for the bounded test-input partition and strict fallback.
 
+Original inputs can also contain `resolved_maven_artifacts`. Readback re-derives
+this field from the source-bound Maven observation and original local-parent
+consumer POMs, checks the fixed recorder/helper source hashes, and binds default
+repository JAR/aggregate-POM coordinates, resolved file SHA-256/size and scopes to every actual
+classpath consumer. All observed resolved rows must agree. JAR archive type, literal POM model/parent hashes and JAR/POM byte requirements
+remain separate conditions. Source-declared and observed reactor coordinates
+prevent treating a missing owned output as an external dependency; first-party
+repository dependencies outside that reactor retain their own byte/model facts.
+Embedded producer identities and actual class consumption are not upgraded.
+Current peers and worker phases must retain the same capture. Legacy absence
+keeps the original output/component shape; adding this support does not rewrite
+old archives or infer a new capture from an old summary.
+
 ZIP names are canonical, unique and bounded. Only regular files/directories are
 accepted; links, special modes, encryption, traversal and file-as-parent entries
 reject. The evidence reference reader bounds each raw input to 64 MiB. ZIPs allow

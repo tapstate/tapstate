@@ -47,7 +47,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def packaged_test_fixture(pre, work, bytecode):
+def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False):
     """Protocol bytes and native-shaped observations; this does not run Maven or compile Java."""
     roles = m.test_jars
     path = 'fixture/target/fixture-1-tests.jar'
@@ -66,11 +66,13 @@ def packaged_test_fixture(pre, work, bytecode):
     pre['resolved_test_classpaths']['consumer'] = [dict(identity='repository/io/tapstate/fixture/1/fixture-1-tests.jar',
                                                        sha256=g.checksum(raw), size=len(raw), own_classes=own)]
     files = {}
-    def reference(data, label):
-        sha, identity = g.checksum(data), g.checksum(label.encode())
-        key = g.checksum((identity + ':' + str(len(data)) + ':' + sha).encode())
-        files[key] = dict(state='observed-file', size=len(data), sha256=sha, path_identity_sha256=identity)
+    def observed_digest(sha, size, label):
+        identity = g.checksum(label.encode())
+        key = g.checksum((identity + ':' + str(size) + ':' + sha).encode())
+        files[key] = dict(state='observed-file', size=size, sha256=sha, path_identity_sha256=identity)
         return key
+    def reference(data, label):
+        return observed_digest(g.checksum(data), len(data), label)
     plugin_bytes = b'bounded plugin protocol fixture'
     plugin_file, output_file = reference(plugin_bytes, 'plugin.jar'), reference(raw, 'fixture-tests.jar')
     plugin_path = 'org/apache/maven/plugins/maven-jar-plugin/3.4.2/maven-jar-plugin-3.4.2.jar'
@@ -83,9 +85,17 @@ def packaged_test_fixture(pre, work, bytecode):
                    maven_core={'file': plugin_file}, major_jvm_file_identities={n: {'file': plugin_file}
                    for n in ('release', 'bin/java', 'lib/modules', 'lib/ct.sym')}, capture_phase='first-configured-mojo',
                    whole_JDK_installation_proven=False, selected_or_forked_compiler_proven=False)
+    external_dependencies = []
+    if resolved_artifacts:
+        for entry in pre['resolved_test_classpaths']['fixture']:
+            relative = entry['identity'].removeprefix('repository/')
+            parts = Path(relative).parts
+            external_dependencies.append(dict(group='.'.join(parts[:-3]), artifact=parts[-3], version=parts[-2],
+                type=Path(relative).suffix.removeprefix('.'), classifier=None, scope='test', resolved=True,
+                file=observed_digest(entry['sha256'], entry['size'], relative)))
     rows = []
     for project, execution, goal, implementation, dependencies in [
-            ('io.tapstate:fixture:1', 'test-jar', 'test-jar', 'TestJarMojo', []),
+            ('io.tapstate:fixture:1', 'test-jar', 'test-jar', 'TestJarMojo', external_dependencies),
             ('io.tapstate:consumer:1', 'default-jar', 'jar', 'JarMojo', [dependency])]:
         common = dict(project=project, execution=execution, goal=goal,
                       plugin='org.apache.maven.plugins:maven-jar-plugin:3.4.2', fully_injected_parameter_values='not-observed')
@@ -115,9 +125,13 @@ def packaged_test_fixture(pre, work, bytecode):
         observer_source_sha256=source_hash, observer_jar_sha256='4' * 64,
         **observer.observation_summary(json.dumps(metadata).encode()))
     pre['packaged_test_outputs'] = roles.capture(lambda n: (work / n).read_bytes(), lambda n: raw if n == path else None, pre)
+    if resolved_artifacts:
+        pre['resolved_maven_artifacts'] = m.maven_artifacts.capture(pre, lambda n: (work / n).read_bytes())
+        m.maven_artifacts.validate(pre['resolved_maven_artifacts'], pre, lambda n: (work / n).read_bytes())
+    return raw
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -127,11 +141,12 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         subprocess.run(['git', 'init', '-q', str(main)], check=True)
         for key, value in [('user.name', 'Fixture'), ('user.email', 'fixture@example.test'), ('commit.gpgsign', 'false')]:
             v.git(main, 'config', key, value)
+        assert not resolved_artifacts or test_jar, 'resolved artifact fixture requires original Maven observations'
         if test_jar:
             assert not two_workers and test_resource_bytes is None, 'bounded test-JAR fixture uses one complete owner class'
             maven_source = True
             extra_source_files = dict(extra_source_files or {})
-            for name in m.test_jars.PRODUCERS:
+            for name in (*m.test_jars.PRODUCERS, *(m.maven_artifacts.PRODUCERS if resolved_artifacts else ())):
                 extra_source_files[name] = Path(__file__).with_name(Path(name).name).read_bytes()
             extra_source_files['pom.xml'] = ('<project><groupId>io.tapstate</groupId><artifactId>parent</artifactId>'
                 '<version>${revision}</version><properties><revision>1</revision></properties><packaging>pom</packaging>'
@@ -145,6 +160,10 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             extra_source_files['consumer/pom.xml'] = ('<project>' + parent + '<artifactId>consumer</artifactId><dependencies>'
                 '<dependency><groupId>io.tapstate</groupId><artifactId>fixture</artifactId><version>${revision}</version>'
                 '<type>test-jar</type><classifier>tests</classifier><scope>test</scope></dependency></dependencies></project>')
+        if resolved_artifacts:
+            extra_source_files['fixture/pom.xml'] = extra_source_files['fixture/pom.xml'].replace('</project>',
+                '<dependencies><dependency><groupId>example</groupId><artifactId>lib</artifactId><version>1</version>'
+                '<scope>test</scope></dependency></dependencies></project>')
         (main / 'fixture.cfg').write_text('base\n')
         (main / 'pom.xml').write_text('<project><modelVersion>4.0.0</modelVersion><groupId>io.tapstate</groupId><artifactId>parent</artifactId><version>1</version><packaging>pom</packaging><modules><module>fixture</module></modules></project>')
         (main / 'fixture/src/test/java/io/tapstate/fixture').mkdir(parents=True)
@@ -263,7 +282,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         if test_resource_bytes is not None:
             pre['test_resource_files']={name:g.checksum(raw) for name,raw in test_resource_bytes.items()}
         if test_jar:
-            packaged_test_fixture(pre, work, bytecode)
+            packaged_raw = packaged_test_fixture(pre, work, bytecode, resolved_artifacts=resolved_artifacts)
         post = copy.deepcopy(pre)
         post['phase'] = 'post-test-before-pack'
         binding = {'execution': 'github-actions', 'run_id': str(run_id), 'run_attempt': 1}

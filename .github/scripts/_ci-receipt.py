@@ -370,6 +370,13 @@ def test_jar_inputs_module():
     return value
 
 
+def maven_artifacts_module():
+    spec = importlib.util.spec_from_file_location('receipt_maven_artifacts', Path(__file__).with_name('_ci-maven-artifacts.py'))
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
 def inputs(args):
     root = Path(args.root).resolve()
     require(Path(git(root, 'rev-parse', '--show-toplevel')).resolve() == root, 'input root must be the actual product checkout')
@@ -494,6 +501,25 @@ def inputs(args):
             lambda name: shards.owned_path(root, name).read_bytes(),
             lambda name: shards.owned_path(root, name).read_bytes(), value)
         roles.validate(value['packaged_test_outputs'], value, lambda name: shards.owned_path(root, name).read_bytes())
+    if 'maven_execution_observation' in value and '.github/scripts/_ci-maven-artifacts.py' in source_files:
+        artifacts = maven_artifacts_module()
+        if all(name in source_files for name in artifacts.PRODUCERS):
+            repository = Path(args.repo_local).resolve()
+            def read_repository(name):
+                path = shards.owned_path(repository, name)
+                require(path.is_file() and path.stat().st_size <= 1024 * 1024, 'repository POM unavailable or exceeds bound')
+                return path.read_bytes()
+            extra = artifacts.additional_repository_paths(value, lambda name: shards.owned_path(root, name).read_bytes(), read_repository)
+            for name in extra:
+                path = shards.owned_path(repository, name)
+                if path.exists():
+                    require(path.is_file() and not path.is_symlink(), 'unsafe non-reactor repository input')
+                    value['dependency_repository_files'][name] = digest(path)
+            if extra:
+                value['dependency_coordinate_models'], value['dependency_producer_facts'] = dependency_models(
+                    repository, value['dependency_repository_files'])
+            value['resolved_maven_artifacts'] = artifacts.capture(value, lambda name: shards.owned_path(root, name).read_bytes())
+            artifacts.validate(value['resolved_maven_artifacts'], value, lambda name: shards.owned_path(root, name).read_bytes())
     if args.resolve_classpath:
         expected_modules = {t['module'] for t in shards.discover(root)}
         require(expected_modules <= set(classpaths), 'selected test module classpaths missing: ' + str(sorted(expected_modules - set(classpaths))))
@@ -678,6 +704,11 @@ def compare_input_snapshots(plan, aggregate, workers):
     if has_test_packages:
         require(all(value is not None for value in test_packages), 'test-JAR capture missing from a current peer')
         require(all(value == test_packages[0] for value in test_packages), 'independent test-JAR captures differ')
+    artifact_packets = [value.get('resolved_maven_artifacts') for value in [aggregate, *workers.values()]]
+    has_artifacts = any(value is not None for value in artifact_packets)
+    if has_artifacts:
+        require(all(value is not None for value in artifact_packets), 'resolved Maven artifact capture missing from a current peer')
+        require(all(value == artifact_packets[0] for value in artifact_packets), 'independent resolved Maven artifact captures differ')
     runner = compare_runner_contexts(aggregate, workers)
     maven = compare_maven_observations(aggregate, workers)
     result = dict(schema=1, type='independent-build-input-hashes', source_sha=source,
@@ -689,6 +720,8 @@ def compare_input_snapshots(plan, aggregate, workers):
         result['compared_fields'].append('test_resource_files')
     if has_test_packages:
         result['compared_fields'].append('packaged_test_outputs')
+    if has_artifacts:
+        result['compared_fields'].append('resolved_maven_artifacts')
     if runner is not None:
         result['runner_context'] = runner
     if maven is not None:

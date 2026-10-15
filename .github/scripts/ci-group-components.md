@@ -48,3 +48,8 @@ proof flags remain false.
 The offline smoke uses the shared original Git/ZIP case fixture and rejects
 omitted facts and foreign bindings. Its bytecode/dependency declarations are
 synthetic protocol data, not actual compiled build or CI evidence.
+
+When original inputs contain `resolved_maven_artifacts`, D also retains each
+peer's independently replayed capture. It keeps the original producer facts,
+including unknown embedded identities, alongside the distinct recorded Maven
+resolution facts. Legacy inputs do not gain this field during readback.

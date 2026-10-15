@@ -25,6 +25,7 @@ _spec.loader.exec_module(source)
 g, require = source.groups, source.require
 shards = g.module('archive_shards', '_ci-shards.py')
 test_jars = g.module('archive_test_jars', '_ci-test-jar-inputs.py')
+maven_artifacts = g.module('archived_maven_artifacts', '_ci-maven-artifacts.py')
 MAX_MEMBER = 64 * 1024 * 1024
 MAX_TOTAL = 512 * 1024 * 1024
 
@@ -142,7 +143,7 @@ def checkout_poms(raw):
     poms = {}
     with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as archive:
         for item in archive:
-            if item.isfile() and (item.name == 'pom.xml' or item.name.endswith('/pom.xml') or item.name in test_jars.PRODUCERS):
+            if item.isfile() and (item.name == 'pom.xml' or item.name.endswith('/pom.xml') or item.name in (*test_jars.PRODUCERS, *maven_artifacts.PRODUCERS)):
                 require(item.size <= 1024 * 1024, 'test-JAR source POM exceeds budget')
                 poms[item.name] = archive.extractfile(item).read()
     return poms
@@ -370,11 +371,17 @@ def project(refs, root, request):
         pre[name] = snapshot(g.json_bytes(raw[name]), scope, checkout, tree, sources, 'pre-test-after-install', poms)
         g.receipt.input_runner_context(pre[name], name, scope['repository'])
         g.receipt.maven_observation_fact(pre[name], name, scope['repository'])
+        if 'resolved_maven_artifacts' in pre[name]:
+            maven_artifacts.validate(pre[name]['resolved_maven_artifacts'], pre[name], lambda path: poms[path])
         if name != 'build':
             post[name] = snapshot(g.json_bytes(inputs['post-test-inputs.json']), scope, checkout, tree, sources,
                                   'post-test-before-pack', poms)
             g.receipt.input_runner_context(post[name], name, scope['repository'])
             g.receipt.maven_observation_fact(post[name], name, scope['repository'])
+            if 'resolved_maven_artifacts' in post[name]:
+                maven_artifacts.validate(post[name]['resolved_maven_artifacts'], post[name], lambda path: poms[path])
+            require(pre[name].get('resolved_maven_artifacts') == post[name].get('resolved_maven_artifacts'),
+                    'post-test resolved Maven artifact capture differs: ' + name)
             require(pre[name].get('maven_execution_observation') == post[name].get('maven_execution_observation'),
                     'post-test Maven observation differs: ' + name)
             require(g.receipt.test_resource_snapshot(pre[name])==g.receipt.test_resource_snapshot(post[name]),
@@ -430,6 +437,8 @@ def project(refs, root, request):
             'unverified_components': sorted(missing), 'input_files': refs.finish()}
     if test_jar_facts is not None:
         result['observed_packaged_test_outputs'] = test_jar_facts
+    if 'resolved_maven_artifacts' in observed:
+        result['observed_resolved_maven_artifacts'] = {name: value['resolved_maven_artifacts'] for name, value in pre.items()}
     if 'test_resource_files' in observed:
         result['observed_test_resource_files']=observed['test_resource_files']
     if provider is not None:
