@@ -193,7 +193,9 @@ def read_capture(archive, worker, members, before, after, source, source_hashes,
     binding = value['binding']
     require(set(binding)=={'source_sha','source_tree','run_id','run_attempt','event'}
             and g.origin(binding)=={'run_id':archive.scope['run_id'],'run_attempt':archive.scope['run_attempt'],'source_sha':before['source_sha']}
-            and binding['source_tree']==before['source_tree'] and binding['event']==before['event']=='pull_request'
+            and binding['source_tree']==before['source_tree']
+            and binding['event']==before['event']==archive.scope['event']
+            and binding['event'] in ('pull_request','workflow_dispatch')
             and value['original_source_sha']==before['source_sha'] and value['lane']=='ci', 'provider capture source/run/tree differs')
     context = g.receipt.input_runner_context(before,worker,archive.scope['repository'])
     require(context is not None and context==value['runner_context'] and context['workflow_source']['snapshot']=='captured',

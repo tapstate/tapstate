@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -87,7 +88,8 @@ def controls(f, callback=None, only_callback=False):
     post['test_files'][f['compiled']] = pre['test_files'][f['compiled']]
     post['test_class_ids'][f['compiled']] = pre['test_class_ids'][f['compiled']]
     context = {'repository': f['scope']['repository'], 'shard_id': 'rest', 'workflow_source': {
-        'snapshot': 'captured', 'workflow_ref': 'example/project/.github/workflows/ci.yml@refs/pull/7/merge',
+        'snapshot': 'captured', 'workflow_ref': ('example/project/.github/workflows/ci.yml@refs/pull/7/merge'
+            if f['scope']['event'] == 'pull_request' else 'example/project/.github/workflows/ci.yml@refs/heads/ws/fixture'),
         'workflow_sha': f['merge'], 'workflow_path': '.github/workflows/ci.yml', 'job': 'test-shards',
         'source_bytes_verified': False}}
     pre['runner_context'] = copy.deepcopy(context)
@@ -287,6 +289,37 @@ def controls(f, callback=None, only_callback=False):
           and not fmod.v.git(f['work'], 'status', '--porcelain').stdout, 'all passive archive reads leave the worktree unchanged')
 
 
+def dispatch_fixture():
+    def dispatch_control(context):
+        artifacts = context['artifacts']
+        project, reseal, reset = context['project'], context['reseal'], context['reset']
+        value = project()
+        check(value['scope']['event'] == 'workflow_dispatch'
+              and not value['first_complete_PR_sample'] and not value['performance_accepted'],
+              'original native dispatch provider input replay keeps PR and performance claims false')
+        artifacts['ci-inputs-rest'][r.MEMBER]['binding']['event'] = 'pull_request'
+        reseal(); rejected(project, 'provider capture source/run/tree differs'); reset()
+        artifacts['ci-inputs-rest']['build-inputs.json']['event'] = 'pull_request'
+        reseal(); rejected(project, 'phase/event'); reset()
+        artifacts['ci-inputs-rest'][r.MEMBER]['binding']['event'] = 'push'
+        reseal(); rejected(project, 'provider capture source/run/tree differs'); reset()
+        expected = project()
+        output, manifest = context['f']['evidence'] / 'dispatch-readback.json', context['f']['evidence'] / 'dispatch-request.json'
+        manifest.write_bytes(fmod.encode(context['f']['request']))
+        child = subprocess.run(['bash',str(HERE/'ci-archive-inputs.sh'),'--manifest',str(manifest),
+            '--evidence-root',str(context['f']['evidence']),'--root',str(context['f']['work']),'--output',str(output)],capture_output=True,text=True)
+        check(child.returncode == 0 and json.loads(output.read_bytes()) == expected,
+              'original dispatch provider archive CLI: '+child.stderr)
+    contract = {'schema': 1, 'classes': {CLASS: {'module': 'fixture', 'source': SOURCE,
+        'source_sha256': g.checksum(CODE.encode()), 'providers': {'values': {'kind': 'source', 'projection': 'strict'}}}}}
+    def receive(f):
+        controls(f, callback=dispatch_control, only_callback=True)
+    fmod.run(callback=receive, only_callback=True, source_case=CODE,
+             workflow_sources={'ci.yml': (HERE.parent/'workflows/ci.yml').read_text()},
+             extra_source_files={CONTRACT: json.dumps(contract), PRODUCER: (HERE/'_ci-evidence.py').read_bytes(), RESOURCE:RESOURCE_BYTES},
+             event_name='workflow_dispatch')
+
+
 def main():
     workflow = (HERE.parent / 'workflows/ci.yml').read_text()
     check(r.workflow_recipe(workflow), 'actual producer workflow has the exact bounded capture recipe')
@@ -316,6 +349,7 @@ def main():
         'source_sha256': g.checksum(CODE.encode()), 'providers': {'values': {'kind': 'source', 'projection': 'strict'}}}}}
     fmod.run(callback=controls, only_callback=True, source_case=CODE, workflow_sources={'ci.yml': workflow},
              extra_source_files={CONTRACT: json.dumps(contract), PRODUCER: (HERE / '_ci-evidence.py').read_bytes(), RESOURCE: RESOURCE_BYTES})
+    dispatch_fixture()
     print('CI provider archive readback controls passed:', CHECKS)
 
 

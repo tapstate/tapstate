@@ -142,7 +142,7 @@ def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False, maven_s
     return raw
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False, maven_schema=3):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False, maven_schema=3, event_name='pull_request'):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -212,7 +212,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         anchor, tree = v.text(main, 'rev-parse', 'HEAD'), v.text(main, 'rev-parse', 'HEAD^{tree}')
         v.git(main, 'remote', 'add', 'origin', 'https://github.com/example/project.git')
         v.git(main, 'worktree', 'add', '-qb', 'ws/fixture', str(work), anchor)
-        scope = {'repository': 'example/project', 'branch': 'ws/fixture', 'variant': 'C', 'event': 'pull_request',
+        assert event_name in ('pull_request', 'workflow_dispatch')
+        scope = {'repository': 'example/project', 'branch': 'ws/fixture', 'variant': 'C', 'event': event_name,
                  'run_id': 42, 'run_attempt': 1, 'head_sha': anchor, 'base_sha': base, 'pr': 7}
 
         def save(name, value):
@@ -248,13 +249,17 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             v.git(work, 'read-tree', '--reset', '-u', tree)
         scope.update(variant=variant, run_id=run_id, head_sha=anchor)
         merge = v.text(work, 'commit-tree', tree, '-p', base, '-p', anchor, '-m', 'Original PR checkout')
+        if event_name == 'workflow_dispatch':
+            merge = anchor
+            scope.pop('pr'); scope.pop('base_sha')
 
         def commit(sha):
             return {'sha': sha, 'tree': {'sha': v.text(work, 'rev-parse', sha + '^{tree}')},
                     'parents': [{'sha': p} for p in v.text(work, 'rev-list', '--parents', '-n', '1', sha).split()[1:]]}
 
         event = {'repository': scope['repository'], 'event': scope['event'], 'run_id': run_id, 'run_attempt': 1,
-                 'checkout_sha': merge, 'checkout_tree': tree, 'checkout_parents': [base, anchor]}
+                 'checkout_sha': merge, 'checkout_tree': tree,
+                 'checkout_parents': v.text(work, 'rev-list', '--parents', '-n', '1', merge).split()[1:]}
         test = {'module': 'fixture', 'kind': 'unit', 'class': 'io.tapstate.fixture.SampleTest'}
         worker = {'id': 'rest', 'tests': [test], 'estimated_seconds': 1, 'required_exec': s.execs([test])}
         plan = {'schema': 1, 'source_sha': merge, 'cohort_hash': s.cohort([test]), 'selection': 'default-reactor',
@@ -380,7 +385,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         def archive():
             values = {'run.json': {'id': run_id, 'run_attempt': 1, 'head_sha': anchor, 'head_branch': scope['branch'],
                                   'event': scope['event'], 'repository': {'full_name': scope['repository']},
-                                  'pull_requests': [{'number': 7, 'head': {'sha': anchor}, 'base': {'sha': base}}]},
+                                  'pull_requests': ([{'number': 7, 'head': {'sha': anchor}, 'base': {'sha': base}}]
+                                                    if event_name == 'pull_request' else [])},
                       'commit.json': commit(anchor), 'source.tar': v.git(work, 'archive', '--format=tar', anchor).stdout,
                       'checkout-commit.json': commit(merge), 'checkout-source.tar': v.git(work, 'archive', '--format=tar', merge).stdout,
                       'event-inputs.json': event, 'artifacts-1.json': {'total_count': len(records), 'artifacts': records}}

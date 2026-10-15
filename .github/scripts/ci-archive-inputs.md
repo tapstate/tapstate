@@ -110,7 +110,10 @@ at most 20,000 members and 512 MiB expanded data, with 64 MiB per member.
 Older archives missing an original event capture or comparator reject with a
 missing-input error. Preserve those archives and their gaps; do not rewrite them
 or infer a checkout from the declared plan. Diagnostic dispatch/later attempts
-retain the source projection's explicit event/first-attempt gaps.
+retain the source projection's explicit event/first-attempt gaps. Provider capture
+bindings must match the original API event, snapshot, source and tree exactly for
+both `pull_request` and `workflow_dispatch`; a manual readback never becomes a
+first complete PR sample. Other events and cross-event captures reject.
 
 The offline smoke uses real Git objects, synthetic API pages and actual ZIPs to
 discriminate source/run/attempt/event drift, changed dependency/production hashes,
