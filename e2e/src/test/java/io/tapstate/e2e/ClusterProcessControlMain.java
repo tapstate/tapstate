@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.locks.LockSupport;
 
 /** A JDK child for observing OS lifecycle, file handshakes and shutdown hooks. */
@@ -34,7 +35,8 @@ public final class ClusterProcessControlMain {
         System.out.println("control child pid=" + ProcessHandle.current().pid() + " mode=" + mode);
         write(Path.of(settings.get("fixture.ready")), Long.toString(ProcessHandle.current().pid()));
         if (mode.equals("exit-seven")) System.exit(7);
-        for (;;) Thread.sleep(1_000);
+        // Hold the owned process alive while its parent exercises OS termination and shutdown hooks.
+        new CountDownLatch(1).await();
     }
 
     private static void write(Path path, String value) {
