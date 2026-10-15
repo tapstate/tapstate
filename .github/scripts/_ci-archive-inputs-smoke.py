@@ -47,7 +47,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-') as temporary:
@@ -146,6 +146,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                'resolved_test_classpaths': {'fixture': [{'identity': 'repository/' + dep, 'sha256': 'c' * 64, 'size': 10,
                                                        'own_classes': {}}]},
                'toolchain': {'java': '21', 'maven': '3.9.9', 'os': 'fixture', 'architecture': 'aarch64', 'cpu_count': 2}}
+        if dependency_metadata:
+            pre.update(dependency_coordinate_models={}, dependency_producer_facts={})
         observer_class = 'test-support/target/test-classes/io/tapstate/testsupport/CiCaseEvidence.class'
         pre['test_files'][observer_class] = g.checksum(b'observer fixture')
         pre['test_class_ids'][observer_class] = g.receipt.crc64(b'observer fixture')

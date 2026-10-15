@@ -145,6 +145,16 @@ class References:
 
 def component(refs, name, reference, binding=None):
     value, unused = refs.read(reference)
+    if value.get('type') == 'archived-group-component':
+        require(set(value) == {'schema', 'type', 'name', 'binding', 'payload', 'request', 'source_root',
+                'normalized_original_inputs_verified'} and type(value['schema']) is int and value['schema'] == 1
+                and value['name'] == name and value['normalized_original_inputs_verified'] is False,
+                'invalid archived group component')
+        reader = module('archived_component_replay', '_ci-group-components.py')
+        expected = reader.component(refs, value['source_root'], value['request'], name)
+        require(canonical(value) == canonical(expected), 'component payload differs from original archive replay')
+        require(binding is None or value['binding'] == binding, 'component belongs to another variant run')
+        return checksum(canonical(value['payload']))
     require(type(value.get('schema')) is int and value['schema'] == 1
             and value.get('type') == 'declared-group-component' and value.get('name') == name,
             'invalid declared component')
@@ -153,6 +163,13 @@ def component(refs, name, reference, binding=None):
     if binding is not None:
         require(value.get('binding') == binding, 'component belongs to another variant run')
     return checksum(canonical(payload))
+
+
+def component_mode(refs, references):
+    modes = {refs.read(reference)[0].get('type') for reference in references.values()}
+    require(modes in ({'declared-group-component'}, {'archived-group-component'}),
+            'mixed or unsupported group component capture')
+    return 'archive-replayed' if modes == {'archived-group-component'} else 'declared'
 
 
 def timestamp(value):
@@ -194,9 +211,13 @@ def variant(refs, scope, value):
     require(timestamp(run['created_at']) <= timestamp(run['updated_at']), 'reversed CI run times')
     binding = {'run_id': run['id'], 'run_attempt': 1, 'source_sha': identity['checkout_sha']}
     require(set(value['components']) == COMPONENTS, 'group component set differs')
+    mode = component_mode(refs, value['components'])
     hashes = {name: component(refs, name, value['components'][name], binding) for name in sorted(COMPONENTS)}
-    return {'identity': identity, 'binding': binding, 'components': hashes,
+    result = {'identity': identity, 'binding': binding, 'components': hashes,
             'ci_created_at': run['created_at'], 'ci_terminal_observed_at': run['updated_at']}
+    if mode == 'archive-replayed':
+        result['component_mode'] = mode
+    return result
 
 
 def comparison(refs, request, before_binding=None, after_binding=None, lane=None):
@@ -249,6 +270,8 @@ def group_inputs(refs, value):
     require(set(value['variants']) == {'A', 'B', 'C'} and sorted(value['order']) == ['A', 'B', 'C'],
             'group must contain A/B/C exactly once')
     variants = {name: variant(refs, scope, entry) for name, entry in value['variants'].items()}
+    require(len({entry.get('component_mode', 'declared') for entry in variants.values()}) == 1,
+            'mixed variant component capture')
     require(len({entry['identity']['head_sha'] for entry in variants.values()}) == 3
             and len({entry['identity']['run_id'] for entry in variants.values()}) == 3, 'reused variant head or run')
     require(all(entry['components'] == variants['A']['components'] for entry in variants.values()),
@@ -283,6 +306,8 @@ def group_inputs(refs, value):
 def impact(refs, value):
     require(value['group_state'] in ('pending', 'completed'), 'unknown group state')
     require(set(value['before']) == set(value['after']) == COMPONENTS, 'impact component set differs')
+    require(component_mode(refs, value['before']) == component_mode(refs, value['after']),
+            'mixed impact component capture')
     hashes = {label: {name: component(refs, name, reference) for name, reference in value[label].items()}
               for label in ('before', 'after')}
     changed = sorted(name for name in COMPONENTS if hashes['before'][name] != hashes['after'][name])

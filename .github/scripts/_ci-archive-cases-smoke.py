@@ -42,7 +42,7 @@ def rejected(call, message):
         raise AssertionError('expected rejection: ' + message)
 
 
-def controls(f):
+def prepare_cases(f):
     data = f['root'] / 'producer-data'
     data.mkdir()
     inv_path = data / 'inventory.json'
@@ -71,8 +71,14 @@ def controls(f):
     artifacts['ci-inputs-rest']['expected-case-hashes.json'] = json.loads(expected_path.read_bytes())
     artifacts['ci-inputs-rest']['observed-case-hashes.json'] = json.loads(hashes_path.read_bytes())
     f['reseal']()
-    original = copy.deepcopy(artifacts)
     request = {'schema': 1, 'type': 'archive-cases-request', 'archive_inputs': f['save']('input-request.json', f['request'])}
+    return request, inv
+
+
+def controls(f):
+    request, inv = prepare_cases(f)
+    artifacts = f['artifacts']
+    original = copy.deepcopy(artifacts)
 
     def reseal():
         f['reseal']()
@@ -271,15 +277,16 @@ def source_entry_controls():
     print('CI archive source-entry controls passed: 3')
 
 
-fixture.run(controls)
-fixture.run(controls, source_case='''package io.tapstate.fixture;
+if __name__ == '__main__':
+    fixture.run(controls)
+    fixture.run(controls, source_case='''package io.tapstate.fixture;
 class SampleTest {
  @Test void holds() {}
  @ParameterizedTest @MethodSource("computed") void dynamic(int value) {}
  static Stream<Integer> computed() { return external(); }
 }
 ''')
-fixture.run(two_worker_controls, two_workers=True, only_callback=True)
-published_controls()
-source_entry_controls()
-print('CI archive case total controls passed: ' + str(count))
+    fixture.run(two_worker_controls, two_workers=True, only_callback=True)
+    published_controls()
+    source_entry_controls()
+    print('CI archive case total controls passed: ' + str(count))
