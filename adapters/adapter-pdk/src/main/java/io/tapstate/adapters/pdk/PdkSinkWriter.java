@@ -19,11 +19,15 @@ import io.tapdata.pdk.apis.entity.WriteListResult;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * A write session over one sink connector, opened once and held across batches. Each write encodes the
@@ -54,6 +58,14 @@ final class PdkSinkWriter implements SinkWriter {
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
     private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
+    // Blocking connector calls must leave the shared async pool available for engine lifecycle callbacks.
+    private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "tapstate-sink-write");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final Object lifecycle = new Object();
+    private final Set<CompletableFuture<WriteResult>> pending = new HashSet<>();
     private boolean closed;
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl, TargetTable target) {
@@ -139,7 +151,21 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
-        return CompletableFuture.supplyAsync(() -> deliver(records));
+        synchronized (lifecycle) {
+            if (closed) {
+                throw new IllegalStateException("write called after the sink writer was closed");
+            }
+            // Cancellation releases the caller's batch even while its interrupted callback unwinds.
+            List<Envelope> batch = List.copyOf(records);
+            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> deliver(batch), writes);
+            pending.add(result);
+            result.whenComplete((accepted, failure) -> {
+                synchronized (lifecycle) {
+                    pending.remove(result);
+                }
+            });
+            return result;
+        }
     }
 
     private synchronized WriteResult deliver(List<Envelope> records) {
@@ -218,10 +244,22 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public void close() {
-        if (closed) {
-            return;
+        List<CompletableFuture<WriteResult>> abandoned;
+        synchronized (lifecycle) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            abandoned = List.copyOf(pending);
         }
-        closed = true;
-        letGo.run();
+        // Completion handlers may wait for the active callback to exit, so interrupt it first.
+        writes.shutdownNow();
+        try {
+            letGo.run();
+        } finally {
+            // Release connector resources before notifying handlers; a blocked call may need both signals.
+            // Tasks removed from the queue still owe a result when connector cleanup fails.
+            abandoned.forEach(result -> result.cancel(false));
+        }
     }
 }
