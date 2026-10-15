@@ -528,6 +528,32 @@ final class PipelineActuationOwnership {
         return released;
     }
 
+    /** Whether a local capture still serves a pipeline this member holds; never acquires or renews a claim. */
+    boolean isDriving(String pipelineId) {
+        if (closing) {
+            return false;
+        }
+        if (!fenced) {
+            return true;
+        }
+        synchronized (this) {
+            Held state = held.get(pipelineId);
+            if (state != null && state.claim != null) {
+                return true;
+            }
+        }
+        WorkloadClaimKey key = new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
+        try {
+            return claims.read(key).filter(WorkloadClaimReading::leased)
+                    .map(WorkloadClaimReading::claim)
+                    .filter(claim -> claim.owner().equals(owner))
+                    .isPresent();
+        } catch (RuntimeException unavailable) {
+            // An unreadable pipeline claim proves no handoff. The capture still renews its own fenced claim.
+            return true;
+        }
+    }
+
     /** The execution generation the claim this member holds for {@code pipelineId} carries, or zero. */
     synchronized long heldExecutionGeneration(String pipelineId) {
         Held state = fenced ? held.get(pipelineId) : null;

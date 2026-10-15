@@ -59,6 +59,8 @@ class PipelineAdmissionRefusalsTest {
         when(admission.prepare(eq("p"), any(), eq(ownership))).thenThrow(refusal);
         var actuator = new EngineLifecycleActuator(engine, dags, captures, teardown, ownership,
                 ExecutionPlanRecorder.NONE, Clock.systemUTC(), (pipeline, connectors) -> Set.of(), admission);
+        // Constructor binding configures ownership observation; a refusal must still open no capture.
+        clearInvocations(captures);
 
         assertThatThrownBy(() -> actuator.start("p")).isSameAs(refusal);
 

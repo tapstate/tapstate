@@ -5,7 +5,9 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.CaptureResumePreparation;
 
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -46,7 +48,16 @@ public record CaptureRunSpec(
         WorkloadClaimFence captureFence,
         String consumerId,
         CaptureResumeWitness resumeWitness,
-        WorkloadClaimFence pipelineFence) {
+        WorkloadClaimFence pipelineFence,
+        List<CaptureResumePreparation> startupAttachments) {
+
+    public CaptureRunSpec(CaptureConfig config, ReadMode readMode, String srsKey, boolean srsEnabled,
+            String sourceId, String pipelineId, StartFrom startFrom, String retention, long schemaVer,
+            long snapshotEpoch, WorkloadClaimFence captureFence, String consumerId,
+            CaptureResumeWitness resumeWitness, WorkloadClaimFence pipelineFence) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId, startFrom, retention, schemaVer,
+                snapshotEpoch, captureFence, consumerId, resumeWitness, pipelineFence, List.of());
+    }
 
     public CaptureRunSpec(CaptureConfig config, ReadMode readMode, String srsKey, boolean srsEnabled,
             String sourceId, String pipelineId, StartFrom startFrom, String retention, long schemaVer,
@@ -114,13 +125,15 @@ public record CaptureRunSpec(
     public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, fence, consumerId, resumeWitness, pipelineFence);
+                startFrom, retention, schemaVer, snapshotEpoch, fence, consumerId, resumeWitness, pipelineFence,
+                startupAttachments);
     }
 
     /** The same run using {@code id} as this source node's independent progress record. */
     public CaptureRunSpec withConsumerId(String id) {
         return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, captureFence, id, resumeWitness, pipelineFence);
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, id, resumeWitness, pipelineFence,
+                startupAttachments);
     }
 
     /** Freeze the exact pre-open source truth and successor authority for this run. */
@@ -132,7 +145,15 @@ public record CaptureRunSpec(
             throw new IllegalArgumentException("a frozen witness must name the actual source run");
         }
         return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, witness, pipeline);
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, witness, pipeline,
+                startupAttachments);
+    }
+
+    /** Account for existing consumers without replacing the physical reader's current durable request. */
+    public CaptureRunSpec withStartupAttachments(List<CaptureResumePreparation> attachments) {
+        return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, resumeWitness, pipelineFence,
+                attachments);
     }
 
     /** Shared capture state follows the physical source; direct recovery state follows its own channel. */
@@ -147,6 +168,25 @@ public record CaptureRunSpec(
         Objects.requireNonNull(sourceId, "sourceId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(startFrom, "startFrom");
+        startupAttachments = List.copyOf(startupAttachments);
+        if (!startupAttachments.isEmpty()) {
+            if (readMode == ReadMode.SNAPSHOT_ONLY || captureFence == null
+                    || captureFence.profileGeneration() == 0) {
+                throw new IllegalArgumentException("startup accounting requires a qualified incremental reader");
+            }
+            String chain = (srsEnabled ? MiningChainId.resolve(config, srsKey)
+                    : MiningChainId.forChannel(config, srsKey, pipelineId, sourceId)).value();
+            for (CaptureResumePreparation attachment : startupAttachments) {
+                if (attachment.witness().srsEnabled() != srsEnabled
+                        || attachment.witness().readMode() == ReadMode.SNAPSHOT_ONLY
+                        || !attachment.witness().miningChainId().equals(chain)
+                        || !attachment.witness().connectorId().equals(config.connectorId())
+                        || attachment.pipelineClaim().profileGeneration() != captureFence.profileGeneration()
+                        || !attachment.pipelineClaim().key().clusterId().equals(captureFence.key().clusterId())) {
+                    throw new IllegalArgumentException("startup accounting must name this physical source and profile");
+                }
+            }
+        }
         consumerId = consumerId == null ? pipelineId : consumerId;
         if (consumerId.isBlank()) {
             throw new IllegalArgumentException("a source consumer id must be non-blank");

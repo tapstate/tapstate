@@ -244,6 +244,13 @@ public final class CaptureRunUnit {
                 throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
                         Map.of("pipeline", spec.pipelineId(), "source", spec.sourceId()), null);
             }
+            for (var attachment : spec.startupAttachments()) {
+                if (!meta.recordCaptureAttachment(attachment.pipelineClaim(), attachment.witness(), state.epoch)) {
+                    throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                            Map.of("pipeline", attachment.pipelineClaim().key().resourceId(),
+                                    "source", attachment.witness().sourceId()), null);
+                }
+            }
             state.load = openLoad(spec, plan, tables, state.chainId, state.epoch);
             if (state.load != null && state.load.readsAnything()) {
                 health.snapshotOpened();
@@ -802,7 +809,7 @@ public final class CaptureRunUnit {
                     };
             Subscription direct = CdcPhase.openReader(port, spec.config(), start, health.recording(CdcPhase.qualifiedReader(
                     directCallbacks, meta, directChain, epoch, spec.config().streams(), start, spec.captureFence(),
-                    spec.pipelineFence(), spec.resumeWitness())));
+                    spec.pipelineFence(), spec.resumeWitness(), spec.startupAttachments())));
             // Bounded by what this channel's targets confirmed: a direct channel has no log to replay from.
             return Optional.of(sourceAcknowledgements.follow(meta, directChain, direct, health, false));
         }

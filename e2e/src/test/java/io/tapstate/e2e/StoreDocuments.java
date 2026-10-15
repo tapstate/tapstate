@@ -169,6 +169,28 @@ final class StoreDocuments implements AutoCloseable {
         return claim == null ? null : claim.getDate("leaseUntil").toInstant();
     }
 
+    /** Hands one fixture pipeline to another live member without stopping the original holder's process. */
+    void handPipelineTo(String clusterId, String pipelineId, String oldNodeId, String newNodeId) {
+        var claims = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS);
+        Document session = claims.find(new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.NODE_SESSION.name())
+                .append("_id.resourceId", newNodeId)).first();
+        if (session == null) {
+            throw new AssertionError("the successor has no node session: " + newNodeId);
+        }
+        Document expected = new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
+                .append("_id.resourceId", pipelineId).append("ownerNodeId", oldNodeId);
+        Document next = new Document("ownerNodeId", newNodeId)
+                .append("ownerBootId", session.getString("ownerBootId"))
+                .append("claimGeneration", new Document("$add", List.of("$claimGeneration", 1L)))
+                .append("leaseUntil", new Document("$dateAdd", new Document("startDate", "$$NOW")
+                        .append("unit", "second").append("amount", 120L)));
+        if (claims.updateOne(expected, List.of(new Document("$set", next))).getModifiedCount() != 1) {
+            throw new AssertionError("the fixture did not hand pipeline " + pipelineId + " to " + newNodeId);
+        }
+    }
+
     /**
      * Opens a transaction on a client connected as {@code applicationName}, writes one chain's record in it, and
      * leaves it open until what this returns is closed: what a process whose store client connected under that

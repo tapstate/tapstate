@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Set;
 
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * Runs a pipeline's source-side capture alongside its Jet job. When a pipeline starts, its cdc capture must
@@ -22,6 +23,10 @@ import java.util.Optional;
  * so a start fills the ring before the job reads it and a stop stops the job before the capture behind it.
  */
 interface PipelineCaptureCoordinator {
+
+    /** Keeps a shared claim only while the capture serves a pipeline driven here, preserving durable positions. */
+    default void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
+    }
 
     /**
      * Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop.

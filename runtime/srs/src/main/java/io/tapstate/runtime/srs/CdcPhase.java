@@ -228,7 +228,8 @@ public final class CdcPhase {
         };
         return openReader(port, config, start, health.recording(qualifiedReader(callback, physical.meta(),
                 physical.miningChainId(), physical.epoch(), servedTables, start, physical.captureFence(),
-                prepared == null ? null : prepared.pipelineFence(), prepared == null ? null : prepared.resumeWitness())));
+                prepared == null ? null : prepared.pipelineFence(), prepared == null ? null : prepared.resumeWitness(),
+                prepared == null ? List.of() : prepared.startupAttachments())));
     }
 
     /** A coded synchronous refusal belongs to the same qualified attempt as an asynchronous callback. */
@@ -244,6 +245,12 @@ public final class CdcPhase {
     static CaptureListener qualifiedReader(CaptureListener delegate, SrsMetaStore meta, String chain, long epoch,
             List<String> tables, CaptureStart start, WorkloadClaimFence capture, WorkloadClaimFence pipeline,
             CaptureResumeWitness witness) {
+        return qualifiedReader(delegate, meta, chain, epoch, tables, start, capture, pipeline, witness, List.of());
+    }
+
+    static CaptureListener qualifiedReader(CaptureListener delegate, SrsMetaStore meta, String chain, long epoch,
+            List<String> tables, CaptureStart start, WorkloadClaimFence capture, WorkloadClaimFence pipeline,
+            CaptureResumeWitness witness, List<io.tapstate.spi.store.CaptureResumePreparation> attachments) {
         if (capture == null || capture.profileGeneration() == 0) { return delegate; }
         CaptureReadAttempt.Kind kind = start instanceof CaptureStart.Resume ? CaptureReadAttempt.Kind.RESUME
                 : start instanceof CaptureStart.At ? CaptureReadAttempt.Kind.AT
@@ -254,6 +261,11 @@ public final class CdcPhase {
                 .orElseThrow(() -> new TapstateException(CaptureError.CLAIM_LOST, Map.of("captureId", capture.key().resourceId()), null));
         if (pipeline != null && witness != null && !meta.bindCaptureReadAttempt(pipeline, witness, attempt, false)) {
             throw new TapstateException(CaptureError.CLAIM_LOST, Map.of("captureId", capture.key().resourceId()), null);
+        }
+        for (var attachment : attachments) {
+            if (!meta.bindCaptureReadAttempt(attachment.pipelineClaim(), attachment.witness(), attempt, attachment.witness().srsEnabled())) {
+                throw new TapstateException(CaptureError.CLAIM_LOST, Map.of("captureId", capture.key().resourceId()), null);
+            }
         }
         return new CaptureStartedListener() {
             @Override
