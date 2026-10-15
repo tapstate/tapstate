@@ -3,7 +3,11 @@ set -euo pipefail
 umask 077
 
 fail() { printf 'Cloud GHCR publication refused: %s\n' "$1" >&2; exit 1; }
-[[ "${1:-}" == publish ]] || fail 'usage: ghcr-publish.sh publish --archive FILE --version VERSION --expected-digest SHA256'
+mode="${1:-}"
+case "$mode" in
+    publish|publish-dev) ;;
+    *) fail 'usage: ghcr-publish.sh <publish|publish-dev> --archive FILE --version VERSION --expected-digest SHA256' ;;
+esac
 shift
 archive='' version='' expected_digest=''
 while [[ $# -gt 0 ]]; do
@@ -17,6 +21,8 @@ while [[ $# -gt 0 ]]; do
     shift 2
 done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'a numeric release version is required; floating tags are forbidden'
+tag="$version"
+if [[ "$mode" == publish-dev ]]; then tag="$version-dev"; fi
 [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'expected OCI digest is missing or invalid'
 [[ -f "$archive" ]] || fail 'verified OCI archive is missing'
 workflow_identity=false
@@ -84,20 +90,20 @@ check_public() {
 check_public before
 
 existing="$(gh api --paginate "$endpoint/versions?per_page=100" \
-    --jq ".[] | select((.metadata.container.tags // []) | index(\"$version\")) | .name" \
+    --jq ".[] | select((.metadata.container.tags // []) | index(\"$tag\")) | .name" \
     2>"$scratch/api-error")" || fail 'existing Cloud release tags could not be read'
-[[ -z "$existing" || "$existing" == "$expected_digest" ]] \
+[[ "$mode" == publish-dev || -z "$existing" || "$existing" == "$expected_digest" ]] \
     || fail 'the release version already names different bytes; overwriting is forbidden'
 
 printf '%s' "$CLOUD_GHCR_TOKEN" \
     | docker login ghcr.io --username "$CLOUD_GHCR_USERNAME" --password-stdin \
         >"$scratch/login-out" 2>"$scratch/login-error" || fail 'GHCR login failed'
-if [[ -z "$existing" ]]; then
-    docker buildx imagetools create --tag "$image:$version" \
+if [[ -z "$existing" || ( "$mode" == publish-dev && "$existing" != "$expected_digest" ) ]]; then
+    docker buildx imagetools create --tag "$image:$tag" \
         "oci-layout://$scratch/layout@$expected_digest" \
         >"$scratch/push-out" 2>"$scratch/push-error" || fail 'GHCR image push failed'
 fi
-docker buildx imagetools inspect --raw "$image:$version" \
+docker buildx imagetools inspect --raw "$image:$tag" \
     >"$scratch/remote-manifest.json" 2>"$scratch/read-error" \
     || fail 'the published Cloud image could not be read back'
 actual="sha256:$(sha256sum "$scratch/remote-manifest.json" | awk '{print $1}')"
@@ -129,6 +135,6 @@ anonymous_digest="sha256:$(sha256sum "$scratch/anonymous-manifest.json" | awk '{
 
 deployable="$image@$expected_digest"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-    printf 'image=%s\ntag=%s\n' "$deployable" "$image:$version" >> "$GITHUB_OUTPUT"
+    printf 'image=%s\ntag=%s\n' "$deployable" "$image:$tag" >> "$GITHUB_OUTPUT"
 fi
-printf 'Published Public Cloud image %s as %s\n' "$deployable" "$image:$version"
+printf 'Published Public Cloud image %s as %s\n' "$deployable" "$image:$tag"
