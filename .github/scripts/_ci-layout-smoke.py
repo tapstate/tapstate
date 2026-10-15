@@ -4,6 +4,7 @@ from collections import Counter
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -146,5 +147,29 @@ with tempfile.TemporaryDirectory(prefix='ci-layout-controls-') as temporary:
     for value in (True, float('inf'), float('nan'), -1):
         rejected(lambda: s.balance([{'module': 'core', 'kind': 'unit', 'class': 'sample.CoreTest'}], 1,
                                   {'sample.CoreTest': value}), 'invalid duration scalar')
+    workflow = (HERE.parent / 'workflows/ci.yml').read_text()
+    title = '      - name: Derive every test from the current reactor\n'
+    check(workflow.count(title) == 1, 'the exercised workflow producer step is unique')
+    step = workflow.split(title, 1)[1].split('\n      - ', 1)[0]
+    block = step.split('        run: |\n', 1)[1]
+    command = '\n'.join(line[10:] for line in block.splitlines() if line.strip())
+    producer = put('.github/scripts/ci-shard.sh', '#!/usr/bin/env bash\nset -e\n'
+        'if [[ "$1" == "matrix" ]]; then printf observed > "$RUNNER_TEMP/matrix-called"; exit 7; fi\n'
+        '[[ "$1" == "plan" ]]\n')
+    producer.chmod(0o755)
+    output = root / 'workflow-output'
+    result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', command], cwd=root,
+        env={**os.environ, 'RUNNER_TEMP': str(root), 'GITHUB_OUTPUT': str(output)}, capture_output=True, text=True)
+    check((root / 'matrix-called').is_file(), 'the actual workflow block executed the failing producer')
+    check(result.returncode != 0 and not output.exists(), 'workflow must stop before publishing a failed matrix')
+    expected = '{"include":[{"shard":"sample","prepare_cloud_inputs":false}]}'
+    producer.write_text('#!/usr/bin/env bash\nset -e\n'
+        'if [[ "$1" == "matrix" ]]; then printf \'%s\\n\' \'' + expected + '\'; exit 0; fi\n'
+        '[[ "$1" == "plan" ]]\n')
+    output.write_text('prior=unchanged\n')
+    result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', command], cwd=root,
+        env={**os.environ, 'RUNNER_TEMP': str(root), 'GITHUB_OUTPUT': str(output)}, capture_output=True, text=True)
+    check(result.returncode == 0 and output.read_text() == 'prior=unchanged\nmatrix=' + expected + '\n',
+          'successful workflow publication preserves existing outputs and the exact matrix JSON')
 
 print('CI source layout controls passed:', count)

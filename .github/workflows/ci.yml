@@ -51,7 +51,8 @@ jobs:
         id: plan
         run: |
           .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
-          echo "matrix=$(.github/scripts/ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json")" >> "$GITHUB_OUTPUT"
+          matrix_json="$(.github/scripts/ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json")"
+          echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ci-shard-plan
