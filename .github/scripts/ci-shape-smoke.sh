@@ -78,6 +78,7 @@ def check(workflows, contexts, inputs):
     assert 'python3 .github/scripts/_ci-provider-receipt-smoke.py' in ci.get('catalog-scripts', ''), 'provider capture controls must run in CI'
     assert 'python3 .github/scripts/_ci-provider-readback-smoke.py' in ci.get('catalog-scripts', ''), 'provider archive controls must run in CI'
     assert 'python3 .github/scripts/_ci-provider-replay-smoke.py' in ci.get('catalog-scripts', ''), 'active provider replay controls must run in CI'
+    assert 'python3 .github/scripts/_ci-provider-replay-readback-smoke.py' in ci.get('catalog-scripts', ''), 'passive replay readback controls must run in CI'
     assert 'fail-fast: false' in shards, 'collect evidence from every shard on failure'
     assert shards.count('--shard-id "${{ matrix.shard }}"') == 3, 'both input snapshots and the preparation observer must declare the actual matrix shard'
     assert '--shard-id build' in build, 'aggregate inputs must declare their own producer role'
@@ -154,6 +155,7 @@ for original, replacement in [
     ('python3 .github/scripts/_ci-provider-receipt-smoke.py', 'echo provider-controls-removed'),
     ('python3 .github/scripts/_ci-provider-readback-smoke.py', 'echo archive-provider-controls-removed'),
     ('python3 .github/scripts/_ci-provider-replay-smoke.py', 'echo active-provider-controls-removed'),
+    ('python3 .github/scripts/_ci-provider-replay-readback-smoke.py', 'echo passive-replay-controls-removed'),
     ('--phase prepare -- .github/scripts/ci-build-observation.sh', '--phase prepare -- unrelated-observer.sh'),
     ('--phase verify -- .github/scripts/ci-shard.sh run', '--phase verify -- unrelated-shards.sh run'),
     ('--event-inputs "$RUNNER_TEMP/ci-event-inputs.json"', '--event-inputs unrelated-event.json'),

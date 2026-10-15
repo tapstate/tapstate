@@ -6,7 +6,6 @@ inputs privately, runs the fixed bounded provider helper and compares case multi
 Historical runtime equivalence, original assertions and whole CI remain unproven.
 """
 import argparse
-from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -165,37 +164,10 @@ def bounded_command(command, cwd, directory, timeout=120):
 
 def result_methods(raw, call, capture, before):
     require(len(raw) <= MAX_RESULT_BYTES, 'provider replay result exceeds metadata budget')
-    wanted = {(row['class'], row['method']): (row['provider'], row['provider_kind']) for row in call['requested_methods']}
-    original = {(row['class'], row['method']): row for row in capture['resolved_methods'] if row['module'] == call['module']}
-    rows, found, counts = [], set(), {}
-    for line in raw.decode('utf-8').splitlines():
-        row = json.loads(line, object_pairs_hook=ev.provider_record)
-        ev.validate_provider_record(row, wanted, before, call['module'])
-        key = row['class'], row['test_method']
-        require(key not in found and key in original, 'duplicate or foreign replay result')
-        found.add(key)
-        method = original[key]
-        if method['mapping'] == 'dynamic-marker':
-            require(row['kind'] == 'dynamic', 'replay dynamic projection differs')
-            parameters = [case['display_name_digest'] for case in row['cases']]
-        elif method['mapping'] == 'named-carrier-marker':
-            require(row['class'] == 'io.tapstate.e2e.JoinConformanceIT' and row['provider'] == 'carriers', 'unreviewed replay carrier projection')
-            require(all(case['first_string_digest'] and len(case['argument_descriptors']) == 2
-                        and case['argument_descriptors'][0]['stable'] for case in row['cases']), 'replay carrier lacks stable source identity')
-            parameters = [case['first_string_digest'] for case in row['cases']]
-        else:
-            require(method['mapping'] == 'argument-marker' and row['kind'] == 'source'
-                    and all(case['stable'] for case in row['cases']), 'replay arguments lack stable identities')
-            parameters = [case['argument_digest'] for case in row['cases']]
-        require(len(parameters) == len(set(parameters)), 'duplicate provider replay case')
-        digests = [ev.case_hash({**{field: method[field] for field in ('lane', 'module', 'kind', 'class', 'method')},
-                                'parameter': parameter}) for parameter in parameters]
-        require(Counter(digests) == Counter(method['case_digests']), 'replayed provider case multiset differs')
-        counts[key] = len(digests)
-        rows.append(row)
-    require(found == set(wanted) == set(original), 'provider replay method set is incomplete')
-    return {'method_count': len(found), 'case_count': sum(counts.values()),
-            'result_sha256': g.checksum(raw), 'result_records_sha256': g.checksum(g.canonical(rows))}
+    records=[json.loads(line,object_pairs_hook=ev.provider_record) for line in raw.decode('utf-8').splitlines()]
+    reader=g.module('replay_record_projection','_ci-provider-readback.py')
+    return {**reader.reproduce_records(records,call,capture,before),
+            'result_sha256':g.checksum(raw),'result_records':records}
 
 
 def replay(refs, root, repository, request, java='java'):
@@ -227,7 +199,7 @@ def replay(refs, root, repository, request, java='java'):
     require(executable.is_file() and os.access(executable, os.X_OK), 'provider replay Java executable is not executable')
     executable_sha = g.receipt.digest(executable)
     refs.finish()
-    calls = []
+    calls, result_bytes = [], 0
     with tempfile.TemporaryDirectory(prefix='ci-provider-replay-') as temporary:
         stage = Path(temporary).resolve()
         checkout, dependencies, staged, byte_count = stage_inputs(root, repository, before, capture, stage)
@@ -249,7 +221,10 @@ def replay(refs, root, repository, request, java='java'):
                        'io.tapstate.testsupport.CiProviderInventory', str(requests), str(result)]
             observed = bounded_command(command, checkout / module, directory)
             require(result.is_file() and not result.is_symlink() and result.stat().st_size <= MAX_RESULT_BYTES, 'provider replay result missing or unsafe')
-            checked = result_methods(result.read_bytes(), call, capture, before)
+            raw_result=result.read_bytes()
+            result_bytes+=len(raw_result)
+            require(result_bytes<=MAX_RESULT_BYTES,'combined provider replay metadata exceeds byte budget')
+            checked = result_methods(raw_result, call, capture, before)
             calls.append({'module': module, **observed, **checked,
                           'original_result_records_hash_equal': checked['result_records_sha256'] == call['result_records_sha256']})
             unchanged(staged, checkout, dependencies)
@@ -278,10 +253,18 @@ def main():
     output = Path(args.output)
     require(not output.exists() and not output.is_symlink(), 'provider replay output must be a new file')
     require(all(not output.resolve().is_relative_to(Path(path).resolve()) for path in (args.root, args.repo_local)), 'provider replay output must stay outside its byte inputs')
-    raw = g.file_bytes(Path(args.manifest))
-    result = replay(g.References(args.evidence_root), args.root, args.repo_local, g.json_bytes(raw), args.java)
+    manifest=Path(args.manifest).absolute()
+    raw = g.file_bytes(manifest)
+    refs=g.References(args.evidence_root)
+    require(manifest.is_relative_to(refs.root),'provider replay request must be under the evidence root')
+    request_reference={'path':manifest.relative_to(refs.root).as_posix(),'sha256':g.checksum(raw)}
+    refs.blob(request_reference)
+    result = replay(refs, args.root, args.repo_local, g.json_bytes(raw), args.java)
+    result['request']=request_reference
     require(g.file_bytes(Path(args.manifest)) == raw, 'provider replay request changed during execution')
-    g.write_new(output, result)
+    payload=(json.dumps(result,indent=2,sort_keys=True,allow_nan=False)+'\n').encode()
+    require(len(payload)<=MAX_RESULT_BYTES,'provider replay receipt exceeds metadata byte budget')
+    g.write_new_bytes(output,payload)
     print('bounded provider case multiset reproduced; historical runtime, assertions and whole CI remain unproven')
 
 

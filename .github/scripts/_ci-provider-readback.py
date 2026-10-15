@@ -366,3 +366,39 @@ def project(archive, plan, pre, post, input_members, payloads, source_hashes, so
                 for name in sorted(workers)}
     finally:
         with_source.close()
+
+
+def reproduce_records(records, call, capture, before):
+    require(isinstance(records,list), 'invalid provider replay result record list')
+    wanted = {(row['class'], row['method']): (row['provider'], row['provider_kind']) for row in call['requested_methods']}
+    original = {(row['class'], row['method']): row for row in capture['resolved_methods'] if row['module'] == call['module']}
+    rows, found, counts, multisets = [], set(), {}, []
+    for row in records:
+        ev.validate_provider_record(row, wanted, before, call['module'])
+        key = row['class'], row['test_method']
+        require(key not in found and key in original, 'duplicate or foreign replay result')
+        found.add(key)
+        method = original[key]
+        if method['mapping'] == 'dynamic-marker':
+            require(row['kind'] == 'dynamic', 'replay dynamic projection differs')
+            parameters = [case['display_name_digest'] for case in row['cases']]
+        elif method['mapping'] == 'named-carrier-marker':
+            require(row['class'] == 'io.tapstate.e2e.JoinConformanceIT' and row['provider'] == 'carriers', 'unreviewed replay carrier projection')
+            require(all(case['first_string_digest'] and len(case['argument_descriptors']) == 2
+                        and case['argument_descriptors'][0]['stable'] for case in row['cases']), 'replay carrier lacks stable source identity')
+            parameters = [case['first_string_digest'] for case in row['cases']]
+        else:
+            require(method['mapping'] == 'argument-marker' and row['kind'] == 'source'
+                    and all(case['stable'] for case in row['cases']), 'replay arguments lack stable identities')
+            parameters = [case['argument_digest'] for case in row['cases']]
+        require(len(parameters) == len(set(parameters)), 'duplicate provider replay case')
+        digests = [ev.case_hash({**{field: method[field] for field in ('lane', 'module', 'kind', 'class', 'method')},
+                                'parameter': parameter}) for parameter in parameters]
+        require(Counter(digests) == Counter(method['case_digests']), 'replayed provider case multiset differs')
+        multisets.append({**{field:method[field] for field in ('lane','module','kind','class','method')}, 'case_digests':sorted(digests)})
+        counts[key] = len(digests)
+        rows.append(row)
+    require(found == set(wanted) == set(original), 'provider replay method set is incomplete')
+    return {'method_count': len(found), 'case_count': sum(counts.values()),
+            'result_records_sha256': g.checksum(g.canonical(rows)),
+            'case_multisets': sorted(multisets,key=lambda value:tuple(value[key] for key in ('lane','module','kind','class','method')))}
