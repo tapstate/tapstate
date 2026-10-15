@@ -448,10 +448,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 active.add(current);
             }
             try {
+                // A completed handover remains completed if close woke its final listener.
+                // Entry and chunk boundaries still reject every subsequent delivery.
                 batch.run();
-                if (closed) {
-                    throw new CancellationException("the change capture was closed");
-                }
             } finally {
                 synchronized (this) {
                     active.remove(current);

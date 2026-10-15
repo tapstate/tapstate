@@ -170,7 +170,7 @@ final class StoreDocuments implements AutoCloseable {
     }
 
     /** Hands one fixture pipeline to another live member without stopping the original holder's process. */
-    void handPipelineTo(String clusterId, String pipelineId, String oldNodeId, String newNodeId) {
+    Instant handPipelineTo(String clusterId, String pipelineId, String oldNodeId, String newNodeId) {
         var claims = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS);
         Document session = claims.find(new Document("_id.clusterId", clusterId)
                 .append("_id.resourceType", WorkloadClaimType.NODE_SESSION.name())
@@ -183,12 +183,13 @@ final class StoreDocuments implements AutoCloseable {
                 .append("_id.resourceId", pipelineId).append("ownerNodeId", oldNodeId);
         Document next = new Document("ownerNodeId", newNodeId)
                 .append("ownerBootId", session.getString("ownerBootId"))
-                .append("claimGeneration", new Document("$add", List.of("$claimGeneration", 1L)))
-                .append("leaseUntil", new Document("$dateAdd", new Document("startDate", "$$NOW")
-                        .append("unit", "second").append("amount", 120L)));
-        if (claims.updateOne(expected, List.of(new Document("$set", next))).getModifiedCount() != 1) {
+                .append("claimGeneration", new Document("$add", List.of("$claimGeneration", 1L)));
+        // Move authority without fabricating a longer promise for calls already admitted by the old owner.
+        Document previous = claims.findOneAndUpdate(expected, List.of(new Document("$set", next)));
+        if (previous == null) {
             throw new AssertionError("the fixture did not hand pipeline " + pipelineId + " to " + newNodeId);
         }
+        return previous.getDate("leaseUntil").toInstant();
     }
 
     /**

@@ -124,11 +124,17 @@ public final class ObservedMongoConnector implements TapConnector {
     private static StreamReadConsumer observe(StreamReadConsumer original, Path witness, String selected) {
         return new StreamReadConsumer() {
             @Override public void accept(List<TapEvent> events, Object offset) {
-                original.accept(events, offset);
                 try {
+                    appendTailObservation(witness, offsetReading("DELIVERY_BEGIN", selected, offset));
+                    try { original.accept(events, offset); }
+                    catch (RuntimeException | Error failure) {
+                        try { appendTailObservation(witness, offsetReading("DELIVERY_ABORT", selected, offset)); }
+                        catch (IOException observationFailure) { failure.addSuppressed(observationFailure); }
+                        throw failure;
+                    }
                     appendTailObservation(witness, offsetReading("DELIVERY", selected, offset));
                 } catch (IOException failure) {
-                    throw new AssertionError("cannot record completed reader delivery", failure);
+                    throw new AssertionError("cannot record reader delivery", failure);
                 }
             }
             @Override public void streamReadStarted() { original.streamReadStarted(); }

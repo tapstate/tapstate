@@ -76,8 +76,7 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                 WorkloadClaimKey actuation = new WorkloadClaimKey(
                         control.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
 
-                documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
-                Instant handedOffLease = store.workloadClaims().read(actuation).orElseThrow().claim().leaseUntil();
+                Instant handedOffLease = documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
                 Await.until("the other member to hold actuation", BOUND,
                         () -> control.pipelineControllerOf(PIPELINE).filter(successor::equals).isPresent(),
                         () -> "controller=" + control.pipelineControllerOf(PIPELINE));
@@ -104,10 +103,15 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         () -> "capture=" + store.workloadClaims().read(capture));
                 assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
 
+                long originalExecution = store.workloadClaims().read(actuation).orElseThrow().claim().executionGeneration();
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 Await.until("the restarted pipeline to run", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "state=" + control.state(PIPELINE));
+                Await.until("the restart to allocate a new execution", BOUND,
+                        () -> store.workloadClaims().read(actuation)
+                                .filter(reading -> reading.claim().executionGeneration() > originalExecution).isPresent(),
+                        () -> "actuation=" + store.workloadClaims().read(actuation));
                 long before = mongo.count(target, TABLE);
                 mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
                 Await.until("a change to reach the restarted pipeline", BOUND,

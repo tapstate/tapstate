@@ -211,8 +211,18 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
                         assertThat(current.executionGeneration()).isEqualTo(original.executionGeneration() + 1);
                         ClusterRecoveryItemView item = recovered.items().stream()
                                 .filter(value -> value.pipelineId().equals(lane.pipeline())).findFirst().orElseThrow();
-                        assertRecovered(item, original, current, lane, reads, originalFloors.get(lane.pipeline()),
-                                originalCaptures.get(lane.pipeline()));
+                        try {
+                            assertRecovered(item, original, current, lane, reads, originalFloors.get(lane.pipeline()),
+                                    originalCaptures.get(lane.pipeline()));
+                        } catch (AssertionError failure) {
+                            try {
+                                Path retained = retainFloorDiagnostics(store, lane, reads, Map.of());
+                                throw new AssertionError(failure.getMessage() + "; recovery evidence retained at " + retained, failure);
+                            } catch (IOException | RuntimeException diagnosticFailure) {
+                                failure.addSuppressed(diagnosticFailure);
+                                throw failure;
+                            }
+                        }
                         if (lane.equals(multipleTables)) {
                             String requested = item.successor().requestedPositions().get(lane.source()).token();
                             assertThat(observed(reads, lane, "START", requested, readsBeforeLoss))
@@ -513,7 +523,8 @@ class MemberLossRebuildsPipelinesOneAtATimeIT {
             assertThat(point.epoch()).isNotNull();
             assertThat(point.sequence()).isNotNull();
             assertThat(delivered(reads, lane, point.token()))
-                    .as("the archived or accepted token is an actual completed SDK delivery, never a fabricated point").isTrue();
+                    .as("the archived or accepted token is an actual completed SDK delivery for %s: %s", lane.pipeline(), point)
+                    .isTrue();
             SourceOrder order = new SourceOrder(point.epoch(), point.sequence());
             floors.forEach((table, floor) -> {
                 // A higher ring epoch cannot establish source-log continuity. The exact native resume
