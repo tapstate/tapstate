@@ -109,5 +109,26 @@ def controls(context):
           'CLI output is exclusive and existing evidence survives')
 
 
+def resource_controls(context):
+    case_request,unused=case_fixture.prepare_cases(context)
+    request={'schema':1,'type':'archived-group-components-request',
+             'archive_cases':context['save']('resource-cases-request.json',case_request)}
+    reference=context['save']('resource-components-request.json',request)
+    replay=m.project(m.g.References(context['evidence']),context['work'],request)
+    resources=context['pre']['test_resource_files']
+    check(resources and replay['payloads']['I']['test_resource_files']==resources,
+          'test-resource component hashes derive from original prepared snapshots and raw packets')
+    value=m.component(m.g.References(context['evidence']),context['work'],reference,'I')
+    for label,change in [('omission',lambda payload:payload.pop('test_resource_files')),
+                         ('change',lambda payload:payload['test_resource_files'].update({'fixture/target/test-classes/corpus/golden.txt':'f'*64}))]:
+        changed=copy.deepcopy(value);change(changed['payload'])
+        rejected(lambda:m.g.component(m.g.References(context['evidence']),'I',
+            context['save']('resource-'+label+'.json',changed),replay['binding']), 'test resource '+label)
+    check(not replay['normalized_original_inputs_verified'] and not replay['whole_build_provenance_complete'],
+          'resource fingerprinting cannot certify original normalization or whole provenance')
+
+
 fixture.run(controls, only_callback=True, dependency_metadata=True)
+fixture.run(resource_controls,only_callback=True,dependency_metadata=True,
+            test_resource_bytes={'fixture/target/test-classes/corpus/golden.txt':b'compiled resource fixture\n'})
 print('CI archived group component controls passed:', count)

@@ -47,7 +47,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -170,6 +170,8 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             other_compiled = 'fixture/target/test-classes/io/tapstate/fixture/OtherTest.class'
             pre['test_files'][other_compiled] = g.checksum(b'other protocol class')
             pre['test_class_ids'][other_compiled] = g.receipt.crc64(b'other protocol class')
+        if test_resource_bytes is not None:
+            pre['test_resource_files']={name:g.checksum(raw) for name,raw in test_resource_bytes.items()}
         post = copy.deepcopy(pre)
         post['phase'] = 'post-test-before-pack'
         binding = {'execution': 'github-actions', 'run_id': str(run_id), 'run_attempt': 1}
@@ -190,7 +192,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
                    '<testcase classname="io.tapstate.fixture.SampleTest" name="' + method + '"/>'
                    for method in fixture_methods) + '</testsuite>').encode()
         marker = s.provenance_path(worker).as_posix()
-        result_files = {compiled: bytecode, xml_path: xml, worker['required_exec'][0]: b'coverage protocol fixture', marker: encode(provenance)}
+        result_files = {compiled: bytecode, xml_path: xml, worker['required_exec'][0]: b'coverage protocol fixture', marker: encode(provenance), **(test_resource_bytes or {})}
         manifest = {'schema': 2, 'source_sha': merge, 'cohort_hash': plan['cohort_hash'], 'shard_id': 'rest',
                     'tests': [test], 'required_exec': worker['required_exec'], 'provenance': provenance,
                     'provenance_path': marker, 'witness_ledgers': [], 'files': {n: g.checksum(b) for n, b in result_files.items()},
@@ -226,7 +228,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             other_xml_path = xml_path.replace('SampleTest','OtherTest')
             other_xml = xml.replace(b'SampleTest',b'OtherTest')
             other_files = {other_compiled: b'other protocol class', other_xml_path: other_xml,
-                           other_worker['required_exec'][0]: b'other coverage protocol', other_marker: encode(other_provenance)}
+                           other_worker['required_exec'][0]: b'other coverage protocol', other_marker: encode(other_provenance), **(test_resource_bytes or {})}
             other_manifest = copy.deepcopy(manifest)
             other_manifest.update(shard_id='engine',tests=[other],provenance=other_provenance,
                                   provenance_path=other_marker,report_classes=[other['class']],

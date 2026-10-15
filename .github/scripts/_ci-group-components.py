@@ -53,6 +53,8 @@ def project(refs, root, request):
         'spec': {'toolchain': input_facts['observed_toolchain'], 'jacoco_version': observed['jacoco_version'],
                  'runtime_spec_complete': False},
     }
+    if 'observed_test_resource_files' in input_facts:
+        payloads['I']['test_resource_files']=input_facts['observed_test_resource_files']
     binding = {'run_id': scope['run_id'], 'run_attempt': scope['run_attempt'],
                'source_sha': input_facts['checkout']['sha']}
     return {'schema': 1, 'type': 'archived-full-variant-components', 'scope': scope, 'binding': binding,
