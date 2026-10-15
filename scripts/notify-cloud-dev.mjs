@@ -62,6 +62,16 @@ export async function notifyCloudDev(env = process.env, fetchImpl = fetch) {
     // A transport failure can occur after the write; do not retry or expose credential-bearing errors.
     throw new Error('Cloud dev version registration failed or timed out; delivery may be uncertain');
   }
+  if (response.status === 409) {
+    let conflict;
+    try { conflict = await response.json(); }
+    catch { throw new Error('Cloud dev version registration received an invalid conflict response'); }
+    if (conflict?.code === 'cluster.version-duplicate') {
+      // Rebuilds intentionally retain the first catalog record, including its Git and image metadata.
+      return `Cloud dev version ${version} already exists; kept the original catalog record. Rebuilt image: ${image}`;
+    }
+    throw new Error('Cloud dev version registration failed (HTTP 409); unrecognized conflict');
+  }
   if (response.status !== 201) {
     throw new Error(`Cloud dev version registration failed (HTTP ${response.status}); reconcile before retrying`);
   }

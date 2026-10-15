@@ -47,16 +47,21 @@ Version registration uses these additional `cloud-ghcr-dev` environment settings
 | --- | --- | --- |
 | `CLOUD_RELEASE_API_URL` | Variable | `https://dev.cloud.tapstate.com/v1/api/cluster-versions` |
 | `CLOUD_RELEASE_CODE` | Variable | `BETA` (or `ALPHA` / `RC`) |
-| `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN` | Secret | The same static token configured on the dev Cloud control plane |
+| `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` | Repository or environment Secret | The same static token configured on the dev Cloud control plane |
 
 The workflow validates this configuration before building the image. After a
 successful public push and digest readback, it registers `<version>-dev` with the
 main and Web revisions, image tag, digest reference, and workflow run URL. The
 caller rejects production endpoints and checks the returned record against the
 published image. It never follows redirects, logs credential-bearing response
-bodies, or retries a write whose delivery is uncertain. The current API returns
-409 for an existing version; this is an explicit failure requiring reconciliation,
-not proof that the catalog has the rebuilt image's metadata. A GitHub Secret alone
+bodies, or retries a write whose delivery is uncertain. The API returns HTTP 409
+with `cluster.version-duplicate` for an existing version; the dev caller reports
+that it kept the first catalog record and completes without updating it. Other
+conflicts and authentication failures still fail the workflow. Rebuilds can
+replace the image tag while the catalog retains the first registration's Git
+and image metadata; use the current run summary for the rebuilt image's digest.
+The workflow maps `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` into the caller's
+`CLOUD_CLUSTER_VERSION_RELEASE_TOKEN` environment variable. A GitHub Secret alone
 does not configure the control plane's token.
 
 The lane builds only the Cloud Web/Boot JAR and dual-platform image, verifies its

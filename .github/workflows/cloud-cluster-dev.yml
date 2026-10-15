@@ -65,7 +65,7 @@ jobs:
         env:
           CLOUD_RELEASE_API_URL: ${{ vars.CLOUD_RELEASE_API_URL }}
           CLOUD_RELEASE_CODE: ${{ vars.CLOUD_RELEASE_CODE }}
-          CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: ${{ secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN }}
+          CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: ${{ secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV }}
         run: node scripts/notify-cloud-dev.mjs --validate
       - name: enable the pinned package manager
         run: corepack enable
@@ -214,5 +214,5 @@ jobs:
           CLOUD_IMAGE_DIGEST: ${{ steps.verify.outputs.digest }}
           CLOUD_RELEASE_API_URL: ${{ vars.CLOUD_RELEASE_API_URL }}
           CLOUD_RELEASE_CODE: ${{ vars.CLOUD_RELEASE_CODE }}
-          CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: ${{ secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN }}
+          CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: ${{ secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV }}
         run: node scripts/notify-cloud-dev.mjs

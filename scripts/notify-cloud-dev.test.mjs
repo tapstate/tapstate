@@ -82,7 +82,7 @@ test('preflight checks only configuration, before expensive image construction',
   assert.throws(() => validateCloudDevConfiguration(environment({ CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: '' })), /required/);
 });
 
-for (const status of [200, 301, 400, 401, 403, 409, 500, 503]) {
+for (const status of [200, 301, 400, 401, 403, 500, 503]) {
   test(`does not retry or accept HTTP ${status}, or disclose its body`, async () => {
     let calls = 0;
     let reads = 0;
@@ -94,6 +94,55 @@ for (const status of [200, 301, 400, 401, 403, 409, 500, 503]) {
     assert.equal(reads, 0);
   });
 }
+
+test('rebuilds retain the first catalog record when the API reports a duplicate version', async () => {
+  let saved;
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, method: options.method });
+    if (saved) {
+      return { status: 409, json: async () => ({ code: 'cluster.version-duplicate', msg: 'private-dev-token' }) };
+    }
+    saved = receipt(options).data;
+    return { status: 201, json: async () => ({ code: 'ok', data: saved }) };
+  };
+  await notifyCloudDev(environment(), fetchImpl);
+  const firstRecord = structuredClone(saved);
+  const rebuiltDigest = `sha256:${'d'.repeat(64)}`;
+  const result = await notifyCloudDev(environment({
+    DEV_SHA: 'e'.repeat(40), DEV_WEB_SHA: 'f'.repeat(40),
+    DEV_RUN_URL: 'https://github.com/tapstate/tapstate/actions/runs/456',
+    CLOUD_IMAGE_DIGEST: rebuiltDigest, CLOUD_IMAGE: `ghcr.io/tapstate/tapstate-cloud@${rebuiltDigest}`,
+  }), fetchImpl);
+  assert.deepEqual(saved, firstRecord);
+  assert.equal(saved.git.commitId, 'b'.repeat(40));
+  assert.equal(saved.git.extra.imageDigest, digest);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(call => call.method === 'POST'));
+  assert.match(result, /0\.7\.0-dev already exists; kept the original catalog record/);
+  assert.ok(result.includes(rebuiltDigest));
+  assert.ok(!result.includes('private-dev-token'));
+});
+
+for (const code of ['ok', 'cluster.version-not-active', undefined]) {
+  test(`rejects an unrecognized HTTP 409 code: ${code}`, async () => {
+    let calls = 0;
+    await assert.rejects(notifyCloudDev(environment(), async () => {
+      calls++;
+      return { status: 409, json: async () => ({ code, msg: 'private-dev-token' }) };
+    }), error => /HTTP 409/.test(error.message) && !error.message.includes('private-dev-token'));
+    assert.equal(calls, 1);
+  });
+}
+
+test('rejects an invalid conflict body without disclosing details or retrying', async () => {
+  let calls = 0;
+  await assert.rejects(notifyCloudDev(environment(), async () => {
+    calls++;
+    return { status: 409, json: async () => { throw new Error('private-dev-token'); } };
+  }), error => /invalid conflict response/.test(error.message) && !error.message.includes('private-dev-token'));
+  assert.equal(calls, 1);
+});
 
 test('transport errors do not disclose credentials or automatically retry an uncertain write', async () => {
   let calls = 0;
