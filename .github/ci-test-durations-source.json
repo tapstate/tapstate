@@ -64,6 +64,7 @@
     }
   ],
   "cohort_hash": "07125e4700c837791522e8bdf086d46a606899617d3b15b5c920edac77eeacab",
+  "comparison_scope": "The recorded source unit set predates current product and recovery changes. The current reactor has 1285 source units; newly discovered classes use the configured 30-second fallback. These weights remain estimates, not identity or performance acceptance.",
   "current_selected_verify_provenance_verified": true,
   "duration_hints_sha256": "f8f7e9ac27f6919335ded48940da0a9e948ab314ccb9b38ad3796aa6233361dd",
   "estimates_only": true,
@@ -76,7 +77,7 @@
   "schema": 1,
   "scope": "All four selected Maven verify commands completed successfully. The rest identity export failed afterwards and the whole workflow failed; these are scheduling estimates, not successful-run or paired performance evidence.",
   "source_sha": "e32f49200bc68d6967d3143867a3e6d15afed7cd",
-  "source_unit_set_matches_current": true,
+  "source_unit_set_matches_current": false,
   "source_units": 1283,
   "whole_run_complete_at_capture": true,
   "workflow": "ci.yml",
