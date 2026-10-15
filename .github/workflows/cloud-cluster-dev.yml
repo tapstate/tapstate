@@ -61,6 +61,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: validate the dev version registration configuration
+        env:
+          CLOUD_RELEASE_API_URL: ${{ vars.CLOUD_RELEASE_API_URL }}
+          CLOUD_RELEASE_CODE: ${{ vars.CLOUD_RELEASE_CODE }}
+          CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: ${{ secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN }}
+        run: node scripts/notify-cloud-dev.mjs --validate
       - name: enable the pinned package manager
         run: corepack enable
       - uses: actions/setup-node@v4
@@ -196,3 +202,17 @@ jobs:
           test -n "$IMAGE"
           printf "Dev image: \`%s\`\n\nDigest reference: \`%s\`\n\nTapstate main: \`%s\`\n\nWeb main: \`%s\`\n" \
             "$TAG" "$IMAGE" "$TAPSTATE_SHA" "$WEB_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: register the checked image in the dev Cloud version catalog
+        env:
+          DEV_VERSION: ${{ steps.source.outputs.version }}
+          DEV_SHA: ${{ steps.source.outputs.sha }}
+          DEV_WEB_SHA: ${{ steps.web.outputs.sha }}
+          DEV_BRANCH: main
+          DEV_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLOUD_IMAGE: ${{ steps.publish.outputs.image }}
+          CLOUD_IMAGE_TAG: ${{ steps.publish.outputs.tag }}
+          CLOUD_IMAGE_DIGEST: ${{ steps.verify.outputs.digest }}
+          CLOUD_RELEASE_API_URL: ${{ vars.CLOUD_RELEASE_API_URL }}
+          CLOUD_RELEASE_CODE: ${{ vars.CLOUD_RELEASE_CODE }}
+          CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: ${{ secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN }}
+        run: node scripts/notify-cloud-dev.mjs

@@ -41,6 +41,24 @@ Reuse the existing Public `tapstate-cloud` package and its workflow write access
 the publisher refuses missing or non-public packages. Package access follows the
 [GitHub package access and visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
 
+Version registration uses these additional `cloud-ghcr-dev` environment settings:
+
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `CLOUD_RELEASE_API_URL` | Variable | `https://dev.cloud.tapstate.com/v1/api/cluster-versions` |
+| `CLOUD_RELEASE_CODE` | Variable | `BETA` (or `ALPHA` / `RC`) |
+| `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN` | Secret | The same static token configured on the dev Cloud control plane |
+
+The workflow validates this configuration before building the image. After a
+successful public push and digest readback, it registers `<version>-dev` with the
+main and Web revisions, image tag, digest reference, and workflow run URL. The
+caller rejects production endpoints and checks the returned record against the
+published image. It never follows redirects, logs credential-bearing response
+bodies, or retries a write whose delivery is uncertain. The current API returns
+409 for an existing version; this is an explicit failure requiring reconciliation,
+not proof that the catalog has the rebuilt image's metadata. A GitHub Secret alone
+does not configure the control plane's token.
+
 The lane builds only the Cloud Web/Boot JAR and dual-platform image, verifies its
 locked inputs, and uploads the checked OCI digest. It deploys no environment.
 Use the digest reference in the run summary for dev validation; a numeric dev
