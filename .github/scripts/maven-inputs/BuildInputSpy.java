@@ -98,7 +98,8 @@ public final class BuildInputSpy extends AbstractEventSpy {
     private Object artifact(Artifact value) throws Exception {
         if (value == null) return row("state", "not-observed", "reason", "no-artifact");
         Map<String, Object> record = row("group", value.getGroupId(), "artifact", value.getArtifactId(),
-                "version", value.getVersion(), "type", value.getType(), "classifier", value.getClassifier(),
+                "version", value.getVersion(), "base_version", value.getBaseVersion(),
+                "type", value.getType(), "classifier", value.getClassifier(),
                 "scope", value.getScope(), "resolved", value.isResolved());
         if (value.getFile() == null) record.put("state", "not-observed-no-file");
         else record.put("file", file(value.getFile().toPath()));
@@ -327,7 +328,7 @@ public final class BuildInputSpy extends AbstractEventSpy {
 
     @Override public synchronized void close() throws Exception {
         if (output == null) return;
-        Map<String, Object> root = row("schema", 3, "type", "local-configured-build-input-observation", "events", events,
+        Map<String, Object> root = row("schema", 4, "type", "local-configured-build-input-observation", "events", events,
                 "files", files, "failures", failures, "dropped_events", droppedEvents, "hashed_bytes", hashedBytes, "java_version", System.getProperty("java.version"),
                 "java_vendor", System.getProperty("java.vendor"), "os_arch", System.getProperty("os.arch"),
                 "annotation_processor_inputs", "not-observed", "external_generator_inputs", "not-observed",

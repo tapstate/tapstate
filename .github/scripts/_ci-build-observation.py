@@ -62,18 +62,20 @@ def file_reference(value, files, reason=None):
                 'unsupported runtime file state')
 
 
-def artifact_fact(value, files):
+def artifact_fact(value, files, schema=3):
     if isinstance(value, dict) and value.get('state') == 'not-observed':
         object_fields(value, 'state reason', 'unobserved artifact')
         require(value['reason'] == 'no-artifact', 'unsupported artifact state')
         return
     fields = 'group artifact version type classifier scope resolved'
+    if schema == 4:
+        fields += ' base_version'
     if isinstance(value, dict) and value.get('state') == 'not-observed-no-file':
         object_fields(value, fields + ' state', 'artifact')
     else:
         object_fields(value, fields + ' file', 'artifact')
         file_reference({'file': value['file']}, files)
-    for name in ('group', 'artifact', 'version', 'type'):
+    for name in ('group', 'artifact', 'version', 'type') + (('base_version',) if schema == 4 else ()):
         text_field(value[name], 'artifact ' + name)
     for name in ('classifier', 'scope'):
         if value[name] is not None:
@@ -116,7 +118,7 @@ def realm_fact(value, files):
             pending.extend((child, depth + 1) for child in reversed(bounded_list(realm['imports'], 'realm imports')))
 
 
-def event_fact(record, files):
+def event_fact(record, files, schema=3):
     common = 'event nanos project execution goal plugin fully_injected_parameter_values'
     if record['event'] == 'MojoConfigured':
         object_fields(record, common + ' configured_implementation effective_model_sha256 active_profile_identities '
@@ -157,11 +159,11 @@ def event_fact(record, files):
         object_fields(record, common + ' merged_xml_config_sha256 project_artifacts_at_event' + extra, 'Mojo event')
         sha_field(record['merged_xml_config_sha256'], 'merged XML digest')
         for artifact in bounded_list(record['project_artifacts_at_event'], 'project artifacts'):
-            artifact_fact(artifact, files)
+            artifact_fact(artifact, files, schema)
         if extra:
-            artifact_fact(record['plugin_artifact'], files)
+            artifact_fact(record['plugin_artifact'], files, schema)
             for artifact in bounded_list(record['plugin_artifacts'], 'plugin artifacts'):
-                artifact_fact(artifact, files)
+                artifact_fact(artifact, files, schema)
             realm_fact(record['realm'], files)
     require(type(record['nanos']) is int and record['nanos'] >= 0, 'invalid event timing')
     require(record['fully_injected_parameter_values'] == 'not-observed', 'unsupported parameter completeness')
@@ -179,7 +181,7 @@ def observation_summary(raw):
     object_fields(value, 'schema type events event_records files failures dropped_events hashed_bytes java_version '
                   'java_vendor os_arch annotation_processor_inputs external_generator_inputs '
                   'whole_build_provenance_complete elapsed_nanos', 'observation')
-    require(type(value.get('schema')) is int and value['schema'] == 3
+    require(type(value.get('schema')) is int and value['schema'] in (3, 4)
             and value.get('type') == 'local-configured-build-input-observation', 'unsupported build observation')
     records, files = value.get('event_records'), value.get('files')
     require(isinstance(records, list) and 0 < len(records) <= 20000
@@ -205,7 +207,7 @@ def observation_summary(raw):
         require(all(isinstance(item, str) and item for item in key), 'invalid Mojo identity')
         for item in key:
             text_field(item, 'Mojo identity')
-        event_fact(record, files)
+        event_fact(record, files, value['schema'])
         require(previous_nanos <= record['nanos'] <= value['elapsed_nanos'], 'invalid event timing order')
         previous_nanos = record['nanos']
         kind = record['event']

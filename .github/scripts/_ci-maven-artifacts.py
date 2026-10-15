@@ -117,6 +117,9 @@ def capture(snapshot, read_source):
     metadata = observation.get('observation_metadata')
     require(isinstance(metadata, dict) and isinstance(metadata.get('event_records'), list)
             and len(metadata['event_records']) <= 20000, 'resolved Maven artifact event stream unavailable')
+    require(type(metadata.get('schema')) is int and metadata['schema'] in (3, 4),
+            'unsupported resolved Maven artifact metadata')
+    has_base_version = metadata['schema'] == 4
     index, visited = {}, 0
     for row in metadata['event_records']:
         if row.get('event') not in ('MojoStarted', 'MojoSucceeded'):
@@ -128,7 +131,7 @@ def capture(snapshot, read_source):
             require(visited <= 100000 and isinstance(artifact, dict), 'excessive original project artifacts')
             if artifact.get('resolved') is not True or artifact.get('classifier') is not None:
                 continue
-            gav = tuple(artifact.get(k) for k in ('group', 'artifact', 'version'))
+            gav = tuple(artifact.get(k) for k in ('group', 'artifact', 'base_version' if has_base_version else 'version'))
             if not all(isinstance(v, str) and LITERAL.fullmatch(v) for v in gav):
                 continue
             index.setdefault((row.get('project'), gav), []).append(artifact)
@@ -183,8 +186,14 @@ def capture(snapshot, read_source):
             rows = index.get((':'.join(gav), tuple(candidate)), [])
             if not rows:
                 errors[identity] = 'no original resolved artifact for this consumer'; continue
-            scopes, observed, failure = set(), [], None
+            scopes, versions, observed, failure = set(), set(), [], None
             for artifact in rows:
+                if has_base_version:
+                    version = artifact.get('version')
+                    if (not isinstance(version, str) or not LITERAL.fullmatch(version)
+                            or version != candidate[2] and not candidate[2].endswith('-SNAPSHOT')):
+                        failure = 'unsupported resolved version/base version binding'; break
+                    versions.add(version)
                 if artifact.get('type') != kind or artifact.get('scope') not in SCOPES:
                     failure = 'unsupported or conflicting resolved artifact type/scope'; break
                 reference = artifact.get('file')
@@ -196,10 +205,14 @@ def capture(snapshot, read_source):
                     failure = 'original resolved artifact file is unobserved'; break
                 scopes.add(artifact['scope'])
             expected = {key: entry[key] for key in ('sha256', 'size')}
+            if has_base_version and len(versions) > 1:
+                failure = 'conflicting original resolved artifact versions'
             if failure or not observed or any(value != expected for value in observed):
                 errors[identity] = failure or 'conflicting original resolved artifact bytes'; continue
             result['artifacts'][identity] = {'gav': candidate, 'type': kind, 'classifier': None,
                                             **expected, 'scopes': sorted(scopes)}
+            if has_base_version:
+                result['artifacts'][identity]['resolved_versions'] = sorted(versions)
         if not errors:
             unresolved.pop(consumer)
     return {'schema': 1, 'capture_helpers': helpers, 'reactor': reactor, 'consumers': consumers, 'unresolved': unresolved,

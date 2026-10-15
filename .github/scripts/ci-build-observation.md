@@ -21,3 +21,17 @@ claim embedded producer identity, actual consumption or whole provenance.
 For local use, create a task-owned work directory outside the checkout and dependency repository, then pass it as `--work-dir` with a new `--output` file and the explicit `--shard-id`. Pass the unchanged Maven command after `--`. The wrapper refuses narrowed reactor commands, extension overrides, dirty tracked source, reused output and incomplete or inconsistent event observations.
 
 `ci-build-observation-smoke.sh` exercises scoped producer/consumer validation and original Git/ZIP archive readback. Actual full-product and Linux runner behavior must be recorded separately; offline controls do not establish CI or performance acceptance.
+
+New native observations use metadata schema 4. Every observed Maven artifact
+retains its exact `version` and records `base_version` directly from the same
+Artifact API object. This distinguishes a timestamped resolved SNAPSHOT from
+its repository/model base coordinates without deriving that association from
+a filename, timestamp spelling or POM. Schema 3 archives retain their original
+shape and exact-version rules; missing historical base facts are never added.
+
+Resolved dependency capture uses the recorded base coordinates in schema 4 and
+retains the exact recorded `resolved_versions` in each used dependency fact. Conflicting
+versions, wrong base coordinates, missing consumer records or different file
+bytes remain unresolved. A concrete version difference remains an input
+difference even when the bytes match. This does not establish an effective
+dependency model, archive producer identity or actual class consumption.

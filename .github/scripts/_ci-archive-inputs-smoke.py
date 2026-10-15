@@ -47,7 +47,7 @@ def zipped(files):
     return output.getvalue()
 
 
-def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False):
+def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False, maven_schema=3):
     """Protocol bytes and native-shaped observations; this does not run Maven or compile Java."""
     roles = m.test_jars
     path = 'fixture/target/fixture-1-tests.jar'
@@ -114,6 +114,17 @@ def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False):
         files=files, failures=0, dropped_events=0, hashed_bytes=sum(v['size'] for v in files.values()),
         java_version='21', java_vendor='Fixture', os_arch='fixture', annotation_processor_inputs='not-observed',
         external_generator_inputs='not-observed', whole_build_provenance_complete=False, elapsed_nanos=7)
+    if maven_schema == 4:
+        metadata['schema'] = 4
+        for row in rows:
+            artifacts = list(row.get('project_artifacts_at_event', [])) + list(row.get('plugin_artifacts', []))
+            if 'plugin_artifact' in row:
+                artifacts.append(row['plugin_artifact'])
+            for item in artifacts:
+                if 'base_version' not in item:
+                    item['base_version'] = item['version']
+                    if item['version'] == '2-SNAPSHOT':
+                        item['version'] = '2-20261016.000000-1'
     observer = g.module('test_jar_fixture_observation', '_ci-build-observation.py')
     source_hash = g.checksum(json.dumps({Path(n).name: h for n, h in pre['source_files'].items()
                                        if n.startswith('.github/scripts/maven-inputs/')}, sort_keys=True).encode())
@@ -131,7 +142,7 @@ def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False):
     return raw
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False, maven_schema=3):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -141,6 +152,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         subprocess.run(['git', 'init', '-q', str(main)], check=True)
         for key, value in [('user.name', 'Fixture'), ('user.email', 'fixture@example.test'), ('commit.gpgsign', 'false')]:
             v.git(main, 'config', key, value)
+        assert type(maven_schema) is int and maven_schema in (3, 4)
         assert not resolved_artifacts or test_jar, 'resolved artifact fixture requires original Maven observations'
         if test_jar:
             assert not two_workers and test_resource_bytes is None, 'bounded test-JAR fixture uses one complete owner class'
@@ -282,7 +294,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         if test_resource_bytes is not None:
             pre['test_resource_files']={name:g.checksum(raw) for name,raw in test_resource_bytes.items()}
         if test_jar:
-            packaged_raw = packaged_test_fixture(pre, work, bytecode, resolved_artifacts=resolved_artifacts)
+            packaged_raw = packaged_test_fixture(pre, work, bytecode, resolved_artifacts=resolved_artifacts, maven_schema=maven_schema)
         post = copy.deepcopy(pre)
         post['phase'] = 'post-test-before-pack'
         binding = {'execution': 'github-actions', 'run_id': str(run_id), 'run_attempt': 1}

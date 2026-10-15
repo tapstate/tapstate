@@ -285,6 +285,77 @@ def controls(context):
     recording_control(context)
 
 
+def snapshot_controls(context):
+    value, root = context['pre'], context['work']
+    identity = 'repository/io/tapstate/published-api/2-SNAPSHOT/published-api-2-SNAPSHOT.jar'
+    read_source = lambda name: (root / name).read_bytes()
+    packet = roles.validate(value['resolved_maven_artifacts'], value, read_source)
+    record = roles.consumer_identity(packet, 'fixture', identity)['artifact']
+    check(record['gav'] == ['io.tapstate', 'published-api', '2-SNAPSHOT']
+          and record['resolved_versions'] == ['2-20261016.000000-1'],
+          'original base version joins snapshot bytes while preserving the concrete version')
+    def project_rows(md):
+        return [a for row in md['event_records'] for a in row.get('project_artifacts_at_event', [])
+                if a.get('artifact') == 'published-api']
+    def recapture(mutate):
+        changed = copy.deepcopy(value)
+        observation = changed['maven_execution_observation']
+        mutate(observation['observation_metadata'])
+        reader = g.module('snapshot_controls_observation', '_ci-build-observation.py')
+        observation.update(reader.observation_summary(json.dumps(observation['observation_metadata']).encode()))
+        return roles.capture(changed, read_source)
+    def duplicate_version(md):
+        row = next(r for r in md['event_records'] if r['event'] == 'MojoStarted')
+        artifact = copy.deepcopy(next(a for a in row['project_artifacts_at_event'] if a['artifact'] == 'published-api'))
+        artifact['version'] = '2-20261016.000000-2'
+        row['project_artifacts_at_event'].append(artifact)
+    for label, mutate in [
+        ('wrong base version', lambda md: [a.update(base_version='3-SNAPSHOT') for a in project_rows(md)]),
+        ('conflicting concrete versions', duplicate_version),
+        ('wrong original consumer', lambda md: [r.update(project='io.tapstate:consumer:1') for r in md['event_records']
+             if r['project'] == 'io.tapstate:fixture:1']),
+        ('unresolved original dependency', lambda md: [a.update(resolved=False) for a in project_rows(md)]),
+        ('wrong snapshot type', lambda md: [a.update(type='pom') for a in project_rows(md)]),
+        ('wrong snapshot scope', lambda md: [a.update(scope='unknown') for a in project_rows(md)]),
+        ('wrong snapshot file', lambda md: [a.update(file=md['event_records'][2]['plugin_artifact']['file']) for a in project_rows(md)]),
+    ]:
+        changed = recapture(mutate)
+        check(identity in changed['unresolved'].get('fixture', {})
+              and roles.consumer_identity(changed, 'fixture', identity) is None, label + ' remains unknown')
+    def downgrade(md):
+        md['schema'] = 3
+        for row in md['event_records']:
+            artifacts = list(row.get('project_artifacts_at_event', [])) + list(row.get('plugin_artifacts', []))
+            if 'plugin_artifact' in row:
+                artifacts.append(row['plugin_artifact'])
+            for artifact in artifacts:
+                artifact.pop('base_version', None)
+    legacy = recapture(downgrade)
+    check(identity in legacy['unresolved'].get('fixture', {}), 'legacy timestamp records never acquire inferred base coordinates')
+    release = roles.consumer_identity(legacy, 'fixture', 'repository/example/lib/1/lib-1.jar')['artifact']
+    check('resolved_versions' not in release, 'legacy exact-version capture preserves its original artifact shape')
+    changed = recapture(lambda md: [a.update(version='different-release') for row in md['event_records']
+        for a in row.get('project_artifacts_at_event', []) if a.get('artifact') == 'lib'])
+    check('repository/example/lib/1/lib-1.jar' in changed['unresolved'].get('fixture', {}),
+          'a release base cannot associate a different concrete release')
+    artifacts = context['artifacts']
+    native = artifacts['ci-inputs-rest']['build-inputs.json']['resolved_maven_artifacts']
+    native['consumers']['fixture']['artifacts'][identity]['resolved_versions'] = ['2-20261016.000000-2']
+    context['reseal'](); rejected(context['project'], 'false concrete version in original capture'); context['reset']()
+    observation = artifacts['ci-inputs-rest']['build-inputs.json']['maven_execution_observation']
+    for artifact in project_rows(observation['observation_metadata']):
+        artifact['base_version'] = '3-SNAPSHOT'
+    reader = g.module('snapshot_archive_observation', '_ci-build-observation.py')
+    observation.update(reader.observation_summary(json.dumps(observation['observation_metadata']).encode()))
+    context['reseal'](); rejected(context['project'], 'changed original base version'); context['reset']()
+    expected = context['project']()
+    output, manifest = context['evidence'] / 'snapshot-cli.json', context['evidence'] / 'snapshot-request.json'
+    manifest.write_bytes(archive_fixture.encode(context['request']))
+    child = subprocess.run(['bash', str(HERE / 'ci-archive-inputs.sh'), '--manifest', str(manifest),
+        '--evidence-root', str(context['evidence']), '--root', str(root), '--output', str(output)], capture_output=True, text=True)
+    check(child.returncode == 0 and json.loads(output.read_bytes()) == expected, 'original schema4 snapshot archive CLI: ' + child.stderr)
+
+
 def group_controls(root, contexts, unused_complete, unused_added):
     request, inventories, unused = group_fixture.fixture.prepare_request(root, contexts, group_fixture.original_event)
     def save(name, value):
@@ -355,6 +426,20 @@ def group_controls(root, contexts, unused_complete, unused_added):
             check(any(r['field'] == 'resolved_dependency_identities' and r['status'] == status
                       for r in delta.compare_payloads(changed, report['case_partition'], parsed)),
                   label + ' remains an input difference with embedded identity ' + str(embedded))
+    if contexts['B']['pre']['maven_execution_observation']['observation_metadata']['schema'] == 4:
+        def version_change(md, base=False):
+            for row in md['event_records']:
+                for artifact in row.get('project_artifacts_at_event', []):
+                    if artifact.get('artifact') == 'published-api':
+                        artifact.update(base_version='3-SNAPSHOT') if base else artifact.update(version='2-20261016.000000-2')
+        for base, status in ((False, 'needs_review'), (True, 'unknown')):
+            changed = copy.deepcopy(payloads)
+            packet = original_packet(lambda md: version_change(md, base))
+            for peer in changed['B']['D']['peer_dependency_observations'].values():
+                peer['resolved_maven_artifacts'] = packet
+            check(any(r['field'] == 'resolved_dependency_identities' and r['status'] == status
+                      for r in delta.compare_payloads(changed, report['case_partition'], parsed)),
+                  'concrete version and base version changes cannot be cache side facts: ' + str(base))
     request_path, output = root / 'native-delta-request.json', root / 'native-delta-output.json'
     request_path.write_bytes(archive_fixture.encode(manifest))
     child = subprocess.run(['bash', str(HERE / 'ci-group-delta.sh'), '--manifest', str(request_path),
@@ -366,4 +451,22 @@ if __name__ == '__main__':
     archive_fixture.run(controls, only_callback=True, test_jar=True, resolved_artifacts=True, dependency_metadata=metadata)
     group_fixture.fixture.cohort(added=True, callback=group_controls, dependency_metadata=metadata,
                                 test_jar=True, resolved_artifacts=True)
+    snapshot_metadata = copy.deepcopy(metadata)
+    old_pom = sdk_path.removesuffix('.jar') + '.pom'
+    new_jar = 'io/tapstate/published-api/2-SNAPSHOT/published-api-2-SNAPSHOT.jar'
+    new_pom = new_jar.removesuffix('.jar') + '.pom'
+    for field in ('dependency_repository_files', 'dependency_producer_facts'):
+        snapshot_metadata[field][new_jar] = snapshot_metadata[field].pop(sdk_path)
+    for field in ('dependency_repository_files', 'dependency_coordinate_models'):
+        snapshot_metadata[field][new_pom] = snapshot_metadata[field].pop(old_pom)
+    snapshot_metadata['dependency_coordinate_models'][new_pom]['gav'][2] = '2-SNAPSHOT'
+    producer = snapshot_metadata['dependency_producer_facts'][new_jar]
+    producer['gav'][2], producer['pom_path'] = '2-SNAPSHOT', new_pom
+    for entry in snapshot_metadata['resolved_test_classpaths']['fixture']:
+        if entry['identity'] == 'repository/' + sdk_path:
+            entry['identity'] = 'repository/' + new_jar
+    archive_fixture.run(snapshot_controls, only_callback=True, test_jar=True, resolved_artifacts=True,
+                        dependency_metadata=snapshot_metadata, maven_schema=4)
+    group_fixture.fixture.cohort(added=True, callback=group_controls, dependency_metadata=snapshot_metadata,
+                                test_jar=True, resolved_artifacts=True, maven_schema=4)
     print('original resolved Maven artifact identity controls passed:', count)

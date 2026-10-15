@@ -67,6 +67,22 @@ for name,mutate in [('false JDK',lambda x:x['runtime_identity'].update(whole_JDK
 for name,mutate in [('boolean bytes',lambda x:x.update(hashed_bytes=True)),('negative elapsed',lambda x:x.update(elapsed_nanos=-1)),('missing start facts',lambda x:x['event_records'][0].pop('merged_xml_config_sha256')),('missing success realm',lambda x:x['event_records'][-1].pop('realm')),('generator claim',lambda x:x.update(external_generator_inputs='complete'))]:
     changed=copy.deepcopy(metadata);mutate(changed);reject(name,lambda:reader.observation_summary(json.dumps(changed).encode()))
 reject('duplicate keys',lambda:reader.observation_summary(b'{"schema":3,"schema":3}'))
+def schema_four():
+    value=metadata_fixture();value['schema']=4
+    for row in value['event_records']:
+        artifacts=list(row.get('project_artifacts_at_event',[]))+list(row.get('plugin_artifacts',[]))
+        if 'plugin_artifact' in row:artifacts.append(row['plugin_artifact'])
+        for artifact in artifacts:artifact['base_version']=artifact['version']
+    return value
+current=schema_four()
+assert reader.observation_summary(json.dumps(current).encode())['event_count']==3;count+=1
+for label,mutation in [('missing base',lambda a:a.pop('base_version')),('empty base',lambda a:a.update(base_version='')),('boolean base',lambda a:a.update(base_version=True)),('unknown field',lambda a:a.update(inferred_base=True))]:
+    changed=schema_four();mutation(changed['event_records'][0]['project_artifacts_at_event'][0])
+    reject(label,lambda:reader.observation_summary(json.dumps(changed).encode()))
+changed=schema_four();changed['schema']=3
+reject('schema3 cannot acquire current fields',lambda:reader.observation_summary(json.dumps(changed).encode()))
+changed=schema_four();changed['schema']=5
+reject('unsupported metadata version',lambda:reader.observation_summary(json.dumps(changed).encode()))
 print('build observation smoke:',count,'controls passed')
 spec=importlib.util.spec_from_file_location('archive_fixture',here/'_ci-archive-inputs-smoke.py');fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
 count=0
