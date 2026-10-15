@@ -334,9 +334,14 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
     path.unlink(); path.write_text(content)
     # Exercise the complete command with a real independent Git source and plan.
     fixture = root / 'input-comparison-checkout'; (fixture / 'core/src/test/java/sample').mkdir(parents=True)
-    (fixture / 'pom.xml').write_text('<project><modules><module>core</module></modules></project>')
+    # A layout-bound default plan needs one source unit on every worker.
+    (fixture / 'pom.xml').write_text('<project><modules><module>core</module><module>e2e</module><module>runtime/engine</module></modules></project>')
     (fixture / 'core/pom.xml').write_text('<project/>')
     (fixture / 'core/src/test/java/sample/OneTest.java').write_text('package sample; class OneTest {}')
+    for module, names in [('e2e', ['OneIT', 'TwoIT']), ('runtime/engine', ['EngineTest'])]:
+        directory=fixture/module/'src/test/java/sample'; directory.mkdir(parents=True)
+        (fixture/module/'pom.xml').write_text('<project><build><plugins><plugin><artifactId>maven-failsafe-plugin</artifactId><executions><execution><goals><goal>integration-test</goal></goals></execution></executions></plugin></plugins></build></project>')
+        for name in names: (directory/(name+'.java')).write_text('package sample; class '+name+' {}')
     git_env = {key: value for key, value in os.environ.items() if key not in
                ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_PREFIX', 'GIT_QUARANTINE_PATH')}
     def fixture_git(*args):
