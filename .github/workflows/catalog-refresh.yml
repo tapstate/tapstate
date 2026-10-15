@@ -1,178 +1,90 @@
-# Full connector catalog rebuild - the expensive half of upstream drift.
-#
-# A connector's capabilities are not written down anywhere a file can be read: they are whichever
-# functions the connector registers when it is loaded. Finding out means building every connector and
-# classloading it, which is 60-odd Maven modules and a large dependency graph. That is why this is its
-# own lane rather than a step in the daily specification scan (catalog-spec-drift.yml) or in the
-# nightly real-connector one.
-#
-# Its own workflow, deliberately, and the three reasons are all things a shared one cannot give:
-#   - its own timeout, which a second job in a shared workflow cannot have without also being a second
-#     runner that rebuilds everything from scratch;
-#   - its own schedule, since adding a cron to a shared workflow re-runs everything else on it;
-#   - its own concurrency group - concurrency is declared per workflow, so sharing one means a manual
-#     rebuild here cancels whatever else that workflow was running, and the reverse.
-#
-# Red here is allowed to mean "a connector would not build". That is a different signal from the daily
-# scan's, and keeping the two apart is the point: the cheap lane stays a punctual, reliable channel for
-# "upstream declarations moved", and is not taken down by whichever connector broke this week.
-#
-# The byte-lock over the checked-in catalog runs here, because here is where it can: it needs the
-# connectors checkout and the derived bitmap, so on an ordinary pull request it skips.
-
-name: Catalog refresh
+name: Cloud version credential probe
+run-name: Cloud version credential probe (dev and prod)
 
 on:
   workflow_dispatch:
-  schedule:
-    # Weekly. Off the hour, and on a Tuesday rather than a weekend, so a rebuild that fails is looked
-    # at within a working day rather than on the following Monday alongside everything else.
-    - cron: "50 1 * * 2"
-  pull_request:
-    # By label, not by path: this lane builds 60-odd connector modules and is given three hours to do
-    # it, so on a pull request it runs only when someone asks for it by name. It can be asked for at
-    # all because workflow_dispatch does not exist until the file is on the default branch, which
-    # would otherwise leave the pull request introducing this lane with no way to run it once.
-    types: [labeled]
-
-concurrency:
-  group: catalog-refresh
-  cancel-in-progress: false
 
 permissions:
   contents: read
 
-env:
-  UPSTREAM: https://github.com/tapdata/tapdata-connectors.git
-
 jobs:
-  refresh:
-    # The label is the ask; the fork check is because a fork's pull request is handed none of the
-    # secrets, so the app token cannot be minted and the run would be red for a reason its author has
-    # no way to fix.
-    if: >-
-      github.event_name != 'pull_request'
-      || (github.event.label.name == 'catalog-full-rebuild'
-          && github.event.pull_request.head.repo.full_name == github.repository)
+  probe:
+    if: github.repository == 'tapstate/tapstate' && github.ref == 'refs/heads/ws/release-cloud-credential-probe'
+    name: version API probe (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 3
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: dev
+            endpoint: https://dev.cloud.tapstate.com/v1/api/cluster-versions
+            secret_name: CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV
+          - target: prod
+            endpoint: https://cloud.tapstate.com/v1/api/cluster-versions
+            secret_name: CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD
     steps:
-      - uses: actions/checkout@v4
-
-      - name: A JDK 17 for the connectors, whose pinned Lombok predates JDK 21
-        # Their build dies mid-reactor under a newer JDK, on a javac internal that names nothing about
-        # Lombok. Installed first so its JAVA_HOME can be captured while it is the current one; the
-        # product's own JDK is set up after this and takes JAVA_HOME back.
-        uses: actions/setup-java@v4
+      - uses: actions/setup-node@v4
         with:
-          distribution: temurin
-          java-version: "17"
-      - run: echo "TAPSTATE_CONNECTOR_JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-
-      - name: Clone the connectors
-        # A full clone: the refresh walks the connector sources to find each one's annotation, and a
-        # checkout holding only specification files resolves no Java connector at all - every one of
-        # them would empty out of the catalog, in a diff shaped exactly like an ordinary edit.
-        run: git clone --depth 1 "$UPSTREAM" upstream
-
-      - name: Rebuild the catalog, connectors and all
-        # Nothing about the connectors' extra repository is set here any more. It used to be an env
-        # var on this step alone, which meant this lane and a development machine ran two different
-        # builds - the one that worked was the one nobody could reproduce, and this lane's acceptance
-        # asks a person to run it on their own machine. The connector build now supplies it itself,
-        # so both take the same path and the path CI exercises is the one a developer gets.
-        #
-        # No module list here: the refresh derives it from the probe manifest it writes, so a
-        # connector added upstream is built without anyone editing this file. A fixed list would
-        # silently derive nothing for it, and a connector with no jar is not an error - it is a line
-        # in the report's "not derived" section, which is where such an omission would go to hide.
-        run: scripts/refresh-catalog.sh --connectors upstream
-
-      - name: What changed
-        id: diff
+          node-version: '22'
+      - name: Verify authentication without changing version records
+        env:
+          TARGET: ${{ matrix.target }}
+          ENDPOINT: ${{ matrix.endpoint }}
+          RELEASE_TOKEN: ${{ secrets[matrix.secret_name] }}
+        shell: bash
         run: |
-          if git diff --quiet; then
-            echo "the catalog already matches upstream"
-            echo "changed=no" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=yes" >> "$GITHUB_OUTPUT"
-            git diff --stat
-          fi
+          node --input-type=module <<'NODE'
+          import { randomUUID } from 'node:crypto';
+          import { appendFileSync } from 'node:fs';
 
-      - name: Mint the publication token
-        # App tokens expire after one hour; the rebuild can take up to three. Mint after the
-        # rebuild so the pull request action gets fresh credentials for both Git and the API.
-        if: steps.diff.outputs.changed == 'yes' && github.event_name != 'pull_request'
-        id: token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
-          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+          const target = process.env.TARGET;
+          const endpoint = process.env.ENDPOINT;
+          const token = (process.env.RELEASE_TOKEN || '').trim();
+          const expectedEndpoint = {
+            dev: 'https://dev.cloud.tapstate.com/v1/api/cluster-versions',
+            prod: 'https://cloud.tapstate.com/v1/api/cluster-versions',
+          }[target];
+          if (!expectedEndpoint || endpoint !== expectedEndpoint || !token || /[\r\n]/.test(token)) {
+            console.error('Probe configuration is missing or invalid.');
+            process.exit(1);
+          }
 
-      - name: Open the pull request
-        # Not on a pull request: that run is here to prove the rebuild works, not to act on what it
-        # produced, and opening a second pull request from inside one is not that.
-        if: steps.diff.outputs.changed == 'yes' && github.event_name != 'pull_request'
-        uses: peter-evans/create-pull-request@v7
-        with:
-          token: ${{ steps.token.outputs.token }}
-          branch: ws/catalog-refresh
-          # Only the paths a refresh writes. Without this the action commits everything untracked in
-          # the workspace, and this job leaves plenty there: the upstream partial clone and the path,
-          # fetch and decision lists it drives the scan from. A pull request carrying those is not a
-          # catalog change with some noise attached - it is a 3500-line diff a reviewer has to sift.
-          # Keep in sync with the three checked-in paths refresh-catalog.sh writes.
-          add-paths: |
-            core/core-catalog/src/main/resources/catalog
-            tools/catalog-assembler/ingest-report.md
-            tools/catalog-assembler/capability-bitmap.tsv
-          base: main
-          title: "Rebuild the connector catalog from upstream"
-          commit-message: "Rebuild the connector catalog from upstream"
-          body: |
-            A full rebuild: every connector built and classloaded, so both faces of the catalog - the
-            specifications and the derived capabilities - come from the same upstream revision. The
-            capability bitmap and the header's `capabilitySha` move with it.
+          // A random nonexistent version fails before any catalog state is saved.
+          const url = `${endpoint}/connectivity-probe-${randomUUID()}/state`;
+          const allowedCodes = new Set([
+            'cluster.version-not-found',
+            'cluster.release-token-invalid',
+            'cluster.release-token-missing',
+            'cluster.release-disabled',
+          ]);
+          async function probe(label, bearer, expectedStatus, expectedCode) {
+            try {
+              const response = await fetch(url, {
+                method: 'PATCH',
+                redirect: 'error',
+                signal: AbortSignal.timeout(30000),
+                headers: {
+                  Authorization: `Bearer ${bearer}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ state: 'OFFLINE' }),
+              });
+              const payload = await response.json().catch(() => null);
+              const code = allowedCodes.has(payload?.code) ? payload.code : 'unexpected-response';
+              const passed = response.status === expectedStatus && code === expectedCode;
+              const result = `${target} ${label}: HTTP ${response.status}, code=${code}, ${passed ? 'PASS' : 'FAIL'}`;
+              console.log(result);
+              appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${result}\n\n`);
+              return passed;
+            } catch {
+              // Never print request headers, token values, or raw remote content.
+              console.error(`${target} ${label}: request failed before a verifiable API response.`);
+              return false;
+            }
+          }
 
-            Worth reading in the ingest report diff rather than the entry diff: connectors that newly
-            derive no capability at all, and connectors whose modes are derived with nothing declared
-            behind them. Both are how a connector that stopped building looks.
-
-            ## Linked issue
-
-            none - nothing decided this pull request but the rebuild that opened it. What it carries,
-            and what makes it open at all, is `.github/workflows/catalog-refresh.yml`, whose header
-            holds the design.
-
-            ## End-to-end case
-
-            None, and none is possible: what changed here is generated data, and no end-to-end case
-            fails when a regenerated hash or a derived capability bit is reverted. The `no-e2e` label
-            is applied by this lane for that reason, which is why it is on a pull request nobody has
-            reviewed yet - the exception was decided once, in this workflow, rather than clicked on
-            each run. What does guard this diff runs in `build`: `CatalogArtifactTest` locks the
-            catalog byte-for-byte against a regeneration, and `CatalogConsistencyTest` reads the rows
-            back.
-
-            ## Live verification scenario
-
-            Run `sh scripts/refresh-catalog.sh` against an upstream checkout at the revision this
-            pull request names, and the three regenerated paths come back byte-identical to the diff
-            here. The ingest report's header is where to look first: `specSha` and `capabilitySha`
-            must be the same revision, which is the whole difference between this lane and the
-            specification-drift one.
-
-            ### Release note
-
-            none
-
-          labels: |
-            catalog
-            no-e2e
-          delete-branch: false
+          const rejected = await probe('invalid-token control', `invalid-${randomUUID()}`, 401, 'cluster.release-token-invalid');
+          const accepted = await probe('configured-secret', token, 404, 'cluster.version-not-found');
+          if (!rejected || !accepted) process.exitCode = 1;
+          NODE
