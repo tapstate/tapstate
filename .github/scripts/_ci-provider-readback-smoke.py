@@ -73,7 +73,7 @@ def class_header(name):
             + struct.pack('>HHHHHHH', 0x21, 2, 4, 0, 0, 0, 0))
 
 
-def controls(f):
+def controls(f, callback=None, only_callback=False):
     artifacts = f['artifacts']
     pre = artifacts['ci-inputs-rest']['build-inputs.json']
     post = artifacts['ci-inputs-rest']['post-test-inputs.json']
@@ -180,6 +180,10 @@ def controls(f):
     def project():
         return fmod.m.project(g.References(f['evidence']), f['work'], f['request'])
 
+    if callback is not None:
+        callback(locals())
+        if only_callback:
+            return
     answer = project()
     found = answer['provider_captures']['rest']
     check(found['receipt_hash_links_consistent'] and found['step']['archived_step_log_binding_consistent'], 'original step marker joins the actual receipt member')
