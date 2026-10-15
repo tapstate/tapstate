@@ -199,8 +199,16 @@ class ViewStoreSeedRunnerTest {
         SecretRedactor redactor = new SecretRedactor();
         SecretTrackingArtifactStore tracked = new SecretTrackingArtifactStore(
                 store.artifacts(), TapstateCatalog::load, redactor);
-        new ViewStoreSeedRunner(tracked,
-                "mongodb+srv://state:pa%40ss@cluster.example/metadata?retryWrites=true", null).seed();
+        DefaultDnsResolver dns = new DefaultDnsResolver((name, type) -> {
+            assertThat(name).isEqualTo("cluster.example");
+            assertThat(type).isEqualTo("TXT");
+            return List.of();
+        });
+        try (var ignored = mockConstruction(DefaultDnsResolver.class,
+                withSettings().defaultAnswer(delegatesTo(dns)))) {
+            new ViewStoreSeedRunner(tracked,
+                    "mongodb+srv://state:pa%40ss@cluster.example/metadata?retryWrites=true", null).seed();
+        }
 
         SourceResource seeded = (SourceResource) store.artifacts()
                 .get(ViewTargetResolver.STATE_STORE_SOURCE_ID).orElseThrow();
