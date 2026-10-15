@@ -21,6 +21,36 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Cloud release version registration
+
+The release workflow registers the current Cloud runtime version only after the
+Cloud image publisher verifies the public registry digest. Configure the two
+variables in the `cloud-ghcr-release` environment and the production token in
+the repository's Actions secrets before using that notification:
+
+- Variable `CLOUD_RELEASE_API_URL`: the HTTPS endpoint ending in
+  `/v1/api/cluster-versions`.
+- Variable `CLOUD_RELEASE_CODE`: `ALPHA`, `BETA`, `RC`, or `STABLE`.
+- Repository secret `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD`: the operator
+  token configured on the production Cloud control plane. The release workflow
+  reads only this production key; `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV`
+  is reserved for other CI workflows.
+
+The request carries the version and source revision; `git.extra` records the
+image tag, immutable image reference, digest, release URL, and workflow URL.
+Cloud provisioning continues to select the image by its version tag. Publication
+and registration share a cross-version concurrency queue so a delayed older
+insert cannot overtake the newer version's registration. Older
+release lines and releases already overtaken when the notification checks
+GitHub's latest marker are skipped. HTTP errors fail the notification visibly;
+the image and release have already been published at that point. The API is
+not idempotent: a timeout may have committed, and a 409 requires reconciling the
+existing catalog entry before retrying. The notification never retries a POST
+or treats a 409 as success without comparing the existing entry.
+The helper is loaded from the workflow's commit in a separate sparse checkout,
+so selecting an earlier product commit does not lose the notification tooling.
+The approved image and its source revision still come from the selected release.
+
 ## Cloud cluster dev images
 
 `cloud-cluster-dev.yml` is manual-only and must be dispatched on `main`. Select

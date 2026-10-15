@@ -170,6 +170,23 @@ has   "Cloud publication supplies the existing workflow token fallback" cloud-gh
 has   "Cloud GHCR uses the checked digest publisher" cloud-ghcr 'ghcr-publish[.]sh publish'
 has   "Cloud and OP use the same release version" cloud-ghcr 'needs[.]version[.]outputs[.]version'
 has   "Cloud GHCR publishes the verified archive digest" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]digest'
+has   "Cloud registers the published version with the control plane" cloud-ghcr 'node cloud-release-tooling/scripts/notify-cloud-release[.]mjs'
+has   "Cloud notification tooling follows the workflow revision" cloud-ghcr 'ref:.*github[.]workflow_sha'
+has   "Cloud notification tooling is checked out separately" cloud-ghcr 'path: cloud-release-tooling'
+has   "Cloud notification checkout selects only its helper" cloud-ghcr 'sparse-checkout: scripts/notify-cloud-release[.]mjs'
+has   "Cloud registration excludes older release lines" cloud-ghcr "if: needs.version.outputs.is_latest == 'true'"
+has   "Cloud registration sends the publisher's immutable image" cloud-ghcr 'CLOUD_IMAGE:.*steps[.]image[.]outputs[.]image'
+has   "Cloud registration sends the checked image digest" cloud-ghcr 'CLOUD_IMAGE_DIGEST:.*needs[.]cloud-image[.]outputs[.]digest'
+has   "Cloud publication and registration serialize across versions" cloud-ghcr '^      group: tapstate-cloud-release-publication$'
+has   "queued Cloud publications do not replace one another" cloud-ghcr '^      queue: max$'
+cloud_publish_at="$(job cloud-ghcr | grep -n 'ghcr-publish[.]sh publish' | head -1 | cut -d: -f1)"
+cloud_register_at="$(job cloud-ghcr | grep -n 'node cloud-release-tooling/scripts/notify-cloud-release[.]mjs' | head -1 | cut -d: -f1)"
+if [ -n "$cloud_publish_at" ] && [ -n "$cloud_register_at" ] && [ "$cloud_publish_at" -lt "$cloud_register_at" ]; then
+  ok "Cloud version registration follows checked image publication"
+else
+  bad "Cloud version registration follows checked image publication" \
+      "publish ${cloud_publish_at:-none}, register ${cloud_register_at:-none}"
+fi
 hasnt "Cloud never rebuilds the approved image" cloud-ghcr 'buildx build|build-push-action'
 hasnt "Cloud never downloads connector bytes again" cloud-ghcr 'stage-connectors|release download'
 has   "cleanup waits for final Cloud publication" cleanup 'needs:.*cloud-ghcr'
