@@ -313,3 +313,4 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run(cmd,check=True)
 print('ci-shard smoke: source discovery, exact assignment, balance and source-gate placement passed')
 PY
+python3 -B "$here/_ci-layout-smoke.py"

@@ -1,0 +1,52 @@
+{
+  "aggregation": "Sum original JUnit XML suite times by module and source outer class; nested container timers may overlap.",
+  "artifacts": [
+    {
+      "id": 11943981115,
+      "name": "ci-shard-plan",
+      "sha256": "1947ec8dc2b243f5108bb2cf0671010bd5bf8ac13073d781bdd3ea40b26b2eef"
+    },
+    {
+      "id": 11944815821,
+      "name": "ci-test-results-e2e-1",
+      "sha256": "ec15e9f9da8687cb08c1e7c6b7c193cefd185bdcbe5648b54b6744751445382f"
+    },
+    {
+      "id": 11944730159,
+      "name": "ci-test-results-e2e-2",
+      "sha256": "73ae26c7ecd861d06d4def9de8f49eb0eb902f895944bfb9040a436f20239f3d"
+    },
+    {
+      "id": 11943577430,
+      "name": "ci-test-results-engine",
+      "sha256": "0c6c519106370e7ee760d51b2543fd8e784c738f7a9e1950f7bc81e7ba909b3c"
+    },
+    {
+      "id": 11944004548,
+      "name": "ci-test-results-rest",
+      "sha256": "a906d2492d945927febc026d2fcc23e5e8dfed4cfb565c7b50c012ee034c5e32"
+    }
+  ],
+  "cohort_hash": "78a3e45cd43c5eba4a36a5a9c9010808eee73bf52d870cc8bd5a1f5f184cdb39",
+  "completed_test_workers": [
+    "e2e-1",
+    "e2e-2",
+    "engine",
+    "rest"
+  ],
+  "current_selected_verify_provenance_verified": false,
+  "duration_hints_sha256": "bdcac40432ba5190ab05c9548c512ef22e2fa735496779ca5e1a40bc49017489",
+  "estimates_only": true,
+  "event": "push",
+  "original_packet_schema": 1,
+  "performance_accepted": false,
+  "repository": "tapstate/tapstate",
+  "run_attempt": 1,
+  "run_id": 38670277242,
+  "run_url": "https://github.com/tapstate/tapstate/actions/runs/38670277242",
+  "schema": 1,
+  "source_sha": "da1cf6db4803c9865447db9b612e3bf5f0659462",
+  "source_units": 1262,
+  "whole_run_complete_at_capture": false,
+  "workflow": "ci.yml"
+}

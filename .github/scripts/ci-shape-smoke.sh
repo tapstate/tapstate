@@ -34,6 +34,10 @@ def check(workflows, contexts, inputs):
     plan = ci.get('shard-plan', '')
     assert 'ci-receipt.sh event-inputs' in plan and '${{ runner.temp }}/ci-event-inputs.json' in plan, \
         'the original event and actual checkout must be retained with the shard plan'
+    assert 'matrix: ${{ steps.plan.outputs.matrix }}' in plan and 'id: plan' in plan, \
+        'the planner must publish its exact matrix output'
+    assert 'ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json"' in plan, \
+        'matrix IDs must come from the actual emitted plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
     assert not re.search(r'^\s+matrix:', build, re.M), 'build must not be a matrix'
@@ -44,6 +48,12 @@ def check(workflows, contexts, inputs):
     assert 'ci-receipt.sh compare-inputs' in build and 'pattern: ci-inputs-*' in build, \
         'build must compare every independent worker input snapshot before report admission'
     shards = ci.get('test-shards', '')
+    assert 'matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}' in shards, \
+        'workers must consume the planner matrix without a second shard list'
+    assert 'name: test-shards (${{ matrix.shard }})' in shards, \
+        'worker display names must not include auxiliary matrix metadata'
+    assert 'if: matrix.prepare_cloud_inputs' in shards, \
+        'every residual module group must retain Cloud test inputs'
     for role in ('test-shards', 'build'):
         block = ci[role]
         assert block.count('ci-build-observation.sh') == 1, 'each original prepare must capture one observation'
@@ -119,6 +129,11 @@ mutations = 0
 for original, replacement in [
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),
+    ('matrix: ${{ steps.plan.outputs.matrix }}', 'matrix: wrong-output'),
+    ('ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json"', 'echo unrelated-matrix'),
+    ('matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}', 'matrix: {shard: [rest]}'),
+    ('name: test-shards (${{ matrix.shard }})', 'name: unrelated-worker'),
+    ('if: matrix.prepare_cloud_inputs', "if: matrix.shard == 'rest'"),
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),

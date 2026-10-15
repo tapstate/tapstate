@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "e2e_shards": 2,
+  "rest_modules": {},
+  "new_test_seconds": 30.0
+}

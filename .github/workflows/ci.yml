@@ -41,12 +41,17 @@ permissions:
 jobs:
   shard-plan:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - name: Record the original event and actual checkout identities
         run: .github/scripts/ci-receipt.sh event-inputs --root . --output "$RUNNER_TEMP/ci-event-inputs.json"
       - name: Derive every test from the current reactor
-        run: .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
+        id: plan
+        run: |
+          .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
+          echo "matrix=$(.github/scripts/ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json")" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ci-shard-plan
@@ -57,11 +62,11 @@ jobs:
           retention-days: 7
 
   test-shards:
+    name: test-shards (${{ matrix.shard }})
     needs: shard-plan
     strategy:
       fail-fast: false
-      matrix:
-        shard: [e2e-1, e2e-2, engine, rest]
+      matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +88,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/maven-observation"
           .github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/maven-observation" --output "$RUNNER_TEMP/maven-observation/summary.json" --shard-id "${{ matrix.shard }}" -- mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Prepare pinned public inputs for Cloud startup witnesses
-        if: matrix.shard == 'rest'
+        if: matrix.prepare_cloud_inputs
         run: |
           python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
           echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"

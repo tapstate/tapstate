@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -118,16 +119,30 @@ def execs(tests):
                    for t in tests if not (t['module'] == 'e2e' and t['kind'] == 'it')})
 
 
-def balance(tests, count, hints):
-    require(count > 0, 'shard count must be positive')
+def seconds(value):
+    require(type(value) in (int, float), 'invalid duration hint')
+    try:
+        value = float(value)
+    except OverflowError as error:
+        raise ValueError('invalid duration hint') from error
+    require(math.isfinite(value) and value >= 0, 'invalid duration hint')
+    return value
+
+
+def hint_key(test):
+    return test['class'] + ('#' + test['example'] if 'example' in test else '')
+
+
+def balance(tests, count, hints, fallback=1.0):
+    require(type(count) is int and count > 0, 'shard count must be positive')
+    require(isinstance(hints, dict), 'invalid duration hints')
+    fallback = seconds(fallback)
     bins = [[] for _ in range(count)]
     totals = [0.0] * count
     def duration(test):
-        identity = test['class'] + ('#' + test['example'] if 'example' in test else '')
-        # New source-discovered units join automatically with a one-second fallback weight.
-        value = hints.get(test['module'] + '/' + identity, hints.get(identity, 1.0))
-        require(isinstance(value, (float, int)) and value >= 0, 'invalid duration hint')
-        return float(value)
+        identity = hint_key(test)
+        value = hints.get(test['module'] + '/' + identity, hints.get(identity, fallback))
+        return seconds(value)
     for test in sorted(tests, key=lambda t: (-duration(t), key(t))):
         slot = min(range(count), key=lambda n: (totals[n], n))
         bins[slot].append(test)
@@ -140,22 +155,104 @@ def sha(root):
     return result.stdout.strip() if result.returncode == 0 else 'unversioned'
 
 
+LAYOUT_PATH = '.github/ci-shard-layout.json'
+
+
+def layout_config(args, root, name=None):
+    name = name or getattr(args, 'layout', LAYOUT_PATH)
+    path = owned_path(root, name, 'layout')
+    source = {'path': name, 'sha256': None, 'legacy_defaults': not path.exists()}
+    if path.exists():
+        require(path.is_file(), 'layout is not a regular file')
+        raw = path.read_bytes()
+
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                require(key not in result, 'duplicate layout key')
+                result[key] = value
+            return result
+
+        value = json.loads(raw, object_pairs_hook=unique)
+        source['sha256'] = hashlib.sha256(raw).hexdigest()
+    else:
+        require(name == LAYOUT_PATH, 'layout file missing')
+        value = {'schema': 1, 'e2e_shards': 2, 'rest_modules': {}, 'new_test_seconds': 1.0}
+    require(isinstance(value, dict) and set(value) == {'schema', 'e2e_shards', 'rest_modules', 'new_test_seconds'}
+            and type(value['schema']) is int and value['schema'] == 1
+            and type(value['e2e_shards']) is int and value['e2e_shards'] in (2, 4, 6)
+            and isinstance(value['rest_modules'], dict), 'invalid shard layout')
+    require(seconds(value['new_test_seconds']) > 0, 'new-test fallback must be positive')
+    assigned = set()
+    for worker, modules in value['rest_modules'].items():
+        require(isinstance(worker, str) and re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', worker)
+                and worker not in ('build', 'engine', 'rest') and not worker.startswith('e2e-'), 'reserved or invalid module shard name')
+        require(isinstance(modules, list) and modules and all(isinstance(module, str) for module in modules), 'invalid module shard list')
+        for module in modules:
+            safe_path(module)
+            require(module not in assigned, 'module assigned more than once')
+            assigned.add(module)
+    return value, source
+
+
+def default_groups(tests, hints, layout):
+    e2e = [t for t in tests if t['module'] == 'e2e' and t['kind'] == 'it']
+    engine = [t for t in tests if t['module'] == 'runtime/engine']
+    rest = [t for t in tests if t not in e2e and t not in engine]
+    fallback = layout['new_test_seconds']
+    groups = [(f'e2e-{i+1}', ts, total) for i, (ts, total) in enumerate(balance(e2e, layout['e2e_shards'], hints, fallback))]
+    groups.append(('engine', *balance(engine, 1, hints, fallback)[0]))
+    known = {t['module'] for t in rest}
+    moved = set()
+    for name, modules in sorted(layout['rest_modules'].items()):
+        require(set(modules) <= known, 'module shard contains no residual source tests')
+        chosen = [t for t in rest if t['module'] in modules]
+        groups.append((name, *balance(chosen, 1, hints, fallback)[0]))
+        moved.update(modules)
+    rest = [t for t in rest if t['module'] not in moved]
+    require(rest or not layout['rest_modules'], 'module grouping must retain a nonempty rest shard')
+    groups.append(('rest', *balance(rest, 1, hints, fallback)[0]))
+    return groups
+
+
+def matrix(plan):
+    require(plan['selection'] == 'default-reactor' and 'layout' in plan, 'matrix requires a layout-bound default reactor plan')
+    expected = default_groups(plan['expected'], {}, plan['layout'])
+    require([row[0] for row in expected] == [shard['id'] for shard in plan['shards']], 'matrix shard IDs differ from layout')
+    for (name, tests, unused), shard in zip(expected, plan['shards']):
+        # E2E balancing may move complete source classes between E2E bins.
+        if not name.startswith('e2e-'):
+            require(Counter(key(t) for t in tests) == Counter(key(t) for t in shard['tests']), 'matrix module assignment differs from layout')
+        else:
+            require(all(t['module'] == 'e2e' and t['kind'] == 'it' for t in shard['tests']), 'matrix E2E shard contains a foreign test')
+        require(shard['tests'], 'matrix contains an empty shard')
+    return {'include': [{'shard': shard['id'], 'prepare_cloud_inputs': any(
+        not (test['module'] == 'e2e' and test['kind'] == 'it') and test['module'] != 'runtime/engine'
+        for test in shard['tests'])} for shard in plan['shards']]}
+
+
 def make_plan(args, root):
     tests = read(args.inventory) if args.inventory else discover(root)
     require(tests and len({key(t) for t in tests}) == len(tests), 'empty or duplicate test inventory')
     hints = read(args.durations) if args.durations else {}
+    require(isinstance(hints, dict), 'invalid duration hints')
+    for value in hints.values():
+        seconds(value)
     if args.inventory:
         groups = [(f'shard-{i+1}', ts, total) for i, (ts, total) in enumerate(balance(tests, args.count, hints))]
     else:
-        e2e = [t for t in tests if t['module'] == 'e2e' and t['kind'] == 'it']
-        engine = [t for t in tests if t['module'] == 'runtime/engine']
-        rest = [t for t in tests if t not in e2e and t not in engine]
-        groups = [(f'e2e-{i+1}', ts, total) for i, (ts, total) in enumerate(balance(e2e, 2, hints))]
-        groups += [(name, *balance(ts, 1, hints)[0]) for name, ts in [('engine', engine), ('rest', rest)]]
+        layout, source = layout_config(args, root)
+        groups = default_groups(tests, hints, layout)
     plan = dict(schema=1, source_sha=sha(root), cohort_hash=cohort(tests),
                 selection='inventory' if args.inventory else 'default-reactor', expected=tests,
                 shards=[dict(id=name, tests=ts, estimated_seconds=round(total, 3), required_exec=execs(ts))
                         for name, ts, total in groups])
+    if not args.inventory:
+        plan.update(layout=layout, layout_source=source, duration_hints={
+            'sha256': hashlib.sha256(Path(args.durations).read_bytes()).hexdigest() if args.durations else None,
+            'fallback_seconds': layout['new_test_seconds'], 'estimates_only': True,
+            'missing': [test['module'] + '/' + hint_key(test) for test in tests
+                        if test['module'] + '/' + hint_key(test) not in hints and hint_key(test) not in hints]})
     write(args.output, plan)
     print('planned ' + str(len(tests)) + ' source-selected units across ' + str(len(groups)) + ' shards')
 
@@ -186,6 +283,11 @@ def load_plan(args, root):
         require(shard['required_exec'] == execs(shard['tests']), 'invalid required coverage manifest')
     actual = Counter(key(t) for s in plan['shards'] for t in s['tests'])
     require(actual == Counter(key(t) for t in tests), 'shard union differs from expected class set')
+    if 'layout' in plan or 'layout_source' in plan:
+        require('layout' in plan and 'layout_source' in plan, 'partial layout binding')
+        layout, source = layout_config(args, root, plan['layout_source']['path'])
+        require(json.dumps([layout, source], sort_keys=True) == json.dumps([plan['layout'], plan['layout_source']], sort_keys=True),
+                'layout changed after planning')
     return plan
 
 
@@ -818,13 +920,14 @@ def verify(args, root, plan):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ['plan', 'run', 'pack', 'verify']:
+    for name in ['plan', 'matrix', 'run', 'pack', 'verify']:
         command = commands.add_parser(name)
         command.add_argument('--root', default='.')
         if name == 'plan':
             command.add_argument('--durations')
             command.add_argument('--inventory')
             command.add_argument('--count', type=int, default=4)
+            command.add_argument('--layout', default=LAYOUT_PATH)
             command.add_argument('--output', required=True)
         else:
             command.add_argument('--plan', required=True)
@@ -848,6 +951,9 @@ def main():
             make_plan(args, root)
     else:
         plan = load_plan(args, root)
+        if args.command == 'matrix':
+            print(json.dumps(matrix(plan), separators=(',', ':')))
+            return
         operation = {'run': run_shard, 'pack': pack, 'verify': verify}[args.command]
         if args.command == 'run':
             operation(args, root, plan)
