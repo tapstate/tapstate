@@ -330,6 +330,8 @@ public final class MongoHandshakeGate implements AutoCloseable {
                 socket.close();
                 throw new SocketException("The Mongo handshake gate is closed");
             }
+            // The released relay must not add Nagle/delayed-ACK stalls to split Mongo frames.
+            socket.setTcpNoDelay(true);
             sockets.add(socket);
         }
     }
