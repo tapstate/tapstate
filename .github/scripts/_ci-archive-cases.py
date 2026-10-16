@@ -153,7 +153,8 @@ def provider_inventory(refs, root, request, inventory, scope, workers):
     return result, bindings
 
 
-def project(refs, root, request):
+def project(refs, root, request, include_test_observations=False):
+    require(type(include_test_observations) is bool, 'invalid full observation export option')
     require(isinstance(request, dict) and set(request) in ({'schema', 'type', 'archive_inputs'}, {'schema', 'type', 'archive_inputs', 'provider_replays'})
             and type(request['schema']) is int and request['schema'] == 1
             and request['type'] == 'archive-cases-request', 'invalid archived case request')
@@ -169,7 +170,7 @@ def project(refs, root, request):
                     '_ci-variants.py', '_ci-pr-groups.py', '_ci-evidence.py', '_ci-shards.py', '_ci-receipt.py', '_ci-provider-readback.py']
     if 'provider_replays' in request: reader_paths.append('_ci-provider-replay-readback.py')
     reader_hashes = {name: g.checksum(Path(__file__).with_name(name).read_bytes()) for name in reader_paths}
-    worker_reads = {}
+    worker_reads, test_observations = {}, {}
     with tempfile.TemporaryDirectory(prefix='ci-case-data-') as temporary:
         data_root = Path(temporary).resolve()
         tree = data_root / 'source'
@@ -248,6 +249,13 @@ def project(refs, root, request):
                 ev.reports(args)
             observation = ev.load(observation_path)
             published_observations(inv, observation['cases'], observation['canonical_ledger'])
+            if include_test_observations:
+                test_observations[name] = {
+                    'observation_json': observation_path.read_text(),
+                    'observation_sha256': g.checksum(observation_path.read_bytes()),
+                    'selected_tests': worker['tests'],
+                    'prepared_input_member_sha256': g.checksum(prepared),
+                    'result_manifest_sha256': g.checksum(result[name + '/manifest.json'])}
             replay_path = target / 'replayed-hashes.json'
             # Unknown parameters cannot be hashed as resolved identities. Retain
             # them in the observation, compare only independently parsed methods.
@@ -281,6 +289,9 @@ def project(refs, root, request):
         fully_parsed = inv['complete'] and not gaps and all(v['complete'] for v in worker_reads.values())
         inventory = {'methods': inv['methods'], 'cases': inv['cases'], 'class_contracts': inv['class_contracts'],
                      'sources': inv['sources'], 'unresolved': inv['unresolved'], 'entry_contract': environment}
+        exported = ({'test_observations': {'source_inventory_json': inv_path.read_text(),
+                     'source_inventory_sha256': g.checksum(inv_path.read_bytes()),
+                     'workers': test_observations}} if include_test_observations else {})
     require(reader_hashes == {name: g.checksum(Path(__file__).with_name(name).read_bytes()) for name in reader_paths},
             'trusted case reader changed during replay')
     return {'schema': 1, 'type': 'archived-case-readback', 'scope': readback['scope'], 'checkout': readback['checkout'],
@@ -291,6 +302,7 @@ def project(refs, root, request):
             'workers': worker_reads, 'unverified_components': sorted(set(readback['unverified_components'])
                            | ({'computed_provider_identities'} if not fully_parsed else set())),
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
+            **exported,
             'trusted_reader_hashes': reader_hashes, 'input_files': refs.finish()}
 
 
@@ -298,8 +310,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for field in ('manifest', 'evidence-root', 'root', 'output'):
         parser.add_argument('--' + field, required=True)
+    parser.add_argument('--include-test-observations', action='store_true',
+                        help='Retain full independently replayed worker outcomes and their exact source inventory')
     args = parser.parse_args()
-    answer = project(g.References(args.evidence_root), args.root, g.load(Path(args.manifest)))
+    answer = project(g.References(args.evidence_root), args.root, g.load(Path(args.manifest)),
+                     include_test_observations=args.include_test_observations)
     g.write_new(Path(args.output), answer)
     print('archived source case subset replayed; unknown providers and whole input acceptance remain unverified')
 

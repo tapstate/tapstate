@@ -24,6 +24,16 @@ does not certify effective build provenance, original assertions, workflow
 applicability, whole input equality, a first complete PR sample or performance.
 Those acceptance flags stay false even when every simple source case is parsed.
 
+The optional `--include-test-observations` flag retains each worker's full replayed
+test observation as exact JSON bytes and a digest, including status, skip text,
+class callbacks, prepared input binding and actual published-ledger selector.
+Each worker also retains its selected tests and original input and result-manifest
+digests. The export retains the exact reconstructed
+source inventory JSON and its byte digest. All normal archive and semantic checks
+still run before export; unresolved identities and acceptance flags stay unchanged.
+The default output is unchanged. Consumers must preserve each worker's provenance
+when comparing their union; this export does not invent a single aggregate verify.
+
 ## Request and command
 
 The request has exactly `schema: 1`, `type: archive-cases-request` and

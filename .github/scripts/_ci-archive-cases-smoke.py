@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
 
@@ -68,6 +69,9 @@ def prepare_cases(f, transform_inventory=None):
                                   binding=str(binding_path), class_gates=str(gates), artifact_manifest=str(manifest_path),
                                   shard_plan=None, shard=None, output=str(obs_path)))
     hashes_path = data / 'observed.json'
+    observation = ev.load(obs_path)
+    observation['cases'] = [row for row in observation['cases'] if row.get('parameter') is not None]
+    ev.output(obs_path, observation)
     with redirect_stdout(io.StringIO()):
         ev.export_hashes(SimpleNamespace(input=str(obs_path), output=str(hashes_path)))
     artifacts = f['artifacts']
@@ -93,22 +97,54 @@ def controls(f):
         reseal()
 
     def project():
-        return m.project(g.References(f['evidence']), f['work'], request)
+        return m.project(g.References(f['evidence']), f['work'], request, include_test_observations=True)
 
     answer = project()
+    exported = answer['test_observations']
+    exported_inventory = json.loads(exported['source_inventory_json'])
+    check(g.checksum(exported['source_inventory_json'].encode()) == exported['source_inventory_sha256']
+          and exported_inventory['methods'] == answer['source_inventory']['methods'],
+          'full outcomes retain the exact independently reconstructed source inventory')
+    worker_export = exported['workers']['rest']
+    observation = json.loads(worker_export['observation_json'])
+    check(g.checksum(worker_export['observation_json'].encode()) == worker_export['observation_sha256']
+          and worker_export['selected_tests'] == f['plan']['shards'][0]['tests']
+          and worker_export['result_manifest_sha256'] == g.checksum(fixture.encode(f['manifest'])),
+          'full outcomes retain exact raw replay bytes and actual selected manifest')
+    check(observation['source_inventory_sha256'] == exported['source_inventory_sha256']
+          and observation['input_binding']['source_sha'] == f['merge']
+          and observation['inputs_sha256'] == g.checksum(fixture.encode(artifacts['ci-inputs-rest']['build-inputs.json'])),
+          'full outcomes retain their actual worker source and prepared input binding')
     if not inv['complete']:
         check(answer['source_case_subset_verified'] and not answer['all_source_cases_statically_parsed'],
               'computed provider stays outside the verified static subset')
         check('computed_provider_identities' in answer['unverified_components']
               and not answer['whole_input_projection_verified'], 'computed provider cannot become complete from matching declarations')
         check(answer['source_inventory']['unresolved'], 'actual computed source gap is retained')
-        print('CI archive computed provider controls passed: 3')
+        check(not observation['complete'] and not exported_inventory['complete'] and exported_inventory['unresolved'],
+              'full export preserves source incompleteness even when XML has only known methods')
+        print('CI archive computed provider controls passed: 7')
         return
     check(answer['source_class_cohort_verified'] and answer['source_case_subset_verified'], 'source and raw XML are independently joined')
     check(answer['all_source_cases_statically_parsed'], 'simple literal source methods resolve completely')
     check(len(answer['source_inventory']['cases']) == 1, 'original source case count is derived')
     check(not answer['whole_input_projection_verified'] and not answer['first_complete_PR_sample']
           and not answer['performance_accepted'], 'case subset readback cannot certify the other input components')
+    full_inventory = f['evidence'] / 'full-inventory.json'
+    full_inventory.write_text(exported['source_inventory_json'])
+    full_observation = f['evidence'] / 'full-observation.json'
+    full_observation.write_text(json.dumps(observation))
+    comparison = f['evidence'] / 'full-comparison.json'
+    args = SimpleNamespace(inventory=str(full_inventory), candidate_inventory=None, additions=None,
+                           before=str(full_observation), after=str(full_observation), output=str(comparison))
+    ev.compare_tests(args)
+    check(json.loads(comparison.read_text())['complete'], 'full export supports the status and skip comparator')
+    changed_observation = copy.deepcopy(observation)
+    changed_observation['cases'][0].update(status='skipped', skip={'type': None, 'reason': 'changed outcome'})
+    changed_path = f['evidence'] / 'changed-outcome.json'
+    changed_path.write_text(json.dumps(changed_observation))
+    args.after = str(changed_path)
+    rejected(lambda: ev.compare_tests(args), 'per-case skip status or reason changed')
     foreign = copy.deepcopy(artifacts['ci-inputs-rest']['expected-case-hashes.json']['cases'][0])
     foreign['method'] = 'foreign'
     artifacts['ci-inputs-rest']['expected-case-hashes.json']['cases'].append(foreign)
@@ -174,9 +210,15 @@ def controls(f):
     child = subprocess.run(command, capture_output=True, text=True)
     check(child.returncode == 0 and json.loads(output.read_bytes())['source_inventory_digest'] == answer['source_inventory_digest'],
           'case CLI replays original members: ' + child.stderr)
+    check('test_observations' not in json.loads(output.read_bytes()), 'default output retains its existing scope')
     before = output.read_bytes()
     check(subprocess.run(command, capture_output=True).returncode != 0 and output.read_bytes() == before,
           'case output is created exclusively')
+    full_output = f['evidence'] / 'cases-cli-full.json'
+    command[command.index('--output') + 1] = str(full_output)
+    child = subprocess.run(command + ['--include-test-observations'], capture_output=True, text=True)
+    check(child.returncode == 0 and json.loads(full_output.read_bytes())['test_observations'] == exported,
+          'CLI opt-in exports the same validated full outcomes: ' + child.stderr)
     print('CI archive case controls passed: ' + str(count))
 
 
@@ -222,12 +264,42 @@ def two_worker_controls(f):
     f['reseal']()
     request = {'schema': 1, 'type': 'archive-cases-request',
                'archive_inputs': f['save']('two-worker-request.json', f['request'])}
-    answer = m.project(g.References(f['evidence']), f['work'], request)
+    answer = m.project(g.References(f['evidence']), f['work'], request, include_test_observations=True)
     check(answer['all_source_cases_statically_parsed'] and len(answer['workers']) == 2,
           'same source and different worker capture metadata are valid')
     check(len({v['source_inventory_sha256'] for v in answer['workers'].values()}) == 2,
           'each original worker inventory binding is retained')
-    print('CI archive two-worker controls passed: 3')
+    exported = answer['test_observations']
+    check(set(exported['workers']) == {'rest', 'engine'}
+          and len({json.loads(v['observation_json'])['inputs_sha256'] for v in exported['workers'].values()}) == 2
+          and all(json.loads(v['observation_json'])['inputs_sha256'] == v['prepared_input_member_sha256']
+                  for v in exported['workers'].values()),
+          'full export preserves distinct worker inputs without inventing an aggregate invocation')
+    print('CI archive two-worker controls passed: 4')
+
+
+def unresolved_xml_controls(f):
+    suite = ET.fromstring(f['xml'])
+    ET.SubElement(suite, 'testcase', classname='io.tapstate.fixture.SampleTest', name='dynamic(int)[1]')
+    suite.set('tests', '2')
+    raw = ET.tostring(suite)
+    path = f['xml_path']
+    f['result_files'][path] = raw
+    f['manifest']['files'][path] = g.checksum(raw)
+    f['manifest']['statistics']['tests'] = 2
+    f['artifacts']['ci-test-results-rest']['rest/files/' + path] = raw
+    f['artifacts']['ci-test-results-rest']['rest/manifest.json'] = copy.deepcopy(f['manifest'])
+    f['artifacts']['ci-aggregate'][path] = raw
+    f['reseal']()
+    request, unused = prepare_cases(f)
+    answer = m.project(g.References(f['evidence']), f['work'], request, include_test_observations=True)
+    observation = json.loads(answer['test_observations']['workers']['rest']['observation_json'])
+    check(len(observation['cases']) == 2 and sum(row['parameter'] is None for row in observation['cases']) == 1,
+          'full export retains the actual unresolved XML case before hash filtering')
+    check(observation['unresolved'] and not observation['complete']
+          and len(answer['workers']['rest']['replayed_cases']) == 1,
+          'unresolved XML remains incomplete while the hash subset contains only the resolved case')
+    print('CI archive unresolved XML controls passed: 2')
 
 
 def published_controls():
@@ -290,6 +362,13 @@ class SampleTest {
 }
 ''')
     fixture.run(two_worker_controls, two_workers=True, only_callback=True)
+    fixture.run(unresolved_xml_controls, source_case='''package io.tapstate.fixture;
+class SampleTest {
+ @Test void holds() {}
+ @ParameterizedTest @MethodSource("computed") void dynamic(int value) {}
+ static Stream<Integer> computed() { return external(); }
+}
+''', only_callback=True)
     published_controls()
     source_entry_controls()
     print('CI archive case total controls passed: ' + str(count))
