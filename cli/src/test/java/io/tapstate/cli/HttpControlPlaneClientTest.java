@@ -1875,7 +1875,8 @@ class HttpControlPlaneClientTest {
                         assertThat(reading.pipelineId()).isEqualTo("orders");
                         assertThat(reading.state()).isEqualTo("NEW");
                         assertThat(reading.desiredState()).isEqualTo("RUNNING");
-                        assertThat(RecoveryWire.tree(reading.recovery())).isEqualTo(RecoveryFixtures.pipelineRecovery());
+                        assertThat(JsonReader.parse(io.tapstate.core.common.JsonWriter.write(
+                                RecoveryWire.tree(reading.recovery())))).isEqualTo(RecoveryFixtures.pipelineRecovery());
                     });
         } finally {
             server.stop(0);
