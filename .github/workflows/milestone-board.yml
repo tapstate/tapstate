@@ -1,0 +1,39 @@
+name: Milestone board
+
+on:
+  milestone:
+    types: [created, edited]
+  issues:
+    types: [opened, milestoned, demilestoned, labeled, unlabeled, closed, reopened]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tapstate-milestone-board-${{ github.event_name }}-${{ github.event.issue.number || github.event.milestone.number || 'all' }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.repository == 'tapstate/tapstate'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Update milestone project
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          if [[ '${{ github.event_name }}' == 'workflow_dispatch' || '${{ github.event_name }}' == 'schedule' ]]; then
+            .github/scripts/milestone-board.sh --reconcile
+          else
+            .github/scripts/milestone-board.sh
+          fi
