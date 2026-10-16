@@ -33,6 +33,7 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.time.Duration;
@@ -72,6 +73,20 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
     /** The engine's own delay before it would re-plan a run for a changed cluster. */
     private static final Duration SCALE_UP_DELAY =
             Duration.ofMillis(new JetConfig().getScaleUpDelayMillis());
+
+    @Test
+    void freePortsExcludeAPortAlreadyListeningOnTheMembersLoopbackAddress() throws Exception {
+        try (ServerSocket occupied = new ServerSocket(
+                0, 0, InetAddress.getByName("127.0.0.1"))) {
+            // The ephemeral allocator may wrap before a wildcard probe offers the occupied port.
+            // Exercise more than the full TCP port range while the loopback listener stays open.
+            for (int attempt = 0; attempt < 65_536; attempt++) {
+                assertThat(twoFreePorts())
+                        .as("ports for members binding 127.0.0.1 must exclude the open loopback listener")
+                        .doesNotContain(occupied.getLocalPort());
+            }
+        }
+    }
 
     @Test
     void eitherMemberAnswersTheSamePlacementAndAPinnedVertexRunsInOnePlace() throws Exception {
@@ -397,7 +412,9 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
     }
 
     private static int[] twoFreePorts() throws Exception {
-        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        try (ServerSocket first = new ServerSocket(0, 0, loopback);
+                ServerSocket second = new ServerSocket(0, 0, loopback)) {
             return new int[] {first.getLocalPort(), second.getLocalPort()};
         }
     }
