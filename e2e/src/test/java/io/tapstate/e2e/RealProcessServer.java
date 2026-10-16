@@ -313,6 +313,28 @@ final class RealProcessServer implements ServerHandle {
         return output;
     }
 
+    /** A bounded read of this fixture's own child, taken before failure cleanup stops it. */
+    Path threadDiagnostic() throws IOException, InterruptedException {
+        Path dump = output.resolveSibling("failure-threads.log");
+        Path tool = Path.of(System.getProperty("java.home"), "bin", "jcmd");
+        if (!process.isAlive() || !Files.isExecutable(tool) || Thread.currentThread().isInterrupted()) {
+            Files.writeString(dump, "Owned child thread diagnostic unavailable.\n");
+            return dump;
+        }
+        Process diagnostic = new ProcessBuilder(tool.toString(), Long.toString(process.pid()), "Thread.print")
+                .redirectErrorStream(true).redirectOutput(dump.toFile()).start();
+        try {
+            if (!diagnostic.waitFor(5, TimeUnit.SECONDS)) {
+                diagnostic.destroyForcibly();
+                diagnostic.waitFor(5, TimeUnit.SECONDS);
+            }
+        } finally {
+            // This command belongs to the diagnostic; never stop the member being observed.
+            if (diagnostic.isAlive()) diagnostic.destroyForcibly();
+        }
+        return dump;
+    }
+
     /**
      * The operating system's id for this process: what a connector running inside it names itself by, and so how
      * a case finds the member carrying a write the connector reports.

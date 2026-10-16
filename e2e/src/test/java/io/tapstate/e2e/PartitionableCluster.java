@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -193,6 +194,18 @@ final class PartitionableCluster implements AutoCloseable {
     /** The owned process, selected from observed placement rather than assumed by a witness. */
     RealProcessServer processCarrying(String nodeId) {
         return servers.get(requireKnown(nodeId));
+    }
+
+    /** Captures only these owned members; the existing artifact writer removes address-shaped input. */
+    void keepThreadDiagnostics() throws IOException, InterruptedException {
+        Map<String, Path> dumps = new LinkedHashMap<>();
+        try {
+            for (Map.Entry<String, RealProcessServer> entry : servers.entrySet()) {
+                dumps.put(entry.getKey() + "-threads", entry.getValue().threadDiagnostic());
+            }
+        } finally {
+            FailureScene.writeMemberLogs(clusterId, dumps);
+        }
     }
 
     /** Crashes one owned member without releasing its node session or closing the retained links. */
