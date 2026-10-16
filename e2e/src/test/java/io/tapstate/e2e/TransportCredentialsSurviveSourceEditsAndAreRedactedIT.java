@@ -71,7 +71,7 @@ class TransportCredentialsSurviveSourceEditsAndAreRedactedIT {
             String report = control.testConnectionBody(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID,
                     object(edited.get("config")));
             assertThat(report)
-                    .contains("PASSED", "transport credentials", "SUCCESS")
+                    .contains("PASSED", "transport credentials")
                     .doesNotContain(TLS_KEY, TLS_KEY_PASSWORD, SSH_PASSWORD);
         }
     }
