@@ -1857,9 +1857,59 @@ class HttpControlPlaneClientTest {
                 new AtomicReference<>());
         try {
             assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
-                    .isEqualTo(new StatusOutcome.NoObservation());
+                    .isEqualTo(new StatusOutcome.NoObservation("pl1", "NEW", "STARTING", "RUNNING", true, null));
         } finally {
             server.stop(0);
+        }
+    }
+
+    @Test
+    void aggregateStatusKeepsRecoveryBeforeTheFirstRuntimeObservation() throws Exception {
+        Map<String, Object> body = Map.of("pipelineId", "orders", "state", "NEW", "displayState", "STARTING",
+                "desiredState", "RUNNING", "hasArtifact", true, "recovery", RecoveryFixtures.pipelineRecovery());
+        HttpServer server = apiServer("/api/pipelines/orders/status", 200,
+                io.tapstate.core.common.JsonWriter.write(body), new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "orders"))
+                    .isInstanceOfSatisfying(StatusOutcome.NoObservation.class, reading -> {
+                        assertThat(reading.pipelineId()).isEqualTo("orders");
+                        assertThat(reading.state()).isEqualTo("NEW");
+                        assertThat(reading.desiredState()).isEqualTo("RUNNING");
+                        assertThat(RecoveryWire.tree(reading.recovery())).isEqualTo(RecoveryFixtures.pipelineRecovery());
+                    });
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void unobservedStatusAllowsAbsentOrNullOptionalMetadata() throws Exception {
+        for (String body : List.of(
+                "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"observedState\":null}",
+                "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"displayState\":null,"
+                        + "\"desiredState\":null,\"hasArtifact\":null,\"recovery\":null}")) {
+            HttpServer server = apiServer("/api/pipelines/pl1/status", 200, body, new AtomicReference<>());
+            try {
+                assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                        .isEqualTo(new StatusOutcome.NoObservation("pl1", "NEW", null, null, null, null));
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void malformedRecoveryInAnUnobservedStatusIsNotAcceptedAsAValidRead() throws Exception {
+        for (String recovery : List.of("\"invalid\"", "[]", "{\"items\":12}")) {
+            String body = "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"observedState\":null,\"recovery\":"
+                    + recovery + "}";
+            HttpServer server = apiServer("/api/pipelines/pl1/status", 200, body, new AtomicReference<>());
+            try {
+                assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                        .isInstanceOf(StatusOutcome.Unreachable.class);
+            } finally {
+                server.stop(0);
+            }
         }
     }
 

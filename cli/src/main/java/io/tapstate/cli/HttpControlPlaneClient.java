@@ -1688,7 +1688,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             if (aggregate) {
                 Object observed = m.get("observedState");
                 if (observed == null) {
-                    return new StatusOutcome.NoObservation();
+                    return new StatusOutcome.NoObservation(id, state,
+                            stringOrNull(m.get("displayState")), stringOrNull(m.get("desiredState")),
+                            m.get("hasArtifact") instanceof Boolean present ? present : null,
+                            RecoveryWire.pipeline(m.get("recovery")));
                 }
                 if (!(observed instanceof String observedState)) {
                     return null;

@@ -3757,6 +3757,10 @@ final class Repl {
                     renderReadDocument(ReadViewDocuments.status(found), target.format());
                     yield Cli.EXIT_OK;
                 }
+                case StatusOutcome.NoObservation unobserved -> {
+                    renderReadDocument(ReadViewDocuments.status(unobserved, id), target.format());
+                    yield Cli.EXIT_OK;
+                }
                 case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
                 case StatusOutcome.Unreachable ignored -> reportRequestFailed();
             };

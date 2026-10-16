@@ -66,8 +66,15 @@ sealed interface StatusOutcome {
     record Rejected(String code, String message) implements StatusOutcome {
     }
 
-    /** A current aggregate status response identified a known pipeline with no runtime observation yet. */
-    record NoObservation() implements StatusOutcome {
+    /**
+     * A known pipeline before its first runtime observation. State is the server's placeholder, never
+     * an observed state for lifecycle decisions; recovery and catalog intent remain independently readable.
+     */
+    record NoObservation(String pipelineId, String state, String displayState, String desiredState,
+            Boolean hasArtifact, RemoteRecovery.Pipeline recovery) implements StatusOutcome {
+        NoObservation() {
+            this(null, null, null, null, null, null);
+        }
     }
 
     /** The server could not be reached (connection refused, timeout, or a malformed target). */

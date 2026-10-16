@@ -5838,6 +5838,56 @@ class ReplTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"json", "yaml"})
+    void machineStatusKeepsRecoveryAndIntentWithoutInventingARuntimeObservation(String format) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.NoObservation("orders", "NEW", "STARTING", "RUNNING", true,
+                RecoveryWire.pipeline(RecoveryFixtures.pipelineRecovery()));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status orders -o " + format);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.statusCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+        assertThat(client.explainCalls).isEmpty();
+        assertThat(client.metricsCalls).isEmpty();
+        String out = h.sink().toString().substring(mark);
+        if (format.equals("json")) {
+            Map<String, Object> expected = new java.util.LinkedHashMap<>();
+            expected.put("pipelineId", "orders");
+            expected.put("state", "NEW");
+            expected.put("displayState", "STARTING");
+            expected.put("desiredState", "RUNNING");
+            expected.put("observedState", null);
+            expected.put("hasArtifact", true);
+            expected.put("recovery", RecoveryFixtures.pipelineRecovery());
+            assertThat(io.tapstate.core.common.JsonReader.parse(out)).isEqualTo(expected);
+        } else {
+            assertThat(out).contains("state: NEW", "displayState: STARTING", "desiredState: RUNNING",
+                    "observedState: null", "capture.start-from-outside-window");
+        }
+    }
+
+    @Test
+    void machineStatusDoesNotFillUnknownMetadataForAnUnobservedRead() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.NoObservation();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status orders -o json");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.statusCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+        assertThat(client.explainCalls).isEmpty();
+        assertThat(client.metricsCalls).isEmpty();
+        assertThat(io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark)))
+                .isEqualTo(io.tapstate.core.common.JsonReader.parse(
+                        "{\"pipelineId\":\"orders\",\"observedState\":null}"));
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"status", "explain"})
     void textPipelineReadsKeepTheirExplanationAndExposeTheDurableRecoveryCause(String command) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));

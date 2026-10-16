@@ -22,6 +22,19 @@ final class ReadViewDocuments {
         return result;
     }
 
+    static Map<String, Object> status(StatusOutcome.NoObservation status, String requestedId) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("pipelineId", status.pipelineId() == null ? requestedId : status.pipelineId());
+        present(result, "state", status.state());
+        present(result, "displayState", status.displayState());
+        present(result, "desiredState", status.desiredState());
+        // Keep the missing runtime fact explicit even if the server supplied a state placeholder.
+        result.put("observedState", null);
+        present(result, "hasArtifact", status.hasArtifact());
+        present(result, "recovery", RecoveryWire.tree(status.recovery()));
+        return result;
+    }
+
     static Map<String, Object> explanation(ExplainOutcome.Found answer) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("pipelineId", answer.pipelineId());
