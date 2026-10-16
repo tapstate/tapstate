@@ -27,6 +27,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.List;
@@ -149,7 +150,9 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     }
 
     private static int[] twoFreePorts() throws Exception {
-        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        try (ServerSocket first = new ServerSocket(0, 0, loopback);
+                ServerSocket second = new ServerSocket(0, 0, loopback)) {
             return new int[] {first.getLocalPort(), second.getLocalPort()};
         }
     }
