@@ -49,13 +49,22 @@ def check(text):
     assert jars.index('connector-cache.sh verify') < jars.index('name: Cache verified remote PDK dependencies')
     assert "if: steps.pdk.outputs.cache-hit != 'true'" in jars
     assert 'connector-cache.sh prepare' in jars and 'connector-cache.sh seal' in jars and 'connector-cache.sh verify' in jars
+    selected = re.findall(r'^      CONNECTOR_MODULES: (.+)$', jars, re.M)
+    assert len(selected) == 1
+    assert set(selected[0].split(',')) == {
+        'mysql=connectors/mysql-connector', 'mongodb=connectors/mongodb-connector',
+        'postgres=connectors/postgres-connector', 'oracle=connectors/oracle-connector',
+        'sqlserver=connectors/mssql-connector', 'mongodb-atlas=connectors/mongodb-atlas-connector',
+        'aws-rds-mysql=connectors/aws-rds-mysql-connector'}
+    for command in ('connector-cache.sh prepare', 'scripts/build-real-connectors.sh'):
+        assert command + ' --modules "$CONNECTOR_MODULES" --checkout ' in jars
     assert '-nsu -Dmaven.repo.local=' in jars
     assert 'repository: tapdata/tapdata-connectors-enterprise' in jars
     assert 'token: ${{ secrets.ENTERPRISE_CONNECTORS_READ_TOKEN }}' in jars
     assert 'persist-credentials: false' in jars
     assert 'mv "$GITHUB_WORKSPACE/.connector-enterprise-source" "$RUNNER_TEMP/connector-enterprise-source"' in jars
     for line in jars.splitlines():
-        if 'connector-cache.sh prepare ' in line or 'connector-cache.sh seal ' in line or 'scripts/build-real-connectors.sh --checkout ' in line:
+        if 'connector-cache.sh prepare ' in line or 'connector-cache.sh seal ' in line or 'scripts/build-real-connectors.sh --modules ' in line:
             assert '--checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source"' in line
     assert '-Dit.test=' not in text  # No second selector list can drift from source inventory.
 assert 'group: real-connectors-sharded-${{ github.ref }}' in workflow
@@ -68,6 +77,9 @@ for before,after in [
     ('connector-witnesses.sh verify --plan','true # connector-witnesses.sh verify --plan'),
     ('shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]','shard: [shard-1, shard-2, shard-3]'),
     ('connector-cache.sh verify','connector-cache.sh key'),
+    ('connector-cache.sh prepare --modules "$CONNECTOR_MODULES"', 'connector-cache.sh prepare'),
+    ('scripts/build-real-connectors.sh --modules "$CONNECTOR_MODULES"', 'scripts/build-real-connectors.sh'),
+    (',mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector', ''),
     ('path: ${{ runner.temp }}/connector-m2/io/tapdata', 'path: ~/.m2/repository'),
     ('pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-', 'pdk-inputs-${{ runner.os }}-'),
     ('-${{ steps.source.outputs.enterprise_sha }}-', '-'),
@@ -84,5 +96,5 @@ for before,after in [
     try: check(mutated)
     except (AssertionError,KeyError,ValueError): pass
     else: raise AssertionError('workflow mutation survived: '+before)
-print('connector-workflow smoke: fixed check name, explicit Atlas deferral, complete active admission and 16 mutations passed')
+print('connector-workflow smoke: fixed check name, explicit artifact selection/Atlas deferral, complete active admission and 19 mutations passed')
 PY

@@ -227,12 +227,19 @@ fresh_checkout
 expect "a checkout that is not one" 2 "no connectors/ directory" \
   --modules "mysql=connectors/mysql-connector" --checkout "$scratch/checkout/connectors" "$scratch/dest"
 
-# The default is what the nightly witness lane gets by passing no list at all. Pinned by name and by
-# order: this is the one input whose regression the lane that uses it cannot report.
+# The default remains the verified support promise, independent of the extra compatibility
+# artifacts explicitly selected by the nightly lane.
 fresh_checkout
-expect "the default list still builds the witness lane's connectors" 0 "Connector jars staged" \
+expect "the default list still builds the verified database kinds" 0 "Connector jars staged" \
   --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 expect_modules "the default list, by name and in order" \
+  $'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector\nconnectors/oracle-connector,connectors/mssql-connector'
+
+fresh_checkout
+expect "the explicit witness selection builds all seven artifacts" 0 "Connector jars staged" \
+  --modules "mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector,mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector" \
+  --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+expect_modules "all seven selected modules, by checkout" \
   $'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector,connectors/mongodb-atlas-connector,connectors/aws-rds-mysql-connector\nconnectors/oracle-connector,connectors/mssql-connector'
 
 fresh_checkout

@@ -40,6 +40,8 @@ jobs:
     needs: connector-plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CONNECTOR_MODULES: mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector,mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector
     steps:
       - uses: actions/checkout@v4
       - name: Connector JDK compatible with its pinned Lombok
@@ -98,7 +100,7 @@ jobs:
       - name: Resolve current snapshot artifacts
         id: inputs
         run: |
-          .github/scripts/connector-cache.sh prepare --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
+          .github/scripts/connector-cache.sh prepare --modules "$CONNECTOR_MODULES" --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
           echo "key=$(.github/scripts/connector-cache.sh key --manifest "$RUNNER_TEMP/connector-inputs.json")" >> "$GITHUB_OUTPUT"
       # Reuse delays discovering faults outside the resolved source/snapshot inputs.
       # A miss also means possible cache eviction, not necessarily an upstream change.
@@ -112,7 +114,7 @@ jobs:
         env:
           MAVEN_ARGS: -nsu -Dmaven.repo.local=${{ runner.temp }}/connector-m2
         run: |
-          scripts/build-real-connectors.sh --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" "$RUNNER_TEMP/connectors"
+          scripts/build-real-connectors.sh --modules "$CONNECTOR_MODULES" --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" "$RUNNER_TEMP/connectors"
           .github/scripts/connector-cache.sh seal --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" --manifest "$RUNNER_TEMP/connector-inputs.json" --repo-local "$RUNNER_TEMP/connector-m2" --jars "$RUNNER_TEMP/connectors"
       - name: Verify exact connector jar evidence
         run: .github/scripts/connector-cache.sh verify --manifest "$RUNNER_TEMP/connector-inputs.json" --jars "$RUNNER_TEMP/connectors"

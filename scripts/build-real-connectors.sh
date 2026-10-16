@@ -27,10 +27,10 @@
 # A second argument names the directory to clone into, which has to be empty; it defaults to a fresh
 # temporary directory.
 #
-# Two callers, two module lists. The witness lane wants the handful of connectors its scenarios drive;
+# Callers can select different module lists. The witness lane names the connectors its scenarios drive;
 # a catalog refresh wants every connector the catalog carries, and that list is not knowable here - it
 # comes from the probe manifest the assembler writes, which is derived from the checkout rather than
-# written down. So the list is an input, defaulting to the witness lane's connectors:
+# written down. So the list is an input, defaulting to the verified database kinds:
 #
 #   --modules <id>=<module-path>[,...]  what to build; the id is the file-name prefix the witnesses
 #                                       and the catalog resolve by, so it cannot be chosen freely
@@ -65,9 +65,9 @@ readonly SOURCE_REPOSITORY="https://github.com/tapdata/tapdata-connectors.git"
 CONNECTOR_SETTINGS="$(cd "$(dirname "$0")/.." && pwd)/.github/maven-settings-connectors.xml"
 readonly CONNECTOR_SETTINGS
 
-# The witness lane's connectors, as the specifications name them, paired with the module that builds
-# each one. This is the default rather than the only option - see --modules above.
-readonly DEFAULT_MODULES="mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector,mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector"
+# The verified database kinds, paired with their build modules. Compatibility witnesses
+# select additional connector variants explicitly with --modules.
+readonly DEFAULT_MODULES="mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector"
 
 modules_arg=""
 checkout=""
