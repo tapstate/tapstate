@@ -71,8 +71,8 @@ SERVER="tapstate-image-smoke-$$"
 WORK="$(mktemp -d)"
 MONGO_STARTING=0
 
-# Invoked through the EXIT trap.
-# shellcheck disable=SC2329
+# Invoked through the EXIT trap, which ShellCheck 0.9 does not follow.
+# shellcheck disable=SC2317,SC2329
 mongo_diagnostics() {
   bold "Mongo fixture state (first 4096 bytes)"
   docker inspect -f 'status={{.State.Status}} running={{.State.Running}} exitCode={{.State.ExitCode}} oomKilled={{.State.OOMKilled}} error={{json .State.Error}}' \
@@ -87,7 +87,8 @@ mongo_diagnostics() {
 }
 
 # Containers before the network they attach to (a network with attached containers will not remove).
-# shellcheck disable=SC2329
+# Invoked through the EXIT trap, which ShellCheck 0.9 does not follow.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   local status=$?
   if [[ $status -ne 0 && $MONGO_STARTING -eq 1 ]]; then
