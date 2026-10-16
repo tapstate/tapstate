@@ -27,10 +27,10 @@
 # A second argument names the directory to clone into, which has to be empty; it defaults to a fresh
 # temporary directory.
 #
-# Two callers, two module lists. The witness lane wants the handful of connectors its scenarios drive;
+# Callers can select different module lists. The witness lane names the connectors its scenarios drive;
 # a catalog refresh wants every connector the catalog carries, and that list is not knowable here - it
 # comes from the probe manifest the assembler writes, which is derived from the checkout rather than
-# written down. So the list is an input, defaulting to the witness lane's connectors:
+# written down. So the list is an input, defaulting to the verified database kinds:
 #
 #   --modules <id>=<module-path>[,...]  what to build; the id is the file-name prefix the witnesses
 #                                       and the catalog resolve by, so it cannot be chosen freely
@@ -65,8 +65,8 @@ readonly SOURCE_REPOSITORY="https://github.com/tapdata/tapdata-connectors.git"
 CONNECTOR_SETTINGS="$(cd "$(dirname "$0")/.." && pwd)/.github/maven-settings-connectors.xml"
 readonly CONNECTOR_SETTINGS
 
-# The witness lane's connectors, as the specifications name them, paired with the module that builds
-# each one. This is the default rather than the only option - see --modules above.
+# The verified database kinds, paired with their build modules. Compatibility witnesses
+# select additional connector variants explicitly with --modules.
 readonly DEFAULT_MODULES="mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector"
 
 modules_arg=""
@@ -309,8 +309,7 @@ fi
 # by the "-v" the shade plugin puts before the version. Matching on the connector id alone would take
 # both, and the witnesses refuse an ambiguous match - so the selector has to be this specific.
 #
-# Staging the whole build output would break them the same way, on the sibling connectors that share a
-# prefix: mysql-pxc, mongodb-atlas.
+# Sibling connector ids may share a prefix; stage only the selected module's shaded jar.
 for index in "${!CONNECTOR_IDS[@]}"; do
     id="${CONNECTOR_IDS[$index]}"
     module="${CONNECTOR_MODULES[$index]}"
@@ -342,11 +341,13 @@ for id in "${CONNECTOR_IDS[@]}"; do
     fi
 done
 
-# Witnesses use a broader id prefix. Refuse sibling ambiguity in the default
-# witness dist; a catalog refresh deliberately stages such siblings together.
+# Match the witness resolver's exact id and its legacy aliases. A sibling such
+# as mongodb-atlas must not make mongodb ambiguous, but two jars for one id must.
 if [ -z "$modules_arg" ]; then
     for id in "${CONNECTOR_IDS[@]}"; do
-        staged="$(find "$destination" -maxdepth 1 -name "$id*.jar" -type f | wc -l | tr -d ' ')"
+        staged="$(find "$destination" -maxdepth 1 -type f \
+            \( -name "$id.jar" -o -name "$id-connector.jar" -o -name "$id-connector-*.jar" \) \
+            | wc -l | tr -d ' ')"
         if [ "$staged" -ne 1 ]; then
             echo "$destination resolves $staged jars for '$id', and the witnesses require exactly one" >&2
             exit 1
