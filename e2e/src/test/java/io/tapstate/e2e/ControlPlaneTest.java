@@ -344,6 +344,38 @@ class ControlPlaneTest {
                 .isEmpty();
     }
 
+    @Test
+    void typedStatusPollWaitsOnlyForTheExplicitUnavailableMembership() {
+        assertThat(ControlPlane.interpretClusterStatus(503, coded(ClusterError.MEMBERSHIP_UNREADABLE.code())))
+                .isEmpty();
+    }
+
+    @Test
+    void typedStatusPollKeepsOtherFailuresLoud() {
+        for (int status : List.of(401, 500, 502)) {
+            assertThatThrownBy(() -> ControlPlane.interpretClusterStatus(
+                            status, coded(ClusterError.MEMBERSHIP_UNREADABLE.code())))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("got " + status);
+        }
+        for (String body : List.of(coded(LifecycleError.UNKNOWN_PIPELINE.code()), "", "<html>unavailable</html>")) {
+            assertThatThrownBy(() -> ControlPlane.interpretClusterStatus(503, body))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("got 503");
+        }
+    }
+
+    @Test
+    void typedStatusPollReturnsTheActualProjection() {
+        String body = JsonWriter.write(Map.of("clusterId", "observed-cluster", "members", List.of(),
+                "pipelines", List.of()));
+        assertThat(ControlPlane.interpretClusterStatus(200, body)).hasValueSatisfying(view -> {
+            assertThat(view.clusterId()).isEqualTo("observed-cluster");
+            assertThat(view.members()).isEmpty();
+            assertThat(view.pipelines()).isEmpty();
+        });
+        assertThatThrownBy(() -> ControlPlane.interpretClusterStatus(200, "<html>unavailable</html>"))
+                .isInstanceOf(AssertionError.class);
+    }
+
     /**
      * Written on the code and not on the status, so that a 503 arriving from anywhere else stays loud.
      * A proxy in front of the product answers 503 too, and it means the opposite of this one.

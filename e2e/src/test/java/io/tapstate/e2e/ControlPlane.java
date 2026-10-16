@@ -502,6 +502,23 @@ final class ControlPlane {
         return typed(response.body(), ClusterTopologyView.class);
     }
 
+    /** A bounded poll may wait for the product's explicit temporary membership refusal. */
+    Optional<ClusterTopologyView> clusterStatusIfAnswered() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/status"));
+        return interpretClusterStatus(response.statusCode(), response.body());
+    }
+
+    static Optional<ClusterTopologyView> interpretClusterStatus(int status, String body) {
+        if (status == 503 && ClusterError.MEMBERSHIP_UNREADABLE.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError("could not read the typed cluster status: expected HTTP 200, got "
+                    + status + " - " + body);
+        }
+        return Optional.of(typed(body, ClusterTopologyView.class));
+    }
+
     /** Uses the same authenticated read transport with an explicit case-scoped request bound. */
     ClusterTopologyView clusterStatus(Duration bound) {
         HttpRequest request = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/cluster/status"))

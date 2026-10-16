@@ -7,7 +7,10 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoSrsMetaStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.control.core.ClusterClaimView;
+import io.tapstate.control.core.ClusterPipelineView;
+import io.tapstate.control.core.ClusterProcessorView;
 import io.tapstate.control.core.ClusterRecoveryItemView;
+import io.tapstate.control.core.ClusterTopologyView;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.ReadMode;
@@ -31,9 +34,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicReference;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -139,10 +144,10 @@ class AFullClusterRestartRebuildsDesiredPipelinesFromMongoTruthIT {
                 assertThat(csv(fileTarget, LARGE_TABLE)).containsEntry(11L, 11L);
                 Map<String, ClusterClaimView> previous = new LinkedHashMap<>();
                 for (String pipeline : PIPELINES) {
-                    awaitCohort(initial, pipeline);
+                    ClusterClaimView original = awaitCohort(initial, pipeline);
                     assertThat(initial.state(pipeline)).as("each original run is healthy before the full stop")
                             .contains(PipelineState.RUNNING);
-                    previous.put(pipeline, claim(initial, pipeline));
+                    previous.put(pipeline, original);
                 }
                 Map<String, ClusterMemberFacts> oldBoots = initial.clusterMembers().stream()
                         .collect(Collectors.toMap(ClusterMemberFacts::nodeId, member -> member));
@@ -330,11 +335,31 @@ class AFullClusterRestartRebuildsDesiredPipelinesFromMongoTruthIT {
                 .findFirst().orElseThrow().controllerClaim();
     }
 
-    private static void awaitCohort(ControlPlane control, String pipeline) {
+    private static ClusterClaimView awaitCohort(ControlPlane control, String pipeline) {
+        AtomicReference<ClusterClaimView> ready = new AtomicReference<>();
+        AtomicReference<String> last = new AtomicReference<>("no cluster reading yet");
         Await.until(pipeline + " to use every actual active member", BOUND,
-                () -> control.membersCarryingPartOf(pipeline).equals(Set.copyOf(NODES)) && claim(control, pipeline) != null
-                        && claim(control, pipeline).leased(),
-                () -> "participants=" + control.membersCarryingPartOf(pipeline) + ", claim=" + claim(control, pipeline));
+                () -> {
+                    Optional<ClusterTopologyView> observed = control.clusterStatusIfAnswered();
+                    last.set(observed.map(view -> view.pipelines().stream()
+                                    .filter(value -> value.pipelineId().equals(pipeline)).toList().toString())
+                            .orElse("503 cluster.membership-unreadable"));
+                    Optional<ClusterClaimView> cohort = observed.flatMap(view -> cohortClaim(view, pipeline));
+                    cohort.ifPresent(ready::set);
+                    return cohort.isPresent();
+                }, last::get);
+        return ready.get();
+    }
+
+    /** Placement and authority must come from the same successful observation. */
+    static Optional<ClusterClaimView> cohortClaim(ClusterTopologyView view, String pipeline) {
+        return view.pipelines().stream()
+                .filter(value -> value.pipelineId().equals(pipeline))
+                .filter(value -> value.controllerClaim() != null && value.controllerClaim().leased())
+                .filter(value -> value.vertices().stream().flatMap(vertex -> vertex.processors().stream())
+                        .map(ClusterProcessorView::nodeId).filter(Objects::nonNull)
+                        .collect(Collectors.toSet()).equals(Set.copyOf(NODES)))
+                .map(ClusterPipelineView::controllerClaim).findFirst();
     }
 
     private static Optional<ClusterRecoveryItemView> item(ControlPlane control, String pipeline) {
