@@ -21,6 +21,42 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Real connector fixture inputs
+
+The scheduled/manual Real connectors lane builds seven checked connector kinds,
+including `mongodb-atlas` and `aws-rds-mysql`. Connector production uses Maven
+3.9.16 with a verified distribution checksum. Its snapshot manifest, sealed JAR
+set and witness admission must agree; adding unchecked files to a cache is not
+a replacement for building the selected artifacts.
+
+External managed Atlas acceptance is temporarily deferred under
+[#702](https://github.com/tapstate/tapstate/issues/702). The exact four live classes
+are listed in `.github/connector-witness-deferrals.json`; their unchanged tests
+remain in the repository. Each plan records the policy bytes, deferred classes
+and follow-up. Deferred cases are not execution or managed Atlas acceptance.
+MongoDB witnesses, local replica-set Atlas PDK controls and all other selected
+connector cases still require positive, zero-skip execution.
+
+Before restoring the deferred classes, configure these repository Actions secrets:
+
+- `TAPSTATE_ATLAS_TEST_URI`: a controlled real Atlas test deployment URI for
+  managed-store, recovery and pipeline witnesses.
+- `TAPSTATE_ATLAS_STANDARD_URI`: the standard MongoDB connection URI for the
+  same controlled Atlas fixture, with the resolved hosts and connection options
+  required by the source HTTP witness.
+
+When the active source inventory includes external Atlas classes, the planning
+job rejects missing inputs before connector production starts. Removing a class
+from the deferral list restores its execution and this prerequisite automatically.
+Each witness shard also stages the locked public Cloud release inputs and sets
+`TAPSTATE_TEST_CLOUD_RELEASE_DIR`; this directory is prepared by CI, not supplied
+as a secret. Zero-test and skipped witnesses remain admission failures.
+
+Use a dedicated test deployment with room for the approximately 423 MB connector
+release plus concurrent witness databases. A 512 MB shared deployment has
+exhausted its quota during these tests. The lane does not provision or resize
+an Atlas deployment.
+
 ## Cloud release version registration
 
 The release workflow registers the current Cloud runtime version only after the

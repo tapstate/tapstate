@@ -16,6 +16,12 @@ with tempfile.TemporaryDirectory() as tmp:
     names=['PublishedExamplesIT','RealMysqlToMongoFreshIT','NestFreshIT','DataBrowserFreshIT','WatchFreshIT','AnObjectIdReadsBackTheSameThroughBothFacesIT','SinkValueRoundTripIT','RealTargetPreparationIT','EnterpriseTargetPreparationIT']
     for name in names+['UnrelatedIT']:
         put('e2e/src/test/java/sample/'+name+'.java','package sample; class '+name+' {}')
+    deferred=['io.tapstate.e2e.RealAtlasSourceHttpIT','io.tapstate.e2e.RealAtlasToAtlasPipelineIT']
+    for name,variable in [('RealAtlasSourceHttpIT','TAPSTATE_ATLAS_STANDARD_URI'),('RealAtlasToAtlasPipelineIT','TAPSTATE_ATLAS_TEST_URI')]:
+        put('e2e/src/test/java/io/tapstate/e2e/'+name+'.java', 'package io.tapstate.e2e; class '+name+' { void run() { RealConnectorGate.require("mongodb-atlas"); String url="https://example.test"; System.getenv("'+variable+'"); } }')
+    policy={'schema':1,'issue':'https://github.com/tapstate/tapstate/issues/702',
+            'reason':'Controlled external Atlas fixtures are not ready.', 'classes':deferred}
+    put('.github/connector-witness-deferrals.json',json.dumps(policy))
     for n in range(12): put(f'e2e/examples/sample{n}/case.e2e.yml','fixture')
     put('e2e/witness-manifest.txt',''.join(f'sample{n} on {tier}\n' for n in range(12) for tier in ['IN_PROCESS','REAL_PROCESS']))
     def call(command,*extra,ok=True):
@@ -27,8 +33,34 @@ with tempfile.TemporaryDirectory() as tmp:
     plan=json.loads((root/'plan.json').read_text()); assert len(plan['shards'])==10
     put('bin/mvn','#!/bin/sh\nexit 0\n'); (root/'bin/mvn').chmod(0o755)
     os.environ['PATH']=str(root/'bin')+':'+os.environ['PATH']
-    assert {t['class'] for t in plan['expected']}=={'sample.'+n for n in names}
+    assert {t['class'] for t in plan['expected']}=={'sample.'+n for n in names}, 'deferred external Atlas witnesses must be absent from the active cohort'
+    assert plan['connector_deferrals']['classes']==deferred and plan['requires_atlas_fixtures'] is False
     assert len(plan['expected'])==20
+    policy_path=root/'.github/connector-witness-deferrals.json'
+    for change in [dict(policy,classes=deferred+deferred[:1]),dict(policy,classes=['sample.UnknownIT']),
+                   dict(policy,classes=['sample.WatchFreshIT']),dict(policy,issue=''),dict(policy,reason=''),
+                   dict(policy,schema=2),dict(policy,issue='https://github.com/tapstate/tapstate/issues/999')]:
+        policy_path.write_text(json.dumps(change)); call('plan','--output',root/'invalid.json',ok=False)
+    extra='io.tapstate.e2e.AddedAtlasFixtureIT'
+    put('e2e/src/test/java/io/tapstate/e2e/AddedAtlasFixtureIT.java',
+        'package io.tapstate.e2e; class AddedAtlasFixtureIT { void run() { RealConnectorGate.require("mongodb-atlas"); System.getenv("TAPSTATE_ATLAS_TEST_URI"); } }')
+    policy_path.write_text(json.dumps(dict(policy,classes=sorted(deferred+[extra]))))
+    call('plan','--output',root/'invalid.json',ok=False)
+    (root/'e2e/src/test/java/io/tapstate/e2e/AddedAtlasFixtureIT.java').unlink()
+    policy_path.write_text(json.dumps(policy))
+    source=root/'e2e/src/test/java/io/tapstate/e2e/RealAtlasSourceHttpIT.java'
+    saved=source.read_text()
+    for expression in ['/* System.getenv("TAPSTATE_ATLAS_STANDARD_URI"); */',
+                       '// System.getenv("TAPSTATE_ATLAS_STANDARD_URI");\n',
+                       'String fixture="""\nSystem.getenv("TAPSTATE_ATLAS_STANDARD_URI");\n""";']:
+        source.write_text('package io.tapstate.e2e; class RealAtlasSourceHttpIT { void run() { RealConnectorGate.require("mongodb-atlas"); '+expression+' } }')
+        call('plan','--output',root/'invalid.json',ok=False)
+    source.write_text(saved)
+    policy_path.write_text(json.dumps(dict(policy,classes=[])))
+    call('plan','--output',root/'restored-atlas.json')
+    restored=json.loads((root/'restored-atlas.json').read_text())
+    assert restored['requires_atlas_fixtures'] is True and len(restored['expected'])==22
+    policy_path.write_text(json.dumps(policy))
     assert plan['shards'][0]['estimated_seconds']==100 and len(plan['shards'][0]['tests'])==1
     assert all(s['estimated_seconds']==len(s['tests']) for s in plan['shards'][1:])
     expected=Counter(t['example']+' on '+tier for t in plan['expected'] if 'example' in t for tier in ['IN_PROCESS','REAL_PROCESS'])
@@ -65,6 +97,9 @@ with tempfile.TemporaryDirectory() as tmp:
         call('verify','--plan',root/'plan.json','--artifacts',artifacts,'--restore',root/'restored',ok=ok)
         if not ok: assert not (root/'restored').exists()
     verify()
+    policy_path.write_text(json.dumps(dict(policy,reason='Changed policy requires a fresh plan.')))
+    verify(False)
+    policy_path.write_text(json.dumps(policy)); verify()
     assert Counter((root/'restored/e2e/target/witness-ledger.txt').read_text().splitlines())==Counter((root/'e2e/witness-manifest.txt').read_text().splitlines())
     merged=ET.parse(root/'restored/e2e/target/failsafe-reports/TEST-sample.PublishedExamplesIT.xml').getroot()
     assert len(merged.findall('testcase'))==24 and int(merged.get('tests'))==24
@@ -145,5 +180,5 @@ with tempfile.TemporaryDirectory() as tmp:
             assert all((outside/name).is_file() and (outside/name).read_text()==value for name,value in foreign.items()), 'wrapper modified external evidence before preflight'
         finally:
             target.unlink(); backup_target.rename(target)
-print('connector-witnesses smoke: example scheduling, XML preservation and 28 adverse admission/run scenario types passed')
+print('connector-witnesses smoke: explicit Atlas deferral/restoration, policy binding, XML preservation and 28 adverse admission/run scenario types passed')
 PY

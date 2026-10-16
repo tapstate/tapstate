@@ -26,6 +26,21 @@ LEDGER = Path('e2e/target/witness-ledger.txt')
 TIERS = ('IN_PROCESS', 'REAL_PROCESS')
 LEDGERS = Path('e2e/target/witness-ledgers')
 MARKER = 'tapstate.published-case='
+DEFERRALS = Path('.github/connector-witness-deferrals.json')
+ATLAS_INPUT = re.compile(r'\bSystem\s*\.\s*getenv\s*\(\s*"TAPSTATE_ATLAS_(?:TEST|STANDARD)_URI"\s*\)')
+AUTHORIZED_DEFERRALS = frozenset({
+    'io.tapstate.e2e.CloudAtlasObservabilityRecoveryIT',
+    'io.tapstate.e2e.RealAtlasSourceHttpIT',
+    'io.tapstate.e2e.RealAtlasToAtlasPipelineIT',
+    'io.tapstate.e2e.RealMySqlToAtlasPipelineIT',
+})
+JAVA_NON_CODE = re.compile(r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*[\s\S]*?\*/|//[^\n]*')
+
+
+def external_atlas_input(source):
+    text = JAVA_NON_CODE.sub(lambda match: match.group() if match.group().startswith('"')
+                             and not match.group().startswith('"""') else ' ', source)
+    return ATLAS_INPUT.search(text) is not None
 
 
 def inventory(root):
@@ -47,6 +62,32 @@ def inventory(root):
         else:
             result.append(test)
     return result
+
+
+def active_inventory(root):
+    tests = inventory(root)
+    path = root / DEFERRALS
+    raw = path.read_bytes()
+    policy = shards.read(path)
+    shards.require(set(policy) == {'schema', 'issue', 'reason', 'classes'} and policy['schema'] == 1,
+                   'invalid connector deferral policy')
+    shards.require(policy['issue'] == 'https://github.com/tapstate/tapstate/issues/702', 'invalid deferral issue')
+    shards.require(isinstance(policy['reason'], str) and policy['reason'].strip(), 'missing deferral reason')
+    classes = policy['classes']
+    shards.require(isinstance(classes, list) and all(isinstance(name, str) for name in classes)
+                   and classes == sorted(set(classes)), 'deferrals must be unique sorted class names')
+    shards.require(set(classes) <= AUTHORIZED_DEFERRALS, 'deferral exceeds the authorized four-class exception')
+    known = {test['class'] for test in tests}
+    shards.require(set(classes) <= known, 'deferral names an unknown connector witness')
+    external = set()
+    for test in tests:
+        source = root / 'e2e/src/test/java' / (test['class'].replace('.', '/') + '.java')
+        if external_atlas_input(source.read_text()):
+            external.add(test['class'])
+    shards.require(set(classes) <= external, 'only external Atlas fixture witnesses may be deferred')
+    active = [test for test in tests if test['class'] not in classes]
+    record = dict(policy, path=DEFERRALS.as_posix(), sha256=hashlib.sha256(raw).hexdigest())
+    return active, record, bool(external - set(classes))
 
 
 def expected_cases(tests):
@@ -124,15 +165,24 @@ def main():
             cmd.add_argument('--restore', required=True, type=Path)
     args = parser.parse_args()
     args.root = args.root.resolve()
+    tests, deferrals, requires_atlas = active_inventory(args.root)
     if args.command == 'plan':
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / 'inventory.json'
-            shards.write(source, inventory(args.root))
+            shards.write(source, tests)
             extra = ['--durations', args.durations] if args.durations else []
             engine('plan', args, '--inventory', source, '--count', '10', '--output', args.output, *extra)
+        plan = shards.read(args.output)
+        plan.update(connector_deferrals=deferrals, requires_atlas_fixtures=requires_atlas)
+        shards.write(args.output, plan)
+        for name in deferrals['classes']:
+            print('Deferred external Atlas witness: ' + name + ' (' + deferrals['issue'] + ')')
         return
     plan = shards.load_plan(args, args.root)
-    shards.require(plan['selection'] == 'inventory' and plan['cohort_hash'] == shards.cohort(inventory(args.root)),
+    shards.require(plan.get('connector_deferrals') == deferrals
+                   and plan.get('requires_atlas_fixtures') is requires_atlas,
+                   'connector deferral policy differs from plan')
+    shards.require(plan['selection'] == 'inventory' and plan['cohort_hash'] == shards.cohort(tests),
                    'connector witness cohort differs from plan')
     shards.require(len(plan['shards']) == 10, 'connector lane requires ten shards')
     if args.command == 'run':
@@ -169,7 +219,7 @@ def main():
                 all_ledgers.update(shard_ledger(ledger, selected['tests']))
                 shards.require(shards.read(directory / 'ledger.json') == dict(source_sha=plan['source_sha'], cohort_hash=plan['cohort_hash'],
                                shard_id=selected['id'], sha256=hashlib.sha256(ledger.read_bytes()).hexdigest()), 'ledger identity differs')
-        expected = expected_cases(inventory(args.root))
+        expected = expected_cases(tests)
         shards.require(all_cases == expected and all_ledgers == expected, 'global Published case or ledger multiset differs')
         # The existing release gate still consumes its original manifest vocabulary.
         # Keep every occurrence through translation; no set conversion can hide a duplicate.

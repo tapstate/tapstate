@@ -1,12 +1,16 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.PipelinePreviewService;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.method.HandlerTypePredicate;
+import org.springframework.web.servlet.config.annotation.AsyncSupportConfigurer;
 import org.springframework.web.servlet.config.annotation.PathMatchConfigurer;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+import java.time.Duration;
 
 /**
  * The HTTP presentation configuration: the single Spring context's Web MVC face over the control
@@ -26,12 +30,23 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 @Configuration
 public class RestApiConfiguration {
 
+    private static final Duration ASYNC_RESPONSE_BUFFER = Duration.ofSeconds(15);
+
+    static long asyncRequestTimeoutMillis() {
+        return PipelinePreviewService.DEADLINE.plus(ASYNC_RESPONSE_BUFFER).toMillis();
+    }
+
     @Bean
     WebMvcConfigurer apiWebMvc() {
         return new WebMvcConfigurer() {
             @Override
             public void configurePathMatch(PathMatchConfigurer configurer) {
                 configurer.addPathPrefix("/api", HandlerTypePredicate.forAnnotation(RestController.class));
+            }
+
+            @Override
+            public void configureAsyncSupport(AsyncSupportConfigurer configurer) {
+                configurer.setDefaultTimeout(asyncRequestTimeoutMillis());
             }
         };
     }
