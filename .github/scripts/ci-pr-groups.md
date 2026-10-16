@@ -121,6 +121,11 @@ missing required checks and any unfinished run/check prevent advancing. All chec
 instances remain visible; equal context names do not hide another running instance.
 The PR scope is read again before returning to detect concurrent changes.
 
+This declared workflow inventory is the PR event view. Use the source-aware
+`ci-trigger-contract.sh --head-status` path to reconcile applicable branch push
+instances as well. Their check IDs, raw archives and whole-wave timing remain
+separate from same-name PR instances and the PR event interval.
+
 `can_advance_after_archiving` describes terminal state only. Archive and read back
 every observed run/attempt/check and applicable-lane evidence before making the next
 ordinary variant commit. A terminal failure or retry can be archived for diagnosis;

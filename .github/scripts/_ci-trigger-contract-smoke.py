@@ -447,4 +447,130 @@ fixture.run(base_target_controls, only_callback=True, base_source=True, workflow
     'opened-target.yml': 'on:\n  pull_request_target:\n    types: [opened]\njobs:\n  target:\n    steps: []\n',
     'closed-target.yml': 'on:\n  pull_request_target:\n    types: [closed]\njobs:\n  target:\n    steps: []\n',
 })
+def missing_push_instance_controls(context):
+    request = seed(context)
+    policy = m.project(m.g.References(context['evidence']), context['work'], request)
+    check(policy['source_policy_eligible'], 'dual-event source remains eligible for its original PR')
+    scope = policy['scope']
+    association = {'number': 7, 'head': {'sha': scope['head_sha']}, 'base': {'sha': scope['base_sha']}}
+    pr = {'number': 7, 'state': 'open', 'draft': True, 'merge_commit_sha': policy['checkout']['sha'],
+          'head': {'sha': scope['head_sha'], 'ref': scope['branch'], 'repo': {'full_name': scope['repository']}},
+          'base': {'sha': scope['base_sha'], 'ref': 'main', 'repo': {'full_name': scope['repository']}}}
+    runs = [{'id': number + 42, 'path': path, 'run_attempt': 1, 'status': 'completed', 'conclusion': 'success',
+             'head_sha': scope['head_sha'], 'head_branch': scope['branch'], 'event': 'pull_request',
+             'repository': {'full_name': scope['repository']}, 'pull_requests': [association],
+             'created_at': '2026-01-01T10:00:00Z', 'updated_at': '2026-01-01T10:01:00Z'}
+            for number, path in enumerate(policy['ordinary_applicable_workflows'])]
+    push_runs, head_checks = [], []
+
+    def api(endpoint):
+        if endpoint.endswith('/pulls/7'):
+            return copy.deepcopy(pr)
+        if '/git/commits/' in endpoint:
+            return {'sha': pr['merge_commit_sha'], 'parents': [{'sha': scope['base_sha']}, {'sha': scope['head_sha']}]}
+        if '/actions/runs?' in endpoint:
+            rows = push_runs if 'event=push' in endpoint else runs
+            return {'total_count': len(rows), 'workflow_runs': copy.deepcopy(rows)}
+        if '/check-runs?' in endpoint:
+            commit = endpoint.split('/commits/', 1)[1].split('/', 1)[0]
+            rows = head_checks if commit == scope['head_sha'] else [
+                {'id': 700 + number, 'name': name, 'head_sha': commit, 'status': 'completed',
+                 'conclusion': 'success', 'pull_requests': [association]}
+                for number, name in enumerate(policy['minimum_required_checks'])]
+            return {'total_count': len(rows), 'check_runs': rows}
+        if '/attempts/1/jobs?' in endpoint:
+            return {'total_count': 0, 'jobs': []}
+        if endpoint.endswith('/attempts/1'):
+            identity = int(endpoint.split('/actions/runs/', 1)[1].split('/', 1)[0])
+            return copy.deepcopy(next(run for run in runs + push_runs if run['id'] == identity))
+        raise AssertionError('unexpected missing-push API: ' + endpoint)
+
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'],
+          'missing branch push instance must not be hidden by its successful PR counterpart')
+    check(policy['head_push_source_sha'] == scope['head_sha']
+          and policy['head_push_applicable_workflows'] == ['.github/workflows/no-cjk.yml'],
+          'push membership is derived from original head source and its branch filter')
+    push_runs.append({'id': 44, 'path': '.github/workflows/no-cjk.yml', 'run_attempt': 1,
+        'status': 'completed', 'conclusion': 'success', 'head_sha': scope['head_sha'],
+        'head_branch': scope['branch'], 'event': 'push', 'repository': {'full_name': scope['repository']},
+        'pull_requests': [], 'check_suite_id': 8000,
+        'created_at': '2026-01-01T09:59:00Z', 'updated_at': '2026-01-01T10:02:00Z'})
+    head_checks.append({'id': 8001, 'name': 'no-cjk', 'head_sha': scope['head_sha'], 'status': 'completed',
+                        'conclusion': 'success', 'pull_requests': [], 'check_suite': {'id': 8000}})
+    status = m.policy_head_status(policy, api)
+    check(status['can_advance_after_archiving'] and len(status['runs']) == 2
+          and [run['id'] for run in status['head_push_runs']] == [44], 'PR and head push instances remain distinct')
+    push_runs[0]['status'] = 'queued'
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'], 'queued push blocks a successful PR counterpart')
+    push_runs[0]['status'] = 'completed'
+    saved = head_checks.pop()
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'], 'absent push check cannot borrow the PR check name')
+    head_checks.append(saved)
+    saved['check_suite']['id'] = 8002
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'], 'foreign check suite cannot satisfy the push instance')
+    saved['check_suite']['id'] = 8000
+    for key, value in [('head_branch', 'ws/foreign'), ('head_sha', 'f' * 40), ('event', 'workflow_dispatch')]:
+        old = push_runs[0][key]
+        push_runs[0][key] = value
+        try: m.policy_head_status(policy, api)
+        except ValueError as error: check('foreign workflow run' in str(error), 'wrong push scope is rejected')
+        else: raise AssertionError('foreign push scope accepted')
+        push_runs[0][key] = old
+
+    archives = []
+    for run in runs + push_runs:
+        prefix = 'dual-transition/' + str(run['id']) + '/'
+        context['save'](prefix + 'run.json', run)
+        context['save'](prefix + 'attempt-1/run.json', run)
+        context['save'](prefix + 'attempt-1/jobs-1.json', {'total_count': 0, 'jobs': []})
+        context['save'](prefix + 'attempt-1/logs.zip', fixture.zipped({'setup.log': b'original event-specific workflow log'}))
+        directory = context['evidence'] / prefix
+        m.g.receipt.manifest(directory, {'archive_root': str(directory), 'archive_complete': True,
+            'purpose': 'offline raw workflow evidence', 'gaps': []})
+        archives.append({'run_id': run['id'], 'receipt': {'path': prefix + 'receipt.json',
+                         'sha256': m.g.checksum((directory / 'receipt.json').read_bytes())}})
+    pages = {commit: [context['save']('dual-transition/checks-' + commit + '.json',
+             api('repos/example/project/commits/' + commit + '/check-runs?filter=all'))]
+             for commit in [scope['head_sha'], policy['checkout']['sha']]}
+    transition = {'schema': 1, 'type': 'serial-transition-request',
+        'scope': {name: scope[name] for name in ['repository', 'pr', 'branch', 'head_sha']},
+        'expected_base_sha': scope['base_sha'], 'contract': {'applicable_workflows': policy['ordinary_applicable_workflows'],
+        'required_checks': policy['minimum_required_checks']}, 'archives': archives, 'check_pages': pages,
+        'trigger_policy': {'request': context['save']('dual-transition/policy.json', request),
+                           'source_root': str(context['work'])}}
+    variants = m.basis_reader.source.variants
+    result = variants.transition(m.g.References(context['evidence']), transition, api)
+    check([row['event'] for row in result['archives']] == ['pull_request', 'pull_request', 'push'],
+          'original raw archives retain both event types without inventing a PR association for push')
+    missing = copy.deepcopy(transition)
+    missing['archives'] = [row for row in missing['archives'] if row['run_id'] != 44]
+    try: variants.transition(m.g.References(context['evidence']), missing, api)
+    except ValueError as error: check('archive set differs' in str(error), 'missing push raw archive is rejected')
+    else: raise AssertionError('push archive omitted')
+    wrong = copy.deepcopy(transition)
+    raw = copy.deepcopy(api('repos/example/project/commits/' + scope['head_sha'] + '/check-runs?filter=all'))
+    raw['check_runs'][0]['check_suite']['id'] = 8002
+    wrong['check_pages'][scope['head_sha']] = [context['save']('dual-transition/wrong-suite.json', raw)]
+    try: variants.transition(m.g.References(context['evidence']), wrong, api)
+    except ValueError as error: check('push check suite differs' in str(error), 'raw push suite tampering is rejected')
+    else: raise AssertionError('raw push check suite tampering accepted')
+    serial = m.g.module('dual_serial_readback', '_ci-serial-readback.py')
+    reference = context['save']('dual-transition/request.json', transition)
+    captured = serial.capture(m.g.References(context['evidence']), reference, api)
+    serial_reference = context['save']('dual-transition/captured.json', captured)
+    variant = {'identity': {'head_sha': scope['head_sha'], 'base_sha': scope['base_sha'],
+                           'checkout_sha': policy['checkout']['sha'], 'run_id': runs[0]['id']}}
+    bound = serial.bind(m.g.References(context['evidence']), serial_reference,
+        {name: scope[name] for name in ['repository', 'pr', 'branch']}, variant, archives[0]['receipt'])
+    check(bound['workflow_created_at'] == '2026-01-01T10:00:00Z'
+          and bound['workflow_terminal_observed_at'] == '2026-01-01T10:01:00Z'
+          and bound['whole_wave_workflow_created_at'] == '2026-01-01T09:59:00Z'
+          and bound['whole_wave_workflow_terminal_observed_at'] == '2026-01-01T10:02:00Z',
+          'passive replay retains PR timing and separately reports the earlier and later push work')
+
+
+fixture.run(missing_push_instance_controls, only_callback=True, base_source=True, workflow_sources={
+    'ci.yml': workflow('    branches: [main]\n'),
+    'no-cjk.yml': 'on:\n  push:\n    branches: [main, "ws/**"]\n  pull_request:\n    branches: [main]\njobs:\n  no-cjk:\n    steps: []\n',
+})
 print('CI trigger contract controls passed:', count)

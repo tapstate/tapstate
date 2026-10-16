@@ -57,6 +57,11 @@ attempt `attempt-N/run.json`, consecutive `attempt-N/jobs-1.json` etc., and orig
 `attempt-N/logs.zip`. All attempts and job timelines are reconciled with their
 original Actions APIs, including failures and retries. The ZIPs are read back.
 
+With a source-derived trigger policy, the archive set also includes every
+applicable branch push instance. Its event and check suite remain distinct from
+the PR counterpart, and no PR association is invented for an unassociated push.
+Raw head check pages must preserve the source-bound push check-suite IDs.
+
 CI collector archives carry additional CI-specific artifacts and provenance.
 Short workflow archives can use the same hash/size index with a narrowly scoped
 `raw-workflow-evidence` purpose. This operational readback never replaces full CI

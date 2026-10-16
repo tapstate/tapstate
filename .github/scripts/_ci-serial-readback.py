@@ -85,7 +85,7 @@ def readback(refs, value):
 
 def workflow_window(refs, captured, result):
     """Read terminal workflow intervals from the exact archives and recorded API data."""
-    intervals = []
+    intervals, push_intervals = [], []
     for entry in result['archives']:
         archive, path = refs.read(entry['receipt'])
 
@@ -122,12 +122,18 @@ def workflow_window(refs, captured, result):
                 require(g.timestamp(start) <= g.timestamp(begin) <= g.timestamp(finish)
                         and all(g.timestamp(finish) <= g.timestamp(view['updated_at']) for view in (run, attempt)),
                         'serial job timeline is outside its workflow interval')
-        intervals.append({'run_id': run['id'], 'workflow': run['path'],
-                          'created_at': start, 'terminal_observed_at': end})
+        interval = {'run_id': run['id'], 'workflow': run['path'],
+                    'created_at': start, 'terminal_observed_at': end}
+        require(run['event'] in ('pull_request', 'push'), 'serial workflow event is unsupported')
+        (intervals if run['event'] == 'pull_request' else push_intervals).append(interval)
     require(intervals, 'serial workflow timeline is empty')
+    whole_wave = intervals + push_intervals
     return {'workflow_created_at': min((row['created_at'] for row in intervals), key=g.timestamp),
             'workflow_terminal_observed_at': max((row['terminal_observed_at'] for row in intervals), key=g.timestamp),
-            'workflow_intervals': sorted(intervals, key=lambda row: row['run_id'])}
+            'workflow_intervals': sorted(intervals, key=lambda row: row['run_id']),
+            'head_push_workflow_intervals': sorted(push_intervals, key=lambda row: row['run_id']),
+            'whole_wave_workflow_created_at': min((row['created_at'] for row in whole_wave), key=g.timestamp),
+            'whole_wave_workflow_terminal_observed_at': max((row['terminal_observed_at'] for row in whole_wave), key=g.timestamp)}
 
 
 def bind(refs, reference, scope, variant, archive_reference):
@@ -144,7 +150,7 @@ def bind(refs, reference, scope, variant, archive_reference):
     require(len(matches) == 1 and matches[0]['receipt'] == archive_reference and matches[0]['attempts_read_back'] == 1,
             'serial readback belongs to another archive or rerun')
     require(all(run['status'] == 'completed' and run['conclusion'] == 'success' and run['run_attempt'] == 1
-                for run in snapshot['runs'])
+                for run in snapshot['runs'] + result['source_trigger_policy']['head_push_runs'])
             and all(check['status'] == 'completed' and check['conclusion'] in ('success', 'neutral', 'skipped')
                     for check in snapshot['checks']), 'serial group has a failed or retried original instance')
     return {'capture': reference, 'snapshot': snapshot, 'source_trigger_policy': result['source_trigger_policy'],

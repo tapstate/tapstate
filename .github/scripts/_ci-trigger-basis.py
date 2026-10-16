@@ -79,9 +79,18 @@ def workflow_fact(raw):
                     break
             block = ''.join(lines[i:end])
             event_blocks[match[1]] = {'source': block, 'sha256': g.checksum(block.encode())}
+    job_checks = []
+    if jobs is not None:
+        headers = [line for line in jobs.splitlines()[1:] if re.match(r'^  [^ \t#]', line)]
+        if not headers or any(re.fullmatch(r'  [A-Za-z0-9_-]+:\s*(?:#.*)?', line) is None for line in headers) \
+                or re.search(r'^    (?:name|strategy|uses):', jobs, re.MULTILINE):
+            job_checks = None
+        else:
+            job_checks = [line.strip().split(':', 1)[0] for line in headers]
     return {'source_sha256': g.checksum(raw), 'on_source': on,
             'on_sha256': None if on is None else g.checksum(on.encode()),
             'event_blocks': event_blocks, 'job_guard_blocks': guards,
+            'literal_job_check_names': job_checks,
             'declaration_structure': 'indented-block-source' if event_blocks else 'unparsed-source',
             'applicability_verified': False}
 
@@ -186,6 +195,8 @@ def project(refs, root, request):
             rulesets.append({'file': name, 'sha256': g.checksum(data), 'value': value})
     result = {'schema': 1, 'type': 'archived-trigger-source-basis', 'scope': basis['scope'], 'checkout': basis['checkout'],
             'workflows': workflows, 'runner_workflow_source': workflow_readback,
+            'head_source': {'sha': basis['scope']['head_sha'], 'source_readback_verified': True,
+                            'workflows': workflow_sources(raw('source.tar'))},
             'original_labels': labels, 'ruleset_records': rulesets,
             'source_blocks_readback_verified': True, 'R_G_complete': False,
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,

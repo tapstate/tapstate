@@ -3,6 +3,8 @@
 `ci-trigger-contract.sh` independently replays the original source recipe, CI
 receipt, indexed event artifact and checkout archive. It derives an ordinary
 `pull_request` workflow set from those bytes and the original base/head Git diff.
+Branch `push` expectations are derived separately from the original head's
+`source.tar`; merge-checkout or default-branch bytes cannot substitute for them.
 It does not execute workflow source, push a commit or change a workflow or PR.
 
 The request has exactly `schema: 1`, `type: trigger-contract-request` and `source`,
@@ -21,12 +23,25 @@ workflows/checks prevent advancing. Unknown policy facts prevent advancing even
 when the observed instances are terminal. The original input chain and request
 are reread before exclusive output creation.
 
+Head push runs retain their event, branch, source SHA, check suite and distinct
+head check IDs. A successful same-name PR check cannot satisfy an absent push
+workflow or check. Source-aware transitions require the original raw archives
+for both event types. `head_push_runs` remains separate from the PR `runs` view.
+Serial readback preserves PR event intervals and additionally exposes whole-wave
+intervals for capacity and cost accounting.
+
 The parser supports indented event blocks, explicit activity lists, exact branch
 and file patterns, terminal `/**` prefix patterns and ordered positive/negative
 filters. Branch and path filters both have to match. A unique three-dot merge
 base and at most 3,000 changed paths are required for path evaluation; renames,
 copies, unsupported patterns, aliases or structures remain unknown. No current
 PR file list substitutes for the original event's Git objects.
+
+For branch pushes, tag-only filters are inapplicable. Supported branch filters
+are evaluated without borrowing the cumulative PR diff; a matching push with
+path filters remains unknown when its original push diff is unavailable. Push
+check names currently require literal job keys without custom names, matrices or
+reusable-workflow jobs; unsupported declarations remain ineligible.
 
 Supported job predicates include same-repository checks and original captured
 ASCII label membership. `always()` remains a native result requirement. Missing

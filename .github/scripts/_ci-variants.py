@@ -179,6 +179,8 @@ def validate_recipe(refs, root, recipe):
 
 
 def archive_run(refs, reference, expected, scope, request):
+    event = expected['event']
+    require(event in ('pull_request', 'push'), 'unsupported archived transition event')
     archive, receipt_path = refs.read(reference)
     require(receipt_path.name == 'receipt.json' and archive.get('archive_root') == str(receipt_path.parent), 'archive location differs')
     with redirect_stdout(io.StringIO()):
@@ -202,8 +204,10 @@ def archive_run(refs, reference, expected, scope, request):
     root_associated = associations(current)
     require(all(current.get(key) == expected[key] for key in ('id', 'path', 'run_attempt', 'status', 'conclusion'))
             and current['head_sha'] == scope['head_sha'] and current['head_branch'] == scope['branch']
-            and current['event'] == 'pull_request' and current['repository']['full_name'] == scope['repository'],
+            and current['event'] == event and current['repository']['full_name'] == scope['repository'],
             'archived workflow run differs from current head snapshot')
+    if event == 'push':
+        require(current.get('check_suite_id') == expected['check_suite_id'], 'archived push check suite differs')
     require(type(current['run_attempt']) is int and 1 <= current['run_attempt'] <= 100, 'invalid archived attempt count')
     unassociated = []
     for attempt in range(1, current['run_attempt'] + 1):
@@ -214,7 +218,7 @@ def archive_run(refs, reference, expected, scope, request):
             if not associations(value) and attempt not in unassociated: unassociated.append(attempt)
             require(value['id'] == current['id'] and value['run_attempt'] == attempt and value['status'] == 'completed'
                     and value['head_sha'] == scope['head_sha'] and value['head_branch'] == scope['branch']
-                    and value['event'] == 'pull_request' and value['repository']['full_name'] == scope['repository'],
+                    and value['event'] == event and value['repository']['full_name'] == scope['repository'],
                     'old, missing or unfinished archived attempt')
         require(observed['conclusion'] == actual['conclusion'], 'archived attempt conclusion differs')
         pages = sorted((name for name in archive['files'] if re.fullmatch(re.escape(prefix) + r'jobs-[0-9]+\.json', name)),
@@ -242,8 +246,9 @@ def archive_run(refs, reference, expected, scope, request):
         groups.receipt.zip_members(log)
     with redirect_stdout(io.StringIO()):
         groups.receipt.verify(type('Args', (), {'directory': str(receipt_path.parent)})())
-    return {'run_id': current['id'], 'attempts_read_back': current['run_attempt'], 'receipt': reference,
-            'root_PR_association_unknown': not root_associated, 'unassociated_attempts': unassociated}
+    return {'run_id': current['id'], 'event': event, 'attempts_read_back': current['run_attempt'], 'receipt': reference,
+            'root_PR_association_unknown': event == 'pull_request' and not root_associated,
+            'unassociated_attempts': unassociated if event == 'pull_request' else []}
 
 
 def transition(refs, value, request):
@@ -270,12 +275,16 @@ def transition(refs, value, request):
         require(policy_before['runs'] == before['runs'] and policy_before['checks'] == before['checks'],
                 'head instances changed during trigger policy join')
     archives = value['archives']
+    expected_runs = [dict(run, event='pull_request') for run in before['runs']]
+    if policy_before is not None:
+        expected_runs.extend(policy_before['head_push_runs'])
+    require(len({run['id'] for run in expected_runs}) == len(expected_runs), 'transition run event identity is duplicated')
     require(isinstance(archives, list) and len({entry['run_id'] for entry in archives}) == len(archives)
-            and {entry['run_id'] for entry in archives} == {run['id'] for run in before['runs']},
+            and {entry['run_id'] for entry in archives} == {run['id'] for run in expected_runs},
             'workflow archive set differs from the current head')
     indexed = {entry['run_id']: entry['receipt'] for entry in archives}
     readback = [archive_run(refs, indexed[run['id']], run, dict(scope, base_sha=before['base_sha']), request)
-                for run in before['runs']]
+                for run in expected_runs]
     frames = value['check_pages']
     require(set(frames) == {scope['head_sha'], before['merge_sha']}, 'head/merge check page set differs')
     checks = []
@@ -293,6 +302,13 @@ def transition(refs, value, request):
             require(all(association['number'] == scope['pr'] and association['head']['sha'] == scope['head_sha']
                         and association['base']['sha'] == before['base_sha'] for association in check.get('pull_requests', [])),
                     'raw check PR association differs')
+            if policy_before is not None:
+                bindings = {row['id']: row for row in policy_before['head_push_checks']}
+                if check['id'] in bindings:
+                    row = bindings[check['id']]
+                    require(check['head_sha'] == row['head_sha'] and check['name'] == row['name']
+                            and check.get('check_suite', {}).get('id') == row['check_suite_id'],
+                            'raw head push check suite differs')
         checks.extend({key: check[key] for key in ('id', 'name', 'head_sha', 'status', 'conclusion')} for check in records)
     require(len({check['id'] for check in checks}) == len(checks)
             and sorted(checks, key=lambda check: check['id']) == sorted(before['checks'], key=lambda check: check['id']),
