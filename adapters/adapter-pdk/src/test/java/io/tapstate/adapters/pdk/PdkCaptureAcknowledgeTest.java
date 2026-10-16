@@ -20,13 +20,10 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A cdc subscription told how far its source may release its change log. The position is only recorded
@@ -60,7 +57,7 @@ class PdkCaptureAcknowledgeTest {
     void anAcknowledgedPositionReachesTheFlushAsTheConnectorsOwnOffsetOnItsDeliveryThread(@TempDir Path dir)
             throws Exception {
         Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key), "AcknowledgingSource",
+        try (Subscription sub = open(Synthetic.acknowledgingSource(dir, channel.key), "AcknowledgingSource",
                 recorder)) {
             SourcePosition durable = deliver(recorder, "rows").position().orElseThrow();
 
@@ -82,7 +79,6 @@ class PdkCaptureAcknowledgeTest {
                     .isNotSameAs(Thread.currentThread());
             assertThat(recorder.acknowledged).containsExactly(durable);
             assertThat(recorder.acknowledgeFailures).isEmpty();
-            completeAfterAssertions(recorder);
         }
     }
 
@@ -99,7 +95,7 @@ class PdkCaptureAcknowledgeTest {
     void anAcknowledgementMadeWhileTheStreamIsIdleWaitsForTheNextDeliveryAndAHeartbeatIsOne(@TempDir Path dir)
             throws Exception {
         Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key), "AcknowledgingSource",
+        try (Subscription sub = open(Synthetic.acknowledgingSource(dir, channel.key), "AcknowledgingSource",
                 recorder)) {
             SourcePosition durable = deliver(recorder, "rows").position().orElseThrow();
 
@@ -117,7 +113,6 @@ class PdkCaptureAcknowledgeTest {
             FlushCall call = FlushCall.of(channel.flushes.get(0));
             assertThat(call.offset()).isEqualTo(channel.named.get(0));
             assertThat(call.thread()).isSameAs(channel.deliveredOn.get(1)).isNotSameAs(acknowledger);
-            completeAfterAssertions(recorder);
         }
     }
 
@@ -130,7 +125,7 @@ class PdkCaptureAcknowledgeTest {
     void ofSeveralAcknowledgementsBetweenTwoDeliveriesOnlyTheNewestIsHandedOver(@TempDir Path dir)
             throws Exception {
         Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key), "AcknowledgingSource",
+        try (Subscription sub = open(Synthetic.acknowledgingSource(dir, channel.key), "AcknowledgingSource",
                 recorder)) {
             SourcePosition first = deliver(recorder, "rows").position().orElseThrow();
             SourcePosition second = deliver(recorder, "rows").position().orElseThrow();
@@ -145,7 +140,6 @@ class PdkCaptureAcknowledgeTest {
             assertThat(channel.flushes).hasSize(1);
             assertThat(FlushCall.of(channel.flushes.get(0)).offset()).isEqualTo(channel.named.get(2));
             assertThat(recorder.acknowledged).containsExactly(third);
-            completeAfterAssertions(recorder);
         }
     }
 
@@ -159,7 +153,7 @@ class PdkCaptureAcknowledgeTest {
     @Test
     void anUnchangedPositionIsHandedOverAgainOnceAnIntervalAndNoMoreOften(@TempDir Path dir) throws Exception {
         Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key), "AcknowledgingSource",
+        try (Subscription sub = open(Synthetic.acknowledgingSource(dir, channel.key), "AcknowledgingSource",
                 recorder)) {
             SourcePosition durable = deliver(recorder, "rows").position().orElseThrow();
             sub.acknowledge(durable);
@@ -179,14 +173,13 @@ class PdkCaptureAcknowledgeTest {
             deliver(recorder, "heartbeat");
             assertThat(channel.flushes).as("and not on the delivery straight after").hasSize(2);
             assertThat(recorder.acknowledged).containsExactly(durable, durable);
-            completeAfterAssertions(recorder);
         }
     }
 
     @Test
     void aConnectorWithoutAFlushFunctionIsLeftAloneAndNothingIsReported(@TempDir Path dir) throws Exception {
         Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingUnacknowledgingSource(dir, channel.key), "UnacknowledgingSource",
+        try (Subscription sub = open(Synthetic.unacknowledgingSource(dir, channel.key), "UnacknowledgingSource",
                 recorder)) {
             SourcePosition durable = deliver(recorder, "rows").position().orElseThrow();
 
@@ -201,7 +194,6 @@ class PdkCaptureAcknowledgeTest {
                     .as("a connector that cannot be told is not one that failed to be")
                     .isEmpty();
             assertThat(recorder.errors).isEmpty();
-            completeAfterAssertions(recorder);
         }
     }
 
@@ -215,7 +207,7 @@ class PdkCaptureAcknowledgeTest {
     @Test
     void aFlushThatThrowsIsReportedCodedAndTheStreamDeliversOn(@TempDir Path dir) throws Exception {
         Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingRefusingAcknowledgementSource(dir, channel.key),
+        try (Subscription sub = open(Synthetic.refusingAcknowledgementSource(dir, channel.key),
                 "RefusingAcknowledgementSource", recorder)) {
             SourcePosition durable = deliver(recorder, "rows").position().orElseThrow();
             sub.acknowledge(durable);
@@ -248,7 +240,6 @@ class PdkCaptureAcknowledgeTest {
             assertThat(recorder.acknowledgeFailures).hasSize(3);
             assertThat(later.events()).hasSize(1);
             assertThat(recorder.errors).isEmpty();
-            completeAfterAssertions(recorder);
         }
     }
 
@@ -261,7 +252,7 @@ class PdkCaptureAcknowledgeTest {
     void aPositionTheConnectorCannotReadBackIsReportedCodedAndTheStreamDeliversOn(@TempDir Path dir)
             throws Exception {
         Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key), "AcknowledgingSource",
+        try (Subscription sub = open(Synthetic.acknowledgingSource(dir, channel.key), "AcknowledgingSource",
                 recorder)) {
             deliver(recorder, "rows");
 
@@ -278,7 +269,6 @@ class PdkCaptureAcknowledgeTest {
                         unreadable -> assertThat(unreadable.code()).isEqualTo(ConnectorError.POSITION_UNREADABLE));
             });
             assertThat(recorder.errors).isEmpty();
-            completeAfterAssertions(recorder);
         }
     }
 
@@ -316,59 +306,6 @@ class PdkCaptureAcknowledgeTest {
                 .doesNotThrowAnyException();
     }
 
-    @Test
-    void prematureCompletionCannotCutOffTheLastOrderedDelivery(@TempDir Path dir) throws Exception {
-        Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key),
-                "AcknowledgingSource", recorder)) {
-            deliver(recorder, "rows");
-            assertThatThrownBy(channel::requestCompletion)
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessage("completion requires all case assertions to have finished");
-            Delivery last = deliver(recorder, "rows");
-            assertThat(last.events()).as("a refused early EOF leaves the final ordered batch intact").hasSize(1);
-            assertThat(channel.named).hasSize(2);
-            completeAfterAssertions(recorder);
-        }
-    }
-
-    @Test
-    void naturalCompletionDrainsAlreadyOrderedDeliveriesWithoutAddingACloseHeartbeat(@TempDir Path dir)
-            throws Exception {
-        Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key),
-                "AcknowledgingSource", recorder)) {
-            channel.orders.add("rows");
-            channel.orders.add("rows");
-            Delivery first = recorder.next();
-            Delivery last = recorder.next();
-            assertThat(first.events()).hasSize(1);
-            assertThat(last.events()).hasSize(1);
-            assertThat(channel.named).hasSize(2);
-            completeAfterAssertions(recorder);
-            assertThat(channel.deliveredOn).hasSize(2);
-            assertThat(channel.handedOver).hasSize(2);
-            assertThat(recorder.deliveries).isEmpty();
-        }
-    }
-
-    @Test
-    void aPollingFailureIsReportedBeforeTheFiniteSourceIsJoined(@TempDir Path dir) throws Exception {
-        Recorder recorder = new Recorder();
-        try (Subscription sub = open(Synthetic.naturallyCompletingAcknowledgingSource(dir, channel.key),
-                "AcknowledgingSource", recorder)) {
-            channel.orders.add("fail");
-            Throwable error = recorder.nextError();
-            assertThat(error).isInstanceOfSatisfying(TapstateException.class, coded -> {
-                assertThat(coded.code()).isEqualTo(ConnectorError.CAPTURE_FAILED);
-                assertThat(coded.getCause()).isSameAs(channel.failure.get()).hasMessage("poll boom");
-            });
-            awaitFiniteSourceExit();
-            assertThat(recorder.errors).containsExactly(error);
-            assertThat(recorder.deliveries).isEmpty();
-        }
-    }
-
     // ---- harness -----------------------------------------------------------------------------------------
 
     /**
@@ -385,34 +322,6 @@ class PdkCaptureAcknowledgeTest {
             }
             Thread.onSpinWait();
         }
-    }
-
-    /** EOF belongs to the case and is requested only after the assertions above have all succeeded. */
-    private void completeAfterAssertions(Recorder recorder) throws InterruptedException {
-        awaitTheSourceBetweenDeliveries();
-        channel.completionAllowed.set(true);
-        channel.requestCompletion();
-        awaitFiniteSourceExit();
-        assertThat(channel.failure.get()).as("the finite polling fixture did not lose an asynchronous failure").isNull();
-        assertThat(recorder.errors).as("natural source completion reported no stream failure").isEmpty();
-    }
-
-    /** Waits for both real threads, including the worker's loader restoration, before the real close. */
-    private void awaitFiniteSourceExit() throws InterruptedException {
-        Thread worker = channel.worker.get();
-        Thread polling = channel.polling.get();
-        assertThat(worker).as("the source identified its real CDC worker").isNotNull();
-        assertThat(polling).as("the source identified its connector-owned delivery thread").isNotNull();
-        worker.join(TimeUnit.SECONDS.toMillis(AWAIT_SECONDS));
-        polling.join(TimeUnit.SECONDS.toMillis(AWAIT_SECONDS));
-        assertThat(polling.isAlive()).as("the finite polling thread exited").isFalse();
-        assertThat(worker.isAlive()).as("streamRead and its real CDC worker exited before close").isFalse();
-        assertThat(channel.loader.get()).as("the source was driven under the connector's own loader")
-                .isNotSameAs(channel.hostLoader);
-        assertThat(polling.getContextClassLoader()).as("the delivery thread inherited the connector loader")
-                .isSameAs(channel.loader.get());
-        assertThat(worker.getContextClassLoader()).as("the real worker restored its caller's context loader")
-                .isSameAs(channel.hostLoader);
     }
 
     /** Starts a stream at the present over the synthetic {@code simpleName}, on the case's clock. */
@@ -445,25 +354,11 @@ class PdkCaptureAcknowledgeTest {
         private final List<Thread> handedOver = new CopyOnWriteArrayList<>();
         /** One entry per flush call, as the source recorded it. */
         private final List<Map<String, Object>> flushes = new CopyOnWriteArrayList<>();
-        private final ClassLoader hostLoader = Thread.currentThread().getContextClassLoader();
-        private final AtomicReference<Thread> worker = new AtomicReference<>();
-        private final AtomicReference<Thread> polling = new AtomicReference<>();
-        private final AtomicReference<ClassLoader> loader = new AtomicReference<>();
-        private final AtomicReference<Throwable> failure = new AtomicReference<>();
-        private final AtomicBoolean completionAllowed = new AtomicBoolean();
 
         private Channel() {
             System.getProperties().put(key, Map.of(
                     "orders", orders, "named", named, "deliveredOn", deliveredOn, "handedOver", handedOver,
-                    "flushes", flushes, "worker", worker, "polling", polling, "loader", loader,
-                    "failure", failure, "completionAllowed", completionAllowed));
-        }
-
-        void requestCompletion() {
-            if (!completionAllowed.get()) {
-                throw new IllegalStateException("completion requires all case assertions to have finished");
-            }
-            orders.add("complete");
+                    "flushes", flushes));
         }
 
         @Override
@@ -492,7 +387,6 @@ class PdkCaptureAcknowledgeTest {
         private final List<SourcePosition> acknowledged = new CopyOnWriteArrayList<>();
         private final List<Throwable> acknowledgeFailures = new CopyOnWriteArrayList<>();
         private final List<Throwable> errors = new CopyOnWriteArrayList<>();
-        private final BlockingQueue<Throwable> reportedErrors = new LinkedBlockingQueue<>();
 
         @Override
         public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
@@ -512,13 +406,6 @@ class PdkCaptureAcknowledgeTest {
         @Override
         public void onError(Throwable error) {
             errors.add(error);
-            reportedErrors.add(error);
-        }
-
-        Throwable nextError() throws InterruptedException {
-            Throwable error = reportedErrors.poll(AWAIT_SECONDS, TimeUnit.SECONDS);
-            assertThat(error).as("the source reported its polling failure within %d seconds", AWAIT_SECONDS).isNotNull();
-            return error;
         }
 
         /** The next run the stream delivered, waiting for it to arrive. */

@@ -71,7 +71,7 @@ The provenance records all 1,285 source units from one complete,
 successful manual CI run. All nine original selected verify commands and
 validated worker packs retain their original source/run bindings. The 1,290
 XML reports include five additional nested-container suites; their times are
-summed under the owning source outer class. The current source has 1,287 units,
+summed under the owning source outer class. The current source has 1,283 units,
 including an additional recovery integration class and REST configuration unit class.
 Its source-unit set and test-source bytes no longer match the recorded run. The
 provenance keeps both current-match and current-verify flags false. Both unmeasured

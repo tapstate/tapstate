@@ -13,7 +13,9 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -31,9 +33,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoCloudSessionStoreIT {
 
-    @RegisterExtension
-    static final SharedMongoCase MONGO =
-            SharedMongoCase.forSuite(MongoCloudSessionStoreIT.class);
+    @Container
+    static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     private static final Instant CREATED = Instant.parse("2026-09-28T10:00:00Z");
     private static final Duration IDLE = Duration.ofMinutes(30);
     private static final CloudSessionIdentity IDENTITY =
@@ -268,7 +269,7 @@ class MongoCloudSessionStoreIT {
 
     private static void withCollection(CollectionTest body) throws Exception {
         try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            body.run(SystemCollections.SESSIONS.on(client.getDatabase(MONGO.database(database()))));
+            body.run(SystemCollections.SESSIONS.on(client.getDatabase(database())));
         }
     }
 

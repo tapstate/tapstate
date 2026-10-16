@@ -22,7 +22,9 @@ import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.User;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -51,14 +53,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class SystemCollectionsReconciliationIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final DslParser PARSER = new DslParser();
     private static final String DATABASE = "reconciliation";
     private static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
     private static final Instant WHEN = Instant.parse("2026-09-02T00:00:00Z");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(SystemCollectionsReconciliationIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static final String ORDERS = """
             version: tapstate/v1
@@ -72,16 +74,16 @@ class SystemCollectionsReconciliationIT {
     @Test
     void aLiveStoreHoldsNothingTheRegistryDoesNotDeclare() {
         String uri = REPLICA_SET.getReplicaSetUrl();
-        String storeUri = uri.substring(0, uri.lastIndexOf('/') + 1) + REPLICA_SET.database(DATABASE);
+        String storeUri = uri.substring(0, uri.lastIndexOf('/') + 1) + DATABASE;
         try (MongoConnection connection =
                 new MongoConnection(new MongoConnectionSettings(storeUri, null, Duration.ofSeconds(5)))) {
             connection.verify();
             writeThroughEveryStore(
-                    new MongoStorePort(connection, REPLICA_SET.database(OPERATOR_STATE_DATABASE)), new MongoAuthStores(connection));
+                    new MongoStorePort(connection, OPERATOR_STATE_DATABASE), new MongoAuthStores(connection));
 
             try (MongoClient raw = MongoClients.create(uri)) {
                 List<String> live = new ArrayList<>();
-                raw.getDatabase(REPLICA_SET.database(DATABASE)).listCollectionNames().into(live);
+                raw.getDatabase(DATABASE).listCollectionNames().into(live);
                 Set<String> declared = SystemCollections.physicalNamesIn(SystemCollections.Database.STORE);
 
                 // Positive control: a run that wrote nothing would satisfy the subset below and report
@@ -101,7 +103,7 @@ class SystemCollectionsReconciliationIT {
                         .isSubsetOf(declared);
 
                 List<String> liveNest = new ArrayList<>();
-                raw.getDatabase(REPLICA_SET.database(OPERATOR_STATE_DATABASE)).listCollectionNames().into(liveNest);
+                raw.getDatabase(OPERATOR_STATE_DATABASE).listCollectionNames().into(liveNest);
                 assertThat(liveNest)
                         .as("positive control: operator state and its dead letters must have been written")
                         .hasSizeGreaterThanOrEqualTo(2);

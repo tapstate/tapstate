@@ -148,10 +148,10 @@
     }
   ],
   "cohort_hash": "9aa53da631ae55d0f25d42f3a789601b2c650801827f4a076704597e41969c9b",
-  "comparison_scope": "The recorded 1285 source identities and test-source bytes do not match the current 1287 source identities after synchronization. The recovery integration class and REST configuration unit class use the declared 30-second estimate; neither has a recorded duration here. Historical successful verify records do not verify the changed product, test helpers or current source. Scheduling estimates establish no input or performance acceptance.",
+  "comparison_scope": "The historical scheduling source has 1285 identities; this reviewed variant has 1283. Source bytes and class cohorts differ. Two current source identities lack measured durations and use the declared 30-second estimate. Historical successful verify does not verify current product/test source. Scheduling estimates establish no input or performance acceptance.",
   "current_selected_verify_provenance_verified": false,
-  "current_source_cohort_hash": "2f5ddfe759b223870c7bca93930f2bea4dbef7b26566bf57500b67324e39fc1e",
-  "current_source_units": 1287,
+  "current_source_cohort_hash": "e4f6e4ecedafe6f5902ef17bccd6ad5111b7bed67fdf95d34163a3d82488bffb",
+  "current_source_units": 1283,
   "current_test_source_bytes_match_recorded": false,
   "current_unmeasured_source_units": [
     {
