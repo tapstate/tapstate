@@ -52,10 +52,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * for that ack is also what makes the first half mean anything: before one exists there is no position on
  * screen to be read as the wrong one.
  *
- * <p><b>A real connector, and not by preference.</b> The harness's own file connector hands the product a
- * null offset on every change it streams, so nothing it drives ever acks a position -- measured, not
- * assumed: written first over that connector, this case timed out waiting for one, with the run otherwise
- * healthy. A position that is never recorded cannot witness a position naming itself.
+ * <p>The real Mongo connector exercises change-stream tokens after updates to an existing row. The
+ * harness's file connector also records its insert-only frontier, while this case verifies that the
+ * displayed fingerprint advances with the actual database token for each confirmed update.
  *
  * <p>Gated on Docker and on a directory of real connector jars
  * ({@code -Dtapstate.e2e.connectors-dir}). Run it with:

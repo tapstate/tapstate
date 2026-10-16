@@ -45,7 +45,13 @@ class RealAtlasSourceHttpIT {
         String uri = base.substring(0, slash + 1) + database + (query < 0 ? "" : base.substring(query));
         String metadataUri = SharedMongo.replicaSetUrl("ts_plan_hm_" + suffix);
         try (var atlas = MongoClients.create(uri);
-             AutoCloseable cleanup = () -> atlas.getDatabase(database).drop();
+             AutoCloseable cleanup = () -> {
+                 // The witness connection has been idle throughout the HTTP scenario. Open a fresh
+                 // cleanup connection rather than reusing one an intermediary may have closed.
+                 try (var cleaner = MongoClients.create(uri)) {
+                     cleaner.getDatabase(database).drop();
+                 }
+             };
              var rawMetadata = MongoClients.create(metadataUri);
              AtlasRuntime runtime = new AtlasRuntime(mode, metadataUri);
              ServerHandle server = runtime.launch(Tiers.REAL_PROCESS)) {

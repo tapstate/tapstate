@@ -87,6 +87,14 @@ public record NodeWidth(String node, int local, int plannedMembers, BatchSpec ba
         return isNative() ? vertex.localParallelism(local) : vertex;
     }
 
+    /** The buffering of the processor actually drawn, independent of its native or total-one width. */
+    public Vertex buffered(Vertex vertex, ProcessorBufferBounds bounds) {
+        if (drawn != null) {
+            drawn.buffers(vertex.getName(), bounds);
+        }
+        return vertex;
+    }
+
     /**
      * {@code edge}, into the node's vertex named {@code destination}: routed by {@code key} where the node runs
      * natively, and to the one processor it runs otherwise.

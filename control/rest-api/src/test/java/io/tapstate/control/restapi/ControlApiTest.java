@@ -9,6 +9,7 @@ import io.tapstate.control.core.ClusterVertexView;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.ApplyResult;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -136,6 +137,7 @@ class ControlApiTest {
     void resetStore() {
         ((InMemoryArtifactStore) context.getBean(ArtifactStore.class)).clear();
         context.getBean(RecordingAuditStore.class).records.clear();
+        context.getBean(RecoveryTestQueries.class).clear();
     }
 
     private RestClient client() {
@@ -764,7 +766,65 @@ class ControlApiTest {
                         tuple("node-a", "8b0a1e6e-0000-4000-8000-00000000000a", "boot-a1",
                                 "[127.0.0.1]:5701", "https://node-a.example:8443"),
                         tuple("node-b", "8b0a1e6e-0000-4000-8000-00000000000b", "boot-b1",
-                                "[127.0.0.1]:5702", "https://node-b.example:8443"));
+                                "[127.0.0.1]:5702", "https://node-b.example:8443"),
+                        tuple("node-c", "uuid-c", "boot-c1", "[127.0.0.1]:5703", "https://node-c.example:8443"),
+                        tuple("node-d", null, "boot-d1", null, "https://node-d.example:8443"));
+    }
+
+    @Test
+    void clusterStatusAndMembersCarryTheSameProfileAndHonestSessionProjection() throws Exception {
+        ClusterTopologyView status = client().get().uri("/api/cluster/status")
+                .retrieve().body(ClusterTopologyView.class);
+        ClusterTopologyView members = client().get().uri("/api/cluster/members")
+                .retrieve().body(ClusterTopologyView.class);
+
+        assertThat(status).isEqualTo(members);
+        assertThat(status.profileGeneration()).isEqualTo(2L);
+        assertThat(status.profileHash()).isEqualTo(ClusterTopologyTestConfiguration.PROFILE.profile().hash());
+        assertThat(status.members()).extracting(member -> member.state().name(),
+                ClusterMemberView::live, ClusterMemberView::sessionLeased, ClusterMemberView::joined,
+                ClusterMemberView::sessionLeaseRemainingMillis)
+                .containsExactly(tuple("ACTIVE", true, true, true, 21_000L),
+                        tuple("ACTIVE", true, true, true, 28_000L),
+                        tuple("LOST", false, false, true, -7_000L),
+                        tuple("JOINING", false, true, false, 15_000L));
+        assertThat(status.pipelines().getFirst().vertices()).extracting(ClusterVertexView::effective)
+                .containsExactly(1, 2);
+        String body = client().get().uri("/api/cluster/status").retrieve().body(String.class);
+        assertThat(body).contains("\"profileGeneration\":2", "\"sessionLeaseRemainingMillis\":-7000",
+                "\"sessionBootId\":\"boot-c1\"", "\"joinedAt\":\"2026-09-19T08:29:00Z\"")
+                .doesNotContain("heartbeat", "activeConnections");
+        try (var golden = ControlApiTest.class.getResourceAsStream("/golden/cluster/topology-profile.golden.json")) {
+            assertThat(golden).isNotNull();
+            assertThat(JsonReader.parse(body)).isEqualTo(JsonReader.parse(
+                    new String(golden.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)));
+        }
+    }
+
+    @Test
+    void clusterRecoveryUsesTheSameTypedReadingOnBothExistingEndpoints() throws Exception {
+        RecoveryTestQueries recovery = context.getBean(RecoveryTestQueries.class);
+        recovery.enable(ClusterTopologyTestConfiguration.CLUSTER, "orders");
+
+        ClusterTopologyView members = client().get().uri("/api/cluster/members").retrieve().body(ClusterTopologyView.class);
+        ClusterTopologyView status = client().get().uri("/api/cluster/status").retrieve().body(ClusterTopologyView.class);
+
+        assertThat(members).isEqualTo(status);
+        assertThat(status.recovery()).isEqualTo(recovery.cluster());
+        assertThat(status.recovery().capacity().occupiedByNode()).isNull();
+        assertThat(status.recovery().items().getFirst().successor().failureNote().diagnostic().params())
+                .containsEntry("requested", "resume-12");
+    }
+
+    @Test
+    void theClusterHttpSurfaceExposesOnlyItsTwoExistingGets() {
+        RequestMappingHandlerMapping mapping = context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
+        var routes = mapping.getHandlerMethods().keySet().stream()
+                .filter(route -> route.getPatternValues().stream().anyMatch(path -> path.startsWith("/api/cluster"))).toList();
+        assertThat(routes.stream().flatMap(route -> route.getPatternValues().stream()))
+                .containsExactlyInAnyOrder("/api/cluster/members", "/api/cluster/status");
+        assertThat(routes).allSatisfy(route -> assertThat(route.getMethodsCondition().getMethods())
+                .containsExactly(org.springframework.web.bind.annotation.RequestMethod.GET));
     }
 
     @Test
@@ -781,12 +841,10 @@ class ControlApiTest {
         assertThat(pipeline.controllerClaim())
                 .as("who actuates it, and under which generations -- the pair is what tells one run of "
                         + "a pipeline from the next")
-                .isEqualTo(new ClusterClaimView(
-                        ClusterTopologyTestConfiguration.PIPELINE, "node-b", "boot-b1", 3, 7, 4, true));
+                .isEqualTo(fixtureClaim(ClusterTopologyTestConfiguration.PIPELINE, "node-b", "boot-b1", 3, 7, 21_000L));
         assertThat(pipeline.captureClaims())
                 .as("and who reads its sources, which is a separate ownership with its own generations")
-                .containsExactly(new ClusterClaimView(
-                        ClusterTopologyTestConfiguration.CAPTURE, "node-a", "boot-a1", 1, 1, 4, true));
+                .containsExactly(fixtureClaim(ClusterTopologyTestConfiguration.CAPTURE, "node-a", "boot-a1", 1, 1, 28_000L));
         assertThat(pipeline.measuredFrom())
                 .as("which members this picture was assembled from; against the member list it says "
                         + "whether the picture is complete")
@@ -805,7 +863,7 @@ class ControlApiTest {
         assertThat(pipeline.vertices().get(0).processors())
                 .as("and the processor names the stable node as well as the engine's identity for this "
                         + "run of it, because a claim names the stable one")
-                .containsExactly(new ClusterProcessorView(0, 0,
+                .containsExactly(new ClusterProcessorView(0, null,
                         ClusterTopologyTestConfiguration.SECOND.memberUuid(), "node-b", null, Map.of(), Map.of()));
         assertThat(pipeline.awaitingRebalance())
                 .as("both members were planned into this run -- one doing the pinned vertex's work and "
@@ -816,6 +874,12 @@ class ControlApiTest {
                 .as("a run with no plan recorded asked for nothing, and absent is not the same as the one "
                         + "processor that happened to run")
                 .isNull();
+    }
+
+    private static ClusterClaimView fixtureClaim(String id, String node, String boot, long claim, long execution, long remaining) {
+        return new ClusterClaimView(id, node, boot, claim, execution, 4, true,
+                ClusterTopologyTestConfiguration.MEASURED_AT.plusSeconds(30), remaining,
+                null, null, null, null, null, null, null, null, List.of(), null, null, null);
     }
 
     @Test
@@ -880,7 +944,7 @@ class ControlApiTest {
                 .contains("artifact.apply", "artifact.get", "artifact.list", "connection.test",
                         "connection.test-result", "connection.discover-schema", "connection.schema",
                         "source.draft",
-                        "cluster.members");
+                        "cluster.members", "cluster.status");
     }
 
     private static String describe(HandlerMethod handler) {

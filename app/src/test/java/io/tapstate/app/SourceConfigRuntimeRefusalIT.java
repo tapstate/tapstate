@@ -65,7 +65,8 @@ class SourceConfigRuntimeRefusalIT {
     private static final Map<String, Object> DISPLAY_SETTINGS = Map.of("isUri", true);
 
     @Container
-    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--wiredTigerCacheSizeGB", "1.0");
 
     @TempDir Path work;
 

@@ -61,6 +61,34 @@ class StoreBackedSinkAckFactoryTest {
     private static final String OTHER_WRITER = "serve.t#0";
 
     @Test
+    void aHeldNewGenerationSnapshotCannotInventADurableRingCursor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
+        ack.advance("orders", at(0, "w0"));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsEntry("orders", 0L);
+
+        Map<String, SourceOrder> pending = new LinkedHashMap<>();
+        pending.put("orders", SourceOrder.snapshotRow(2));
+        ChainAxes axes = ChainAxes.assign(List.of("orders"));
+        LevelBounds bounds = new LevelBounds(Map.of(0, List.of("orders")), axes, pending::get);
+        long newerSnapshot = FrontierOrders.pack("orders", SourceOrder.snapshotRow(2));
+        bounds.observe(0, axes.axisOf("orders"), newerSnapshot)
+                .ifPresent(packed -> ack.bounded("orders", FrontierOrders.unpack(packed)));
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .as("a held snapshot cannot acknowledge a nonexistent sequence in the preceding generation")
+                .containsExactlyEntriesOf(Map.of("orders", 0L));
+        pending.clear();
+        List<com.hazelcast.jet.core.Watermark> released = new ArrayList<>();
+        assertThat(bounds.release(released::add)).isTrue();
+        assertThat(released).extracting(com.hazelcast.jet.core.Watermark::timestamp).containsExactly(newerSnapshot);
+        released.forEach(mark -> ack.bounded("orders", FrontierOrders.unpack(mark.timestamp())));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsExactlyEntriesOf(Map.of("orders", 0L));
+    }
+
+    @Test
     void qualifiedStreamsKeepIndependentProgressUnderTheirPhysicalTableNames() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-left", null);
@@ -773,8 +801,14 @@ class StoreBackedSinkAckFactoryTest {
         ChainAxes axes = ChainAxes.assign(List.of("orders"));
         LevelBounds bounds = new LevelBounds(Map.of(0, List.of("orders")), axes,
                 chain -> SourceOrder.snapshotRow(snapshotEpoch));
-        SourceOrder cap = FrontierOrders.unpack(bounds.observe(0, axes.axisOf("orders"),
-                FrontierOrders.pack("orders", confirmed.order())).orElseThrow());
+        assertThat(bounds.observe(0, axes.axisOf("orders"),
+                FrontierOrders.pack("orders", confirmed.order())))
+                .as("a held snapshot must not emit the preceding generation's encoding ceiling")
+                .isEmpty();
+        // Inject the historical bound at the ACK boundary; the level must no longer emit it.
+        SourceOrder cap = FrontierOrders.unpack(
+                FrontierOrders.pack("orders", SourceOrder.snapshotRow(snapshotEpoch)) - 1);
+        assertThat(cap.epoch()).isEqualTo(snapshotEpoch - 1);
         assertThat(cap.seq()).as("the held snapshot's packed predecessor").isEqualTo(FrontierOrders.HIGHEST_SEQ);
         List<SinkAck> acknowledgements = writers.stream()
                 .map(writer -> factory.resolve(member).forWriter(writer)).toList();

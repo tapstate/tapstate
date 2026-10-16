@@ -109,4 +109,30 @@ class PipelineFailuresTest {
         // Capped length plus the truncation marker, not the full 500 characters.
         assertThat(cause).hasSize(200 + 2).endsWith(" …");
     }
+
+    @Test
+    void aQualifiedRemoteSourceFailureKeepsItsOriginalCodeAndNamedArguments() {
+        var owner = new io.tapstate.spi.store.WorkloadOwner("a", "boot-a");
+        var pipeline = new io.tapstate.spi.store.WorkloadClaimFence(new io.tapstate.spi.store.WorkloadClaimKey(
+                "cluster", io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "orders"), owner, 1, 2, 7, 1);
+        var capture = new io.tapstate.spi.store.WorkloadClaimFence(new io.tapstate.spi.store.WorkloadClaimKey(
+                "cluster", io.tapstate.spi.store.WorkloadClaimType.CAPTURE, "capture"), owner, 2, 0, 7, 1);
+        var time = java.time.Instant.parse("2026-10-10T06:00:00Z");
+        var position = new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(1, 4), "old");
+        var witness = new io.tapstate.spi.store.CaptureResumeWitness("source", "mongo", "chain", "consumer",
+                io.tapstate.core.model.ReadMode.CDC_ONLY, true, java.util.List.of("orders"), true, 1,
+                position, true, false, java.util.List.of(), null, 0, null, null, Map.of());
+        var attempt = new io.tapstate.spi.store.CaptureReadAttempt("chain", 1, 1, capture, java.util.List.of("orders"),
+                io.tapstate.spi.store.CaptureReadAttempt.Kind.RESUME, "old", null, time);
+        var params = Map.<String, Object>of("requested", "old", "earliest", "head", "retention", "2h");
+        var state = new io.tapstate.spi.store.CaptureReadState(attempt, null, null, null, true,
+                io.tapstate.runtime.srs.CaptureError.START_FROM_OUTSIDE_WINDOW.code(), params, "Inspect the retained source position", time);
+        var proof = new io.tapstate.spi.store.CaptureStartupFailure(pipeline, witness,
+                witness.requestedPosition("capture").orElseThrow(), time, state);
+
+        ObservationFailure failure = PipelineFailures.of("orders", new io.tapstate.runtime.srs.CaptureStartupException(proof));
+
+        assertThat(failure.code()).isEqualTo(io.tapstate.runtime.srs.CaptureError.START_FROM_OUTSIDE_WINDOW.code());
+        assertThat(failure.params()).containsOnly(entry("requested", "old"), entry("earliest", "head"), entry("retention", "2h"));
+    }
 }

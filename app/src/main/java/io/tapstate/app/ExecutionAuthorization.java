@@ -20,6 +20,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -74,10 +75,12 @@ final class ExecutionAuthorization implements AutoCloseable {
     private final long windowNanos;
     private final long refreshIntervalNanos;
     private final LongSupplier nanoTime;
+    private final Supplier<NodeSessionLease.Proof> sessionProof;
     private final boolean fenced;
     private final Map<String, Entry> entries = new ConcurrentHashMap<>();
     private final Map<String, Long> nextReadNanos = new ConcurrentHashMap<>();
     private final ScheduledExecutorService refresher;
+    private volatile boolean closed;
 
     private ExecutionAuthorization() {
         this.clusterId = "single";
@@ -86,6 +89,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         this.windowNanos = 0;
         this.refreshIntervalNanos = 0;
         this.nanoTime = System::nanoTime;
+        this.sessionProof = null;
         this.fenced = false;
         this.refresher = null;
     }
@@ -101,9 +105,19 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     ExecutionAuthorization(
             String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime) {
+        this(clusterId, claims, window, nanoTime, null);
+    }
+
+    ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window, NodeSessionLease session) {
+        this(clusterId, claims, window, System::nanoTime, session::proof);
+    }
+
+    ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime,
+            Supplier<NodeSessionLease.Proof> sessionProof) {
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.claims = Objects.requireNonNull(claims, "claims");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
+        this.sessionProof = sessionProof;
         Objects.requireNonNull(window, "window");
         if (window.isZero() || window.isNegative()) {
             throw new IllegalArgumentException("the local authorization window must be positive");
@@ -178,7 +192,15 @@ final class ExecutionAuthorization implements AutoCloseable {
     /** The current matching entry, refreshing it under the same rules as the boolean guard. */
     private Entry authorizedEntry(ExecutionFence fence) {
         Objects.requireNonNull(fence, "fence");
+        if (closed) {
+            return null;
+        }
         long now = nanoTime.getAsLong();
+        NodeSessionLease.Proof node = sessionProof == null ? null : sessionProof.get();
+        if (sessionProof != null && (node == null || !node.live() || now - node.deadlineNanos() >= 0
+                || node.claim().profileGeneration() != fence.profileGeneration())) {
+            return null;
+        }
         Entry entry = entries.get(fence.pipelineId());
         if (entry != null && precedes(entry, fence)) {
             // This reading was taken before the run asking about itself was submitted, so it is not the
@@ -194,6 +216,8 @@ final class ExecutionAuthorization implements AutoCloseable {
         return entry != null
                 && entry.claim().claimGeneration() == fence.claimGeneration()
                 && entry.claim().executionGeneration() == fence.executionGeneration()
+                && entry.claim().profileGeneration() == fence.profileGeneration()
+                && nanoTime.getAsLong() - entry.deadlineNanos() < 0
                 ? entry
                 : null;
     }
@@ -211,7 +235,8 @@ final class ExecutionAuthorization implements AutoCloseable {
             }
             var claim = reading.get().claim();
             if (claim.claimGeneration() == fence.claimGeneration()
-                    && claim.executionGeneration() == fence.executionGeneration()) {
+                    && claim.executionGeneration() == fence.executionGeneration()
+                    && claim.profileGeneration() == fence.profileGeneration()) {
                 claims.recordExecutionFailure(claim, false);
             }
         } catch (RuntimeException unreachable) {
@@ -290,6 +315,15 @@ final class ExecutionAuthorization implements AutoCloseable {
         // keeps matching until somebody else takes it over, and nobody may be in a hurry to.
         Duration leaseRemaining = current.get().leaseRemaining();
         long held = leaseRemaining.compareTo(window) < 0 ? leaseRemaining.toNanos() : windowNanos;
+        if (sessionProof != null) {
+            NodeSessionLease.Proof node = sessionProof.get();
+            if (node == null || !node.live()
+                    || node.claim().profileGeneration() != current.get().claim().profileGeneration()) {
+                entries.remove(pipelineId);
+                return null;
+            }
+            held = Math.min(held, node.deadlineNanos() - startedAt);
+        }
         if (held <= 0) {
             // Nobody owns this run any more, whoever may own it next. Dropping the entry is what refuses
             // the batch: a reading that was already out of date when it arrived is not a reading.
@@ -303,6 +337,8 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     @Override
     public void close() {
+        closed = true;
+        entries.clear();
         if (refresher != null) {
             refresher.shutdownNow();
         }

@@ -89,18 +89,28 @@ class V12EncryptSourceConfigsIT {
         assertThat(encryptedSource.toJson())
                 .doesNotContain("migration-secret", "migration-user", "migration-password", "nested-secret");
         assertThat(encryptedSource.getString("contentHash")).isEqualTo(CanonicalHash.of(source));
-        assertThat(artifacts.find(new Document("_id", "orders-copy")).first()).isEqualTo(originalPipeline);
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(12);
+        Document installedPipeline = artifacts.find(new Document("_id", "orders-copy")).first();
+        assertThat(installedPipeline.getString("incarnation")).isNotBlank();
+        assertThat(installedPipeline).isEqualTo(
+                new Document(originalPipeline).append("incarnation", installedPipeline.getString("incarnation")));
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
 
         SourceConfigCipher cipher = new SourceConfigKeyringStore(database).loadExistingCipher();
         MongoArtifactStore store = new MongoArtifactStore(client, artifacts, cipher);
         assertThat(WRITER.write(store.get("orders").orElseThrow())).isEqualTo(WRITER.write(source));
+        assertThat(encryptedSource.getString("incarnation")).isNotBlank();
+        assertThat(store.identity(source.id()).orElseThrow().incarnation())
+                .isEqualTo(encryptedSource.getString("incarnation"));
+        assertThat(store.identity(pipeline.id()).orElseThrow().incarnation())
+                .isEqualTo(installedPipeline.getString("incarnation"));
 
         String firstEnvelope = (String) storedConfig;
         seedVersion(database, 11);
         MigrationRunner.migrate(database);
         assertThat(artifacts.find(new Document("_id", "orders")).first()
                 .get("body", Document.class).getString("config")).isEqualTo(firstEnvelope);
+        assertThat(artifacts.find(new Document("_id", "orders")).first()).isEqualTo(encryptedSource);
+        assertThat(artifacts.find(new Document("_id", "orders-copy")).first()).isEqualTo(installedPipeline);
     }
 
     @Test
@@ -135,7 +145,7 @@ class V12EncryptSourceConfigsIT {
                 new Document("$set", new Document("contentHash", CanonicalHash.of(source))));
         MigrationRunner.migrate(database);
 
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(12);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         assertThat(artifacts.find(new Document("_id", "orders")).first()
                 .get("body", Document.class).get("config")).isInstanceOf(String.class);
     }
@@ -186,7 +196,7 @@ class V12EncryptSourceConfigsIT {
         systemMeta.insertOne(keyring);
         artifacts.replaceOne(new Document("_id", source.id()), original);
         MigrationRunner.migrate(database);
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(12);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         assertThat(artifacts.find(new Document("_id", source.id())).first()).isEqualTo(original);
         assertThat(new MongoArtifactStore(client, artifacts,
                 new SourceConfigKeyringStore(database).loadExistingCipher()).get(source.id())).contains(source);
@@ -240,7 +250,7 @@ class V12EncryptSourceConfigsIT {
 
         MigrationRunner.migrate(database);
 
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(12);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         MongoArtifactStore store = new MongoArtifactStore(client, artifacts,
                 new SourceConfigKeyringStore(database).loadExistingCipher());
         for (Resource resource : expected) {
@@ -248,6 +258,7 @@ class V12EncryptSourceConfigsIT {
             Document actual = artifacts.find(new Document("_id", resource.id())).first();
             assertThat(actual).doesNotContainKey("canonical");
             assertThat(actual.getString("contentHash")).isEqualTo(CanonicalHash.of(resource));
+            assertThat(actual.getString("incarnation")).isNotBlank();
             if (resource.kind().equals("source")) {
                 assertThat(actual.get("body", Document.class).get("config"))
                         .isInstanceOf(String.class).asString().startsWith("tscfg:1:");
@@ -257,7 +268,8 @@ class V12EncryptSourceConfigsIT {
                 // BSON decoding turns nested maps into Documents. Compare their encoded storage
                 // shapes rather than Document-vs-Map Java equality for identical nested content.
                 assertThat(actual.toBsonDocument(Document.class, MongoClientSettings.getDefaultCodecRegistry()))
-                        .isEqualTo(stored(resource).toBsonDocument(Document.class, MongoClientSettings.getDefaultCodecRegistry()));
+                        .isEqualTo(stored(resource).append("incarnation", actual.getString("incarnation"))
+                                .toBsonDocument(Document.class, MongoClientSettings.getDefaultCodecRegistry()));
             }
         }
         List<Document> once = artifacts.find().sort(new Document("_id", 1)).into(new ArrayList<>());
@@ -328,7 +340,7 @@ class V12EncryptSourceConfigsIT {
 
         MigrationRunner.migrate(database);
 
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(12);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         MongoArtifactStore store = new MongoArtifactStore(client, artifacts,
                 new SourceConfigKeyringStore(database).loadExistingCipher());
         assertThat(store.get(original.id())).contains(replacement);

@@ -26,7 +26,8 @@ import java.util.function.Supplier;
  * <p><b>The connector reads on a thread of its own, at most a few of its batches ahead of whoever takes the
  * rows.</b> A connector hands its rows over a batch at a time from inside its own read loop, and that loop
  * is paused, by the hand-over waiting, whenever {@link #READ_AHEAD} of its batches are already waiting
- * here -- which pauses the fetch from the source with it. Collecting the whole read first was the shape this
+     * here, each bounded by the bridge's delivery chunk size -- which pauses the fetch from the source with it.
+     * Collecting the whole read first was the shape this
  * replaced: a table held twice over on the heap, as the connector's events and again decoded, before a
  * single row of it could go anywhere, so the heap a snapshot needed was the size of its largest table.
  *
@@ -43,8 +44,8 @@ final class PdkCaptureBatch implements CaptureBatch {
 
     /**
      * How many of the connector's batches may wait for the reader of this one. Enough that taking a row never
-     * waits on the source while the source has one ready; each batch is at most the size the connector reads
-     * in, so this bounds the rows the read holds at once to a few thousand.
+     * waits on the source while the source has one ready. The bridge splits oversized connector callbacks
+     * into bounded copied chunks before they reach this queue.
      */
     static final int READ_AHEAD = 4;
 
@@ -134,6 +135,9 @@ final class PdkCaptureBatch implements CaptureBatch {
      * taken. Waits while {@link #READ_AHEAD} are already waiting, and gives up if the batch is closed meanwhile.
      */
     void rowsRead(Supplier<List<Envelope>> decode) {
+        if (closed.get()) {
+            throw new CancellationException("the snapshot read was closed before its next chunk");
+        }
         put(decode);
     }
 

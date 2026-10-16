@@ -14,13 +14,16 @@ import io.tapstate.control.core.LivePipelineRun;
 import io.tapstate.control.core.LivePipelineRuns;
 import io.tapstate.control.core.LivePipelineVertex;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ProcessorRuntimeContext;
 import io.tapstate.runtime.engine.FrontierMetricNames;
 import io.tapstate.runtime.engine.PinnedStandIns;
+import io.tapstate.runtime.engine.NativeExecutionStartup;
 import io.tapstate.runtime.engine.SinkWaitingMetricNames;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -134,7 +137,13 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
                 if (job.getName() == null || job.getStatus().isTerminal()) {
                     continue;
                 }
-                live.add(runOf(job.getName(), job.getMetrics()));
+                JobMetrics collected = job.getMetrics();
+                LivePipelineRun measured = runOf(job.getName(), collected);
+                NativeExecutionStartup.Evidence initialized = job.getConfig().getArgument(NativeExecutionStartup.CLAIM_ARGUMENT) == null
+                        ? null : NativeExecutionStartup.read(member, job.getName()).orElse(null);
+                LivePipelineRun.NativeExecution scope = nativeScope(job, measured, collected, initialized);
+                live.add(measured.withNativeExecution(scope, scope == null ? List.of()
+                        : nativeContexts(job, measured.executionId(), initialized)));
             }
         } catch (RuntimeException failed) {
             if (!theClusterIsChanging(failed)) {
@@ -146,6 +155,63 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
             throw new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), failed);
         }
         return List.copyOf(live);
+    }
+
+    /** The job/configuration and metrics must name the same native execution before contexts are joined. */
+    static List<ProcessorRuntimeContext> nativeContexts(Job job, String measuredExecution,
+            NativeExecutionStartup.Evidence evidence) {
+        if (evidence == null || !Long.toUnsignedString(job.getId()).equals(evidence.jobId())
+                || !Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.CLAIM_ARGUMENT), evidence.claimGeneration())
+                || !Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.EXECUTION_ARGUMENT), evidence.executionGeneration())
+                || !Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.PROFILE_ARGUMENT), evidence.profileGeneration())) {
+            return List.of();
+        }
+        if (measuredExecution != null && !measuredExecution.equals(com.hazelcast.jet.Util.idToString(
+                Long.parseUnsignedLong(evidence.runtimeExecutionId())))) { return List.of(); }
+        return evidence.processors().values().stream()
+                .filter(context -> context.pipelineId().equals(job.getName()) && context.jobId().equals(evidence.jobId())
+                        && context.runtimeExecutionId().equals(evidence.runtimeExecutionId())
+                        && context.claimGeneration() == evidence.claimGeneration()
+                        && context.executionGeneration() == evidence.executionGeneration()
+                        && context.profileGeneration() == evidence.profileGeneration())
+                .sorted(java.util.Comparator.comparing(ProcessorRuntimeContext::vertex)
+                        .thenComparingInt(ProcessorRuntimeContext::globalProcessorIndex))
+                .toList();
+    }
+
+    private record MeasuredSlot(String vertex, int processor) { }
+
+    static LivePipelineRun.NativeExecution nativeScope(Job job, LivePipelineRun measured, JobMetrics collected,
+            NativeExecutionStartup.Evidence evidence) {
+        if (evidence == null || nativeContexts(job, measured.executionId(), evidence).isEmpty()) {
+            return null;
+        }
+        String execution = com.hazelcast.jet.Util.idToString(Long.parseUnsignedLong(evidence.runtimeExecutionId()));
+        Set<String> metricExecutions = new HashSet<>();
+        Map<MeasuredSlot, String> measuredMembers = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            for (Measurement measurement : collected.get(metric)) {
+                String value = measurement.tag(MetricTags.EXECUTION);
+                if (value != null) { metricExecutions.add(value); }
+                String vertex = measurement.tag(MetricTags.VERTEX);
+                String processor = measurement.tag(MetricTags.PROCESSOR);
+                if (vertex != null && processor != null) {
+                    if (!execution.equals(value)) { return null; }
+                    String memberUuid = measurement.tag(MetricTags.MEMBER);
+                    if (memberUuid == null) { return null; }
+                    String previous = measuredMembers.putIfAbsent(new MeasuredSlot(vertex, Integer.parseInt(processor)), memberUuid);
+                    if (previous != null && !previous.equals(memberUuid)) { return null; }
+                }
+            }
+        }
+        if (!metricExecutions.equals(Set.of(execution)) || !execution.equals(measured.executionId())) {
+            return null;
+        }
+        LivePipelineRun.NativeExecution scope = new LivePipelineRun.NativeExecution(evidence.jobId(),
+                evidence.runtimeExecutionId(), execution, evidence.claimGeneration(), evidence.executionGeneration(),
+                evidence.profileGeneration());
+        return evidence.processors().values().stream().allMatch(context -> context.pipelineId().equals(job.getName())
+                && scope.matches(context)) ? scope : null;
     }
 
     /**

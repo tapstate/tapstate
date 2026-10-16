@@ -622,26 +622,25 @@ class ClusterRebuildAdmissionTest {
     }
 
     /**
-     * The other half: taking the claim back is not by itself a sign the run is somebody else's. A member
-     * joining moves the committed revision, and every holder takes its claim once more under the new one -
-     * the same owner, so the same generation, still carrying the run it submitted. Forgetting what that run
+     * The other half: refreshing a claim is not a sign the run is somebody else's. A member
+     * joining moves the committed revision, and the same holder refreshes its lease under the new one -
+     * the same owner and generation, still carrying the run it submitted. Forgetting what that run
      * was planned over there would make its every death read as inherited, and a member starting up would
      * restart a connector defect that happened to die around then.
      */
     @Test
-    void aRunThisMemberTakesBackUnderANewRevisionIsStillJudgedByWhatItWasPlannedOver() {
+    void aRunThisMemberKeepsUnderANewRevisionIsStillJudgedByWhatItWasPlannedOver() {
         committed(7, "node-a", "node-b");
         submitRunUnder(7);
+        long originalClaimGeneration = ownership.currentClaim("orders").orElseThrow().claimGeneration();
 
         committed(8, "node-a", "node-b", "node-c");
         nanos.addAndGet(RENEW.toNanos() + 1);
-        assertThat(ownership.permit("orders").granted())
-                .as("the claim was granted under a cluster that has changed, so it has to be taken again")
-                .isFalse();
-        nanos.addAndGet(RENEW.toNanos() + 1);
         PipelineActuationOwnership.Permit again = ownership.permit("orders");
         assertThat(again.granted()).isTrue();
+        assertThat(again.claim().claimGeneration()).isEqualTo(originalClaimGeneration);
         assertThat(again.claim().topologyRevision()).isEqualTo(8);
+        assertThat(again.claim().executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-b");
         assertThat(again.claim().executionGeneration())
                 .as("still the run this member submitted")
                 .isEqualTo(1);

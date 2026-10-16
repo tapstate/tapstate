@@ -21,6 +21,7 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
@@ -152,6 +153,7 @@ class StateStoreModeWiringTest {
                 .withBean(StorePort.class, () -> fixture.store)
                 .withBean(NestSettings.class, NestSettings::defaults)
                 .withBean(ParallelismBudget.class, () -> ParallelismBudget.DEFAULTS)
+                .withBean(SnapshotBuffer.class, SnapshotBuffer::new)
                 .withBean(ConnectionTester.class, () -> fixture.probe)
                 .withBean(HazelcastInstance.class, () -> fixture.member);
         return ABSENT.equals(legacyProfile) ? runner
@@ -185,6 +187,7 @@ class StateStoreModeWiringTest {
             Cluster cluster = mock(Cluster.class);
             Member local = mock(Member.class);
             when(member.getCluster()).thenReturn(cluster);
+            when(member.getConfig()).thenReturn(HazelcastConfiguration.memberConfig(new HazelcastProperties()));
             when(cluster.getLocalMember()).thenReturn(local);
             when(cluster.getMembers()).thenReturn(Set.of(local));
             when(local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn("state-mode-node");

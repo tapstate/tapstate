@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -168,13 +169,24 @@ class IndependentCdcRecoveryIT {
                         () -> "held writes=" + CdcRecoveryFixture.heldWrites(fixture.signals())
                                 + ", streams=" + streamText(fixture));
             }
+            Document beforeStop = stopFacts(fixture.storeUri());
             control.stop(ROOT_PIPELINE, false);
-            if (retainStopEvidence) {
-                try (StopEvidence evidence = new StopEvidence(database, server, fixture)) {
+            try {
+                if (retainStopEvidence) {
+                    try (StopEvidence evidence = new StopEvidence(database, server, fixture)) {
+                        awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
+                    }
+                } else {
                     awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
                 }
-            } else {
-                awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
+            } catch (AssertionError failure) {
+                try {
+                    Path retained = retainStopFacts(fixture, beforeStop, server);
+                    throw new AssertionError(failure.getMessage() + "; direct-stop diagnostics retained at " + retained, failure);
+                } catch (java.io.IOException | RuntimeException unavailable) {
+                    failure.addSuppressed(unavailable);
+                    throw failure;
+                }
             }
             List<Path> beforeRestart = CdcRecoveryFixture.streams(fixture.source());
             Files.writeString(fixture.signals().resolve("release"), "");
@@ -618,6 +630,57 @@ class IndependentCdcRecoveryIT {
                 () -> "rows=" + CdcRecoveryFixture.lines(target.resolve(table + ".csv"))
                         + ", root=" + control.state(ROOT_PIPELINE) + ", mail=" + control.state(MAIL_PIPELINE)
                         + ", root logs=" + control.logs(ROOT_PIPELINE) + ", streams=" + streamText(fixture));
+    }
+
+    private static Document stopFacts(String uri) {
+        ConnectionString connection = new ConnectionString(uri);
+        var settings = MongoClientSettings.builder().applyConnectionString(connection)
+                .applyToClusterSettings(options -> options.serverSelectionTimeout(2, java.util.concurrent.TimeUnit.SECONDS))
+                .applyToSocketSettings(options -> options.connectTimeout(2, java.util.concurrent.TimeUnit.SECONDS)
+                        .readTimeout(2, java.util.concurrent.TimeUnit.SECONDS)).build();
+        Document facts = new Document();
+        try (MongoClient observer = MongoClients.create(settings)) {
+            MongoDatabase database = database(observer, uri);
+            for (String collection : List.of(MongoStorePort.PIPELINE_DESIRED, MongoStorePort.PIPELINE_STATE,
+                    MongoStorePort.PIPELINE_OBSERVATION)) {
+                facts.append(collection, database.getCollection(collection).find(new Document("_id", ROOT_PIPELINE)).first());
+            }
+            facts.append("pipelineClaims", database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                    .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", ROOT_PIPELINE))
+                    .into(new java.util.ArrayList<>()));
+            java.util.List<Document> consumers = new java.util.ArrayList<>();
+            java.util.List<Document> chains = new java.util.ArrayList<>();
+            for (var owner : Map.of(ROOT_PIPELINE, ROOT_SOURCE, MAIL_PIPELINE, MAIL_SOURCE).entrySet()) {
+                Document consumer = consumer(database, owner.getKey(), owner.getValue());
+                if (consumer != null) {
+                    consumers.add(consumer);
+                    String chain = consumer.getString("miningChainId");
+                    if (chain != null) {
+                        chains.add(database.getCollection(MongoStorePort.SRS_META).find(new Document("_id", chain)).first());
+                    }
+                }
+            }
+            facts.append("consumers", consumers).append("chains", chains);
+        } catch (RuntimeException unavailable) {
+            facts.append("readFailure", unavailable.getClass().getName()).append("readFailureDetail", unavailable.getMessage());
+        }
+        return facts;
+    }
+
+    private static Path retainStopFacts(Fixture fixture, Document before, RealProcessServer server)
+            throws java.io.IOException {
+        Path retained = Path.of(System.getProperty("tapstate.e2e.build-directory", "target"))
+                .resolve("failure-scenes").resolve("direct-cdc-stop").resolve(java.util.UUID.randomUUID().toString());
+        Files.createDirectories(retained);
+        Files.writeString(retained.resolve("store-facts.json"), new Document("beforeStop", before)
+                .append("atFailure", stopFacts(fixture.storeUri())).toJson());
+        for (Path stream : CdcRecoveryFixture.streams(fixture.source())) {
+            Files.copy(stream, retained.resolve(stream.getFileName()));
+        }
+        Files.copy(server.output(), retained.resolve("server.log"));
+        Files.writeString(retained.resolve("signals.txt"), "waiting=" + Files.exists(fixture.signals().resolve("waiting"))
+                + ", release=" + Files.exists(fixture.signals().resolve("release")));
+        return retained;
     }
 
     private static void awaitState(ControlPlane control, String pipeline, PipelineState state) {

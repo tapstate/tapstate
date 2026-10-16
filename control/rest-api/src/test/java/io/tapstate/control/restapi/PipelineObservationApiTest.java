@@ -200,6 +200,7 @@ class PipelineObservationApiTest {
                 Map.of("records.out", 700L, "bytes.out", 13_000L), Map.of("orders", 2L), COUNTING_SINCE));
         context.getBean(FakeChainStore.class).reset();
         context.getBean(FakeStoppedPipelines.class).reset();
+        context.getBean(RecoveryTestQueries.class).clear();
         context.getBean(PipelineApiTest.FakePipelineDraftStore.class).clear();
     }
 
@@ -213,6 +214,20 @@ class PipelineObservationApiTest {
     }
 
     // ---- the three read faces round-trip through the query service ----
+
+    @Test
+    void statusAndExplainCarryTheSameDurableRecoveryReading() throws Exception {
+        RecoveryTestQueries recovery = context.getBean(RecoveryTestQueries.class);
+        recovery.enable("cluster-a", "pl3");
+        String token = machineToken(Scope.READ);
+        for (String operation : List.of("status", "explain")) {
+            String json = client().get().uri("/api/pipelines/pl3/" + operation)
+                    .header("Authorization", "Bearer " + token).retrieve().body(String.class);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> body = (Map<String, Object>) io.tapstate.core.common.JsonReader.parse(json);
+            assertThat(body.get("recovery")).as(operation).isEqualTo(recovery.pipelineJson("pl3"));
+        }
+    }
 
     @Test
     void statusReturnsTheLifecycleStateForAReadCredential() {
@@ -589,18 +604,23 @@ class PipelineObservationApiTest {
     }
 
     @Test
-    void aReadOfAnAppliedPipelineThatHasNotConvergedKeepsStateUnobservedAndShowsStarting() {
+    void aReadOfAnAppliedPipelineThatHasNotConvergedKeepsStateUnobservedAndShowsStarting() throws Exception {
         context.getBean(FakeObservationStore.class).clear();
         context.getBean(FakeStoppedPipelines.class).intent("pl1", PipelineState.RUNNING);
+        RecoveryTestQueries recovery = context.getBean(RecoveryTestQueries.class);
+        recovery.enable("cluster-a", "pl1");
 
-        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+        String json = client().get().uri("/api/pipelines/pl1/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .retrieve().body(new ParameterizedTypeReference<>() {});
+                .retrieve().body(String.class);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> body = (Map<String, Object>) io.tapstate.core.common.JsonReader.parse(json);
 
         assertThat(body).containsEntry("state", "NEW")
                 .containsEntry("displayState", "STARTING")
                 .containsEntry("desiredState", "RUNNING")
                 .containsEntry("hasArtifact", true)
+                .containsEntry("recovery", recovery.pipelineJson("pl1"))
                 .doesNotContainKey("observedState");
     }
 
@@ -713,11 +733,14 @@ class PipelineObservationApiTest {
         }
 
         @Bean
-        PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations) {
+        PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations, RecoveryTestQueries recovery) {
             ExecutionPlans plans = pipelineIds -> pipelineIds.contains("pl2") ? Map.of("pl2", PL_POS_PLAN) : Map.of();
             return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations,
-                    plans, () -> List.of("m1", "m2", "m3", "m4"));
+                    plans, () -> List.of("m1", "m2", "m3", "m4"), recovery);
         }
+
+        @Bean
+        RecoveryTestQueries recoveryTestQueries() { return new RecoveryTestQueries(); }
 
         @Bean
         PipelineCatalogService pipelineCatalogService(PipelineObservationQueryService observations,
@@ -745,10 +768,10 @@ class PipelineObservationApiTest {
         }
 
         @Bean
-        PipelineExplainService pipelineExplainService(ObservationStore observations, Clock clock) {
+        PipelineExplainService pipelineExplainService(ObservationStore observations, Clock clock, RecoveryTestQueries recovery) {
             ExplanationCatalog messages = ExplanationCatalog.bundled();
             return new PipelineExplainService(new ArtifactQueryService(appliedPipelines()), observations,
-                    clock, messages::render);
+                    clock, messages::render, ExecutionPlans.NONE, List::of, recovery);
         }
 
         @Bean

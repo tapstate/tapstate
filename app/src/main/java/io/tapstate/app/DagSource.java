@@ -2,10 +2,12 @@ package io.tapstate.app;
 
 import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.ClusterCapacityDemand;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.SourceModel;
 
 import java.util.List;
 import java.util.Map;
@@ -172,9 +174,9 @@ interface DagSource {
 
     /**
      * The validated, artifact-derived inputs available before placement is configured. The run itself is worked
-     * out later, in two steps a start takes on either side of opening its capture: {@link #plan()} once placement
-     * and pending teardown are settled, because planning may inspect and record operator shape; the topology once
-     * the capture is open, because its source vertices read what the capture opens.
+     * out later, in two steps a start takes on either side of opening its capture: {@link #plan()} before
+     * admission, without changing durable shape state; the topology after pending teardown and capture, because
+     * its source vertices read what the capture opens and activation records the shape it actually uses.
      */
     record StartPreparation(
             NestCapacity capacity,
@@ -225,12 +227,81 @@ interface DagSource {
         Function<ExecutionFence, PlannedDag> plan();
     }
 
+    /** A deferred topology carrying facts from the same compiler before any runtime effect is opened. */
+    interface FactBearingBuilder extends Function<ExecutionFence, PlannedDag> {
+        Optional<PlanningFacts> planningFacts();
+
+        /** Models used by source selection and the compiled resource facts, without a later discovery read. */
+        default Optional<Map<String, SourceModel>> sourceModels() { return Optional.empty(); }
+
+        /** Validates and records frozen state after pending teardown, before allocating an execution. */
+        default void activate() { }
+    }
+
+    /**
+     * Capacity facts for the frozen compiled graph. Bounds cover the named owned resources only; a nonempty
+     * {@code unknownInputs} means that at least one enforced axis has no complete bound and cannot be admitted.
+     * Total-one vertices retain their effective width; per-member reservations allow their owner to be any member.
+     */
+    record PlanningFacts(List<String> plannedStableIds, ExecutionShape shape,
+            Map<String, ClusterCapacityDemand> perMemberUpperBounds, ClusterCapacityDemand clusterUpperBound,
+            Map<String, VertexResources> vertices, List<EdgeResources> edges,
+            List<String> unknownInputs, List<String> diagnostics, Set<String> selectedSourceIds) {
+        public PlanningFacts {
+            plannedStableIds = List.copyOf(plannedStableIds);
+            Objects.requireNonNull(shape, "shape");
+            perMemberUpperBounds = Map.copyOf(perMemberUpperBounds);
+            Objects.requireNonNull(clusterUpperBound, "clusterUpperBound");
+            vertices = Map.copyOf(vertices);
+            edges = List.copyOf(edges);
+            unknownInputs = List.copyOf(unknownInputs);
+            diagnostics = List.copyOf(diagnostics);
+            selectedSourceIds = Set.copyOf(selectedSourceIds);
+        }
+
+        /** A fixture without source selection evidence cannot supply a complete admission demand. */
+        PlanningFacts(List<String> plannedStableIds, ExecutionShape shape,
+                Map<String, ClusterCapacityDemand> perMemberUpperBounds, ClusterCapacityDemand clusterUpperBound,
+                Map<String, VertexResources> vertices, List<EdgeResources> edges,
+                List<String> unknownInputs, List<String> diagnostics) {
+            this(plannedStableIds, shape, perMemberUpperBounds, clusterUpperBound, vertices, edges,
+                    java.util.stream.Stream.concat(unknownInputs.stream(),
+                            java.util.stream.Stream.of("selected-sources-unproven")).toList(), diagnostics, Set.of());
+        }
+    }
+
+    /** Physical processor slots include total-one stand-ins; effective processors exclude them. */
+    record VertexResources(String node, int localProcessorSlots, int effectiveProcessors,
+            boolean blocking, boolean writer, long ownedBufferedRecordsPerProcessor) { }
+
+    /** An actual compiler edge and the capacity of its local, sender and receiver queues on any member. */
+    record EdgeResources(String source, int sourceOrdinal, String destination, int destinationOrdinal,
+            boolean distributed, int queueCapacity, long queuesPerMemberUpperBound) { }
+
     /** A start whose run has been planned, and whose topology is built once its capture is open. */
     record PlannedStart(StartPreparation preparation, Function<ExecutionFence, PlannedDag> dagBuilder) {
 
         public PlannedStart {
             Objects.requireNonNull(preparation, "preparation");
             Objects.requireNonNull(dagBuilder, "dagBuilder");
+        }
+
+        /** Legacy fixture builders have no facts; a production profiled start must require them. */
+        Optional<PlanningFacts> planningFacts() {
+            return dagBuilder instanceof FactBearingBuilder planned
+                    ? planned.planningFacts() : Optional.empty();
+        }
+
+        Optional<Map<String, SourceModel>> sourceModels() {
+            return dagBuilder instanceof FactBearingBuilder planned
+                    ? planned.sourceModels() : Optional.empty();
+        }
+
+        /** Legacy fixture builders have no activation state. */
+        void activate() {
+            if (dagBuilder instanceof FactBearingBuilder planned) {
+                planned.activate();
+            }
         }
 
         /**
@@ -245,6 +316,7 @@ interface DagSource {
          * anything in the call saying so.
          */
         StartPlan build(ExecutionFence fence) {
+            activate();
             return new StartPlan(dagBuilder.apply(fence), preparation.capacity(), preparation.stateLocations(),
                     preparation.artifactSnapshot());
         }

@@ -51,7 +51,10 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -90,6 +93,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 
 class CaptureOwnershipTest {
 
@@ -332,7 +338,7 @@ class CaptureOwnershipTest {
     }
 
     @Test
-    void aTopologyOnlyActuationRefusalKeepsTheStillOwnedCaptureRunning() {
+    void aTopologyRefreshKeepsTheSameAuthorityAndItsCaptureRunning() {
         InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p"));
         InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
         ClusterMembershipGate gate = eligibleGate();
@@ -341,6 +347,8 @@ class CaptureOwnershipTest {
         Member a = new Member("node-a", store, claims, TTL, Duration.ofMillis(20), new ArrayList<>());
         bindActuation(a, store, actuation);
         assertThat(actuation.permit("p").granted()).isTrue();
+        WorkloadClaimKey pipeline = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "p");
+        WorkloadClaim original = claims.read(pipeline).orElseThrow().claim();
         try {
             a.captures.startCapture("p");
             store.meta().upsertConsumerOffset(CHAIN, new ConsumerOffset("p", Map.of(), null));
@@ -348,7 +356,13 @@ class CaptureOwnershipTest {
             gate.canCommit(Set.of("node-a", "node-b", "node-c", "node-d"));
             nanos.addAndGet(Duration.ofSeconds(10).toNanos());
             actuation.renewDue();
-            assertThat(actuation.permit("p").granted()).as("the old topology permit was dropped").isFalse();
+            var refreshed = actuation.permit("p");
+            assertThat(refreshed.granted()).as("live authority survives an acquisition-topology refresh").isTrue();
+            assertThat(refreshed.claim().topologyRevision()).isEqualTo(8);
+            assertThat(refreshed.claim().owner()).isEqualTo(original.owner());
+            assertThat(refreshed.claim().claimGeneration()).isEqualTo(original.claimGeneration());
+            assertThat(refreshed.claim().executionGeneration()).isEqualTo(original.executionGeneration());
+            assertThat(refreshed.claim().executionNodeIds()).isEqualTo(original.executionNodeIds());
             assertThat(actuation.isDriving("p")).as("the store still names this owner").isTrue();
             WorkloadClaimKey capture = captureKey(store, "p");
             Instant before = claims.read(capture).orElseThrow().claim().leaseUntil();
@@ -1025,6 +1039,78 @@ class CaptureOwnershipTest {
         assertThat(coordinator.captureFailure("q")).as("q's independent load stays healthy").isEmpty();
         coordinator.stopCapture("p", false);
         coordinator.stopCapture("q", false);
+    }
+
+    @Test
+    void aTopologyRefreshStillReportsTheCurrentProfiledCaptureFailure() {
+        InMemoryStorePort backing = new InMemoryStorePort(artifactsWith(ReadMode.CDC_ONLY, "p"));
+        StorePort store = acceptingLocalPreparation(backing);
+        CaptureHealth health = new CaptureHealth();
+        CaptureAttacher attacher = (spec, handoff, startTail) -> new CaptureRun(
+                Optional.empty(), false, 0L, Optional.empty(), Optional.of(() -> { }), health);
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store, attacher,
+                new SrsCoordinator(store.meta()), new SnapshotBuffer());
+        WorkloadClaimFence initial = localProfileFence("p", 1, 3, 7);
+        WorkloadClaimFence refreshed = localProfileFence("p", 1, 3, 8);
+        try {
+            coordinator.startCapture("p", store.artifacts(), Map.of(), initial);
+            RuntimeException failure = new RuntimeException("the current reader failed");
+            health.fail(failure);
+            assertThat(coordinator.captureFailure("p", initial)).containsSame(failure);
+            assertThat(initial.sameAuthorityAs(refreshed)).isTrue();
+            assertThat(coordinator.captureFailure("p", refreshed)).containsSame(failure);
+            assertThat(coordinator.captureFailure("p", localProfileFence("p", 1, 4, 8))).isEmpty();
+            assertThat(coordinator.captureFailure("p", localProfileFence("p", 2, 3, 8))).isEmpty();
+        } finally {
+            coordinator.stopCapture("p", false);
+            coordinator.close();
+        }
+    }
+
+    @Test
+    void aProfiledAttachmentReportsItsSharedTailsUncodedFailure() {
+        InMemoryStorePort backing = new InMemoryStorePort(artifactsWith(ReadMode.CDC_ONLY, "p", "q"));
+        StorePort store = acceptingLocalPreparation(backing);
+        CaptureHealth ownerHealth = new CaptureHealth();
+        CaptureHealth attachedHealth = new CaptureHealth();
+        List<Boolean> starts = new ArrayList<>();
+        CaptureAttacher attacher = (spec, handoff, startTail) -> {
+            starts.add(startTail);
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(), Optional.of(() -> { }),
+                    spec.pipelineId().equals("p") ? ownerHealth : attachedHealth);
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store, attacher,
+                new SrsCoordinator(store.meta()), new SnapshotBuffer());
+        WorkloadClaimFence owner = localProfileFence("p", 1, 3, 7);
+        WorkloadClaimFence attached = localProfileFence("q", 1, 5, 7);
+        try {
+            coordinator.startCapture("p", store.artifacts(), Map.of(), owner);
+            coordinator.startCapture("q", store.artifacts(), Map.of(), attached);
+            assertThat(starts).containsExactly(true, false);
+            RuntimeException failure = new RuntimeException("the shared physical reader failed");
+            ownerHealth.fail(failure);
+            assertThat(attachedHealth.failure()).isEmpty();
+            assertThat(coordinator.captureFailure("q", attached)).containsSame(failure);
+            assertThat(coordinator.captureFailure("q", localProfileFence("q", 1, 6, 7))).isEmpty();
+        } finally {
+            coordinator.stopCapture("p", false);
+            coordinator.stopCapture("q", false);
+            coordinator.close();
+        }
+    }
+
+    private static WorkloadClaimFence localProfileFence(String pipeline, long claim, long execution, long topology) {
+        return new WorkloadClaimFence(new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, pipeline),
+                Member.owner("node-a"), claim, execution, topology, 1);
+    }
+
+    private static StorePort acceptingLocalPreparation(InMemoryStorePort backing) {
+        // Only persistence acceptance is outside these local failure-routing tests; no proof is fabricated.
+        SrsMetaStore meta = mock(SrsMetaStore.class, delegatesTo(backing.meta()));
+        when(meta.prepareCaptureResume(any(), any(), any(), anySet(), nullable(String.class))).thenReturn(true);
+        StorePort store = mock(StorePort.class, delegatesTo(backing));
+        when(store.meta()).thenReturn(meta);
+        return store;
     }
 
     @Test

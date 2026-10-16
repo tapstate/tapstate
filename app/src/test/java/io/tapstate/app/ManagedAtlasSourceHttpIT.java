@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClients;
 import io.tapstate.control.core.ConnectionTestReport;
 import io.tapstate.control.core.SchemaReport;
 import io.tapstate.control.core.SourceView;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.spi.store.StorePort;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -15,6 +16,7 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -253,5 +255,13 @@ class ManagedAtlasSourceHttpIT {
     @EnableAutoConfiguration
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
     static class AssemblyApp {
+
+        /** These Source witnesses mount the HTTP face but never execute Pipeline previews. */
+        @Bean
+        PipelinePreviewProbe unusedPreviewProbe() {
+            return request -> {
+                throw new AssertionError("this Atlas Source HTTP fixture does not execute a Pipeline preview");
+            };
+        }
     }
 }

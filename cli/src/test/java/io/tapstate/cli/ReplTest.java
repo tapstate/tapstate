@@ -161,6 +161,7 @@ class ReplTest {
         final List<String> events = new ArrayList<>();
         final List<URI> probed = new ArrayList<>();
         final List<URI> discovered = new ArrayList<>();
+        final Map<URI, DiscoveryOutcome> discoveryOutcomes = new HashMap<>();
         /** What the server answers when asked its version; null is a server that does not say. */
         String serverVersion;
         /** The grammars it accepts and the schema version of its store; null in either is a server
@@ -322,8 +323,9 @@ class ReplTest {
             events.add("discover " + baseUrl);
             discovered.add(baseUrl);
             return healthy.contains(baseUrl)
-                    ? new DiscoveryOutcome.Discovered("urn:tapstate:cluster:test-cluster", "test-cluster",
-                            "tapstate/v1", List.of("password", "machine_token"))
+                    ? discoveryOutcomes.getOrDefault(baseUrl, new DiscoveryOutcome.Discovered(
+                            "urn:tapstate:cluster:test-cluster", "test-cluster",
+                            "tapstate/v1", List.of("password", "machine_token")))
                     : new DiscoveryOutcome.Unreachable();
         }
 
@@ -614,10 +616,17 @@ class ReplTest {
                 new ClusterMembersOutcome.Listed(null, null, List.of(), List.of());
 
         final List<String> clusterCalls = new ArrayList<>();
+        final List<String> clusterStatusCalls = new ArrayList<>();
 
         @Override
         public ClusterMembersOutcome clusterMembers(URI baseUrl, String credential) {
             clusterCalls.add(credential + "@" + baseUrl);
+            return healthy.contains(baseUrl) ? clusterOutcome : new ClusterMembersOutcome.Unreachable();
+        }
+
+        @Override
+        public ClusterMembersOutcome clusterStatus(URI baseUrl, String credential) {
+            clusterStatusCalls.add(credential + "@" + baseUrl);
             return healthy.contains(baseUrl) ? clusterOutcome : new ClusterMembersOutcome.Unreachable();
         }
 
@@ -729,9 +738,10 @@ class ReplTest {
         // is the more common question of the two, and it was the one that did not work.
         Harness h = harness();
         assertThat(h.repl().dispatch("help status")).isTrue();
-        assertThat(h.sink().toString())
+        // Descriptions may wrap while still naming the same verb and its complete behavior.
+        assertThat(h.sink().toString().replaceAll("\\s+", " "))
                 .contains("Usage: tapstate status")
-                .contains(Cli.VERB_HELP.get("status").summary());
+                .contains(Cli.VERB_HELP.get("status").summary().replaceAll("\\s+", " "));
     }
 
     @Test
@@ -1532,6 +1542,86 @@ class ReplTest {
     }
 
     // --- failover: re-land across the member set on a lost landing node --------------------------
+
+    @ParameterizedTest
+    @CsvSource({
+            "ls,false", "ls,true",
+            "status pl1 --watch,false", "status pl1 --watch,true",
+            "logs pl1 --follow,false", "logs pl1 --follow,true"
+    })
+    void aPreviouslyUnreachableForeignSeedIsSkippedForReadsAndStreams(
+            String command, boolean machineBearer) {
+        URI original = URI.create("http://localhost:7900");
+        URI foreign = URI.create("http://localhost:7901");
+        URI replacement = URI.create("http://localhost:7902");
+        FakeControlPlane client = new FakeControlPlane(original);
+        Harness h = authenticatedFailoverHarness(client, List.of(original, foreign, replacement), machineBearer);
+        assertThat(client.discovered).contains(foreign, replacement);
+        client.discoveryOutcomes.put(foreign, new DiscoveryOutcome.Discovered(
+                "urn:tapstate:cluster:another-cluster", "another-cluster", "tapstate/v1",
+                List.of("password", "machine_token")));
+        client.setHealthy(foreign, replacement);
+        client.watchStates = List.of("RUNNING");
+        client.followBatches = List.of(List.of(new RemoteLogLine(1_700_000_000_000L, "INFO", "submitted job")));
+        client.streamEndings.clear();
+        client.streamEndings.addAll(List.of(
+                FakeControlPlane.StreamEnding.DROPPED, FakeControlPlane.StreamEnding.STOPPED));
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command);
+
+        List<String> calls = switch (command) {
+            case "ls" -> client.listCalls;
+            case "status pl1 --watch" -> client.watchCalls;
+            case "logs pl1 --follow" -> client.followCalls;
+            default -> throw new IllegalStateException("unexpected command " + command);
+        };
+        assertThat(calls).hasSize(2).noneMatch(call -> call.contains("@" + foreign));
+        assertThat(calls.getLast()).contains("@" + replacement);
+        assertThat(h.repl().session().landingNode()).isEqualTo(replacement);
+        assertThat(h.repl().session().credential()).isEqualTo("cluster-bearer");
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.sink().toString().substring(mark)).contains("cli.auth-issuer-mismatch");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failoverRefusesAForeignSeedWhenNoVerifiedMemberRemains(boolean machineBearer) {
+        URI original = URI.create("http://localhost:7900");
+        URI foreign = URI.create("http://localhost:7901");
+        FakeControlPlane client = new FakeControlPlane(original);
+        Harness h = authenticatedFailoverHarness(client, List.of(original, foreign), machineBearer);
+        client.discoveryOutcomes.put(foreign, new DiscoveryOutcome.Discovered(
+                "urn:tapstate:cluster:another-cluster", "another-cluster", "tapstate/v1",
+                List.of("password", "machine_token")));
+        client.setHealthy(foreign);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("ls");
+
+        assertThat(client.listCalls).containsExactly("cluster-bearer@" + original + "?null");
+        assertThat(h.repl().session().isConnected()).isFalse();
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString().substring(mark)).contains("cli.auth-issuer-mismatch");
+    }
+
+    private static Harness authenticatedFailoverHarness(
+            FakeControlPlane client, List<URI> seeds, boolean machineBearer) {
+        client.loginOutcome = new LoginOutcome.Success("cluster-bearer");
+        client.listOutcome = new ListOutcome.Listed(List.of());
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        h.repl().dispatch("connect " + String.join(",", seeds.stream().map(URI::toString).toList()));
+        if (machineBearer) {
+            h.repl().installMachineToken("cluster-bearer");
+            h.repl().dispatch("ls");
+        } else {
+            h.repl().dispatch("login alice");
+        }
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().session().credential()).isEqualTo("cluster-bearer");
+        client.listCalls.clear();
+        return h;
+    }
 
     @Test
     void failoverRelandsOnAnotherHealthyMemberKeepingTheCredential() {
@@ -5592,6 +5682,344 @@ class ReplTest {
     // --- cluster: the topology read -------------------------------------------------------------
 
     @Test
+    void clusterHelpDescribesTheTwoReadsAndExistingOutputFormats() {
+        Harness h = harness();
+
+        h.repl().dispatch("help cluster");
+
+        assertThat(h.sink().toString()).contains("members|status", "text|json|yaml");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"rebalance", "drain", "cordon", "uncordon", "restart", "rejoin"})
+    void noClusterMutationIsRegisteredInBeta(String verb) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        client.clusterCalls.clear();
+        client.clusterStatusCalls.clear();
+        client.lifecycleCalls.clear();
+
+        h.repl().dispatch("cluster " + verb);
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.clusterCalls).isEmpty();
+        assertThat(client.clusterStatusCalls).isEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"cluster", "cluster members", "cluster status"})
+    void clusterReadsReuseTheVerifiedFailoverWithoutSendingTheBearerToAForeignSeed(String command) {
+        URI original = URI.create("http://localhost:7900");
+        URI foreign = URI.create("http://localhost:7901");
+        URI replacement = URI.create("http://localhost:7902");
+        FakeControlPlane client = new FakeControlPlane(original);
+        Harness h = authenticatedFailoverHarness(client, List.of(original, foreign, replacement), false);
+        client.clusterCalls.clear();
+        client.discoveryOutcomes.put(foreign, new DiscoveryOutcome.Discovered(
+                "urn:tapstate:cluster:another-cluster", "another-cluster", "tapstate/v1",
+                List.of("password", "machine_token")));
+        client.setHealthy(foreign, replacement);
+
+        h.repl().dispatch(command + " -o json");
+
+        List<String> calls = command.endsWith("status") ? client.clusterStatusCalls : client.clusterCalls;
+        assertThat(calls).containsExactly("cluster-bearer@" + original, "cluster-bearer@" + replacement);
+        assertThat(h.repl().session().credential()).isEqualTo("cluster-bearer");
+        assertThat(h.repl().session().landingNode()).isEqualTo(replacement);
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.sink().toString()).contains("cli.auth-issuer-mismatch");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "cluster,text", "cluster,json", "cluster,yaml",
+            "cluster members,text", "cluster members,json", "cluster members,yaml",
+            "cluster status,text", "cluster status,json", "cluster status,yaml"
+    })
+    void clusterAliasesRouteTheTypedReadAndPreserveProfileAndSessionFacts(String command, String format) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L,
+                List.of(profiledMember("a", "ACTIVE", true, true, 21_000L),
+                        profiledMember("c", "LOST", false, true, -7_000L),
+                        profiledMember("d", "JOINING", false, false, 15_000L),
+                        profiledMember("f", "INCOMPATIBLE", true, true, 15_000L),
+                        new RemoteClusterMember("unknown", null, null, null, null, null)),
+                List.of(), 2L, "profile-hash");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command + " -o " + format);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        if (command.endsWith("status")) {
+            assertThat(client.clusterStatusCalls).containsExactly("jwt-tok@http://node1:7900");
+            assertThat(client.clusterCalls).isEmpty();
+        } else {
+            assertThat(client.clusterCalls).containsExactly("jwt-tok@http://node1:7900");
+            assertThat(client.clusterStatusCalls).isEmpty();
+        }
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("LOST", "JOINING", "INCOMPATIBLE", "profile-hash", "older-profile-hash")
+                .doesNotContain("heartbeat", "activeConnections");
+        switch (format) {
+            case "text" -> assertThat(out).contains("profile 2", "profile 1", "boot boot-a", "member uuid-a",
+                    "session boot boot-c", "remaining ms -7000", "live false", "join observed false");
+            case "json" -> {
+                Map<?, ?> body = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(out);
+                assertThat(((Number) body.get("profileGeneration")).longValue()).isEqualTo(2L);
+                Map<?, ?> lost = (Map<?, ?>) ((List<?>) body.get("members")).get(1);
+                assertThat(((Number) lost.get("sessionLeaseRemainingMillis")).longValue()).isEqualTo(-7_000L);
+                assertThat(lost.get("live")).isEqualTo(false);
+                assertThat(lost.get("joinedMemberUuid")).isEqualTo("uuid-c");
+                Map<?, ?> unknown = (Map<?, ?>) ((List<?>) body.get("members")).getLast();
+                assertThat(unknown).hasSize(1);
+                assertThat(unknown.get("nodeId")).isEqualTo("unknown");
+            }
+            case "yaml" -> assertThat(out).contains("profileGeneration: 2", "sessionLeaseRemainingMillis: -7000",
+                    "live: false", "joined: false", "joinedMemberUuid: uuid-c");
+            default -> throw new IllegalStateException("unexpected format " + format);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"text", "json", "yaml"})
+    void clusterRecoveryFormatsPreserveUnknownDemandAndTheAttemptSourceRejection(String format) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 9L, List.of(), List.of(),
+                2L, "profile-current", RecoveryWire.cluster(RecoveryFixtures.clusterRecovery()));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("cluster status -o " + format);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("FULL_CLUSTER_RESTART", "SOURCE_POSITION_REJECTION", "capture.start-from-outside-window", "resume-7", "resume-12");
+        if (format.equals("text")) {
+            assertThat(out).contains("quorum unknown", "occupied   unknown", "attempt 2/3", "original position", "requested position", "failure note")
+                    .doesNotContain("occupied   0", "profile 0");
+        } else if (format.equals("json")) {
+            Map<?, ?> body = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(out);
+            assertThat(body.get("recovery")).isEqualTo(RecoveryFixtures.clusterRecovery());
+        } else {
+            assertThat(out).contains("occupiedByNode: null", "quorumReady: null", "failureNote:");
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"status,json", "status,yaml", "explain,json", "explain,yaml"})
+    void machinePipelineReadsUseTheirExistingTypedEndpointOnceWithoutMetricPolling(String command, String format) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = RecoveryFixtures.statusFound();
+        client.explainOutcome = RecoveryFixtures.explanationFound();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command + " orders -o " + format);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.metricsCalls).isEmpty();
+        if (command.equals("status")) {
+            assertThat(client.statusCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+            assertThat(client.explainCalls).isEmpty();
+        } else {
+            assertThat(client.explainCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+            assertThat(client.statusCalls).isEmpty();
+        }
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("capture.start-from-outside-window", "resume-12", "occupiedByNode");
+        if (format.equals("json")) {
+            assertThat(io.tapstate.core.common.JsonReader.parse(out))
+                    .isEqualTo(command.equals("status") ? RecoveryFixtures.status() : RecoveryFixtures.explanation());
+        } else {
+            assertThat(out).contains("occupiedByNode: null", "requested: resume-12", "failureNote:");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"json", "yaml"})
+    void machineStatusKeepsRecoveryAndIntentWithoutInventingARuntimeObservation(String format) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.NoObservation("orders", "NEW", "STARTING", "RUNNING", true,
+                RecoveryWire.pipeline(RecoveryFixtures.pipelineRecovery()));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status orders -o " + format);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.statusCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+        assertThat(client.explainCalls).isEmpty();
+        assertThat(client.metricsCalls).isEmpty();
+        String out = h.sink().toString().substring(mark);
+        if (format.equals("json")) {
+            Map<String, Object> expected = new java.util.LinkedHashMap<>();
+            expected.put("pipelineId", "orders");
+            expected.put("state", "NEW");
+            expected.put("displayState", "STARTING");
+            expected.put("desiredState", "RUNNING");
+            expected.put("observedState", null);
+            expected.put("hasArtifact", true);
+            expected.put("recovery", RecoveryFixtures.pipelineRecovery());
+            assertThat(io.tapstate.core.common.JsonReader.parse(out)).isEqualTo(expected);
+        } else {
+            assertThat(out).contains("state: NEW", "displayState: STARTING", "desiredState: RUNNING",
+                    "observedState: null", "capture.start-from-outside-window");
+        }
+    }
+
+    @Test
+    void machineStatusDoesNotFillUnknownMetadataForAnUnobservedRead() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.NoObservation();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status orders -o json");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.statusCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+        assertThat(client.explainCalls).isEmpty();
+        assertThat(client.metricsCalls).isEmpty();
+        assertThat(io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark)))
+                .isEqualTo(io.tapstate.core.common.JsonReader.parse(
+                        "{\"pipelineId\":\"orders\",\"observedState\":null}"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"status", "explain"})
+    void textPipelineReadsKeepTheirExplanationAndExposeTheDurableRecoveryCause(String command) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = RecoveryFixtures.statusFound();
+        client.explainOutcome = RecoveryFixtures.explanationFound();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command + " orders");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.sink().toString().substring(mark)).contains("orders  failed", "why:", "recovery   RECOVERING",
+                "FULL_CLUSTER_RESTART", "attempt 2/3", "capture.start-from-outside-window", "resume-7", "resume-12")
+                .doesNotContain("occupied   0");
+        assertThat(client.statusCalls).isEmpty();
+        assertThat(client.explainCalls).hasSize(1);
+        assertThat(client.metricsCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"status", "explain"})
+    void machineRecoveryReadsReuseIssuerBoundFailoverWithoutSendingBearerToForeignSeeds(String command) {
+        URI original = URI.create("http://localhost:7900");
+        URI foreign = URI.create("http://localhost:7901");
+        URI replacement = URI.create("http://localhost:7902");
+        FakeControlPlane client = new FakeControlPlane(original);
+        client.statusOutcome = RecoveryFixtures.statusFound();
+        client.explainOutcome = RecoveryFixtures.explanationFound();
+        Harness h = authenticatedFailoverHarness(client, List.of(original, foreign, replacement), false);
+        client.statusCalls.clear();
+        client.explainCalls.clear();
+        client.discoveryOutcomes.put(foreign, new DiscoveryOutcome.Discovered(
+                "urn:tapstate:cluster:another-cluster", "another-cluster", "tapstate/v1", List.of("password", "machine_token")));
+        client.setHealthy(foreign, replacement);
+
+        h.repl().dispatch(command + " orders -o json");
+
+        assertThat(command.equals("status") ? client.statusCalls : client.explainCalls)
+                .containsExactly("cluster-bearer@" + original + "/orders", "cluster-bearer@" + replacement + "/orders");
+        assertThat(h.repl().session().credential()).isEqualTo("cluster-bearer");
+        assertThat(h.repl().session().landingNode()).isEqualTo(replacement);
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.metricsCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"rebalance", "drain", "cordon", "uncordon", "restart", "rejoin"})
+    void clusterMutationWordsAreRejectedBeforeAnyRemoteRead(String action) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("cluster " + action);
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.clusterCalls).isEmpty();
+        assertThat(client.clusterStatusCalls).isEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
+    @Test
+    void unknownLiveIdentityReportsUnknownCoverageWithoutAPretendMemberCount() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", null,
+                List.of(new RemoteClusterMember(null, null, null, null, null, null)),
+                List.of(running("orders", "node-b", 3L, 7L)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("cluster status");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.sink().toString().substring(mark))
+                .contains("measured from 2 members; membership coverage unknown")
+                .doesNotContain("of 0", "profile 0", "remaining ms 0");
+    }
+
+    @Test
+    void registryRowsAndAwaitingMembersDoNotMakeACompletePlacementLookPartial() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        RemotePipeline running = running("orders", "node-b", 3L, 7L);
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L,
+                List.of(profiledMember("a", "ACTIVE", true, true, 21_000L),
+                        profiledMember("b", "ACTIVE", true, true, 28_000L),
+                        profiledMember("c", "LOST", false, true, -7_000L),
+                        profiledMember("d", "JOINING", false, false, 15_000L),
+                        profiledMember("e", "ACTIVE", true, true, 15_000L),
+                        profiledMember("f", "INCOMPATIBLE", true, true, 15_000L)),
+                List.of(new RemotePipeline(running.pipelineId(), running.controllerClaim(), running.captureClaims(),
+                        running.measuredAt(), running.measuredFrom(), List.of("node-e"), running.vertices())),
+                2L, "profile-hash");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("cluster");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.sink().toString().substring(mark)).contains("awaiting rebalance: node-e")
+                .doesNotContain("measured from");
+    }
+
+    @Test
+    void aReadingFromADepartedMemberCannotStandInForAMissingLiveMember() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        RemotePipeline running = running("orders", "node-b", 3L, 7L);
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L,
+                List.of(profiledMember("a", "ACTIVE", true, true, 21_000L),
+                        profiledMember("b", "ACTIVE", true, true, 28_000L),
+                        profiledMember("c", "LOST", false, true, -7_000L)),
+                List.of(new RemotePipeline(running.pipelineId(), running.controllerClaim(), running.captureClaims(),
+                        running.measuredAt(), List.of("uuid-a", "uuid-c"), List.of(), running.vertices())));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("cluster members");
+
+        assertThat(h.sink().toString().substring(mark)).contains("measured from 1 of 2 members");
+    }
+
+    private static RemoteClusterMember profiledMember(
+            String suffix, String state, Boolean live, boolean joined, Long remainingMillis) {
+        String uuid = joined ? "uuid-" + suffix : null;
+        String address = joined ? "[127.0.0.1]:5701" : null;
+        return new RemoteClusterMember("node-" + suffix, uuid, "boot-" + suffix, address,
+                "https://" + suffix + ".example:8443", state,
+                "INCOMPATIBLE".equals(state) ? 1L : 2L,
+                "INCOMPATIBLE".equals(state) ? "older-profile-hash" : "profile-hash", "boot-" + suffix,
+                "2026-09-19T08:30:00Z", remainingMillis,
+                remainingMillis == null ? null : remainingMillis > 0, joined,
+                joined ? "2026-09-19T08:29:00Z" : null, live, uuid, address);
+    }
+
+    @Test
     void clusterListsEachMemberWithWhatItIsAndWhereToReachIt() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
@@ -5698,10 +6126,8 @@ class ReplTest {
     void aPlacementStillArrivingFromSomeMembersSaysSoRatherThanReadingAsNarrow() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
-                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
-                        "https://a.example:8443", "ACTIVE"),
-                new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
-                        "https://b.example:8443", "ACTIVE")),
+                profiledMember("a", "ACTIVE", true, true, 21_000L),
+                profiledMember("b", "ACTIVE", true, true, 28_000L)),
                 List.of(new RemotePipeline("orders",
                         new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, true),
                         List.of(), "2026-09-19T08:30:00Z", List.of("uuid-b"), List.of(),

@@ -228,6 +228,19 @@ final class RealProcessServer implements ServerHandle {
                 jvmOptions, null, port -> List.of()));
     }
 
+    /** Launches a cluster listener with explicit JVM options through the existing owned process path. */
+    static RealProcessServer launchingInJvm(String storeUri, String listenAddress, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
+                jvmOptions, null, extraArguments);
+    }
+
+    /** The same launch, retaining the existing health and failed-start cleanup behavior. */
+    static RealProcessServer startInJvm(String storeUri, String listenAddress, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return healthy(launchingInJvm(storeUri, listenAddress, jvmOptions, extraArguments));
+    }
+
     /**
      * Returns the launch once its health probe answers, and ends it otherwise.
      *
@@ -298,6 +311,28 @@ final class RealProcessServer implements ServerHandle {
      */
     Path output() {
         return output;
+    }
+
+    /** A bounded read of this fixture's own child, taken before failure cleanup stops it. */
+    Path threadDiagnostic() throws IOException, InterruptedException {
+        Path dump = output.resolveSibling("failure-threads.log");
+        Path tool = Path.of(System.getProperty("java.home"), "bin", "jcmd");
+        if (!process.isAlive() || !Files.isExecutable(tool) || Thread.currentThread().isInterrupted()) {
+            Files.writeString(dump, "Owned child thread diagnostic unavailable.\n");
+            return dump;
+        }
+        Process diagnostic = new ProcessBuilder(tool.toString(), Long.toString(process.pid()), "Thread.print")
+                .redirectErrorStream(true).redirectOutput(dump.toFile()).start();
+        try {
+            if (!diagnostic.waitFor(5, TimeUnit.SECONDS)) {
+                diagnostic.destroyForcibly();
+                diagnostic.waitFor(5, TimeUnit.SECONDS);
+            }
+        } finally {
+            // This command belongs to the diagnostic; never stop the member being observed.
+            if (diagnostic.isAlive()) diagnostic.destroyForcibly();
+        }
+        return dump;
     }
 
     /**

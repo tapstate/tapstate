@@ -33,7 +33,8 @@ public record PipelineExplanation(
         Next next,
         Pending pending,
         ExecutionPlan plan,
-        List<String> awaitingRebalance) {
+        List<String> awaitingRebalance,
+        ClusterPipelineRecoveryView recovery) {
 
     public PipelineExplanation {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -51,6 +52,13 @@ public record PipelineExplanation(
         if (kind == Kind.NO_MATCH && cannotSay.isEmpty()) {
             throw new IllegalArgumentException("a no-match explanation names what it cannot say");
         }
+    }
+
+    public PipelineExplanation(String pipelineId, PipelineState state, Kind kind, String message,
+            Instant observedAt, Long observedAgeMillis, Freshness freshness, List<Evidence> evidence,
+            List<String> cannotSay, Next next, Pending pending, ExecutionPlan plan, List<String> awaitingRebalance) {
+        this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay,
+                next, pending, plan, awaitingRebalance, null);
     }
 
     /** An explanation of a run with no plan recorded. */
@@ -72,7 +80,12 @@ public record PipelineExplanation(
      */
     public PipelineExplanation withPlan(ExecutionPlan plan, List<String> awaitingRebalance) {
         return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, recovery);
+    }
+
+    public PipelineExplanation withRecovery(ClusterPipelineRecoveryView view) {
+        return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, view);
     }
 
     public enum Kind {

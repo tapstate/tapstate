@@ -95,6 +95,8 @@ class MongoArtifactStoreRetryTest {
                 });
         MongoCollection<Document> collection = (MongoCollection<Document>) Proxy.newProxyInstance(
                 MongoCollection.class.getClassLoader(), new Class<?>[]{MongoCollection.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("withReadPreference") || method.getName().equals("withReadConcern")
+                            || method.getName().equals("withWriteConcern")) return proxy;
                     if (!method.getName().equals("insertOne")) throw new AssertionError(method.getName());
                     if (!atCommit) throw error;
                     return null;

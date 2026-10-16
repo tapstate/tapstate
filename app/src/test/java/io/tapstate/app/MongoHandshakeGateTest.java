@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.testsupport.MongoHandshakeGate;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledOnOs;

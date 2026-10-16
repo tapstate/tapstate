@@ -14,6 +14,7 @@ import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.ReplayFloor;
 import java.util.ArrayList;
@@ -48,6 +49,30 @@ class AFailedHandoffLeavesTheDocumentWholeTest {
     private final HeapNestStore<RootAssembly> documents = new HeapNestStore<>();
     private final TestOutbox resolverOut = new TestOutbox(256);
     private final TestOutbox assemblerOut = new TestOutbox(256);
+
+    @Test
+    void aFailedRootHandoverLeavesAllRowsInTheDonor() throws Exception {
+        NestTopology tracked = NestTopology.compile("p", "doc", nest(new NestRoot("customer",
+                List.of("customer_id"), null, true, List.of(embed("policy", "customer_id", "customer_id",
+                        EmbedAs.ARRAY, "policies", List.of("policy_no"))))), tables());
+        AssemblerProcessor processor = new AssemblerProcessor(tracked.assembler(), tracked.slots(), documents,
+                "doc", null, null, ReplayFloor.NONE, NestSettings.defaults(), NestClock.SYSTEM,
+                NestSendPolicy.within(0), new RefusesToSave());
+        processor.init(assemblerOut, new TestProcessorContext());
+        RootAssembly donor = new RootAssembly();
+        donor.applyRoot(row("customer_id", "C1"), at(1));
+        donor.applyElement(new ElementRef(List.of("policies"), null, List.of("PN-1"), null),
+                row("policy_id", "P1", "policy_no", "PN-1"), at(2), Map.of());
+        documents.save(List.of("C1"), donor);
+        TestInbox move = new TestInbox();
+        move.add(Envelope.update(3, "customer", row("customer_id", "C1"), row("customer_id", "C2"), null)
+                .withOrder(at(3)));
+
+        assertThatThrownBy(() -> processor.process(2, move)).isInstanceOf(IllegalStateException.class);
+
+        assertThat((List<?>) documents.load(List.of("C1")).render(tracked.slots()).orElseThrow().get("policies"))
+                .as("parking did not accept the handover, so the donor must retain every row").hasSize(1);
+    }
 
     @Test
     void aFailedParkingWriteLeavesTheSubtreeInTheDocumentItCameFrom() throws Exception {

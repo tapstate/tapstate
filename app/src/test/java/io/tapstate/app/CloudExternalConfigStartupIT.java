@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.testsupport.MongoHandshakeGate;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.client.MongoClients;
@@ -74,7 +76,8 @@ class CloudExternalConfigStartupIT {
 
     @Container
     private static final MongoDBContainer MONGO =
-            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+            new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                    .withCommand("--replSet", "docker-rs", "--wiredTigerCacheSizeGB", "1.0");
 
     @TempDir static Path fixtureDirectory;
     private static final Map<Distribution, Path> JARS = new EnumMap<>(Distribution.class);

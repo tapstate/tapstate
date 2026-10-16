@@ -31,6 +31,13 @@
       <artifactId>tapdata-pdk-api</artifactId>
     </dependency>
 
+    <!-- The preserved SDK exception contract shares the host loader with the PDK API. -->
+    <dependency>
+      <groupId>io.tapdata</groupId>
+      <artifactId>pdk-error-code</artifactId>
+      <version>${pdk-errorcode.version}</version>
+    </dependency>
+
     <!-- The host's logging facade. A connector's own output is written through this rather than being
          dropped or printed straight to the console, so it lands in the same log, under the same format,
          and with the pipeline attribution the read face files lines by. Facade only: which backend it
@@ -159,7 +166,7 @@
          tapdata error-code libraries). That tree resolves cleanly under the full enforcer — no rule is
          relaxed for this profile: it converges, respects the upper-bound gate, and (crucially for rule
          R3) carries no Spring and no Hazelcast, so the adapters-ring cross-ring blacklist stays fully in
-         force and green. The compile surface is unchanged (tapdata-pdk-api only), so the ArchUnit R3
+         force and green. The compile surface remains the shared PDK API and exception contract, so the ArchUnit R3
          import lock is untouched. -->
     <profile>
       <id>pdk-it</id>

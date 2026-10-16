@@ -184,8 +184,8 @@ boot.node-session-ttl-invalid:
   message: "The node-session lease lifetime must be positive."
   solution: "Set tapstate.cluster.node-session-ttl to a positive duration."
 boot.workload-claim-renew-interval-invalid:
-  message: "The workload-claim renewal interval must be positive and shorter than its lease."
-  solution: "Set tapstate.cluster.workload-claim-renew-interval below tapstate.cluster.workload-claim-ttl."
+  message: "The workload-claim renewal interval must be positive and shorter than the workload-claim and node-session lease lifetimes."
+  solution: "Set tapstate.cluster.workload-claim-renew-interval below both tapstate.cluster.workload-claim-ttl and tapstate.cluster.node-session-ttl."
 boot.workload-claim-ttl-invalid:
   message: "The workload-claim lease must be positive."
   solution: "Set tapstate.cluster.workload-claim-ttl to a positive duration."
@@ -198,6 +198,9 @@ capture.start-from-outside-window:
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."
+capture.reader-startup-failed:
+  message: "Source '{source}' failed during reader startup for pipeline '{pipeline}' ({code})."
+  solution: "Inspect the recorded source failure and its requested position before retrying."
 capture.recovery-log-gap:
   message: "Change log `{ring}` cannot recover sequence {sequence}: {reason}."
   solution: "Restore the retained SRS log or stop with state purge and perform a full reload. Do not resume from a newer cursor; a CDC-only baseline requires explicit acceptance of the missing interval."
@@ -465,6 +468,12 @@ dsl.undefined-variable:
 dsl.malformed-interpolation:
   message: "Reference '{ref}' is not a form the grammar defines."
   solution: "A reference names a variable, as in ${var:NAME:default} for one with a fallback; a lone dollar sign is ordinary text."
+lifecycle.cluster-capacity-refused:
+  message: "Node {node} cannot reserve {requested} {resource}: {occupied} already occupied, ceiling {limit}."
+  solution: "Wait for a pending rebuild or execution to release its resources, reduce the pipeline's computed demand, or configure a verified larger capacity ceiling."
+lifecycle.cluster-capacity-unproven:
+  message: "Pipeline {pipeline} cannot start because its resource upper bound is unproven: {reason}."
+  solution: "Resolve the unavailable compiled resource facts before starting; unknown resource demand cannot be counted as zero."
 lifecycle.illegal-transition:
   message: "Cannot {verb} a pipeline in state {from}."
   solution: "Only certain actions are valid from each state; check the pipeline's current state first."
@@ -600,6 +609,9 @@ connector.projection-failed:
 connector.capture-failed:
   message: "Connector '{connector}' failed while reading: {detail}."
   solution: "Check the source is reachable and the connection settings are correct."
+connector.resume-position-rejected:
+  message: "Connector '{connector}' rejected retained position '{requested}' because its source log no longer contains it."
+  solution: "The SDK reported {pdkId} error {pdkCode}, server code {serverCode}, and arguments {pdkArgs}. Stop the pipeline and inspect source log retention before explicitly choosing a new start; recovery does not reset the position."
 connector.position-unrenderable:
   message: "Connector '{connector}' produced a stream position that could not be recorded: {detail}."
   solution: "Without a recordable position this source can only be read from the present; report the connector build that produced it."
@@ -738,6 +750,9 @@ engine.cluster-refused-the-state:
 engine.membership-changed-before-start:
   message: "Pipeline {pipeline} was planned for {planned} members but started on {actual}; it was stopped before any processor ran."
   solution: "Nothing to do: the next start works the plan out again for the members present then."
+engine.execution-cohort-changed-before-start:
+  message: "Pipeline {pipeline} could not start because its execution cohort changed ({reason}); planned {planned}, observed {actual}. This execution was refused before its processors ran."
+  solution: "Check that all data members have the same admitted profile and valid node sessions. Retry only after the live identities and committed membership agree."
 engine.job-failed:
   message: "Pipeline {pipeline} stopped because its job failed: {cause}."
   solution: "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."
@@ -942,6 +957,9 @@ nest.root-fanout-limit-exceeded:
 nest.migration-parking-limit-exceeded:
   message: "Rows on their way to {address} have parked {changes} changes, past the limit of {limit}."
   solution: "These rows are in no document while they sit there and the durable position is held below the change that moved them, so this is worth looking at rather than only raising. Reaching it usually means the half of the move that collects them is not being worked - check that side before raising the limit."
+nest.migration-handover-unavailable:
+  message: "Parked handover {address} does not supply its promised piece {piece}."
+  solution: "The handover was refused without freeing its identifying entry. Retry the fenced execution after concurrent collection or storage availability settles; investigate the retained operator state if the piece remains unavailable."
 nest.reference-fanout-limit-exceeded:
   message: "Row {identity} behind embed {refPath} is referenced by {referrers} rows, past the per-row limit of {limit}."
   solution: "One change to that row rewrites that many documents, which is what this bounds - it is not a limit on storage, so widening how the references are held does not lift it. Raise the limit if the data really is this wide, or embed the row from the other side so the change travels with one document instead of all of them."
@@ -1054,3 +1072,22 @@ cli.auth-issuer-mismatch:
 actuation.unwind-parent-key-unresolved:
   message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
   solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
+
+boot.execution-profile-incompatible:
+  message: "Execution profile {proposed} is incompatible with active profile {active}."
+  solution: "Use identical product/runtime, heap, thread and capacity settings, or stop all members for a cold profile upgrade."
+boot.execution-profile-invalid:
+  message: "The execution profile cannot be constructed: {detail}."
+  solution: "Supply valid heap and capacity settings and a build with substituted runtime/PDK metadata."
+boot.profile-authorization-pending:
+  message: "The prior profile generation still has an outstanding authorization deadline."
+  solution: "Wait until its promised node-session horizon expires before starting the next profile generation."
+boot.profile-session-lost:
+  message: "The node session could not prove its profile while the member was joining."
+  solution: "Restore the coordination store and retry after the previous session expires."
+boot.legacy-cluster-active:
+  message: "Legacy cluster workload leases are still active."
+  solution: "Stop all legacy processes and wait for node and business leases and local authorization deadlines before the cold upgrade."
+migration.cold-upgrade-required:
+  message: "Live legacy workload leases prevent installing the execution-profile protocol."
+  solution: "Stop every legacy process, wait for its node/business leases and local authorization deadlines, then start the upgrade again."

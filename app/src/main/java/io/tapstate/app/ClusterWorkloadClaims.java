@@ -38,8 +38,9 @@ final class ClusterWorkloadClaims {
      *
      * <p>Every business claim needs the committed majority to renew. Most also need the topology they were
      * granted under to still be the committed one: their work is planned over the members, so a changed
-     * membership has them prove themselves again, and their holder takes the claim once more under the new
-     * revision on its next pass -- the same owner, so the same generation.
+     * membership has them prove themselves again. The pipeline holder refreshes acquisition topology on
+     * the renewal pass only after proving that its original authority is still leased, preserving the same
+     * owner, generations and frozen execution.
      *
      * <p>A capture claim is held to the majority alone. It decides which member tails a source, which a
      * member joining does not change -- and only a join moves the revision, since departures are never

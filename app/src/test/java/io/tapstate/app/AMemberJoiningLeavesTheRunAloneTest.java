@@ -65,7 +65,7 @@ class AMemberJoiningLeavesTheRunAloneTest {
 
         // What a rebalance is, at this level: not a redistribution of the run that is going, but the
         // next run being planned over the cluster that is there when it is submitted.
-        takeTheClaimAgainUnderTheClusterThatIsHereNow();
+        refreshTheClaimUnderTheClusterThatIsHereNow();
         assertThat(ownership.beginExecution("orders").allowed()).isTrue();
 
         assertThat(ownership.runMembership("orders").values())
@@ -84,14 +84,16 @@ class AMemberJoiningLeavesTheRunAloneTest {
         assertThat(ownership.beginExecution("orders").allowed()).isTrue();
     }
 
-    /** A claim granted under a cluster that has since moved is refused on renew, then taken afresh. */
-    private void takeTheClaimAgainUnderTheClusterThatIsHereNow() {
+    /** The same live holder refreshes its lease without changing the run's frozen member set. */
+    private void refreshTheClaimUnderTheClusterThatIsHereNow() {
+        var original = ownership.currentClaim("orders").orElseThrow();
         nanos.addAndGet(RENEW.toNanos() + 1);
-        assertThat(ownership.permit("orders").granted())
-                .as("the renew is refused: this claim was granted under a cluster that is gone")
-                .isFalse();
-        nanos.addAndGet(RENEW.toNanos() + 1);
-        assertThat(ownership.permit("orders").granted()).isTrue();
+        var refreshed = ownership.permit("orders");
+        assertThat(refreshed.granted()).isTrue();
+        assertThat(refreshed.claim().claimGeneration()).isEqualTo(original.claimGeneration());
+        assertThat(refreshed.claim().executionGeneration()).isEqualTo(original.executionGeneration());
+        assertThat(refreshed.claim().executionNodeIds()).isEqualTo(original.executionNodeIds());
+        assertThat(refreshed.claim().topologyRevision()).isEqualTo(8);
     }
 
     private static ClusterProperties production() {

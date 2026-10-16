@@ -12,6 +12,8 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.ExecutionProfile;
+import io.tapstate.spi.store.PendingPipelineResume;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -19,6 +21,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -79,6 +82,93 @@ class WorkloadClaimStoreIT {
             assertThat(second.owner().bootId()).isEqualTo("boot-2");
             assertThat(collection.countDocuments()).isEqualTo(1);
         });
+    }
+
+    @Test
+    void theSameBootCannotReuseAReleasedClaimGeneration() {
+        withStore((store, collection) -> {
+            WorkloadClaimKey pipeline = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            WorkloadOwner owner = new WorkloadOwner("node-a", "boot-1");
+            WorkloadClaim first = store.acquire(pipeline, owner, 7, TTL).claim();
+            WorkloadClaim original = store.advanceExecution(first, 7, Set.of("node-a", "node-b")).orElseThrow();
+            assertThat(store.release(original)).isTrue();
+
+            WorkloadClaim current = store.acquire(pipeline, owner, 7, TTL).claim();
+
+            assertThat(current.claimGeneration()).isEqualTo(original.claimGeneration() + 1);
+            assertThat(PendingPipelineResume.sameExecutionContext(original, current)).isTrue();
+            assertOldGenerationIsRejected(store, collection, original, current);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void theSameBootCannotReuseAnExpiredClaimGeneration() {
+        withStore((store, collection) -> {
+            WorkloadClaimKey pipeline = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            WorkloadOwner owner = new WorkloadOwner("node-a", "boot-1");
+            WorkloadClaim first = store.acquire(pipeline, owner, 7, Duration.ofSeconds(2)).claim();
+            WorkloadClaim original = store.advanceExecution(first, 7, Set.of("node-a", "node-b")).orElseThrow();
+            awaitServerExpiry(store, pipeline);
+
+            WorkloadClaim current = store.acquire(pipeline, owner, 7, TTL).claim();
+
+            assertThat(current.claimGeneration()).isEqualTo(original.claimGeneration() + 1);
+            assertThat(PendingPipelineResume.sameExecutionContext(original, current)).isTrue();
+            assertOldGenerationIsRejected(store, collection, original, current);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aLiveSameBootCanRefreshTopologyWithoutChangingItsGenerationOrExecutionContext() {
+        withStore((store, collection) -> {
+            WorkloadClaimKey pipeline = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            WorkloadOwner owner = new WorkloadOwner("node-a", "boot-1");
+            WorkloadClaim first = store.acquire(pipeline, owner, 7, TTL).claim();
+            WorkloadClaim original = store.advanceExecution(first, 7, Set.of("node-a", "node-b")).orElseThrow();
+
+            WorkloadClaim refreshed = store.acquire(pipeline, owner, 8, TTL).claim();
+
+            assertThat(refreshed.claimGeneration()).isEqualTo(original.claimGeneration());
+            assertThat(refreshed.topologyRevision()).isEqualTo(8);
+            assertThat(PendingPipelineResume.sameExecutionContext(original, refreshed)).isTrue();
+            assertThat(store.renew(original, TTL)).isEmpty();
+            assertThat(store.renew(refreshed, TTL)).isPresent();
+            assertThat(store.read(pipeline).orElseThrow().claim().executionGeneration()).isEqualTo(original.executionGeneration());
+        });
+    }
+
+    @Test
+    void profiledSameBootReacquisitionSeparatesLeaseContinuityFromRetiredAuthority() {
+        for (boolean release : List.of(false, true)) {
+            withProfiledStore((store, collection) -> {
+                WorkloadClaimKey pipeline = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+                WorkloadOwner owner = new WorkloadOwner("node-a", "boot-1");
+                WorkloadClaim first = store.acquire(pipeline, owner, 7, Duration.ofSeconds(2)).claim();
+                WorkloadClaim original = store.advanceExecution(first, 7, Set.of("node-a", "node-b")).orElseThrow();
+                WorkloadClaim refreshed = store.acquire(pipeline, owner, 8, Duration.ofSeconds(2)).claim();
+                assertThat(refreshed.profileGeneration()).isPositive();
+                assertThat(refreshed.executionProfile().generation()).isEqualTo(refreshed.profileGeneration());
+                assertThat(refreshed.claimGeneration()).isEqualTo(original.claimGeneration());
+                assertThat(refreshed.topologyRevision()).isEqualTo(8);
+                assertThat(refreshed.executionTopologyRevision()).isEqualTo(7);
+                assertThat(PendingPipelineResume.sameExecutionContext(original, refreshed)).isTrue();
+                if (release) {
+                    assertThat(store.release(refreshed)).isTrue();
+                } else {
+                    awaitServerExpiry(store, pipeline);
+                }
+
+                WorkloadClaim current = store.acquire(pipeline, owner, 8, TTL).claim();
+
+                assertThat(current.claimGeneration()).isEqualTo(refreshed.claimGeneration() + 1);
+                assertThat(PendingPipelineResume.sameExecutionContext(refreshed, current)).isTrue();
+                assertOldGenerationIsRejected(store, collection, refreshed, current);
+                assertThat(collection.countDocuments(new org.bson.Document("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())))
+                        .isEqualTo(1);
+            });
+        }
     }
 
     @Test
@@ -250,6 +340,47 @@ class WorkloadClaimStoreIT {
             commands.clear();
             assertThat(store.readAll(List.of())).isEmpty();
             assertThat(commands).as("asking for nothing sends nothing").isEmpty();
+        }
+    }
+
+    private static void assertOldGenerationIsRejected(MongoWorkloadClaimStore store,
+            com.mongodb.client.MongoCollection<org.bson.Document> collection, WorkloadClaim original, WorkloadClaim current) {
+        org.bson.Document before = collection.find(new org.bson.Document("resourceId", current.key().resourceId())).first();
+        assertThat(store.renew(original, TTL)).isEmpty();
+        assertThat(store.advanceExecution(original, original.topologyRevision(), original.executionNodeIds())).isEmpty();
+        assertThat(store.recordExecutionFailure(original, false)).isEmpty();
+        assertThat(store.release(original)).isFalse();
+        assertThat(collection.find(new org.bson.Document("resourceId", current.key().resourceId())).first()).isEqualTo(before);
+        assertThat(store.read(current.key()).orElseThrow().claim()).isEqualTo(current);
+    }
+
+    private static void awaitServerExpiry(MongoWorkloadClaimStore store, WorkloadClaimKey key) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(8).toNanos();
+        while (store.read(key).orElseThrow().leased()) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("the claim did not expire on the Mongo server clock");
+            }
+            Thread.sleep(10);
+        }
+    }
+
+    private static void withProfiledStore(CheckedBody body) {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate");
+            var collection = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS);
+            var profiles = database.getCollection("workload_test_profiles");
+            var registry = database.getCollection("workload_test_nodes");
+            collection.drop();
+            profiles.drop();
+            registry.drop();
+            MongoClusterProfileStore profileStore = new MongoClusterProfileStore(client, profiles, collection, registry);
+            profileStore.reserve("cluster-a", new WorkloadOwner("node-a", "boot-1"), URI.create("http://node-a:8080"),
+                    new ExecutionProfile(1, Map.of("build", "one", "threads", "4")), Duration.ofMinutes(1));
+            body.run(new MongoWorkloadClaimStore(collection, profileStore), collection);
+        } catch (RuntimeException | Error failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw new AssertionError(failure);
         }
     }
 

@@ -6,16 +6,19 @@ import static io.tapstate.runtime.engine.nest.NestTreeFixtures.embed;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.nest;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.tables;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.ReplayFloor;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +57,144 @@ class AHandOverIsWrittenInBatchesTheDeploymentSizesTest {
     private final NestBinding.NestStores stores = HeapNestStores.onHeap();
     private final HeapNestStore<RootAssembly> documents = new HeapNestStore<>();
     private final TestOutbox out = new TestOutbox(512);
+
+    @Test
+    void aRecoveredHandoverCountsItsStoredRowsBeforeAcceptingAnotherMove() {
+        HeapNestStore<ParkedSubtree> parking = new HeapNestStore<>();
+        ParkedSubtree.At address = ParkedSubtree.At.ofRoot(List.of("C2"));
+        NestMigrationWriter.publish(address, new CountingRows(5), parking, 2, 5);
+        ParkedSubtree original = parking.load(address);
+
+        assertThatThrownBy(() -> NestMigrationWriter.publish(address, new CountingRows(1), parking, 2, 5))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(NestError.MIGRATION_PARKING_LIMIT_EXCEEDED);
+                    assertThat(failure.args()).containsEntry("changes", 6L).containsEntry("limit", 5L);
+                });
+
+        assertThat(parking.load(address)).isEqualTo(original);
+    }
+
+    @Test
+    void aMissingPromisedPieceRefusesAnAppendWithoutReplacingTheHeader() {
+        HeapNestStore<ParkedSubtree> parking = new HeapNestStore<>();
+        ParkedSubtree.At address = ParkedSubtree.At.ofRoot(List.of("C2"));
+        ParkedSubtree original = new ParkedSubtree(List.of(new CountingRows(1).iterator().next()), 1);
+        parking.save(address, original);
+
+        assertThatThrownBy(() -> NestMigrationWriter.publish(address, new CountingRows(1), parking, 2, 50))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(NestError.MIGRATION_HANDOVER_UNAVAILABLE);
+                    assertThat(failure.args()).containsEntry("piece", 1);
+                });
+
+        assertThat(parking.load(address)).isEqualTo(original);
+    }
+
+    @Test
+    void aMissingPromisedPieceIsNotSilentlySkippedByTheReceivingDocument() throws Exception {
+        NestStore<ParkedSubtree> parking = stores.forParking(TOPOLOGY.assembler());
+        ParkedSubtree.At address = ParkedSubtree.At.ofRoot(List.of("C2"));
+        ParkedSubtree original = new ParkedSubtree(List.of(new CountingRows(1).iterator().next()), 1);
+        parking.save(address, original);
+        AssemblerProcessor gaining = assembler(twoPerBatch());
+
+        assertThatThrownBy(() -> feed(gaining, OWN_ROWS, renamed("C1", "C2")))
+                .isInstanceOfSatisfying(TapstateException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(NestError.MIGRATION_HANDOVER_UNAVAILABLE));
+
+        assertThat(parking.load(address)).isEqualTo(original);
+    }
+
+    @Test
+    void boundedChunksPublishEveryRowInItsOriginalOrder() {
+        HeapNestStore<ParkedSubtree> parking = new HeapNestStore<>();
+        ParkedSubtree.At address = ParkedSubtree.At.ofRoot(List.of("C2"));
+        NestMigrationWriter.publish(address, new CountingRows(21), parking, 2, 50);
+        ParkedSubtree first = parking.load(address);
+        List<NestElement> rows = new ArrayList<>(first.changes());
+        assertThat(first.changes()).hasSizeLessThanOrEqualTo(2);
+        for (int piece = 1; piece <= first.batches(); piece++) {
+            ParkedSubtree next = parking.load(address.piece(piece));
+            assertThat(next.changes()).hasSizeLessThanOrEqualTo(2);
+            rows.addAll(next.changes());
+        }
+        assertThat(rows).extracting(row -> row.fields().get("policy_no"))
+                .containsExactlyElementsOf(java.util.stream.IntStream.range(0, 21)
+                        .mapToObj(index -> "PN-" + index).toList());
+    }
+
+    @Test
+    void aHandoverViewDoesNotCopyRowsThatHaveNotBeenConsumed() {
+        RootAssembly donor = new RootAssembly();
+        ElementRef parent = new ElementRef(List.of("policies"), null, List.of("PN-1"), List.of("P1"));
+        donor.applyElement(parent, row("policy_id", "P1"), at(1), Map.of());
+        ElementRef first = new ElementRef(List.of("policies", "claims"), List.of("P1"), List.of("K1"), null);
+        ElementRef later = new ElementRef(List.of("policies", "claims"), List.of("P1"), List.of("K2"), null);
+        donor.applyElement(first, row("claim_id", "K1", "value", "first"), at(2), Map.of());
+        donor.applyElement(later, row("claim_id", "K2", "value", "before"), at(3), Map.of());
+
+        Iterable<NestElement> handover = donor.subtreeForHandover(parent);
+        donor.applyElement(later, row("claim_id", "K2", "value", "after"), at(4), Map.of());
+
+        Iterator<NestElement> rows = handover.iterator();
+        assertThat(rows.next().fields()).containsEntry("claim_id", "K1");
+        assertThat(rows.next().fields()).as("a later row is copied only as its writer consumes it")
+                .containsEntry("claim_id", "K2").containsEntry("value", "after");
+        assertThat(rows.hasNext()).isFalse();
+    }
+
+    @Test
+    void aFailedChunkWriteDoesNotPullRowsBeyondTheHeadAndCurrentChunk() {
+        CountingRows rows = new CountingRows(21);
+        NestStore<ParkedSubtree> refuses = new NestStore<>() {
+            @Override public ParkedSubtree load(Object key) { return null; }
+            @Override public void save(Object key, ParkedSubtree value) {
+                throw new IllegalStateException("parking write refused");
+            }
+            @Override public void remove(Object key) { }
+            @Override public long count() { return 0; }
+        };
+
+        assertThatThrownBy(() -> NestMigrationWriter.publish(ParkedSubtree.At.ofRoot(List.of("C2")),
+                rows, refuses, 2, 50)).isInstanceOf(IllegalStateException.class);
+
+        assertThat(rows.produced).as("the writer retains one identifying chunk and one current chunk")
+                .isLessThanOrEqualTo(4);
+    }
+
+    @Test
+    void aParkingLimitStopsBeforeMaterializingTheRestOfTheInput() {
+        CountingRows rows = new CountingRows(21);
+        HeapNestStore<ParkedSubtree> parking = new HeapNestStore<>();
+        ParkedSubtree.At address = ParkedSubtree.At.ofRoot(List.of("C2"));
+
+        assertThatThrownBy(() -> NestMigrationWriter.publish(address, rows, parking, 2, 3))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(NestError.MIGRATION_PARKING_LIMIT_EXCEEDED);
+                    assertThat(failure.args()).containsEntry("changes", 4L).containsEntry("limit", 3L);
+                });
+
+        assertThat(rows.produced).isEqualTo(4);
+        assertThat(parking.load(address)).as("an incomplete handover has no collectible identifying entry")
+                .isNull();
+    }
+
+    private static final class CountingRows implements Iterable<NestElement> {
+        private final int count;
+        private int produced;
+        private CountingRows(int count) { this.count = count; }
+        @Override public Iterator<NestElement> iterator() {
+            return new Iterator<>() {
+                @Override public boolean hasNext() { return produced < count; }
+                @Override public NestElement next() {
+                    int ordinal = produced++;
+                    return new NestElement(new ElementRef(List.of("policies"), null,
+                            List.of("PN-" + ordinal), null), row("policy_no", "PN-" + ordinal),
+                            at(ordinal + 1L), Map.of());
+                }
+            };
+        }
+    }
 
     @Test
     void aTreeWiderThanOneBatchIsParkedAsSeveralEntries() throws Exception {

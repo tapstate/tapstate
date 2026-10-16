@@ -81,11 +81,14 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester,
-            HazelcastInstance hazelcastMember, CloudRuntimeSettings cloud, ParallelismBudget parallelismBudget) {
+            HazelcastInstance hazelcastMember, CloudRuntimeSettings cloud, ParallelismBudget parallelismBudget, SnapshotBuffer snapshotBuffer) {
         return new StoreBackedDagSource(storePort, nestSettings,
                 StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT),
                 SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()),
-                cloud.cloud(), () -> dataMembers(hazelcastMember), parallelismBudget);
+                cloud.cloud(), () -> dataMembers(hazelcastMember), parallelismBudget,
+                new DagResourceAnalyzer.Limits(hazelcastMember.getConfig().getJetConfig().getCooperativeThreadCount(),
+                        snapshotBuffer.capacity(), hazelcastMember.getConfig().findRingbufferConfig("srs.planning").getCapacity(),
+                        hazelcastMember.getConfig().getJetConfig().getDefaultEdgeConfig().getQueueSize()));
     }
 
     /**
@@ -175,13 +178,14 @@ class DataPlaneActuationConfiguration {
     ExecutionAuthorization executionAuthorization(
             HazelcastInstance hazelcastMember,
             ClusterProperties clusterProperties,
-            WorkloadClaimStore workloadClaimStore) {
+            WorkloadClaimStore workloadClaimStore,
+            NodeSessionLease nodeSessionLease) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return ExecutionAuthorization.unfenced();
         }
         ExecutionAuthorization authorization = new ExecutionAuthorization(
                 clusterProperties.getId(), workloadClaimStore,
-                clusterProperties.getWorkloadClaimRenewInterval());
+                clusterProperties.getWorkloadClaimRenewInterval(), nodeSessionLease);
         hazelcastMember.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         return authorization;
     }
@@ -199,17 +203,17 @@ class DataPlaneActuationConfiguration {
      * membership that has stopped moving rather than into the middle of a handover.
      */
     @Bean
-    RebuildAdmission rebuildAdmission(
+    ClusterRecoveryRuntime rebuildAdmission(
             ClusterProperties clusterProperties, HazelcastProperties hazelcastProperties,
-            PipelineActuationOwnership pipelineActuationOwnership, Engine engine) {
-        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return RebuildAdmission.never();
-        }
-        return new ClusterRebuildAdmission(
-                pipelineActuationOwnership,
-                pipelineId -> engine.failureOf(pipelineId)
-                        .map(ClusterRebuildAdmission::isMembershipChangedBeforeStart).orElse(false),
-                clusterProperties.getWorkloadClaimTtl(), hazelcastProperties.getMaximumNoHeartbeat());
+            PipelineActuationOwnership pipelineActuationOwnership, Engine engine, StorePort storePort,
+            DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            ClusterWorkloadClaims workloadClaims, ClusterMembershipGate membershipGate,
+            HazelcastInstance hazelcastMember, io.tapstate.core.lifecycle.ClusterCapacityLimits capacityLimits,
+            NestStateTeardown stateTeardown) {
+        return new ClusterRecoveryRuntime(storePort, dagSource, captureCoordinator, engine,
+                pipelineActuationOwnership, workloadClaims, membershipGate, hazelcastMember,
+                clusterProperties, capacityLimits, stateTeardown.defaultDatabase(),
+                hazelcastProperties.getMaximumNoHeartbeat());
     }
 
     /**
@@ -288,9 +292,9 @@ class DataPlaneActuationConfiguration {
     LifecycleActuator lifecycleActuator(Engine engine, DagSource dagSource,
             PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown,
             PipelineActuationOwnership pipelineActuationOwnership, HazelcastExecutionPlans executionPlans,
-            HazelcastInstance hazelcastMember) {
+            HazelcastInstance hazelcastMember, ClusterRecoveryRuntime admission) {
         return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown,
                 pipelineActuationOwnership, executionPlans, Clock.systemUTC(),
-                new HazelcastConnectorReadiness(hazelcastMember, CONNECTOR_READINESS_TIMEOUT));
+                new HazelcastConnectorReadiness(hazelcastMember, CONNECTOR_READINESS_TIMEOUT), admission);
     }
 }

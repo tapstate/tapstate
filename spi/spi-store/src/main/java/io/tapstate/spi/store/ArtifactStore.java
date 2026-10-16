@@ -159,6 +159,11 @@ public interface ArtifactStore {
     /** Returns the stored resource for the id, or empty if none is stored. */
     Optional<Resource> get(String id);
 
+    /** Reads the stored incarnation and content frontier; it never creates identity during a read. */
+    default Optional<ArtifactIdentity> identity(String id) {
+        throw new UnsupportedOperationException("durable artifact identity is not configured");
+    }
+
     /** Lists every stored resource. */
     List<Resource> list();
 

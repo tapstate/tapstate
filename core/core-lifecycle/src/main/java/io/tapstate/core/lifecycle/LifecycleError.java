@@ -42,7 +42,14 @@ public enum LifecycleError implements TapstateErrorCode {
      * {@code pipeline} is the id the caller gave. Permanent -- unlike an applied pipeline with no
      * observation published yet, waiting will never turn this into a usable id.
      */
-    UNKNOWN_PIPELINE("lifecycle.unknown-pipeline", Set.of("pipeline"));
+    UNKNOWN_PIPELINE("lifecycle.unknown-pipeline", Set.of("pipeline")),
+
+    /** Aggregate execution and reserved demand would exceed a member's configured ceiling. */
+    CLUSTER_CAPACITY_REFUSED("lifecycle.cluster-capacity-refused",
+            Set.of("node", "resource", "occupied", "requested", "limit")),
+
+    /** An enforced owned resource has no computable upper bound before submission. */
+    CLUSTER_CAPACITY_UNPROVEN("lifecycle.cluster-capacity-unproven", Set.of("pipeline", "reason"));
 
     private final String code;
     private final Set<String> placeholders;

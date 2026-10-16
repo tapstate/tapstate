@@ -520,6 +520,29 @@ final class Synthetic {
                 "LargeSource", "", register, "  private volatile boolean stopped;", discovery, "stopped = true;"));
     }
 
+    /** Delivers one oversized source batch, ignoring the requested batch size, with optional decode instrumentation. */
+    static Path oversizedSource(Path dir, int rows, String decodeCounter) {
+        String events = "List<TapEvent> events = new ArrayList<>();"
+                + "for (int i = 1; i <= " + rows + "; i++) {"
+                + "Map<String,Object> row = new DecodeObservedMap(); row.put(\"id\", i);"
+                + "events.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime((long) i).after(row)); }";
+        String register = "functions.supportTimestampToStreamOffset((context, timestamp) -> \"start\");"
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + events + "consumer.accept(events, null); });"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "consumer.streamReadStarted();" + events + "consumer.accept(events, \"batch-end\");"
+                + "consumer.accept(new ArrayList<TapEvent>(), \"heartbeat\"); });";
+        String members = "private static class DecodeObservedMap extends LinkedHashMap<String,Object> {"
+                + "private boolean seen;"
+                + "public java.util.Set<Map.Entry<String,Object>> entrySet() {"
+                + "if (!seen) { seen = true; Object counter = System.getProperties().get(\"" + decodeCounter + "\");"
+                + "if (counter instanceof java.util.concurrent.atomic.AtomicLong)"
+                + "((java.util.concurrent.atomic.AtomicLong) counter).incrementAndGet(); }"
+                + "return super.entrySet(); }}";
+        return SyntheticJar.compileToJar(dir, "synthetic.OversizedSource",
+                source("OversizedSource", "", register, members));
+    }
+
     /** A connector whose batchRead throws — a connector-side read failure. */
     static Path throwingReadSource(Path dir) {
         String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"

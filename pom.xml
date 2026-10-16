@@ -53,6 +53,12 @@
 
   <properties>
     <revision>0.6.0</revision>
+    <!-- PDK coordinates shared by dependency management and immutable execution-profile metadata. -->
+    <pdk-api.version>2.0.8-SNAPSHOT</pdk-api.version>
+    <pdk-entity.version>2.0.9-SNAPSHOT</pdk-entity.version>
+    <pdk-errorcode.version>2.8-SNAPSHOT</pdk-errorcode.version>
+    <pdk-runner.version>2.8-SNAPSHOT</pdk-runner.version>
+    <pdk-common.version>2.8-SNAPSHOT</pdk-common.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
     <!-- Reproducible build: the same commit must produce bit-identical artifacts -->

@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineStatus;
+import io.tapstate.control.core.ClusterPipelineRecoveryView;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
@@ -31,7 +32,8 @@ record PipelineStatusResponse(
         PipelineState observedState,
         boolean hasArtifact,
         ExecutionPlanResponse plan,
-        List<String> awaitingRebalance) {
+        List<String> awaitingRebalance,
+        ClusterPipelineRecoveryView recovery) {
 
     /**
      * A coded failure as a client reads it: the canonical code string, its named arguments sorted for a stable
@@ -52,7 +54,7 @@ record PipelineStatusResponse(
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 null, status.state(), true, ExecutionPlanResponse.of(status.plan()),
-                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance());
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), status.recovery());
     }
 
     static PipelineStatusResponse of(
@@ -65,7 +67,7 @@ record PipelineStatusResponse(
                         : Math.max(0, Duration.between(observedAt, Clock.systemUTC().instant()).toMillis()),
                 status.desiredState(), runtime.state(), item.hasArtifact(),
                 ExecutionPlanResponse.of(runtime.plan()),
-                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance());
+                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance(), runtime.recovery());
     }
 
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
@@ -73,14 +75,24 @@ record PipelineStatusResponse(
     }
 
     /** Builds a catalog status without inventing a runtime observation when none has been published yet. */
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog,
+            ClusterPipelineRecoveryView recovery) {
+        return of(item, catalog, Clock.systemUTC(), recovery);
+    }
+
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock) {
+        return of(item, catalog, clock, null);
+    }
+
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock,
+            ClusterPipelineRecoveryView recovery) {
         PipelineCatalogItem.Status status = item.status();
         PipelineState state = status.observedState() == null ? PipelineState.NEW : status.observedState();
         Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(item.id(), state, status.displayState(),
                 failure(status.failure(), catalog), observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
-                status.desiredState(), status.observedState(), item.hasArtifact(), null, null);
+                status.desiredState(), status.observedState(), item.hasArtifact(), null, null, recovery);
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {

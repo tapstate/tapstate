@@ -23,11 +23,24 @@ sealed interface ClusterMembersOutcome {
             String clusterId,
             Long topologyRevision,
             List<RemoteClusterMember> members,
-            List<RemotePipeline> pipelines)
+            List<RemotePipeline> pipelines,
+            Long profileGeneration,
+            String profileHash,
+            RemoteRecovery.Cluster recovery)
             implements ClusterMembersOutcome {
         public Listed {
             members = List.copyOf(members);
             pipelines = List.copyOf(pipelines);
+        }
+
+        Listed(String clusterId, Long topologyRevision, List<RemoteClusterMember> members,
+                List<RemotePipeline> pipelines) {
+            this(clusterId, topologyRevision, members, pipelines, null, null, null);
+        }
+
+        Listed(String clusterId, Long topologyRevision, List<RemoteClusterMember> members,
+                List<RemotePipeline> pipelines, Long profileGeneration, String profileHash) {
+            this(clusterId, topologyRevision, members, pipelines, profileGeneration, profileHash, null);
         }
     }
 

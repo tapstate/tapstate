@@ -80,6 +80,35 @@ public record ConsumerOffset(
         java.util.Objects.requireNonNull(progressKind, "progressKind");
     }
 
+    /** A run-local legacy read cursor is not a source position or a sink completion. */
+    public boolean legacyReadCursorOnly() {
+        return SrsConsumerId.sourceOf(pipelineId).isEmpty() && progressKind == ConsumerProgressKind.LEGACY
+                && !perTableSeq.isEmpty() && perTableSeq.values().stream().allMatch(value -> value != null && value >= -1)
+                && sinkAcked == null && sinkAckedByTable.isEmpty() && snapshotCompletedTables.isEmpty()
+                && cdcStartPosition == null && snapshotEpoch == 0;
+    }
+
+    /** Preserve raw evidence, excluding an obsolete cursor only after one scoped snapshot has a real seam. */
+    public static List<ConsumerOffset> activeForFlow(List<ConsumerOffset> raw,
+            java.util.function.Predicate<ConsumerOffset> cursorOnly) {
+        Map<String, Map<String, Integer>> scopedStarts = new java.util.HashMap<>();
+        for (ConsumerOffset scoped : raw) {
+            if (SrsConsumerId.sourceOf(scoped.pipelineId()).isPresent()
+                    && scoped.progressKind() != ConsumerProgressKind.DIRECT_SOURCE
+                    && scoped.cdcStartPosition() != null && !scoped.cdcStartPosition().isBlank()
+                    && scoped.snapshotEpoch() > 0 && scoped.perTableSeq().size() == 1) {
+                scopedStarts.computeIfAbsent(SrsConsumerId.pipelineOf(scoped.pipelineId()), ignored -> new java.util.HashMap<>())
+                        .merge(scoped.perTableSeq().keySet().iterator().next(), 1, Integer::sum);
+            }
+        }
+        return raw.stream().filter(legacy -> {
+            if (!legacy.legacyReadCursorOnly() || legacy.perTableSeq().size() != 1) { return true; }
+            int replacements = scopedStarts.getOrDefault(legacy.pipelineId(), Map.of())
+                    .getOrDefault(legacy.perTableSeq().keySet().iterator().next(), 0);
+            return replacements != 1 || !cursorOnly.test(legacy);
+        }).toList();
+    }
+
     /** Older callers do not establish a shared ordering between their table cursors. */
     public ConsumerOffset(String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked,
             List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch) {

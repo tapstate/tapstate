@@ -23,6 +23,13 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.ClusterRecoveryPosition;
+import io.tapstate.spi.store.CaptureResumePreparation;
+import io.tapstate.spi.store.CaptureStartupProof;
+import io.tapstate.spi.store.CaptureStartupFailure;
+import io.tapstate.runtime.srs.CaptureStartupException;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsConsumerId;
@@ -180,9 +187,30 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public synchronized void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+        startCapture(pipelineId, artifactSnapshot, null);
+    }
+
+    @Override
+    public synchronized void startCapture(String pipelineId, ArtifactStore artifactSnapshot, WorkloadClaimFence pipelineClaim) {
+        startCapture(pipelineId, artifactSnapshot, null, pipelineClaim);
+    }
+
+    @Override
+    public synchronized void startCapture(String pipelineId, ArtifactStore artifactSnapshot,
+            Map<String, SourceModel> frozenModels, WorkloadClaimFence pipelineClaim) {
+        boolean profiled = pipelineClaim != null && pipelineClaim.profileGeneration() > 0;
+        if (profiled && frozenModels == null) {
+            throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                    Map.of("pipeline", pipelineId, "source", pipelineId), null);
+        }
         // Idempotent: a pipeline whose capture is already running is left running, so a repeated start does not
         // open a second capture behind the one already filling the ring.
         if (runsByPipeline.containsKey(pipelineId)) {
+            if (profiled && runsByPipeline.get(pipelineId).stream()
+                    .anyMatch(run -> !sameExecution(run.spec.pipelineFence(), pipelineClaim))) {
+                throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                        Map.of("pipeline", pipelineId, "source", pipelineId), null);
+            }
             return;
         }
         ArtifactStore captured = Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
@@ -198,7 +226,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // back is given back having opened nothing: a source opened first would otherwise read its whole
         // load again on every pass until the last one was ready.
         Map<CaptureId, CaptureOwnership.Permit> permits = new LinkedHashMap<>();
-        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits);
+        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits, frozenModels);
+        if (profiled) {
+            try {
+                List<SourcePlan> frozen = new ArrayList<>();
+                Set<String> required = plans.stream().map(SourcePlan::sourceId)
+                        .collect(java.util.stream.Collectors.toUnmodifiableSet());
+                for (SourcePlan selected : plans) {
+                    CaptureRunSpec spec = selected.spec();
+                    CaptureResumeWitness witness = witness(spec);
+                    if (!storePort.meta().prepareCaptureResume(pipelineClaim, witness,
+                            witness.requestedPosition(selected.captureId().value()).orElse(null), required, spec.retention())) {
+                        throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                                Map.of("pipeline", pipelineId, "source", selected.sourceId()), null);
+                    }
+                    frozen.add(new SourcePlan(selected.sourceId(), selected.discovered(), selected.resolution(),
+                            spec.withResumeWitness(witness, pipelineClaim), selected.captureId()));
+                }
+                plans = List.copyOf(frozen);
+            } catch (RuntimeException | Error failure) {
+                releaseUnopened(permits, failure);
+                throw failure;
+            }
+        }
         List<PipelineRun> runs = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
         // Taken before the first source is opened, because the load is what these totals accumulate from
@@ -247,6 +297,114 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
     }
 
+    private static boolean sameExecution(WorkloadClaimFence actual, WorkloadClaimFence expected) {
+        return actual != null && actual.key().equals(expected.key()) && actual.owner().equals(expected.owner())
+                && actual.claimGeneration() == expected.claimGeneration()
+                && actual.executionGeneration() == expected.executionGeneration()
+                && actual.profileGeneration() == expected.profileGeneration();
+    }
+
+    private CaptureResumeWitness witness(CaptureRunSpec spec) {
+        return storePort.meta().resumeWitness(spec.sourceId(), spec.config().connectorId(), spec.miningChainId().value(),
+                spec.consumerId(), spec.readMode(), spec.srsEnabled(), spec.config().streams());
+    }
+
+    @Override
+    public Map<String, CaptureResumeWitness> resumeWitnesses(String pipelineId, ArtifactStore captured) {
+        Map<String, CaptureResumeWitness> found = new LinkedHashMap<>();
+        diagnosticSpecs(pipelineId, captured).forEach((source, spec) -> found.put(source, witness(spec)));
+        return Map.copyOf(found);
+    }
+
+    @Override
+    public Map<String, ClusterRecoveryPosition> resumePositions(String pipelineId, ArtifactStore captured) {
+        Map<String, ClusterRecoveryPosition> found = new LinkedHashMap<>();
+        diagnosticSpecs(pipelineId, captured).forEach((source, spec) ->
+                witness(spec).requestedPosition(CaptureId.of(spec).value()).ifPresent(position -> found.put(source, position)));
+        return Map.copyOf(found);
+    }
+
+    private Map<String, CaptureRunSpec> diagnosticSpecs(String pipelineId, ArtifactStore captured) {
+        PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
+        Map<String, CaptureRunSpec> found = new LinkedHashMap<>();
+        for (SourceRef ref : pipeline.sources()) {
+            SourceResource source = StoredArtifacts.requireSource(captured, ref.id());
+            SourceModel model = SourceDiscovery.model(storePort, source);
+            SourceCaptureResolution.forPipeline(pipeline, source, model).ifPresent(resolution -> {
+                CaptureRunSpec spec = deriveSpec(pipelineId, pipeline.settings(), source, resolution,
+                        srsSwitchOf(pipelineId, ref), 1L).withPipelineSourceCount(pipeline.sources().size());
+                found.put(ref.id(), spec);
+            });
+        }
+        return Map.copyOf(found);
+    }
+
+    @Override
+    public Map<String, CaptureResumePreparation> preparedSources(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        if (!pipelineClaim.key().resourceId().equals(pipelineId)) {
+            throw new IllegalArgumentException("source startup authority must name its pipeline");
+        }
+        Map<String, CaptureResumePreparation> found = new LinkedHashMap<>();
+        storePort.meta().captureResumePreparations(pipelineClaim)
+                .forEach(prepared -> found.put(prepared.witness().sourceId(), prepared));
+        return Map.copyOf(found);
+    }
+
+    @Override
+    public Set<String> requiredSources(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        if (!pipelineClaim.key().resourceId().equals(pipelineId)) {
+            throw new IllegalArgumentException("source startup authority must name its pipeline");
+        }
+        return storePort.meta().captureResumePreparations(pipelineClaim).stream()
+                .flatMap(prepared -> prepared.requiredSourceIds().stream()).collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
+    @Override
+    public Map<String, CaptureStartupProof> startupProofs(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        if (!pipelineClaim.key().resourceId().equals(pipelineId)) {
+            throw new IllegalArgumentException("source startup authority must name its pipeline");
+        }
+        List<CaptureResumePreparation> prepared = storePort.meta().captureResumePreparations(pipelineClaim);
+        Set<String> actual = prepared.stream().map(start -> start.witness().sourceId())
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        if (prepared.stream().anyMatch(start -> !start.requiredSourceIds().equals(actual))) { return Map.of(); }
+        Map<String, CaptureStartupProof> found = new LinkedHashMap<>();
+        for (CaptureResumePreparation start : prepared) {
+            CaptureResumeWitness witness = start.witness();
+            if (witness.srsEnabled() && witness.readMode() != ReadMode.SNAPSHOT_ONLY) {
+                // A joined pipeline observes the actual shared reader, qualified by its durable version.
+                // The shared recovery validation performed before attachment proves its retained replay.
+                storePort.meta().captureReadState(witness.miningChainId()).filter(state -> state.accepted())
+                        .ifPresent(state -> storePort.meta().bindCaptureReadAttempt(pipelineClaim, witness, state.attempt(), true));
+            }
+            Optional<CaptureStartupProof> proof = storePort.meta().captureStartupProof(pipelineClaim, witness);
+            if (proof.isEmpty()) { return Map.of(); }
+            found.put(witness.sourceId(), proof.get());
+        }
+        return Map.copyOf(found);
+    }
+
+    @Override
+    public Map<String, CaptureStartupFailure> startupFailures(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        Map<String, CaptureStartupFailure> failed = new LinkedHashMap<>();
+        preparedSources(pipelineId, pipelineClaim).values().forEach(prepared ->
+                storePort.meta().captureStartupFailure(pipelineClaim, prepared.witness())
+                        .ifPresent(failure -> failed.put(prepared.witness().sourceId(), failure)));
+        return Map.copyOf(failed);
+    }
+
+    @Override
+    public synchronized Optional<Throwable> captureFailure(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        if (pipelineClaim == null || pipelineClaim.profileGeneration() == 0) { return captureFailure(pipelineId); }
+        List<PipelineRun> runs = runsByPipeline.getOrDefault(pipelineId, List.of());
+        Optional<Throwable> local = runs.stream()
+                .filter(run -> sameExecution(run.spec.pipelineFence(), pipelineClaim))
+                .map(this::localCaptureFailure).filter(Optional::isPresent).map(Optional::get).findFirst();
+        if (local.isPresent()) { return local; }
+        return startupFailures(pipelineId, pipelineClaim).values().stream().findFirst()
+                .map(CaptureStartupException::new).map(failure -> (Throwable) failure);
+    }
+
     private PipelineRun startRun(
             String pipelineId, SourcePlan plan, CaptureHandoff handoff,
             Map<CaptureId, CaptureOwnership.Permit> permits) {
@@ -262,12 +420,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         } else {
             CaptureOwnership.Permit permit = permits.get(captureId);
             if (permit.acquired()) {
+                JoinedCapture joined = joinedCaptures.get(captureId);
+                CaptureRunSpec producer = spec.readMode() == ReadMode.SNAPSHOT_ONLY || joined == null ? spec
+                        : spec.withCaptureFence(permit.fence()).withStartupAttachments(startupAttachments(joined));
                 // From here the tail, or the release in openTail, answers for this claim.
                 permits.remove(captureId);
-                run = openTail(captureId, permit, spec, handoff);
+                run = openTail(captureId, permit, producer, handoff);
                 // Local pipelines that joined the remote tail now share this member's tail.
                 Set<String> pipelines = new LinkedHashSet<>(List.of(pipelineId));
-                JoinedCapture joined = joinedCaptures.remove(captureId);
+                joinedCaptures.remove(captureId);
                 if (joined != null) {
                     pipelines.addAll(joined.pipelines.keySet());
                 }
@@ -375,7 +536,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             PipelineResource pipeline,
             ArtifactStore captured,
             long snapshotEpoch,
-            Map<CaptureId, CaptureOwnership.Permit> permits) {
+            Map<CaptureId, CaptureOwnership.Permit> permits,
+            Map<String, SourceModel> frozenModels) {
         List<SourcePlan> plans = new ArrayList<>();
         try {
             for (SourceRef ref : pipeline.sources()) {
@@ -384,7 +546,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // Read once and used twice: it decides which streams this run reads, and it carries the
                 // row count the last discovery took of each of them. Asking the store again for the second
                 // use would pay for a second read per source on every start.
-                SourceModel discovered = SourceDiscovery.model(storePort, source);
+                SourceModel discovered;
+                if (frozenModels == null) {
+                    discovered = SourceDiscovery.model(storePort, source);
+                } else {
+                    // Omitted discovery is frozen absence, not permission to reread mutable metadata.
+                    discovered = frozenModels.get(sourceId);
+                }
                 Optional<SourceCaptureResolution> selected =
                         SourceCaptureResolution.forPipeline(pipeline, source, discovered);
                 if (selected.isEmpty()) {
@@ -393,7 +561,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 SourceCaptureResolution resolution = selected.orElseThrow();
                 CaptureRunSpec spec = deriveSpec(
                         pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
-                        snapshotEpoch);
+                        snapshotEpoch).withPipelineSourceCount(pipeline.sources().size());
                 CaptureId captureId = CaptureId.of(spec);
                 if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
                     permits.put(captureId, permitOrNotYet(pipelineId, captureId, spec));
@@ -583,12 +751,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
                     joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
                     joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch())
-                    .withConsumerId(joinedWith.consumerId());
-            pipelines.putIfAbsent(joinedWith.pipelineId(), new JoinedPipeline(tailSpec, passthrough));
+                    .withConsumerId(joinedWith.consumerId()).withPipelineSourceCount(joinedWith.pipelineSourceCount());
+            pipelines.putIfAbsent(joinedWith.pipelineId(), new JoinedPipeline(tailSpec, joinedWith, passthrough));
         }
     }
 
-    private record JoinedPipeline(CaptureRunSpec tailSpec, CaptureHandoff tailPassthrough) {
+    private record JoinedPipeline(CaptureRunSpec tailSpec, CaptureRunSpec originalSpec, CaptureHandoff tailPassthrough) {
     }
 
     private void own(CaptureId captureId, CaptureRun run, CaptureOwnership.Permit permit, Set<String> pipelines) {
@@ -647,15 +815,56 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private CaptureRun tryOpeningTakeover(
             CaptureId captureId, JoinedCapture capture, CaptureOwnership.Permit permit) {
         try {
-            JoinedPipeline pipeline = capture.pipelines.values().iterator().next();
+            List<JoinedPipeline> driven = capture.pipelines.values().stream()
+                    .filter(joined -> drivesPipeline.get().test(joined.originalSpec.pipelineId())).toList();
+            if (driven.isEmpty()) {
+                letGo(captureId, permit);
+                return null;
+            }
+            JoinedPipeline pipeline = driven.getFirst();
+            CaptureRunSpec producer = pipeline.tailSpec.withCaptureFence(permit.fence());
+            if (!producer.srsEnabled()) {
+                // A direct reader has no replay log: freeze its actual confirmed prefix for this open.
+                // The original preparation remains immutable and is bound separately below.
+                producer = producer.withResumeWitness(witness(producer), null);
+            }
+            producer = producer.withStartupAttachments(startupAttachments(capture));
             return captureAttacher.start(
-                    pipeline.tailSpec.withCaptureFence(permit.fence()), pipeline.tailPassthrough, true);
+                    producer, pipeline.tailPassthrough, true);
         } catch (RuntimeException failure) {
             letGo(captureId, permit);
             LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
                     captureId.value(), capture.pipelines.keySet(), failure);
             return null;
         }
+    }
+
+    private List<CaptureResumePreparation> startupAttachments(JoinedCapture capture) {
+        List<CaptureResumePreparation> attachments = new ArrayList<>();
+        for (JoinedPipeline joined : capture.pipelines.values()) {
+            CaptureRunSpec original = joined.originalSpec;
+            if (!drivesPipeline.get().test(original.pipelineId()) || original.pipelineFence() == null
+                    || original.pipelineFence().profileGeneration() == 0) {
+                continue;
+            }
+            // Acquisition topology can refresh while the exact execution authority remains unchanged.
+            WorkloadClaimFence current = storePort.workloadClaims().read(original.pipelineFence().key())
+                    .filter(reading -> reading.leased())
+                    .map(reading -> WorkloadClaimFence.from(reading.claim()))
+                    .filter(fence -> sameExecution(fence, original.pipelineFence()))
+                    .orElseThrow(() -> unprovenStartup(original));
+            CaptureResumePreparation prepared = storePort.meta().captureResumePreparation(current,
+                    original.miningChainId().value(), original.consumerId())
+                    .filter(value -> value.witness().equals(original.resumeWitness()))
+                    .orElseThrow(() -> unprovenStartup(original));
+            attachments.add(prepared);
+        }
+        return List.copyOf(attachments);
+    }
+
+    private static TapstateException unprovenStartup(CaptureRunSpec spec) {
+        return new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                Map.of("pipeline", spec.pipelineId(), "source", spec.sourceId()), null);
     }
 
     /** Whether any run of {@code pipelines} here is still reading its load. */
@@ -1545,20 +1754,28 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (runs == null) {
             return Optional.empty();
         }
-        // Surface a failure of this pipeline's own run or a tail it shares with another pipeline. A
-        // snapshot-only capture has no shared tail; its owner's load failure belongs to that owner alone.
-        return runs.stream()
-                .map(run -> {
-                    Optional<Throwable> ownFailure = run.run.failure();
-                    if (ownFailure.isPresent()) {
-                        return ownFailure;
-                    }
-                    OwnedCapture shared = run.sharedTail ? ownedCaptures.get(run.captureId) : null;
-                    return shared == null ? Optional.<Throwable>empty() : shared.run.failure();
-                })
+        // Surface this run's failure or its current incremental reader's failure after a takeover.
+        // A snapshot-only attachment has an independent load and must not inherit its owner's failure.
+        Optional<Throwable> local = runs.stream()
+                .map(this::localCaptureFailure)
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .findFirst();
+        if (local.isPresent()) { return local; }
+        return runs.stream().map(run -> run.spec.pipelineFence()).filter(java.util.Objects::nonNull)
+                .filter(fence -> fence.profileGeneration() > 0)
+                .flatMap(fence -> startupFailures(pipelineId, fence).values().stream())
+                .findFirst().map(CaptureStartupException::new).map(failure -> (Throwable) failure);
+    }
+
+    private Optional<Throwable> localCaptureFailure(PipelineRun run) {
+        Optional<Throwable> ownFailure = run.run.failure();
+        if (ownFailure.isPresent()) {
+            return ownFailure;
+        }
+        OwnedCapture reader = run.managed && run.spec.readMode() != ReadMode.SNAPSHOT_ONLY
+                ? ownedCaptures.get(run.captureId) : null;
+        return reader == null ? Optional.empty() : reader.run.failure();
     }
 
     @Override

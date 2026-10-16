@@ -1077,6 +1077,110 @@ class PdkCapturePortTest {
                 .isPresent();
     }
 
+    @Test
+    void anOversizedCdcBatchIsChunkedWithoutHandingItsPositionToAnEarlyPrefix(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.oversizedSource(dir, 2_501, "no-decode-counter");
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.OversizedSource", null));
+        List<List<Envelope>> chunks = new CopyOnWriteArrayList<>();
+        List<Optional<SourcePosition>> positions = new CopyOnWriteArrayList<>();
+        CountDownLatch delivered = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CaptureListener listener = new CaptureListener() {
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                chunks.add(events);
+                positions.add(position);
+                if (events.isEmpty()) {
+                    delivered.countDown();
+                }
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                failure.set(error);
+                delivered.countDown();
+            }
+        };
+        try (Subscription subscription = port.cdc(config("t1"), CaptureStart.present(), listener)) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(failure.get()).isNull();
+        assertThat(chunks).extracting(List::size).containsExactly(1_000, 1_000, 501, 0);
+        assertThat(chunks.stream().flatMap(List::stream).map(event -> event.after().get("id")).toList())
+                .containsExactlyElementsOf(java.util.stream.LongStream.rangeClosed(1, 2_501).boxed().toList());
+        assertThat(positions.get(0)).isEmpty();
+        assertThat(positions.get(1)).isEmpty();
+        assertThat(ConnectorOffsetCodec.fromToken("demo", positions.get(2).orElseThrow().token(), getClass().getClassLoader()))
+                .isEqualTo("batch-end");
+        assertThat(ConnectorOffsetCodec.fromToken("demo", positions.get(3).orElseThrow().token(), getClass().getClassLoader()))
+                .isEqualTo("heartbeat");
+    }
+
+    @Test
+    void anOversizedSnapshotIsNotDecodedWholeBeforeItsFirstRowIsTaken(@TempDir Path dir) throws Exception {
+        String counter = "synthetic.oversized.decoded." + System.nanoTime();
+        AtomicLong decoded = new AtomicLong();
+        System.getProperties().put(counter, decoded);
+        try {
+            Path jar = Synthetic.oversizedSource(dir, 2_001, counter);
+            PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.OversizedSource", null));
+            try (CaptureBatch batch = port.snapshot(config("t1"))) {
+                assertThat(batch.hasNext()).isTrue();
+                assertThat(batch.next().after()).containsEntry("id", 1L);
+                assertThat(decoded.get()).as("only one bounded decoded chunk is needed for the first row")
+                        .isLessThanOrEqualTo(1_000L);
+                long rows = 1;
+                while (batch.hasNext()) {
+                    assertThat(batch.next().after()).containsEntry("id", ++rows);
+                }
+                assertThat(rows).isEqualTo(2_001L);
+                assertThat(decoded.get()).isEqualTo(2_001L);
+            }
+        } finally {
+            System.getProperties().remove(counter);
+        }
+    }
+
+    @Test
+    void closingBetweenCdcChunksDoesNotDeliverItsUnconfirmedSuffix(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.oversizedSource(dir, 2_501, "no-decode-counter");
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.OversizedSource", null));
+        CountDownLatch first = new CountDownLatch(1);
+        CountDownLatch blocked = new CountDownLatch(1);
+        List<List<Envelope>> chunks = new CopyOnWriteArrayList<>();
+        List<Optional<SourcePosition>> positions = new CopyOnWriteArrayList<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CaptureListener listener = new CaptureListener() {
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                chunks.add(events);
+                positions.add(position);
+                first.countDown();
+                try {
+                    blocked.await();
+                } catch (InterruptedException stopped) {
+                    // A receiver can return normally after its wake-up; the adapter must still stop.
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                failure.set(error);
+                first.countDown();
+            }
+        };
+        try (Subscription subscription = port.cdc(config("t1"), CaptureStart.present(), listener)) {
+            assertThat(first.await(5, TimeUnit.SECONDS)).isTrue();
+            subscription.close();
+        } finally {
+            blocked.countDown();
+        }
+        assertThat(failure.get()).isNull();
+        assertThat(chunks).extracting(List::size).containsExactly(PdkCapturePort.MAX_DELIVERY_CHUNK_RECORDS);
+        assertThat(positions).containsExactly(Optional.empty());
+    }
+
     // ---- testConnection / discoverSchema drive ---------------------------------------------------
 
     @Test

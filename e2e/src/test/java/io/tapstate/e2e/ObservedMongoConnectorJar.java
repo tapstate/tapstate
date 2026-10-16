@@ -20,6 +20,10 @@ final class ObservedMongoConnectorJar {
     private ObservedMongoConnectorJar() {}
 
     static byte[] build(byte[] original, Path witness) throws IOException, URISyntaxException {
+        return build(original, witness, null);
+    }
+
+    static byte[] build(byte[] original, Path witness, Path readerWitness) throws IOException, URISyntaxException {
         Manifest manifest;
         byte[] spec = null;
         try (JarInputStream in = new JarInputStream(new ByteArrayInputStream(original))) {
@@ -44,6 +48,10 @@ final class ObservedMongoConnectorJar {
             }
             put(out, "observed-mongo-spec.json", spec);
             put(out, "mongo-write-witness-path.txt", witness.toAbsolutePath().toString().getBytes(StandardCharsets.UTF_8));
+            if (readerWitness != null) {
+                put(out, "mongo-read-witness-path.txt",
+                        readerWitness.toAbsolutePath().toString().getBytes(StandardCharsets.UTF_8));
+            }
         }
         return bytes.toByteArray();
     }

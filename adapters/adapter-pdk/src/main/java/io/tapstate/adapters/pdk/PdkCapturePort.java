@@ -28,6 +28,7 @@ import io.tapdata.entity.utils.JsonParser;
 import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
+import io.tapdata.exception.TapPdkOffsetOutOfLogEx;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
 import io.tapdata.pdk.apis.functions.connector.common.ReleaseExternalFunction;
 import io.tapdata.pdk.apis.functions.connector.source.BatchReadFunction;
@@ -73,7 +74,18 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private static final Logger LOG = LoggerFactory.getLogger(PdkCapturePort.class);
 
-    private static final int BATCH_SIZE = 1000;
+    /** Maximum rows in one Tapstate-owned decoded delivery or copied snapshot read-ahead chunk. */
+    public static final int MAX_DELIVERY_CHUNK_RECORDS = 1000;
+
+    private static final int BATCH_SIZE = MAX_DELIVERY_CHUNK_RECORDS;
+
+    /**
+     * Snapshot records retained by this bridge: queued chunks, one producer waiting to enqueue, one raw
+     * chunk being decoded, and its decoded rows. Connector-owned input allocation is outside this bound.
+     */
+    public static long snapshotBufferedRecordsUpperBound() {
+        return Math.multiplyExact((long) PdkCaptureBatch.READ_AHEAD + 3, MAX_DELIVERY_CHUNK_RECORDS);
+    }
     private static final int SAMPLE_SIZE = 10;
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
     private static final long CDC_SHUTDOWN_GRACE_MILLIS = 5000;
@@ -331,8 +343,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         CdcDelivery delivery = new CdcDelivery();
         Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
                 connector.functions().getFlushOffsetFunction(), acknowledgeIntervalNanos, nanoClock);
+        String requestedToken = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
         Thread thread = new Thread(
-                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight,
+                () -> streamLoop(connector, config, resumeAt, startAt, requestedToken, listener, stream, preflight,
                         acknowledgements, delivery),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
@@ -410,6 +423,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         private final Set<Thread> active = new HashSet<>();
         private volatile boolean closed;
 
+        void requireOpen() {
+            if (closed) {
+                throw new CancellationException("the change capture was closed");
+            }
+        }
+
         synchronized boolean cancel() {
             if (closed) {
                 return false;
@@ -429,10 +448,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 active.add(current);
             }
             try {
+                // A completed handover remains completed if close woke its final listener.
+                // Entry and chunk boundaries still reject every subsequent delivery.
                 batch.run();
-                if (closed) {
-                    throw new CancellationException("the change capture was closed");
-                }
             } finally {
                 synchronized (this) {
                     active.remove(current);
@@ -740,9 +758,14 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             if (events.isEmpty()) {
                 return;
             }
-            // A copy: the list is the connector's, and is decoded only once somebody takes it.
-            List<TapEvent> handed = new ArrayList<>(events);
-            reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+            // A connector may ignore its requested batch size. Copy only a bounded chunk while waiting
+            // for read-ahead room, and decode it on the taker's thread as before.
+            for (int first = 0; first < events.size();) {
+                int end = first + Math.min(MAX_DELIVERY_CHUNK_RECORDS, events.size() - first);
+                List<TapEvent> handed = new ArrayList<>(events.subList(first, end));
+                reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+                first = end;
+            }
         });
     }
 
@@ -859,6 +882,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     }
 
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
+            String requestedToken,
             CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
             Acknowledgements acknowledgements, CdcDelivery delivery) {
         try {
@@ -892,7 +916,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                     // and outside the delivery a close cancels, so a close wakes the hand-over and never the
                     // source's own call.
                     acknowledgements.applyIfDue();
-                    delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                    delivery.accept(() -> handOver(connector, declared, listener, events, offset, delivery));
                 });
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
                 stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
@@ -917,10 +941,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             // cause chain for something coded. Handed on uncoded, a connector that refused to start for a
             // reason it stated precisely arrives as "the job died", with the sentence naming what to
             // reconfigure surviving only in a log line.
-            TapstateException reported = t instanceof TapstateException coded
-                    ? coded
-                    : new TapstateException(ConnectorError.CAPTURE_FAILED,
-                            Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
+            TapstateException reported = captureFailure(connector.connectorId(), t, requestedToken);
             if (preflight != null && preflight.completeExceptionally(reported)) {
                 return;
             }
@@ -940,24 +961,28 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * Hands one delivery to {@code listener}: its changes, decoded, with the offset the source named for it.
      *
      * <p>A change stream also carries control events (heartbeats and the like) that signal the tail is alive but
-     * carry no row; they are not decodable changes, so they are skipped. The batch goes over whole, with the one
-     * offset the source named for it. The offset means the source had read to here once this entire batch was
-     * handed over, so it belongs to the batch and not to any change inside it; and the batch itself is worth
-     * keeping, because everything downstream that costs per act rather than per change -- writing the changes
-     * down above all -- costs one act per batch only while the batch still exists.
+     * carry no row; they are not decodable changes, so they are skipped. A batch fitting the delivery bound
+     * goes over whole; an oversized callback goes over in bounded chunks. Its one offset belongs only to
+     * the final chunk, because it covers every change in the original callback, not an earlier prefix.
      */
     private static void handOver(PdkConnector connector, Map<String, Map<String, String>> declared,
-            CaptureListener listener, List<TapEvent> events, Object offset) {
-        List<TapEvent> changes = new ArrayList<>(events.size());
+            CaptureListener listener, List<TapEvent> events, Object offset, CdcDelivery delivery) {
+        List<Envelope> decoded = new ArrayList<>(Math.min(MAX_DELIVERY_CHUNK_RECORDS, events.size()));
         for (TapEvent event : events) {
-            if (!(event instanceof ControlEvent)) {
-                changes.add(event);
+            delivery.requireOpen();
+            if (event instanceof ControlEvent) {
+                continue;
             }
+            if (decoded.size() == MAX_DELIVERY_CHUNK_RECORDS) {
+                listener.onBatch(decoded, Optional.empty());
+                delivery.requireOpen();
+                decoded = new ArrayList<>(MAX_DELIVERY_CHUNK_RECORDS);
+            }
+            decoded.add(TapEventCodec.decodeChange(event, connector.codecs(), declaredTypes(declared, event)));
         }
-        List<Envelope> decoded = new ArrayList<>(changes.size());
-        for (TapEvent change : changes) {
-            decoded.add(TapEventCodec.decodeChange(change, connector.codecs(), declaredTypes(declared, change)));
-        }
+        delivery.requireOpen();
+        // The source's position covers its whole callback, so only its final chunk may carry it. An
+        // empty heartbeat still reaches the listener with the source position it reports.
         listener.onBatch(decoded, position(connector, offset));
     }
 
@@ -1200,9 +1225,45 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {
-            throw new TapstateException(ConnectorError.CAPTURE_FAILED,
-                    Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
+            throw captureFailure(connector.connectorId(), t);
         }
+    }
+
+    /** The single coded boundary for a connector-side capture failure. */
+    static TapstateException captureFailure(String connectorId, Throwable failure) {
+        return captureFailure(connectorId, failure, null);
+    }
+
+    static TapstateException captureFailure(String connectorId, Throwable failure, String requestedToken) {
+        Objects.requireNonNull(failure, "failure");
+        if (failure instanceof TapstateException coded) {
+            return coded;
+        }
+        Throwable each = failure;
+        for (int depth = 0; each != null && depth < 32; depth++, each = each.getCause()) {
+            if (each instanceof TapPdkOffsetOutOfLogEx refused) {
+                Map<String, Object> args = new LinkedHashMap<>();
+                String requested = requestedToken;
+                if (requested == null && refused.getOffset() != null) {
+                    try {
+                        requested = ConnectorOffsetCodec.toToken(connectorId, refused.getOffset());
+                    } catch (TapstateException unrenderable) {
+                        // Rendering a diagnostic cannot replace the source's declared refusal.
+                        args.put("requestedEncodingCode", unrenderable.code().code());
+                        args.put("requestedEncodingParams", unrenderable.args());
+                    }
+                }
+                args.put("connector", connectorId);
+                args.put("requested", requested);
+                args.put("pdkId", refused.getPdkId());
+                args.put("pdkCode", refused.getCode());
+                args.put("serverCode", refused.getServerErrorCode());
+                args.put("pdkArgs", List.of(refused.getDynamicDescriptionParameters()));
+                return new TapstateException(ConnectorError.RESUME_POSITION_REJECTED, args, failure);
+            }
+        }
+        return new TapstateException(ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", connectorId, "detail", detail(failure)), failure);
     }
 
     /** Projects raw snapshot rows to envelopes; a codec refusal is a projection failure, not a read failure. */
