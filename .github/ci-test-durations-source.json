@@ -148,8 +148,18 @@
     }
   ],
   "cohort_hash": "9aa53da631ae55d0f25d42f3a789601b2c650801827f4a076704597e41969c9b",
-  "comparison_scope": "The current 1285 source identities and original test-source bytes match this recorded run. These scheduling weights do not establish dependency or whole-input equality, original case applicability, or performance acceptance.",
-  "current_selected_verify_provenance_verified": true,
+  "comparison_scope": "The recorded 1285 source identities and test-source bytes do not match the current 1286 source identities after the recovery change. The new recovery integration class uses the declared 30-second estimate; it has no recorded duration here. Historical successful verify records do not verify the changed product, test helpers or current source. Scheduling estimates establish no input or performance acceptance.",
+  "current_selected_verify_provenance_verified": false,
+  "current_source_cohort_hash": "92ede2f9e562492dc15f6221d30febf233feab08dbc4e15d36c81a7f152dc0fb",
+  "current_source_units": 1286,
+  "current_test_source_bytes_match_recorded": false,
+  "current_unmeasured_source_units": [
+    {
+      "class": "io.tapstate.e2e.AHeldLoadCannotBecomeARecoveryCursorIT",
+      "kind": "it",
+      "module": "e2e"
+    }
+  ],
   "duration_hints_sha256": "4a315ebc2a2c94ffca8eaf4b508f05c4ea3d723c7dcaeecdbaece70ae4478eca",
   "estimates_only": true,
   "event": "workflow_dispatch",
@@ -164,7 +174,7 @@
   "source_archive_receipt_sha256": "1c7e3db36d62a29ee0c17c15149676ca558e3377b4cef75e8691694c28847ea4",
   "source_classes_without_testcase_rows": 98,
   "source_sha": "809815e6e0abcf5c0fe853bbe9f57bf471a9b1d1",
-  "source_unit_set_matches_current": true,
+  "source_unit_set_matches_current": false,
   "source_units": 1285,
   "testcases": 10077,
   "whole_run_complete_at_capture": true,
