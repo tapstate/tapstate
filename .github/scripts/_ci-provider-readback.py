@@ -98,9 +98,16 @@ def step_binding(archive, worker, all_jobs, log_files, receipt_sha, invocations)
     start, end = g.timestamp(step['started_at']), g.timestamp(step['completed_at'])
     require(start <= end and end <= g.timestamp(later['started_at']), 'provider step timeline differs from pre-selection claim')
     name = job['name']+'/'+str(step['number'])+'_'+STEP+'.txt'
-    require(name in log_files, 'original provider step log member missing')
+    if name not in log_files:
+        # A workflow log archive can contain numbered, combined job logs. Its
+        # receipt marker must still bind to this job's original API step window.
+        combined = [path for path in log_files if re.fullmatch(
+            r'(?:0|[1-9][0-9]*)_' + re.escape(job['name']) + r'\.txt', path)]
+        require(len(combined) <= 1, 'original provider job log member ambiguous')
+        require(combined, 'original provider step log member missing')
+        name = combined[0]
     markers = []
-    for line in log_files[name].decode('utf-8').splitlines():
+    for line in log_files[name].decode('utf-8-sig').splitlines():
         if 'CI_PROVIDER_PROBE_RECEIPT_SHA256' not in line:
             continue
         match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T[^ ]+) CI_PROVIDER_PROBE_RECEIPT_SHA256 ([0-9a-f]{64})',line)

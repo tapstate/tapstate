@@ -74,6 +74,48 @@ def class_header(name):
             + struct.pack('>HHHHHHH', 0x21, 2, 4, 0, 0, 0, 0))
 
 
+def combined_log_controls(context):
+    logs, reset = context['logs'], context['reset']
+    step_name = context['log_name']
+    job = context['pages']['jobs'][0]
+    capture_raw = fmod.encode(context['artifacts']['ci-inputs-rest'][r.MEMBER])
+    receipt_sha = g.checksum(capture_raw)
+    invocations = context['artifacts']['ci-inputs-rest'][r.MEMBER]['invocations']
+    name = '4_' + job['name'] + '.txt'
+    raw = (b'\xef\xbb\xbf2026-10-14T09:59:00Z Runner setup\n' + logs[step_name]
+           + b'2026-10-14T10:00:02Z Job cleanup\n')
+    combined = {name: raw}
+
+    def bind(values):
+        return r.step_binding(None, 'rest', [job], values, receipt_sha, invocations)
+
+    bound = bind(combined)
+    check(bound['job_id'] == job['id'] and bound['step_number'] == 9 and bound['log_member'] == name
+          and bound['log_member_sha256'] == g.checksum(raw) and bound['archived_step_log_binding_consistent'],
+          'combined original job log keeps its full raw hash and API step binding')
+    for foreign in ('combined-job.txt', '4_test-shards (engine).txt', '-1_' + job['name'] + '.txt',
+                    '04_' + job['name'] + '.txt', 'nested/' + name):
+        rejected(lambda: bind({foreign: raw}), 'original provider step log member missing')
+    rejected(lambda: bind({name: raw, '8_' + job['name'] + '.txt': raw}), 'original provider job log member ambiguous')
+    rejected(lambda: bind({name: raw.replace(receipt_sha.encode(), b'f' * 64)}), 'log marker missing, duplicated or different')
+    rejected(lambda: bind({name: raw + logs[step_name]}), 'log marker missing, duplicated or different')
+    rejected(lambda: bind({name: raw.replace(b'10:00:00.3000000', b'10:00:09.3000000')}), 'marker outside original step')
+    rejected(lambda: bind({name: raw.replace(b'CI_PROVIDER_PROBE_RECEIPT_SHA256 ', b'CI_PROVIDER_PROBE_RECEIPT_SHA256 malformed ')}),
+             'malformed provider receipt log marker')
+    rejected(lambda: bind({name: b'2026-10-14T10:00:00Z No receipt marker\n'}), 'log marker missing, duplicated or different')
+    rejected(lambda: bind({**combined, step_name: logs[step_name].replace(receipt_sha.encode(), b'f' * 64)}),
+             'log marker missing, duplicated or different')
+    logs.clear()
+    logs.update(combined)
+    context['reseal'](False)
+    answer = context['project']()
+    found = answer['provider_captures']['rest']
+    check(found['step'] == bound and found['receipt_hash_links_consistent']
+          and not found['independent_provider_replay_proven'] and not answer['whole_input_projection_verified'],
+          'full archive chain accepts a combined job log without upgrading provenance or provider semantics')
+    reset()
+
+
 def controls(f, callback=None, only_callback=False):
     artifacts = f['artifacts']
     pre = artifacts['ci-inputs-rest']['build-inputs.json']
@@ -195,6 +237,7 @@ def controls(f, callback=None, only_callback=False):
     check(found['method_count'] == 1 and found['case_count'] == 2 and found['workflow_source_is_archived_checkout'], 'source, method and case counts join original checkout')
     check(not found['provider_result_bytes_read_back'] and not found['independent_provider_replay_proven']
           and not found['ability_proven'] and not answer['whole_input_projection_verified'], 'protocol joins cannot certify provider semantics, original execution or whole provenance')
+    combined_log_controls(locals())
     before = fmod.v.text(f['work'], 'rev-parse', 'HEAD'), fmod.v.git(f['work'], 'write-tree').stdout
 
     def edit(change, message):
@@ -297,6 +340,7 @@ def dispatch_fixture():
         check(value['scope']['event'] == 'workflow_dispatch'
               and not value['first_complete_PR_sample'] and not value['performance_accepted'],
               'original native dispatch provider input replay keeps PR and performance claims false')
+        combined_log_controls(context)
         artifacts['ci-inputs-rest'][r.MEMBER]['binding']['event'] = 'pull_request'
         reseal(); rejected(project, 'provider capture source/run/tree differs'); reset()
         artifacts['ci-inputs-rest']['build-inputs.json']['event'] = 'pull_request'
