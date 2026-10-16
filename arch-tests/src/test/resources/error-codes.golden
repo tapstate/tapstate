@@ -62,6 +62,7 @@ boot.heartbeat-config-invalid
 boot.member-bind-address-invalid
 boot.node-id-in-use
 boot.node-id-required
+boot.node-session-lost
 boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
 boot.web-console-url-invalid

@@ -180,6 +180,9 @@ boot.node-id-in-use:
 boot.node-session-renew-interval-invalid:
   message: "The node-session renewal interval must be positive and shorter than its lease lifetime."
   solution: "Set tapstate.cluster.node-session-renew-interval below tapstate.cluster.node-session-ttl."
+boot.node-session-lost:
+  message: "The member lost its reserved node session during startup."
+  solution: "Restore coordination-store reachability and resolve any competing process using this node id before restarting."
 boot.node-session-ttl-invalid:
   message: "The node-session lease lifetime must be positive."
   solution: "Set tapstate.cluster.node-session-ttl to a positive duration."
