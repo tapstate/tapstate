@@ -9,7 +9,6 @@ import com.hazelcast.jet.pipeline.StreamSource;
 import com.tngtech.archunit.core.domain.JavaAccess;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,9 +46,7 @@ class IdleQueueGatesTest {
 
     @BeforeAll
     static void importClasses() {
-        productionClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        productionClasses = ProductionClassImports.packages("io.tapstate");
         fixtureClasses = new ClassFileImporter().importClasses(QueueThatGoesIdle.class);
     }
 
