@@ -203,19 +203,9 @@ class AFullClusterRestartRebuildsDesiredPipelinesFromMongoTruthIT {
                 Set<Long> newPids = NODES.stream().map(node -> cluster.processCarrying(node).pid()).collect(Collectors.toSet());
                 Await.until("a new writer reaches the retained snapshot hold", BOUND,
                         () -> heldBy(holds.directory(), newPids), () -> "newPids=" + newPids + ", holds=" + paths(holds.directory()));
-                ClusterRecoveryItemView loading;
-                try {
-                    loading = Await.answered("the snapshot's one unfinished rebuild", BOUND,
-                            () -> item(resumed, SNAPSHOT).filter(item -> item.successor() != null
-                                    && item.persistedStatus().equals(ClusterRecoveryStatus.REBUILDING.name())));
-                } catch (RuntimeException | Error failure) {
-                    try { cluster.keepThreadDiagnostics(); }
-                    catch (Exception | Error diagnosticFailure) {
-                        if (diagnosticFailure instanceof InterruptedException) Thread.currentThread().interrupt();
-                        failure.addSuppressed(diagnosticFailure);
-                    }
-                    throw failure;
-                }
+                ClusterRecoveryItemView loading = Await.answered("the snapshot's one unfinished rebuild", BOUND,
+                        () -> item(cluster, resumed, SNAPSHOT).filter(item -> item.successor() != null
+                                && item.persistedStatus().equals(ClusterRecoveryStatus.REBUILDING.name())));
                 assertThat(loading.successor().sourcesAcceptedAt()).isNull();
                 assertThat(loading.successor().pipelineClaim().executionGeneration()).isEqualTo(previous.get(SNAPSHOT).executionGeneration() + 1);
                 assertThat(consumer(store, SNAPSHOT, SNAPSHOT_SOURCE).getString("cdcStartPosition")).isEqualTo(snapshotSeam);
@@ -224,7 +214,7 @@ class AFullClusterRestartRebuildsDesiredPipelinesFromMongoTruthIT {
                 Map<String, ClusterRecoveryItemView> recovered = new LinkedHashMap<>();
                 for (String pipeline : PIPELINES) {
                     ClusterRecoveryItemView item = Await.answered(pipeline + " to recover from Mongo truth", BOUND,
-                            () -> item(resumed, pipeline).filter(value -> value.persistedStatus().equals(ClusterRecoveryStatus.RECOVERED.name())));
+                            () -> item(cluster, resumed, pipeline).filter(value -> value.persistedStatus().equals(ClusterRecoveryStatus.RECOVERED.name())));
                     assertRecovered(store, resumed, pipeline, item, previous.get(pipeline), oldProfile, archived);
                     recovered.put(pipeline, item);
                 }
@@ -372,8 +362,18 @@ class AFullClusterRestartRebuildsDesiredPipelinesFromMongoTruthIT {
                 .map(ClusterPipelineView::controllerClaim).findFirst();
     }
 
-    private static Optional<ClusterRecoveryItemView> item(ControlPlane control, String pipeline) {
-        return control.pipelineRecovery(pipeline).items().stream().max(java.util.Comparator.comparingLong(ClusterRecoveryItemView::enqueueSequence));
+    private static Optional<ClusterRecoveryItemView> item(PartitionableCluster cluster, ControlPlane control, String pipeline) {
+        try {
+            return control.pipelineRecovery(pipeline).items().stream()
+                    .max(java.util.Comparator.comparingLong(ClusterRecoveryItemView::enqueueSequence));
+        } catch (RuntimeException | Error failure) {
+            try { cluster.keepThreadDiagnostics(); }
+            catch (Exception | Error diagnosticFailure) {
+                if (diagnosticFailure instanceof InterruptedException) Thread.currentThread().interrupt();
+                failure.addSuppressed(diagnosticFailure);
+            }
+            throw failure;
+        }
     }
 
     private static List<Document> queueRows(MongoDatabase store, String cluster, String pipeline) {
