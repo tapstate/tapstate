@@ -46,7 +46,9 @@ final class PublishedConnectorArtifacts {
             "sqlserver", new Artifact(16_232_120,
                     "3254471003dbb5cb6512610efae34bc35f4d4a77c8c02cfbf9fc883659a4c826"),
             "db2", new Artifact(203_082_147,
-                    "3c7c34e54e110402dca4699ecafce9aa04f719457fccba14e3b759d8e8fdb500"));
+                    "3c7c34e54e110402dca4699ecafce9aa04f719457fccba14e3b759d8e8fdb500"),
+            "db2i", new Artifact(34_343_764,
+                    "510a34799ee3dc8d55a5f8205d1a96209b45679d68eed4f5283b87289e1848ff"));
 
     /** Exact public ids with a matching {@code <id>-connector.jar} release asset and trusted digest. */
     static final List<String> IDS = List.copyOf(ARTIFACTS.keySet());

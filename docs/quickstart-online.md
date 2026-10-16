@@ -83,11 +83,26 @@ published server image runs as a non-root user and is not prepared for this mode
 `rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
 production use, where the native mode is the one to run.
 
+Db2 for i (IBM i, formerly AS/400) is accepted as a source-only **preview** under the id
+`db2i`, outside the certified table: no release lane reads a live IBM i system. Snapshot, journal
+capture of inserts, updates and deletes, and continuation across a server restart were verified
+by hand against IBM i 7.4.
+Db2 for i is supported as a source only. Its connector can write, but its catalog row is not
+sink-capable, so a `serve.sync` naming a `db2i` connection is refused on-prem as well as in
+the cloud profile. Reads take a snapshot through the IBM Toolbox for Java JDBC driver and then
+capture inserts, updates and deletes from the journal named by `journalLibraryName` and
+`journalName`; every captured table must be journaled to it. The connection user needs `*USE`
+authority on the data library and its files, on that journal and its attached receiver, and on
+the `DSPJRN` command; `SELECT` on the `QSYS2` catalog views `SYSSCHEMAS`, `SYSTABLES`,
+`SYSCOLUMNS`, `SYSKEYCST`, `SYSINDEXES`, `OBJECT_PRIVILEGES`, `JOURNAL_INFO` and
+`JOURNAL_RECEIVER_INFO`; and `EXECUTE` on `QSYS2.DISPLAY_JOURNAL`. Change capture carries
+neither large-object values nor DDL changes; a snapshot reads large objects in full.
+
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL
 and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
-and 16 across these five database kinds, including existing managed variants of MySQL,
+all-data-type matrix. The default accepted set contains 18 connector ids: the Db2 and
+Db2 for i previews, and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
 live-verified individually. The Atlas connector was verified with snapshot and change-stream
 reads, restart continuation, and target writes against a real Atlas deployment in both cloud
@@ -109,14 +124,15 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle, SQL Server and Db2 connector jars are published as separate assets on the floating
-`connectors-preview` release. They remain outside versioned Tapstate releases and are not
-downloaded by the three-database quickstart unless you explicitly run `register oracle`,
-`register sqlserver` or `register db2`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+Oracle, SQL Server, Db2 and Db2 for i connector jars are published as separate assets on the
+floating `connectors-preview` release. They remain outside versioned Tapstate releases and are
+not downloaded by the three-database quickstart unless you explicitly run `register oracle`,
+`register sqlserver`, `register db2` or `register db2i`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
 the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
 the MIT License; the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
-IBM's International Program License Agreement. Those dependency terms govern only the bundled drivers and do not change
-Tapstate's Apache-2.0 license. The Oracle, SQL Server and Db2 implementations are paid connector
+IBM's International Program License Agreement; the Db2 for i jar bundles IBM Toolbox for Java
+(JTOpen) 21.0.5 under the IBM Public License 1.0. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle, SQL Server, Db2 and Db2 for i implementations are paid connector
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
@@ -338,7 +354,7 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle, SQL Server, Db2, MongoDB Atlas, and the unverified AWS RDS MySQL preview
+The same release carries Oracle, SQL Server, Db2, Db2 for i, MongoDB Atlas, and the unverified AWS RDS MySQL preview
 for explicit registration. From an authenticated CLI session, give `register` the published
 connector id instead of a local path:
 
@@ -348,6 +364,7 @@ tapstate(admin@127.0.0.1:8080)> register sqlserver
 tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
 tapstate(admin@127.0.0.1:8080)> register aws-rds-mysql
 tapstate(admin@127.0.0.1:8080)> register db2
+tapstate(admin@127.0.0.1:8080)> register db2i
 ```
 
 The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to
