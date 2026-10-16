@@ -519,10 +519,15 @@ final class ControlPlane {
      * <p>What tells one run of a pipeline from the run that replaced it. A rebuild that reused the
      * number would leave the two indistinguishable to everything downstream, which is the whole reason
      * the number exists.
+     *
+     * <p>A coded membership refusal leaves no generation to compare yet; callers keep polling within
+     * their original bound, just as the membership wait does.
      */
     Optional<Long> executionGenerationOf(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/cluster/members"));
-        expect(response, 200, "read the execution generation of " + pipelineId);
+        if (interpretClusterMembers(response.statusCode(), response.body()).isEmpty()) {
+            return Optional.empty();
+        }
         for (Object pipeline : pipelinesOf(response.body())) {
             if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
                     && one.get("controllerClaim") instanceof Map<?, ?> claim
