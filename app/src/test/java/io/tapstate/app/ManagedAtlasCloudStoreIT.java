@@ -4,6 +4,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.StorePort;
 import org.bson.Document;
@@ -19,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -44,12 +46,19 @@ class ManagedAtlasCloudStoreIT {
 
         try (MongoClient witness = MongoClients.create(metadataUri)) {
             try {
+                String authoredViewsHash;
                 try (ConfigurableApplicationContext first = start(metadataUri, plugins)) {
                     StorePort store = first.getBean(StorePort.class);
                     assertThat(first.getBean(OperatorStateStores.class).defaultDatabase())
                             .isEqualTo(operatorDatabase);
                     store.keyedState().save(NAMESPACE, "key", "durable-state".getBytes(StandardCharsets.UTF_8));
+                    assertThat(store.artifacts().get("views")).isEmpty();
+                    // This is an explicitly authored test connection; Cloud startup must not create one.
+                    store.artifacts().create(new SourceResource("views", null, "mongodb",
+                            Map.of("isUri", true, "uri", inDatabase(baseUri, viewsDatabase)),
+                            null, null, null, null));
                     SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
+                    authoredViewsHash = CanonicalHash.of(views);
                     String viewsUri = String.valueOf(views.config().get("uri"));
                     assertThat(databaseName(viewsUri)).isEqualTo(viewsDatabase);
                     witness.getDatabase(viewsDatabase).getCollection("witness")
@@ -63,6 +72,7 @@ class ManagedAtlasCloudStoreIT {
                             .hasValueSatisfying(bytes -> assertThat(bytes)
                                     .isEqualTo("durable-state".getBytes(StandardCharsets.UTF_8)));
                     SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
+                    assertThat(CanonicalHash.of(views)).isEqualTo(authoredViewsHash);
                     String viewsUri = String.valueOf(views.config().get("uri"));
                     assertThat(databaseName(viewsUri)).isEqualTo(viewsDatabase);
                     assertThat(witness.getDatabase(viewsDatabase).getCollection("witness")
