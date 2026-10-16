@@ -1,12 +1,9 @@
 # Source-bound CI shard layouts
 
-The default-reactor planner reads `.github/ci-shard-layout.json`. The checked-in
-configuration records the current comparison candidate: six E2E IT workers,
-four whole-class App workers, a complete E2E unit-module worker, `engine` and
-`rest`. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
-counts 2, 4 and 6 are supported for ordinary source-commit comparisons; there is
-no separate workflow or benchmark entry point. A staged layout is not a
-performance adoption result.
+The checked-in comparison variant has two E2E IT workers plus `engine` and
+`rest`; App remains in its original residual module group. This fixed four-worker
+layout is staged for source-commit comparisons, not a performance adoption result.
+The planner also supports four/six E2E workers and whole-class App assignments.
 
 The configuration requires `schema: 1`, `e2e_shards`, `rest_modules` and
 `new_test_seconds`. The optional `app_shards` field accepts 2 or 4; omitting it
@@ -70,20 +67,14 @@ reject.
 
 The plan retains layout and duration-input hashes. Timing provenance and timer
 aggregation limits accompany the duration map; nested suite timers can overlap.
-The provenance records all 1,290 source units from one complete, successful
-manual CI run. All thirteen original selected verify commands and validated
-worker packs retain that recorded source/run binding. The 1,295 XML reports
-include five additional nested-container suites; their times are summed under
-the owning source outer class. All current source identities and test-source
-bytes match the recorded cohort, and no current class uses a missing-hint
-fallback. Future unmeasured classes still use the declared 30-second estimate.
-Updating the weights changes worker assignments; the newly planned selected
-verify commands have not run, so their current-verify flag remains false.
-Of the recorded source classes, 99 have no testcase rows, and twelve have zero
-aggregate suite time. These reports remain visible; report presence or zero
-time cannot establish executed cases. The weights are scheduling estimates
-from that run, not an observed four-versus-six comparison, input equivalence,
-or PR performance acceptance.
+The duration provenance records 1,290 source units from one complete,
+successful manual CI run. Its thirteen selected verify commands, reports and
+worker packs remain bound to that source/run. The source metadata states each
+variant's current identity and test-source-byte match separately. New assignments
+have not run; current-verify and performance flags remain false. The reports
+include classes with no testcase rows and zero aggregate suite times; report
+presence or zero time does not establish executed cases. These are scheduling
+estimates, not input equivalence or four-versus-six/PR performance acceptance.
 
 Source discovery and the exact multiset assignment remain authoritative for
 which tests run. Estimated balancing, historical main timings and a valid
