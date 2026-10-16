@@ -2,6 +2,9 @@ package io.tapstate.app;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import jdk.net.ExtendedSocketOptions;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -15,6 +18,9 @@ import java.nio.ByteOrder;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -24,6 +30,77 @@ class MongoHandshakeGateTest {
 
     private static final int IO_TIMEOUT_MILLIS = 3_000;
     private static final Duration AWAIT_REPLY_TIMEOUT = Duration.ofSeconds(3);
+
+    @Test
+    @EnabledOnOs(OS.LINUX)
+    void aReleasedGateDoesNotAddDelayedAckStallsToSplitRequests() throws Exception {
+        Duration direct = exchangeSplitRequests(false);
+        Duration relayed = exchangeSplitRequests(true);
+        assertThat(relayed)
+                .withFailMessage("After release, 32 byte-checked split requests took %s through the gate "
+                                + "versus %s directly; the relay must not add a delayed-ACK wait per request",
+                        relayed, direct)
+                .isLessThan(direct.multipliedBy(4).plusMillis(100));
+    }
+
+    private static Duration exchangeSplitRequests(boolean relayed) throws Exception {
+        int prefixLength = 16_384;
+        byte[] payload = bytes(prefixLength + 17);
+        byte[] prefix = Arrays.copyOf(payload, prefixLength);
+        byte[] tail = Arrays.copyOfRange(payload, prefixLength, payload.length);
+        byte[] reply = message(1, bytes(16));
+        CyclicBarrier nextRequest = new CyclicBarrier(2);
+        CyclicBarrier prefixReceived = new CyclicBarrier(2);
+        try (ServerSocket server = listen();
+                MongoHandshakeGate gate = relayed
+                        ? new MongoHandshakeGate("127.0.0.1", server.getLocalPort()) : null;
+                var peer = Executors.newSingleThreadExecutor()) {
+            var exchange = peer.submit(() -> {
+                try (Socket upstream = accept(server)) {
+                    upstream.setTcpNoDelay(true);
+                    upstream.getOutputStream().write(reply);
+                    for (int index = 0; index < 32; index++) {
+                        upstream.setOption(ExtendedSocketOptions.TCP_QUICKACK, false);
+                        nextRequest.await(3, TimeUnit.SECONDS);
+                        // Keep assertion-library initialization out of the timed wire exchange.
+                        if (!Arrays.equals(upstream.getInputStream().readNBytes(prefixLength), prefix)) {
+                            throw new AssertionError("The relay changed the request prefix");
+                        }
+                        prefixReceived.await(3, TimeUnit.SECONDS);
+                        if (!Arrays.equals(upstream.getInputStream().readNBytes(17), tail)) {
+                            throw new AssertionError("The relay changed the request tail");
+                        }
+                        upstream.getOutputStream().write(index);
+                    }
+                }
+                return null;
+            });
+            try (Socket client = connect(relayed ? gate.port() : server.getLocalPort())) {
+                client.setTcpNoDelay(true);
+                if (gate != null) {
+                    gate.awaitFirstReply(AWAIT_REPLY_TIMEOUT);
+                    gate.release();
+                }
+                if (!Arrays.equals(client.getInputStream().readNBytes(reply.length), reply)) {
+                    throw new AssertionError("The relay changed the handshake reply");
+                }
+                long started = System.nanoTime();
+                for (int index = 0; index < 32; index++) {
+                    nextRequest.await(3, TimeUnit.SECONDS);
+                    client.getOutputStream().write(payload, 0, prefixLength);
+                    // Split after the peer has read the prefix, without a guessed scheduling delay.
+                    prefixReceived.await(3, TimeUnit.SECONDS);
+                    client.getOutputStream().write(payload, prefixLength, 17);
+                    if (client.getInputStream().read() != index) {
+                        throw new AssertionError("The relay changed the response");
+                    }
+                }
+                Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+                exchange.get(3, TimeUnit.SECONDS);
+                return elapsed;
+            }
+        }
+    }
 
     @Test
     void holdsTheFirstCompleteReplyAndThenForwardsExactBytesInBothDirections() throws Exception {
