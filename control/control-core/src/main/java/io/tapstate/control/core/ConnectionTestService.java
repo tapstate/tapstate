@@ -70,8 +70,13 @@ public final class ConnectionTestService {
                 new AuditContext(principal, config.id()),
                 () -> {
                     ConnectionTestResult result = probe.probe(config);
-                    resultStore.save(result);
-                    return ConnectionTestReport.from(result);
+                    ConnectionTestResult safeResult = sourceConnections == null
+                            ? ConnectionTestResultRedactor.redact(
+                                    result, ConnectionTestResultRedactor.sharedSecretValues(config.settings()))
+                            : sourceConnections.redactDiagnostics(
+                                    result, config.connectorId(), config.settings());
+                    resultStore.save(safeResult);
+                    return ConnectionTestReport.from(safeResult);
                 });
     }
 }

@@ -7,6 +7,7 @@ import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionConfig;
+import io.tapstate.spi.store.ConnectionTestResult;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -77,6 +78,34 @@ public final class SourceConnectionResolver {
                     return new ConnectionConfig(source.id(), connectorId, resolved);
                 })
                 .orElseGet(() -> new ConnectionConfig(connectionId, connectorId, settings));
+    }
+
+    /** Returns catalog and shared transport secret values used to redact connector diagnostics. */
+    List<String> secretValuesForDiagnostics(String connectorId, Map<String, Object> settings) {
+        Map<String, Object> values = settings == null ? Map.of() : settings;
+        java.util.LinkedHashSet<String> secrets = new java.util.LinkedHashSet<>(
+                ConnectionTestResultRedactor.sharedSecretValues(values));
+        for (String field : secretFields(connectorId)) {
+            Object value = values.get(field);
+            if (value instanceof String text && !text.isBlank()) secrets.add(text);
+        }
+        return List.copyOf(secrets);
+    }
+
+    ConnectionTestResult redactDiagnostics(
+            ConnectionTestResult result, String connectorId, Map<String, Object> settings) {
+        return ConnectionTestResultRedactor.redact(
+                result, secretValuesForDiagnostics(connectorId, settings));
+    }
+
+    ConnectionTestResult redactStoredDiagnostics(ConnectionTestResult result) {
+        Map<String, Object> settings = artifacts.get(result.connectionId())
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.connector().equals(result.connectorId()))
+                .map(SourceResource::config)
+                .orElseGet(Map::of);
+        return redactDiagnostics(result, result.connectorId(), settings);
     }
 
     private List<String> secretFields(String connectorId) {
