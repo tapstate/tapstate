@@ -8,7 +8,9 @@ import io.tapstate.spi.store.RateHistoryStore.Entry;
 import io.tapstate.spi.store.RateHistoryStore.Page;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -21,17 +23,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoRateHistoryStorePagingIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoRateHistoryStorePagingIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static final Instant T0 = Instant.parse("2026-09-21T10:00:00Z");
 
     @Test
     void equalTimestampsPageWithoutDuplicatesAndBoundariesStayHalfOpen() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoDatabase database = client.getDatabase(REPLICA_SET.database("history_keyset_it"));
+            MongoDatabase database = client.getDatabase("history_keyset_it");
             database.drop();
             MongoRateHistoryStore history = new MongoRateHistoryStore(database,
                     SystemCollections.PIPELINE_RATE_HISTORY.on(database), Duration.ofDays(15));

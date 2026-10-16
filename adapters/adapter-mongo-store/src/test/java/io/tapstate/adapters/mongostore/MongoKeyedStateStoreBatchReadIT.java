@@ -12,7 +12,9 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -45,13 +47,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoKeyedStateStoreBatchReadIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
     private static final String NAMESPACE = "join.orders_wide.dimension.customers";
     private static final String SIBLING = "join.orders_wide.fact.orders";
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoKeyedStateStoreBatchReadIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
     void aBatchAnswersExactlyWhatTheKeyAtATimeReadsWould() {
@@ -214,7 +216,7 @@ class MongoKeyedStateStoreBatchReadIT {
 
     private static Document explain(BsonDocument filter) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            return client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.OPERATOR_STATE)
+            return client.getDatabase("tapstate").getCollection(MongoStorePort.OPERATOR_STATE)
                     .find(filter).explain(ExplainVerbosity.EXECUTION_STATS);
         }
     }
@@ -246,7 +248,7 @@ class MongoKeyedStateStoreBatchReadIT {
                 .build();
         try (MongoClient client = MongoClients.create(settings)) {
             MongoCollection<Document> collection =
-                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.OPERATOR_STATE);
+                    client.getDatabase("tapstate").getCollection(MongoStorePort.OPERATOR_STATE);
             collection.drop();
             test.accept(new MongoKeyedStateStore(collection), finds);
         }

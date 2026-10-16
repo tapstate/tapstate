@@ -1,12 +1,9 @@
 # Source-bound CI shard layouts
 
-The default-reactor planner reads `.github/ci-shard-layout.json`. The checked-in
-configuration records the current comparison candidate: four E2E IT workers,
-two whole-class App workers, a complete E2E unit-module worker, `engine` and
-`rest`. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
-counts 2, 4 and 6 are supported for ordinary source-commit comparisons; there is
-no separate workflow or benchmark entry point. A staged layout is not a
-performance adoption result.
+The default-reactor planner reads `.github/ci-shard-layout.json`. This ordinary
+comparison commit keeps the fixed four-worker layout: two E2E IT workers,
+`engine` and `rest`. The optional layouts described below remain available;
+a source recipe and valid matrix are not performance acceptance.
 
 The configuration requires `schema: 1`, `e2e_shards`, `rest_modules` and
 `new_test_seconds`. The optional `app_shards` field accepts 2 or 4; omitting it
@@ -74,8 +71,9 @@ The provenance records all 1,285 source units from one complete,
 successful manual CI run. All nine original selected verify commands and
 validated worker packs retain their original source/run bindings. The 1,290
 XML reports include five additional nested-container suites; their times are
-summed under the owning source outer class. The current source has 1,286 units after an additional recovery integration
-class and changes to an existing unit regression and test helpers. Its source-unit
+summed under the owning source outer class. The current original-path source has 1,282 units. It retains the shared recovery
+integration class and test helpers while reverting fixture mechanisms and their
+own control classes. Its source-unit
 set and test-source bytes no longer match the recorded run. The provenance keeps
 both current-match and current-verify flags false. The unmeasured recovery class
 uses the declared 30-second estimate, which is not a runtime bound. Of the recorded source classes, 98 have no testcase rows

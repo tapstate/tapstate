@@ -6,7 +6,9 @@ import com.mongodb.client.MongoCollection;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.nio.charset.StandardCharsets;
 import java.util.function.Consumer;
@@ -31,13 +33,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoKeyedStateStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
     private static final String NAMESPACE = "nest.orders_to_docs.assemble.policies";
     private static final String SIBLING = "nest.orders_to_docs.assemble.orders";
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoKeyedStateStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
     void whatWasSavedComesBackAsItWasSaved() {
@@ -189,7 +191,7 @@ class MongoKeyedStateStoreIT {
     private static void withStore(Consumer<MongoKeyedStateStore> test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection =
-                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.OPERATOR_STATE);
+                    client.getDatabase("tapstate").getCollection(MongoStorePort.OPERATOR_STATE);
             collection.drop();
             test.accept(new MongoKeyedStateStore(collection));
         }

@@ -3,6 +3,8 @@ package io.tapstate.archtests;
 import com.tngtech.archunit.base.DescribedPredicate;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaMethodCall;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.StateStore;
@@ -69,7 +71,9 @@ class SingleWritePathRulesTest {
 
     @BeforeAll
     static void importTapstateClasses() {
-        tapstateClasses = ProductionClassImports.packages("io.tapstate");
+        tapstateClasses = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("io.tapstate");
     }
 
     @Test

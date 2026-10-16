@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.join;
 
 import com.hazelcast.config.Config;
+import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
 import io.tapstate.spi.store.KeyedStateStore;
@@ -8,7 +9,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInfo;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -42,22 +42,16 @@ class ImapJoinStoresTest {
     private ImapJoinStores stores;
 
     @BeforeEach
-    void startMember(TestInfo test) {
+    void startMember() {
         cold = new RecordingColdLayer();
-        member = StandaloneJoinMember.start(memberConfig(),
-                "ImapJoinStoresTest/" + test.getTestMethod().orElseThrow().getName());
-        JoinStateMapStoreFactory.bindTo(member, cold);
-        stores = new ImapJoinStores(member, PIPELINE, STEP, 4);
-    }
-
-    static Config memberConfig() {
         Config config = new Config();
         config.getJetConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
-        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
         config.addMapConfig(JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY));
-        return config;
+        member = Hazelcast.newHazelcastInstance(config);
+        JoinStateMapStoreFactory.bindTo(member, cold);
+        stores = new ImapJoinStores(member, PIPELINE, STEP, 4);
     }
 
     @AfterEach
