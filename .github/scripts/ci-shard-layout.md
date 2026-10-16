@@ -70,19 +70,20 @@ reject.
 
 The plan retains layout and duration-input hashes. Timing provenance and timer
 aggregation limits accompany the duration map; nested suite timers can overlap.
-The provenance records all 1,285 source units from one complete,
-successful manual CI run. All nine original selected verify commands and
-validated worker packs retain their original source/run bindings. The 1,290
-XML reports include five additional nested-container suites; their times are
-summed under the owning source outer class. At candidate staging, the source inventory has 1,290 units, including five
-classes absent from the recorded cohort. Its source-unit set and test-source
-bytes no longer match the recorded run. The
-provenance keeps both current-match and current-verify flags false. All five unmeasured
-classes use the declared 30-second estimate, which is not a runtime bound. Of the recorded source classes, 98 have no testcase rows
-(including 97 E2E classes), and ten have zero aggregate suite time. These reports
-remain visible; report presence or zero time cannot establish executed cases.
-The weights are estimates from that run, not an observed four-versus-six
-comparison, input equivalence, or PR performance acceptance.
+The provenance records all 1,290 source units from one complete, successful
+manual CI run. All thirteen original selected verify commands and validated
+worker packs retain that recorded source/run binding. The 1,295 XML reports
+include five additional nested-container suites; their times are summed under
+the owning source outer class. All current source identities and test-source
+bytes match the recorded cohort, and no current class uses a missing-hint
+fallback. Future unmeasured classes still use the declared 30-second estimate.
+Updating the weights changes worker assignments; the newly planned selected
+verify commands have not run, so their current-verify flag remains false.
+Of the recorded source classes, 99 have no testcase rows, and twelve have zero
+aggregate suite time. These reports remain visible; report presence or zero
+time cannot establish executed cases. The weights are scheduling estimates
+from that run, not an observed four-versus-six comparison, input equivalence,
+or PR performance acceptance.
 
 Source discovery and the exact multiset assignment remain authoritative for
 which tests run. Estimated balancing, historical main timings and a valid
