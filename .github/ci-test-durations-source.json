@@ -148,12 +148,17 @@
     }
   ],
   "cohort_hash": "9aa53da631ae55d0f25d42f3a789601b2c650801827f4a076704597e41969c9b",
-  "comparison_scope": "The recorded 1285 source identities and test-source bytes do not match the current 1286 source identities after the recovery change. The new recovery integration class uses the declared 30-second estimate; it has no recorded duration here. Historical successful verify records do not verify the changed product, test helpers or current source. Scheduling estimates establish no input or performance acceptance.",
+  "comparison_scope": "The recorded 1285 source identities and test-source bytes do not match the current 1287 source identities after synchronization. The recovery integration class and REST configuration unit class use the declared 30-second estimate; neither has a recorded duration here. Historical successful verify records do not verify the changed product, test helpers or current source. Scheduling estimates establish no input or performance acceptance.",
   "current_selected_verify_provenance_verified": false,
-  "current_source_cohort_hash": "92ede2f9e562492dc15f6221d30febf233feab08dbc4e15d36c81a7f152dc0fb",
-  "current_source_units": 1286,
+  "current_source_cohort_hash": "2f5ddfe759b223870c7bca93930f2bea4dbef7b26566bf57500b67324e39fc1e",
+  "current_source_units": 1287,
   "current_test_source_bytes_match_recorded": false,
   "current_unmeasured_source_units": [
+    {
+      "class": "io.tapstate.control.restapi.RestApiConfigurationTest",
+      "kind": "unit",
+      "module": "control/rest-api"
+    },
     {
       "class": "io.tapstate.e2e.AHeldLoadCannotBecomeARecoveryCursorIT",
       "kind": "it",
