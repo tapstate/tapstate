@@ -450,6 +450,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 return true;
             }
             Landed now = answer.get();
+            // A held load can cap progress in the previous generation. That constructed bound is not a
+            // ring position: only progress at or beyond the recorded load may become a recovery cursor.
+            if (run.snapshotEpoch() != null && !SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
+                return true;
+            }
             Landed before = landed.get(chain);
             // Every writer reports on its own, so this may land after a later report of the table's - which the
             // store, comparing the two, leaves standing.
@@ -461,6 +466,21 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     meta.settleDirectBatches(source.miningChainId(), source.consumerId());
                 }
             }
+            if (!advanceResumableProgress(source, run, now, before, fence)) {
+                return false;
+            }
+            if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
+                if (!markSnapshotComplete(source, table, fence)) {
+                    return false;
+                }
+                loaded.add(chain);
+            }
+            landed.put(chain, now);
+            return true;
+        }
+
+        private boolean advanceResumableProgress(SourceProgress source, WriterRun run, Landed now, Landed before,
+                WorkloadClaimFence fence) {
             ChainPosition resumable = now.resumableAt();
             if (resumable != null && (before == null || before.resumableAt() == null
                     || resumable.order().compareTo(before.resumableAt().order()) > 0)) {
@@ -475,13 +495,6 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     recordHowFarTheSourceHasBeenRead(meta, source.miningChainId(), resumable, recordedRead);
                 }
             }
-            if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
-                if (!markSnapshotComplete(source, table, fence)) {
-                    return false;
-                }
-                loaded.add(chain);
-            }
-            landed.put(chain, now);
             return true;
         }
 
