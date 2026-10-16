@@ -69,8 +69,36 @@ NET="tapstate-smoke-net-$$"
 MONGO="tapstate-smoke-mongo-$$"
 SERVER="tapstate-image-smoke-$$"
 WORK="$(mktemp -d)"
+MONGO_STARTING=0
+
+# Invoked through the EXIT trap.
+# shellcheck disable=SC2329
+mongo_diagnostics() {
+  bold "Mongo fixture state (first 4096 bytes)"
+  docker inspect -f 'status={{.State.Status}} running={{.State.Running}} exitCode={{.State.ExitCode}} oomKilled={{.State.OOMKilled}} error={{json .State.Error}}' \
+    "$MONGO" 2>&1 | head -c 4096 || true
+  printf '\n'
+  bold "Final Mongo readiness stderr (last 4096 bytes)"
+  tail -c 4096 "$WORK/mongo-readiness.err" 2>/dev/null || true
+  printf '\n'
+  bold "Mongo fixture logs (last 100 lines, up to 16384 bytes)"
+  docker logs --tail 100 "$MONGO" 2>&1 | tail -c 16384 || true
+  printf '\n'
+}
+
 # Containers before the network they attach to (a network with attached containers will not remove).
-trap 'docker rm -f "$SERVER" "$MONGO" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+# shellcheck disable=SC2329
+cleanup() {
+  local status=$?
+  if [[ $status -ne 0 && $MONGO_STARTING -eq 1 ]]; then
+    mongo_diagnostics >&2 || true
+  fi
+  docker rm -f "$SERVER" "$MONGO" >/dev/null 2>&1 || true
+  docker network rm "$NET" >/dev/null 2>&1 || true
+  rm -rf "$WORK" || true
+  exit "$status"
+}
+trap 'cleanup' EXIT
 
 health_of() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$1" 2>/dev/null || echo gone; }
 is_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo false)" = "true" ]; }
@@ -144,13 +172,14 @@ fi
 
 bold "0. bring up a throwaway single-member replica set for the store"
 docker network create "$NET" >/dev/null
+MONGO_STARTING=1
 docker run -d --name "$MONGO" --network "$NET" mongo:7.0 --replSet rs0 --bind_ip_all >/dev/null
 # Wait for mongod to accept connections, then initiate the set and wait for a primary. The advertised
 # member host is irrelevant: the server addresses the set with directConnection, which bypasses topology
 # discovery, so it reaches the member under its service name regardless of what the set advertises.
 mongo_ready=0
 for _ in $(seq 1 60); do
-  if docker exec "$MONGO" mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' 2>/dev/null | grep -q 1; then
+  if docker exec "$MONGO" mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' 2>"$WORK/mongo-readiness.err" | grep -q 1; then
     mongo_ready=1; break
   fi
   sleep 1
@@ -161,12 +190,13 @@ docker exec "$MONGO" mongosh --quiet --eval \
   >/dev/null 2>&1 || true
 primary=0
 for _ in $(seq 1 60); do
-  if docker exec "$MONGO" mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
+  if docker exec "$MONGO" mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>"$WORK/mongo-readiness.err" | grep -q true; then
     primary=1; break
   fi
   sleep 1
 done
 [ "$primary" = 1 ] || { red "mongo replica set did not elect a primary"; exit 2; }
+MONGO_STARTING=0
 green "  store ready (primary elected)"
 
 bold "1. container boots against the store, HEALTHCHECK reaches healthy, runs as the unprivileged uid"
