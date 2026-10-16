@@ -19,10 +19,15 @@ not a page - sample data, workspace files, scripts - carries no header: it belon
 code and is read by running it.
 
 
+The demo (`install.tapstate.dev/demo`) is the starting point for everyone. It ends with three
+ways in - the web application the server ships with, an AI agent connected over MCP, and the
+CLI - and the published quickstart walks through the browser one. The pages below are the
+CLI's: the path for scripts, CI, and machines without a browser or an AI assistant.
+
 | Start here | |
 |---|---|
-| [First run](first-run/) | The guided path: install the CLI, answer a few questions, and bring a workspace to running - the contract every step is held to. |
-| [Quickstart](quickstart-online.md) | The full demo (`install.tapstate.dev/demo`): sample databases, the server, and a live object assembled from two engines - and the same flow by hand, verb by verb, as the reference for what the guided path does. |
+| [Quickstart](quickstart-online.md) | The full demo: sample databases, the server, and a live object assembled from two engines - and the same flow by hand, verb by verb, from the CLI. |
+| [First run](first-run/) | The CLI's guided path: answer a few questions and bring a workspace to running - the contract every step is held to. |
 | [Running on your own databases](running-on-your-own-databases.md) | Run the server as a process on your machine, against a MySQL and a MongoDB you already have. |
 | [Tutorials](tutorials/) | Worked scenarios, each with its own sample data, run end to end. |
 
