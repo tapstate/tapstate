@@ -15,6 +15,7 @@ import java.net.SocketAddress;
 import java.net.URI;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -33,6 +34,157 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 @Isolated("This class temporarily owns the JVM proxy selector")
 @Execution(ExecutionMode.SAME_THREAD)
 class CuttableLinkCleanupTest {
+    @Test
+    void closingCancelsAnOwnedTargetConnectionBeforeTheRelayStarts() throws Exception {
+        stopPendingConnection(true);
+    }
+
+    @Test
+    void refusingAPeerCancelsItsOwnedTargetConnectionBeforeTheRelayStarts() throws Exception {
+        stopPendingConnection(false);
+    }
+
+    @Test
+    void admittingAPeerDoesNotReviveItsAcceptedConnectionWhileTheTargetIsBeingCreated() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        int linkPort = RealProcessServer.reservePort();
+        CountDownLatch creating = new CountDownLatch(1);
+        CountDownLatch releaseCreation = new CountDownLatch(1);
+        ConnectingSocket target = new ConnectingSocket();
+        CuttableLink link = null;
+        Throwable primary = null;
+        try (Socket client = new Socket(Proxy.NO_PROXY)) {
+            client.bind(new InetSocketAddress(loopback, 0));
+            int diallerPort = client.getLocalPort();
+            link = CuttableLink.open(linkPort, loopback.getHostAddress(), 1,
+                    Map.of("owned-peer", new int[]{diallerPort, diallerPort}), () -> {
+                        creating.countDown();
+                        try {
+                            if (!releaseCreation.await(5, TimeUnit.SECONDS)) {
+                                throw new AssertionError("the owned target creation was never released");
+                            }
+                        } catch (InterruptedException failure) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError("the owned target creation was interrupted", failure);
+                        }
+                        return target;
+                    });
+            client.connect(new InetSocketAddress(loopback, linkPort), 5_000);
+            assertThat(creating.await(5, TimeUnit.SECONDS)).as("the real accept reached target creation").isTrue();
+            link.refuse("owned-peer");
+            link.admit("owned-peer");
+            client.setSoTimeout(1_000);
+            Throwable retained = catchThrowable(() -> assertThat(client.getInputStream().read())
+                    .as("the cut owns and closes the already accepted socket").isEqualTo(-1));
+            releaseCreation.countDown();
+            assertThat(target.progressed.await(5, TimeUnit.SECONDS))
+                    .as("the accept thread handled the returned target socket").isTrue();
+            assertAll("admitting new traffic cannot revive a connection accepted before the cut",
+                    () -> assertThat(retained).as("the accepted socket closed during target creation").isNull(),
+                    () -> assertThat(target.entered.getCount()).as("the cut connection is never dialled").isOne(),
+                    () -> assertThat(target.closed.getCount()).as("the late target socket is also closed").isZero());
+        } catch (Exception | Error failure) {
+            primary = failure;
+            throw failure;
+        } finally {
+            releaseCreation.countDown();
+            List<Throwable> failures = new ArrayList<>();
+            try { target.close(); } catch (Exception | Error failure) { failures.add(failure); }
+            if (link != null) {
+                try { link.close(); } catch (Exception | Error failure) { failures.add(failure); }
+            }
+            try { RealProcessServer.releasePort(linkPort); }
+            catch (Exception | Error failure) { failures.add(failure); }
+            if (!failures.isEmpty()) {
+                if (primary != null) failures.forEach(primary::addSuppressed);
+                else {
+                    AssertionError failure = new AssertionError("the accepted connection control did not clean up");
+                    failures.forEach(failure::addSuppressed);
+                    throw failure;
+                }
+            }
+        }
+    }
+
+    private static void stopPendingConnection(boolean closeLink) throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        int linkPort = RealProcessServer.reservePort();
+        CuttableLink link = null;
+        Throwable primary = null;
+        ConnectingSocket target = new ConnectingSocket();
+        try (Socket client = new Socket(Proxy.NO_PROXY)) {
+            client.bind(new InetSocketAddress(loopback, 0));
+            int diallerPort = client.getLocalPort();
+            link = CuttableLink.open(linkPort, loopback.getHostAddress(), 1,
+                    Map.of("owned-peer", new int[]{diallerPort, diallerPort}), () -> target);
+            Field field = CuttableLink.class.getDeclaredField("acceptThread");
+            field.setAccessible(true);
+            Thread accepting = (Thread) field.get(link);
+            client.connect(new InetSocketAddress(loopback, linkPort), 5_000);
+            assertThat(target.entered.await(5, TimeUnit.SECONDS))
+                    .as("the real accept thread has entered the owned target connection").isTrue();
+            CuttableLink stopping = link;
+            Throwable failure = catchThrowable(() -> {
+                if (closeLink) stopping.close();
+                else stopping.refuse("owned-peer");
+            });
+            assertThat(failure).as("stopping a relay cancels its pending owned connection").isNull();
+            assertThat(target.closed.await(1, TimeUnit.SECONDS))
+                    .as("the pending target socket is closed before it can become a relay").isTrue();
+            client.setSoTimeout(1_000);
+            assertThat(client.getInputStream().read()).as("the accepted client is also released").isEqualTo(-1);
+            assertThat(accepting.isAlive()).as("only closing the link stops its listener").isEqualTo(!closeLink);
+        } catch (Exception | Error failure) {
+            primary = failure;
+            throw failure;
+        } finally {
+            List<Throwable> failures = new ArrayList<>();
+            try { target.close(); } catch (Exception | Error failure) { failures.add(failure); }
+            if (link != null) {
+                try { link.close(); } catch (Exception | Error failure) { failures.add(failure); }
+            }
+            try { RealProcessServer.releasePort(linkPort); }
+            catch (Exception | Error failure) { failures.add(failure); }
+            if (!failures.isEmpty()) {
+                if (primary != null) failures.forEach(primary::addSuppressed);
+                else {
+                    AssertionError failure = new AssertionError("the pending connection control did not clean up");
+                    failures.forEach(failure::addSuppressed);
+                    throw failure;
+                }
+            }
+        }
+    }
+
+    /** A connection that only its owning socket's close can release. */
+    private static final class ConnectingSocket extends Socket {
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch closed = new CountDownLatch(1);
+        private final CountDownLatch progressed = new CountDownLatch(1);
+
+        @Override
+        public void connect(SocketAddress endpoint) throws IOException {
+            entered.countDown();
+            progressed.countDown();
+            try {
+                if (!closed.await(30, TimeUnit.SECONDS)) {
+                    throw new SocketTimeoutException("the owned target connection was never cancelled");
+                }
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new IOException("the owned connection control was interrupted", failure);
+            }
+            throw new SocketException("the owned target connection was closed");
+        }
+
+        @Override
+        public synchronized void close() throws IOException {
+            closed.countDown();
+            progressed.countDown();
+            super.close();
+        }
+    }
+
     @Test
     void anInterruptedListenerJoinStillClosesBothOwnedRelayHalvesAndLeavesForeignTrafficAlone()
             throws Exception {
