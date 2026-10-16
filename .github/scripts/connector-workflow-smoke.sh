@@ -16,6 +16,9 @@ def check(text):
     jobs={m.group(1):text[m.end():starts[i+1].start() if i+1<len(starts) else len(text)] for i,m in enumerate(starts)}
     aggregate=jobs['real-connectors']; witness=jobs['connector-witnesses']; jars=jobs['connector-jars']; plan=jobs['connector-plan']
     assert 'needs: connector-plan' in jars
+    assert "if: steps.plan.outputs.requires_atlas == 'true'" in plan
+    assert "jq -r '.requires_atlas_fixtures'" in plan and '.connector_deferrals' in plan
+    assert plan.index('connector-witnesses.sh plan') < plan.index('test -n "$TAPSTATE_ATLAS_TEST_URI"')
     for name in ('TAPSTATE_ATLAS_TEST_URI', 'TAPSTATE_ATLAS_STANDARD_URI'):
         binding = name + ': ${{ secrets.' + name + ' }}'
         assert binding in plan and binding in witness
@@ -70,6 +73,8 @@ for before,after in [
     ('-${{ steps.source.outputs.enterprise_sha }}-', '-'),
     (' --checkout "$RUNNER_TEMP/connector-enterprise-source"', ''),
     ('    needs: connector-plan', '    needs: []'),
+    ("if: steps.plan.outputs.requires_atlas == 'true'", "if: false"),
+    ("jq -r '.requires_atlas_fixtures'", "jq -r 'false'"),
     ('TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}', 'TAPSTATE_ATLAS_TEST_URI: ""'),
     ('TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}', 'TAPSTATE_ATLAS_STANDARD_URI: ""'),
     ('prepare-test-inputs.py --output', 'true --output'),
@@ -79,5 +84,5 @@ for before,after in [
     try: check(mutated)
     except (AssertionError,KeyError,ValueError): pass
     else: raise AssertionError('workflow mutation survived: '+before)
-print('connector-workflow smoke: fixed check name, complete fixtures/admission and 14 mutations passed')
+print('connector-workflow smoke: fixed check name, explicit Atlas deferral, complete active admission and 16 mutations passed')
 PY

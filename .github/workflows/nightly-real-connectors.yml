@@ -16,15 +16,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Require controlled Atlas fixture inputs
+      - name: Plan active connector witnesses and record deferred acceptance
+        id: plan
+        run: |
+          .github/scripts/connector-witnesses.sh plan --durations .github/connector-test-durations.json --output "$RUNNER_TEMP/connector-shards.json"
+          echo "requires_atlas=$(jq -r '.requires_atlas_fixtures' "$RUNNER_TEMP/connector-shards.json")" >> "$GITHUB_OUTPUT"
+          jq -r '.connector_deferrals | "## Deferred external Atlas acceptance\n\(.reason)\nFollow-up: \(.issue)\n", (.classes[] | "- " + .)' "$RUNNER_TEMP/connector-shards.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Require controlled Atlas fixture inputs when selected
+        if: steps.plan.outputs.requires_atlas == 'true'
         env:
           TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}
           TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}
         run: |
           test -n "$TAPSTATE_ATLAS_TEST_URI" || { echo "Missing required Actions secret: TAPSTATE_ATLAS_TEST_URI" >&2; exit 1; }
           test -n "$TAPSTATE_ATLAS_STANDARD_URI" || { echo "Missing required Actions secret: TAPSTATE_ATLAS_STANDARD_URI" >&2; exit 1; }
-      - name: Plan all source-selected connector witnesses
-        run: .github/scripts/connector-witnesses.sh plan --durations .github/connector-test-durations.json --output "$RUNNER_TEMP/connector-shards.json"
       - uses: actions/upload-artifact@v4
         with:
           name: connector-shard-plan
