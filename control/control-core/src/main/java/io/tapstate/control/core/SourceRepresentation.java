@@ -34,12 +34,12 @@ public final class SourceRepresentation {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
     }
 
-    /** Builds a core Source while applying catalog-driven secret replacement semantics. */
+    /** Builds a core Source while applying catalog and shared transport secret replacement semantics. */
     public SourceResource toModel(SourceDraft draft, SourceResource existing) {
         return toModel(draft, existing, true);
     }
 
-    /** Builds a persistent Source from structured HTTP input and catalog-driven secret rules. */
+    /** Builds a persistent Source from structured HTTP input and catalog and shared transport secret rules. */
     public SourceResource toModel(SourceInput input, SourceResource existing) {
         Objects.requireNonNull(input, "input");
         return toModel(input.asDraft(), existing, true);
@@ -54,7 +54,7 @@ public final class SourceRepresentation {
             SourceDraft draft, SourceResource existing, boolean enforceSecretRules) {
         Objects.requireNonNull(draft, "draft");
         ConnectorCatalogEntry connector = connector(draft.connector());
-        Map<String, ConfigField> secrets = secretFields(connector);
+        Map<String, SecretField> secrets = secretFields(connector);
         if (enforceSecretRules) {
             validateSuppliedSecrets(draft, secrets);
         }
@@ -64,11 +64,9 @@ public final class SourceRepresentation {
 
         Map<String, Object> config = new LinkedHashMap<>(draft.config());
         if (existing != null && existing.connector().equals(draft.connector())) {
-            for (String secret : secrets.keySet()) {
-                if (!config.containsKey(secret)
-                        && existing.config().containsKey(secret)
-                        && existing.config().get(secret) != null) {
-                    config.put(secret, SourceDraft.copyJsonValue(existing.config().get(secret)));
+            for (SecretField secret : secrets.values()) {
+                if (!secret.contains(config) && secret.value(existing.config()) != null) {
+                    secret.put(config, SourceDraft.copyJsonValue(secret.value(existing.config())));
                 }
             }
         }
@@ -81,7 +79,14 @@ public final class SourceRepresentation {
             }
             config.put("uri", savedUri);
         }
-        clearSecrets.forEach(config::remove);
+        for (String secret : clearSecrets) {
+            SecretField field = secrets.get(secret);
+            if (field == null) {
+                config.remove(secret);
+            } else {
+                field.remove(config);
+            }
+        }
 
         // Options are the engine's own configuration and its vocabulary is empty today, so the model
         // has nowhere to put one. Refusing here rather than dropping it silently: a draft that keeps
@@ -101,12 +106,12 @@ public final class SourceRepresentation {
                 SourceDraft.copyJsonMap(draft.experimental(), true));
     }
 
-    /** Builds a normalized response with every catalog secret removed. */
+    /** Builds a normalized response with every catalog and shared transport secret removed. */
     public SourceView toView(SourceResource source, String contentHash) {
         Objects.requireNonNull(source, "source");
-        Map<String, ConfigField> secrets = secretFields(connector(source.connector()));
+        Map<String, SecretField> secrets = secretFields(connector(source.connector()));
         Map<String, Object> redactedConfig = new LinkedHashMap<>(source.config());
-        secrets.keySet().forEach(redactedConfig::remove);
+        secrets.values().forEach(secret -> secret.remove(redactedConfig));
         Object uri = redactedConfig.get("uri");
         if (uri instanceof String value) {
             redactedConfig.put("uri", MongoUriUserInfo.redact(value));
@@ -114,8 +119,7 @@ public final class SourceRepresentation {
             redactedConfig.put("uri", MongoUriUserInfo.REDACTED);
         }
         List<String> configuredSecrets = secrets.keySet().stream()
-                .filter(name -> source.config().containsKey(name)
-                        && source.config().get(name) != null)
+                .filter(name -> secrets.get(name).value(source.config()) != null)
                 .sorted()
                 .toList();
 
@@ -149,16 +153,67 @@ public final class SourceRepresentation {
         return "mongodb".equals(connector) || "mongodb-atlas".equals(connector);
     }
 
-    private static Map<String, ConfigField> secretFields(ConnectorCatalogEntry connector) {
-        Map<String, ConfigField> result = new LinkedHashMap<>();
+    private static Map<String, SecretField> secretFields(ConnectorCatalogEntry connector) {
+        Map<String, SecretField> result = new LinkedHashMap<>();
         connector.config().stream()
                 .filter(ConfigField::secret)
-                .forEach(field -> result.put(field.name(), field));
+                .forEach(field -> result.put(field.name(), new SecretField(null, field.name(), field.required())));
+        result.putIfAbsent("sslKey", new SecretField(null, "sslKey", false));
+        result.putIfAbsent("sslKeyPassword", new SecretField(null, "sslKeyPassword", false));
+        result.putIfAbsent("__TAPDATA.sshPassword", new SecretField("__TAPDATA", "sshPassword", false));
         return result;
     }
 
+    /** Catalog names remain literal; only explicitly registered shared fields have a nested path. */
+    private record SecretField(String group, String name, boolean required) {
+        private Map<?, ?> container(Map<String, Object> config) {
+            if (group == null) {
+                return config;
+            }
+            return config.get(group) instanceof Map<?, ?> nested ? nested : Map.of();
+        }
+
+        boolean contains(Map<String, Object> config) {
+            return container(config).containsKey(name);
+        }
+
+        Object value(Map<String, Object> config) {
+            return container(config).get(name);
+        }
+
+        void put(Map<String, Object> config, Object value) {
+            if (group == null) {
+                config.put(name, value);
+            } else {
+                Map<String, Object> nested = mutableGroup(config);
+                nested.put(name, value);
+                config.put(group, nested);
+            }
+        }
+
+        void remove(Map<String, Object> config) {
+            if (group == null) {
+                config.remove(name);
+            } else if (contains(config)) {
+                Map<String, Object> nested = mutableGroup(config);
+                nested.remove(name);
+                config.put(group, nested);
+            }
+        }
+
+        private Map<String, Object> mutableGroup(Map<String, Object> config) {
+            Object existing = config.get(group);
+            if (existing != null && !(existing instanceof Map<?, ?>)) {
+                throw malformed("config." + group + " must be an object");
+            }
+            Map<String, Object> nested = new LinkedHashMap<>();
+            container(config).forEach((key, value) -> nested.put((String) key, value));
+            return nested;
+        }
+    }
+
     private static List<String> validateClearSecrets(
-            SourceDraft draft, Map<String, ConfigField> secrets) {
+            SourceDraft draft, Map<String, SecretField> secrets) {
         Set<String> seen = new LinkedHashSet<>();
         for (String field : draft.clearSecrets()) {
             if (field == null || !secrets.containsKey(field)) {
@@ -167,7 +222,7 @@ public final class SourceRepresentation {
             if (!seen.add(field)) {
                 throw malformed("clearSecrets contains a duplicate field: " + field);
             }
-            if (draft.config().containsKey(field)) {
+            if (secrets.get(field).contains(draft.config())) {
                 throw malformed("a secret cannot be supplied and cleared in the same request: " + field);
             }
             if (secrets.get(field).required()) {
@@ -178,9 +233,9 @@ public final class SourceRepresentation {
     }
 
     private static void validateSuppliedSecrets(
-            SourceDraft draft, Map<String, ConfigField> secrets) {
+            SourceDraft draft, Map<String, SecretField> secrets) {
         for (String secret : secrets.keySet()) {
-            if (draft.config().containsKey(secret) && draft.config().get(secret) == null) {
+            if (secrets.get(secret).contains(draft.config()) && secrets.get(secret).value(draft.config()) == null) {
                 throw malformed("a supplied secret cannot be null: " + secret);
             }
         }
