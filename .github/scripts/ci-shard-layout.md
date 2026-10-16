@@ -71,9 +71,8 @@ The provenance records all 1,285 source units from one complete,
 successful manual CI run. All nine original selected verify commands and
 validated worker packs retain their original source/run bindings. The 1,290
 XML reports include five additional nested-container suites; their times are
-summed under the owning source outer class. The current original-path source has 1,282 units. It retains the shared recovery
-integration class and test helpers while reverting fixture mechanisms and their
-own control classes. Its source-unit
+summed under the owning source outer class. The current source has 1,286 units after an additional recovery integration
+class and changes to an existing unit regression and test helpers. Its source-unit
 set and test-source bytes no longer match the recorded run. The provenance keeps
 both current-match and current-verify flags false. The unmeasured recovery class
 uses the declared 30-second estimate, which is not a runtime bound. Of the recorded source classes, 98 have no testcase rows
