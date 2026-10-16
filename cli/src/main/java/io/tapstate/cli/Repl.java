@@ -1527,6 +1527,7 @@ final class Repl {
                 }
             }
             if (outcome instanceof StatusOutcome.Rejected
+                    || outcome instanceof StatusOutcome.NoObservation
                     || System.nanoTime() - deadline >= 0
                     || !sleepUnlessCancelled(PAUSE_SETTLE_POLL)) {
                 return seen;
@@ -1681,7 +1682,16 @@ final class Repl {
         return switch (outcome) {
             case StatusOutcome.Found found -> carryOnFrom(id, found.state());
             case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case StatusOutcome.NoObservation ignored -> handleNoObservationForRestart(id);
             case StatusOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private int handleNoObservationForRestart(String id) {
+        return switch (readExplanation(id)) {
+            case ExplainOutcome.Found found -> carryOnFrom(id, found.state());
+            case ExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ExplainOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 

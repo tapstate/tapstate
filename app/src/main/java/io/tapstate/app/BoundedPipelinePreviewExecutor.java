@@ -469,14 +469,12 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 submitted.cancel();
                 throw refused("the preview exceeded its 45 second execution deadline");
             } catch (java.util.concurrent.ExecutionException failed) {
-                Throwable cause = failed.getCause();
-                while (cause instanceof java.util.concurrent.ExecutionException
-                        || cause instanceof java.util.concurrent.CompletionException) {
-                    cause = cause.getCause();
-                }
-                if (cause instanceof TapstateException coded) {
+                TapstateException coded = BoundedPipelinePreviewExecutor.codedCause(failed);
+                if (coded != null) {
                     throw coded;
                 }
+                LOG.warn("Pipeline preview run {} failed with cause chain {}",
+                        request.runId(), exceptionTypes(failed));
                 throw refused("the isolated preview pipeline failed during execution");
             }
         }
@@ -726,6 +724,16 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                         executionId);
             }
         }
+    }
+
+    static TapstateException codedCause(Throwable failureCause) {
+        Set<Throwable> seen = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (Throwable current = failureCause; current != null && seen.add(current); current = current.getCause()) {
+            if (current instanceof TapstateException coded) {
+                return coded;
+            }
+        }
+        return null;
     }
 
     private static TapstateException refused(String reason) {
