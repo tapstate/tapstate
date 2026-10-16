@@ -179,13 +179,23 @@ final class ControlPlane {
     /** A fresh timestamp rules out a retained observation from the process that was replaced. */
     Optional<Instant> observedAt(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
-        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+        return interpretObservedAt(response.statusCode(), response.body(), pipelineId);
+    }
+
+    static Optional<Instant> interpretObservedAt(int status, String body, String pipelineId) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
             return Optional.empty();
         }
-        expect(response, 200, "read the observation time of " + pipelineId);
-        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> answer)
-                || !(answer.get("observedAt") instanceof String time)) {
-            throw new AssertionError("the pipeline status returned no observation time");
+        if (status != 200) {
+            throw new AssertionError("could not read the observation time of " + pipelineId
+                    + ": expected HTTP 200, got " + status + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> answer)) {
+            throw new AssertionError("the pipeline status returned no observation object: " + body);
+        }
+        if (answer.get("observedAt") == null) return Optional.empty();
+        if (!(answer.get("observedAt") instanceof String time)) {
+            throw new AssertionError("the pipeline status returned an invalid observation time: " + body);
         }
         return Optional.of(Instant.parse(time));
     }
@@ -519,10 +529,15 @@ final class ControlPlane {
      * <p>What tells one run of a pipeline from the run that replaced it. A rebuild that reused the
      * number would leave the two indistinguishable to everything downstream, which is the whole reason
      * the number exists.
+     *
+     * <p>A coded membership refusal leaves no generation to compare yet; callers keep polling within
+     * their original bound, just as the membership wait does.
      */
     Optional<Long> executionGenerationOf(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/cluster/members"));
-        expect(response, 200, "read the execution generation of " + pipelineId);
+        if (interpretClusterMembers(response.statusCode(), response.body()).isEmpty()) {
+            return Optional.empty();
+        }
         for (Object pipeline : pipelinesOf(response.body())) {
             if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
                     && one.get("controllerClaim") instanceof Map<?, ?> claim
@@ -784,6 +799,16 @@ final class ControlPlane {
         expect(read, 200, "read pipeline draft " + id);
         if (!(JsonReader.parse(read.body()) instanceof Map<?, ?> map)) {
             throw new AssertionError("the pipeline draft read was not an object: " + read.body());
+        }
+        return asObject(map);
+    }
+
+    /** Reads the aggregate lifecycle projection for a known pipeline draft. */
+    Map<String, Object> pipelineStatus(String id) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(id) + "/status"));
+        expect(response, 200, "read pipeline status " + id);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("pipeline status was not an object: " + response.body());
         }
         return asObject(map);
     }
@@ -1611,11 +1636,12 @@ final class ControlPlane {
                     "could not read the status of " + pipelineId + ": expected HTTP 200, got " + status
                             + " - " + body);
         }
-        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
-                || !(map.get("observedAgeMillis") instanceof Number age)) {
-            // Not waited out as though the pipeline were slow: a published observation carries its age,
-            // so a 200 without one is the contract being gone, which is the thing to say out loud.
-            throw new AssertionError("status carried no observedAgeMillis: " + body);
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)) {
+            throw new AssertionError("status carried no object: " + body);
+        }
+        if (map.get("observedAgeMillis") == null) return Optional.empty();
+        if (!(map.get("observedAgeMillis") instanceof Number age)) {
+            throw new AssertionError("status carried an invalid observedAgeMillis: " + body);
         }
         return Optional.of(age.longValue());
     }
@@ -1629,10 +1655,28 @@ final class ControlPlane {
                     "could not read the status of " + pipelineId + ": expected HTTP 200, got " + status
                             + " - " + body);
         }
-        if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("state") instanceof String state)) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)) {
             throw new AssertionError("status carried no state: " + body);
         }
-        return Optional.of(PipelineState.valueOf(state));
+
+        // The aggregate status projection can report a desired/catalog state before the runtime publishes
+        // an observation. Its display/desired fields identify that shape; hasArtifact is an independent
+        // business fact and must not be used to decide whether state is observed.
+        if (map.containsKey("observedState") || map.containsKey("displayState")
+                || map.containsKey("desiredState")) {
+            Object observedState = map.get("observedState");
+            if (observedState == null) {
+                return Optional.empty();
+            }
+            if (observedState instanceof String state) {
+                return Optional.of(PipelineState.valueOf(state));
+            }
+            throw new AssertionError("status carried an invalid observedState: " + body);
+        }
+        if (map.get("state") instanceof String state) {
+            return Optional.of(PipelineState.valueOf(state));
+        }
+        throw new AssertionError("status carried no state: " + body);
     }
 
     /**

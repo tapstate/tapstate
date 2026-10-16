@@ -114,6 +114,12 @@ final class StoreDocuments implements AutoCloseable {
         return ids(MongoStorePort.SRS_META);
     }
 
+    /** The retained log's bounds, which survive removal of its already confirmed records. */
+    Document logBounds(String ringName) {
+        return database.getCollection(MongoStorePort.SRS_LOG)
+                .find(new Document("_id", "srs-log-bounds:" + ringName)).first();
+    }
+
     /** The whole chain record, for reporting what a chain actually held when an assertion about it fails. */
     Document chain(String miningChainId) {
         return database.getCollection(MongoStorePort.SRS_META)

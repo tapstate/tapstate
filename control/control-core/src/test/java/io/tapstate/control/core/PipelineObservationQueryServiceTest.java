@@ -218,6 +218,31 @@ class PipelineObservationQueryServiceTest {
     }
 
     @Test
+    void findsAnObservedStatusWithItsPlanWithoutRequiringOneToExist() {
+        ExecutionPlan plan = new ExecutionPlan("orders_sync", 3L, 7L, 11L, List.of("m1"), List.of(),
+                Instant.parse("2026-09-26T10:00:00Z"));
+        ReadCountingPlans plans = new ReadCountingPlans(Map.of("orders_sync", plan));
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()),
+                plans, () -> List.of("m1", "m2"));
+
+        Optional<PipelineStatus> found = service.findStatusWithPlan("orders_sync");
+
+        assertThat(found).get().extracting(PipelineStatus::state).isEqualTo(PipelineState.RUNNING);
+        assertThat(found).get().extracting(PipelineStatus::plan).isEqualTo(plan);
+        assertThat(found).get().extracting(PipelineStatus::awaitingRebalance).isEqualTo(List.of("m2"));
+        assertThat(plans.reads).containsExactly(List.of("orders_sync"));
+    }
+
+    @Test
+    void findsNoStatusAndDoesNotReadPlansBeforeTheFirstObservation() {
+        ReadCountingPlans plans = new ReadCountingPlans(Map.of());
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(), plans);
+
+        assertThat(service.findStatusWithPlan("orders_sync")).isEmpty();
+        assertThat(plans.reads).isEmpty();
+    }
+
+    @Test
     void aReaderFollowingTheStateAsItChangesIsAnsweredWithoutThePlanBeingRead() {
         ReadCountingPlans plans = new ReadCountingPlans(Map.of("orders_sync", new ExecutionPlan("orders_sync",
                 null, null, null, List.of("local"), List.of(), Instant.parse("2026-09-26T10:00:00Z"))));
