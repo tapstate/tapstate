@@ -97,6 +97,26 @@ final class NodeSessionLease implements AutoCloseable {
         return new Proof(current.get(), deadline, !closed.get() && System.nanoTime() - deadline < 0);
     }
 
+    /** Transfers the exact last proof without releasing the reservation or buying more local time. */
+    Proof handoff() {
+        if (store == null || !closed.compareAndSet(false, true)) {
+            // Loss may already be stopping the member; do not interrupt that graceful stop.
+            throw joinLost();
+        }
+        long deadline = provenUntil;
+        renewer.shutdownNow();
+        boolean quiesced;
+        try {
+            // A keyring acknowledgement may ignore interruption. Its local publication must finish
+            // before the next owner can acknowledge another epoch on the same handle.
+            quiesced = renewer.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            quiesced = false;
+        }
+        return new Proof(current.get(), deadline, quiesced && System.nanoTime() - deadline < 0);
+    }
+
     /**
      * Keeps {@code initial} live from now on. {@code askedAt} is when, on the monotonic clock, the
      * acquisition that produced it was asked for -- no later -- which is where its lease is timed from.

@@ -395,6 +395,133 @@ class NodeSessionLeaseTest {
         }
     }
 
+    @Test
+    void handoffKeepsTheExactDeadlineAndDoesNotReleaseTheReservation() throws Exception {
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        CountDownLatch asked = new CountDownLatch(1);
+        when(store.renew(any(), any())).thenAnswer(call -> {
+            asked.countDown();
+            new CountDownLatch(1).await();
+            return Optional.empty();
+        });
+        SourceConfigKeyringSession keyring = mock(SourceConfigKeyringSession.class);
+        long askedAt = System.nanoTime();
+        Duration ttl = Duration.ofSeconds(5);
+        try (NodeSessionLease session = new NodeSessionLease(store, CLAIM, askedAt, ttl,
+                Duration.ofSeconds(1), keyring, () -> { })) {
+            assertThat(asked.await(1, TimeUnit.SECONDS)).isTrue();
+            NodeSessionLease.Proof transfer = session.handoff();
+            assertThat(transfer.live()).isTrue();
+            assertThat(transfer.claim()).isSameAs(CLAIM);
+            assertThat(transfer.deadlineNanos()).isEqualTo(askedAt + ttl.toNanos());
+            assertThat(session.proof().live()).isFalse();
+            session.close();
+            verify(store, never()).release(any());
+            verify(store, never()).acquire(any(), any(), anyLong(), any());
+            verify(keyring, never()).release(any());
+        }
+    }
+
+    @Test
+    void handoffWaitsForAnAcknowledgementThatOutlivesCancellation() throws Exception {
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.renew(any(), any())).thenReturn(Optional.of(CLAIM));
+        SourceConfigKeyringSession keyring = mock(SourceConfigKeyringSession.class);
+        CountDownLatch acknowledgementEntered = new CountDownLatch(1);
+        CountDownLatch allowAcknowledgement = new CountDownLatch(1);
+        doAnswer(call -> {
+            acknowledgementEntered.countDown();
+            awaitIgnoringInterrupts(allowAcknowledgement);
+            return null;
+        }).when(keyring).acknowledge(any(), any());
+        AtomicReference<NodeSessionLease.Proof> transferred = new AtomicReference<>();
+        CountDownLatch completed = new CountDownLatch(1);
+        try (NodeSessionLease session = new NodeSessionLease(store, CLAIM, System.nanoTime(), Duration.ofSeconds(5),
+                Duration.ofSeconds(1), keyring, () -> { })) {
+            assertThat(acknowledgementEntered.await(1, TimeUnit.SECONDS)).isTrue();
+            Thread handover = new Thread(() -> {
+                transferred.set(session.handoff());
+                completed.countDown();
+            });
+            handover.start();
+            try {
+                assertThat(completed.await(100, TimeUnit.MILLISECONDS))
+                        .as("no successor can start while the old keyring publication is still running").isFalse();
+            } finally {
+                allowAcknowledgement.countDown();
+                handover.join(2000);
+            }
+            assertThat(handover.isAlive()).isFalse();
+            assertThat(transferred.get().live()).isTrue();
+            verify(store, never()).release(any());
+            verify(keyring, never()).release(any());
+        } finally {
+            allowAcknowledgement.countDown();
+        }
+    }
+
+    @Test
+    void aStuckAcknowledgementCannotTransferAuthorityBeyondTheProvenDeadline() throws Exception {
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.renew(any(), any())).thenReturn(Optional.of(CLAIM));
+        SourceConfigKeyringSession keyring = mock(SourceConfigKeyringSession.class);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(call -> {
+            entered.countDown();
+            awaitIgnoringInterrupts(release);
+            return null;
+        }).when(keyring).acknowledge(any(), any());
+        long askedAt = System.nanoTime();
+        Duration ttl = Duration.ofMillis(500);
+        try (NodeSessionLease session = new NodeSessionLease(store, CLAIM, askedAt, ttl,
+                Duration.ofMillis(100), keyring, () -> { })) {
+            assertThat(entered.await(1, TimeUnit.SECONDS)).isTrue();
+            NodeSessionLease.Proof transfer = session.handoff();
+            assertThat(transfer.live()).isFalse();
+            assertThat(transfer.deadlineNanos()).isEqualTo(askedAt + ttl.toNanos());
+            verify(store, never()).release(any());
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void aFailedHandoffDoesNotInterruptALossOwnedGracefulShutdown() throws Exception {
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.renew(any(), any())).thenReturn(Optional.empty());
+        CountDownLatch stopping = new CountDownLatch(1);
+        CountDownLatch allowStop = new CountDownLatch(1);
+        CountDownLatch stopped = new CountDownLatch(1);
+        AtomicBoolean interruptedStop = new AtomicBoolean();
+        try (NodeSessionLease session = new NodeSessionLease(store, CLAIM, System.nanoTime(), Duration.ofSeconds(5),
+                Duration.ofSeconds(1), () -> {
+                    stopping.countDown();
+                    try { allowStop.await(); }
+                    catch (InterruptedException interrupted) { interruptedStop.set(true); }
+                    finally { stopped.countDown(); }
+                })) {
+            assertThat(stopping.await(1, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(session::handoff).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(BootError.PROFILE_SESSION_LOST));
+            assertThat(stopped.await(100, TimeUnit.MILLISECONDS)).isFalse();
+            verify(store, never()).release(any());
+        } finally {
+            allowStop.countDown();
+            assertThat(stopped.await(2, TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(interruptedStop).isFalse();
+    }
+
+    private static void awaitIgnoringInterrupts(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try { latch.await(); break; }
+            catch (InterruptedException ignored) { interrupted = true; }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
     private static WorkloadClaim acceptedProfileClaim(long generation) {
         return new WorkloadClaim(PROFILE_CLAIM.key(), PROFILE_CLAIM.owner(), generation, 0, 0,
                 Instant.now().plusSeconds(60), 0, 0, Set.of(), 0, false, PROFILE_CLAIM.profileGeneration());

@@ -57,6 +57,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -146,16 +147,34 @@ class HazelcastConfiguration {
             configureClusterProtection(config, membershipGate);
         }
         HazelcastInstance member;
+        AtomicReference<HazelcastInstance> formingMember = new AtomicReference<>();
+        NodeSessionLease formationOwner = null;
         try {
-            member = startMember(() -> Hazelcast.newHazelcastInstance(config));
-        } catch (RuntimeException startupFailure) {
             if (identity != null) {
+                formationOwner = new NodeSessionLease(Objects.requireNonNull(claimStore, "workload-claim store"),
+                        identity.nodeSession(), sessionAskedAt, clusterProperties.getNodeSessionTtl(),
+                        clusterProperties.getNodeSessionRenewInterval(), sourceConfigKeyring, () -> {
+                            HazelcastInstance formed = formingMember.get();
+                            if (formed != null) formed.shutdown();
+                        });
+            }
+            member = startMember(() -> Hazelcast.newHazelcastInstance(config));
+            formingMember.set(member);
+        } catch (RuntimeException | Error startupFailure) {
+            if (formationOwner != null) {
+                try { formationOwner.close(); }
+                catch (RuntimeException | Error cleanup) { startupFailure.addSuppressed(cleanup); }
+            } else if (identity != null) {
                 releaseReservedSession(claimStore, sourceConfigKeyring, identity.nodeSession(), startupFailure);
             }
             throw startupFailure;
         }
         if (identity != null) {
+            boolean transferred = false;
             try {
+                if (!formationOwner.proof().live()) {
+                    throw new TapstateException(BootError.PROFILE_SESSION_LOST, Map.of(), null);
+                }
                 NodeSessionLease.JoinedIdentity joined = localJoinedIdentity(member);
                 ClusterProfileStore profiles = clusterProfiles.getIfAvailable();
                 if (profiles == null || !profiles.markJoined(identity.nodeSession(),
@@ -181,10 +200,23 @@ class HazelcastConfiguration {
                 member.getUserContext().put(
                         io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
                         ClusterMembershipGate.PROTECTION_NAME);
+                NodeSessionLease.Proof transfer = formationOwner.handoff();
+                transferred = true;
+                if (!transfer.live()) {
+                    throw new TapstateException(BootError.PROFILE_SESSION_LOST, Map.of(), null);
+                }
+                member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, transfer.claim());
+                member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY,
+                        transfer.deadlineNanos() - clusterProperties.getNodeSessionTtl().toNanos());
             } catch (RuntimeException | Error unprovedJoin) {
                 try { member.shutdown(); }
                 catch (RuntimeException | Error cleanup) { unprovedJoin.addSuppressed(cleanup); }
-                releaseReservedSession(claimStore, sourceConfigKeyring, identity.nodeSession(), unprovedJoin);
+                if (transferred) {
+                    releaseReservedSession(claimStore, sourceConfigKeyring, identity.nodeSession(), unprovedJoin);
+                } else {
+                    try { formationOwner.close(); }
+                    catch (RuntimeException | Error cleanup) { unprovedJoin.addSuppressed(cleanup); }
+                }
                 if (unprovedJoin instanceof HazelcastException || unprovedJoin instanceof HazelcastInstanceNotActiveException) {
                     throw new TapstateException(BootError.HAZELCAST_UNAVAILABLE, Map.of(), unprovedJoin);
                 }
