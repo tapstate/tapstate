@@ -449,6 +449,8 @@ class CliMainFreshProcessTest {
             builder.environment().remove("TAPSTATE_PASSWORD");
             builder.environment().remove("TAPSTATE_TOKEN");
             builder.environment().remove("TAPSTATE_CONTEXT");
+            // Launcher banners are outside the CLI's stderr contract; bound this child explicitly instead.
+            builder.environment().keySet().removeAll(List.of("JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS"));
             builder.environment().put("TAPSTATE_WORKDIR", workspace.toString());
             builder.environment().putAll(environment);
             builder.redirectOutput(stdout.toFile());
@@ -475,6 +477,7 @@ class CliMainFreshProcessTest {
         String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
         List<String> command = new ArrayList<>(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx384m", "-XX:ActiveProcessorCount=2",
                 "-Duser.home=" + home,
                 "-cp", classpath,
                 Cli.class.getName()));
