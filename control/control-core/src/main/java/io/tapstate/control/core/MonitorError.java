@@ -18,8 +18,9 @@ import java.util.Set;
 public enum MonitorError implements TapstateErrorCode {
 
     /**
-     * A status / metrics / snapshot read named a pipeline that has published no observation:
-     * {@code pipeline} is the id the caller asked to observe.
+     * A runtime-dependent read named a pipeline that has published no observation:
+     * {@code pipeline} is the id the caller asked to observe. Catalog status reads can still return a known
+     * pipeline's {@code NEW} state before its first observation.
      */
     NO_OBSERVATION("monitor.no-observation", Set.of("pipeline")),
 

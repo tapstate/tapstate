@@ -24,6 +24,19 @@ elif [[ "$2" == repos/tapstate/tapstate ]]; then
     [[ "${STUB_WORKFLOW_API_FAIL:-false}" != true ]] || exit 1
     printf '{"full_name":"%s","permissions":{"pull":%s}}\n' \
         "${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}" "${STUB_WORKFLOW_PULL:-true}"
+elif [[ "$2" == --paginate && "$3" == 'installation/repositories?per_page=100' ]]; then
+    [[ "${STUB_WORKFLOW_API_FAIL:-false}" != true ]] || exit 1
+    query="${*: -1}"
+    if [[ "${STUB_WORKFLOW_ACCESS:-true}" == true ]]; then
+        repository="${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}"
+    else
+        repository=tapstate/other
+    fi
+    if [[ "${STUB_WORKFLOW_SECOND_PAGE:-false}" == true ]]; then
+        printf '{"repositories":[]}' | jq -r "$query"
+    fi
+    jq -n --arg repository "$repository" '{repositories:[{full_name:$repository}]}' | jq -r "$query"
+    [[ "${STUB_WORKFLOW_LAST_PAGE_FAIL:-false}" != true ]] || exit 1
 elif [[ "$2" == --paginate ]]; then
     printf '%s' "${STUB_EXISTING_DIGEST:-}"
 elif [[ "${STUB_MISSING:-false}" == true && ! -f "$STUB_PUSHED" ]]; then
@@ -117,6 +130,9 @@ run_publish() {
         STUB_WORKFLOW_API_FAIL="${STUB_WORKFLOW_API_FAIL:-false}" \
         STUB_WORKFLOW_REPOSITORY="${STUB_WORKFLOW_REPOSITORY:-tapstate/tapstate}" \
         STUB_WORKFLOW_PULL="${STUB_WORKFLOW_PULL:-true}" \
+        STUB_WORKFLOW_ACCESS="${STUB_WORKFLOW_ACCESS:-true}" \
+        STUB_WORKFLOW_SECOND_PAGE="${STUB_WORKFLOW_SECOND_PAGE:-false}" \
+        STUB_WORKFLOW_LAST_PAGE_FAIL="${STUB_WORKFLOW_LAST_PAGE_FAIL:-false}" \
         STUB_TOKEN="$TOKEN" STUB_ACTOR="${STUB_ACTOR:-publisher}" \
         STUB_LOG="$WORK/commands.log" STUB_PUSHED="$WORK/pushed" STUB_MANIFEST="$WORK/manifest.json" \
         STUB_MISSING="${STUB_MISSING:-false}" STUB_API_FAIL="${STUB_API_FAIL:-false}" \
@@ -156,7 +172,7 @@ TEST_TOKEN='' expect_failure 'missing dedicated credentials are refused' 'userna
 STUB_ACTOR=other expect_failure 'publishing identity must match the configured account' 'differs'
 if TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" TEST_USERNAME=unused-personal-account \
         run_publish > "$WORK/out" 2> "$WORK/err" \
-        && grep -qF 'gh api repos/tapstate/tapstate' "$WORK/commands.log" \
+        && grep -qF 'gh api --paginate installation/repositories?per_page=100' "$WORK/commands.log" \
         && ! grep -qF 'gh api user' "$WORK/commands.log" \
         && grep -qF 'docker login ghcr.io --username publisher' "$WORK/commands.log"; then
     ok 'Actions reuses the workflow token and actor without a new personal token'
@@ -174,15 +190,28 @@ TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_API_F
 if ! grep -qF 'docker login' "$WORK/commands.log"; then
     ok 'workflow authentication refusal causes no registry login or write'
 else bad 'workflow authentication refusal causes no registry login or write'; fi
-TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_PULL=false \
-    expect_failure 'unauthorized workflow repository metadata fails closed' 'workflow repository authentication'
+if TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_PULL=false \
+        run_publish > "$WORK/out" 2> "$WORK/err"; then
+    ok 'installation access does not depend on personal repository permission flags'
+else bad 'installation access does not depend on personal repository permission flags'; fi
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_ACCESS=false \
+    expect_failure 'public repository metadata cannot substitute for installation access' 'workflow repository authentication'
+if ! grep -qF 'docker login' "$WORK/commands.log"; then
+    ok 'missing installation access causes no registry login or write'
+else bad 'missing installation access causes no registry login or write'; fi
+if TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_SECOND_PAGE=true \
+        run_publish > "$WORK/out" 2> "$WORK/err"; then
+    ok 'installation access can be confirmed on a later page'
+else bad 'installation access can be confirmed on a later page'; fi
+TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_LAST_PAGE_FAIL=true \
+    expect_failure 'a failed installation page is not hidden by an earlier match' 'workflow repository authentication'
 TEST_TOKEN='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" STUB_WORKFLOW_REPOSITORY=tapstate/other \
     expect_failure 'workflow API must confirm the intended publishing repository' 'workflow repository authentication'
 TEST_USERNAME='' TEST_ACTIONS=true TEST_WORKFLOW_TOKEN="$TOKEN" \
     expect_failure 'an incomplete configured personal credential never falls back' 'username and token'
 if TEST_ACTIONS=true TEST_WORKFLOW_TOKEN=unused-workflow-sentinel run_publish > "$WORK/out" 2> "$WORK/err" \
         && grep -qF 'gh api user' "$WORK/commands.log" \
-        && ! grep -qF 'gh api repos/tapstate/tapstate' "$WORK/commands.log"; then
+        && ! grep -qF 'installation/repositories' "$WORK/commands.log"; then
     ok 'configured personal credentials retain their existing account verification'
 else bad 'configured personal credentials retain their existing account verification'; fi
 if ! grep -qE "$TOKEN|unused-workflow-sentinel" "$WORK/out" "$WORK/err" "$WORK/commands.log"; then

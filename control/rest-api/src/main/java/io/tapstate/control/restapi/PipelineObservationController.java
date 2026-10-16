@@ -1,17 +1,19 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineSnapshot;
-import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Optional;
+
 /**
- * Status, metrics, and snapshot retain their observation-based read contracts. Catalog UI projections
- * qualify a successful status read without replacing its runtime state or unobserved refusal.
+ * Status combines catalog intent with runtime observation fields. Metrics and snapshot remain observation-based
+ * reads; a known pipeline without an observation can still return its catalog status.
  */
 @RestController
 class PipelineObservationController {
@@ -30,10 +32,14 @@ class PipelineObservationController {
     @Verb("pipeline.status")
     @GetMapping("/pipelines/{id}/status")
     PipelineStatusResponse status(@PathVariable("id") String id) {
-        PipelineStatus runtime = observations.status(id);
-        return pipelines.find(id)
-                .map(item -> PipelineStatusResponse.of(item, catalog, runtime))
-                .orElseGet(() -> PipelineStatusResponse.of(runtime, catalog));
+        Optional<PipelineCatalogItem> item = pipelines.find(id);
+        if (item.isPresent()) {
+            PipelineCatalogItem pipeline = item.orElseThrow();
+            return observations.findStatusWithPlan(pipeline)
+                    .map(status -> PipelineStatusResponse.of(pipeline, catalog, status))
+                    .orElseGet(() -> PipelineStatusResponse.of(pipeline, catalog));
+        }
+        return PipelineStatusResponse.of(observations.status(id), catalog);
     }
 
     @Verb("pipeline.metrics")

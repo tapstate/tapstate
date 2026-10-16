@@ -2,8 +2,9 @@ package io.tapstate.cli;
 
 /**
  * The outcome of a remote pipeline status read ({@code GET /api/pipelines/{id}/status}). Either the read
- * found the pipeline's latest published lifecycle state, or it was refused with a coded reason (a pipeline
- * that has published no observation is {@code monitor.no-observation}), or the server could not be reached.
+ * found the pipeline's latest observed lifecycle state, the known pipeline has not published an observation,
+ * it was refused with a coded reason, or the server could not be reached. Aggregate status responses carry
+ * desired and display state separately, so an absent {@code observedState} is never treated as runtime state.
  * Sealed so the caller renders each branch without try/catch, mirroring the never-throw transport seam. The
  * CLI carries no shared control type (rule R6: it reaches the server over HTTP only), so the state travels
  * as its wire string.
@@ -42,6 +43,10 @@ sealed interface StatusOutcome {
 
     /** The server refused the read with a coded reason already rendered to a message. */
     record Rejected(String code, String message) implements StatusOutcome {
+    }
+
+    /** A current aggregate status response identified a known pipeline with no runtime observation yet. */
+    record NoObservation() implements StatusOutcome {
     }
 
     /** The server could not be reached (connection refused, timeout, or a malformed target). */
