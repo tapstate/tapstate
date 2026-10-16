@@ -29,7 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 
 /** Bootstraps, refreshes and rotates the Cluster keyring stored beside encrypted Source configs. */
 public final class SourceConfigKeyringStore {
@@ -38,6 +38,7 @@ public final class SourceConfigKeyringStore {
     private static final int FORMAT_VERSION = 1;
     private static final int KEY_BYTES = 32;
     private static final String ACK_KIND = "source-config-keyring-node";
+    private static final Duration ACK_CONFLICT_RETRY_WINDOW = Duration.ofSeconds(2);
     private static final TransactionOptions ACK_TRANSACTION = TransactionOptions.builder()
             .readPreference(ReadPreference.primary())
             .readConcern(ReadConcern.SNAPSHOT)
@@ -49,12 +50,6 @@ public final class SourceConfigKeyringStore {
     private final MongoCollection<Document> artifacts;
     private final SecureRandom random;
     private final MongoClient client;
-    private final AcknowledgementRetryPause acknowledgementRetryPause;
-
-    @FunctionalInterface
-    interface AcknowledgementRetryPause {
-        void pause(int failedAttempt) throws InterruptedException;
-    }
 
     public SourceConfigKeyringStore(MongoDatabase database) {
         this(database, new SecureRandom());
@@ -68,19 +63,8 @@ public final class SourceConfigKeyringStore {
         this(Objects.requireNonNull(client, "client"), database, new SecureRandom());
     }
 
-    SourceConfigKeyringStore(MongoClient client, MongoDatabase database,
-            AcknowledgementRetryPause acknowledgementRetryPause) {
-        this(Objects.requireNonNull(client, "client"), database, new SecureRandom(), acknowledgementRetryPause);
-    }
-
     private SourceConfigKeyringStore(MongoClient client, MongoDatabase database, SecureRandom random) {
-        this(client, database, random, failedAttempt -> Thread.sleep(acknowledgementRetryDelayMillis(failedAttempt)));
-    }
-
-    private SourceConfigKeyringStore(MongoClient client, MongoDatabase database, SecureRandom random,
-            AcknowledgementRetryPause acknowledgementRetryPause) {
         Objects.requireNonNull(database, "database");
-        this.acknowledgementRetryPause = Objects.requireNonNull(acknowledgementRetryPause, "acknowledgementRetryPause");
         this.client = client;
         this.systemMeta = SystemCollections.SYSTEM_META.on(database)
                 .withReadPreference(ReadPreference.primary())
@@ -443,38 +427,38 @@ public final class SourceConfigKeyringStore {
         return stored;
     }
 
-    static long acknowledgementRetryDelayMillis(int failedAttempt) {
-        long lower = switch (failedAttempt) {
-            case 0 -> 50L;
-            case 1 -> 100L;
-            default -> throw new IllegalArgumentException("invalid acknowledgement retry attempt");
-        };
-        return ThreadLocalRandom.current().nextLong(lower, lower * 2 + 1);
-    }
-
     boolean acknowledge(WorkloadClaim session, long epoch, Duration ttl) {
         requireNodeSession(session);
         Objects.requireNonNull(ttl, "ttl");
         if (epoch < 1 || ttl.toMillis() < 1) throw new IllegalArgumentException("invalid keyring lease");
         if (client == null) throw new IllegalStateException("keyring acknowledgement needs the owning store client");
         return StoreIo.call(() -> {
-            for (int attempt = 0; attempt < 3; attempt++) {
+            long started = System.nanoTime();
+            int conflicts = 0;
+            while (true) {
                 try {
                     return acknowledgeOnce(session, epoch, ttl);
                 } catch (MongoException error) {
-                    if (attempt == 2 || !error.hasErrorLabel("TransientTransactionError")
-                            || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
-                    // The failed session has closed; let the competing transaction finish before retrying.
-                    try {
-                        acknowledgementRetryPause.pause(attempt);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw error;
-                    }
+                    awaitAcknowledgementRetry(error, started, conflicts++);
                 }
             }
-            throw new IllegalStateException("acknowledgement attempts must return or throw");
         });
+    }
+
+    private static void awaitAcknowledgementRetry(MongoException error, long started, int conflicts) {
+        if (!error.hasErrorLabel("TransientTransactionError")
+                || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
+        // Every live node touches the same keyring fence. Immediate retries can lose
+        // repeatedly to another node's transaction during a join or renewal.
+        long remaining = ACK_CONFLICT_RETRY_WINDOW.toNanos() - (System.nanoTime() - started);
+        if (remaining <= 0 || Thread.currentThread().isInterrupted()) throw error;
+        long delay = TimeUnit.MILLISECONDS.toNanos(Math.min(50L, 5L << Math.min(conflicts, 4)));
+        try {
+            TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw error;
+        }
     }
 
     private boolean acknowledgeOnce(WorkloadClaim node, long epoch, Duration ttl) {

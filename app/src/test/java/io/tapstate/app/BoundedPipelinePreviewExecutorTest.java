@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
+import com.hazelcast.map.IMap;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
@@ -34,6 +35,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
@@ -42,10 +44,71 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
 
 class BoundedPipelinePreviewExecutorTest {
+
+    @Test
+    void preservesACodedFailureUnderANonConcurrentCauseWrapper() {
+        TapstateException coded = new TapstateException(
+                ActuationError.PREVIEW_REFUSED, Map.of("reason", "expected"), null);
+
+        TapstateException found = BoundedPipelinePreviewExecutor.codedCause(
+                new IllegalStateException("wrapper", coded));
+
+        assertThat(found).isSameAs(coded);
+    }
+
+    @Test
+    void causeTraversalStopsAtAnIdentityCycle() {
+        IllegalStateException first = new IllegalStateException("first");
+        IllegalArgumentException second = new IllegalArgumentException("second");
+        first.initCause(second);
+        second.initCause(first);
+
+        assertThat(BoundedPipelinePreviewExecutor.codedCause(first)).isNull();
+    }
+
+    @Test
+    void failureIsNotPublishedWhileItsPipelineLeaseIsStillBeingReleased() throws Exception {
+        HazelcastInstance member = member("preview-lease-release");
+        HazelcastInstance observedMember = spy(member);
+        IMap<String, String> leases = member.getMap(BoundedPipelinePreviewExecutor.LEASE_MAP);
+        IMap<String, String> observedLeases = spy(leases);
+        when(observedMember.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP))
+                .thenReturn(observedLeases);
+        CountDownLatch releasing = new CountDownLatch(1);
+        CountDownLatch allowRelease = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            releasing.countDown();
+            if (!allowRelease.await(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("the test did not allow the preview lease to be released");
+            }
+            return leases.remove(invocation.getArgument(0), invocation.getArgument(1));
+        }).when(observedLeases).remove(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        BoundedPipelinePreviewExecutor executor = executor(observedMember);
+        try {
+            var stream = executor.preview(new PipelinePreviewRequest(
+                    "run-release", "author", "pipeline", "output", 3, "sample", "candidate-hash",
+                    List.of("not: a tapstate resource"), Instant.now().plusSeconds(30)));
+
+            assertThat(releasing.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(leases.size()).isEqualTo(1);
+            java.util.concurrent.BlockingQueue<PipelinePreviewEvent> events = getField(stream, "events");
+            assertThat(events).isEmpty();
+
+            allowRelease.countDown();
+            assertThat(stream.next().kind()).isEqualTo("run.failed");
+            assertThat(leases.size()).isZero();
+        } finally {
+            allowRelease.countDown();
+            executor.close();
+            member.shutdown();
+        }
+    }
 
     @Test
     void interruptedCleanupWaitPreservesTheWorkerInterruptAndDefersMapCleanup() throws Exception {
@@ -109,8 +172,9 @@ class BoundedPipelinePreviewExecutorTest {
             assertThat(failed.kind()).isEqualTo("run.failed");
             assertThat(failed.payload()).containsKeys("code", "reason");
             assertThat(failed.payload().get("code")).isEqualTo("dsl.unsupported-version");
-            assertThat(member.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP).size()).isZero();
+            // Stream exhaustion observes worker finalization; the queued failure event does not.
             assertThat(stream.next()).isNull();
+            assertThat(member.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP).size()).isZero();
         } finally {
             executor.close();
             member.shutdown();
@@ -138,8 +202,9 @@ class BoundedPipelinePreviewExecutorTest {
             PipelinePreviewEvent failed = stream.next();
             assertThat(failed.kind()).isEqualTo("run.failed");
             assertThat(failed.payload()).containsKeys("code", "reason");
-            assertThat(member.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP).size()).isZero();
+            // Stream exhaustion observes worker finalization; the queued failure event does not.
             assertThat(stream.next()).isNull();
+            assertThat(member.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP).size()).isZero();
         } finally {
             executor.close();
             member.shutdown();

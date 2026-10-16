@@ -18,6 +18,9 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.FrontierOrders;
+import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -56,6 +59,40 @@ class StoreBackedSinkAckFactoryTest {
 
     private static final String WRITER = "serve.s#0";
     private static final String OTHER_WRITER = "serve.t#0";
+
+    @Test
+    void qualifiedStreamsKeepIndependentProgressUnderTheirPhysicalTableNames() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-left", null);
+        store.create("mc-right", null);
+        String left = SrsConsumerId.of("pipe", "left").value();
+        String right = SrsConsumerId.of("pipe", "right").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "left.orders", new StoreBackedSinkAckFactory.SourceProgress(
+                        "mc-left", left, ConsumerProgressKind.SRS, "orders"),
+                "left.items", new StoreBackedSinkAckFactory.SourceProgress(
+                        "mc-left", left, ConsumerProgressKind.SRS, "items"),
+                "right.orders", new StoreBackedSinkAckFactory.SourceProgress(
+                        "mc-right", right, ConsumerProgressKind.SRS, "orders"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, "pipe", "run");
+        factory.beginRun(member, Map.of("left.orders", List.of("view"), "left.items", List.of("view"),
+                "right.orders", List.of("view")));
+        assertThat(store.writerRun("mc-left", left).orElseThrow().expected())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", List.of("view"), "items", List.of("view")));
+        SinkAck ack = factory.resolve(member).forWriter("view");
+
+        ack.advance("left.orders", at(7, "left-7"));
+        assertThat(store.ringDoneThrough("mc-left", left)).containsExactlyEntriesOf(Map.of("orders", 7L));
+        assertThat(store.ringDoneThrough("mc-right", right)).isEmpty();
+        ack.advance("right.orders", at(3, "right-3"));
+
+        assertThat(store.ringDoneThrough("mc-left", left)).containsExactlyEntriesOf(Map.of("orders", 7L));
+        assertThat(store.ringDoneThrough("mc-right", right)).containsExactlyEntriesOf(Map.of("orders", 3L));
+        var floor = new StoreBackedReplayFloorFactory(progress).resolve(member);
+        assertThat(floor.of("left.orders")).contains(at(7, "left-7").order());
+        assertThat(floor.of("right.orders")).contains(at(3, "right-3").order());
+    }
 
     @Test
     void anUnusedTableMappingDoesNotHoldASingleTableLegacyCheckpoint() {
@@ -715,6 +752,39 @@ class StoreBackedSinkAckFactoryTest {
         assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
                 .as("and the ring no further than the busy writer got: the bound runs past it, the rows do not")
                 .containsEntry("orders", 7L);
+    }
+
+    @Test
+    void aHeldSnapshotBoundCannotPoisonAReplacementRunsRingCursor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        String consumer = SrsConsumerId.of("pipe-1", "src_orders").value();
+        // This epoch is a fixture choice, not an attribution of the original member-loss failure.
+        long snapshotEpoch = 2;
+        store.setCdcStart("mc-orders", consumer, "w0", snapshotEpoch);
+        ChainPosition confirmed = new ChainPosition(new SourceOrder(snapshotEpoch, 3), "w3");
+        store.advanceTableConfirmed("mc-orders", consumer, "orders", confirmed);
+        HazelcastInstance member = memberWith(store);
+        List<String> writers = List.of("serve.s#0", "serve.s#1", "serve.s#2");
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", srsProgress("mc-orders", consumer)), "pipe-1", "replacement-run");
+        factory.beginRun(member, Map.of("orders", writers));
+
+        ChainAxes axes = ChainAxes.assign(List.of("orders"));
+        LevelBounds bounds = new LevelBounds(Map.of(0, List.of("orders")), axes,
+                chain -> SourceOrder.snapshotRow(snapshotEpoch));
+        SourceOrder cap = FrontierOrders.unpack(bounds.observe(0, axes.axisOf("orders"),
+                FrontierOrders.pack("orders", confirmed.order())).orElseThrow());
+        assertThat(cap.seq()).as("the held snapshot's packed predecessor").isEqualTo(FrontierOrders.HIGHEST_SEQ);
+        List<SinkAck> acknowledgements = writers.stream()
+                .map(writer -> factory.resolve(member).forWriter(writer)).toList();
+
+        acknowledgements.forEach(ack -> ack.bounded("orders", cap));
+        acknowledgements.forEach(ack -> ack.advance("orders", confirmed));
+
+        assertThat(store.ringDoneThrough("mc-orders", consumer))
+                .as("a held snapshot bound must not become a recovery cursor beyond the confirmed ring history")
+                .containsExactlyEntriesOf(Map.of("orders", 3L));
     }
 
     /**

@@ -11,6 +11,8 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 
 /** One Oracle Free server per JVM, with a separate schema for every specification run. */
 final class SharedOracle {
@@ -109,7 +111,7 @@ final class SharedOracle {
                       IF SQLCODE != -65019 THEN RAISE; END IF;
                     END;
                     /
-                    PROMPT ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+                    PROMPT Enabling minimal supplemental logging;
                     ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
                     PROMPT ALTER DATABASE FORCE LOGGING;
                     ALTER DATABASE FORCE LOGGING;
@@ -144,11 +146,62 @@ final class SharedOracle {
             System.out.printf("Oracle source fixture ready in %.1f seconds%n", (System.nanoTime() - began) / 1_000_000_000.0);
             return container;
         } catch (Exception error) {
-            starting.stop();
-            if (error instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
+            boolean interrupted = error instanceof InterruptedException;
+            interrupted |= captureInitializationState(starting, error);
+            try {
+                starting.stop();
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
             throw new EnvelopeException("cannot initialize Oracle source fixture", error);
         }
+    }
+
+    /** Retains live initialization state before a failed fixture is stopped. */
+    private static boolean captureInitializationState(OracleContainer server, Exception failure) {
+        var capture = new FutureTask<>(() -> server.execInContainer("bash", "-c", """
+                oracle_state_output=$(mktemp) || exit $?
+                timeout --kill-after=2 10 sqlplus -s / as sysdba > "$oracle_state_output" 2>&1 <<'SQL'
+                WHENEVER SQLERROR CONTINUE NONE
+                SET LINESIZE 260
+                SET PAGESIZE 100
+                SELECT STATUS, DATABASE_STATUS, STARTUP_TIME FROM V$INSTANCE;
+                SELECT LOG_MODE, SUPPLEMENTAL_LOG_DATA_MIN, FORCE_LOGGING FROM V$DATABASE;
+                SELECT S.SID, S.SERIAL#, S.STATUS, S.STATE, S.EVENT, S.SECONDS_IN_WAIT,
+                       S.SQL_ID, S.PREV_SQL_ID, S.SQL_EXEC_START, S.PROCESS AS CLIENT_PROCESS,
+                       P.SPID AS SERVER_PROCESS
+                  FROM V$SESSION S JOIN V$PROCESS P ON P.ADDR = S.PADDR
+                 WHERE S.PROGRAM LIKE '%sqlplus%';
+                SELECT SQL_ID, SQL_TEXT FROM V$SQLAREA
+                 WHERE SQL_ID IN (SELECT SQL_ID FROM V$SESSION WHERE PROGRAM LIKE '%sqlplus%'
+                                  UNION
+                                  SELECT PREV_SQL_ID FROM V$SESSION WHERE PROGRAM LIKE '%sqlplus%');
+                SELECT XID, STATUS, START_TIME, USED_UBLK, USED_UREC FROM V$TRANSACTION;
+                SELECT USERNAME FROM ALL_USERS WHERE USERNAME = 'C##TAPSTATE';
+                EXIT;
+                SQL
+                status=$?
+                cat "$oracle_state_output"
+                rm -f "$oracle_state_output"
+                exit "$status"
+                """));
+        try {
+            Thread.ofVirtual().name("oracle-state-capture").start(capture);
+            var state = capture.get(15, TimeUnit.SECONDS);
+            failure.addSuppressed(new EnvelopeException("Oracle initialization state (SQL*Plus exit "
+                    + state.getExitCode() + "):\n" + state.getStdout() + state.getStderr()));
+            System.err.printf("Oracle initialization state before cleanup (SQL*Plus exit %d):%n%s%s",
+                    state.getExitCode(), state.getStdout(), state.getStderr());
+        } catch (InterruptedException interrupted) {
+            failure.addSuppressed(interrupted);
+            return true;
+        } catch (Exception diagnosticFailure) {
+            failure.addSuppressed(diagnosticFailure);
+        } finally {
+            capture.cancel(true);
+        }
+        return false;
     }
 }

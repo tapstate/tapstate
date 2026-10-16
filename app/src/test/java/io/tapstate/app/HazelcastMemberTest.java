@@ -39,6 +39,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.time.Duration;
 
@@ -743,7 +744,9 @@ class HazelcastMemberTest {
     }
 
     private static int[] twoFreePorts() throws Exception {
-        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        try (ServerSocket first = new ServerSocket(0, 0, loopback);
+                ServerSocket second = new ServerSocket(0, 0, loopback)) {
             return new int[] {first.getLocalPort(), second.getLocalPort()};
         }
     }

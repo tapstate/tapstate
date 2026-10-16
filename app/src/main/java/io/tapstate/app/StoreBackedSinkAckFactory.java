@@ -116,9 +116,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             return;
         }
         Map<SourceProgress, Map<String, List<String>>> bySource = new LinkedHashMap<>();
-        writersByChain.forEach((table, writers) -> bySource
-                .computeIfAbsent(sourceOf(progressByTable, table), source -> new LinkedHashMap<>())
-                .put(table, writers));
+        writersByChain.forEach((stream, writers) -> {
+            SourceProgress source = sourceOf(progressByTable, stream);
+            SourceProgress node = new SourceProgress(source.miningChainId(), source.consumerId(), source.kind());
+            bySource.computeIfAbsent(node, ignored -> new LinkedHashMap<>()).put(source.table(stream), writers);
+        });
         bySource.forEach((source, byTable) -> {
             if (fence == null) {
                 meta.beginWriterRun(source.miningChainId(), source.consumerId(), runId, byTable, source.kind());
@@ -179,7 +181,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     private boolean landed(AwaitedLoad load, SourceProgress source, List<ConsumerOffset> consumers,
             Optional<WriterRun> run) {
         boolean recorded = consumers.stream().anyMatch(consumer -> consumer.pipelineId().equals(source.consumerId())
-                && consumer.snapshotCompletedTables().contains(load.table()));
+                && consumer.snapshotCompletedTables().contains(source.table(load.table())));
         if (recorded) {
             return true;
         }
@@ -190,7 +192,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         if (snapshotEpoch == null) {
             return true;
         }
-        return SrsWriterFrontier.landed(run.get(), load.table(), load.writers())
+        return SrsWriterFrontier.landed(run.get(), source.table(load.table()), load.writers())
                 .map(landed -> SrsWriterFrontier.passedLoad(landed, snapshotEpoch))
                 .orElse(false);
     }
@@ -221,8 +223,16 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
      * Where one source node's progress is kept: the mining chain it reads, the consumer that names it there, and
      * what its progress is measured against.
      */
-    record SourceProgress(String miningChainId, String consumerId, ConsumerProgressKind kind)
+    record SourceProgress(String miningChainId, String consumerId, ConsumerProgressKind kind, String physicalTable)
             implements Serializable {
+        SourceProgress(String miningChainId, String consumerId, ConsumerProgressKind kind) {
+            this(miningChainId, consumerId, kind, null);
+        }
+
+        String table(String stream) {
+            return physicalTable == null ? stream : physicalTable;
+        }
+
         SourceProgress {
             Objects.requireNonNull(miningChainId, "miningChainId");
             Objects.requireNonNull(consumerId, "consumerId");
@@ -374,9 +384,9 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 return;
             }
             Optional<WriterRun> run = fence == null
-                    ? meta.advanceWriter(source.miningChainId(), source.consumerId(), runId, writerId, chain, next)
+                    ? meta.advanceWriter(source.miningChainId(), source.consumerId(), runId, writerId, source.table(chain), next)
                     : meta.advanceWriter(
-                            source.miningChainId(), source.consumerId(), runId, writerId, chain, next, fence);
+                            source.miningChainId(), source.consumerId(), runId, writerId, source.table(chain), next, fence);
             if (run.isEmpty()) {
                 refused(source);
                 if (replaced) {
@@ -430,26 +440,47 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
          * @return false where the store turned a fenced write away, leaving the rest of the landing owed
          */
         private boolean land(String chain, SourceProgress source, WriterRun run, WorkloadClaimFence fence) {
-            if (!run.expectedFor(chain).contains(writerId)) {
+            String table = source.table(chain);
+            if (!run.expectedFor(table).contains(writerId)) {
                 throw new IllegalStateException("writer '" + writerId + "' landed changes of '" + chain
                         + "' that run '" + runId + "' of pipeline '" + pipelineId + "' does not route to it");
             }
-            Optional<Landed> answer = SrsWriterFrontier.landed(run, chain);
+            Optional<Landed> answer = SrsWriterFrontier.landed(run, table);
             if (answer.isEmpty()) {
                 return true;
             }
             Landed now = answer.get();
+            // A held load can cap progress in the previous generation. That constructed bound is not a
+            // ring position: only progress at or beyond the recorded load may become a recovery cursor.
+            if (run.snapshotEpoch() != null && !SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
+                return true;
+            }
             Landed before = landed.get(chain);
             // Every writer reports on its own, so this may land after a later report of the table's - which the
             // store, comparing the two, leaves standing.
             if (before == null || now.durableThrough().compareTo(before.durableThrough()) > 0) {
-                if (!advanceTableConfirmed(source, chain, confirmedAt(now), fence)) {
+                if (!advanceTableConfirmed(source, table, confirmedAt(now), fence)) {
                     return false;
                 }
                 if (source.kind() == ConsumerProgressKind.DIRECT_SOURCE) {
                     meta.settleDirectBatches(source.miningChainId(), source.consumerId());
                 }
             }
+            if (!advanceResumableProgress(source, run, now, before, fence)) {
+                return false;
+            }
+            if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
+                if (!markSnapshotComplete(source, table, fence)) {
+                    return false;
+                }
+                loaded.add(chain);
+            }
+            landed.put(chain, now);
+            return true;
+        }
+
+        private boolean advanceResumableProgress(SourceProgress source, WriterRun run, Landed now, Landed before,
+                WorkloadClaimFence fence) {
             ChainPosition resumable = now.resumableAt();
             if (resumable != null && (before == null || before.resumableAt() == null
                     || resumable.order().compareTo(before.resumableAt().order()) > 0)) {
@@ -464,13 +495,6 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     recordHowFarTheSourceHasBeenRead(meta, source.miningChainId(), resumable, recordedRead);
                 }
             }
-            if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
-                if (!markSnapshotComplete(source, chain, fence)) {
-                    return false;
-                }
-                loaded.add(chain);
-            }
-            landed.put(chain, now);
             return true;
         }
 

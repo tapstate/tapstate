@@ -18,3 +18,53 @@ Required sourceReadOffset: before-batch or after-low.
 The existing table-aware acknowledgement contract identifies sequence spaces as independent.
 The persisted CDC item carries an opaque source token and no source-wide order.
 A snapshot-seam fallback cannot cover CDC-only pipelines without a recorded seam.
+
+Issue 562: staged-artifact integrity and the existing member-start error contract conflict.
+Source: GitHub Actions run 38197564418, test-shards (rest), commit dd4f0b9f36f0fad469a4deac9de736b65985aae0.
+PR: https://github.com/tapstate/tapstate/pull/706
+Case: EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest#aMemberThatCannotStageTheConnectorRefusesTheStartBeforeAnythingIsStarted
+
+Golden inputs:
+  app/src/test/java/io/tapstate/app/EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest.java:102-122
+    Member m2 receives the real RegistryConnectorProvisioner and cacheDir <scratch>/not-a-directory/plugins.
+    <scratch>/not-a-directory is a regular file, so staging cannot create that directory.
+  The same file:393-420
+    The fake registry lists connector pg, contentHash h1, PDK API 1.0, registration source SEED.
+    artifact("h1") returns the three bytes 01 02 03.
+    Their SHA-256 is 039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81, not h1.
+
+Golden observed assertion values from CI:
+  actual reason: "connector.load-failed {connector=pg}"
+  expected prefix: "UncheckedIOException: staging connector artifact /tmp/junit-8969691250146957685/not-a-directory/plugins"
+  The next assertion also requires a parenthesized exception type and its nonempty cause message.
+  The outer code is actuation.connector-unavailable-on-member, with pipeline, member=m2 and connector=pg parameters.
+  Those outer code and parameter assertions passed before the reason assertion failed at line 118.
+  The no-start assertions follow the failing assertion and were not reached in this case.
+
+Cause and contract boundary:
+  adapters/adapter-pdk/src/main/java/io/tapstate/adapters/pdk/RegistryConnectorProvisioner.java
+    stage validates store bytes before Files.createDirectories. The fake h1 registration is rejected there,
+    so this particular failure does not reach the directory creation or its IOException handler.
+    This PR separately changes that handler from an UncheckedIOException containing the target path and
+    cause to ConnectorError.LOAD_FAILED with only the connector parameter and no cause.
+    Making the fixture hash valid alone would still leave the old reason assertion incompatible.
+  app/src/main/java/io/tapstate/app/HazelcastConnectorReadiness.java:190-197
+    Coded failures retain their code/arguments as the reason. Other failures retain type/message and cause.
+    No changes to this caller, the translator, error enums, catalogs or schemas are needed to explain the failure.
+  The issue requires safe integrity refusals. The task requires diagnosable errors to use the error-code system,
+    forbids changing a case merely to pass it, and requires stopping before an unreviewed contract repair.
+    Restoring path/cause output or explicitly changing this legacy reason contract requires a human decision.
+
+Local confirmation on the same unchanged head, with the configured runtime sourced inside the test shell:
+  mvn -pl app -am -Dtest=EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest#aMemberThatCannotStageTheConnectorRefusesTheStartBeforeAnythingIsStarted -Dsurefire.failIfNoSpecifiedTests=false test
+  Result: 1 test, 1 failure, 0 errors, 0 skips; the same actual reason and expected path-bearing prefix.
+  Source and test assertions remain unchanged. The saved reproduction and wider verification commands remain unchanged.
+
+Other exact-head failures:
+  build: ci-shards: artifact shard set differs from declared shards.
+    The failed rest shard did not publish its required report/coverage artifact; the aggregate cannot admit it.
+  sonarqube: BUILD_RESULT=failure, SONAR_ENABLED=true, SONAR_OUTCOME=skipped.
+    The reporting step fails at its build-success prerequisite. This is not a quality-gate finding.
+  Authenticated exact-head Sonar evidence helper: status=unavailable, reason=analysis-missing,
+    analysis_date=null, gate=null, issues=[]. A new head must run CI and refresh Sonar evidence before readiness.
+  e2e-admission passed; both e2e test shards passed. No waiver is justified or requested.

@@ -510,6 +510,66 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    @Test
+    void rewritingCompletedLoadsKeepsTheirWriterSetAndRefusesTheReplacedRunsWriters() {
+        withStore(store -> {
+            String consumer = SrsConsumerId.of("pipeline", "source").value();
+            List<String> writers = List.of("serve.first#0", "serve.second#0");
+            store.create(CHAIN, null);
+            store.setCdcStart(CHAIN, consumer, "seam", 1L);
+            store.beginWriterRun(CHAIN, consumer, "run-1", Map.of("orders", writers), ConsumerProgressKind.SRS);
+            ChainPosition confirmed = new ChainPosition(new SourceOrder(1, 5), "confirmed");
+            for (String writer : writers) {
+                store.advanceWriter(CHAIN, consumer, "run-1", writer, "orders",
+                        new WriterProgress(confirmed.order(), confirmed));
+            }
+            store.advanceTableConfirmed(CHAIN, consumer, "orders", confirmed);
+            store.markSnapshotComplete(CHAIN, consumer, "orders");
+            ConsumerOffset offset = store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow();
+            ConsumerOffset released = new ConsumerOffset(consumer, offset.perTableSeq(), null,
+                    offset.snapshotCompletedTables(), offset.cdcStartPosition(), offset.snapshotEpoch(),
+                    Map.of(), offset.progressKind());
+
+            store.upsertConsumerOffset(CHAIN, released);
+
+            WriterRun rewritten = store.writerRun(CHAIN, consumer).orElseThrow();
+            assertThat(rewritten.runId()).isNotEqualTo("run-1");
+            assertThat(rewritten.expectedFor("orders")).containsExactlyElementsOf(writers);
+            assertThat(rewritten.progress()).isEmpty();
+            assertThat(rewritten.snapshotEpoch()).isEqualTo(1L);
+            assertThat(store.ringDoneThrough(CHAIN, consumer)).isEmpty();
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(consumer)).contains(released);
+            for (String writer : writers) {
+                assertThat(store.advanceWriter(CHAIN, consumer, "run-1", writer, "orders",
+                        new WriterProgress(new SourceOrder(1, 99), confirmed))).isEmpty();
+            }
+
+            store.upsertConsumerOffset(CHAIN, released);
+            assertThat(store.writerRun(CHAIN, consumer).orElseThrow().expectedFor("orders"))
+                    .containsExactlyElementsOf(writers);
+            assertThat(store.advanceWriter(CHAIN, consumer, rewritten.runId(), writers.getFirst(), "orders",
+                    new WriterProgress(new SourceOrder(1, 99), confirmed))).isEmpty();
+            store.beginWriterRun(CHAIN, consumer, "run-2", Map.of("orders", writers), ConsumerProgressKind.SRS);
+            assertThat(store.writerRun(CHAIN, consumer).orElseThrow().runId()).isEqualTo("run-2");
+            assertThat(store.writerRun(CHAIN, consumer).orElseThrow().progress()).isEmpty();
+        });
+    }
+
+    @Test
+    void rewritingLegacyCompletedLoadsDoesNotInventPerWriterAccounting() {
+        withStore(store -> {
+            String consumer = SrsConsumerId.of("pipeline", "source").value();
+            store.create(CHAIN, null);
+            store.markSnapshotComplete(CHAIN, consumer, "orders");
+
+            ConsumerOffset legacy = store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow();
+            store.upsertConsumerOffset(CHAIN, legacy);
+
+            assertThat(store.writerRun(CHAIN, consumer)).isEmpty();
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(consumer)).contains(legacy);
+        });
+    }
+
     /**
      * Landed progress with no token behind it raises the table's ring place and its own confirmation, and leaves
      * the acked position: that is a token and the order it sat at, and there is no token to pair a new order

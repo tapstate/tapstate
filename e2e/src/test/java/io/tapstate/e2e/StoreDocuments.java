@@ -14,6 +14,7 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -113,6 +114,12 @@ final class StoreDocuments implements AutoCloseable {
         return ids(MongoStorePort.SRS_META);
     }
 
+    /** The retained log's bounds, which survive removal of its already confirmed records. */
+    Document logBounds(String ringName) {
+        return database.getCollection(MongoStorePort.SRS_LOG)
+                .find(new Document("_id", "srs-log-bounds:" + ringName)).first();
+    }
+
     /** The whole chain record, for reporting what a chain actually held when an assertion about it fails. */
     Document chain(String miningChainId) {
         return database.getCollection(MongoStorePort.SRS_META)
@@ -164,6 +171,28 @@ final class StoreDocuments implements AutoCloseable {
                         .append("_id.resourceId", captureId))
                 .first();
         return claim == null ? null : claim.getDate("leaseUntil").toInstant();
+    }
+
+    /** Hands one fixture pipeline to another live member without stopping the original holder's process. */
+    void handPipelineTo(String clusterId, String pipelineId, String oldNodeId, String newNodeId) {
+        var claims = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS);
+        Document session = claims.find(new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.NODE_SESSION.name())
+                .append("_id.resourceId", newNodeId)).first();
+        if (session == null) {
+            throw new AssertionError("the successor has no node session: " + newNodeId);
+        }
+        Document expected = new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
+                .append("_id.resourceId", pipelineId).append("ownerNodeId", oldNodeId);
+        Document next = new Document("ownerNodeId", newNodeId)
+                .append("ownerBootId", session.getString("ownerBootId"))
+                .append("claimGeneration", new Document("$add", List.of("$claimGeneration", 1L)))
+                .append("leaseUntil", new Document("$dateAdd", new Document("startDate", "$$NOW")
+                        .append("unit", "second").append("amount", 120L)));
+        if (claims.updateOne(expected, List.of(new Document("$set", next))).getModifiedCount() != 1) {
+            throw new AssertionError("the fixture did not hand pipeline " + pipelineId + " to " + newNodeId);
+        }
     }
 
     /**

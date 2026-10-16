@@ -4,6 +4,8 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -14,6 +16,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -206,8 +209,9 @@ class HttpControlClientTest {
         }
     }
 
-    @Test
-    void closeCancelsAnInFlightExchange() throws Exception {
+    @ParameterizedTest
+    @EnumSource(value = RequestBudget.class, names = {"HEAVY", "CONNECTION"})
+    void closeCancelsAnInFlightExchange(RequestBudget budget) throws Exception {
         CountDownLatch received = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         HttpServer server = server(exchange -> {
@@ -223,7 +227,7 @@ class HttpControlClientTest {
         try {
             CompletableFuture<ControlResponse> response = new CompletableFuture<>();
             Thread.ofVirtual().start(() -> response.complete(client.post(
-                    baseOf(server), "token", "/api/artifacts:apply", Map.of(), RequestBudget.HEAVY)));
+                    baseOf(server), "token", "/api/connections:test", Map.of(), budget)));
 
             assertThat(received.await(5, TimeUnit.SECONDS)).isTrue();
             client.close();
@@ -233,6 +237,68 @@ class HttpControlClientTest {
         } finally {
             release.countDown();
             client.close();
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void liveConnectionWorkOutlivesTheBoundedControlBudget() throws Exception {
+        CountDownLatch received = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        HttpServer server = server(exchange -> {
+            received.countDown();
+            try {
+                release.await();
+                answer(exchange, 200, "{\"finished\":true}");
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(5), Duration.ofMillis(100))) {
+            CompletableFuture<ControlResponse> response = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> response.complete(client.post(
+                    baseOf(server), "token", "/api/connections:test", Map.of(), RequestBudget.CONNECTION)));
+
+            assertThat(received.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> response.get(400, TimeUnit.MILLISECONDS))
+                    .as("the client must still be waiting while the connector's work continues")
+                    .isInstanceOf(TimeoutException.class);
+            release.countDown();
+            assertThat(response.get(5, TimeUnit.SECONDS))
+                    .isEqualTo(new ControlResponse.Success(200, Map.of("finished", true)));
+        } finally {
+            release.countDown();
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void interruptionCancelsLiveConnectionWorkAndPreservesTheInterrupt() throws Exception {
+        CountDownLatch received = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        HttpServer server = server(exchange -> {
+            received.countDown();
+            try {
+                release.await();
+                answer(exchange, 200, "{}");
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        try (HttpControlClient client = new HttpControlClient()) {
+            CompletableFuture<ControlResponse> response = new CompletableFuture<>();
+            CompletableFuture<Boolean> interrupted = new CompletableFuture<>();
+            Thread request = Thread.ofVirtual().start(() -> {
+                response.complete(client.post(baseOf(server), "token", "/api/connections:test",
+                        Map.of(), RequestBudget.CONNECTION));
+                interrupted.complete(Thread.currentThread().isInterrupted());
+            });
+            assertThat(received.await(5, TimeUnit.SECONDS)).isTrue();
+            request.interrupt();
+            assertThat(response.get(5, TimeUnit.SECONDS)).isInstanceOf(ControlResponse.Unreachable.class);
+            assertThat(interrupted.get(5, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            release.countDown();
             server.stop(0);
         }
     }

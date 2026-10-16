@@ -1,9 +1,11 @@
 package io.tapstate.cli;
 
+import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.GeneratedSecret;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineLogQueryService;
-import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TokenSecrets;
@@ -11,6 +13,7 @@ import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.control.restapi.PipelineStreamConfiguration;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -20,7 +23,11 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.messages.MessageCatalog;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
 import org.junit.jupiter.api.AfterAll;
@@ -245,30 +252,46 @@ class PipelineStreamRoundTripTest {
         }
 
         @Bean
-        PipelineObservationQueryService pipelineObservationQueryService(ObservationStore store) {
+        ArtifactQueryService artifactQueryService() {
             // Every id reads as applied except the "ghost" prefix, which resolves to nothing -- the one
             // case in this round trip that is about telling an applied pipeline from one never applied.
-            return new PipelineObservationQueryService(new ArtifactQueryService(new ArtifactStore() {
+            return new ArtifactQueryService(new ArtifactStore() {
                 @Override
-                public void saveAll(java.util.List<Resource> artifacts) {
+                public void saveAll(List<Resource> artifacts) {
                 }
 
                 @Override
-                public java.util.Optional<Resource> get(String id) {
+                public Optional<Resource> get(String id) {
                     if (id.startsWith("ghost")) {
-                        return java.util.Optional.empty();
+                        return Optional.empty();
                     }
-                    return java.util.Optional.of(
+                    return Optional.of(
                             new PipelineResource(id, null,
                                     java.util.List.of(io.tapstate.core.model.SourceRef.bare("src_x")),
                                     null, null, null, null, null));
                 }
 
                 @Override
-                public java.util.List<Resource> list() {
-                    return java.util.List.of();
+                public List<Resource> list() {
+                    return List.of();
                 }
-            }), store);
+            });
+        }
+
+        @Bean
+        PipelineObservationQueryService pipelineObservationQueryService(
+                ArtifactQueryService artifacts, ObservationStore store) {
+            return new PipelineObservationQueryService(artifacts, store);
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(
+                ArtifactQueryService artifacts, PipelineObservationQueryService observations) {
+            return new PipelineCatalogService(
+                    artifacts,
+                    new PipelineDraftService(new EmptyPipelineDraftStore()),
+                    new EmptyDesiredStore(),
+                    observations);
         }
 
         @Bean
@@ -324,6 +347,60 @@ class PipelineStreamRoundTripTest {
         @Override
         public Optional<Observation> read(String pipelineId) {
             return Optional.ofNullable(byId.get(pipelineId));
+        }
+    }
+
+    private static final class EmptyPipelineDraftStore implements PipelineDraftStore {
+        @Override
+        public Optional<PipelineDraft> get(String pipelineId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public List<PipelineDraft> list() {
+            return List.of();
+        }
+
+        @Override
+        public PipelineDraftMutation create(PipelineDraft draft) {
+            throw new UnsupportedOperationException("draft writes are not exercised by this test");
+        }
+
+        @Override
+        public PipelineDraftMutation replace(String pipelineId, long expectedRevision, PipelineDraft replacement) {
+            throw new UnsupportedOperationException("draft writes are not exercised by this test");
+        }
+
+        @Override
+        public PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+            throw new UnsupportedOperationException("draft writes are not exercised by this test");
+        }
+
+        @Override
+        public PipelineDraftMutation publish(PipelineDraft.Publication publication) {
+            throw new UnsupportedOperationException("draft writes are not exercised by this test");
+        }
+    }
+
+    private static final class EmptyDesiredStore implements DesiredStore {
+        @Override
+        public void save(DesiredState desired) {
+            throw new UnsupportedOperationException("desired-state writes are not exercised by this test");
+        }
+
+        @Override
+        public Optional<DesiredState> read(String pipelineId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public List<String> pipelineIds() {
+            return List.of();
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            throw new UnsupportedOperationException("desired-state writes are not exercised by this test");
         }
     }
 

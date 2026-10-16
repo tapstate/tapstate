@@ -130,8 +130,12 @@ docker run -d --name "$SERVER" --label "$label=$OWNER" --network "$NETWORK" \
   -e 'TAPSTATE_STORE_MONGO_URI=mongodb://unreachable.invalid:27017/no_fallback' \
   "$CLOUD" "${BASE_ARGS[@]}" >/dev/null
 ready "$SERVER"
-[[ "$(docker exec "$SERVER" id -u)" = 10001 ]]
-docker exec "$SERVER" sh -ec 'test "$(cat /proc/1/comm)" = java; cd /opt/tapstate/connectors; sha256sum -c /opt/tapstate/release/connectors.sha256' \
+[[ "$(docker exec "$SERVER" id -u)" = 0 ]]
+docker exec "$SERVER" sh -ec 'test "$(cat /proc/1/comm)" = java; \
+    if ! ldconfig -p | grep -F "libxml2.so.2"; then echo "FAIL: Cloud runtime lacks libxml2.so.2" >&2; exit 1; fi; \
+    if [ "${LD_PRELOAD:-}" != libstdc++.so.6 ]; then echo "FAIL: Cloud runtime lacks the shared C++ preload" >&2; exit 1; fi; \
+    if ! grep -F "libstdc++.so.6" /proc/1/maps; then echo "FAIL: Cloud Java process has not loaded shared libstdc++.so.6" >&2; exit 1; fi; \
+    cd /opt/tapstate/connectors; sha256sum -c /opt/tapstate/release/connectors.sha256' \
   >"$WORK/seed-bytes.log"
 SERVER_URL="$(url "$SERVER" 8080)"
 node "$ROOT/deploy/cloud/image-runtime-probe.mjs" verify cloud "$SERVER_URL" "$FIXTURE_URL" "$WORK/cloud.json" "$WORK/cloud-state.json"

@@ -25,11 +25,11 @@ import java.util.TreeMap;
  * is chosen from the code: a client input error (a {@code dsl.*} validation failure or a
  * {@code control.malformed-request} refused at the boundary) is a 400; the authentication codes map to
  * 401 / 403 / 409; a lifecycle verb on an unknown pipeline is a 404 and a forbidden transition or stale
- * revision is a 409; a status / metrics / snapshot read of a pipeline that has published no observation is a
- * 404; a member that cannot read the cluster right now is a 503, because it is neither the caller's
- * fault nor a failure but a window the member passes through; any other coded error keeps the structured
- * body but answers 500, since the surface has no client-attributable mapping for it yet. That mapping is the seam later slices extend as more
- * client-attributable codes land.
+ * revision is a 409; a metrics, snapshot, or explanation read that requires an observation is a 404 when
+ * none has been published; a member that cannot read the cluster right now is a 503, because it is neither the
+ * caller's fault nor a failure but a window the member passes through; any other coded error keeps the structured
+ * body but answers 500, since the surface has no client-attributable mapping for it yet. That mapping is the seam
+ * later slices extend as more client-attributable codes land.
  *
  * <p>Only {@link TapstateException} is handled here. A programmer error / invariant violation (a bare NPE or
  * {@code IllegalStateException}) is left to crash into the container's default 500 — it must never be
@@ -93,8 +93,9 @@ class ApiExceptionHandler {
      * non-loopback caller is 403, and a bootstrap channel that has already closed is a 409 state conflict.
      * A client input error — a {@code dsl.*} validation failure or a {@code control.malformed-request} refused
      * at the boundary — is a 400. A lifecycle verb on a pipeline that was never applied is a 404; a transition
-     * the state machine forbids, or a start/resume at a stale revision, is a 409 state conflict. A status /
-     * metrics / snapshot read of a pipeline that has published no observation is likewise a 404. Any other coded
+     * the state machine forbids, or a start/resume at a stale revision, is a 409 state conflict. A metrics,
+     * snapshot, or explanation read that requires a published observation is likewise a 404 when none exists.
+     * Catalog status reads of a known pipeline still return its catalog state before observation. Any other coded
      * error is a server-side failure (500) that still carries the structured body — never a bare, uncoded crash.
      */
     static HttpStatus statusFor(TapstateErrorCode code) {
@@ -146,8 +147,8 @@ class ApiExceptionHandler {
             // The request did not say something it has to say, which is the caller's to fix by sending
             // it -- not a conflict with the pipeline's state, which is what the two above are.
             case "lifecycle.purge-state-not-stated" -> HttpStatus.BAD_REQUEST;
-            // A status / metrics / snapshot read of a pipeline that has published no observation is a 404: the
-            // observation resource does not exist yet, like a get of an unknown artifact.
+            // Runtime-dependent reads return this when the observation resource does not exist yet, like a get
+            // of an unknown artifact. The catalog status endpoint handles known pipelines before this path.
             case "monitor.no-observation" -> HttpStatus.NOT_FOUND;
             case "monitor.invalid-cursor", "monitor.query-budget-exceeded" -> HttpStatus.BAD_REQUEST;
             case "monitor.cursor-expired" -> HttpStatus.GONE;

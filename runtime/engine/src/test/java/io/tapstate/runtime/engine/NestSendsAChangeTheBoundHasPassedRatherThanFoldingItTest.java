@@ -162,6 +162,9 @@ class NestSendsAChangeTheBoundHasPassedRatherThanFoldingItTest {
         await(() -> ACKED.contains(acked(CUSTOMERS, CUSTOMER_AT)) || job.getStatus() == JobStatus.FAILED);
         await(() -> MOST_CLAIMS_IN_A_DOCUMENT.get() >= CLAIMS_SEEDED
                 || job.getStatus() == JobStatus.FAILED);
+        // The document count is observed inside write(); confirmation follows when the sink settles it.
+        await(() -> ACKED.contains(acked(CLAIMS, claimAt(CLAIMS_SEEDED - 1)))
+                || job.getStatus() == JobStatus.FAILED);
 
         assertThat(job.getStatus())
                 .describedAs("what fell was this level's own hold, with every edge still climbing; read as "
