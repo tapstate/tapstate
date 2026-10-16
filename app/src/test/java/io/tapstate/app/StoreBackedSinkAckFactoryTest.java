@@ -782,6 +782,39 @@ class StoreBackedSinkAckFactoryTest {
                 .containsEntry("orders", 7L);
     }
 
+    @Test
+    void aHeldSnapshotBoundCannotPoisonAReplacementRunsRingCursor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        String consumer = SrsConsumerId.of("pipe-1", "src_orders").value();
+        // This epoch is a fixture choice, not an attribution of the original member-loss failure.
+        long snapshotEpoch = 2;
+        store.setCdcStart("mc-orders", consumer, "w0", snapshotEpoch);
+        ChainPosition confirmed = new ChainPosition(new SourceOrder(snapshotEpoch, 3), "w3");
+        store.advanceTableConfirmed("mc-orders", consumer, "orders", confirmed);
+        HazelcastInstance member = memberWith(store);
+        List<String> writers = List.of("serve.s#0", "serve.s#1", "serve.s#2");
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", srsProgress("mc-orders", consumer)), "pipe-1", "replacement-run");
+        factory.beginRun(member, Map.of("orders", writers));
+
+        ChainAxes axes = ChainAxes.assign(List.of("orders"));
+        LevelBounds bounds = new LevelBounds(Map.of(0, List.of("orders")), axes,
+                chain -> SourceOrder.snapshotRow(snapshotEpoch));
+        SourceOrder cap = FrontierOrders.unpack(bounds.observe(0, axes.axisOf("orders"),
+                FrontierOrders.pack("orders", confirmed.order())).orElseThrow());
+        assertThat(cap.seq()).as("the held snapshot's packed predecessor").isEqualTo(FrontierOrders.HIGHEST_SEQ);
+        List<SinkAck> acknowledgements = writers.stream()
+                .map(writer -> factory.resolve(member).forWriter(writer)).toList();
+
+        acknowledgements.forEach(ack -> ack.bounded("orders", cap));
+        acknowledgements.forEach(ack -> ack.advance("orders", confirmed));
+
+        assertThat(store.ringDoneThrough("mc-orders", consumer))
+                .as("a held snapshot bound must not become a recovery cursor beyond the confirmed ring history")
+                .containsExactlyEntriesOf(Map.of("orders", 3L));
+    }
+
     /**
      * The table's load is recorded as landed only once every writer the run expects has passed it: each
      * writer is given its own share of the load's rows, and the one that has not reported may still hold its

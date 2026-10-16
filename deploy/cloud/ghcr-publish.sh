@@ -63,11 +63,13 @@ blob="$scratch/layout/blobs/sha256/${expected_digest#sha256:}"
     || fail 'OCI manifest bytes differ from the verified digest'
 
 if [[ "$workflow_identity" == true ]]; then
-    # Installation tokens authenticate the workflow repository, not a personal /user endpoint.
-    gh api repos/tapstate/tapstate >"$scratch/repository.json" 2>"$scratch/api-error" \
+    # Personal repository permission flags do not describe an installation token's access.
+    # Keep only per-page booleans, never the installation's repository names or metadata.
+    gh api --paginate 'installation/repositories?per_page=100' \
+        --jq 'any(.repositories[]; .full_name == "tapstate/tapstate")' \
+        >"$scratch/repository-access" 2>"$scratch/api-error" \
         || fail 'workflow repository authentication failed'
-    jq -e '.full_name == "tapstate/tapstate" and .permissions.pull == true' \
-        "$scratch/repository.json" >/dev/null \
+    grep -Fxq true "$scratch/repository-access" \
         || fail 'workflow repository authentication failed'
 else
     actor="$(gh api user --jq .login 2>"$scratch/api-error")" || fail 'GHCR account authentication failed'

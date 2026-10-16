@@ -1180,7 +1180,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
-                StatusOutcome.Found found = statusFound(response.body());
+                StatusOutcome found = statusFound(response.body());
                 // a 200 that is not a usable status reply (a proxy / non-Tapstate answer) is unreachable
                 return found == null ? new StatusOutcome.Unreachable() : found;
             }
@@ -1675,16 +1675,26 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     /**
-     * The status decoded from a 200 body, or {@code null} unless it carries a string id and a string
-     * state -- and, when it carries a {@code failure} block at all, one shaped like a real one. A present
-     * but malformed failure block (not an object, or missing/wrong-typed code) is a regression of the
-     * status contract, not a healthy pipeline: it must not silently decode the same way an absent failure
-     * block does, so the whole body is treated as shape-wrong here rather than a fabricated healthy read.
+     * The status decoded from a 200 body, or {@code null} unless it carries a string id and state. Aggregate
+     * responses use {@code observedState} as the runtime fact and report {@link StatusOutcome.NoObservation}
+     * when that field is absent. A malformed failure block is a contract error, not a healthy pipeline.
      */
-    private static StatusOutcome.Found statusFound(String body) {
+    private static StatusOutcome statusFound(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
                 && m.get("pipelineId") instanceof String id
                 && m.get("state") instanceof String state) {
+            boolean aggregate = m.containsKey("observedState")
+                    || m.containsKey("desiredState") || m.containsKey("displayState");
+            if (aggregate) {
+                Object observed = m.get("observedState");
+                if (observed == null) {
+                    return new StatusOutcome.NoObservation();
+                }
+                if (!(observed instanceof String observedState)) {
+                    return null;
+                }
+                state = observedState;
+            }
             // How old the reading is, as the server measured it. Absent on a server that does not report
             // it and on an observation stored before the time was recorded; both read back null, which
             // means "nobody can say" and is never replaced by a subtraction against this machine's clock.
@@ -1955,8 +1965,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     public String watchStatus(URI baseUrl, String credential, String pipelineId,
             StatusStream sink, BooleanSupplier stop) {
         return stream(wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/status/watch"), credential, stop, frame -> {
-            StatusOutcome.Found found = statusFound(frame);
-            if (found != null) {
+            StatusOutcome decoded = statusFound(frame);
+            if (decoded instanceof StatusOutcome.Found found) {
                 sink.state(found.pipelineId(), found.state(), found.failureCode(), found.failureMessage());
             }
         });

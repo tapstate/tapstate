@@ -52,6 +52,27 @@ import static org.mockito.Mockito.verify;
 class BoundedPipelinePreviewExecutorTest {
 
     @Test
+    void preservesACodedFailureUnderANonConcurrentCauseWrapper() {
+        TapstateException coded = new TapstateException(
+                ActuationError.PREVIEW_REFUSED, Map.of("reason", "expected"), null);
+
+        TapstateException found = BoundedPipelinePreviewExecutor.codedCause(
+                new IllegalStateException("wrapper", coded));
+
+        assertThat(found).isSameAs(coded);
+    }
+
+    @Test
+    void causeTraversalStopsAtAnIdentityCycle() {
+        IllegalStateException first = new IllegalStateException("first");
+        IllegalArgumentException second = new IllegalArgumentException("second");
+        first.initCause(second);
+        second.initCause(first);
+
+        assertThat(BoundedPipelinePreviewExecutor.codedCause(first)).isNull();
+    }
+
+    @Test
     void failureIsNotPublishedWhileItsPipelineLeaseIsStillBeingReleased() throws Exception {
         HazelcastInstance member = member("preview-lease-release");
         HazelcastInstance observedMember = spy(member);

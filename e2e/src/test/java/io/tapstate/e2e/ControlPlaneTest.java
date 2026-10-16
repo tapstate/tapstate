@@ -31,6 +31,53 @@ class ControlPlaneTest {
     }
 
     @Test
+    void doesNotTreatTheMergedDesiredStateAsARuntimeObservation() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "RUNNING",
+                "desiredState", "RUNNING",
+                "hasArtifact", true));
+
+        assertThat(ControlPlane.interpretState(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
+    void readsTheObservedStateFromTheMergedStatusProjection() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "PAUSED",
+                "desiredState", "RUNNING",
+                "observedState", "PAUSED",
+                "hasArtifact", true));
+
+        assertThat(ControlPlane.interpretState(200, body, PIPELINE)).contains(PipelineState.PAUSED);
+    }
+
+    @Test
+    void absentObservationTimeAndAgeAreEmptyOnAggregateStatus() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "NEW",
+                "displayState", "STARTING",
+                "desiredState", "RUNNING"));
+
+        assertThat(ControlPlane.interpretObservedAt(200, body, PIPELINE)).isEmpty();
+        assertThat(ControlPlane.interpretObservedAgeMillis(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
+    void missingAgeRemainsUnknownEvenWhenTheStatusCarriesAnObservationTime() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "RUNNING",
+                "observedAt", "2026-01-01T00:00:00Z"));
+
+        assertThat(ControlPlane.interpretObservedAt(200, body, PIPELINE))
+                .contains(java.time.Instant.parse("2026-01-01T00:00:00Z"));
+        assertThat(ControlPlane.interpretObservedAgeMillis(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
     void readsTheProductsOwnNoObservationCodeAsNothingPublishedYet() {
         assertThat(ControlPlane.interpretState(404, coded(MonitorError.NO_OBSERVATION.code()), PIPELINE))
                 .isEmpty();
@@ -469,7 +516,8 @@ class ControlPlaneTest {
     }
 
     private static String status(String state) {
-        return JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", state));
+        return JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", state,
+                "displayState", state, "observedState", state));
     }
 
     private static String metrics(long errorCount) {

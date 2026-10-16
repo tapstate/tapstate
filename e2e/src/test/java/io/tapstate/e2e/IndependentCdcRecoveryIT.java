@@ -22,6 +22,10 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -106,9 +110,22 @@ class IndependentCdcRecoveryIT {
     @ValueSource(strings = {"snapshot_and_cdc", "cdc_only"})
     void independentDirectChannelsOnOnePhysicalSourceResumeAtTheirOwnConfirmedPositions(
             String readMode, @TempDir Path temporary) throws Exception {
+        independentDirectChannels(readMode, temporary, false);
+    }
+
+    @Test
+    void stopObservationConvergesWhileAnIndependentTargetHoldsHigh(@TempDir Path temporary) throws Exception {
+        independentDirectChannels("snapshot_and_cdc", temporary, true);
+    }
+
+    private static void independentDirectChannels(String readMode, Path temporary, boolean retainStopEvidence)
+            throws Exception {
         Fixture fixture = fixture(temporary, "direct_channels_" + readMode);
         try (MongoClient reader = MongoClients.create(fixture.storeUri());
-                RealProcessServer server = RealProcessServer.start(fixture.storeUri())) {
+                // Match the failing runner's CPU count, which also sizes the JVM's shared async pool.
+                RealProcessServer server = retainStopEvidence
+                        ? RealProcessServer.startInJvm(fixture.storeUri(), List.of("-XX:ActiveProcessorCount=4"))
+                        : RealProcessServer.start(fixture.storeUri())) {
             MongoDatabase database = database(reader, fixture.storeUri());
             ControlPlane control = start(server, fixture, readMode, false, true);
             CdcRecoveryFixture.change(fixture.source(), 1, ROOT, "1", "Low", "Low");
@@ -139,10 +156,29 @@ class IndependentCdcRecoveryIT {
                             && sourceSequence(consumer(database, ROOT_PIPELINE, ROOT_SOURCE)) < 3,
                     () -> consumersText(database));
 
+            if (retainStopEvidence) {
+                // Mail has confirmed the reported later change. Fill the held channel's remaining writers
+                // before STOP, so cancellation cannot depend on a lucky gap in its blocking target calls.
+                for (int sequence = 5; sequence <= 20; sequence++) {
+                    CdcRecoveryFixture.change(fixture.source(), sequence, ROOT,
+                            Integer.toString(sequence), "", "held");
+                }
+                awaitSourceBatch(fixture, 20, 2);
+                Await.until("three independent target calls to enter the unchanged hold", TIMEOUT,
+                        () -> CdcRecoveryFixture.heldWrites(fixture.signals()) >= 3,
+                        () -> "held writes=" + CdcRecoveryFixture.heldWrites(fixture.signals())
+                                + ", streams=" + streamText(fixture));
+            }
             Document beforeStop = stopFacts(fixture.storeUri());
             control.stop(ROOT_PIPELINE, false);
             try {
-                awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
+                if (retainStopEvidence) {
+                    try (StopEvidence evidence = new StopEvidence(database, server, fixture)) {
+                        awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
+                    }
+                } else {
+                    awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
+                }
             } catch (AssertionError failure) {
                 try {
                     Path retained = retainStopFacts(fixture, beforeStop, server);
@@ -165,6 +201,65 @@ class IndependentCdcRecoveryIT {
             assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
         } finally {
             Files.writeString(fixture.signals().resolve("release"), "");
+        }
+    }
+
+    /** Samples independently of the STOP wait, before either the held write or the server is released. */
+    private static final class StopEvidence implements AutoCloseable {
+        private final ScheduledExecutorService sampler = Executors.newSingleThreadScheduledExecutor();
+        private final List<? extends ScheduledFuture<?>> samples;
+        private final Path directory;
+        private final RealProcessServer server;
+
+        private StopEvidence(MongoDatabase database, RealProcessServer server, Fixture fixture) throws Exception {
+            long acceptedAt = System.nanoTime();
+            this.server = server;
+            directory = Files.createDirectories(Path.of(System.getProperty("tapstate.e2e.build-directory"),
+                    "stop-observation", java.util.UUID.randomUUID().toString()));
+            System.out.println("Held-target STOP evidence: " + directory);
+            samples = List.of(5, 35).stream().map(seconds -> sampler.schedule(() -> {
+                Path sample = Files.createDirectory(directory.resolve("after-" + seconds + "s"));
+                Document snapshot = new Document("elapsedMillis",
+                        Duration.ofNanos(System.nanoTime() - acceptedAt).toMillis())
+                        .append("serverPid", server.pid())
+                        .append("heldWrites", CdcRecoveryFixture.heldWrites(fixture.signals()))
+                        .append("writeWaiting", Files.exists(fixture.signals().resolve("waiting")))
+                        .append("writeReleased", Files.exists(fixture.signals().resolve("release")));
+                for (String pipeline : List.of(ROOT_PIPELINE, MAIL_PIPELINE)) {
+                    Document state = new Document();
+                    for (String collection : List.of(MongoStorePort.PIPELINE_DESIRED,
+                            MongoStorePort.PIPELINE_STATE, MongoStorePort.PIPELINE_OBSERVATION)) {
+                        state.append(collection, database.getCollection(collection)
+                                .find(new Document("_id", pipeline)).first());
+                    }
+                    snapshot.append(pipeline, state);
+                }
+                Files.writeString(sample.resolve("state.json"), snapshot.toJson());
+                Files.writeString(sample.resolve("streams.txt"), streamText(fixture));
+                Files.writeString(sample.resolve("consumers.txt"), consumersText(database));
+                Files.copy(server.output(), sample.resolve("server.log"));
+                Process dump = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "jcmd").toString(),
+                        Long.toString(server.pid()), "Thread.print", "-l")
+                        .redirectErrorStream(true).redirectOutput(sample.resolve("threads.txt").toFile()).start();
+                if (!dump.waitFor(10, TimeUnit.SECONDS)) {
+                    dump.destroyForcibly();
+                    throw new AssertionError("the child JVM thread dump exceeded its collection budget: " + sample);
+                }
+                assertThat(dump.exitValue()).as("the child JVM thread dump at " + sample).isZero();
+                return null;
+            }, Math.max(0, seconds * 1_000_000_000L - (System.nanoTime() - acceptedAt)), TimeUnit.NANOSECONDS)).toList();
+        }
+
+        @Override
+        public void close() throws Exception {
+            try {
+                for (ScheduledFuture<?> sample : samples) {
+                    sample.get(50, TimeUnit.SECONDS);
+                }
+            } finally {
+                sampler.shutdownNow();
+                Files.copy(server.output(), directory.resolve("server-before-cleanup.log"));
+            }
         }
     }
 
@@ -355,7 +450,9 @@ class IndependentCdcRecoveryIT {
         FileEndpoints.replaceTable(source.resolve(ROOT + ".csv"), "id,priority\n1,Low\n");
         FileEndpoints.replaceTable(source.resolve(MAIL + ".csv"), "id,priority\n");
         Path delegate = E2eConnectorJar.buildInto(Files.createDirectory(temporary.resolve("connector")));
-        return new Fixture(source, rootTarget, mailTarget, signals, SharedMongo.replicaSetUrl(database),
+        // Independent invocations may share a scenario name, but must not inherit its users or checkpoints.
+        String isolatedDatabase = database + "_" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        return new Fixture(source, rootTarget, mailTarget, signals, SharedMongo.replicaSetUrl(isolatedDatabase),
                 CdcRecoveryFixture.connectorJar(delegate));
     }
 

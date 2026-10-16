@@ -4,6 +4,7 @@ import io.tapstate.control.core.MonitorError;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.scheduling.TaskScheduler;
@@ -13,13 +14,13 @@ import org.springframework.web.socket.WebSocketSession;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.function.Predicate;
 
 /**
  * The status watch channel: streams a pipeline's lifecycle state, then the next state whenever it
- * changes. It polls the same store-backed status read the one-shot {@code GET} uses, so it is a re-poll
- * over the eventually-consistent observation doc, not a live push. Only a changed state emits a frame,
- * so an idle pipeline is quiet on the wire. A pipeline that has published no observation yet emits
- * nothing and keeps polling — a watch may be started before the pipeline is first observed.
+ * changes. It polls the store-backed runtime observation, not the aggregate one-shot status, so it is a
+ * re-poll over the eventually-consistent observation doc, not a live push. Only a changed observed state
+ * emits a frame. An applied pipeline or known draft without an observation emits nothing and keeps polling.
  */
 final class PipelineStatusWatchHandler extends PollingStreamHandler {
 
@@ -27,12 +28,14 @@ final class PipelineStatusWatchHandler extends PollingStreamHandler {
     private static final String LAST_STATE = "tapstate.stream.lastState";
 
     private final PipelineObservationQueryService observations;
+    private final Predicate<String> knownPipeline;
     private final MessageCatalog catalog;
 
-    PipelineStatusWatchHandler(PipelineObservationQueryService observations, MessageCatalog catalog,
-            TaskScheduler scheduler, Duration interval) {
+    PipelineStatusWatchHandler(PipelineObservationQueryService observations, Predicate<String> knownPipeline,
+            MessageCatalog catalog, TaskScheduler scheduler, Duration interval) {
         super(scheduler, interval);
         this.observations = Objects.requireNonNull(observations, "observations");
+        this.knownPipeline = Objects.requireNonNull(knownPipeline, "knownPipeline");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
     }
 
@@ -45,6 +48,12 @@ final class PipelineStatusWatchHandler extends PollingStreamHandler {
             if (coded.code() == MonitorError.NO_OBSERVATION) {
                 // Applied but not yet converged: transient, so nothing to stream and keep polling.
                 return;
+            }
+            if (coded.code() == LifecycleError.UNKNOWN_PIPELINE) {
+                if (knownPipeline.test(pipelineId)) {
+                    // The catalog may see a pipeline published after this observation read began.
+                    return;
+                }
             }
             // Anything else -- most notably lifecycle.unknown-pipeline, permanent per this same read
             // face's javadoc -- will never resolve into an observation on its own. Waiting it out here

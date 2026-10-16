@@ -904,6 +904,53 @@ class EngineTest {
         assertThat(engine.frontierGaps("orders-pipe")).isEmpty();
     }
 
+    @Test
+    void an_empty_frontier_reading_clears_previously_published_gap_and_stall() {
+        Engine engine = new Engine(member);
+        DAG dag = new DAG();
+        dag.newVertex("serve.out", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of((SupplierEx<Processor>) ClearingFrontierSource::new)));
+        engine.submit("orders-pipe", dag);
+        awaitFrontierGaps(engine, "orders-pipe", Map.of("orders", 7L));
+        assertThat(engine.frontierStalls("orders-pipe")).containsEntry("orders", 7L);
+
+        member.getUserContext().put(ClearingFrontierSource.CLEAR, true);
+        awaitFrontierGaps(engine, "orders-pipe", Map.of("orders", 0L));
+        assertThat(engine.frontierStalls("orders-pipe")).containsEntry("orders", 0L);
+    }
+
+    /** Lets the test replace a positive reading with an empty one on the actual job thread. */
+    private static final class ClearingFrontierSource extends AbstractProcessor {
+        private static final String CLEAR = "clear-frontier-readings";
+        private final JetFrontierGauge gauge = new JetFrontierGauge();
+        private HazelcastInstance instance;
+
+        @Override
+        protected void init(Processor.Context context) {
+            instance = context.hazelcastInstance();
+        }
+
+        @Override
+        public boolean isCooperative() {
+            return false;
+        }
+
+        @Override
+        public boolean complete() {
+            Map<String, Long> reading = instance.getUserContext().containsKey(CLEAR)
+                    ? Map.of() : Map.of("orders", 7L);
+            gauge.trailing(reading);
+            gauge.pinned(reading);
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return true;
+            }
+            return false;
+        }
+    }
+
     /**
      * A streaming DAG of one idling vertex per given set of readings, each publishing them as the sink
      * adapter does. It stands in for the sinks rather than assembling one: what is under test here is the

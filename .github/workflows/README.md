@@ -21,6 +21,72 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Real connector fixture inputs
+
+The scheduled/manual Real connectors lane builds seven checked connector kinds,
+including `mongodb-atlas` and `aws-rds-mysql`. Connector production uses Maven
+3.9.16 with a verified distribution checksum. Its snapshot manifest, sealed JAR
+set and witness admission must agree; adding unchecked files to a cache is not
+a replacement for building the selected artifacts.
+
+External managed Atlas acceptance is temporarily deferred under
+[#702](https://github.com/tapstate/tapstate/issues/702). The exact four live classes
+are listed in `.github/connector-witness-deferrals.json`; their unchanged tests
+remain in the repository. Each plan records the policy bytes, deferred classes
+and follow-up. Deferred cases are not execution or managed Atlas acceptance.
+MongoDB witnesses, local replica-set Atlas PDK controls and all other selected
+connector cases still require positive, zero-skip execution.
+
+Before restoring the deferred classes, configure these repository Actions secrets:
+
+- `TAPSTATE_ATLAS_TEST_URI`: a controlled real Atlas test deployment URI for
+  managed-store, recovery and pipeline witnesses.
+- `TAPSTATE_ATLAS_STANDARD_URI`: the standard MongoDB connection URI for the
+  same controlled Atlas fixture, with the resolved hosts and connection options
+  required by the source HTTP witness.
+
+When the active source inventory includes external Atlas classes, the planning
+job rejects missing inputs before connector production starts. Removing a class
+from the deferral list restores its execution and this prerequisite automatically.
+Each witness shard also stages the locked public Cloud release inputs and sets
+`TAPSTATE_TEST_CLOUD_RELEASE_DIR`; this directory is prepared by CI, not supplied
+as a secret. Zero-test and skipped witnesses remain admission failures.
+
+Use a dedicated test deployment with room for the approximately 423 MB connector
+release plus concurrent witness databases. A 512 MB shared deployment has
+exhausted its quota during these tests. The lane does not provision or resize
+an Atlas deployment.
+
+## Cloud release version registration
+
+The release workflow registers the current Cloud runtime version only after the
+Cloud image publisher verifies the public registry digest. Configure the two
+variables in the `cloud-ghcr-release` environment and the production token in
+the repository's Actions secrets before using that notification:
+
+- Variable `CLOUD_RELEASE_API_URL`: the HTTPS endpoint ending in
+  `/v1/api/cluster-versions`.
+- Variable `CLOUD_RELEASE_CODE`: `ALPHA`, `BETA`, `RC`, or `STABLE`.
+- Repository secret `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD`: the operator
+  token configured on the production Cloud control plane. The release workflow
+  reads only this production key; `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV`
+  is reserved for other CI workflows.
+
+The request carries the version and source revision; `git.extra` records the
+image tag, immutable image reference, digest, release URL, and workflow URL.
+Cloud provisioning continues to select the image by its version tag. Publication
+and registration share a cross-version concurrency queue so a delayed older
+insert cannot overtake the newer version's registration. Older
+release lines and releases already overtaken when the notification checks
+GitHub's latest marker are skipped. HTTP errors fail the notification visibly;
+the image and release have already been published at that point. The API is
+not idempotent: a timeout may have committed, and a 409 requires reconciling the
+existing catalog entry before retrying. The notification never retries a POST
+or treats a 409 as success without comparing the existing entry.
+The helper is loaded from the workflow's commit in a separate sparse checkout,
+so selecting an earlier product commit does not lose the notification tooling.
+The approved image and its source revision still come from the selected release.
+
 ## Cloud cluster dev images
 
 `cloud-cluster-dev.yml` is manual-only and must be dispatched on `main`. Select
@@ -40,6 +106,13 @@ the environment's `CLOUD_GHCR_USERNAME` / `CLOUD_GHCR_TOKEN` when explicitly set
 Reuse the existing Public `tapstate-cloud` package and its workflow write access;
 the publisher refuses missing or non-public packages. Package access follows the
 [GitHub package access and visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+
+Workflow-token authentication checks that the installation can access
+`tapstate/tapstate`, reading every repository-list page before registry login.
+It does not rely on personal `permissions.pull` flags in public repository
+metadata. API errors or missing installation access fail closed; repository
+lists and credentials are never logged. Explicit personal publishing credentials
+retain their account-identity verification.
 
 Version registration uses these additional `cloud-ghcr-dev` environment settings:
 

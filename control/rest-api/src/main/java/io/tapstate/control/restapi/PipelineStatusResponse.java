@@ -16,8 +16,9 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * The wire shape of the latest actual Pipeline observation. Optional UI metadata qualifies the observation
- * while state, failure, and observation time remain the runtime facts consumed by existing clients.
+ * The wire shape of a Pipeline status read. {@code state}, failure, and observation time describe runtime
+ * facts; before the first runtime observation, state is {@code NEW} and {@code observedState} is absent.
+ * {@code desiredState} and {@code displayState} separately describe lifecycle intent and its UI projection.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record PipelineStatusResponse(
@@ -67,6 +68,31 @@ record PipelineStatusResponse(
                 status.desiredState(), runtime.state(), item.hasArtifact(),
                 ExecutionPlanResponse.of(runtime.plan()),
                 runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance(), runtime.recovery());
+    }
+
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
+        return of(item, catalog, Clock.systemUTC());
+    }
+
+    /** Builds a catalog status without inventing a runtime observation when none has been published yet. */
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog,
+            ClusterPipelineRecoveryView recovery) {
+        return of(item, catalog, Clock.systemUTC(), recovery);
+    }
+
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock) {
+        return of(item, catalog, clock, null);
+    }
+
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock,
+            ClusterPipelineRecoveryView recovery) {
+        PipelineCatalogItem.Status status = item.status();
+        PipelineState state = status.observedState() == null ? PipelineState.NEW : status.observedState();
+        Instant observedAt = status.observedAt();
+        return new PipelineStatusResponse(item.id(), state, status.displayState(),
+                failure(status.failure(), catalog), observedAt, observedAt == null ? null
+                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
+                status.desiredState(), status.observedState(), item.hasArtifact(), null, null, recovery);
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {
