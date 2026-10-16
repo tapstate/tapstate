@@ -801,8 +801,14 @@ class StoreBackedSinkAckFactoryTest {
         ChainAxes axes = ChainAxes.assign(List.of("orders"));
         LevelBounds bounds = new LevelBounds(Map.of(0, List.of("orders")), axes,
                 chain -> SourceOrder.snapshotRow(snapshotEpoch));
-        SourceOrder cap = FrontierOrders.unpack(bounds.observe(0, axes.axisOf("orders"),
-                FrontierOrders.pack("orders", confirmed.order())).orElseThrow());
+        assertThat(bounds.observe(0, axes.axisOf("orders"),
+                FrontierOrders.pack("orders", confirmed.order())))
+                .as("a held snapshot must not emit the preceding generation's encoding ceiling")
+                .isEmpty();
+        // Inject the historical bound at the ACK boundary; the level must no longer emit it.
+        SourceOrder cap = FrontierOrders.unpack(
+                FrontierOrders.pack("orders", SourceOrder.snapshotRow(snapshotEpoch)) - 1);
+        assertThat(cap.epoch()).isEqualTo(snapshotEpoch - 1);
         assertThat(cap.seq()).as("the held snapshot's packed predecessor").isEqualTo(FrontierOrders.HIGHEST_SEQ);
         List<SinkAck> acknowledgements = writers.stream()
                 .map(writer -> factory.resolve(member).forWriter(writer)).toList();
