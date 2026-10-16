@@ -1,10 +1,18 @@
 package io.tapstate.e2e;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
+import org.junit.jupiter.api.parallel.Isolated;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.SocketAddress;
+import java.net.URI;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -13,13 +21,17 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.junit.jupiter.api.Assertions.assertAll;
 
-/** Actual relay sockets must close even when the listener join reports an interruption. */
+/** Owned relays retain their direct path and close both halves even when cleanup is interrupted. */
+@Isolated("This class temporarily owns the JVM proxy selector")
+@Execution(ExecutionMode.SAME_THREAD)
 class CuttableLinkCleanupTest {
     @Test
     void anInterruptedListenerJoinStillClosesBothOwnedRelayHalvesAndLeavesForeignTrafficAlone()
@@ -147,6 +159,88 @@ class CuttableLinkCleanupTest {
                 }
             }
         }
+    }
+
+    @Test
+    void anOwnedMemberRelayDoesNotDelegateItsTargetToTheJvmProxy() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        ProxySelector previous = ProxySelector.getDefault();
+        AtomicInteger selections = new AtomicInteger();
+        AtomicInteger intercepted = new AtomicInteger();
+        AtomicInteger proxyFirstByte = new AtomicInteger(-1);
+        int linkPort = RealProcessServer.reservePort();
+        try (ServerSocket target = listener(loopback);
+             ServerSocket proxy = listener(loopback);
+             var worker = Executors.newSingleThreadExecutor()) {
+            target.setSoTimeout(2_000);
+            proxy.setSoTimeout(2_000);
+            try (Socket control = new Socket(Proxy.NO_PROXY)) {
+                control.connect(new InetSocketAddress(loopback, target.getLocalPort()), 2_000);
+                control.setSoTimeout(1_000);
+                try (Socket peer = target.accept()) {
+                    peer.setSoTimeout(1_000);
+                    delivered(control, peer, 31, "the real target is reachable before proxy selection changes");
+                    delivered(peer, control, 32, "the independent direct target replies");
+                }
+            }
+            var proxyAttempt = worker.submit(() -> {
+                try (Socket socket = proxy.accept()) {
+                    intercepted.incrementAndGet();
+                    socket.setSoTimeout(1_000);
+                    proxyFirstByte.set(socket.getInputStream().read());
+                    return proxyFirstByte.get();
+                } catch (SocketTimeoutException noConnection) {
+                    return -1;
+                }
+            });
+            ProxySelector.setDefault(new ProxySelector() {
+                @Override public List<Proxy> select(URI uri) {
+                    if ("socket".equals(uri.getScheme()) && uri.getPort() == target.getLocalPort()) {
+                        selections.incrementAndGet();
+                        return List.of(new Proxy(Proxy.Type.SOCKS,
+                                new InetSocketAddress(loopback, proxy.getLocalPort())));
+                    }
+                    return previous == null ? List.of(Proxy.NO_PROXY) : previous.select(uri);
+                }
+                @Override public void connectFailed(URI uri, SocketAddress address, IOException failure) {
+                    if (uri.getPort() != target.getLocalPort() && previous != null) {
+                        previous.connectFailed(uri, address, failure);
+                    }
+                }
+            });
+            try (CuttableLink link = CuttableLink.open(linkPort, loopback.getHostAddress(),
+                         target.getLocalPort(), Map.of());
+                 Socket client = new Socket(Proxy.NO_PROXY)) {
+                client.connect(new InetSocketAddress(loopback, linkPort), 2_000);
+                client.setSoTimeout(1_000);
+                client.getOutputStream().write(73);
+                client.getOutputStream().flush();
+                Socket accepted = null;
+                try { accepted = target.accept(); }
+                catch (SocketTimeoutException notConnected) {
+                    // The independent direct control already proved this target is reachable.
+                }
+                try (Socket peer = accepted) {
+                    assertThat(peer).as("the relay must reach its owned target directly; proxy selections=%s, "
+                            + "intercepted=%s, proxy first byte=%s", selections.get(), intercepted.get(),
+                            proxyFirstByte.get()).isNotNull();
+                    peer.setSoTimeout(1_000);
+                    assertThat(peer.getInputStream().read()).as("the real relay carries its client byte")
+                            .isEqualTo(73);
+                    delivered(peer, client, 74, "the real relay carries its target reply");
+                }
+            } finally {
+                ProxySelector.setDefault(previous);
+            }
+            assertThat(proxyAttempt.get(3, TimeUnit.SECONDS)).as("the owned proxy was never contacted")
+                    .isEqualTo(-1);
+            assertThat(selections.get()).as("fixture member targets do not consult the JVM proxy").isZero();
+            assertThat(intercepted.get()).as("fixture bytes did not reach a proxy").isZero();
+        } finally {
+            ProxySelector.setDefault(previous);
+            RealProcessServer.releasePort(linkPort);
+        }
+        assertThat(ProxySelector.getDefault()).as("the caller's proxy selector is restored").isSameAs(previous);
     }
 
     private static ServerSocket listener(InetAddress address) throws IOException {

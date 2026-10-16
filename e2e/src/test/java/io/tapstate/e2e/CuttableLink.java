@@ -5,6 +5,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
@@ -194,6 +195,19 @@ final class CuttableLink implements AutoCloseable {
         }
     }
 
+    /** Reaches the fixture-owned member endpoint directly, independent of JVM proxy selection. */
+    private Socket connectTarget() throws IOException {
+        Socket socket = new Socket(Proxy.NO_PROXY);
+        boolean connected = false;
+        try {
+            socket.connect(new InetSocketAddress(targetHost, targetPort));
+            connected = true;
+            return socket;
+        } finally {
+            if (!connected) closeQuietly(socket);
+        }
+    }
+
     private void accept(ServerSocket server) {
         while (!server.isClosed() && !closed) {
             Socket inbound;
@@ -212,7 +226,7 @@ final class CuttableLink implements AutoCloseable {
             carried.incrementAndGet();
             carriedFrom.computeIfAbsent(dialler, unknown -> new AtomicInteger()).incrementAndGet();
             try {
-                Socket outbound = new Socket(targetHost, targetPort);
+                Socket outbound = connectTarget();
                 synchronized (live) {
                     // Closing may have finished while the owned outbound connection was opening.
                     if (closed) {
