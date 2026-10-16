@@ -604,7 +604,7 @@ class PipelineObservationApiTest {
     }
 
     @Test
-    void aReadOfAnAppliedPipelineThatHasNotConvergedKeepsStateUnobservedAndShowsStarting() {
+    void aReadOfAnAppliedPipelineThatHasNotConvergedKeepsStateUnobservedAndShowsStarting() throws Exception {
         context.getBean(FakeObservationStore.class).clear();
         context.getBean(FakeStoppedPipelines.class).intent("pl1", PipelineState.RUNNING);
         RecoveryTestQueries recovery = context.getBean(RecoveryTestQueries.class);
