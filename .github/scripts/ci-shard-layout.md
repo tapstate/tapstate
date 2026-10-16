@@ -1,8 +1,8 @@
 # Source-bound CI shard layouts
 
 The default-reactor planner reads `.github/ci-shard-layout.json`. The checked-in
-configuration records the current comparison candidate: four E2E IT workers,
-two whole-class App workers, a complete E2E unit-module worker, `engine` and
+configuration records the current comparison candidate: six E2E IT workers,
+four whole-class App workers, a complete E2E unit-module worker, `engine` and
 `rest`. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
 counts 2, 4 and 6 are supported for ordinary source-commit comparisons; there is
 no separate workflow or benchmark entry point. A staged layout is not a
@@ -74,10 +74,10 @@ The provenance records all 1,285 source units from one complete,
 successful manual CI run. All nine original selected verify commands and
 validated worker packs retain their original source/run bindings. The 1,290
 XML reports include five additional nested-container suites; their times are
-summed under the owning source outer class. The current source has 1,287 units,
-including an additional recovery integration class and REST configuration unit class.
-Its source-unit set and test-source bytes no longer match the recorded run. The
-provenance keeps both current-match and current-verify flags false. Both unmeasured
+summed under the owning source outer class. At candidate staging, the source inventory has 1,290 units, including five
+classes absent from the recorded cohort. Its source-unit set and test-source
+bytes no longer match the recorded run. The
+provenance keeps both current-match and current-verify flags false. All five unmeasured
 classes use the declared 30-second estimate, which is not a runtime bound. Of the recorded source classes, 98 have no testcase rows
 (including 97 E2E classes), and ten have zero aggregate suite time. These reports
 remain visible; report presence or zero time cannot establish executed cases.
