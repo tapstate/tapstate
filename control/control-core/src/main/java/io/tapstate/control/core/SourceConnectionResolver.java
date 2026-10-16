@@ -7,6 +7,7 @@ import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionConfig;
+import io.tapstate.spi.store.ConnectionTestResult;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -46,12 +47,18 @@ public final class SourceConnectionResolver {
                 .map(source -> {
                     Map<String, Object> resolved = new LinkedHashMap<>(requested);
                     for (String secret : secretFields(source.connector())) {
-                        if (!resolved.containsKey(secret)
-                                && source.config().containsKey(secret)
+                        if (resolved.containsKey(secret)) {
+                            if (resolved.get(secret) == null) {
+                                resolved.remove(secret);
+                            }
+                            continue;
+                        }
+                        if (source.config().containsKey(secret)
                                 && source.config().get(secret) != null) {
                             resolved.put(secret, source.config().get(secret));
                         }
                     }
+                    restoreNestedSecret(resolved, source.config(), "__TAPDATA", "sshPassword");
                     Object saved = source.config().get("uri");
                     Object supplied = resolved.get("uri");
                     if ("mongodb-atlas".equals(source.connector())) {
@@ -73,14 +80,81 @@ public final class SourceConnectionResolver {
                 .orElseGet(() -> new ConnectionConfig(connectionId, connectorId, settings));
     }
 
+    /** Returns catalog and shared transport secret values used to redact connector diagnostics. */
+    List<String> secretValuesForDiagnostics(String connectorId, Map<String, Object> settings) {
+        Map<String, Object> values = settings == null ? Map.of() : settings;
+        java.util.LinkedHashSet<String> secrets = new java.util.LinkedHashSet<>(
+                ConnectionTestResultRedactor.sharedSecretValues(values));
+        for (String field : secretFields(connectorId)) {
+            Object value = values.get(field);
+            if (value instanceof String text && !text.isBlank()) secrets.add(text);
+        }
+        return List.copyOf(secrets);
+    }
+
+    ConnectionTestResult redactDiagnostics(
+            ConnectionTestResult result, String connectorId, Map<String, Object> settings) {
+        return ConnectionTestResultRedactor.redact(
+                result, secretValuesForDiagnostics(connectorId, settings));
+    }
+
+    ConnectionTestResult redactStoredDiagnostics(ConnectionTestResult result) {
+        Map<String, Object> settings = artifacts.get(result.connectionId())
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.connector().equals(result.connectorId()))
+                .map(SourceResource::config)
+                .orElseGet(Map::of);
+        return redactDiagnostics(result, result.connectorId(), settings);
+    }
+
     private List<String> secretFields(String connectorId) {
-        return catalog.get().all().stream()
+        List<String> fields = new java.util.ArrayList<>(catalog.get().all().stream()
                 .filter(entry -> entry.id().equals(connectorId))
                 .findFirst()
                 .map(entry -> entry.config().stream()
                         .filter(ConfigField::secret)
                         .map(ConfigField::name)
                         .toList())
-                .orElseGet(List::of);
+                .orElseGet(List::of));
+        if (!fields.contains("sslKey")) fields.add("sslKey");
+        if (!fields.contains("sslKeyPassword")) fields.add("sslKeyPassword");
+        return fields;
+    }
+
+    private static void restoreNestedSecret(
+            Map<String, Object> resolved,
+            Map<String, Object> saved,
+            String group,
+            String name) {
+        Object requestedValue = resolved.get(group);
+        if (resolved.containsKey(group) && !(requestedValue instanceof Map<?, ?>)) return;
+        Map<String, Object> requestedGroup = requestedValue instanceof Map<?, ?> map
+                ? copyStringMap(map)
+                : null;
+        Object savedValue = saved.get(group);
+        Map<String, Object> savedGroup = savedValue instanceof Map<?, ?> map
+                ? copyStringMap(map)
+                : Map.of();
+
+        if (requestedGroup != null && requestedGroup.containsKey(name)) {
+            if (requestedGroup.get(name) == null) requestedGroup.remove(name);
+        } else if (savedGroup.get(name) != null) {
+            if (requestedGroup == null) requestedGroup = new LinkedHashMap<>();
+            requestedGroup.put(name, savedGroup.get(name));
+        }
+
+        if (requestedGroup != null) {
+            if (requestedGroup.isEmpty()) resolved.remove(group);
+            else resolved.put(group, requestedGroup);
+        }
+    }
+
+    private static Map<String, Object> copyStringMap(Map<?, ?> values) {
+        Map<String, Object> copy = new LinkedHashMap<>();
+        values.forEach((key, value) -> {
+            if (key instanceof String name) copy.put(name, value);
+        });
+        return copy;
     }
 }

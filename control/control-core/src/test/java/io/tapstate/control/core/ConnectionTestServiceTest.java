@@ -4,10 +4,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.probe.ConnectionProbe;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionConfig;
+import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResult.Outcome;
 import io.tapstate.spi.store.ConnectionTestResultStore;
@@ -15,6 +19,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +55,72 @@ class ConnectionTestServiceTest {
         assertThat(probed.get()).isEqualTo(CONFIG);
         // The storage-port result is what gets persisted, unchanged.
         assertThat(store.saved).isSameAs(RESULT);
+    }
+
+    @Test
+    void redactsConfiguredSecretsFromImmediateAndStoredReportsWithoutDroppingDiagnostics() {
+        String password = "database-password-sentinel";
+        String tlsKey = "tls-private-key-sentinel";
+        String tlsKeyPassword = "tls-key-password-sentinel";
+        String sshPassword = "ssh-password-sentinel";
+        Map<String, Object> savedConfig = new LinkedHashMap<>();
+        savedConfig.put("password", password);
+        savedConfig.put("sslKey", tlsKey);
+        savedConfig.put("sslKeyPassword", tlsKeyPassword);
+        savedConfig.put("__TAPDATA", Map.of("sshPassword", sshPassword));
+        SourceResource source = new SourceResource(
+                "source-transport", null, "mysql", savedConfig, null, null, null, null);
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override
+            public void saveAll(List<Resource> resources) { }
+
+            @Override
+            public Optional<Resource> get(String id) {
+                return source.id().equals(id) ? Optional.of(source) : Optional.empty();
+            }
+
+            @Override
+            public List<Resource> list() {
+                return List.of(source);
+            }
+        };
+        ConnectionTestResult echoed = new ConnectionTestResult(
+                "source-transport", "mysql", Outcome.FAILED,
+                List.of(new ConnectionTestItem(
+                        "Login", ConnectionTestItem.Status.FAILED,
+                        "handshake detail includes " + tlsKey,
+                        "authentication rejected " + password,
+                        "use the configured key password " + tlsKeyPassword + " and SSH password " + sshPassword,
+                        "TLS error after " + tlsKey)),
+                1_700_000_000_000L);
+        RecordingResultStore store = new RecordingResultStore();
+        ConnectionTestService service = new ConnectionTestService(
+                config -> echoed, store, gate(new RecordingAuditStore()), null,
+                new SourceConnectionResolver(artifacts));
+
+        ConnectionTestReport immediate = service.test(
+                "source-transport", "mysql", Map.of("host", "preview"), "alice");
+        ConnectionTestReport stored = new ConnectionTestResultQueryService(store).find("source-transport").orElseThrow();
+        String visible = immediate.checks().toString() + stored.checks();
+
+        assertThat(visible)
+                .contains("handshake detail includes", "authentication rejected", "use the configured key password",
+                        "and SSH password", "TLS error after", "<redacted>")
+                .doesNotContain(password, tlsKey, tlsKeyPassword, sshPassword);
+        assertThat(store.saved.items()).singleElement().satisfies(item -> {
+            assertThat(item.message()).contains("handshake detail includes", "<redacted>");
+            assertThat(item.reason()).contains("authentication rejected", "<redacted>");
+            assertThat(item.solution()).contains("use the configured key password", "and SSH password", "<redacted>");
+            assertThat(item.connectorErrorCode()).contains("TLS error after", "<redacted>");
+        });
+
+        RecordingResultStore legacyStore = new RecordingResultStore();
+        legacyStore.saved = echoed;
+        ConnectionTestReport legacy = new ConnectionTestResultQueryService(
+                legacyStore, new SourceConnectionResolver(artifacts)).find("source-transport").orElseThrow();
+        assertThat(legacy.checks().toString())
+                .contains("authentication rejected", "use the configured key password", "<redacted>")
+                .doesNotContain(password, tlsKey, tlsKeyPassword, sshPassword);
     }
 
     @Test

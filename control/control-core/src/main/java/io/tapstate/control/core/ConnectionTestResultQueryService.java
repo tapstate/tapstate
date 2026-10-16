@@ -12,15 +12,23 @@ import java.util.Optional;
  * observation data, not the config truth layer, so it carries no audit gate.
  *
  * <p>The store is the truth layer; this only projects the storage-port result onto the control-ring report,
- * so the faces render a control-ring type and never reach into the storage ports (the same split the artifact
- * read side keeps between {@link ArtifactQueryService} and {@link ApplyService}).
+ * redacting values from the matching saved Source before projection so older stored diagnostics cannot expose
+ * its current secrets. The faces render a control-ring type and never reach into the storage ports (the same
+ * split the artifact read side keeps between {@link ArtifactQueryService} and {@link ApplyService}).
  */
 public final class ConnectionTestResultQueryService {
 
     private final ConnectionTestResultStore store;
+    private final SourceConnectionResolver sourceConnections;
 
     public ConnectionTestResultQueryService(ConnectionTestResultStore store) {
+        this(store, null);
+    }
+
+    public ConnectionTestResultQueryService(
+            ConnectionTestResultStore store, SourceConnectionResolver sourceConnections) {
         this.store = Objects.requireNonNull(store, "store");
+        this.sourceConnections = sourceConnections;
     }
 
     /**
@@ -29,6 +37,10 @@ public final class ConnectionTestResultQueryService {
      */
     public Optional<ConnectionTestReport> find(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
-        return store.find(connectionId).map(ConnectionTestReport::from);
+        return store.find(connectionId)
+                .map(result -> sourceConnections == null
+                        ? result
+                        : sourceConnections.redactStoredDiagnostics(result))
+                .map(ConnectionTestReport::from);
     }
 }

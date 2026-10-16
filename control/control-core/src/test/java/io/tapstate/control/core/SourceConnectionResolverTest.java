@@ -9,6 +9,7 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionConfig;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -59,6 +60,74 @@ class SourceConnectionResolverTest {
 
         assertThat(resolved.settings()).containsEntry("password", "saved-secret")
                 .doesNotContainKey("host");
+    }
+
+    @Test
+    void restoresSharedTlsAndSshSecretsForConnectionTests() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource(
+                "source-1", null, "mysql",
+                Map.of(
+                        "host", "production",
+                        "sslKey", "saved-key",
+                        "sslKeyPassword", "saved-key-password",
+                        "__TAPDATA", Map.of("sshHost", "saved-bastion", "sshPassword", "saved-ssh-password")),
+                null, null, null, null));
+
+        ConnectionConfig resolved = new SourceConnectionResolver(artifacts)
+                .resolve("source-1", "mysql", Map.of(
+                        "host", "staging",
+                        "__TAPDATA", Map.of("sshHost", "staging-bastion", "sshPort", 2222)));
+
+        assertThat(resolved.settings())
+                .containsEntry("host", "staging")
+                .containsEntry("sslKey", "saved-key")
+                .containsEntry("sslKeyPassword", "saved-key-password")
+                .containsEntry("__TAPDATA", Map.of(
+                        "sshHost", "staging-bastion",
+                        "sshPort", 2222,
+                        "sshPassword", "saved-ssh-password"));
+    }
+
+    @Test
+    void honorsExplicitNullSecretMarkersWithoutRestoringSavedValues() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource(
+                "source-1", null, "mysql",
+                Map.of(
+                        "sslKey", "saved-key",
+                        "__TAPDATA", Map.of("sshHost", "bastion", "sshPassword", "saved-ssh-password")),
+                null, null, null, null));
+        Map<String, Object> sshSettings = new LinkedHashMap<>();
+        sshSettings.put("sshHost", "bastion");
+        sshSettings.put("sshPassword", null);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("sslKey", null);
+        request.put("__TAPDATA", sshSettings);
+
+        ConnectionConfig resolved = new SourceConnectionResolver(artifacts)
+                .resolve("source-1", "mysql", request);
+
+        assertThat(resolved.settings()).doesNotContainKey("sslKey")
+                .containsEntry("__TAPDATA", Map.of("sshHost", "bastion"));
+    }
+
+    @Test
+    void keepsReplacementSharedSecretsFromTheConnectionTestRequest() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource(
+                "source-1", null, "mysql",
+                Map.of("sslKey", "saved-key", "__TAPDATA", Map.of("sshPassword", "saved-ssh-password")),
+                null, null, null, null));
+
+        ConnectionConfig resolved = new SourceConnectionResolver(artifacts)
+                .resolve("source-1", "mysql", Map.of(
+                        "sslKey", "replacement-key",
+                        "__TAPDATA", Map.of("sshPassword", "replacement-ssh-password")));
+
+        assertThat(resolved.settings())
+                .containsEntry("sslKey", "replacement-key")
+                .containsEntry("__TAPDATA", Map.of("sshPassword", "replacement-ssh-password"));
     }
 
     @Test
