@@ -4,9 +4,11 @@ import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.GeneratedSecret;
+import io.tapstate.control.core.OperationRegistry;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
-import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
@@ -281,6 +283,15 @@ class PipelineStreamApiTest {
         @Bean
         PipelineObservationQueryService pipelineObservationQueryService(ObservationStore store) {
             return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), store);
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(PipelineObservationQueryService observations) {
+            return new PipelineCatalogService(
+                    new ArtifactQueryService(appliedPipelines()),
+                    new PipelineDraftService(new PipelineApiTest.FakePipelineDraftStore()),
+                    new PipelineApiTest.FakeDesiredStore(),
+                    observations);
         }
 
         @Bean

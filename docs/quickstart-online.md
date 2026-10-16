@@ -671,9 +671,15 @@ The last `metrics` form reads bounded, reset-aware history rather than the curre
 pagination, REST and MCP forms, and the difference between an empty retained window and unavailable data.
 
 - The read faces lag the write verbs: they report observed state, which converges to
-  what you asked for rather than changing with the command. Immediately after `start`
-  the first `status`/`metrics` may report no observation yet, and a `status` right
-  after `stop` can still say `running`. Use `--watch`, or retry after a second.
+  what you asked for rather than changing with the command. Immediately after `start`,
+  CLI `status` and `metrics` may report `monitor.no-observation` until the first runtime
+  observation. REST `GET /api/pipelines/{id}/status` returns `state: "NEW"` and omits
+  `observedState` during that window; `desiredState` carries the requested target. After
+  `stop`, the observed state can still be `RUNNING` until another observation arrives,
+  even though the intent is `STOPPED`. `status --watch` streams observed state changes
+  only; a known unobserved pipeline or saved draft keeps the watch open without frames,
+  while an unknown id closes with `lifecycle.unknown-pipeline`. Use `--watch`, or retry
+  after another observation arrives.
 - Under the answer, `status` prints two more lines. `moving` is how fast the pipeline moves, in rows
   per second per direction, measured between two readings of the pipeline's own observation time —
   never this machine's clock, which keeps running while a stalled publisher's reading stands still. A
@@ -709,7 +715,8 @@ pagination, REST and MCP forms, and the difference between an empty retained win
   faces differently. When nothing on the checklist matches it does **not** report
   that all is well — it prints every reading it went through and names the questions these faces
   cannot answer, so you go and look at the thing the product genuinely cannot see instead of
-  trusting a silence. `--watch` is unchanged: it streams the state only, and says nothing more.
+  trusting a silence. `--watch` streams runtime state changes only; while no observation
+  exists yet, the known pipeline's watch stays open and waits for the first one.
 - **The position it reports is `targetAckedPosition`: how far the target has confirmed writes.**
   When a connector supplies a Java-serialized token, `metrics` summarizes how many tables have
   an acknowledged position and how many distinct positions they share; it cannot infer a source
