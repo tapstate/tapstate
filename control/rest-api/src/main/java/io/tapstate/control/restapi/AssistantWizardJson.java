@@ -64,68 +64,119 @@ final class AssistantWizardJson {
     }
     private static void writeRelated(List<Object> nodes, String parent, List<Map<String, Object>> rows, int depth) {
         if (depth > 32 || rows.size() > 100) throw new IllegalArgumentException("too many relations");
-        for (Object raw : nodes) {
-            var node = object(raw); String type = text(node.get("type"));
-            if (!List.of("flatten", "sub_array", "sub_doc").contains(type)) throw new IllegalArgumentException("invalid relation kind");
-            List<Object> conditions = node.containsKey("conditions") ? list(node.get("conditions"))
-                    : List.of(Map.of("childKey", text(node.get("key")), "parentKey", text(node.get("parentKey"))));
-            Map<String, Object> relation = new LinkedHashMap<>();
-            relation.put("shape", type.equals("flatten") ? "flat" : type.equals("sub_array") ? "array" : "object");
-            relation.put("path", type.equals("flatten") ? null : text(node.get("targetField")));
-            relation.put("key", list(node.get("primaryKey")));
-            relation.put("arrayKey", type.equals("sub_array") ? list(node.get("arrayKey")) : List.of());
-            relation.put("on", conditions.stream().map(AssistantWizardJson::object)
-                    .map(c -> Map.of("childField", text(c.get("childKey")), "parentField", text(c.get("parentKey")))).toList());
-            rows.add(Map.of("id", text(node.get("id")), "parentId", parent, "sourceId", text(node.get("source")),
-                    "table", text(node.get("table")), "relation", relation, "preTransforms", writeTransforms(node.get("transforms"))));
-            writeRelated(list(node.get("children")), text(node.get("id")), rows, depth + 1);
-        }
+        for (Object raw : nodes) writeRelatedNode(object(raw), parent, rows, depth);
+    }
+    private static void writeRelatedNode(Map<String, Object> node, String parent, List<Map<String, Object>> rows, int depth) {
+        String type = text(node.get("type"));
+        if (!List.of("flatten", "sub_array", "sub_doc").contains(type)) throw new IllegalArgumentException("invalid relation kind");
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("id", text(node.get("id")));
+        row.put("parentId", parent);
+        row.put("sourceId", text(node.get("source")));
+        row.put("table", text(node.get("table")));
+        row.put("relation", relation(node, type));
+        row.put("preTransforms", writeTransforms(node.get("transforms")));
+        rows.add(row);
+        writeRelated(list(node.get("children")), text(node.get("id")), rows, depth + 1);
+    }
+    private static Map<String, Object> relation(Map<String, Object> node, String type) {
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("shape", relationShape(type));
+        value.put("path", type.equals("flatten") ? null : text(node.get("targetField")));
+        value.put("key", list(node.get("primaryKey")));
+        value.put("arrayKey", type.equals("sub_array") ? list(node.get("arrayKey")) : List.of());
+        value.put("on", relationConditions(node).stream().map(AssistantWizardJson::object)
+                .map(condition -> Map.of("childField", text(condition.get("childKey")),
+                        "parentField", text(condition.get("parentKey")))).toList());
+        return value;
+    }
+    private static String relationShape(String type) {
+        return switch (type) {
+            case "flatten" -> "flat";
+            case "sub_array" -> "array";
+            default -> "object";
+        };
+    }
+    private static List<Object> relationConditions(Map<String, Object> node) {
+        if (node.containsKey("conditions")) return list(node.get("conditions"));
+        return List.of(Map.of("childKey", text(node.get("key")), "parentKey", text(node.get("parentKey"))));
     }
     static List<Map<String, Object>> readTransforms(Object raw) {
         List<Map<String, Object>> result = new ArrayList<>();
-        for (Object value : list(raw)) {
-            var step = object(value); var fields = object(step.get("fields")); String type = text(step.get("type"));
-            Map<String, Object> config;
-            if ("map".equals(type)) {
-                List<Map<String, Object>> rules = new ArrayList<>(); int i = 0;
-                for (var entry : fields.entrySet()) {
-                    Object v = entry.getValue(); String str = v instanceof String s ? s : "";
-                    String rule = Boolean.FALSE.equals(v) ? "delete" : str.startsWith("$") ? "rename" : str.startsWith("=") ? "compute" : "literal";
-                    rules.add(Map.of("id", text(step.get("id")) + "-" + i++, "outputField", entry.getKey(), "ruleType", rule,
-                            "value", str.startsWith("$") || str.startsWith("=") ? str : JsonWriter.write(v)));
-                }
-                config = Map.of("fields", rules, "passthroughUnlisted", true);
-            } else config = fields;
-            result.add(Map.of("id", text(step.get("id")), "name", type, "type", type, "enabled", true,
-                    "config", Map.of(type, config)));
-        }
+        for (Object value : list(raw)) result.add(readTransform(object(value)));
         return result;
+    }
+    private static Map<String, Object> readTransform(Map<String, Object> step) {
+        String type = text(step.get("type"));
+        Map<String, Object> fields = object(step.get("fields"));
+        Map<String, Object> config = "map".equals(type)
+                ? Map.of("fields", readMapRules(step.get("id"), fields), "passthroughUnlisted", true) : fields;
+        return Map.of("id", text(step.get("id")), "name", type, "type", type, "enabled", true,
+                "config", Map.of(type, config));
+    }
+    private static List<Map<String, Object>> readMapRules(Object id, Map<String, Object> fields) {
+        List<Map<String, Object>> rules = new ArrayList<>();
+        int index = 0;
+        for (var entry : fields.entrySet()) {
+            Object value = entry.getValue();
+            String text = value instanceof String string ? string : "";
+            rules.add(Map.of("id", text(id) + "-" + index++, "outputField", entry.getKey(),
+                    "ruleType", readMapRuleType(value, text), "value", readMapRuleValue(value, text)));
+        }
+        return rules;
+    }
+    private static String readMapRuleType(Object value, String text) {
+        if (Boolean.FALSE.equals(value)) return "delete";
+        if (text.startsWith("$")) return "rename";
+        if (text.startsWith("=")) return "compute";
+        return "literal";
+    }
+    private static String readMapRuleValue(Object value, String text) {
+        return text.startsWith("$") || text.startsWith("=") ? text : JsonWriter.write(value);
     }
     static List<Map<String, Object>> writeTransforms(Object raw) {
         List<Map<String, Object>> result = new ArrayList<>();
-        for (Object value : list(raw)) {
-            var step = object(value); String type = text(step.get("type"));
-            if (!List.of("filter", "map", "unwind", "js").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
-            Map<String, Object> config = object(object(step.get("config")).get(type));
-            Map<String, Object> fields = new LinkedHashMap<>();
-            if ("map".equals(type)) {
-                for (Object rawRule : list(config.get("fields"))) {
-                    var rule = object(rawRule); String text = text(rule.get("value")); Object resolved = text;
-                    switch (text(rule.get("ruleType"))) {
-                        case "delete" -> resolved = false;
-                        case "rename" -> resolved = text.startsWith("$") ? text : "$" + text;
-                        case "compute" -> resolved = text.startsWith("=") ? text : "=" + text;
-                        case "literal" -> { try { resolved = JsonReader.parse(text); } catch (IllegalArgumentException ignored) { resolved = text; } }
-                        default -> throw new IllegalArgumentException("invalid map field rule");
-                    }
-                    fields.put(text(rule.get("outputField")), resolved);
-                }
-            } else if ("filter".equals(type)) fields.put("expr", text(config.get("expr")));
-            else if ("js".equals(type)) fields.put("script", text(config.get("script")));
-            else fields.putAll(config);
-            result.add(Map.of("id", text(step.get("id")), "type", type, "fields", fields));
-        }
+        for (Object value : list(raw)) result.add(writeTransform(object(value)));
         return result;
+    }
+    private static Map<String, Object> writeTransform(Map<String, Object> step) {
+        String type = text(step.get("type"));
+        if (!List.of("filter", "map", "unwind", "js").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
+        Map<String, Object> config = object(object(step.get("config")).get(type));
+        return Map.of("id", text(step.get("id")), "type", type, "fields", writeTransformFields(type, config));
+    }
+    private static Map<String, Object> writeTransformFields(String type, Map<String, Object> config) {
+        return switch (type) {
+            case "map" -> writeMapFields(config);
+            case "filter" -> Map.of("expr", text(config.get("expr")));
+            case "js" -> Map.of("script", text(config.get("script")));
+            default -> new LinkedHashMap<>(config);
+        };
+    }
+    private static Map<String, Object> writeMapFields(Map<String, Object> config) {
+        Map<String, Object> fields = new LinkedHashMap<>();
+        for (Object rawRule : list(config.get("fields"))) {
+            Map<String, Object> rule = object(rawRule);
+            fields.put(text(rule.get("outputField")), writeMapValue(rule));
+        }
+        return fields;
+    }
+    private static Object writeMapValue(Map<String, Object> rule) {
+        String value = text(rule.get("value"));
+        return switch (text(rule.get("ruleType"))) {
+            case "delete" -> false;
+            case "rename" -> value.startsWith("$") ? value : "$" + value;
+            case "compute" -> value.startsWith("=") ? value : "=" + value;
+            case "literal" -> parseLiteral(value);
+            default -> throw new IllegalArgumentException("invalid map field rule");
+        };
+    }
+    private static Object parseLiteral(String value) {
+        try {
+            return JsonReader.parse(value);
+        } catch (IllegalArgumentException ignored) {
+            return value;
+        }
     }
     @SuppressWarnings("unchecked") static Map<String, Object> object(Object value) {
         if (value == null) return Map.of();

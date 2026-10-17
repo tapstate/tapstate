@@ -66,48 +66,49 @@ class PipelineAssistantController {
         Map<String, Object> focus = focus(base, body.get("focus"));
         if (!focus.isEmpty()) context.put("focus", focus);
         StreamingResponseBody stream = output -> {
+            Object streamLock = new Object();
             if (!CAPACITY.tryAcquire()) {
-                event(output, Map.of("type", "error", "errorText", ControlError.AI_OVERLOADED.code()));
-                event(output, Map.of("type", "data-status", "data", Map.of("state", "error", "status", "error",
+                event(output, streamLock, Map.of("type", "error", "errorText", ControlError.AI_OVERLOADED.code()));
+                event(output, streamLock, Map.of("type", "data-status", "data", Map.of("state", "error", "status", "error",
                         "code", ControlError.AI_OVERLOADED.code())));
-                event(output, Map.of("type", "finish", "finishReason", "error"));
-                done(output);
+                event(output, streamLock, Map.of("type", "finish", "finishReason", "error"));
+                done(output, streamLock);
                 return;
             }
             String textId = UUID.randomUUID().toString();
             Thread worker = Thread.currentThread();
             var heartbeat = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().factory());
             heartbeat.scheduleAtFixedRate(() -> {
-                try { synchronized (output) { output.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8)); output.flush(); } }
+                try { synchronized (streamLock) { output.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8)); output.flush(); } }
                 catch (IOException disconnected) { worker.interrupt(); }
             }, 5, 5, java.util.concurrent.TimeUnit.SECONDS);
             try {
-                event(output, Map.of("type", "start", "messageId", UUID.randomUUID().toString()));
-                status(output, "connecting");
-                event(output, Map.of("type", "text-start", "id", textId));
-                status(output, "streaming");
+                event(output, streamLock, Map.of("type", "start", "messageId", UUID.randomUUID().toString()));
+                status(output, streamLock, "connecting");
+                event(output, streamLock, Map.of("type", "text-start", "id", textId));
+                status(output, streamLock, "streaming");
                 Map<String, Object> candidate = client.propose(settings, messages, context,
-                        delta -> event(output, Map.of("type", "text-delta", "id", textId, "delta", delta)));
-                event(output, Map.of("type", "text-end", "id", textId));
-                status(output, "validating");
+                        delta -> event(output, streamLock, Map.of("type", "text-delta", "id", textId, "delta", delta)));
+                event(output, streamLock, Map.of("type", "text-end", "id", textId));
+                status(output, streamLock, "validating");
                 Map<String, Object> validated = validate(id, revision, candidate);
                 if (!Boolean.TRUE.equals(validated.get("valid"))) {
                     throw AiProviderService.error(ControlError.AI_INVALID_PROPOSAL);
                 }
                 Map<String, Object> proposal = new LinkedHashMap<>(validated);
                 proposal.put("baseRevision", revision);
-                event(output, Map.of("type", "data-proposal", "data", proposal));
-                status(output, "ready");
-                event(output, Map.of("type", "finish", "finishReason", "stop"));
-                done(output);
+                event(output, streamLock, Map.of("type", "data-proposal", "data", proposal));
+                status(output, streamLock, "ready");
+                event(output, streamLock, Map.of("type", "finish", "finishReason", "stop"));
+                done(output, streamLock);
             } catch (UncheckedIOException disconnected) {
                 // Client cancellation closes the provider body through the streaming consumer.
             } catch (TapstateException failure) {
                 try {
-                    event(output, Map.of("type", "error", "errorText", failure.code().code()));
-                    event(output, Map.of("type", "data-status", "data", Map.of("state", "error", "status", "error", "code", failure.code().code())));
-                    event(output, Map.of("type", "finish", "finishReason", "error"));
-                    done(output);
+                    event(output, streamLock, Map.of("type", "error", "errorText", failure.code().code()));
+                    event(output, streamLock, Map.of("type", "data-status", "data", Map.of("state", "error", "status", "error", "code", failure.code().code())));
+                    event(output, streamLock, Map.of("type", "finish", "finishReason", "error"));
+                    done(output, streamLock);
                 } catch (UncheckedIOException disconnected) {
                     // A canceled client needs no further terminal event.
                 }
@@ -241,17 +242,23 @@ class PipelineAssistantController {
     }
     private static long revision(Object value) {
         if (!(value instanceof Number)) throw malformed("revision must be a positive integer");
-        try { long revision = new BigDecimal(value.toString()).longValueExact(); if (revision < 1) throw new ArithmeticException(); return revision; }
+        try {
+            long revision = new BigDecimal(value.toString()).longValueExact();
+            if (revision < 1) {
+                throw new ArithmeticException();
+            }
+            return revision;
+        }
         catch (ArithmeticException | NumberFormatException error) { throw malformed("revision must be a positive integer"); }
     }
     private static TapstateException malformed(String reason) { return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null); }
-    private static void status(OutputStream output, String state) { event(output, Map.of("type", "data-status", "data", Map.of("state", state, "status", state))); }
-    private static void event(OutputStream output, Map<String, Object> event) {
-        try { synchronized (output) { output.write(("data: " + JsonWriter.write(event) + "\n\n").getBytes(StandardCharsets.UTF_8)); output.flush(); } }
+    private static void status(OutputStream output, Object streamLock, String state) { event(output, streamLock, Map.of("type", "data-status", "data", Map.of("state", state, "status", state))); }
+    private static void event(OutputStream output, Object streamLock, Map<String, Object> event) {
+        try { synchronized (streamLock) { output.write(("data: " + JsonWriter.write(event) + "\n\n").getBytes(StandardCharsets.UTF_8)); output.flush(); } }
         catch (IOException error) { throw new UncheckedIOException(error); }
     }
-    private static void done(OutputStream output) {
-        try { synchronized (output) { output.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8)); output.flush(); } }
+    private static void done(OutputStream output, Object streamLock) {
+        try { synchronized (streamLock) { output.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8)); output.flush(); } }
         catch (IOException error) { throw new UncheckedIOException(error); }
     }
 }

@@ -23,6 +23,23 @@ class AssistantWizardJsonTest {
             assertThat(AssistantWizardJson.wire(AssistantWizardJson.view(wizard), wizard)).isEqualTo(wizard);
         }
     }
+    @Test void mapTransformsRoundTripLiteralRenameComputeAndDeleteValues() {
+        Map<String, Object> wizard = Map.of("root", Map.of("id", "root", "sourceId", "orders", "table", "orders", "key", List.of("id"), "preTransforms", List.of()),
+                "related", List.of(),
+                "transforms", List.of(Map.of("id", "map", "type", "map", "fields", Map.of(
+                        "literalNumber", 42L, "literalText", "hello", "renamed", "$old_name", "computed", "=amount + 1", "removed", false))),
+                "output", Map.of("kind", "atlas", "config", Map.of("sourceId", "target", "table", "view", "inputTable", "orders", "writeMode", "upsert")));
+
+        assertThat(AssistantWizardJson.wire(AssistantWizardJson.view(wizard), wizard)).isEqualTo(wizard);
+    }
+    @Test void mapTransformRejectsUnknownRuleTypeAndKeepsInvalidLiteralAsText() {
+        assertThatThrownBy(() -> AssistantWizardJson.writeTransforms(List.of(Map.of("id", "map", "type", "map",
+                "config", Map.of("map", Map.of("fields", List.of(Map.of("outputField", "value", "ruleType", "unknown", "value", "x"))))))))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(AssistantWizardJson.writeTransforms(List.of(Map.of("id", "map", "type", "map",
+                "config", Map.of("map", Map.of("fields", List.of(Map.of("outputField", "value", "ruleType", "literal", "value", "not-json"))))))))
+                .containsExactly(Map.of("id", "map", "type", "map", "fields", Map.of("value", "not-json")));
+    }
     @Test void unsupportedTransformAndExcessiveNestingCannotBecomeCandidate() {
         assertThatThrownBy(() -> AssistantWizardJson.writeTransforms(List.of(Map.of("id", "bad", "type", "sql", "config", Map.of()))))
                 .isInstanceOf(IllegalArgumentException.class);

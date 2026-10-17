@@ -4,6 +4,7 @@ import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
 import java.io.BufferedReader;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -77,47 +78,67 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         try {
             var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
             try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
-                if (response.statusCode() == 401 || response.statusCode() == 403) throw AiProviderService.error(ControlError.AI_PROVIDER_AUTH_FAILED);
-                if (response.statusCode() < 200 || response.statusCode() >= 300) throw failed();
-                BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
-                StringBuilder arguments = new StringBuilder();
-                String function = null;
-                String finish = null;
-                int bytes = 0;
-                boolean done = false;
-                String line;
-                while ((line = boundedLine(reader)) != null) {
-                    bytes += line.length();
-                    if (bytes > MAX_BYTES || Thread.currentThread().isInterrupted()) throw failed();
-                    if (!line.startsWith("data:")) continue;
-                    String data = line.substring(5).strip();
-                    if ("[DONE]".equals(data)) { done = true; break; }
-                    Map<String, Object> chunk = object(JsonReader.parse(data));
-                    Object rawChoices = chunk.get("choices");
-                    if (!(rawChoices instanceof List<?> choices) || choices.isEmpty()) continue;
-                    Map<String, Object> choice = object(choices.getFirst());
-                    if (choice.get("finish_reason") instanceof String reason) finish = reason;
-                    Map<String, Object> delta = object(choice.getOrDefault("delta", Map.of()));
-                    if (delta.get("content") instanceof String content && !content.isEmpty()) text.accept(content);
-                    if (delta.get("tool_calls") instanceof List<?> calls) {
-                        for (Object raw : calls) {
-                            Map<String, Object> call = object(raw);
-                            if (!(call.get("index") instanceof Number index) || index.intValue() != 0) throw failed();
-                            Map<String, Object> fn = object(call.getOrDefault("function", Map.of()));
-                            if (fn.get("name") instanceof String name) function = name;
-                            if (fn.get("arguments") instanceof String arg) arguments.append(arg);
-                        }
-                    }
-                }
-                if (!done || !"tool_calls".equals(finish) || !"propose_pipeline".equals(function)) throw invalid();
-                Object parsed = JsonReader.parse(arguments.toString());
-                if (!(parsed instanceof Map<?, ?> map) || !(map.get("candidateWizard") instanceof Map<?, ?> candidate)) throw invalid();
-                return (Map<String, Object>) candidate;
+                requireSuccessfulResponse(response.statusCode());
+                return readEvents(input, text);
             }
         } catch (java.io.IOException | InterruptedException error) {
             if (error instanceof InterruptedException) Thread.currentThread().interrupt();
             throw failed();
         } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
+    }
+    private static Map<String, Object> readEvents(InputStream input, Consumer<String> text) throws java.io.IOException {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+        StreamState state = new StreamState();
+        String line;
+        while ((line = boundedLine(reader)) != null) {
+            state.bytes += line.length();
+            if (state.bytes > MAX_BYTES || Thread.currentThread().isInterrupted()) throw failed();
+            if (!line.startsWith("data:")) continue;
+            String data = line.substring(5).strip();
+            if ("[DONE]".equals(data)) {
+                state.done = true;
+                break;
+            }
+            readChunk(data, state, text);
+        }
+        if (!state.done || !"tool_calls".equals(state.finish) || !"propose_pipeline".equals(state.function)) throw invalid();
+        return candidate(state.arguments.toString());
+    }
+    private static void readChunk(String data, StreamState state, Consumer<String> text) {
+        Map<String, Object> chunk = object(JsonReader.parse(data));
+        Object rawChoices = chunk.get("choices");
+        if (!(rawChoices instanceof List<?> choices) || choices.isEmpty()) return;
+        Map<String, Object> choice = object(choices.getFirst());
+        if (choice.get("finish_reason") instanceof String reason) state.finish = reason;
+        Map<String, Object> delta = object(choice.getOrDefault("delta", Map.of()));
+        if (delta.get("content") instanceof String content && !content.isEmpty()) text.accept(content);
+        if (delta.get("tool_calls") instanceof List<?> calls) {
+            for (Object raw : calls) appendToolCall(raw, state);
+        }
+    }
+    private static void appendToolCall(Object raw, StreamState state) {
+        Map<String, Object> call = object(raw);
+        if (!(call.get("index") instanceof Number index) || index.intValue() != 0) throw failed();
+        Map<String, Object> function = object(call.getOrDefault("function", Map.of()));
+        if (function.get("name") instanceof String name) state.function = name;
+        if (function.get("arguments") instanceof String arguments) state.arguments.append(arguments);
+    }
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> candidate(String arguments) {
+        Object parsed = JsonReader.parse(arguments);
+        if (!(parsed instanceof Map<?, ?> map) || !(map.get("candidateWizard") instanceof Map<?, ?> result)) throw invalid();
+        return (Map<String, Object>) result;
+    }
+    private static void requireSuccessfulResponse(int status) {
+        if (status == 401 || status == 403) throw AiProviderService.error(ControlError.AI_PROVIDER_AUTH_FAILED);
+        if (status < 200 || status >= 300) throw failed();
+    }
+    private static final class StreamState {
+        private final StringBuilder arguments = new StringBuilder();
+        private String function;
+        private String finish;
+        private int bytes;
+        private boolean done;
     }
     private static Map<String, Object> object(Object value) {
         if (!(value instanceof Map<?, ?> source)) throw invalid();
