@@ -139,6 +139,7 @@ class RealManagedAtlasStoreStartupIT {
     private static ConfigurableApplicationContext start(String metadataUri, String cluster, Path plugins,
             Path seedDirectory, String retention, AtomicInteger ready) {
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .initializers(CloudStartupDerivationWitness.initializer(), CloudSeedOutcomeWitness.initializer())
                 .listeners((ApplicationListener<ApplicationReadyEvent>) event -> ready.incrementAndGet())
                 .run("--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
                         "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=ERROR",

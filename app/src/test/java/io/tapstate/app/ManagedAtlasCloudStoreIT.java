@@ -99,6 +99,7 @@ class ManagedAtlasCloudStoreIT {
                 "--tapstate.connectors.plugins-dir=" + plugins,
                 "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory()));
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .initializers(CloudStartupDerivationWitness.initializer(), CloudSeedOutcomeWitness.initializer())
                 .run(arguments.toArray(String[]::new));
     }
 
