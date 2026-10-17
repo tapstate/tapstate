@@ -238,7 +238,7 @@ class MongoConfigurationArtifactStoreIT {
             assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
                     .containsExactlyInAnyOrder("configuration_version", "cluster_identity", "schema_migrations",
-                            "cluster_keys", "sources");
+                            "cluster_keys", "storage_setup", "sources");
         });
     }
 
@@ -490,6 +490,10 @@ class MongoConfigurationArtifactStoreIT {
     }
 
     private static void installConfigFacts(MongoDatabase database) {
+        SystemCollections.STORAGE_SETUP.on(database).insertOne(new Document("_id", "cluster")
+                .append("clusterId", "cluster-a").append("installationId", "installation-a")
+                .append("operationId", "setup-a").append("generation", 1L).append("phase", MongoConfigurationBootstrap.PREPARED));
+        MongoStorageBindingStore.prepareIndex(database);
         SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).insertOne(new Document("_id", "cluster")
                 .append("clusterId", "cluster-a").append("layoutId", MongoConfigurationDomain.LAYOUT)
                 .append("bindingVersion", 0L));

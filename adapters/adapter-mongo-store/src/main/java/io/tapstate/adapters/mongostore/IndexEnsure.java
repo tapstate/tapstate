@@ -54,6 +54,10 @@ public final class IndexEnsure {
                     + " Starting over it either way would mean running without a constraint the store's"
                     + " own declaration asks for, or with one it does not");
         }
+        Document partial = index.partialFilterJson() == null ? null : Document.parse(index.partialFilterJson());
+        if (!java.util.Objects.equals(partial, existing.get("partialFilterExpression"))) {
+            throw new IllegalStateException("index partial filter differs from its declared constraint");
+        }
         Long declared = index.expireAfterSeconds();
         Number found = existing.get("expireAfterSeconds", Number.class);
         if (declared == null || (found != null && found.longValue() == declared)) {
@@ -80,6 +84,9 @@ public final class IndexEnsure {
         IndexOptions options = new IndexOptions().name(index.indexName()).unique(index.unique());
         if (index.expireAfterSeconds() != null) {
             options.expireAfter(index.expireAfterSeconds(), TimeUnit.SECONDS);
+        }
+        if (index.partialFilterJson() != null) {
+            options.partialFilterExpression(Document.parse(index.partialFilterJson()));
         }
         collection.createIndex(keys, options);
     }

@@ -48,6 +48,9 @@ public enum StoreError implements TapstateErrorCode {
     /** Existing configuration facts do not belong to this exact new-installation operation. */
     INITIALIZATION_REFUSED("store.initialization-refused", Set.of()),
 
+    /** A normal authoring write cannot replace or remove the storage binding's system-owned Source. */
+    DEFAULT_SOURCE_PROTECTED("store.default-source-protected", Set.of()),
+
     /**
      * The configured TLS CA certificate file could not be read or parsed. {@code path} is the CA
      * file path (a filesystem path, not a credential, so it is safe to echo back). Reached only when

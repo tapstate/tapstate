@@ -316,6 +316,7 @@ source.precondition-required
 source.srs-change-while-running
 source.version-conflict
 store.database-access-failed
+store.default-source-protected
 store.initialization-refused
 store.invalid-operator-state-database
 store.invalid-uri

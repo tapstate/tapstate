@@ -164,7 +164,8 @@ public enum SystemCollections {
             Strategy.NEST_EXCLUDED, 0),
 
     // Configuration resources in the independently initialized storage layout.
-    SOURCES("sources", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
+    SOURCES("sources", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("systemRole"), true, null, "system_default_target", "{\"systemRole\":\"DEFAULT_TARGET\"}")),
     PIPELINES("pipelines", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
     CONFIGURATION_VERSION("configuration_version", Database.CONFIG, MongoConfigurationArtifactStore.class,
             Strategy.MIGRATED, 1),
@@ -176,7 +177,8 @@ public enum SystemCollections {
     PDK_NOTE_SCOPES("pdk_note_scopes", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
     PDK_NOTES("pdk_notes", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
     PDK_NOTE_MIGRATIONS("pdk_note_migrations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
-    OPERATOR_GENERATIONS("operator_generations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1);
+    OPERATOR_GENERATIONS("operator_generations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
+    STORAGE_BINDING("storage_binding", Database.CONFIG, MongoStorageBindingStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -203,7 +205,8 @@ public enum SystemCollections {
      * An index a query shape needs. Keys are in order and all ascending: nothing here sorts, and a
      * descending key would only matter to a query that did.
      */
-    public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName) {
+    public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName,
+            String partialFilterJson) {
         public IndexSpec {
             keys = List.copyOf(keys);
             if (expireAfterSeconds != null && (expireAfterSeconds < 0 || keys.size() != 1)) {
@@ -213,6 +216,10 @@ public enum SystemCollections {
             if (declaredName != null && declaredName.isBlank()) {
                 throw new IllegalArgumentException("an explicit index name must not be blank");
             }
+        }
+
+        public IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName) {
+            this(keys, unique, expireAfterSeconds, declaredName, null);
         }
 
         /** An index whose existing name is part of the persisted MongoDB contract. */
@@ -377,7 +384,8 @@ public enum SystemCollections {
         }
         return indexes.stream()
                 .map(index -> String.join("+", index.keys()) + (index.unique() ? " (unique)" : "")
-                        + (index.expireAfterSeconds() == null ? "" : " (ttl " + index.expireAfterSeconds() + "s)"))
+                        + (index.expireAfterSeconds() == null ? "" : " (ttl " + index.expireAfterSeconds() + "s)")
+                        + (index.partialFilterJson() == null ? "" : " (partial " + index.partialFilterJson() + ")"))
                 .reduce((a, b) -> a + ", " + b)
                 .orElseThrow();
     }

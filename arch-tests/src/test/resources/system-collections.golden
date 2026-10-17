@@ -26,7 +26,7 @@ pipeline_rate_history | store | MongoRateHistoryStore | migrated | 9 | observedA
 srs_consumer_offsets | store | MongoSrsMetaStore | migrated | 10 | miningChainId, pipelineId
 operator_state | nest | MongoKeyedStateStore | nest-excluded | 0 | -
 nest_dead_letters | nest | MongoNestDeadLetterStore | nest-excluded | 0 | -
-sources | config | MongoConfigurationArtifactStore | migrated | 1 | -
+sources | config | MongoConfigurationArtifactStore | migrated | 1 | systemRole (unique) (partial {"systemRole":"DEFAULT_TARGET"})
 pipelines | config | MongoConfigurationArtifactStore | migrated | 1 | -
 configuration_version | config | MongoConfigurationArtifactStore | migrated | 1 | -
 cluster_identity | config | MongoConfigurationDomain | migrated | 1 | -
@@ -38,3 +38,4 @@ pdk_note_scopes | config | MongoRequiredNoteStore | migrated | 1 | -
 pdk_notes | config | MongoRequiredNoteStore | migrated | 1 | -
 pdk_note_migrations | config | MongoRequiredNoteStore | migrated | 1 | -
 operator_generations | config | MongoRequiredNoteStore | migrated | 1 | -
+storage_binding | config | MongoStorageBindingStore | migrated | 1 | -

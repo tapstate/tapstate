@@ -510,6 +510,9 @@ store.source-config-keyring-rotation-blocked:
 store.initialization-refused:
   message: "Configuration initialization cannot proceed for this installation operation."
   solution: "Verify the original installation identity, operation and generation. Inspect the existing configuration; do not reset its identity or encryption key."
+store.default-source-protected:
+  message: "The system default target Source cannot be changed through ordinary authoring."
+  solution: "Inspect the Cluster storage binding in Settings. Do not remove or replace its default target Source."
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."

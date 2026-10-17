@@ -91,6 +91,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             if (!expectedContentHash.equals(stored.getString("contentHash"))) {
                 throw new Refused(id, ArtifactMutation.VERSION_CONFLICT);
             }
+            requireUnmanaged(stored);
             collection(stored.getString("kind")).deleteOne(session, new Document("_id", id));
             return ArtifactMutation.DELETED;
         }, refused -> refused.outcome);
@@ -128,6 +129,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 throw new Refused(resource.id(), ArtifactMutation.VERSION_CONFLICT);
             }
         }
+        if (observed != null) requireUnmanaged(observed);
         // Unconditional apply may replace a kind, but must never leave the same id in both tables.
         if (observed != null && !resource.kind().equals(observed.getString("kind"))) {
             collection(observed.getString("kind")).deleteOne(session, new Document("_id", resource.id()));
@@ -242,6 +244,12 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             }
         }
         return documents;
+    }
+
+    private static void requireUnmanaged(Document document) {
+        if (document.containsKey("systemRole")) {
+            throw new TapstateException(StoreError.DEFAULT_SOURCE_PROTECTED, Map.of(), null);
+        }
     }
 
     private static void requireKind(Document document, String kind) {
