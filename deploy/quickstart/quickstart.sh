@@ -695,14 +695,16 @@ their shipments are in PostgreSQL -- and kept up to date as either one changes.
 
 Three ways to use it:
 
+  Sign in as  $admin_user  with the password  $admin_pw  (it is also in .env).
+
   In the browser
-    Open http://127.0.0.1:8080 and sign in as admin. The password is in .env.
+    Open http://127.0.0.1:8080 and sign in.
 
   With an AI agent (Claude Code, Cursor, ...) -- it creates and runs pipelines for you
 $agent_lines
 
   From the CLI
-    ./tapstate -w work, then at its prompt: connect http://127.0.0.1:8080 ; login admin
+    ./tapstate -w work, then at its prompt: connect http://127.0.0.1:8080 ; login $admin_user
 
 See it stay in sync
   Run ./try-cdc.sh. It makes four small changes to the source databases, one at a time:
@@ -848,15 +850,15 @@ EOF
     [ -f ./postgres-connector.jar ] || fetch "${cbase}/postgres-connector.jar" ./postgres-connector.jar
 
     # A random admin password replaces the shipped admin/admin default so a stack left running is not
-    # trivially reachable. It is written only to .env (readable by this user alone) and announced once
-    # here -- never passed as a CLI argument, so it stays out of the process table and shell history. A
-    # re-run keeps the existing .env: regenerating it would lock the user out of the admin already
-    # bootstrapped against the old password.
+    # trivially reachable. It is written only to .env (readable by this user alone) and printed once, in
+    # the closing message beside the sign-in it is for -- never passed as a CLI argument, so it stays out
+    # of the process table and shell history. A re-run keeps the existing .env: regenerating it would
+    # lock the user out of the admin already bootstrapped against the old password.
     if [ ! -f .env ]; then
         admin_pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
         printf 'TAPSTATE_ADMIN_USER=admin\nTAPSTATE_ADMIN_PASSWORD=%s\n' "$admin_pw" > .env
         chmod 600 .env
-        printf 'quickstart: generated a random admin password, saved to .env: %s\n' "$admin_pw"
+        printf 'quickstart: generated a random admin password and saved it to .env\n'
     fi
 
     # Generate the demo workspace, unless one is already here: a re-run must not clobber edits the user
@@ -958,6 +960,8 @@ EOF
     # started. Authentication is also the one failure that cascades -- every verb after it reports
     # cli.not-authenticated, so the real cause ends up at the top of a screen of consequences.
     admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+    admin_user="$(sed -n 's/^TAPSTATE_ADMIN_USER=//p' .env)"
+    admin_user="${admin_user:-admin}"
     step_begin "registering the connectors, creating the two sources, starting the pipeline"
     repl_status=0
     repl_out="$(printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nregister ../mysql-connector.jar\nregister ../mongodb-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' "$admin_pw" \

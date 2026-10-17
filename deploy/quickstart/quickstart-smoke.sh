@@ -184,8 +184,10 @@ case "$perms" in
   -rw-------*) ok "writes .env readable only by the user (600)" ;;
   *)          bad ".env perms = '$perms', want -rw-------" ;;
 esac
+# The password is printed once, in the closing message beside the sign-in it is for. Preparing the
+# directory ends before that message, so it prints the password nowhere.
 count="$(printf '%s\n' "$OUT" | grep -Fc "$env_pw" || true)"
-if [ "$count" = 1 ]; then ok "announces the password exactly once"; else bad "password printed $count times (want 1)"; fi
+if [ "$count" = 0 ]; then ok "preparing the directory does not print the password"; else bad "password printed $count times while preparing (want 0)"; fi
 # two fresh runs get different passwords -- a randomness proxy that a fixed or predictable value fails
 run_prepare Darwin arm64 glibc; pw_a="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$DEMO/.env" 2>/dev/null || true)"
 run_prepare Darwin arm64 glibc; pw_b="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$DEMO/.env" 2>/dev/null || true)"
@@ -441,6 +443,15 @@ if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.cli-argv" ] && ! grep -Fq "$RUN_PW" "$RUN/
   ok "the admin password reaches the CLI over stdin, never as a command argument"
 else
   bad "password handling (rc=$RUN_RC, argv=$(grep -Fq "$RUN_PW" "$RUN/.cli-argv" 2>/dev/null && echo LEAK || echo ok), stdin=$(grep -Fq "$RUN_PW" "$RUN/.cli-stdin" 2>/dev/null && echo ok || echo MISSING)): $RUN_OUT"
+fi
+# The closing message names the account and its password once, beside the sign-in, so neither the
+# browser nor the CLI sends the reader off to open .env first.
+pw_lines="$(printf '%s\n' "$RUN_OUT" | grep -Fc "$RUN_PW" || true)"
+if [ "$pw_lines" = 1 ] && printf '%s' "$RUN_OUT" | grep -Fq "Sign in as  admin  with the password  $RUN_PW" \
+   && printf '%s' "$RUN_OUT" | grep -q 'login admin$'; then
+  ok "the closing message gives the user name and password once, for the browser and the CLI"
+else
+  bad "sign-in details missing or repeated ($pw_lines lines): $(printf '%s' "$RUN_OUT" | grep -n 'Sign in\|login')"
 fi
 # Failure branches print the driven command stream to say what went wrong -- and that stream contains
 # the admin password by design (the assertion above requires it there). Print it redacted, always.
@@ -801,7 +812,7 @@ agent_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'With an AI agent' | cut -d: -f1)
 cli_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'From the CLI' | cut -d: -f1)"
 if [ -n "$browser_at" ] && [ -n "$agent_at" ] && [ -n "$cli_at" ] \
    && [ "$browser_at" -lt "$agent_at" ] && [ "$agent_at" -lt "$cli_at" ] \
-   && printf '%s' "$RUN_OUT" | grep -q 'Open http://127.0.0.1:8080 and sign in as admin'; then
+   && printf '%s' "$RUN_OUT" | grep -q 'Open http://127.0.0.1:8080 and sign in\.'; then
   ok "the closing message offers the browser, then an agent, then the CLI"
 else
   bad "the three ways in are missing or out of order (browser $browser_at, agent $agent_at, cli $cli_at): $RUN_OUT"
