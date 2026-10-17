@@ -21,6 +21,8 @@ import org.testcontainers.utility.DockerImageName;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Base64;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -210,6 +212,141 @@ class MongoConfigurationArtifactStoreIT {
             assertThat(store.saveAll(List.of(), Map.of("absent", "hash"))).isEmpty();
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(database).countDocuments()).isZero();
         });
+    }
+
+    @Test
+    void theConfigurationDomainReopensWithTheSameKeyAndNoCacheResources() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            Document key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            Resource original = source("input", "durable-secret");
+            try (var domain = MongoConfigurationDomain.open(settings(uri), "cluster-a")) {
+                domain.artifacts().save(original);
+            }
+            try (var replacement = MongoConfigurationDomain.open(settings(uri), "cluster-a")) {
+                assertThat(replacement.artifacts().get("input")).contains(original);
+                assertThat(replacement.artifacts().create(source("next", "next-secret")))
+                        .isEqualTo(ArtifactMutation.CREATED);
+            }
+            Document reopened = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            assertThat(reopened.get("keyId")).isEqualTo(key.get("keyId"));
+            assertThat(reopened.get("material")).isEqualTo(key.get("material"));
+            assertThat(reopened.getLong("sourceWriteFence")).isEqualTo(2);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .containsExactlyInAnyOrder("configuration_version", "cluster_identity", "schema_migrations",
+                            "cluster_keys", "sources");
+        });
+    }
+
+    @Test
+    void missingKeysAreNeverRegeneratedByOpenOrAnExistingWriter() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            try (var domain = MongoConfigurationDomain.open(settings(uri), "cluster-a")) {
+                domain.artifacts().save(source("original", "secret"));
+                SystemCollections.CLUSTER_KEYS.on(database).deleteMany(new Document());
+                assertThatThrownBy(() -> domain.artifacts().save(source("forbidden", "secret")))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+                assertThat(revision(database)).isEqualTo(1);
+            }
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.SOURCES.on(database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aDifferentValidKeyDoesNotBecomeAnImplicitRotation() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            try (var domain = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a")) {
+                byte[] replacement = new byte[32];
+                java.util.Arrays.fill(replacement, (byte) 7);
+                SystemCollections.CLUSTER_KEYS.on(database).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("keyId", SourceConfigCipher.fingerprint(replacement))
+                                .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(replacement))));
+                assertThatThrownBy(() -> domain.artifacts().create(source("forbidden", "secret")))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+                assertThat(revision(database)).isZero();
+                assertThat(SystemCollections.SOURCES.on(database).countDocuments()).isZero();
+            }
+        });
+    }
+
+    @Test
+    void legacyUnknownAndNewerLayoutsAreRefusedWithoutRunningOldMigrations() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database);
+            identity.updateOne(new Document("_id", "cluster"), new Document("$unset", new Document("layoutId", "")));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(identity.find().first()).doesNotContainKey("layoutId");
+            identity.updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("layoutId", MongoConfigurationDomain.LAYOUT)));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "wrong-cluster"))
+                    .isInstanceOf(TapstateException.class);
+            SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(new Document("_id", "config"),
+                    new Document("$set", new Document("installedVersion", 2)));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(MigrationError.DATA_NEWER_THAN_BINARY));
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .doesNotContain("system_meta", "workload_claims", "operator_state", "srs_meta");
+        });
+    }
+
+    @Test
+    void malformedKeyAndEncryptedSourceFailBeforeTheDomainIsExposed() {
+        withStore((store, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            var keys = SystemCollections.CLUSTER_KEYS.on(database);
+            keys.updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("material", "not-base64!")));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+            keys.updateOne(new Document("_id", "cluster"), new Document("$set", new Document("material",
+                    Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]))));
+            store.save(source("damaged", "secret"));
+            SystemCollections.SOURCES.on(database).updateOne(new Document("_id", "damaged"),
+                    new Document("$set", new Document("body.config", "bad-envelope")));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(keys.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    private static void installConfigFacts(MongoDatabase database) {
+        SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).insertOne(new Document("_id", "cluster")
+                .append("clusterId", "cluster-a").append("layoutId", MongoConfigurationDomain.LAYOUT)
+                .append("bindingVersion", 0L));
+        SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "config")
+                .append("installedVersion", 1));
+        byte[] key = new byte[32];
+        SystemCollections.CLUSTER_KEYS.on(database).insertOne(new Document("_id", "cluster")
+                .append("clusterId", "cluster-a").append("formatVersion", 1)
+                .append("keyId", SourceConfigCipher.fingerprint(key))
+                .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
+    }
+
+    private static String configurationUri(MongoDatabase database) {
+        return MONGO.getReplicaSetUrl(database.getName());
+    }
+
+    private static MongoConnectionSettings settings(String uri) {
+        return new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
     }
 
     private static long revision(MongoDatabase database) {

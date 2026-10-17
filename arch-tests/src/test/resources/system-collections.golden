@@ -29,3 +29,6 @@ nest_dead_letters | nest | MongoNestDeadLetterStore | nest-excluded | 0 | -
 sources | config | MongoConfigurationArtifactStore | migrated | 1 | -
 pipelines | config | MongoConfigurationArtifactStore | migrated | 1 | -
 configuration_version | config | MongoConfigurationArtifactStore | migrated | 1 | -
+cluster_identity | config | MongoConfigurationDomain | migrated | 1 | -
+schema_migrations | config | MongoConfigurationDomain | migrated | 1 | -
+cluster_keys | config | MongoConfigurationDomain | migrated | 1 | -

@@ -167,7 +167,10 @@ public enum SystemCollections {
     SOURCES("sources", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
     PIPELINES("pipelines", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
     CONFIGURATION_VERSION("configuration_version", Database.CONFIG, MongoConfigurationArtifactStore.class,
-            Strategy.MIGRATED, 1);
+            Strategy.MIGRATED, 1),
+    CONFIG_CLUSTER_IDENTITY("cluster_identity", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1),
+    SCHEMA_MIGRATIONS("schema_migrations", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1),
+    CLUSTER_KEYS("cluster_keys", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

@@ -12,6 +12,10 @@ final class SourceConfigWriteScope {
         this.session = Objects.requireNonNull(session, "session");
     }
 
+    ClientSession session() {
+        return session;
+    }
+
     boolean fence(SourceConfigKeyringStore store, String keyId) {
         return store.fenceActiveWriter(session, keyId);
     }

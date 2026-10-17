@@ -204,6 +204,20 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return readSnapshot(session -> read(session, collection(kind), kind).stream().map(codec::browse).toList());
     }
 
+    /** Verifies encrypted Source bodies at open without retaining the entire inventory in memory. */
+    void verifySourceEnvelopes() {
+        readSnapshot(session -> {
+            try (MongoCursor<Document> cursor = sources.find(session).iterator()) {
+                while (cursor.hasNext()) {
+                    Document source = cursor.next();
+                    requireKind(source, "source");
+                    codec.decode(source);
+                }
+            }
+            return null;
+        });
+    }
+
     private <T> T readSnapshot(java.util.function.Function<ClientSession, T> body) {
         return StoreIo.call(() -> {
             try (ClientSession session = client.startSession()) {
