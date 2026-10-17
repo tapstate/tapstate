@@ -3,6 +3,8 @@ package io.tapstate.adapters.mongostore;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SessionStore;
+import io.tapstate.spi.store.CloudSessionStore;
 import io.tapstate.spi.store.StorageBinding;
 import org.bson.Document;
 
@@ -67,17 +69,27 @@ public final class MongoCacheDomain implements AutoCloseable {
         return loadAuthScope(next);
     }
 
+    /** An OP session view captures this exact scope and shares the cache client's lifecycle. */
+    public SessionStore sessions(CacheAuthScope scope) {
+        if (scope.mode() != StorageBinding.Mode.OP) throw MongoCacheIdentity.fenced();
+        loadAuthScope(scope);
+        return new MongoCacheSessionStore(facts(scope), connection.database(), () -> verifyAuthPresence(scope.mode()));
+    }
+
+    /** A managed-session view does not adopt a later authentication generation. */
+    public CloudSessionStore cloudSessions(CacheAuthScope scope) {
+        if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
+        loadAuthScope(scope);
+        return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> verifyAuthPresence(scope.mode()));
+    }
+
     private MongoCacheIdentity facts(CacheAuthScope scope) {
         return new MongoCacheIdentity(connection.client(), connection.database(), Objects.requireNonNull(scope, "scope"));
     }
 
     private void verifyAuthCollections(StorageBinding.Mode mode) {
+        verifyAuthPresence(mode);
         StoreIo.run(() -> {
-            var tables = new ArrayList<>(authTables(mode));
-            tables.add(SystemCollections.CACHE_IDENTITY); tables.add(SystemCollections.CACHE_SCHEMA_MIGRATIONS);
-            Set<String> required = tables.stream().map(SystemCollections::collectionName).collect(java.util.stream.Collectors.toSet());
-            var actual = connection.database().listCollections().filter(new Document("name", new Document("$in", new ArrayList<>(required)))).into(new ArrayList<>());
-            if (actual.size() != required.size() || actual.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadableIndex();
             for (var table : authTables(mode)) {
                 var existing = table.on(connection.database()).listIndexes().into(new ArrayList<>());
                 if (existing.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadableIndex();
@@ -89,6 +101,16 @@ public final class MongoCacheDomain implements AutoCloseable {
                             || found.containsKey("partialFilterExpression")) throw unreadableIndex();
                 }
             }
+        });
+    }
+
+    private void verifyAuthPresence(StorageBinding.Mode mode) {
+        StoreIo.run(() -> {
+            var tables = new ArrayList<>(authTables(mode));
+            tables.add(SystemCollections.CACHE_IDENTITY); tables.add(SystemCollections.CACHE_SCHEMA_MIGRATIONS);
+            Set<String> required = tables.stream().map(SystemCollections::collectionName).collect(java.util.stream.Collectors.toSet());
+            var actual = connection.database().listCollections().filter(new Document("name", new Document("$in", new ArrayList<>(required)))).into(new ArrayList<>());
+            if (actual.size() != required.size() || actual.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadableIndex();
         });
     }
 
