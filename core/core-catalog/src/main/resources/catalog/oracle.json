@@ -63,7 +63,7 @@
     },
     {
       "name": "port",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Port"
       },
@@ -205,7 +205,7 @@
     },
     {
       "name": "rawLogServerPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "grpc server port"
       },
@@ -503,7 +503,7 @@
     },
     {
       "name": "socketReadTimeOut",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Socket ReadTimeOut (minutes)"
       },
