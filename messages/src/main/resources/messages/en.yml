@@ -552,6 +552,9 @@ io.store-unauthorized:
 io.workload-claim-fenced:
   message: "The store rejected a write from an expired or superseded workload owner."
   solution: "Let the current cluster owner continue the workload; do not retry from the fenced generation."
+io.document-invalid:
+  message: "The document '{id}' cannot be stored without changing the value in '{field}'."
+  solution: "Use values supported by the storage format and submit the document again."
 io.document-unreadable:
   message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."

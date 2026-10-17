@@ -45,6 +45,9 @@ public enum IoError implements TapstateErrorCode {
      */
     DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id", "field")),
 
+    /** An input value cannot be represented by the store without changing its value. */
+    DOCUMENT_INVALID("io.document-invalid", Set.of("id", "field")),
+
     /**
      * Re-discovery replaced a connection's schema during every permitted read attempt. The store
      * remains available, but the caller must retry after publication settles to read a coherent model.

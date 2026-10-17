@@ -7,6 +7,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.PipelineStateMappings;
 import io.tapstate.spi.store.RequiredNoteStore;
@@ -29,6 +30,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     static final int SCHEMA_VERSION = 1;
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
+    private final MongoConfigurationCatalogStore catalog;
     private final PipelineLayoutStore layouts;
     private final PipelineStateMappings pipelineStates;
     private final RequiredNoteStore requiredNotes;
@@ -62,7 +64,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         PersistentKey key = new PersistentKey(database, clusterId);
         this.artifacts = new MongoConfigurationArtifactStore(connection.client(), database, key);
         this.requiredNotes = new MongoRequiredNoteStore(connection.client(), database, key);
+        this.catalog = new MongoConfigurationCatalogStore(connection.client(), database, key);
         artifacts.verifySourceEnvelopes();
+        catalog.verifyEnvelopes();
         this.pipelineStates = new MongoPipelineStateMappings(connection.client(), database);
         this.bindings = new MongoStorageBindingStore(connection.client(), database, key);
         bindings.load();
@@ -87,6 +91,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public ArtifactStore artifacts() {
         return artifacts;
+    }
+
+    public CatalogStore catalog() {
+        return catalog;
     }
 
     public PipelineLayoutStore layouts() {
