@@ -6,6 +6,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteCarry;
 import io.tapstate.spi.store.RequiredNoteScope;
 import io.tapstate.spi.store.RequiredNoteStore;
 import io.tapstate.testsupport.RequiresDocker;
@@ -426,6 +427,291 @@ class MongoRequiredNoteStoreIT {
                 assertThat(SystemCollections.PDK_NOTES.on(f.database).find().first()).isEqualTo(retained);
             });
         }
+    }
+
+    @Test
+    void aPreparedSharedCarryCanReadWhileThePrivatePipelineRebuildsOrRetires() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            f.notes.compareAndSet(source, "late-key", 0, bytes("original"), false);
+            var shared = f.notes.initialize(chain("c1"));
+            var carry = new RequiredNoteCarry(shared, source);
+            assertThatThrownBy(() -> f.notes.readCarried(carry, "late-key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(f.notes.prepareCarry(carry)).isEqualTo(carry);
+            assertThat(f.notes.prepareCarry(carry)).isEqualTo(carry);
+            assertThat(SystemCollections.PDK_NOTE_CARRIES.on(f.database).countDocuments()).isEqualTo(1);
+            assertThat(f.notes.carries(shared)).containsExactly(carry);
+            f.pipelineGeneration("p1", 2);
+            assertThatThrownBy(() -> f.notes.read(source, "late-key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(f.notes.readCarried(carry, "late-key").bytes()).containsExactly(bytes("original"));
+            SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id", "p1"),
+                    new Document("$set", new Document("phase", "RETIRING").append("operationId", "delete-a")));
+            assertThatThrownBy(() -> f.notes.read(source, "late-key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> f.notes.compareAndSet(source, "late-key", 1, bytes("stale"), false))
+                    .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(f.notes.readCarried(carry, "late-key").bytes()).containsExactly(bytes("original"));
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aDependencyProtectsPrivateOverwriteRemovalClearAndRetainsBothCounts() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            f.notes.compareAndSet(source, "slot", 0, bytes("retained"), false);
+            var shared = f.notes.initialize(chain("c1"));
+            f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+            assertThatThrownBy(() -> f.notes.compareAndSet(source, "slot", 1, bytes("overwritten"), false))
+                    .satisfies(MongoRequiredNoteStoreIT::referenced);
+            assertThatThrownBy(() -> f.notes.compareAndSet(source, "slot", 1, null, false))
+                    .satisfies(MongoRequiredNoteStoreIT::referenced);
+            assertThatThrownBy(() -> f.notes.clear(source, false)).satisfies(MongoRequiredNoteStoreIT::referenced);
+            assertThat(f.notes.read(source, "slot").bytes()).containsExactly(bytes("retained"));
+            assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 1L);
+            assertThat(scopeMetadata(f, shared)).containsEntry("outgoingCarries", 1L);
+        });
+    }
+
+    @Test
+    void sharedClearKeepsDependencyUntilActualSharedRetirementAndOldTokensCannotRetireAgain() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            f.notes.compareAndSet(source, "slot", 0, bytes("retained"), false);
+            var shared = f.notes.initialize(chain("c1"));
+            var carry = f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+            var cleared = f.notes.clear(shared, true);
+            assertThat(f.notes.allCarryBlocked(cleared)).isTrue();
+            assertThat(f.notes.carries(cleared)).isEmpty();
+            assertThat(SystemCollections.PDK_NOTE_CARRIES.on(f.database).countDocuments()).isEqualTo(1);
+            assertThatThrownBy(() -> f.notes.readCarried(carry, "slot")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> f.notes.clear(source, false)).satisfies(MongoRequiredNoteStoreIT::referenced);
+            var retired = f.notes.retireShared(cleared);
+            assertThat(retired.generation()).isEqualTo(3);
+            assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 0L);
+            assertThat(scopeMetadata(f, retired)).containsEntry("outgoingCarries", 0L);
+            assertThat(SystemCollections.PDK_NOTE_CARRIES.on(f.database).countDocuments()).isZero();
+            f.notes.compareAndSet(retired, "new", 0, bytes("new-generation"), false);
+            assertThatThrownBy(() -> f.notes.retireShared(cleared)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(f.notes.read(retired, "new").bytes()).containsExactly(bytes("new-generation"));
+            var privateCleared = f.notes.clear(source, false);
+            assertThat(f.notes.reclaimBefore(privateCleared)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void retiringOneSharedCaptureDoesNotReleaseAnotherCapturesPrivateDependency() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            var one = f.notes.initialize(chain("one"));
+            var two = f.notes.initialize(chain("two"));
+            f.notes.prepareCarry(new RequiredNoteCarry(one, source));
+            f.notes.prepareCarry(new RequiredNoteCarry(two, source));
+            assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 2L);
+            f.notes.retireShared(one);
+            assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 1L);
+            assertThatThrownBy(() -> f.notes.clear(source, false)).satisfies(MongoRequiredNoteStoreIT::referenced);
+            assertThat(f.notes.carries(two)).hasSize(1);
+            f.notes.retireShared(two);
+            assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 0L);
+            assertThat(f.notes.clear(source, false).generation()).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void privateCarryReadsHonorTheSharedPerKeyRemovalBarrier() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            f.notes.compareAndSet(source, "slot", 0, bytes("old-slot"), false);
+            var shared = f.notes.initialize(chain("c1"));
+            var carry = f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+            f.notes.compareAndSet(shared, "slot", 0, null, true);
+            assertThat(f.notes.readCarried(carry, "slot").bytes()).isNull();
+            assertThat(f.notes.read(source, "slot").bytes()).containsExactly(bytes("old-slot"));
+        });
+    }
+
+    @Test
+    void missingDependencyRowsNeverBecomePermissionToClearOrRepair() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            f.notes.compareAndSet(source, "slot", 0, bytes("retained"), false);
+            var shared = f.notes.initialize(chain("c1"));
+            var carry = f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+            SystemCollections.PDK_NOTE_CARRIES.on(f.database).deleteMany(new Document());
+            assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThatThrownBy(() -> f.notes.prepareCarry(carry)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThatThrownBy(() -> f.notes.compareAndSet(source, "slot", 1, null, false)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThatThrownBy(() -> f.notes.clear(source, false)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThat(f.notes.read(source, "slot").bytes()).containsExactly(bytes("retained"));
+            assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 1L);
+            assertThat(scopeMetadata(f, shared)).containsEntry("outgoingCarries", 1L);
+        });
+    }
+
+    @Test
+    void malformedDependencyCountsAndRecordsRefuseWithoutRepair() {
+        for (String damage : List.of("count", "source-generation")) {
+            withNotes(f -> {
+                f.pipelineGeneration("p1", 1);
+                var source = f.notes.initialize(pipeline("p1", 1));
+                var shared = f.notes.initialize(chain("c1"));
+                f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+                if (damage.equals("count")) SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(
+                        new Document("_id", new Document("bindingVersion", 1L).append("namespace", shared.owner().namespace())),
+                        new Document("$set", new Document("outgoingCarries", 1)));
+                else SystemCollections.PDK_NOTE_CARRIES.on(f.database).updateOne(new Document(),
+                        new Document("$set", new Document("sourceStateGeneration", 1)));
+                Document damaged = SystemCollections.PDK_NOTE_CARRIES.on(f.database).find().first();
+                assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+                assertThatThrownBy(() -> f.notes.retireShared(shared)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+                assertThat(SystemCollections.PDK_NOTE_CARRIES.on(f.database).find().first()).isEqualTo(damaged);
+                assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 1L);
+            });
+        }
+    }
+
+    @Test
+    void aGuardFailureRollsBackBothReferenceCountsAndTheRelationship() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            var shared = f.notes.initialize(chain("c1"));
+            AtomicInteger checks = new AtomicInteger();
+            var guarded = f.notes.guardedBy(() -> { if (checks.incrementAndGet() == 3) throw scopeFailure(); });
+            assertThatThrownBy(() -> guarded.prepareCarry(new RequiredNoteCarry(shared, source)))
+                    .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(checks.get()).isEqualTo(3);
+            assertThat(f.notes.carries(shared)).isEmpty();
+            assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 0L);
+            assertThat(scopeMetadata(f, shared)).containsEntry("outgoingCarries", 0L);
+        });
+    }
+
+    @Test
+    void aSharedGuardClosureRefusesCarryReadsWithoutChangingThePrivateOwner() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            var shared = f.notes.initialize(chain("c1"));
+            var carry = f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+            var closed = f.notes.guardedBy(() -> { throw scopeFailure(); });
+            assertThatThrownBy(() -> closed.readCarried(carry, "key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(f.notes.carries(shared)).containsExactly(carry);
+        });
+    }
+
+    @Test
+    void twoClientsPreparingOneDependencyDoNotDuplicateEitherCount() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            var shared = f.notes.initialize(chain("c1"));
+            var carry = new RequiredNoteCarry(shared, source);
+            try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl());
+                    var executor = Executors.newFixedThreadPool(2)) {
+                var other = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                CountDownLatch ready = new CountDownLatch(2);
+                CountDownLatch start = new CountDownLatch(1);
+                var one = executor.submit(() -> { ready.countDown(); if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start"); return f.notes.prepareCarry(carry); });
+                var two = executor.submit(() -> { ready.countDown(); if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start"); return other.prepareCarry(carry); });
+                assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue(); start.countDown();
+                assertThat(one.get(20, TimeUnit.SECONDS)).isEqualTo(carry);
+                assertThat(two.get(20, TimeUnit.SECONDS)).isEqualTo(carry);
+                assertThat(scopeMetadata(f, source)).containsEntry("incomingCarries", 1L);
+                assertThat(scopeMetadata(f, shared)).containsEntry("outgoingCarries", 1L);
+            }
+        });
+    }
+
+    @Test
+    void dependencyPreparationAndPrivateClearCannotBothWinTheirOriginalTokens() {
+        withNotes(f -> {
+            try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl()); var executor = Executors.newFixedThreadPool(2)) {
+                var other = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                for (int round = 0; round < 6; round++) {
+                    String pipeline = "p" + round;
+                    f.pipelineGeneration(pipeline, 1);
+                    var source = f.notes.initialize(pipeline(pipeline, 1));
+                    var shared = f.notes.initialize(chain("c" + round));
+                    var carry = new RequiredNoteCarry(shared, source);
+                    CountDownLatch ready = new CountDownLatch(2);
+                    CountDownLatch start = new CountDownLatch(1);
+                    var add = executor.submit(() -> { ready.countDown(); if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start"); try { f.notes.prepareCarry(carry); return true; } catch (TapstateException refused) { scopeUnavailable(refused); return false; } });
+                    var clear = executor.submit(() -> { ready.countDown(); if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start"); try { other.clear(source, false); return true; } catch (TapstateException refused) { referenced(refused); return false; } });
+                    assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue(); start.countDown();
+                    assertThat(List.of(add.get(20, TimeUnit.SECONDS), clear.get(20, TimeUnit.SECONDS)))
+                            .containsExactlyInAnyOrder(true, false);
+                }
+            }
+        });
+    }
+
+    @Test
+    void missingCarryIndexesRefuseReadOnlyOpenAndDoNotRecreateThem() {
+        withNotes(f -> {
+            var shared = f.notes.initialize(chain("c1"));
+            SystemCollections.PDK_NOTE_CARRIES.on(f.database).dropIndex("pdk_note_carry_target");
+            assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThat(IndexEnsure.existing(SystemCollections.PDK_NOTE_CARRIES.on(f.database),
+                    SystemCollections.PDK_NOTE_CARRIES.indexes().getFirst())).isNull();
+        });
+    }
+
+    @Test
+    void loadingCarryDependenciesValidatesThePrivateScopeBeforeAPluginCanOpen() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            var shared = f.notes.initialize(chain("c1"));
+            f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+            SystemCollections.PDK_NOTE_SCOPES.on(f.database).deleteOne(new Document("_id",
+                    new Document("bindingVersion", 1L).append("namespace", source.owner().namespace())));
+            assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(SystemCollections.PDK_NOTE_CARRIES.on(f.database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void loadingCarryDependenciesRefusesMissingOrMalformedPrivateScopeFencesWithoutRepair() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var source = f.notes.initialize(pipeline("p1", 1));
+            var shared = f.notes.initialize(chain("c1"));
+            var carry = f.notes.prepareCarry(new RequiredNoteCarry(shared, source));
+            var scopes = SystemCollections.PDK_NOTE_SCOPES.on(f.database);
+            Document filter = new Document("_id", scopeMetadata(f, source).get("_id"));
+            for (Object invalid : new Object[]{null, "0", 0, -1L, Long.MAX_VALUE}) {
+                scopes.updateOne(filter, invalid == null
+                        ? new Document("$unset", new Document("writeFence", ""))
+                        : new Document("$set", new Document("writeFence", invalid)));
+                assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+                assertThatThrownBy(() -> f.notes.readCarried(carry, "key")).satisfies(MongoRequiredNoteStoreIT::unreadable);
+                assertThatThrownBy(() -> f.notes.open(source.owner())).satisfies(MongoRequiredNoteStoreIT::unreadable);
+                assertThat(scopeMetadata(f, source).get("writeFence")).isEqualTo(invalid);
+                assertThat(SystemCollections.PDK_NOTE_CARRIES.on(f.database).countDocuments()).isEqualTo(1);
+            }
+            scopes.updateOne(filter, new Document("$set", new Document("writeFence", 0L)));
+            assertThat(f.notes.carries(shared)).containsExactly(carry);
+        });
+    }
+
+    private static Document scopeMetadata(Fixture f, RequiredNoteScope scope) {
+        return SystemCollections.PDK_NOTE_SCOPES.on(f.database).find(new Document("_id",
+                new Document("bindingVersion", scope.owner().bindingVersion()).append("namespace", scope.owner().namespace()))).first();
+    }
+
+    private static void referenced(Throwable failure) {
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.NOTE_REFERENCED));
+    }
+
+    private static void unreadable(Throwable failure) {
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
     private static TapstateException scopeFailure() {

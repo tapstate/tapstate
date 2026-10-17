@@ -158,7 +158,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 // Binding owns this Cluster-wide scope; pipeline teardown never initializes or clears it.
                 noteScopes.insertOne(session, new Document("_id", new Document("bindingVersion", 1L)
                         .append("namespace", "pdk.global-state")).append("ownerKind", "GLOBAL")
-                        .append("ownerId", expected.clusterId()).append("generation", 1L).append("writeFence", 0L));
+                        .append("ownerId", expected.clusterId()).append("generation", 1L).append("writeFence", 0L)
+                        .append("outgoingCarries", 0L).append("incomingCarries", 0L));
                 return binding;
             });
         });
@@ -209,7 +210,9 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     .append("namespace", "pdk.global-state"))).first();
             if (global == null || !"GLOBAL".equals(global.get("ownerKind")) || !clusterId.equals(global.get("ownerId"))
                     || !(global.get("generation") instanceof Long generation) || generation < 1
-                    || !(global.get("writeFence") instanceof Long writeFence) || writeFence < 0 || writeFence == Long.MAX_VALUE) throw unreadable();
+                    || !(global.get("writeFence") instanceof Long writeFence) || writeFence < 0 || writeFence == Long.MAX_VALUE
+                    || !Long.valueOf(0).equals(global.get("outgoingCarries"))
+                    || !Long.valueOf(0).equals(global.get("incomingCarries"))) throw unreadable();
             return Optional.of(new Loaded(new StorageBinding(scope, mode, version, defaultId, cache), candidateHash));
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
             // Stored or decrypted values may contain credentials. Never attach parser input or causes.

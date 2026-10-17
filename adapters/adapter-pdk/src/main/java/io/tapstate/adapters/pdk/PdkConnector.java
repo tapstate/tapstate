@@ -15,6 +15,7 @@ import io.tapdata.pdk.apis.TapConnector;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.RequiredNoteCarry;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectorCapabilities;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
@@ -150,7 +151,16 @@ final class PdkConnector implements AutoCloseable {
                 }
             });
             var primary = captured.open(stateNamespace);
-            var earlier = carriedFrom.stream().map(captured::open).toList();
+            List<RequiredNoteCarry> prepared = notes == null ? List.of() : captured.store().carries(primary);
+            boolean blocked = notes != null && captured.store().allCarryBlocked(primary);
+            if (prepared.stream().anyMatch(carry -> !carry.shared().equals(primary))
+                    || prepared.stream().map(carry -> carry.source().owner().namespace()).distinct().count() != prepared.size()
+                    || (!blocked && carriedFrom.stream().anyMatch(namespace -> prepared.stream()
+                            .noneMatch(carry -> carry.source().owner().namespace().equals(namespace))))) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            }
+            var earlier = blocked ? List.<io.tapstate.spi.store.RequiredNoteScope>of()
+                    : prepared.stream().map(RequiredNoteCarry::source).toList();
             var global = captured.open(ConnectorStateNamespace.GLOBAL);
             configuredState = new ScopedDurableStateMap(captured.store(), primary, earlier, notes != null, captured::requireActive);
             configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);

@@ -5,6 +5,8 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteCarry;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.store.RequiredNoteScope;
 import io.tapstate.spi.store.RequiredNoteStore;
 import io.tapstate.spi.store.RequiredNoteValue;
@@ -106,8 +108,12 @@ class ScopedDurableStateMapTest {
         var another = pipeline("p2", "source");
         RequiredNoteStore store = scripted((method, args) -> switch (method) {
             case "carryBlocked" -> false;
-            case "read" -> args[0].equals(PRIMARY) ? new RequiredNoteValue(0, null)
-                    : value(1, args[0].equals(EARLIER) ? "left" : "right");
+            case "read" -> { assertThat(args[0]).isEqualTo(PRIMARY); yield new RequiredNoteValue(0, null); }
+            case "readCarried" -> {
+                var carry = (RequiredNoteCarry) args[0];
+                assertThat(carry.shared()).isEqualTo(PRIMARY);
+                yield value(1, carry.source().equals(EARLIER) ? "left" : "right");
+            }
             default -> throw unexpected(method);
         });
         assertThatThrownBy(() -> map(store, PRIMARY, List.of(EARLIER, another), true).get("key"))
@@ -200,8 +206,8 @@ class ScopedDurableStateMapTest {
     void unreadableEarlierNotesRefuseBeforePublishingCarry() {
         AtomicInteger writes = new AtomicInteger();
         RequiredNoteStore store = scripted((method, args) -> switch (method) {
-            case "read" -> args[0].equals(PRIMARY) ? new RequiredNoteValue(0, null)
-                    : new RequiredNoteValue(1, new byte[]{0});
+            case "read" -> { assertThat(args[0]).isEqualTo(PRIMARY); yield new RequiredNoteValue(0, null); }
+            case "readCarried" -> new RequiredNoteValue(1, new byte[]{0});
             case "carryBlocked" -> false;
             case "compareAndSet" -> { writes.incrementAndGet(); yield true; }
             default -> throw unexpected(method);
@@ -272,6 +278,89 @@ class ScopedDurableStateMapTest {
         assertThatThrownBy(() -> globalNotes.get("key")).isInstanceOf(TapstateException.class);
         assertThat(reads.get()).isEqualTo(beforeClosedReads);
         assertThat(opened).hasSize(2);
+    }
+
+    @Test
+    void aSharedContextLoadsRetainedDependenciesThatTheCurrentConsumerListNoLongerNames(@TempDir Path dir) {
+        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null);
+        var currentConsumer = pipeline("p2", "source");
+        var global = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0), 1);
+        List<String> opened = new ArrayList<>();
+        AtomicInteger privateReads = new AtomicInteger();
+        var store = scripted((method, args) -> switch (method) {
+            case "carries" -> List.of(new RequiredNoteCarry(PRIMARY, EARLIER), new RequiredNoteCarry(PRIMARY, currentConsumer));
+            case "allCarryBlocked", "carryBlocked" -> false;
+            case "read" -> { assertThat(args[0]).isEqualTo(PRIMARY); yield new RequiredNoteValue(0, null); }
+            case "readCarried" -> {
+                var carry = (RequiredNoteCarry) args[0];
+                assertThat(carry.shared()).isEqualTo(PRIMARY);
+                privateReads.incrementAndGet();
+                yield carry.source().equals(EARLIER) ? value(1, "retained-a") : new RequiredNoteValue(0, null);
+            }
+            case "compareAndSet" -> { assertThat(args[0]).isEqualTo(PRIMARY); assertThat(args[2]).isEqualTo(0L); yield true; }
+            default -> throw unexpected(method);
+        });
+        var scopes = ConnectorNoteScopes.of(store, namespace -> {
+            opened.add(namespace);
+            if (namespace.equals(PRIMARY.owner().namespace())) return PRIMARY;
+            if (namespace.equals("pdk.global-state")) return global;
+            throw new AssertionError("ordinary private open bypassed the retained carry grant");
+        }, () -> {});
+        try (var connector = PdkConnector.open("demo", reference, Map.of(), new PipelineNode("p2", "source"), null,
+                new SharedNotes("capture", List.of(new PipelineNode("p2", "source"))), scopes)) {
+            assertThat(connector.context().getStateMap().get("slot")).isEqualTo("retained-a");
+            assertThat(privateReads.get()).isEqualTo(2);
+        }
+        assertThat(opened).containsExactly(PRIMARY.owner().namespace(), "pdk.global-state");
+    }
+
+    @Test
+    void missingPreparedDependenciesRefuseBeforeAnyPluginClassCanLoad(@TempDir Path dir) {
+        var reference = new ConnectorRef(List.of(dir.resolve("absent.jar")), "absent.Plugin", "2.0.8", null);
+        var store = scripted((method, args) -> switch (method) {
+            case "carries" -> List.of();
+            case "allCarryBlocked" -> false;
+            default -> throw unexpected(method);
+        });
+        var scopes = ConnectorNoteScopes.of(store, namespace -> PRIMARY, () -> {});
+        assertThatThrownBy(() -> PdkConnector.open("demo", reference, Map.of(), new PipelineNode("p1", "source"), null,
+                new SharedNotes("capture", List.of(new PipelineNode("p1", "source"))), scopes))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+    }
+
+    @Test
+    void aSharedClearBarrierDoesNotReintroduceTheCurrentConsumerAsAnEarlierSource(@TempDir Path dir) {
+        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null);
+        var global = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0), 1);
+        var store = scripted((method, args) -> switch (method) {
+            case "carries" -> List.of();
+            case "allCarryBlocked" -> true;
+            case "read" -> new RequiredNoteValue(0, null);
+            default -> throw unexpected(method);
+        });
+        var scopes = ConnectorNoteScopes.of(store, namespace -> namespace.equals(PRIMARY.owner().namespace()) ? PRIMARY : global, () -> {});
+        try (var connector = PdkConnector.open("demo", reference, Map.of(), new PipelineNode("p1", "source"), null,
+                new SharedNotes("capture", List.of(new PipelineNode("p1", "source"))), scopes)) {
+            assertThat(connector.context().getStateMap().get("slot")).isNull();
+        }
+    }
+
+    @Test
+    void aRefusedCarryNeverCreatesADependencyOrRetriesAgainstAnOrdinaryPrivateRead() {
+        AtomicInteger attempts = new AtomicInteger();
+        var store = scripted((method, args) -> switch (method) {
+            case "read" -> { assertThat(args[0]).isEqualTo(PRIMARY); yield new RequiredNoteValue(0, null); }
+            case "carryBlocked" -> false;
+            case "readCarried" -> {
+                assertThat(args[0]).isEqualTo(new RequiredNoteCarry(PRIMARY, EARLIER));
+                assertThat(attempts.incrementAndGet()).isEqualTo(1);
+                throw unavailable();
+            }
+            default -> throw unexpected(method);
+        });
+        assertThatThrownBy(() -> map(store, PRIMARY, List.of(EARLIER), true).get("key"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+        assertThat(attempts.get()).isEqualTo(1);
     }
 
     private static ScopedDurableStateMap map(RequiredNoteStore store, RequiredNoteScope scope,

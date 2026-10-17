@@ -178,7 +178,10 @@ public enum SystemCollections {
     PDK_NOTES("pdk_notes", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
     PDK_NOTE_MIGRATIONS("pdk_note_migrations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
     OPERATOR_GENERATIONS("operator_generations", Database.CONFIG, MongoPipelineStateMappings.class, Strategy.MIGRATED, 1),
-    STORAGE_BINDING("storage_binding", Database.CONFIG, MongoStorageBindingStore.class, Strategy.MIGRATED, 1);
+    STORAGE_BINDING("storage_binding", Database.CONFIG, MongoStorageBindingStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTE_CARRIES("pdk_note_carries", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.sharedBindingVersion", "_id.sharedNamespace"), false, "pdk_note_carry_target"),
+            new IndexSpec(List.of("_id.sourceBindingVersion", "_id.sourceNamespace", "_id.sourceGeneration"), false, "pdk_note_carry_source"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

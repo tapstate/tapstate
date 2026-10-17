@@ -39,3 +39,4 @@ pdk_notes | config | MongoRequiredNoteStore | migrated | 1 | -
 pdk_note_migrations | config | MongoRequiredNoteStore | migrated | 1 | -
 operator_generations | config | MongoPipelineStateMappings | migrated | 1 | -
 storage_binding | config | MongoStorageBindingStore | migrated | 1 | -
+pdk_note_carries | config | MongoRequiredNoteStore | migrated | 1 | _id.sharedBindingVersion+_id.sharedNamespace, _id.sourceBindingVersion+_id.sourceNamespace+_id.sourceGeneration

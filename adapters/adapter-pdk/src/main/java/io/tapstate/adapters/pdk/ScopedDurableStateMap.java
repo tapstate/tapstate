@@ -4,6 +4,7 @@ import io.tapdata.entity.utils.cache.KVMap;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.RequiredNoteScope;
+import io.tapstate.spi.store.RequiredNoteCarry;
 import io.tapstate.spi.store.RequiredNoteStore;
 import io.tapstate.spi.store.RequiredNoteValue;
 
@@ -96,7 +97,7 @@ final class ScopedDurableStateMap implements KVMap<Object> {
         if (own.present() || own.revision() > 0 || carriedFrom.isEmpty() || store.carryBlocked(captured, key)) return own;
         byte[] candidate = null;
         for (RequiredNoteScope earlier : carriedFrom) {
-            RequiredNoteValue retained = store.read(earlier, key);
+            RequiredNoteValue retained = store.readCarried(new RequiredNoteCarry(captured, earlier), key);
             if (!retained.present()) continue;
             byte[] value = retained.bytes();
             if (candidate != null && !Arrays.equals(candidate, value)) {
