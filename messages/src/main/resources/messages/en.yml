@@ -1093,3 +1093,13 @@ io.cache-auth-fenced:
 io.pipeline-intent-fenced:
   message: "The lifecycle intent no longer owns its captured storage binding or Pipeline state generation."
   solution: "Load the current trusted storage and Pipeline state before starting a new lifecycle operation. Do not retarget the old operation."
+
+io.cache-business-fenced:
+  message: "The captured cache business incarnation is unavailable or no longer current."
+  solution: "Verify the original storage binding and business recovery state before starting a new operation. Do not retarget an old callback."
+io.srs-model-unavailable:
+  message: "Actual model {version} for table {table} on chain {chain} is unavailable in its captured context."
+  solution: "Stop continuation and restore the exact retained model or complete the authorized full rebuild. Do not use the latest discovery model as a substitute."
+io.srs-model-conflict:
+  message: "Model {version} for table {table} on chain {chain} already names different content."
+  solution: "Keep the original version unchanged and verify the capture context before publishing a new model version."

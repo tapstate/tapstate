@@ -78,6 +78,15 @@ public enum IoError implements TapstateErrorCode {
     /** A lifecycle intent no longer owns its captured storage binding or stable Pipeline state generation. */
     PIPELINE_INTENT_FENCED("io.pipeline-intent-fenced", Set.of()),
 
+    /** The captured business incarnation is unavailable or no longer current. */
+    CACHE_BUSINESS_FENCED("io.cache-business-fenced", Set.of()),
+
+    /** An exact actual model is absent or cannot be used for the captured stream context. */
+    SRS_MODEL_UNAVAILABLE("io.srs-model-unavailable", Set.of("chain", "table", "version")),
+
+    /** An immutable model identity already names different structural content. */
+    SRS_MODEL_CONFLICT("io.srs-model-conflict", Set.of("chain", "table", "version")),
+
     /** A connector must not reuse retained notes with another connection or artifact. */
     NOTE_ORIGIN_MISMATCH("io.note-origin-mismatch", Set.of()),
 

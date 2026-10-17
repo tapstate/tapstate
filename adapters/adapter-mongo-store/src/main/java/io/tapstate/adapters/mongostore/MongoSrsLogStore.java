@@ -335,7 +335,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 new UpdateOptions().upsert(true));
     }
 
-    private static String boundsId(String ring) {
+    static String boundsId(String ring) {
         return BOUNDS_PREFIX + ring;
     }
 
@@ -361,7 +361,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
      * The lower bound carries the smallest sequence rather than being open, so the range cannot reach
      * into the ring that sorts before this one.
      */
-    private static Document ringRange(String ring, long throughSeq) {
+    static Document ringRange(String ring, long throughSeq) {
         return new Document("_id", new Document("$gte", key(ring, Long.MIN_VALUE))
                 .append("$lte", key(ring, throughSeq)));
     }
