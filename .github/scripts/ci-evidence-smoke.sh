@@ -630,6 +630,142 @@ class PublishedExamplesIT {
     runtime_cov=['coverage','--root',str(coverage_root),'--binding',str(runtime_binding_file),'--inputs',str(runtime_input_file),'--test-inputs',str(runtime_post_file),'--output',str(root/'runtime-coverage.json')]
     run(runtime_cov);assert json.loads((root/'runtime-coverage.json').read_text())['complete']
     execfile.write_bytes(exec_data()+own_exec.replace(bytes.fromhex(spring['class_id']),b'\x00'*8));run(runtime_cov,False,'undeclared own bytecode');execfile.write_bytes(exec_data())
+    # A merged run keeps each worker's dynamic bytecode attached to its own exec.
+    worker_root=root/'worker-coverage'
+    worker_report='core/target/site/jacoco/jacoco.xml'
+    put(worker_root,worker_report,saved_xml)
+    worker_execs={'app-1':'target/ci-shards/app-1/core/target/jacoco.exec',
+                  'rest':'target/ci-shards/rest/core/target/jacoco.exec'}
+    merged_exec='target/jacoco-reactor.exec'
+    mock_exec=b'\x11'+bytes.fromhex(mock['class_id'])+utf(mock['name'])+b'\x02\x03'
+    put(worker_root,worker_execs['app-1'],exec_data()+own_exec)
+    put(worker_root,worker_execs['rest'],exec_data()+mock_exec)
+    put(worker_root,merged_exec,exec_data()+own_exec+mock_exec)
+    worker_binding=json.loads(binding.read_text())|dict(required_exec=[*worker_execs.values(),merged_exec],
+                required_workers=['app-1','rest','e2e-1'],merged_exec=[merged_exec])
+    worker_binding_file=save('worker-binding.json',worker_binding)
+    def file_ref(path):return dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    workers={}
+    worker_posts={}
+    for worker,generated_class in [('app-1',spring),('rest',mock),('e2e-1',None)]:
+        post=copy.deepcopy(runtime_post);post['runtime_generated_classes']=[copy.deepcopy(generated_class)] if generated_class else []
+        post['runtime_class_capture']['shard_id']=worker
+        for phase in ('reset','verify'):post['runtime_class_capture'][phase]['shard_id']=worker
+        peer_binding={k:worker_binding[k] for k in ['run_id','attempt','source_sha','started_ms','completed_ms']}
+        peer_binding['runtime_class_capture']={k:copy.deepcopy(post['runtime_class_capture'][k]) for k in ['shard_id','invocation_id','cohort_hash','capture_origin_sha256','reset','verify']}
+        post_path=save(worker+'-post.json',post);binding_path=save(worker+'-binding.json',peer_binding)
+        provenance={k:copy.deepcopy(post['runtime_class_capture'][k]) for k in ['source_sha','run_id','run_attempt','shard_id','invocation_id','cohort_hash','reset','verify']}
+        provenance['runtime_class_capture']={key:post['runtime_class_capture'][key]
+                for key in ['capture_origin_sha256','build_inputs_sha256']}
+        provenance['case_observer']=dict(enabled=True,build_inputs_sha256=runtime_input_hash)
+        provenance_path=save(worker+'-provenance.json',provenance)
+        member='core/target/jacoco.exec';marker='target/ci-shards/run-'+worker+'.json'
+        packet_files={marker:hashlib.sha256(provenance_path.read_bytes()).hexdigest()}
+        if worker in worker_execs:
+            packet_files[member]=hashlib.sha256((worker_root/worker_execs[worker]).read_bytes()).hexdigest()
+        packet=dict(schema=2,source_sha='a'*40,shard_id=worker,provenance=provenance,provenance_path=marker,
+                    required_exec=[member] if worker in worker_execs else [],files=packet_files)
+        packet_path=save(worker+'-result-manifest.json',packet)
+        workers[worker]=dict(inputs=file_ref(runtime_input_file),test_inputs=file_ref(post_path),
+                             binding=file_ref(binding_path),required_exec=[worker_execs[worker]] if worker in worker_execs else [],
+                             result_manifest=file_ref(packet_path),provenance=file_ref(provenance_path))
+        worker_posts[worker]=post
+    worker_manifest=dict(schema=1,type='coverage-worker-inputs',workers=workers)
+    worker_manifest_file=save('worker-inputs.json',worker_manifest)
+    worker_command=['coverage','--root',str(worker_root),'--binding',str(worker_binding_file),
+        '--inputs',str(runtime_input_file),'--worker-inputs',str(worker_manifest_file),'--output',str(root/'worker-coverage.json')]
+    # The old single-capture scope fails for the second worker for the original reason.
+    single=worker_binding|dict(runtime_class_capture=json.loads(pathlib.Path(workers['app-1']['binding']['path']).read_text())['runtime_class_capture'])
+    single.pop('required_workers');single.pop('merged_exec')
+    single_file=save('worker-single-binding.json',single)
+    run(['coverage','--root',str(worker_root),'--binding',str(single_file),'--inputs',str(runtime_input_file),
+         '--test-inputs',workers['app-1']['test_inputs']['path'],'--output',str(root/'worker-single.json')],False,'undeclared own bytecode')
+    run(worker_command)
+    worker_value=json.loads((root/'worker-coverage.json').read_text())
+    assert worker_value['complete'] and set(worker_value['worker_inputs']['workers'])=={'app-1','rest','e2e-1'}
+    assert worker_value['worker_inputs']['manifest_sha256']==file_ref(worker_manifest_file)['sha256']
+    assert worker_value['runtime_capture'] is None and not worker_value['runtime_generated_classes']
+    # A self-consistent rewritten input pair still differs from the original receipt.
+    rewritten=copy.deepcopy(runtime_pre);rewritten['source_files']={'changed.java':'0'*64}
+    rewritten_path=save('rewritten-inputs.json',rewritten)
+    rewritten_post=copy.deepcopy(worker_posts['app-1'])
+    rewritten_post['runtime_class_capture']['build_inputs_sha256']=file_ref(rewritten_path)['sha256']
+    rewritten_post_path=save('rewritten-post.json',rewritten_post)
+    rewritten_manifest=copy.deepcopy(worker_manifest)
+    rewritten_manifest['workers']['app-1'].update(inputs=file_ref(rewritten_path),test_inputs=file_ref(rewritten_post_path))
+    save('worker-inputs.json',rewritten_manifest)
+    run(worker_command,False,'prepared inputs differ from original runtime capture receipt')
+    save('worker-inputs.json',worker_manifest)
+    # Simulated replacement after verification must never feed reopened bytes into parsing.
+    read_bytes=pathlib.Path.read_bytes;input_context=evidence.coverage_input_context;load=evidence.load
+    protected=set();reopened=[];exec_reads={(worker_root/name).resolve():0 for name in [*worker_execs.values(),merged_exec]}
+    def replace_on_reopen(path):
+        path=path.resolve()
+        if path in protected:
+            reopened.append(str(path));return b'changed after verification'
+        if path in exec_reads:
+            exec_reads[path]+=1
+            if exec_reads[path]>1:return b'changed after verification'
+        return read_bytes(path)
+    def replaced_document(path):
+        if pathlib.Path(path).resolve() in protected:
+            reopened.append(str(path));raise ValueError('document changed after verification')
+        return load(path)
+    def consume_verified(args,binding,prepared=None,tested=None):
+        if prepared is not None:protected.update([pathlib.Path(args.inputs).resolve(),pathlib.Path(args.test_inputs).resolve()])
+        try:return input_context(args,binding,prepared=prepared,tested=tested)
+        finally:protected.clear()
+    argv=sys.argv
+    try:
+        pathlib.Path.read_bytes=replace_on_reopen;evidence.coverage_input_context=consume_verified;evidence.load=replaced_document
+        sys.argv=[os.environ['EVIDENCE_MODULE'],*worker_command];evidence.main()
+    finally:
+        pathlib.Path.read_bytes=read_bytes;evidence.coverage_input_context=input_context;evidence.load=load;sys.argv=argv
+    assert not reopened and set(exec_reads.values())=={1}, (reopened,exec_reads)
+    checks+=1
+    # A declared worker binding cannot fall back to legacy aggregate validation.
+    for path in [*worker_execs.values(),merged_exec]:put(worker_root,path,exec_data())
+    put(worker_root,merged_exec,exec_data()[:-1]+b'\x01')
+    missing_manifest=[value for value in worker_command]
+    position=missing_manifest.index('--worker-inputs');del missing_manifest[position:position+2]
+    run(missing_manifest,False,'worker coverage manifest required')
+    put(worker_root,worker_execs['app-1'],exec_data()+own_exec)
+    put(worker_root,worker_execs['rest'],exec_data()+mock_exec)
+    put(worker_root,merged_exec,exec_data()+own_exec+mock_exec)
+    # Another worker's observed class cannot exempt foreign bytes in this worker.
+    put(worker_root,worker_execs['app-1'],exec_data()+own_exec+mock_exec)
+    run(worker_command,False,'worker exec digest differs')
+    original_packet=json.loads(pathlib.Path(workers['app-1']['result_manifest']['path']).read_text())
+    changed_packet=copy.deepcopy(original_packet)
+    changed_packet['files']['core/target/jacoco.exec']=hashlib.sha256((worker_root/worker_execs['app-1']).read_bytes()).hexdigest()
+    changed_packet_path=save('app-1-result-manifest.json',changed_packet)
+    changed_manifest=copy.deepcopy(worker_manifest);changed_manifest['workers']['app-1']['result_manifest']=file_ref(changed_packet_path)
+    save('worker-inputs.json',changed_manifest)
+    run(worker_command,False,'undeclared own bytecode')
+    save('app-1-result-manifest.json',original_packet);save('worker-inputs.json',worker_manifest)
+    put(worker_root,worker_execs['app-1'],exec_data()+own_exec)
+    put(worker_root,merged_exec,exec_data()+own_exec)
+    run(worker_command,False,'merged coverage differs')
+    put(worker_root,merged_exec,exec_data()+own_exec+mock_exec)
+    pristine=copy.deepcopy(worker_manifest)
+    worker_manifest['workers'].pop('rest');save('worker-inputs.json',worker_manifest)
+    run(worker_command,False,'worker coverage set differs')
+    worker_manifest=copy.deepcopy(pristine)
+    worker_manifest['workers'].pop('e2e-1');save('worker-inputs.json',worker_manifest)
+    run(worker_command,False,'worker coverage set differs')
+    worker_manifest=copy.deepcopy(pristine)
+    worker_manifest['workers']['app-1']['required_exec']=[worker_execs['rest']];save('worker-inputs.json',worker_manifest)
+    run(worker_command,False,'worker exec ownership')
+    worker_manifest=copy.deepcopy(pristine)
+    worker_manifest['workers']['rest']['test_inputs']['sha256']='0'*64;save('worker-inputs.json',worker_manifest)
+    run(worker_command,False,'reference hash differs')
+    worker_manifest=copy.deepcopy(pristine)
+    old_post=copy.deepcopy(worker_posts['rest']);old_post['runtime_class_capture']['run_id']='old'
+    save('rest-post.json',old_post)
+    worker_manifest['workers']['rest']['test_inputs']=file_ref(pathlib.Path(pristine['workers']['rest']['test_inputs']['path']))
+    save('worker-inputs.json',worker_manifest);run(worker_command,False,'source/run/attempt/input differs')
+    save('rest-post.json',worker_posts['rest']);save('worker-inputs.json',pristine)
+    run(worker_command)
     gate_record = dict(id='ci:build:dispatch',required=True,applicable=True,applicability='workflow_dispatch',contract_sha256='f'*64,scope='always',conclusion='success')
     gates_before=save('gates-before.json',dict(schema=1,gates=[gate_record])); gates_after=save('gates-after.json',dict(schema=1,gates=[gate_record]))
     def gate(success=True,reason=None):run(['gates','--baseline',str(gates_before),'--candidate',str(gates_after),'--output',str(root/'gates-diff.json')],success,reason)

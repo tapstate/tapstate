@@ -497,6 +497,22 @@ class StoreBackedSinkAckFactoryTest {
                 .isNull();
     }
 
+    @Test
+    void theFirstTokenAfterAnUntokenedLandingBecomesTheResumablePosition() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
+
+        ack.advance("orders", at(7, null));
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1")).isNull();
+        ack.advance("orders", at(8, "w8"));
+
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1")).isEqualTo(at(8, "w8"));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsEntry("orders", 8L);
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isEqualTo("w8");
+    }
+
     /**
      * A table's confirmation is how far it has landed, and carries a token only where the change there named
      * one. Paired with the token of an earlier change, the order would read back as a place the source had

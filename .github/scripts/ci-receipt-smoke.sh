@@ -89,6 +89,33 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
     classbytes = b'\xca\xfe\xba\xbe\x00\x00\x00\x41\x00\x01\x10\x01'
     check(m.class_access_flags(classbytes) == 0x1001, 'actual synthetic access flags do not depend on observed XML')
     rejected(lambda: m.class_access_flags(classbytes[:-1]), 'truncated class access metadata rejects')
+    # Shared classpath references retain byte identity without repeated reads.
+    digest_fixture = root/'shared-dependency.jar'
+    digest_fixture.write_bytes(b'first capture bytes')
+    original_digest = m.digest
+    reads = []
+    def counted_digest(path):
+        reads.append(path)
+        return original_digest(path)
+    m.digest = counted_digest
+    try:
+        first_capture = m.input_digest_reader()
+        original_hash = first_capture(digest_fixture)
+        check(first_capture(digest_fixture) == original_hash and len(reads) == 1,
+              'repeated references are hashed once inside the current capture')
+        digest_fixture.write_bytes(b'changed after the first capture')
+        rejected(lambda:first_capture(digest_fixture), 'a mutation inside one capture cannot reuse an old hash')
+        second_capture = m.input_digest_reader()
+        check(second_capture(digest_fixture) != original_hash and len(reads) == 2,
+              'the next input capture rereads changed bytes independently')
+        def mutating_digest(path):
+            checksum = original_digest(path)
+            path.write_bytes(b'changed during read')
+            return checksum
+        m.digest = mutating_digest
+        rejected(lambda:m.input_digest_reader()(digest_fixture), 'mutation while hashing rejects an inconsistent snapshot')
+    finally:
+        m.digest = original_digest
     # Only whitelisted coordinate/type producer facts escape a dependency model.
     repository=root/'repository'; repository.mkdir()
     parent='example/parent/1/parent-1.pom'

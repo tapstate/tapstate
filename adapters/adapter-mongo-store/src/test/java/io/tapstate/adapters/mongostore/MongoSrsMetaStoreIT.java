@@ -1637,6 +1637,40 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void aDirectPrefixUsesTheLowestPositionWhenTheLowestTableIsFirst() {
+        assertDirectPrefixForTableOrder(List.of("support_case", "emailmessage"));
+    }
+
+    @Test
+    void aDirectPrefixUsesTheLowestPositionWhenTheLowestTableIsLast() {
+        assertDirectPrefixForTableOrder(List.of("emailmessage", "support_case"));
+    }
+
+    private void assertDirectPrefixForTableOrder(List<String> tables) {
+        withStore(store -> {
+            String consumer = SrsConsumerId.of("ordered_prefix", "source").value();
+            Map<String, List<String>> expected = new LinkedHashMap<>();
+            for (String table : tables) {
+                expected.put(table, List.of("view"));
+            }
+            store.create(CHAIN, null);
+            store.beginWriterRun(CHAIN, consumer, "ordered-run", expected, ConsumerProgressKind.DIRECT_SOURCE);
+            ChainPosition low = new ChainPosition(new SourceOrder(1, 1), "after-low");
+            ChainPosition high = new ChainPosition(new SourceOrder(1, 3), "after-high");
+            confirmDirect(store, CHAIN, consumer, "support_case", low);
+            confirmDirect(store, CHAIN, consumer, "emailmessage", high);
+
+            ChainPosition settled = store.read(CHAIN).orElseThrow()
+                    .consumerOffset(consumer).orElseThrow().sinkAcked();
+            assertThat(settled)
+                    .as("table iteration order must not move the durable prefix past the lowest table")
+                    .isEqualTo(low);
+            store.advanceSourceReadOffset(CHAIN, settled);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-low");
+        });
+    }
+
+    @Test
     void directBatchRecoveryRetainsUnconfirmedHighAcrossStoreReopenAndAdvancesPastAQuietTable() {
         withCollection((store, collection) -> {
             String consumer = SrsConsumerId.of("support_case_state", "case_source").value();

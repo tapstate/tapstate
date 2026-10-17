@@ -2,8 +2,10 @@
 
 The default-reactor planner reads `.github/ci-shard-layout.json`. The checked-in
 configuration records the current comparison candidate: six E2E IT workers,
-four whole-class App workers, a complete E2E unit-module worker, `engine` and
-`rest`. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
+two whole-class App workers, `engine` and `rest`. The complete E2E unit module
+stays in `rest`, avoiding a separate worker and its repeated preparation. This
+uses ten test workers; the four-App-worker layout remains a supported comparison
+configuration. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
 counts 2, 4 and 6 are supported for ordinary source-commit comparisons; there is
 no separate workflow or benchmark entry point. A staged layout is not a
 performance adoption result.

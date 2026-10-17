@@ -33,6 +33,31 @@ def digest(path):
     return value.hexdigest()
 
 
+
+def input_digest_reader():
+    """Read repeated file references once during one quiescent input capture."""
+    observed = {}
+
+    def fingerprint(path):
+        info = path.stat()
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mode,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def read(path):
+        path = path.resolve()
+        before = fingerprint(path)
+        if path in observed:
+            prior, checksum = observed[path]
+            require(prior == before, 'input changed during the current capture')
+            return checksum
+        checksum = digest(path)
+        require(before == fingerprint(path), 'input changed during the current capture')
+        observed[path] = (before, checksum)
+        return checksum
+
+    return read
+
+
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
@@ -385,6 +410,7 @@ def inputs(args):
     require(not any(name.endswith(('.java', '.py', '.sh', '.xml', '.yml', '.yaml', '.properties'))
                     or '/META-INF/services/' in name for name in untracked), 'untracked source cannot be attributed to the recorded commit')
     start = time.monotonic_ns()
+    input_digest = input_digest_reader()
     from importlib.util import spec_from_file_location, module_from_spec
     spec = spec_from_file_location('ci_shards', Path(__file__).with_name('_ci-shards.py'))
     shards = module_from_spec(spec)
@@ -425,44 +451,47 @@ def inputs(args):
                                     bytecode = archive.read(member)
                                     known[name] = {'class_id': crc64(bytecode), 'sha256': hashlib.sha256(bytecode).hexdigest()}
                     jar_classes[identity] = known
-                resolved.append({'identity': identity, 'sha256': digest(path), 'size': path.stat().st_size,
+                resolved.append({'identity': identity, 'sha256': input_digest(path), 'size': path.stat().st_size,
                                  'own_classes': jar_classes[identity]})
             classpaths[module] = resolved
         classes = target / 'classes'
         if classes.exists():
             for path in safe_files(classes):
                 relative = path.relative_to(root).as_posix()
-                production[relative] = digest(path)
                 if path.suffix == '.class':
                     bytecode = path.read_bytes()
+                    production[relative] = hashlib.sha256(bytecode).hexdigest()
                     class_ids[relative] = crc64(bytecode)
                     class_flags[relative] = class_access_flags(bytecode)
+                else:
+                    production[relative] = input_digest(path)
         test_classes = target / 'test-classes'
         if test_classes.exists():
             for path in safe_files(test_classes):
                 if path.suffix == '.class':
                     relative = path.relative_to(root).as_posix()
-                    test_files[relative] = digest(path)
-                    test_ids[relative] = crc64(path.read_bytes())
+                    bytecode = path.read_bytes()
+                    test_files[relative] = hashlib.sha256(bytecode).hexdigest()
+                    test_ids[relative] = crc64(bytecode)
                 else:
-                    test_resources[path.relative_to(root).as_posix()] = digest(path)
+                    test_resources[path.relative_to(root).as_posix()] = input_digest(path)
         if target.exists():
             for path in sorted(target.iterdir()):
                 if path.is_file() and path.name.endswith(('.jar', '.tar.gz', '.zip', '.pom')):
                     require(not path.is_symlink(), 'symlink build output')
-                    outputs[path.relative_to(root).as_posix()] = {'sha256': digest(path), 'size': path.stat().st_size,
+                    outputs[path.relative_to(root).as_posix()] = {'sha256': input_digest(path), 'size': path.stat().st_size,
                                                                 'mode': stat.S_IMODE(path.stat().st_mode)}
     require(production and class_ids, 'no production class evidence')
     dependencies = {}
     for path in safe_files(Path(args.repo_local).resolve()):
         relative = path.relative_to(Path(args.repo_local).resolve()).as_posix()
         if not relative.startswith('io/tapstate/') and path.suffix in ('.jar', '.pom'):
-            dependencies[relative] = digest(path)
+            dependencies[relative] = input_digest(path)
     require(dependencies, 'no resolved dependency byte evidence')
     models, producers = dependency_models(Path(args.repo_local).resolve(), dependencies)
     source_files = {}
     for name in git(root, 'ls-files').splitlines():
-        source_files[name] = digest(shards.owned_path(root, name))
+        source_files[name] = input_digest(shards.owned_path(root, name))
     java = subprocess.run(['java', '-version'], capture_output=True, text=True, cwd=root)
     require(java.returncode == 0 and java.stderr.strip(), 'Java version evidence unavailable')
     value = {'schema': 1, 'source_sha': git(root, 'rev-parse', 'HEAD'),
@@ -514,7 +543,7 @@ def inputs(args):
                 path = shards.owned_path(repository, name)
                 if path.exists():
                     require(path.is_file() and not path.is_symlink(), 'unsafe non-reactor repository input')
-                    value['dependency_repository_files'][name] = digest(path)
+                    value['dependency_repository_files'][name] = input_digest(path)
             if extra:
                 value['dependency_coordinate_models'], value['dependency_producer_facts'] = dependency_models(
                     repository, value['dependency_repository_files'])

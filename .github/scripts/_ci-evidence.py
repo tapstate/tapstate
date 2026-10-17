@@ -1411,7 +1411,11 @@ class ExecReader:
 
 
 def parse_exec(path):
-    reader = ExecReader(path.read_bytes())
+    return parse_exec_bytes(path.read_bytes())
+
+
+def parse_exec_bytes(content):
+    reader = ExecReader(content)
     sessions, classes, header = [], [], False
     while reader.position < len(reader.content):
         block = reader.number(1)
@@ -1682,21 +1686,9 @@ def verified_runtime_classes(inputs, post, binding, inputs_sha256):
                       runtime_realm_proven=False, generator_causality_proven=False) for key, record in admitted.items()}
 
 
-def coverage(args):
+def coverage_input_context(args, binding, prepared=None, tested=None):
+    """Verify one original worker's prepared and post-test class declarations."""
     root = Path(args.root).resolve()
-    binding = load(args.binding)
-    for key in ('run_id', 'attempt', 'source_sha', 'started_ms', 'completed_ms', 'required_exec', 'required_reports', 'required_report_classes'):
-        require(key in binding, 'missing coverage run binding: ' + key)
-    require(binding['run_id'] and int(binding['attempt']) >= 1 and re.fullmatch(r'[0-9a-f]{40}', binding['source_sha']), 'invalid coverage run binding')
-    require(0 < binding['started_ms'] <= binding['completed_ms'], 'invalid coverage run time bounds')
-    declared = binding['required_exec']
-    require(declared and len(declared) == len(set(declared)), 'empty or duplicate required exec list')
-    found = {p.relative_to(root).as_posix() for p in root.rglob('*.exec')}
-    require(found == set(declared), 'coverage exec path set differs from run binding')
-    required_reports = binding['required_reports']
-    require(isinstance(required_reports, list) and required_reports and len(required_reports) == len(set(required_reports)), 'empty or duplicate required coverage report set')
-    found_reports = {path.relative_to(root).as_posix() for path in root.rglob('jacoco.xml')}
-    require(found_reports == set(required_reports), 'coverage XML path set differs from declared production modules')
     production, test_classes, expected_names, production_modules = {}, {}, {}, {}
     repository_growth = {}
     dependency_unknown = []
@@ -1705,14 +1697,18 @@ def coverage(args):
     require(observed_sha is None or observed_sha == binding['source_sha'], 'coverage source SHA differs from production checkout')
     production_root = Path(args.production_root).resolve() if args.production_root else root
     if args.inputs:
-        inputs = load(args.inputs)
+        if prepared is None:
+            raw_inputs = Path(args.inputs).read_bytes()
+            inputs, inputs_sha256 = json.loads(raw_inputs), digest(raw_inputs)
+        else:
+            inputs, inputs_sha256 = prepared
         require(type(inputs.get('schema')) is int and inputs['schema'] == 1 and inputs.get('phase') == 'pre-test-after-install', 'invalid coverage build inputs schema/phase')
         require(inputs.get('source_sha') == binding['source_sha'] and str(inputs.get('run_id')) == str(binding['run_id']) and
                 str(inputs.get('run_attempt')) == str(binding['attempt']), 'coverage build inputs source/run/attempt differs')
         require(inputs.get('jacoco_version') == '0.8.13', 'unsupported compiled coverage analyzer version')
         require(isinstance(inputs.get('production_class_access_flags'), dict) and set(inputs['production_class_access_flags']) == set(inputs['production_class_ids']), 'production class access flag set differs')
         if args.test_inputs:
-            post = load(args.test_inputs)
+            post = load(args.test_inputs) if tested is None else tested
             require(type(post.get('schema')) is int and post['schema'] == 1 and post.get('phase') == 'post-test-before-pack' and post.get('source_sha') == binding['source_sha'] and str(post.get('run_id')) == str(binding['run_id']) and str(post.get('run_attempt')) == str(binding['attempt']), 'post-test bytecode input origin differs')
             for field in ('production_files', 'production_class_ids', 'production_class_access_flags', 'resolved_test_classpaths', 'jacoco_version'):
                 require(post.get(field) == inputs.get(field), 'production/dependency bytes changed during tests: ' + field)
@@ -1771,7 +1767,184 @@ def coverage(args):
             if destination is production and not class_access_flags(path.read_bytes()) & (0x8000 | 0x1000):
                 production_modules.setdefault(module, set()).add(classname.removesuffix('.class'))
     if args.inputs and post:
-        runtime_classes = verified_runtime_classes(inputs, post, binding, digest(Path(args.inputs).read_bytes()))
+        runtime_classes = verified_runtime_classes(inputs, post, binding, inputs_sha256)
+    require(production, 'production class bytes are required to verify JaCoCo class IDs')
+    require(all(len(values) == 1 for values in expected_names.values()), 'conflicting production class IDs')
+    return dict(production=production, test_classes=test_classes, expected_names=expected_names,
+                production_modules=production_modules, runtime_classes=runtime_classes,
+                runtime_capture=post.get('runtime_class_capture') if post else None,
+                repository_growth=repository_growth, dependency_unknown=dependency_unknown,
+                prepared_inputs=inputs if args.inputs else None)
+
+
+def coverage_worker_contexts(args, binding, declared, base):
+    """Keep every runtime capture attached to its original worker and exec files."""
+    manifest_path = Path(args.worker_inputs).absolute()
+
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, 'duplicate worker coverage metadata field')
+            value[key] = item
+        return value
+
+    def document(path):
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 64 * 1024 * 1024,
+                'unsafe worker coverage input file')
+        raw = path.read_bytes()
+        return json.loads(raw, object_pairs_hook=unique), digest(raw)
+
+    def reference(value):
+        require(isinstance(value, dict) and set(value) == {'path', 'sha256'}
+                and isinstance(value['path'], str) and value['path']
+                and re.fullmatch(r'[0-9a-f]{64}', value.get('sha256', '')), 'invalid worker coverage reference')
+        path = Path(value['path'])
+        require('..' not in path.parts, 'unsafe worker coverage reference path')
+        path = path if path.is_absolute() else manifest_path.parent / path
+        data, checksum = document(path)
+        require(checksum == value['sha256'], 'worker coverage reference hash differs')
+        return path, data, checksum
+
+    manifest, manifest_sha256 = document(manifest_path)
+    require(isinstance(manifest, dict) and set(manifest) == {'schema', 'type', 'workers'}
+            and type(manifest['schema']) is int and manifest['schema'] == 1
+            and manifest['type'] == 'coverage-worker-inputs'
+            and isinstance(manifest['workers'], dict) and 0 < len(manifest['workers']) <= 64,
+            'invalid worker coverage manifest')
+    required_workers, merged = binding.get('required_workers'), binding.get('merged_exec')
+    require(isinstance(required_workers, list) and required_workers
+            and all(isinstance(name, str) for name in required_workers)
+            and len(required_workers) == len(set(required_workers))
+            and set(required_workers) == set(manifest['workers']), 'worker coverage set differs from run binding')
+    require(isinstance(merged, list) and merged and all(isinstance(name, str) for name in merged)
+            and len(merged) == len(set(merged))
+            and all(isinstance(name, str) and name.endswith('.exec') and not Path(name).is_absolute()
+                    and '..' not in Path(name).parts and not name.startswith('target/ci-shards/') for name in merged)
+            and set(merged) <= set(declared), 'invalid merged coverage exec binding')
+    contexts, owners, records, exec_hashes = {}, {}, {}, {}
+    same_fields = ('production_files', 'production_class_ids', 'production_class_access_flags',
+                   'resolved_test_classpaths', 'jacoco_version', 'test_class_ids', 'test_files')
+    for worker, entry in manifest['workers'].items():
+        require(isinstance(worker, str) and re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', worker)
+                and isinstance(entry, dict) and set(entry) == {'binding', 'inputs', 'test_inputs', 'required_exec', 'result_manifest', 'provenance'},
+                'invalid worker coverage entry')
+        binding_path, peer_binding, unused = reference(entry['binding'])
+        inputs_path, inputs, inputs_sha256 = reference(entry['inputs'])
+        post_path, post, unused = reference(entry['test_inputs'])
+        packet_path, packet, unused = reference(entry['result_manifest'])
+        provenance_path, provenance, unused = reference(entry['provenance'])
+        require(isinstance(peer_binding, dict)
+                and set(peer_binding) == {'run_id', 'attempt', 'source_sha', 'started_ms', 'completed_ms', 'runtime_class_capture'}
+                and all(peer_binding.get(key) == binding[key]
+                for key in ('run_id', 'attempt', 'source_sha', 'started_ms', 'completed_ms'))
+                and isinstance(peer_binding.get('runtime_class_capture'), dict),
+                'worker coverage run/source/time binding differs')
+        require(isinstance(inputs, dict) and all(inputs.get(key) == base.get(key) for key in same_fields),
+                'worker prepared class/dependency inputs differ')
+        require(isinstance(packet, dict) and type(packet.get('schema')) is int and packet['schema'] == 2
+                and packet.get('source_sha') == binding['source_sha'] and packet.get('shard_id') == worker
+                and isinstance(packet.get('files'), dict) and isinstance(provenance, dict)
+                and packet.get('provenance') == provenance, 'original worker result manifest differs')
+        marker = packet.get('provenance_path')
+        require(isinstance(marker, str) and marker and not Path(marker).is_absolute() and '..' not in Path(marker).parts
+                and packet['files'].get(marker) == entry['provenance']['sha256'],
+                'original worker provenance bytes differ')
+        require(provenance.get('source_sha') == binding['source_sha'] and provenance.get('shard_id') == worker
+                and str(provenance.get('run_id')) == str(binding['run_id'])
+                and str(provenance.get('run_attempt')) == str(binding['attempt']),
+                'original worker provenance run/source differs')
+        origin = {key: provenance.get(key) for key in ('shard_id', 'invocation_id', 'cohort_hash', 'reset', 'verify')}
+        receipt_capture = provenance.get('runtime_class_capture', {})
+        require(isinstance(receipt_capture, dict)
+                and receipt_capture.get('build_inputs_sha256') == inputs_sha256,
+                'worker prepared inputs differ from original runtime capture receipt')
+        observer = provenance.get('case_observer', {})
+        require(isinstance(observer, dict) and (not observer.get('enabled')
+                and 'build_inputs_sha256' not in observer
+                or observer.get('build_inputs_sha256') == inputs_sha256),
+                'worker prepared inputs differ from original case observer receipt')
+        origin['capture_origin_sha256'] = receipt_capture.get('capture_origin_sha256')
+        require(peer_binding['runtime_class_capture'] == origin, 'worker binding differs from original result provenance')
+        capture = post.get('runtime_class_capture', {}) if isinstance(post, dict) else {}
+        require(capture.get('enabled') is True and capture.get('shard_id') == worker,
+                'worker runtime capture missing or belongs to another worker')
+        peer_args = argparse.Namespace(**vars(args))
+        peer_args.inputs, peer_args.test_inputs = str(inputs_path), str(post_path)
+        context = coverage_input_context(peer_args, peer_binding, prepared=(inputs, inputs_sha256), tested=post)
+        paths = entry['required_exec']
+        prefix = 'target/ci-shards/' + worker + '/'
+        require(isinstance(paths, list) and all(isinstance(name, str) for name in paths)
+                and len(paths) == len(set(paths))
+                and all(isinstance(name, str) and name.startswith(prefix) and '..' not in Path(name).parts
+                        and name in declared and name not in owners for name in paths),
+                'worker exec ownership is missing, duplicate or foreign')
+        original_paths = packet.get('required_exec')
+        require(isinstance(original_paths, list)
+                and all(isinstance(name, str) and name and not Path(name).is_absolute() and '..' not in Path(name).parts
+                        for name in original_paths)
+                and len(original_paths) == len(set(original_paths))
+                and {name.removeprefix(prefix) for name in paths} == set(original_paths),
+                'worker exec set differs from original result manifest')
+        for name in paths:
+            checksum = packet['files'].get(name.removeprefix(prefix))
+            require(isinstance(checksum, str) and re.fullmatch(r'[0-9a-f]{64}', checksum),
+                    'worker exec digest is missing from original result manifest')
+            exec_hashes[name] = checksum
+        owners.update({name: worker for name in paths})
+        contexts[worker] = context
+        records[worker] = dict(binding=peer_binding, references=entry, required_exec=paths,
+                               test_classes=context['test_classes'],
+                               runtime_generated_classes=list(context['runtime_classes'].values()),
+                               runtime_capture=context['runtime_capture'],
+                               dependency_repository_growth=context['repository_growth'])
+    require(set(owners) | set(merged) == set(declared) and not set(owners) & set(merged),
+            'worker exec ownership does not cover the declared raw files')
+    return contexts, owners, set(merged), exec_hashes, dict(manifest_sha256=manifest_sha256, workers=records)
+
+
+def coverage_exec_union(executions):
+    sessions, classes = set(), {}
+    for data in executions:
+        sessions.update((row['id'], row['start_ms'], row['end_ms']) for row in data['sessions'])
+        for row in data['classes']:
+            key = row['name'], row['class_id']
+            if key not in classes:
+                classes[key] = (row['probes'], set())
+            require(classes[key][0] == row['probes'], 'inconsistent coverage probe layout')
+            classes[key][1].update(row['covered_probes'])
+    return sessions, classes
+
+
+def coverage(args):
+    root = Path(args.root).resolve()
+    binding = load(args.binding)
+    worker_mode = 'required_workers' in binding or 'merged_exec' in binding
+    require(not worker_mode or getattr(args, 'worker_inputs', None),
+            'worker coverage manifest required by the run binding')
+    for key in ('run_id', 'attempt', 'source_sha', 'started_ms', 'completed_ms', 'required_exec', 'required_reports', 'required_report_classes'):
+        require(key in binding, 'missing coverage run binding: ' + key)
+    require(binding['run_id'] and int(binding['attempt']) >= 1 and re.fullmatch(r'[0-9a-f]{40}', binding['source_sha']), 'invalid coverage run binding')
+    require(0 < binding['started_ms'] <= binding['completed_ms'], 'invalid coverage run time bounds')
+    declared = binding['required_exec']
+    require(declared and len(declared) == len(set(declared)), 'empty or duplicate required exec list')
+    found = {p.relative_to(root).as_posix() for p in root.rglob('*.exec')}
+    require(found == set(declared), 'coverage exec path set differs from run binding')
+    required_reports = binding['required_reports']
+    require(isinstance(required_reports, list) and required_reports and len(required_reports) == len(set(required_reports)), 'empty or duplicate required coverage report set')
+    found_reports = {path.relative_to(root).as_posix() for path in root.rglob('jacoco.xml')}
+    require(found_reports == set(required_reports), 'coverage XML path set differs from declared production modules')
+    context = coverage_input_context(args, binding)
+    production, test_classes = context['production'], context['test_classes']
+    expected_names, production_modules = context['expected_names'], context['production_modules']
+    runtime_classes = context['runtime_classes']
+    repository_growth, dependency_unknown = context['repository_growth'], context['dependency_unknown']
+    worker_contexts, owners, merged, worker_inputs, exec_hashes = {}, {}, set(), None, {}
+    if getattr(args, 'worker_inputs', None):
+        require(args.inputs and not args.test_inputs, 'worker coverage requires prepared inputs and no aggregate post-test capture')
+        worker_contexts, owners, merged, exec_hashes, worker_inputs = coverage_worker_contexts(
+            args, binding, declared, context['prepared_inputs'])
+        dependency_unknown.extend(worker + ': ' + problem for worker, value in worker_contexts.items()
+                                  for problem in value['dependency_unknown'])
     require(production, 'production class bytes are required to verify JaCoCo class IDs')
     require(all(len(values) == 1 for values in expected_names.values()), 'conflicting production class IDs')
     report_classes = binding['required_report_classes']
@@ -1790,16 +1963,30 @@ def coverage(args):
     for relative in declared:
         path = root / relative
         require(not Path(relative).is_absolute() and '..' not in Path(relative).parts and not path.is_symlink(), 'unsafe coverage path')
-        parsed = parse_exec(path)
+        raw = path.read_bytes()
+        checksum = digest(raw)
+        require(relative not in exec_hashes or checksum == exec_hashes[relative],
+                'worker exec digest differs from original result manifest')
+        parsed = parse_exec_bytes(raw)
         for session in parsed['sessions']:
             require(binding['started_ms'] <= session['start_ms'] <= session['end_ms'] <= binding['completed_ms'],
                     'stale or out-of-run coverage session: ' + relative)
-        for record in parsed['classes']:
-            if record['name'].startswith('io/tapstate/'):
-                require(record['name'] in expected_names or (record['name'], record['class_id']) in runtime_classes, 'undeclared own bytecode in JaCoCo data: ' + record['name'])
-            if record['name'] in expected_names:
-                require(record['class_id'] in expected_names[record['name']], 'JaCoCo class ID differs from production: ' + record['name'])
-        executions[relative] = dict(sha256=digest(path.read_bytes()), size=path.stat().st_size, **parsed)
+        selected = worker_contexts[owners[relative]] if relative in owners else context
+        if relative not in merged:
+            for record in parsed['classes']:
+                names, runtime = selected['expected_names'], selected['runtime_classes']
+                if record['name'].startswith('io/tapstate/'):
+                    require(record['name'] in names or (record['name'], record['class_id']) in runtime,
+                            'undeclared own bytecode in JaCoCo data: ' + record['name'])
+                if record['name'] in names:
+                    require(record['class_id'] in names[record['name']],
+                            'JaCoCo class ID differs from production: ' + record['name'])
+        executions[relative] = dict(sha256=checksum, size=len(raw), **parsed)
+    if worker_inputs:
+        original = coverage_exec_union(executions[name] for name in owners)
+        for name in merged:
+            require(coverage_exec_union([executions[name]]) == original,
+                    'merged coverage differs from the verified original worker exec union')
     hits, reports_found, unresolved = [], [], list(dependency_unknown)
     session_keys = {(s['id'], s['start_ms'], s['end_ms']) for data in executions.values() for s in data['sessions']}
     for path in sorted(root.rglob('jacoco.xml')):
@@ -1821,7 +2008,9 @@ def coverage(args):
                         hits.append([report_path, package.get('name'), source.get('name'), int(line.get('nr')),
                                      int(line.get('ci', '0')), int(line.get('cb', '0'))])
     value = dict(schema=SCHEMA, type='coverage-observation', binding=binding, production=production, test_classes=test_classes, executions=executions,
-                 reports=reports_found, covered_lines_branches=hits, runtime_generated_classes=list(runtime_classes.values()), runtime_capture=(post.get('runtime_class_capture') if post else None), dependency_repository_growth=repository_growth, dependency_growth_accounting='all additions retained; download and verification cost remains inside original steps', unresolved=unresolved, complete=bool(reports_found) and not unresolved)
+                 reports=reports_found, covered_lines_branches=hits, runtime_generated_classes=list(runtime_classes.values()), runtime_capture=context['runtime_capture'], dependency_repository_growth=repository_growth, dependency_growth_accounting='all additions retained; download and verification cost remains inside original steps', unresolved=unresolved, complete=bool(reports_found) and not unresolved)
+    if worker_inputs:
+        value['worker_inputs'] = worker_inputs
     output(args.output, value)
     print(json.dumps(dict(exec_files=len(executions), production_classes=len(production), coverage_xml=len(reports_found), complete=value['complete']), sort_keys=True))
 
@@ -2321,6 +2510,7 @@ def main():
     cov.add_argument('--root', default='.')
     cov.add_argument('--production-root')
     cov.add_argument('--test-inputs', help='Verified post-test compiled fixture metadata; production/dependency bytes must stay identical')
+    cov.add_argument('--worker-inputs', help='Hash-bound per-worker inputs, runtime captures and original exec ownership')
     cov.add_argument('--inputs', help='Verified pre-test production/test class hash metadata from this run')
     cov.add_argument('--binding', required=True)
     cov.add_argument('--output', required=True)
