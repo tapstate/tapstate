@@ -153,7 +153,7 @@ final class AtlasRuntime implements AutoCloseable {
         assertThat(control.snapshotRowsRead(pipeline)).as("resumed job snapshot reads").containsEntry(table, 0L);
     }
 
-    private static Path seedDirectory() {
+    static Path seedDirectory() {
         String value = System.getenv("TAPSTATE_TEST_CLOUD_RELEASE_DIR");
         if (value == null || value.isBlank()) throw new AssertionError("the locked Cloud release inputs are required");
         Path release = Path.of(value).toAbsolutePath().normalize();
