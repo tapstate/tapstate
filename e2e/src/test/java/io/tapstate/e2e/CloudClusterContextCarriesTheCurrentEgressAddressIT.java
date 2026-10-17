@@ -67,6 +67,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                     "--tapstate.cloud.token=controlled-machine-token",
                     "--tapstate.cloud.atlas-uri=" + storeUri,
                     "--tapstate.cloud.cluster-id=" + CLUSTER,
+                    "--tapstate.connectors.seed-dir=" + AtlasRuntime.seedDirectory(),
                     "--tapstate.connectors.plugins-dir=" + stagingDirectory,
                     "--tapstate.connectors.also-accept-ids=" + E2eConnectorJar.CONNECTOR_ID,
                     "--SDK_STATUS_SENDER_ENABLED=false")) {
