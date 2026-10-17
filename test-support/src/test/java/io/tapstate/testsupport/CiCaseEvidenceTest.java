@@ -1,6 +1,5 @@
 package io.tapstate.testsupport;
 
-import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.extension.ExtensionContext;
@@ -233,7 +232,7 @@ class CiCaseEvidenceTest {
 
     @Test
     void repeatedInvocationsUseTheirDeclaredRepetitionWithoutReusingParameterIndices() throws Exception {
-        Method repeated = method("repeatedFixture");
+        Method repeated = RepeatedInvocationMetadata.class.getDeclaredMethod("repeatedFixture");
         Captured captured = capture(true, () -> observer.interceptTestTemplateMethod(() -> null,
                 invocation(repeated, List.of()), context(repeated, "repeat", "[test-template-invocation:#2]")));
         assertThat(captured.output()).contains("\"identity_kind\":\"repeated\"", "\"repetition\":2",
@@ -381,7 +380,7 @@ class CiCaseEvidenceTest {
     private static ExtensionContext context(Method method, String display, String uniqueId) {
         return (ExtensionContext) Proxy.newProxyInstance(ExtensionContext.class.getClassLoader(),
                 new Class<?>[] {ExtensionContext.class}, (proxy, called, arguments) -> switch (called.getName()) {
-                    case "getTestClass" -> Optional.of(CiCaseEvidenceTest.class);
+                    case "getTestClass" -> Optional.of(method.getDeclaringClass());
                     case "getTestMethod" -> Optional.of(method);
                     case "getParent" -> Optional.empty();
                     case "getDisplayName" -> display;
@@ -455,10 +454,6 @@ class CiCaseEvidenceTest {
     }
 
     private void namedFixture(String label, Object argument) {
-    }
-
-    @RepeatedTest(3)
-    private void repeatedFixture() {
     }
 
     private void carrierFixture(String label, Supplier<?> carrier) {

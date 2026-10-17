@@ -76,7 +76,8 @@ worker packs retain that recorded source/run binding. The 1,295 XML reports
 include five additional nested-container suites; their times are summed under
 the owning source outer class. The current source set contains 1,291 units:
 it adds an unmeasured file-connector shutdown control and changes the test CSV
-fixture. Its identity set and test-source bytes differ from that recorded run.
+fixture, and relocates reflection-only repetition metadata outside test discovery.
+Its identity set and test-source bytes differ from that recorded run.
 The new class uses the declared 30-second fallback; recorded weights remain
 estimates, including for callers of the changed fixture.
 Updating the weights changes worker assignments; the newly planned selected
