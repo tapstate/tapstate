@@ -34,8 +34,29 @@ class CloudSdkBridgeTest {
                 .context().ec2PublicIp()).isNull();
     }
 
+    @Test
+    void malformedOrInaccessibleOptionalMetadataFailsClosed() {
+        assertThatThrownBy(() -> CloudSdkBridge.optionalExchangeField(new NumericExchange(42), "ec2PublicIp"))
+                .isInstanceOf(CloudSdkBridge.ProviderFailure.class);
+        assertThatThrownBy(() -> CloudSdkBridge.optionalExchangeField(new ThrowingExchange(), "ec2PublicIp"))
+                .isInstanceOf(CloudSdkBridge.ProviderFailure.class);
+        assertThatThrownBy(() -> CloudSdkBridge.optionalCurrentEgressAddress(new ThrowingAddressSdk()))
+                .isInstanceOf(CloudSdkBridge.ProviderFailure.class);
+    }
+
     public record LegacyExchange(String jwt) { }
     public record EgressExchange(String ec2PublicIp, String egressAddressStatus) { }
+    public record NumericExchange(Integer ec2PublicIp) { }
+
+    public static final class ThrowingExchange {
+        public String ec2PublicIp() { throw new IllegalStateException("provider accessor failed"); }
+    }
+
+    public static final class ThrowingAddressSdk {
+        public CloudEgressAddress currentEgressAddress() {
+            throw new IllegalStateException("provider accessor failed");
+        }
+    }
 
     @Test
     void currentAddressIsOptionalForOlderSdksAndBoundToTheConfiguredCluster() {

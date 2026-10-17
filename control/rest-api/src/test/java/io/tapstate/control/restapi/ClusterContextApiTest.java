@@ -35,6 +35,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -60,13 +61,15 @@ class ClusterContextApiTest {
                 "--server.address=127.0.0.1", "--server.port=0",
                 "--spring.jackson.default-property-inclusion=" + (omitNulls ? "non_null" : "always"))) {
             int port = ((WebServerApplicationContext) context).getWebServer().getPort();
-            Map<?, ?> body = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
+            Map<?, ?> rawBody = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
                     .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + COOKIE)
                     .exchange((request, response) -> {
                         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
                         assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                         return response.bodyTo(Map.class);
                     });
+            Map<String, Object> body = new HashMap<>();
+            rawBody.forEach((key, value) -> body.put((String) key, value));
 
             assertThat(body.get("organizationId")).isEqualTo(DISPLAY.organizationId());
             assertThat(body.get("clusterId")).isEqualTo(DISPLAY.clusterId());
@@ -78,8 +81,9 @@ class ClusterContextApiTest {
             assertThat(body.keySet().stream().map(Object::toString).toList()).containsExactlyInAnyOrder("organizationId", "organizationName", "clusterId",
                     "clusterName", "region", "clusterState", "ec2PublicIp", "egressAddressStatus");
             // The workspace client accepts a null or string state and rejects an absent property.
-            assertThat(body.containsKey("clusterState")).as("workspace context contains its nullable state").isTrue();
-            assertThat(body.get("clusterState")).isNull();
+            assertThat(body).as("workspace context contains its nullable state")
+                    .containsKey("clusterState")
+                    .containsEntry("clusterState", null);
             assertThat(body.toString()).doesNotContain(COOKIE, "password", "jwt", "jti", "secret-sentinel");
             for (String cookie : new String[] {"", COOKIE + "-wrong-secret"}) {
                 RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
