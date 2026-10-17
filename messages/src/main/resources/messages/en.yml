@@ -522,6 +522,9 @@ migration.lock-timeout:
 migration.changeset-failed:
   message: "System data changeset {changeset} failed: {cause}"
   solution: "Fix what the cause names, then start again -- the migration resumes at this changeset rather than repeating the ones before it."
+io.note-write-conflict:
+  message: "Connector notes changed during this operation."
+  solution: "Stop this connector drive and verify the current notes before reopening. Do not overwrite the newer value by refreshing the expected revision."
 io.note-scope-unavailable:
   message: "The captured connector-note scope is missing, changed, or no longer current."
   solution: "Stop this connector drive and verify the original configuration binding and note scope before reopening. Do not substitute an empty map or retry against a newer generation."

@@ -65,10 +65,11 @@ final class PdkConnector implements AutoCloseable {
     private final TapCodecsRegistry codecs;
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
     private volatile boolean stopped;
+    private final Runnable closeNotes;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId) {
+                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes) {
         this.connectorId = connectorId;
         this.loader = loader;
         this.connector = connector;
@@ -77,6 +78,7 @@ final class PdkConnector implements AutoCloseable {
         this.stateNamespace = stateNamespace;
         this.pipelineId = pipelineId;
         this.codecs = codecs;
+        this.closeNotes = closeNotes;
     }
 
     /**
@@ -118,6 +120,13 @@ final class PdkConnector implements AutoCloseable {
     /** Physical notes are shared without changing the actual owner used for connector log attribution. */
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore, SharedNotes notes) {
+        return open(connectorId, ref, settings, node, stateStore, notes, null);
+    }
+
+    /** The configured path captures all necessary note scopes before loading any plugin class. */
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
+                             ConnectorNoteScopes noteScopes) {
         ensureDeploymentIdentity();
         // The contract's shared static log channel prints to standard output until somebody listens, and
         // the first connector opened is the earliest point at which anybody has.
@@ -128,6 +137,24 @@ final class PdkConnector implements AutoCloseable {
                 : notes.carriedFrom().stream().map(ConnectorStateNamespace::of).toList();
         String pipelineId = node == null ? null : node.pipelineId();
         gateApiLevel(connectorId, ref);
+        java.util.concurrent.atomic.AtomicBoolean notesActive = new java.util.concurrent.atomic.AtomicBoolean(true);
+        io.tapdata.entity.utils.cache.KVMap<Object> configuredState = null;
+        io.tapdata.entity.utils.cache.KVMap<Object> configuredGlobal = null;
+        if (noteScopes != null) {
+            if (stateNamespace == null) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            }
+            ConnectorNoteScopes captured = noteScopes.guardedBy(() -> {
+                if (!notesActive.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+                }
+            });
+            var primary = captured.open(stateNamespace);
+            var earlier = carriedFrom.stream().map(captured::open).toList();
+            var global = captured.open(ConnectorStateNamespace.GLOBAL);
+            configuredState = new ScopedDurableStateMap(captured.store(), primary, earlier, notes != null, captured::requireActive);
+            configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);
+        }
 
         ConnectorClassLoader loader;
         try {
@@ -176,7 +203,7 @@ final class PdkConnector implements AutoCloseable {
             // touch NPEs. The map handed over here is the same reference for as long as this handle
             // lives: a connector may compare the map it was bound to against the one it is later handed
             // and refuse to run when they differ, and that expectation is nowhere in the signatures.
-            context.setStateMap(stateNamespace == null || stateStore == null
+            context.setStateMap(configuredState != null ? configuredState : stateNamespace == null || stateStore == null
                     ? new InMemoryStateMap()
                     : new DurableStateMap(stateStore, stateNamespace, carriedFrom, notes != null));
             // The map the contract calls global is one the whole deployment shares, so it is the store
@@ -186,7 +213,7 @@ final class PdkConnector implements AutoCloseable {
             // store has no way to list a namespace precisely so that nothing is tempted to take one.
             // The node plays no part in the name: being tied to no node is the whole of what makes it
             // global, which is why this asks only whether there is somewhere to keep it.
-            context.setGlobalStateMap(stateStore == null
+            context.setGlobalStateMap(configuredGlobal != null ? configuredGlobal : stateStore == null
                     ? new InMemoryStateMap()
                     : new DurableStateMap(stateStore, ConnectorStateNamespace.GLOBAL));
             // A connector reads its capability alternatives off the context during the drive; the context
@@ -194,13 +221,15 @@ final class PdkConnector implements AutoCloseable {
             // the connector uses its own default capability behaviour, which is the L1 intent.
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
-                    connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId);
+                    connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
+                    () -> notesActive.set(false));
             opened = true;
             return result;
         } finally {
             // Release the loader on every failure path — a coded load/class error, an escaping VM error,
             // anything. A shared loader stays open for the artifact's other opens; this is a no-op on it.
             if (!opened) {
+                notesActive.set(false);
                 closeQuietly(loader);
             }
         }
@@ -440,6 +469,7 @@ final class PdkConnector implements AutoCloseable {
 
     @Override
     public void close() {
+        closeNotes.run();
         closeQuietly(loader);
     }
 

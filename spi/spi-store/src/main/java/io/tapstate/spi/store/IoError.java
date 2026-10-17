@@ -66,6 +66,9 @@ public enum IoError implements TapstateErrorCode {
      */
     SINK_WRITER_PROGRESS_AMBIGUOUS("io.sink-writer-progress-ambiguous", Set.of("pipeline")),
 
+    /** A note command lost its captured key revision and must not overwrite the current value. */
+    NOTE_WRITE_CONFLICT("io.note-write-conflict", Set.of()),
+
     /** Necessary connector notes cannot prove the captured namespace, owner or clear generation. */
     NOTE_SCOPE_UNAVAILABLE("io.note-scope-unavailable", Set.of()),
 

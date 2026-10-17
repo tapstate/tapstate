@@ -115,10 +115,19 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
+    private final ConnectorNoteScopes noteScopes;
     private final Duration preflightTimeout;
     private final long acknowledgeIntervalNanos;
     private final LongSupplier nanoClock;
     private final Duration releaseTimeout;
+
+    /** Configured capture notes use the configuration domain, independently of generic operator state. */
+    public static PdkCapturePort withRequiredNotes(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
+            ConnectorNoteScopes noteScopes) {
+        return new PdkCapturePort(provisioner, stateStore, DEFAULT_PREFLIGHT_TIMEOUT,
+                DEFAULT_ACKNOWLEDGE_INTERVAL, System::nanoTime, DEFAULT_RELEASE_TIMEOUT,
+                Objects.requireNonNull(noteScopes, "noteScopes"));
+    }
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
@@ -147,7 +156,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     /** As above, with how long a release waits for its connector -- for a case that cannot wait a minute. */
     PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
             Duration acknowledgeInterval, LongSupplier nanoClock, Duration releaseTimeout) {
+        this(provisioner, stateStore, preflightTimeout, acknowledgeInterval, nanoClock, releaseTimeout, null);
+    }
+
+    PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
+            Duration acknowledgeInterval, LongSupplier nanoClock, Duration releaseTimeout, ConnectorNoteScopes noteScopes) {
         this.provisioner = provisioner;
+        this.noteScopes = noteScopes;
         this.stateStore = stateStore;
         this.preflightTimeout = requirePositive(preflightTimeout, "preflightTimeout");
         this.acknowledgeIntervalNanos = requirePositive(acknowledgeInterval, "acknowledgeInterval").toNanos();
@@ -494,18 +509,24 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     @Override
     public Optional<TapstateException> release(CaptureConfig config) {
         Objects.requireNonNull(config, "config");
-        if (stateStore == null || (config.node() == null && config.sharedNotes() == null)) {
+        if ((stateStore == null && noteScopes == null) || (config.node() == null && config.sharedNotes() == null)) {
             // Nothing was kept anywhere a later drive could read it, so nothing was set up through it either.
             return Optional.empty();
         }
-        FencedStateStore notes = new FencedStateStore(stateStore);
+        FencedStateStore notes = stateStore == null ? null : new FencedStateStore(stateStore);
+        java.util.concurrent.atomic.AtomicBoolean releaseActive = new java.util.concurrent.atomic.AtomicBoolean(true);
+        ConnectorNoteScopes releaseScopes = noteScopes == null ? null : noteScopes.guardedBy(() -> {
+            if (!releaseActive.get()) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            }
+        });
         AtomicReference<List<String>> named = new AtomicReference<>();
         CompletableFuture<Void> released = new CompletableFuture<>();
         Thread thread = new Thread(() -> {
             try {
                 PdkConnector connector = PdkConnector.open(config.connectorId(),
                         provisioner.resolve(config.connectorId()), config.settings(), config.node(), notes,
-                        config.sharedNotes());
+                        config.sharedNotes(), releaseScopes);
                 try {
                     List<String> names = namedOnTheSource(connector);
                     named.set(names);
@@ -515,6 +536,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                                 config.connectorId(),
                                 names.isEmpty() ? "nothing its notes name" : String.join(", ", names));
                         connector.underLoader(() -> {
+                            if (releaseScopes != null) releaseScopes.requireActive();
                             release.release(connector.context());
                             return null;
                         });
@@ -543,14 +565,18 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 throw fatal;
             }
         } catch (TimeoutException silent) {
-            notes.fence();
+            releaseActive.set(false);
+            if (notes != null) notes.fence();
             thread.interrupt();
             failure = new TimeoutException("the source did not answer within " + releaseTimeout.toMillis() + " ms");
         } catch (InterruptedException interrupted) {
-            notes.fence();
+            releaseActive.set(false);
+            if (notes != null) notes.fence();
             thread.interrupt();
             Thread.currentThread().interrupt();
             failure = interrupted;
+        } finally {
+            releaseActive.set(false);
         }
         List<String> left = named.get();
         return Optional.of(new TapstateException(ConnectorError.RELEASE_FAILED,
@@ -681,7 +707,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                node, stateStore, notes);
+                node, stateStore, notes, node == null && notes == null ? null : noteScopes);
     }
 
     /**

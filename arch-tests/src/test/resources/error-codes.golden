@@ -237,6 +237,7 @@ engine.view-key-missing-from-before-image
 io.document-too-large
 io.document-unreadable
 io.note-scope-unavailable
+io.note-write-conflict
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous

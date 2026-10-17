@@ -9,6 +9,10 @@ public record RequiredNoteValue(long revision, byte[] bytes) {
         bytes = bytes == null ? null : bytes.clone();
     }
 
+    public boolean present() {
+        return bytes != null;
+    }
+
     @Override
     public byte[] bytes() {
         return bytes == null ? null : bytes.clone();
