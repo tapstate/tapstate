@@ -1,0 +1,162 @@
+{
+  "id": "kingbaser6",
+  "name": "KingBaseES-R6",
+  "displayName": "KingbaseES V8R6",
+  "icon": "icons/kingbaser6.png",
+  "group": "database",
+  "modes": [],
+  "discovery": "catalog",
+  "sink": {
+    "capable": false,
+    "writeSemantics": []
+  },
+  "pushOut": false,
+  "config": [
+    {
+      "name": "host",
+      "type": "string",
+      "label": {
+        "en_US": "Host"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "port",
+      "type": "number",
+      "label": {
+        "en_US": "Port"
+      },
+      "required": true,
+      "default": "54321",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "database",
+      "type": "string",
+      "label": {
+        "en_US": "database"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "schema",
+      "type": "string",
+      "label": {
+        "en_US": "schema"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "extParams",
+      "type": "string",
+      "label": {
+        "en_US": "extParams"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "user",
+      "type": "string",
+      "label": {
+        "en_US": "user"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "password",
+      "type": "string",
+      "label": {
+        "en_US": "password"
+      },
+      "required": false,
+      "default": null,
+      "secret": true,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "logPluginName",
+      "type": "string",
+      "label": {
+        "en_US": "logPluginName"
+      },
+      "required": true,
+      "default": "wal2json",
+      "secret": false,
+      "options": [
+        {
+          "value": "decoderbufs",
+          "label": {
+            "en_US": "DECODERBUFS"
+          }
+        },
+        {
+          "value": "wal2json",
+          "label": {
+            "en_US": "WAL2JSON"
+          }
+        },
+        {
+          "value": "wal2json_rds",
+          "label": {
+            "en_US": "WAL2JSONRDS"
+          }
+        },
+        {
+          "value": "wal2json_streaming",
+          "label": {
+            "en_US": "WAL2JSONSTREMING"
+          }
+        },
+        {
+          "value": "wal2json_rds_streaming",
+          "label": {
+            "en_US": "WAL2JSONRDSSTREAMING"
+          }
+        },
+        {
+          "value": "pgoutput",
+          "label": {
+            "en_US": "PGOUTPUT"
+          }
+        },
+        {
+          "value": "walminer",
+          "label": {
+            "en_US": "WALMINER"
+          }
+        }
+      ],
+      "visibleWhen": null
+    }
+  ],
+  "provenance": {
+    "specPath": "connectors/kingbaser6-connector/src/main/resources/spec_kingbaser6.json",
+    "specContentHash": "d69b5bae3cd209cd",
+    "pdkApiVersion": null,
+    "requiredLevel": null,
+    "modeSource": {}
+  }
+}

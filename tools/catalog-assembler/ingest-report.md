@@ -1,8 +1,10 @@
 # Connector catalog ingest report
 
-Spec SHA: `cc13816`
+Spec SHA: `c132b49`
 Capability SHA: `cc13816`
-Ingested connectors: 81
+
+> The capability face comes from an earlier upstream revision than the spec face: modes, sink and write semantics were derived at `cc13816`, while the structure below was read at `c132b49`. A full refresh brings them back together.
+Ingested connectors: 95
 
 ## Unclassified — no resolvable mode (need tapstate.modes)
 - ai-chat
@@ -29,7 +31,20 @@ Ingested connectors: 81
 - yashandb: driver published only to the upstream project's private repository
 
 ## Not derived — no built jar or did not classload (excluded from refresh)
-(none)
+- aliyun-rds-sqlserver
+- dameng
+- db2i
+- gbase8a
+- gbase8s
+- hana
+- informix
+- iris
+- kingbaser3
+- kingbaser6
+- oceanbase_oracle
+- sybase
+- tencent-db-mysql
+- tencent-db-sqlserver
 
 ## Unverified modes — derived for a non-database connector nobody declared
 - coding
@@ -95,10 +110,12 @@ Ingested connectors: 81
 ## Unresolved label refs — fell back to raw key
 - aliyun-adb-mysql:addtionalString
 - aliyun-rds-mysql:addtionalString
+- aliyun-rds-sqlserver:timezone
 - aws-rds-mysql:addtionalString
 - mysql-pxc:addtionalString
 - polar-db-mysql:addtionalString
 - tencent-db-mariadb:addtionalString
+- tencent-db-sqlserver:timezone
 
 ## Exemptions — modules and specs set aside
 - [EXCLUDED] coding-demo-connector: known non-connector module
