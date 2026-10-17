@@ -33,30 +33,52 @@ class AnOnPremSrvViewsConnectionKeepsItsAuthenticationDatabaseIT {
         driverLog.setLevel(Level.OFF);
         try {
             verifyConnections(baseUri);
-        } catch (MongoException | IllegalArgumentException failure) {
-            throw new AssertionError("Controlled SRV connection failed: " + failure.getClass().getSimpleName());
         } finally {
             driverLog.setLevel(previousLevel);
         }
     }
 
     private static void verifyConnections(String baseUri) {
-        String suffix = UUID.randomUUID().toString().replace("-", "");
-        String metadataDatabase = "ts_srv_metadata_" + suffix;
-        String metadataUri = inDatabase(baseUri, metadataDatabase);
-        ConnectionString metadata = new ConnectionString(metadataUri);
-        assertThat(metadata.getCredential()).isNotNull();
-        assertThat(metadata.getCredential().getSource()).isEqualTo("admin");
-        ping(metadata);
+        Stage stage = Stage.METADATA_URI;
+        try {
+            Databases databases = databases(UUID.randomUUID());
+            String metadataDatabase = databases.metadata();
+            String metadataUri = inDatabase(baseUri, metadataDatabase);
+            ConnectionString metadata = new ConnectionString(metadataUri);
+            assertThat(metadata.getCredential()).isNotNull();
+            assertThat(metadata.getCredential().getSource()).isEqualTo("admin");
+            stage = Stage.METADATA_PING;
+            ping(metadata);
 
-        String viewsDatabase = "ts_srv_views_" + suffix;
-        ConnectionString views = new ConnectionString(ViewStoreSeedRunner.viewsUri(metadataUri, viewsDatabase));
-        assertThat(views.getDatabase()).isEqualTo(viewsDatabase);
-        assertThat(views.getCredential()).isNotNull();
-        assertThat(views.getCredential().getSource()).isEqualTo("admin");
-        assertThat(views.getCredential().equals(metadata.getCredential()))
-                .as("the derived connection retains the metadata identity").isTrue();
-        ping(views);
+            stage = Stage.VIEWS_URI;
+            String viewsDatabase = databases.views();
+            ConnectionString views = new ConnectionString(ViewStoreSeedRunner.viewsUri(metadataUri, viewsDatabase));
+            assertThat(views.getDatabase()).isEqualTo(viewsDatabase);
+            assertThat(views.getCredential()).isNotNull();
+            assertThat(views.getCredential().getSource()).isEqualTo("admin");
+            assertThat(views.getCredential().equals(metadata.getCredential()))
+                    .as("the derived connection retains the metadata identity").isTrue();
+            stage = Stage.VIEWS_PING;
+            ping(views);
+        } catch (MongoException | IllegalArgumentException failure) {
+            throw failureAt(stage, failure);
+        }
+    }
+
+    record Databases(String metadata, String views) {}
+
+    static Databases databases(UUID identity) {
+        String suffix = identity.toString().replace("-", "");
+        // Atlas Free accepts at most 38 bytes; keep the full UUID in both distinct names.
+        return new Databases("ts_m_" + suffix, "ts_v_" + suffix);
+    }
+
+    enum Stage { METADATA_URI, METADATA_PING, VIEWS_URI, VIEWS_PING }
+
+    static AssertionError failureAt(Stage stage, RuntimeException failure) {
+        String code = failure instanceof MongoException mongo ? " code=" + mongo.getCode() : "";
+        return new AssertionError("Controlled SRV connection failed at " + stage + ": "
+                + failure.getClass().getSimpleName() + code);
     }
 
     private static void ping(ConnectionString connection) {
@@ -64,9 +86,14 @@ class AnOnPremSrvViewsConnectionKeepsItsAuthenticationDatabaseIT {
                 .applyToClusterSettings(cluster -> cluster.serverSelectionTimeout(15, TimeUnit.SECONDS))
                 .timeout(20, TimeUnit.SECONDS).build();
         try (var client = MongoClients.create(settings)) {
-            assertThat(client.getDatabase(connection.getDatabase()).runCommand(new Document("ping", 1))
-                    .getDouble("ok")).isEqualTo(1.0);
+            assertSuccessfulPing(client.getDatabase(connection.getDatabase()).runCommand(new Document("ping", 1)));
         }
+    }
+
+    static void assertSuccessfulPing(Document response) {
+        Object ok = response.get("ok");
+        assertThat(ok instanceof Number).as("ping returns a numeric status").isTrue();
+        assertThat(((Number) ok).doubleValue()).isEqualTo(1.0);
     }
 
     private static String inDatabase(String uri, String database) {
