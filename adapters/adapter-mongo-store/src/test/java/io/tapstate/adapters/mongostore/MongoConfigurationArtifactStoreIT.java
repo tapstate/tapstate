@@ -34,7 +34,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoConfigurationArtifactStoreIT {
     @Container
-    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final DslParser PARSER = new DslParser();
 
     @Test
@@ -325,6 +326,125 @@ class MongoConfigurationArtifactStoreIT {
                     .isInstanceOfSatisfying(TapstateException.class,
                             error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
             assertThat(keys.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void concurrentBootstrapProcessesChooseOnePersistentKeyAndOneOperation() {
+        withStore((unused, database) -> {
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (var executor = Executors.newFixedThreadPool(2)) {
+                CountDownLatch start = new CountDownLatch(1);
+                var first = executor.submit(() -> {
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                            "cluster-a", "installation-a", "setup-a", 1);
+                });
+                var second = executor.submit(() -> {
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                            "cluster-a", "installation-a", "setup-a", 1);
+                });
+                start.countDown();
+                try (var firstDomain = first.get(30, TimeUnit.SECONDS);
+                        var secondDomain = second.get(30, TimeUnit.SECONDS)) {
+                    Resource source = source("proof", "only-winning-key");
+                    firstDomain.artifacts().save(source);
+                    assertThat(secondDomain.artifacts().get("proof")).contains(source);
+                }
+            }
+            Document key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            try (var retry = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                assertThat(retry.artifacts().get("proof")).isPresent();
+                assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+            }
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.STORAGE_SETUP.on(database).find().first())
+                    .containsEntry("phase", MongoConfigurationBootstrap.PREPARED)
+                    .containsEntry("operationId", "setup-a").containsEntry("generation", 1L);
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .containsExactlyInAnyOrder("storage_setup", "cluster_identity", "cluster_keys",
+                            "schema_migrations", "configuration_version", "sources");
+        });
+    }
+
+    @Test
+    void bootstrapCannotResetAnotherOperationOrACompletedPhase() {
+        withStore((unused, database) -> {
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (var domain = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                domain.artifacts().save(source("original", "secret"));
+            }
+            Document key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            for (String[] identity : List.of(new String[]{"cluster-b", "installation-a", "setup-a"},
+                    new String[]{"cluster-a", "installation-b", "setup-a"},
+                    new String[]{"cluster-a", "installation-a", "setup-b"})) {
+                assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                        identity[0], identity[1], identity[2], 1))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(StoreError.INITIALIZATION_REFUSED));
+            }
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 2)).isInstanceOf(TapstateException.class);
+            SystemCollections.STORAGE_SETUP.on(database).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("phase", "COMPLETE")));
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)).isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+            assertThat(revision(database)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void bootstrapDoesNotBrandAnOccupiedTargetOrRepairAMissingKey() {
+        withStore((unused, database) -> {
+            // Even one pre-existing control fact without the complete identity is an unknown target.
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.INITIALIZATION_REFUSED));
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).countDocuments()).isZero();
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (var ignored = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
+            }
+            SystemCollections.CLUSTER_KEYS.on(database).deleteMany(new Document());
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
+        });
+    }
+
+    @Test
+    void bootstrapNamespaceFailuresAreCodedAndDoNotWriteAnyFacts() {
+        withStore((unused, database) -> {
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (MongoClient admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1))
+                        .append("data", new Document("failCommands", List.of("listCollections"))
+                                .append("errorCode", 13)));
+                try {
+                    assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                            "cluster-a", "installation-a", "setup-a", 1))
+                            .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                                assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                                assertThat(coded.args()).containsExactlyEntriesOf(
+                                        Map.of("detail", "MongoCommandException code=13"));
+                                assertThat(coded.getCause()).isNull();
+                            });
+                } finally {
+                    admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", "off"));
+                }
+            }
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>())).isEmpty();
         });
     }
 

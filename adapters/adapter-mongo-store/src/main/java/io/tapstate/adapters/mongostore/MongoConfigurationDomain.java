@@ -26,7 +26,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
 
-    private MongoConfigurationDomain(MongoConnection connection, String clusterId) {
+    MongoConfigurationDomain(MongoConnection connection, String clusterId) {
         this.connection = connection;
         MongoDatabase database = connection.database();
         Document identity = StoreIo.call(() -> durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database))

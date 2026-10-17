@@ -45,6 +45,9 @@ public enum StoreError implements TapstateErrorCode {
     /** A prepared key cannot become active until every live node session has acknowledged its epoch. */
     SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED("store.source-config-keyring-rotation-blocked", Set.of()),
 
+    /** Existing configuration facts do not belong to this exact new-installation operation. */
+    INITIALIZATION_REFUSED("store.initialization-refused", Set.of()),
+
     /**
      * The configured TLS CA certificate file could not be read or parsed. {@code path} is the CA
      * file path (a filesystem path, not a credential, so it is safe to echo back). Reached only when

@@ -32,3 +32,4 @@ configuration_version | config | MongoConfigurationArtifactStore | migrated | 1 
 cluster_identity | config | MongoConfigurationDomain | migrated | 1 | -
 schema_migrations | config | MongoConfigurationDomain | migrated | 1 | -
 cluster_keys | config | MongoConfigurationDomain | migrated | 1 | -
+storage_setup | config | MongoConfigurationBootstrap | migrated | 1 | -

@@ -507,6 +507,9 @@ store.source-config-keyring-not-ready:
 store.source-config-keyring-rotation-blocked:
   message: "The prepared Source config key cannot become active because a live node has not loaded it."
   solution: "Wait for every current node session to renew, or remove the failed node and wait for its lease to expire, then retry rotation."
+store.initialization-refused:
+  message: "Configuration initialization cannot proceed for this installation operation."
+  solution: "Verify the original installation identity, operation and generation. Inspect the existing configuration; do not reset its identity or encryption key."
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
