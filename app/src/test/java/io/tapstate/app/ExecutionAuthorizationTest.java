@@ -482,6 +482,68 @@ class ExecutionAuthorizationTest {
         assertThat(prepared).as("nothing prepared for the run that was rebuilt over").hasSize(1);
     }
 
+    @Test
+    void aCurrentRunOpensAndUsesItsSinkWriter() throws Exception {
+        ExecutionFence fence = submittedRun();
+        CountingWriter target = new CountingWriter();
+        try (ExecutionAuthorization authorization = guard(claims);
+                var hazelcast = org.mockito.Mockito.mockStatic(com.hazelcast.core.Hazelcast.class)) {
+            HazelcastInstance member = mock(HazelcastInstance.class);
+            when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY, authorization)));
+            hazelcast.when(com.hazelcast.core.Hazelcast::getAllHazelcastInstances).thenReturn(Set.of(member));
+            try (SinkWriter writer = FencedSinkWriterFactory.heldTo(() -> target, fence).get()) {
+                writer.write(List.of());
+            }
+            assertThat(target.batches).hasValue(1);
+        }
+    }
+
+    @Test
+    void aSupersededRunCannotOpenItsSinkConnector() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence old = nodeA.beginExecution("orders").fence();
+        nodeA.beginExecution("orders");
+        AtomicInteger opened = new AtomicInteger();
+        try (ExecutionAuthorization authorization = guard(claims);
+                var hazelcast = org.mockito.Mockito.mockStatic(com.hazelcast.core.Hazelcast.class)) {
+            HazelcastInstance member = mock(HazelcastInstance.class);
+            when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY, authorization)));
+            hazelcast.when(com.hazelcast.core.Hazelcast::getAllHazelcastInstances).thenReturn(Set.of(member));
+            SupplierEx<? extends SinkWriter> factory = FencedSinkWriterFactory.heldTo(() -> {
+                opened.incrementAndGet();
+                return new CountingWriter();
+            }, old);
+            assertThatThrownBy(factory::get).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            assertThat(opened).as("plugin construction and init belong behind the run guard").hasValue(0);
+        }
+    }
+
+    @Test
+    void losingAuthorityDuringSinkOpenClosesTheUnpublishedWriter() {
+        ExecutionFence fence = submittedRun();
+        AtomicInteger closed = new AtomicInteger();
+        try (ExecutionAuthorization authorization = guard(claims);
+                var hazelcast = org.mockito.Mockito.mockStatic(com.hazelcast.core.Hazelcast.class)) {
+            HazelcastInstance member = mock(HazelcastInstance.class);
+            when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY, authorization)));
+            hazelcast.when(com.hazelcast.core.Hazelcast::getAllHazelcastInstances).thenReturn(Set.of(member));
+            SupplierEx<? extends SinkWriter> factory = FencedSinkWriterFactory.heldTo(() -> {
+                elapse(TTL.plusSeconds(1));
+                return new SinkWriter() {
+                    @Override public CompletionStage<WriteResult> write(List<Envelope> records) {
+                        throw new AssertionError("an unpublished writer must not write");
+                    }
+                    @Override public void close() { closed.incrementAndGet(); }
+                };
+            }, fence);
+            assertThatThrownBy(factory::get).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            assertThat(closed).as("a blocked open cannot leak its connector after losing the run").hasValue(1);
+        }
+    }
+
     /** Writers of tables prepared for them, recording each preparing. */
     private static final class PreparingWriters implements SupplierEx<SinkWriter>, PreparesTargets {
 
