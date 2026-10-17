@@ -1352,6 +1352,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
+          # The post-publication docs scan reads the frozen base..sha range.
+          fetch-depth: 0
       - name: tag and release every satellite
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
