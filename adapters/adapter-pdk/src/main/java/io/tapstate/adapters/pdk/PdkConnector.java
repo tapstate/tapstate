@@ -139,6 +139,7 @@ final class PdkConnector implements AutoCloseable {
         String pipelineId = node == null ? null : node.pipelineId();
         gateApiLevel(connectorId, ref);
         java.util.concurrent.atomic.AtomicBoolean notesActive = new java.util.concurrent.atomic.AtomicBoolean(true);
+        Map<String, Object> effectiveSettings = settings;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredState = null;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredGlobal = null;
         if (noteScopes != null) {
@@ -161,6 +162,12 @@ final class PdkConnector implements AutoCloseable {
             }
             var earlier = blocked ? List.<io.tapstate.spi.store.RequiredNoteScope>of()
                     : prepared.stream().map(RequiredNoteCarry::source).toList();
+            var origin = captured.store().origin(primary);
+            var requestedOrigin = ConnectorNoteOrigin.capture(connectorId, ref.contentHash(), settings);
+            if (!origin.equals(requestedOrigin)) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
+            }
+            effectiveSettings = ConnectorNoteOrigin.settings(requestedOrigin);
             var global = captured.open(ConnectorStateNamespace.GLOBAL);
             configuredState = new ScopedDurableStateMap(captured.store(), primary, earlier, notes != null, captured::requireActive);
             configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);
@@ -204,7 +211,7 @@ final class PdkConnector implements AutoCloseable {
             // and drift the first time either grows a second source.
             TapNodeSpecification specification = new TapNodeSpecification();
             specification.setDataTypesMap(dataTypesFrom(ref.spec()));
-            Map<String, Object> config = ConfigTypeCoercion.coerce(connectorId, ref.spec(), settings);
+            Map<String, Object> config = ConfigTypeCoercion.coerce(connectorId, ref.spec(), effectiveSettings);
             TapConnectorContext context = new TapConnectorContext(
                     specification, DataMap.create(config), nodeConfigFrom(ref.spec(), config),
                     new ConnectorLog(connectorId, pipelineId));

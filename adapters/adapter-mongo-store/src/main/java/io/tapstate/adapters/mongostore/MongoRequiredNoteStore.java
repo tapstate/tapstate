@@ -11,10 +11,12 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.common.JsonWriter;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteOrigin;
 import io.tapstate.spi.store.RequiredNoteCarry;
 import io.tapstate.spi.store.RequiredNoteScope;
 import io.tapstate.spi.store.RequiredNoteStore;
@@ -40,6 +42,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     private final MongoCollection<Document> notes;
     private final MongoCollection<Document> migrations;
     private final MongoCollection<Document> carryRows;
+    private final MongoCollection<Document> origins;
     private final MongoCollection<Document> identity;
     private final MongoCollection<Document> operators;
     private final SourceConfigCipherProvider ciphers;
@@ -56,6 +59,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         this.notes = durable(SystemCollections.PDK_NOTES.on(database));
         this.migrations = durable(SystemCollections.PDK_NOTE_MIGRATIONS.on(database));
         this.carryRows = durable(SystemCollections.PDK_NOTE_CARRIES.on(database));
+        this.origins = durable(SystemCollections.PDK_NOTE_ORIGINS.on(database));
         this.identity = durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database));
         this.operators = durable(SystemCollections.OPERATOR_GENERATIONS.on(database));
         this.ciphers = Objects.requireNonNull(ciphers, "ciphers");
@@ -68,6 +72,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         this.notes = original.notes;
         this.migrations = original.migrations;
         this.carryRows = original.carryRows;
+        this.origins = original.origins;
         this.identity = original.identity;
         this.operators = original.operators;
         this.ciphers = original.ciphers;
@@ -100,7 +105,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                         if (existing == null) {
                             existing = new Document("_id", scopeId(owner)).append("ownerKind", owner.kind().name())
                                     .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
-                                    .append("outgoingCarries", 0L).append("incomingCarries", 0L);
+                                    .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L);
                             scopes.insertOne(session, existing);
                         }
                         return scopeOf(owner, existing);
@@ -116,6 +121,13 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             StoreIo.run(() -> {
                 requireActive.run();
                 for (var index : SystemCollections.PDK_NOTE_CARRIES.indexes()) IndexEnsure.createIfAbsent(carryRows, index);
+                requireActive.run();
+            });
+        }
+        if (owner.kind() != RequiredNoteOwner.Kind.GLOBAL) {
+            StoreIo.run(() -> {
+                requireActive.run();
+                for (var index : SystemCollections.PDK_NOTE_ORIGINS.indexes()) IndexEnsure.createIfAbsent(origins, index);
                 requireActive.run();
             });
         }
@@ -137,6 +149,40 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return StoreIo.call(() -> transaction(session -> {
             verifyScope(session, scope, false);
             return decode(scope, key, notes.find(session, byNote(scope, key)).first());
+        }));
+    }
+
+    @Override
+    public RequiredNoteOrigin prepareOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
+        requireOriginScope(scope);
+        Objects.requireNonNull(origin, "origin");
+        return withOriginIndexes(() -> transaction(session -> {
+            SourceConfigCipher cipher = cipherForWrite(session);
+            Document metadata = verifyScope(session, scope, true);
+            RequiredNoteOrigin retained = retainedOrigin(session, scope, metadata);
+            if (retained != null) {
+                if (!retained.equals(origin)) throw originMismatch();
+                return retained;
+            }
+            if (notes.find(session, new Document("_id.bindingVersion", scope.owner().bindingVersion())
+                    .append("_id.namespace", scope.owner().namespace()).append("_id.generation", scope.generation())).first() != null) {
+                throw unavailable();
+            }
+            origins.insertOne(session, originDocument(scope, origin, cipher));
+            if (scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation())
+                            .append("originGeneration", 0L),
+                    new Document("$set", new Document("originGeneration", scope.generation()))).getMatchedCount() != 1) throw unavailable();
+            return origin;
+        }));
+    }
+
+    @Override
+    public RequiredNoteOrigin origin(RequiredNoteScope scope) {
+        requireOriginScope(scope);
+        return withOriginIndexes(() -> transaction(session -> {
+            RequiredNoteOrigin retained = retainedOrigin(session, scope, verifyScope(session, scope, false));
+            if (retained == null) throw unavailable();
+            return retained;
         }));
     }
 
@@ -191,13 +237,20 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     @Override
     public RequiredNoteScope clear(RequiredNoteScope scope, boolean blockEarlierValues) {
         return StoreIo.call(() -> transaction(session -> {
-            cipherForWrite(session);
-            verifyScope(session, scope, true);
+            SourceConfigCipher cipher = cipherForWrite(session);
+            Document metadata = verifyScope(session, scope, true);
             requirePrivateUnreferenced(session, scope);
             if (scope.generation() == Long.MAX_VALUE) throw unreadable("generation");
+            RequiredNoteOrigin origin = scope.owner().kind() == RequiredNoteOwner.Kind.GLOBAL ? null
+                    : retainedOrigin(session, scope, metadata);
+            if (scope.owner().kind() != RequiredNoteOwner.Kind.GLOBAL && origin == null) throw unavailable();
+            RequiredNoteScope next = new RequiredNoteScope(scope.owner(), scope.generation() + 1);
+            if (origin != null && origins.replaceOne(session, byScope(scope.owner()).append("generation", scope.generation()),
+                    originDocument(next, origin, cipher)).getMatchedCount() != 1) throw unavailable();
             if (blockEarlierValues) block(session, scope.owner(), ALL_KEYS);
             long matched = scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
-                    new Document("$inc", new Document("generation", 1L))).getMatchedCount();
+                    new Document("$inc", new Document("generation", 1L))
+                            .append("$set", new Document("originGeneration", origin == null ? 0L : next.generation()))).getMatchedCount();
             if (matched != 1) throw unavailable();
             return new RequiredNoteScope(scope.owner(), scope.generation() + 1);
         }));
@@ -237,13 +290,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             for (RequiredNoteCarry existing : retained) {
                 if (carryId(existing).equals(carryId(carry))) {
                     if (!existing.equals(carry)) throw unavailable();
-                    verifyCarrySource(session, existing.source(), false);
+                    Document source = verifyCarrySource(session, existing.source(), false);
+                    compatibleOrigins(session, carry.shared(), target, existing.source(), source);
                     return existing;
                 }
             }
             if (blocked(session, carry.shared().owner(), ALL_KEYS)) throw unavailable();
             Document source = verifyScope(session, carry.source(), true);
             incoming(session, carry.source().owner(), source);
+            compatibleOrigins(session, carry.shared(), target, carry.source(), source);
             carryRows.insertOne(session, carryDocument(carry));
             changeCount(session, carry.shared(), "outgoingCarries", carryCount(target, "outgoingCarries"), 1);
             changeCount(session, carry.source(), "incomingCarries", carryCount(source, "incomingCarries"), 1);
@@ -261,6 +316,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             List<RequiredNoteCarry> current = retained.stream().filter(carry -> carry.shared().equals(shared)).toList();
             for (RequiredNoteCarry carry : current) {
                 Document source = verifyCarrySource(session, carry.source(), false);
+                compatibleOrigins(session, shared, metadata, carry.source(), source);
                 if (!incoming(session, carry.source().owner(), source).contains(carry)) throw unavailable();
             }
             return current;
@@ -278,6 +334,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             if (blocked(session, carry.shared().owner(), ALL_KEYS)
                     || blocked(session, carry.shared().owner(), "removed:" + key)) return new RequiredNoteValue(0, null);
             Document source = verifyCarrySource(session, carry.source(), false);
+            compatibleOrigins(session, carry.shared(), metadata, carry.source(), source);
             if (!incoming(session, carry.source().owner(), source).contains(carry)) throw unavailable();
             return decode(carry.source(), key, notes.find(session, byNote(carry.source(), key)).first());
         }));
@@ -298,6 +355,8 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return withCarryIndexes(() -> transaction(session -> {
             cipherForWrite(session);
             Document metadata = verifyScope(session, shared, true);
+            RequiredNoteOrigin origin = retainedOrigin(session, shared, metadata);
+            if (origin == null) throw unavailable();
             if (shared.generation() == Long.MAX_VALUE) throw unreadable("generation");
             List<RequiredNoteCarry> retained = outgoing(session, shared.owner(), metadata);
             for (RequiredNoteCarry carry : retained) {
@@ -307,11 +366,13 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                 if (carryRows.deleteOne(session, new Document("_id", carryId(carry))).getDeletedCount() != 1) throw unavailable();
                 changeCount(session, carry.source(), "incomingCarries", carryCount(source, "incomingCarries"), -1);
             }
+            if (origin != null && origins.deleteOne(session, byScope(shared.owner())
+                    .append("generation", shared.generation())).getDeletedCount() != 1) throw unavailable();
             block(session, shared.owner(), ALL_KEYS);
             long matched = scopes.updateOne(session, byScope(shared.owner()).append("generation", shared.generation())
                             .append("outgoingCarries", carryCount(metadata, "outgoingCarries")),
                     new Document("$inc", new Document("generation", 1L))
-                            .append("$set", new Document("outgoingCarries", 0L))).getMatchedCount();
+                            .append("$set", new Document("outgoingCarries", 0L).append("originGeneration", 0L))).getMatchedCount();
             if (matched != 1) throw unavailable();
             return new RequiredNoteScope(shared.owner(), shared.generation() + 1);
         }));
@@ -423,6 +484,69 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         }
     }
 
+    private RequiredNoteOrigin retainedOrigin(ClientSession session, RequiredNoteScope scope, Document metadata) {
+        scopeOf(scope.owner(), metadata);
+        Document stored = origins.find(session, byScope(scope.owner())).first();
+        if (Long.valueOf(0).equals(metadata.get("originGeneration"))) {
+            if (stored != null) throw unreadable("origin");
+            return null;
+        }
+        if (stored == null || !Long.valueOf(scope.generation()).equals(stored.get("generation"))
+                || !(stored.get("value") instanceof String value)) throw unreadable("origin");
+        try {
+            Object parsed = JsonReader.parse(ciphers.current().decrypt(originContext(scope), "pdk-note-origin", value));
+            if (!(parsed instanceof Map<?, ?> tree) || !Long.valueOf(1).equals(tree.get("version"))) throw unreadable("origin");
+            return new RequiredNoteOrigin((String) tree.get("connectorId"), (String) tree.get("artifactHash"),
+                    Base64.getUrlDecoder().decode((String) tree.get("settings")));
+        } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
+            throw unreadable("origin");
+        } catch (TapstateException invalid) {
+            if (invalid.code() != IoError.DOCUMENT_UNREADABLE) throw invalid;
+            throw unreadable("origin");
+        }
+    }
+
+    private static Document originDocument(RequiredNoteScope scope, RequiredNoteOrigin origin, SourceConfigCipher cipher) {
+        String body = JsonWriter.write(Map.of("version", 1, "connectorId", origin.connectorId(), "artifactHash", origin.artifactHash(),
+                "settings", Base64.getUrlEncoder().withoutPadding().encodeToString(origin.settings())));
+        return new Document("_id", scopeId(scope.owner())).append("generation", scope.generation())
+                .append("value", cipher.encrypt(originContext(scope), "pdk-note-origin", body));
+    }
+
+    private void compatibleOrigins(ClientSession session, RequiredNoteScope shared, Document sharedMetadata,
+            RequiredNoteScope source, Document sourceMetadata) {
+        RequiredNoteOrigin target = retainedOrigin(session, shared, sharedMetadata);
+        RequiredNoteOrigin earlier = retainedOrigin(session, source, sourceMetadata);
+        if (target == null || earlier == null) throw unavailable();
+        if (!target.equals(earlier)) throw originMismatch();
+    }
+
+    private <T> T withOriginIndexes(java.util.function.Supplier<T> body) {
+        return StoreIo.call(() -> {
+            requireActive.run();
+            for (var declared : SystemCollections.PDK_NOTE_ORIGINS.indexes()) {
+                Document found = IndexEnsure.existing(origins, declared);
+                Document keys = new Document();
+                declared.keys().forEach(key -> keys.append(key, 1));
+                if (found == null || !keys.equals(found.get("key")) || !Boolean.TRUE.equals(found.get("unique"))) throw unreadable("originIndex");
+            }
+            return body.get();
+        });
+    }
+
+    private static String originContext(RequiredNoteScope scope) {
+        return JsonWriter.write(List.of(scope.owner().bindingVersion(), scope.owner().namespace(), scope.generation()));
+    }
+
+    private static void requireOriginScope(RequiredNoteScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        if (scope.owner().kind() == RequiredNoteOwner.Kind.GLOBAL) throw new IllegalArgumentException("global notes have no single connector origin");
+    }
+
+    private static TapstateException originMismatch() {
+        return new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
+    }
+
     private static TapstateException referenced() {
         return new TapstateException(IoError.NOTE_REFERENCED, Map.of(), null);
     }
@@ -502,6 +626,9 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         if (!(document.get("writeFence") instanceof Long fence) || fence < 0 || fence == Long.MAX_VALUE) {
             throw unreadable("writeFence");
         }
+        if (!(document.get("originGeneration") instanceof Long originGeneration)
+                || (originGeneration != 0 && originGeneration != generation)
+                || (owner.kind() == RequiredNoteOwner.Kind.GLOBAL && originGeneration != 0)) throw unreadable("originGeneration");
         long outgoing = carryCount(document, "outgoingCarries");
         long incoming = carryCount(document, "incomingCarries");
         if ((owner.kind() != RequiredNoteOwner.Kind.CHAIN && outgoing != 0)

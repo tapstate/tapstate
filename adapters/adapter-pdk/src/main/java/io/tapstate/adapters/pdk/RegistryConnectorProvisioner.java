@@ -44,7 +44,23 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
 
     @Override
     public ConnectorRef resolve(String connectorId) {
-        ConnectorRegistration registration = resolveRegistration(connectorId);
+        return materialize(connectorId, resolveRegistration(connectorId));
+    }
+
+    @Override
+    public ConnectorRef resolve(String connectorId, String contentHash) {
+        if (contentHash == null || !contentHash.matches("[a-f0-9]{64}")) {
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
+        List<ConnectorRegistration> matches = registry.findAll(connectorId).stream()
+                .filter(registration -> contentHash.equals(registration.contentHash())).toList();
+        if (matches.size() != 1) {
+            throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
+        }
+        return materialize(connectorId, matches.getFirst());
+    }
+
+    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration) {
         Path staged = stage(connectorId, registration.contentHash());
         IntrospectedConnector introspected = introspector.introspect(List.of(staged));
         boolean shareSafe = registry.shareSafeCertification(connectorId, registration.contentHash()).isPresent();

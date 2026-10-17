@@ -69,6 +69,9 @@ public enum IoError implements TapstateErrorCode {
     /** A note command lost its captured key revision and must not overwrite the current value. */
     NOTE_WRITE_CONFLICT("io.note-write-conflict", Set.of()),
 
+    /** A connector must not reuse retained notes with another connection or artifact. */
+    NOTE_ORIGIN_MISMATCH("io.note-origin-mismatch", Set.of()),
+
     /** A retained shared capture still depends on this private note scope. */
     NOTE_REFERENCED("io.note-referenced", Set.of()),
 

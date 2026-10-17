@@ -244,7 +244,7 @@ class ScopedDurableStateMapTest {
 
     @Test
     void theConfiguredContextUsesFixedScopesAndRefusesNotesAfterClose(@TempDir Path dir) {
-        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null);
+        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, null, "a".repeat(64), false);
         var local = pipeline("p1", "source");
         var global = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.global-state",
                 RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0), 1);
@@ -282,7 +282,7 @@ class ScopedDurableStateMapTest {
 
     @Test
     void aSharedContextLoadsRetainedDependenciesThatTheCurrentConsumerListNoLongerNames(@TempDir Path dir) {
-        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null);
+        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, null, "a".repeat(64), false);
         var currentConsumer = pipeline("p2", "source");
         var global = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0), 1);
         List<String> opened = new ArrayList<>();
@@ -330,7 +330,7 @@ class ScopedDurableStateMapTest {
 
     @Test
     void aSharedClearBarrierDoesNotReintroduceTheCurrentConsumerAsAnEarlierSource(@TempDir Path dir) {
-        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null);
+        var reference = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, null, "a".repeat(64), false);
         var global = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0), 1);
         var store = scripted((method, args) -> switch (method) {
             case "carries" -> List.of();
@@ -394,6 +394,7 @@ class ScopedDurableStateMapTest {
                 new Class<?>[]{RequiredNoteStore.class}, (proxy, method, args) -> {
                     // Database retry checks are witnessed against Mongo; these scripts inspect PDK commands.
                     if (method.getName().equals("guardedBy")) return proxy;
+                    if (method.getName().equals("origin")) return ConnectorNoteOrigin.capture("demo", "a".repeat(64), Map.of());
                     return script.call(method.getName(), args);
                 });
     }

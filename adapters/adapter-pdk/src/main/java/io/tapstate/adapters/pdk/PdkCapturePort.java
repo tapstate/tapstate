@@ -524,16 +524,32 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         CompletableFuture<Void> released = new CompletableFuture<>();
         Thread thread = new Thread(() -> {
             try {
-                PdkConnector connector = PdkConnector.open(config.connectorId(),
-                        provisioner.resolve(config.connectorId()), config.settings(), config.node(), notes,
-                        config.sharedNotes(), releaseScopes);
+                String connectorId = config.connectorId();
+                Map<String, Object> settings = config.settings();
+                ConnectorRef reference;
+                ConnectorNoteScopes connectorScopes = releaseScopes;
+                if (releaseScopes == null) {
+                    reference = provisioner.resolve(connectorId);
+                } else {
+                    String namespace = config.sharedNotes() == null ? ConnectorStateNamespace.of(config.node())
+                            : ConnectorStateNamespace.ofShared(config.sharedNotes().sharedBy());
+                    var scope = releaseScopes.open(namespace);
+                    var origin = releaseScopes.store().origin(scope);
+                    connectorId = origin.connectorId();
+                    settings = ConnectorNoteOrigin.settings(origin);
+                    reference = provisioner.resolve(connectorId, origin.artifactHash());
+                    connectorScopes = ConnectorNoteScopes.of(releaseScopes.store(), requested ->
+                            requested.equals(namespace) ? scope : releaseScopes.open(requested), releaseScopes::requireActive);
+                }
+                PdkConnector connector = PdkConnector.open(connectorId, reference, settings, config.node(), notes,
+                        config.sharedNotes(), connectorScopes);
                 try {
                     List<String> names = namedOnTheSource(connector);
                     named.set(names);
                     ReleaseExternalFunction release = connector.functions().getReleaseExternalFunction();
                     if (release != null) {
                         LOG.info("connector {} is letting go of what it set up on its source to read changes ({})",
-                                config.connectorId(),
+                                connectorId,
                                 names.isEmpty() ? "nothing its notes name" : String.join(", ", names));
                         connector.underLoader(() -> {
                             if (releaseScopes != null) releaseScopes.requireActive();

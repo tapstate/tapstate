@@ -594,6 +594,11 @@ final class Synthetic {
      * having first, with {@code writeAfterInterrupt}, tried to write a note, reporting under {@code lateWrite}
      * whether the write was taken.
      */
+    static Path originMutatingConnector(Path dir, String channel) {
+        return SyntheticJar.compileToJar(dir, "synthetic.OriginMutating",
+                source("OriginMutating", "((Runnable) System.getProperties().get(\"" + channel + "\")).run();", ""));
+    }
+
     static Path slotKeepingSource(Path dir, String channel) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
@@ -609,6 +614,7 @@ final class Synthetic {
                 + "  consumer.accept(evs, null);"
                 + "});"
                 + "functions.supportReleaseExternalFunction(context -> {"
+                + "  channel().put(\"releaseSettings\", new LinkedHashMap<>(context.getConnectionConfig()));"
                 + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
                 + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
                 + "  if (channel().containsKey(\"hang\")) {"

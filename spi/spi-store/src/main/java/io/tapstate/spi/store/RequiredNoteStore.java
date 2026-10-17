@@ -15,6 +15,12 @@ public interface RequiredNoteStore {
 
     RequiredNoteValue read(RequiredNoteScope scope, String key);
 
+    /** Explicit preparation before plugin code; a retained or missing published origin is never overwritten. */
+    RequiredNoteOrigin prepareOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin);
+
+    /** Load the exact prepared context without repairing missing facts or following a newer scope. */
+    RequiredNoteOrigin origin(RequiredNoteScope scope);
+
     /** Explicit authorized preparation, before a shared drive can use earlier private notes. */
     RequiredNoteCarry prepareCarry(RequiredNoteCarry carry);
 
