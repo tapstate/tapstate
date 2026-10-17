@@ -1,7 +1,5 @@
 package io.tapstate.adapters.mongostore.migration;
 
-import io.tapstate.adapters.mongostore.SharedMongoCase;
-
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -21,11 +19,13 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -40,22 +40,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class V12EncryptSourceConfigsIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final DslParser PARSER = new DslParser();
     private static final CanonicalWriter WRITER = new CanonicalWriter();
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(V12EncryptSourceConfigsIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static MongoClient client;
 
-    @AfterEach
-    void closeClient() {
-        try {
-            if (client != null) client.close();
-        } finally {
-            client = null;
-        }
+    @AfterAll
+    static void closeClient() {
+        if (client != null) client.close();
     }
 
     @Test
@@ -313,7 +309,7 @@ class V12EncryptSourceConfigsIT {
                 .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
                 .addCommandListener(editBeforeEncryptionCas).build();
         try (MongoClient migrating = MongoClients.create(settings)) {
-            assertThatThrownBy(() -> MigrationRunner.migrate(migrating.getDatabase(REPLICA_SET.database(database.getName()))))
+            assertThatThrownBy(() -> MigrationRunner.migrate(migrating.getDatabase(database.getName())))
                     .isInstanceOfSatisfying(TapstateException.class, failure -> {
                         assertThat(failure.code()).isEqualTo(io.tapstate.adapters.mongostore.MigrationError.CHANGESET_FAILED);
                         assertThat(failure.getCause()).isInstanceOf(IllegalStateException.class)
@@ -358,7 +354,7 @@ class V12EncryptSourceConfigsIT {
 
     private static MongoDatabase freshDatabase(String name) {
         if (client == null) client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
-        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
+        MongoDatabase database = client.getDatabase(name);
         database.drop();
         return database;
     }

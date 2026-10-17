@@ -1,11 +1,6 @@
 {
   "schema": 1,
-  "e2e_shards": 6,
-  "app_shards": 4,
-  "rest_modules": {
-    "unit-fixtures": [
-      "e2e"
-    ]
-  },
+  "e2e_shards": 2,
+  "rest_modules": {},
   "new_test_seconds": 30.0
 }

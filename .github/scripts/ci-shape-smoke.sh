@@ -57,7 +57,7 @@ def check(workflows, contexts, inputs):
     for role in ('test-shards', 'build'):
         block = ci[role]
         assert block.count('ci-build-observation.sh') == 1, 'each original prepare must capture one observation'
-        assert ' -- mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install' in block, 'complete prepare must retain bounded two-thread compilation and skipped test execution'
+        assert ' -- mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install' in block, 'complete prepare must remain serial and skip test execution'
         assert '--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"' in block, 'prepare observation is not bound to the input snapshot'
     assert shards.count('--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"') == 2, 'both worker snapshots must retain the same prepare observation'
     assert build.count('--shard-id build') == 2, 'aggregate prepare and input snapshot must both declare build'
@@ -68,18 +68,6 @@ def check(workflows, contexts, inputs):
     assert 'python3 -m py_compile .github/scripts/_ci-test-jar-inputs.py .github/scripts/_ci-test-jar-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'test-JAR capture and controls must compile'
     assert 'python3 .github/scripts/_ci-mechanism-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'manual mechanism archive controls must run in every recipe'
     assert 'python3 -m py_compile .github/scripts/_ci-mechanism-inputs.py .github/scripts/_ci-mechanism-inputs-smoke.py' in ci.get('catalog-scripts', ''), 'manual mechanism archive readers and controls must compile'
-    assert 'ci-pr-work.sh' not in build, 'aggregate and Sonar must not be interrupted by the test supervisor'
-    assert shards.count('ci-pr-work.sh') == 2, 'both worker preparation and selected verify must supervise their owned command'
-    assert '--phase prepare -- .github/scripts/ci-build-observation.sh' in shards
-    assert '--phase verify -- .github/scripts/ci-shard.sh run' in shards
-    assert shards.count('--event-inputs "$RUNNER_TEMP/ci-event-inputs.json"') == 2, 'both phases must bind the original event'
-    worker_lock = shards.split('    concurrency:\n', 1)[1].split('    strategy:', 1)[0]
-    assert '      cancel-in-progress: false' in worker_lock and '      queue: max' in worker_lock
-    assert "format('ci-test-{0}-{1}'" in worker_lock and 'matrix.shard' in worker_lock
-    assert "format('pr-{0}', github.event.pull_request.number)" in worker_lock
-    assert "format('run-{0}-{1}', github.run_id, github.run_attempt)" in worker_lock
-    assert 'github.event.pull_request.head.repo.full_name == github.repository' in worker_lock
-    assert 'python3 .github/scripts/_ci-pr-work-smoke.py' in ci.get('catalog-scripts', ''), 'owned work controls must run in CI'
     assert '--probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"' in shards, 'provider capture must stay in the original input artifact'
     assert 'python3 .github/scripts/_ci-provider-receipt-smoke.py' in ci.get('catalog-scripts', ''), 'provider capture controls must run in CI'
     assert 'python3 .github/scripts/_ci-provider-readback-smoke.py' in ci.get('catalog-scripts', ''), 'provider archive controls must run in CI'
@@ -119,7 +107,7 @@ def check(workflows, contexts, inputs):
             '-DskipSdkGeneration=true', 'client/java', 'install:install-file')), \
             f'{job} must not inject an unpublished or fake Cloud SDK'
     for job in ('test-shards', 'build'):
-        assert re.search(r'(?:run: | -- )mvn -B -T 2 -Dmaven\.repo\.local="\$RUNNER_TEMP/m2" -DskipTests install',
+        assert re.search(r'(?:run: | -- )mvn -B -Dmaven\.repo\.local="\$RUNNER_TEMP/m2" -DskipTests install',
                          ci[job]), f'{job} must resolve published dependencies in its isolated Maven build'
     assert 'bash deploy/docker/image-smoke.sh --build' in ci['image-smoke'] \
         and 'mvn -q -pl app -am -DskipTests package' in inputs['deploy/docker/image-smoke.sh'], \
@@ -168,13 +156,6 @@ for original, replacement in [
     ('python3 .github/scripts/_ci-provider-replay-smoke.py', 'echo active-provider-controls-removed'),
     ('python3 .github/scripts/_ci-provider-replay-readback-smoke.py', 'echo passive-replay-controls-removed'),
     ('python3 .github/scripts/_ci-provider-cases-smoke.py', 'echo provider-case-controls-removed'),
-    ('--phase prepare -- .github/scripts/ci-build-observation.sh', '--phase prepare -- unrelated-observer.sh'),
-    ('--phase verify -- .github/scripts/ci-shard.sh run', '--phase verify -- unrelated-shards.sh run'),
-    ('--event-inputs "$RUNNER_TEMP/ci-event-inputs.json"', '--event-inputs unrelated-event.json'),
-    ("format('ci-test-{0}-{1}'", "format('unrelated-{0}-{1}'"),
-    ('matrix.shard) }}', 'matrix.other) }}'),
-    ("format('run-{0}-{1}', github.run_id, github.run_attempt)", "format('shared-unknown')"),
-    ('python3 .github/scripts/_ci-pr-work-smoke.py', 'echo work-controls-removed'),
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
@@ -184,9 +165,9 @@ for original, replacement in [
     ('pattern: ci-inputs-*', 'pattern: no-worker-inputs'),
     ('    name: sonarqube', '    name: sonar-renamed'),
     ('  test-shards:', '  test-shards:\n    env:\n      CLOUD_SDK_REVISION: unpublished'),
-    (' -- mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install',
+    (' -- mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install',
      ' -- echo Maven-resolution-removed'),
-    (' -- mvn -B -T 2 ', ' -- mvn -B -T 4 '),
+    (' -- mvn -B ', ' -- mvn -B -T 4 '),
     ('-DskipTests install', '-Dmaven.test.skip=true install'),
     ('ci-build-observation.sh', 'observation-removed.sh'),
     ('--maven-observation "$RUNNER_TEMP/maven-observation/summary.json"', '--maven-observation omitted'),

@@ -5,7 +5,9 @@ import com.mongodb.client.MongoClients;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.util.Set;
 
@@ -15,14 +17,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoClusterMembershipStoreIT {
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoClusterMembershipStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET =
+            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     @Test
     void bootstrapHasOneWinnerAndTopologyRevisionsCannotBeRebasedByAStaleWriter() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.CLUSTER_MEMBERSHIP);
+            var collection = client.getDatabase("tapstate").getCollection(MongoStorePort.CLUSTER_MEMBERSHIP);
             collection.drop();
             MongoClusterMembershipStore store = new MongoClusterMembershipStore(collection);
 

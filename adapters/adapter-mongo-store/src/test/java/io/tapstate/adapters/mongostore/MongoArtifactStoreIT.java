@@ -21,7 +21,9 @@ import io.tapstate.testsupport.RequiresDocker;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -49,12 +51,12 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class MongoArtifactStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoArtifactStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static final String ORDERS = """
             version: tapstate/v1
@@ -521,7 +523,7 @@ class MongoArtifactStoreIT {
     @Test
     void aReadByKindIsAnIndexedLookupRatherThanAScanOfEveryArtifact() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoDatabase database = client.getDatabase(REPLICA_SET.database("tapstate"));
+            MongoDatabase database = client.getDatabase("tapstate");
             MongoCollection<Document> collection = database.getCollection("artifacts");
             collection.drop();
             MongoArtifactStore store = new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32]));
@@ -591,7 +593,7 @@ class MongoArtifactStoreIT {
     /** Runs a test body against a fresh artifact store over a clean collection on the real replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("artifacts");
+            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("artifacts");
             collection.drop();
             test.run(new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32])), collection);
         }

@@ -11,9 +11,11 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -31,9 +33,8 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 /** Real Mongo witnesses for durable writer leases, including loss without exception cleanup. */
 @RequiresDocker
 class MongoSchemaReclamationIT {
-    @RegisterExtension
-    private static final SharedMongoCase MONGO =
-            SharedMongoCase.forSuite(MongoSchemaReclamationIT.class);
+    @Container
+    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     @Test
     void aDeadWritersTablesSurviveUntilItsLeaseExpiresAndAreThenReclaimed() {
@@ -169,7 +170,7 @@ class MongoSchemaReclamationIT {
 
     private static void withCollection(Consumer<MongoCollection<Document>> test) {
         try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase(MONGO.database("tapstate")).getCollection("source_schemas");
+            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("source_schemas");
             collection.drop();
             test.accept(collection);
         }

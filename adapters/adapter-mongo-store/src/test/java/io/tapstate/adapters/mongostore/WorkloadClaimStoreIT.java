@@ -14,7 +14,9 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -36,9 +38,9 @@ class WorkloadClaimStoreIT {
             new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, "node-a");
     private static final Duration TTL = Duration.ofSeconds(30);
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(WorkloadClaimStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET =
+            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     @Test
     void concurrentBootsForOneStableNodeProduceOneClaimHolder() throws Exception {
@@ -230,7 +232,7 @@ class WorkloadClaimStoreIT {
                 })
                 .build();
         try (MongoClient client = MongoClients.create(settings)) {
-            var collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.WORKLOAD_CLAIMS);
+            var collection = client.getDatabase("tapstate").getCollection(MongoStorePort.WORKLOAD_CLAIMS);
             collection.drop();
             MongoWorkloadClaimStore store = new MongoWorkloadClaimStore(collection);
             List<WorkloadClaimKey> keys = new ArrayList<>();
@@ -253,7 +255,7 @@ class WorkloadClaimStoreIT {
 
     private static void withStore(CheckedBody body) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.WORKLOAD_CLAIMS);
+            var collection = client.getDatabase("tapstate").getCollection(MongoStorePort.WORKLOAD_CLAIMS);
             collection.drop();
             body.run(new MongoWorkloadClaimStore(collection), collection);
         } catch (RuntimeException | Error failure) {
