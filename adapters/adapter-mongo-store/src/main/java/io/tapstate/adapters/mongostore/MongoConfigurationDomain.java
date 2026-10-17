@@ -8,6 +8,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.PipelineStateMappings;
 import io.tapstate.spi.store.RequiredNoteStore;
 import io.tapstate.spi.store.StorageBindingStore;
 import io.tapstate.spi.store.IoError;
@@ -29,6 +30,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
     private final PipelineLayoutStore layouts;
+    private final PipelineStateMappings pipelineStates;
     private final RequiredNoteStore requiredNotes;
     private final MongoStorageBindingStore bindings;
 
@@ -61,6 +63,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         this.artifacts = new MongoConfigurationArtifactStore(connection.client(), database, key);
         this.requiredNotes = new MongoRequiredNoteStore(connection.client(), database, key);
         artifacts.verifySourceEnvelopes();
+        this.pipelineStates = new MongoPipelineStateMappings(connection.client(), database);
         this.bindings = new MongoStorageBindingStore(connection.client(), database, key);
         bindings.load();
         this.layouts = new MongoPipelineLayoutStore(connection.client(),
@@ -92,6 +95,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public RequiredNoteStore requiredNotes() {
         return requiredNotes;
+    }
+
+    public PipelineStateMappings pipelineStates() {
+        return pipelineStates;
     }
 
     public StorageBindingStore bindings() {

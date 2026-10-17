@@ -61,7 +61,7 @@ class MongoConfigurationArtifactStoreIT {
             assertThat(store.listStored("view")).isEmpty();
             assertThat(revision(database)).isEqualTo(1);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
-                    .containsExactlyInAnyOrder("sources", "pipelines", "configuration_version");
+                    .containsExactlyInAnyOrder("sources", "pipelines", "configuration_version", "operator_generations");
         });
     }
 
@@ -117,7 +117,7 @@ class MongoConfigurationArtifactStoreIT {
     @Test
     void normalCreateReplaceDeleteAllContendOnConfigurationRevision() {
         withStore((store, database) -> {
-            Resource original = pipeline("flow");
+            Resource original = source("flow", "original");
             assertThat(store.create(original)).isEqualTo(ArtifactMutation.CREATED);
             assertThat(revision(database)).isEqualTo(1);
             assertThat(store.create(source("flow", "secret"))).isEqualTo(ArtifactMutation.ALREADY_EXISTS);

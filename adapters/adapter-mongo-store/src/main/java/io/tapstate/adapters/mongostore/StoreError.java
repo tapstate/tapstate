@@ -51,6 +51,9 @@ public enum StoreError implements TapstateErrorCode {
     /** A normal authoring write cannot replace or remove the storage binding's system-owned Source. */
     DEFAULT_SOURCE_PROTECTED("store.default-source-protected", Set.of()),
 
+    /** A Pipeline's retained state identity cannot be removed or reused before its explicit retirement. */
+    PIPELINE_RETIREMENT_REQUIRED("store.pipeline-retirement-required", Set.of("pipeline")),
+
     /**
      * The configured TLS CA certificate file could not be read or parsed. {@code path} is the CA
      * file path (a filesystem path, not a credential, so it is safe to echo back). Reached only when

@@ -37,5 +37,5 @@ pipeline_layouts | config | MongoPipelineLayoutStore | migrated | 1 | -
 pdk_note_scopes | config | MongoRequiredNoteStore | migrated | 1 | -
 pdk_notes | config | MongoRequiredNoteStore | migrated | 1 | -
 pdk_note_migrations | config | MongoRequiredNoteStore | migrated | 1 | -
-operator_generations | config | MongoRequiredNoteStore | migrated | 1 | -
+operator_generations | config | MongoPipelineStateMappings | migrated | 1 | -
 storage_binding | config | MongoStorageBindingStore | migrated | 1 | -

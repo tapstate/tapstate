@@ -321,6 +321,7 @@ store.initialization-refused
 store.invalid-operator-state-database
 store.invalid-uri
 store.not-replica-set
+store.pipeline-retirement-required
 store.source-config-keyring-invalid
 store.source-config-keyring-not-ready
 store.source-config-keyring-rotation-blocked

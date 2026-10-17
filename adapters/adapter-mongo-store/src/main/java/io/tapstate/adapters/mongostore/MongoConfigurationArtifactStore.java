@@ -48,6 +48,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     private final MongoCollection<Document> pipelines;
     private final MongoCollection<Document> versions;
     private final EncryptedArtifactCodec codec;
+    private final MongoPipelineStateMappings stateMappings;
 
     public MongoConfigurationArtifactStore(MongoClient client, MongoDatabase database, SourceConfigCipher cipher) {
         this(client, database, SourceConfigCipherProvider.fixed(Objects.requireNonNull(cipher, "cipher")));
@@ -60,6 +61,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         this.pipelines = durable(SystemCollections.PIPELINES.on(database));
         this.versions = durable(SystemCollections.CONFIGURATION_VERSION.on(database));
         this.codec = new EncryptedArtifactCodec(Objects.requireNonNull(ciphers, "ciphers"));
+        this.stateMappings = new MongoPipelineStateMappings(client, database);
     }
 
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {
@@ -92,6 +94,8 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 throw new Refused(id, ArtifactMutation.VERSION_CONFLICT);
             }
             requireUnmanaged(stored);
+            if ("pipeline".equals(stored.getString("kind"))) stateMappings.refuseRemoval(session, id);
+            else stateMappings.requireNoRetainedIdentity(session, id);
             collection(stored.getString("kind")).deleteOne(session, new Document("_id", id));
             return ArtifactMutation.DELETED;
         }, refused -> refused.outcome);
@@ -129,7 +133,17 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 throw new Refused(resource.id(), ArtifactMutation.VERSION_CONFLICT);
             }
         }
-        if (observed != null) requireUnmanaged(observed);
+        if (!"pipeline".equals(resource.kind())) stateMappings.requireNoRetainedIdentity(session, resource.id());
+        if (observed != null) {
+            requireUnmanaged(observed);
+            if ("pipeline".equals(observed.getString("kind"))) {
+                stateMappings.requireActive(session, resource.id());
+                if (!"pipeline".equals(resource.kind())) stateMappings.refuseRemoval(session, resource.id());
+            }
+        }
+        if ("pipeline".equals(resource.kind()) && (observed == null || !"pipeline".equals(observed.getString("kind")))) {
+            stateMappings.create(session, resource.id());
+        }
         // Unconditional apply may replace a kind, but must never leave the same id in both tables.
         if (observed != null && !resource.kind().equals(observed.getString("kind"))) {
             collection(observed.getString("kind")).deleteOne(session, new Document("_id", resource.id()));

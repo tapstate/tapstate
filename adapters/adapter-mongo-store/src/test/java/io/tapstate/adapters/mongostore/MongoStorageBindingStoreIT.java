@@ -360,6 +360,21 @@ class MongoStorageBindingStoreIT {
         });
     }
 
+    @Test
+    void aRetainedPipelineIdCannotBeClaimedByTheSystemDefaultSource() {
+        withPrepared(f -> {
+            var pipeline = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: views\nsource: []\n");
+            f.domain.artifacts().create(pipeline);
+            SystemCollections.PIPELINES.on(f.database).deleteMany(new Document());
+            assertThatThrownBy(() -> f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master")))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.PIPELINE_RETIREMENT_REQUIRED));
+            assertThat(SystemCollections.SOURCES.on(f.database).countDocuments()).isZero();
+            assertThat(SystemCollections.STORAGE_BINDING.on(f.database).countDocuments()).isZero();
+            assertThat(f.revision()).isEqualTo(1);
+        });
+    }
+
     private static String attempt(MongoConfigurationDomain domain, String secret, CountDownLatch ready, CountDownLatch start) throws Exception {
         ready.countDown();
         if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");

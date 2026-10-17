@@ -513,6 +513,9 @@ store.initialization-refused:
 store.default-source-protected:
   message: "The system default target Source cannot be changed through ordinary authoring."
   solution: "Inspect the Cluster storage binding in Settings. Do not remove or replace its default target Source."
+store.pipeline-retirement-required:
+  message: "Pipeline {pipeline} must complete its recorded state retirement before removal or identity reuse."
+  solution: "Continue the original deletion operation and verify its private resource release and notes cleanup. Keep retained identities while the result is unknown."
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."

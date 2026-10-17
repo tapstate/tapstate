@@ -374,6 +374,60 @@ class MongoRequiredNoteStoreIT {
         });
     }
 
+    @Test
+    void aRetiringPipelineCannotUseItsOldOrdinaryNoteHandle() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var owner = new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1);
+            var scope = f.notes.initialize(owner);
+            assertThat(f.notes.compareAndSet(scope, "key", 0, bytes("retained"), false)).isTrue();
+            SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id", "p1"),
+                    new Document("$set", new Document("phase", "RETIRING").append("operationId", "delete-a")));
+            assertThatThrownBy(() -> f.notes.read(scope, "key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> f.notes.compareAndSet(scope, "key", 1, bytes("late"), false))
+                    .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void anOrdinaryNoteWriteCannotRepairAMissingMappingFence() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var scope = f.notes.initialize(new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1));
+            assertThat(f.notes.compareAndSet(scope, "key", 0, bytes("retained"), false)).isTrue();
+            SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id", "p1"),
+                    new Document("$unset", new Document("noteWriteFence", "")));
+            Document damaged = SystemCollections.OPERATOR_GENERATIONS.on(f.database).find().first();
+            Document retained = SystemCollections.PDK_NOTES.on(f.database).find().first();
+            assertThatThrownBy(() -> f.notes.compareAndSet(scope, "key", 1, bytes("late"), false))
+                    .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.database).find().first()).isEqualTo(damaged);
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).find().first()).isEqualTo(retained);
+        });
+    }
+
+    @Test
+    void malformedActiveMappingsCannotAuthorizeOrdinaryNoteReadsOrWrites() {
+        for (Document change : List.of(new Document("phase", List.of("ACTIVE")), new Document("stateGeneration", 1),
+                new Document("operationId", 7), new Document("noteWriteFence", 2), new Document("noteWriteFence", -1L))) {
+            withNotes(f -> {
+                f.pipelineGeneration("p1", 1);
+                var scope = f.notes.initialize(new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1));
+                assertThat(f.notes.compareAndSet(scope, "key", 0, bytes("retained"), false)).isTrue();
+                SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id", "p1"),
+                        new Document("$set", change));
+                Document damaged = SystemCollections.OPERATOR_GENERATIONS.on(f.database).find().first();
+                Document retained = SystemCollections.PDK_NOTES.on(f.database).find().first();
+                assertThatThrownBy(() -> f.notes.read(scope, "key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                assertThatThrownBy(() -> f.notes.compareAndSet(scope, "key", 1, bytes("late"), false))
+                        .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.database).find().first()).isEqualTo(damaged);
+                assertThat(SystemCollections.PDK_NOTES.on(f.database).find().first()).isEqualTo(retained);
+            });
+        }
+    }
+
     private static TapstateException scopeFailure() {
         return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
     }
@@ -420,7 +474,8 @@ class MongoRequiredNoteStoreIT {
     private record Fixture(MongoClient admin, MongoDatabase database, RequiredNoteStore notes) {
         void pipelineGeneration(String id, long generation) {
             SystemCollections.OPERATOR_GENERATIONS.on(database).replaceOne(new Document("_id", id),
-                    new Document("_id", id).append("stateGeneration", generation),
+                    new Document("_id", id).append("stateGeneration", generation).append("phase", "ACTIVE")
+                            .append("noteWriteFence", 0L),
                     new com.mongodb.client.model.ReplaceOptions().upsert(true));
         }
 

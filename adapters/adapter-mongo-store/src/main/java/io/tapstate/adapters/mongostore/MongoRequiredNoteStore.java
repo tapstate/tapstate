@@ -13,6 +13,7 @@ import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.spi.store.RequiredNoteScope;
 import io.tapstate.spi.store.RequiredNoteStore;
@@ -237,12 +238,21 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             throw unavailable();
         }
         if (owner.kind() == RequiredNoteOwner.Kind.PIPELINE) {
-            Document filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration());
+            Document operator = operators.find(session, new Document("_id", owner.ownerId())).first();
+            PipelineStateMapping mapping;
+            try {
+                mapping = MongoPipelineStateMappings.decode(owner.ownerId(), operator);
+            } catch (TapstateException invalidMapping) {
+                throw unavailable();
+            }
+            if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || mapping.stateGeneration() != owner.stateGeneration()) {
+                throw unavailable();
+            }
             if (write) {
+                Document filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
+                        .append("phase", "ACTIVE").append("noteWriteFence", operator.getLong("noteWriteFence"));
                 if (operators.updateOne(session, filter,
                         new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw unavailable();
-            } else if (operators.find(session, filter).first() == null) {
-                throw unavailable();
             }
         }
     }

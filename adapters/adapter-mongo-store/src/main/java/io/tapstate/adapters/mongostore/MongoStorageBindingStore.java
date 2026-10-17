@@ -37,6 +37,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
+    private final MongoDatabase database;
     private final MongoCollection<Document> bindings;
     private final MongoCollection<Document> identity;
     private final MongoCollection<Document> setup;
@@ -50,6 +51,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     MongoStorageBindingStore(MongoClient client, MongoDatabase database, SourceConfigCipherProvider ciphers) {
         this.client = Objects.requireNonNull(client, "client");
+        this.database = Objects.requireNonNull(database, "database");
         this.bindings = durable(SystemCollections.STORAGE_BINDING.on(database));
         this.identity = durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database));
         this.setup = durable(SystemCollections.STORAGE_SETUP.on(database));
@@ -64,6 +66,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     private MongoStorageBindingStore(MongoStorageBindingStore original, Runnable guard) {
         this.client = original.client;
+        this.database = original.database;
         this.bindings = original.bindings;
         this.identity = original.identity;
         this.setup = original.setup;
@@ -134,6 +137,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 if (sources.find(session, new Document("_id", captured.id())).first() != null
                         || pipelines.find(session, new Document("_id", captured.id())).first() != null
                         || sources.find(session, new Document("systemRole", DEFAULT_ROLE)).first() != null) throw refused();
+                new MongoPipelineStateMappings(client, database).requireNoRetainedIdentity(session, captured.id());
                 ConfigurationVersion.advance(session, versions);
                 SourceConfigCipher cipher = cipherForWrite(session);
                 StorageBinding binding = new StorageBinding(expected, mode, 1L, captured.id(), cache);
