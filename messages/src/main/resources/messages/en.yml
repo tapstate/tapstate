@@ -1097,6 +1097,9 @@ io.pipeline-intent-fenced:
 io.cache-business-fenced:
   message: "The captured cache business incarnation is unavailable or no longer current."
   solution: "Verify the original storage binding and business recovery state before starting a new operation. Do not retarget an old callback."
+io.srs-consumer-unavailable:
+  message: "Consumer membership or progress for chain {chain} cannot be verified."
+  solution: "Keep the original consumer state and inspect the missing or mismatched membership, cursor and state generation before resuming."
 io.srs-checkpoint-unproven:
   message: "The source checkpoint for chain {chain} cannot prove its durable table and model closure."
   solution: "Keep the original state and inspect the missing checkpoint, log or model facts before resuming."

@@ -31,11 +31,13 @@ final class WorkloadClaimDocuments {
                 .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
     }
 
-    static WorkloadClaimFence readCapture(Document stored) {
+    static WorkloadClaimFence readCapture(Document stored) { return read(stored, WorkloadClaimType.CAPTURE); }
+    static WorkloadClaimFence readPipeline(Document stored) { return read(stored, WorkloadClaimType.PIPELINE_ACTUATION); }
+    private static WorkloadClaimFence read(Document stored, WorkloadClaimType type) {
         try {
             if (!(stored.get("claimGeneration") instanceof Long claim) || !(stored.get("executionGeneration") instanceof Long execution)
                     || !(stored.get("topologyRevision") instanceof Long topology)) throw unreadable();
-            var fence = new WorkloadClaimFence(new WorkloadClaimKey(stored.getString("clusterId"), WorkloadClaimType.CAPTURE,
+            var fence = new WorkloadClaimFence(new WorkloadClaimKey(stored.getString("clusterId"), type,
                     stored.getString("resourceId")), new WorkloadOwner(stored.getString("ownerNodeId"), stored.getString("ownerBootId")),
                     claim, execution, topology);
             if (!stored.equals(stored(fence))) throw unreadable();
@@ -44,7 +46,7 @@ final class WorkloadClaimDocuments {
     }
 
     private static TapstateException unreadable() {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-chain", "field", "capture-fence"), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "workload", "field", "claim-fence"), null);
     }
 
     /** The canonical persisted form of one workload claim fence. */

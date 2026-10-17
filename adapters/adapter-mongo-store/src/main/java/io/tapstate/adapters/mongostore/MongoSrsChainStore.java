@@ -70,7 +70,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     .append("captureId", fence.key().resourceId()).append("captureFence", WorkloadClaimDocuments.stored(fence))
                     .append("retention", retention).append("epoch", 0L).append("requestedTables", List.of())
                     .append("servingTables", List.of()).append("modelContextHeads", List.of()).append("modelWriteFence", 0L)
-                    .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null);
+                    .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L);
             SystemCollections.SRS_CHAINS.on(database).insertOne(session, row);
             return decode(row);
         });
@@ -165,7 +165,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
             }
         }
     }
-    private SrsChainState state(ClientSession session, Document row) {
+    SrsChainState state(ClientSession session, Document row) {
         SrsChainState state = decode(row);
         if (state.checkpoint() != null) validateCheckpoint(session, state.miningChainId(), state.checkpoint(), null, false);
         return state;
@@ -173,11 +173,11 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private Document root(ClientSession session, String chain) {
         return SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
     }
-    private Document requireRoot(ClientSession session, String chain) {
+    Document requireRoot(ClientSession session, String chain) {
         Document row = root(session, chain); if (row == null) throw unproven(chain); return row;
     }
     private boolean hasRetainedFacts(ClientSession session, String chain) {
-        for (var table : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS)) {
+        for (var table : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
             if (table.on(database).find(session, new Document("_id.chain", chain)).limit(1).first() != null) return true;
         }
         return false;
@@ -196,7 +196,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
         requireCapture(row, fence);
         if (!Long.valueOf(epoch).equals(row.get("epoch")) || !fence.equals(WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class)))) throw fenced();
     }
-    private void replace(ClientSession session, Document expected, Document replacement) {
+    void replace(ClientSession session, Document expected, Document replacement) {
         long revision = expected.getLong("modelWriteFence");
         if (revision >= Long.MAX_VALUE - 1) throw unproven(expected.getString("_id"));
         replacement.put("modelWriteFence", revision + 1);
@@ -206,9 +206,10 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private SrsChainState decode(Document row) {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "captureId", "captureFence", "retention", "epoch",
-                    "requestedTables", "servingTables", "modelContextHeads", "modelWriteFence", "checkpointRevision", "checkpoint", "checkpointAt"))
+                    "requestedTables", "servingTables", "modelContextHeads", "modelWriteFence", "checkpointRevision", "checkpoint", "checkpointAt", "consumerCount", "consumerRevision"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion")) || !scope.cacheIncarnation().equals(row.get("cacheIncarnation"))
                     || !(row.get("epoch") instanceof Long epoch) || !(row.get("checkpointRevision") instanceof Long revision)
+                    || !(row.get("consumerCount") instanceof Long consumerCount) || !(row.get("consumerRevision") instanceof Long consumerRevision)
                     || !(row.get("modelWriteFence") instanceof Long write) || write < 0 || write == Long.MAX_VALUE
                     || (row.get("retention") != null && !(row.get("retention") instanceof String))) throw unreadable();
             var fence = WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class));
@@ -219,7 +220,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
             if (row.get("checkpointAt") != null && !(row.get("checkpointAt") instanceof Date)) throw unreadable();
             return new SrsChainState(row.getString("_id"), row.getString("captureId"), row.getString("retention"), epoch,
                     tableSet(row.get("requestedTables")), tableSet(row.get("servingTables")), revision, checkpoint,
-                    row.getDate("checkpointAt") == null ? null : row.getDate("checkpointAt").toInstant());
+                    row.getDate("checkpointAt") == null ? null : row.getDate("checkpointAt").toInstant(), consumerCount, consumerRevision);
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
     private static Document checkpointDocument(SrsCaptureCheckpoint checkpoint) {
