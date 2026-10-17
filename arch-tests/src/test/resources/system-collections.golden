@@ -50,3 +50,8 @@ audit | config | MongoConfigurationSecurityStores | migrated | 1 | -
 users | config | MongoFirstAdminStore | migrated | 1 | -
 op_bootstrap | config | MongoFirstAdminStore | migrated | 1 | -
 pipeline_drafts | config | MongoConfigurationDraftStore | migrated | 1 | revision, updatedAt
+cache_identity | cache | MongoCacheIdentity | migrated | 1 | -
+schema_migrations | cache | MongoCacheIdentity | migrated | 1 | -
+op_sessions | cache | MongoCacheDomain | migrated | 1 | secretHash+issuer
+cloud_sessions | cache | MongoCacheDomain | migrated | 1 | secretHash+issuer
+cloud_revocations | cache | MongoCacheDomain | migrated | 1 | -

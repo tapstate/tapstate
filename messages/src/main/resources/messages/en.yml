@@ -1085,3 +1085,7 @@ actuation.unwind-parent-key-unresolved:
 io.note-origin-mismatch:
   message: "The connector context does not match the retained notes. Retire the original resources before using a new connection or artifact."
   solution: "Continue the original retirement operation with the saved connection and exact registered artifact."
+
+io.cache-auth-fenced:
+  message: "The captured cache authentication generation is unavailable or no longer current."
+  solution: "Load the current trusted storage binding and authentication readiness before retrying."

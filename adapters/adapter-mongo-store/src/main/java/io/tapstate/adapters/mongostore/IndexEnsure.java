@@ -77,6 +77,16 @@ public final class IndexEnsure {
     }
 
     private static void create(MongoCollection<Document> collection, SystemCollections.IndexSpec index) {
+        create(null, collection, index);
+    }
+
+    /** Empty collections may receive their declared indexes in the same local-read schema transaction. */
+    static void createInTransaction(com.mongodb.client.ClientSession session, MongoCollection<Document> collection,
+            SystemCollections.IndexSpec index) {
+        create(java.util.Objects.requireNonNull(session, "session"), collection, index);
+    }
+
+    private static void create(com.mongodb.client.ClientSession session, MongoCollection<Document> collection, SystemCollections.IndexSpec index) {
         Document keys = new Document();
         for (String key : index.keys()) {
             keys.append(key, 1);
@@ -88,7 +98,8 @@ public final class IndexEnsure {
         if (index.partialFilterJson() != null) {
             options.partialFilterExpression(Document.parse(index.partialFilterJson()));
         }
-        collection.createIndex(keys, options);
+        if (session == null) collection.createIndex(keys, options);
+        else collection.createIndex(session, keys, options);
     }
 
     /** The existing index of that name, as the server describes it, or {@code null}. */

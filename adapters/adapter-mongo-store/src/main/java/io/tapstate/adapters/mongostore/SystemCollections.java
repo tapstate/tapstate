@@ -194,7 +194,14 @@ public enum SystemCollections {
     OP_BOOTSTRAP("op_bootstrap", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1),
     CONFIG_PIPELINE_DRAFTS("pipeline_drafts", Database.CONFIG, MongoConfigurationDraftStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
-            new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at"));
+            new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at")),
+    CACHE_IDENTITY("cache_identity", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
+    CACHE_SCHEMA_MIGRATIONS("schema_migrations", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
+    OP_SESSIONS("op_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("secretHash", "issuer"), false)),
+    CLOUD_SESSIONS("cloud_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("secretHash", "issuer"), false)),
+    CLOUD_REVOCATIONS("cloud_revocations", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -215,7 +222,7 @@ public enum SystemCollections {
     public enum Kind { COLLECTION, GRIDFS_BUCKET }
 
     /** Which of the two databases a row lives in. */
-    public enum Database { STORE, NEST, CONFIG }
+    public enum Database { STORE, NEST, CONFIG, CACHE }
 
     /**
      * An index a query shape needs. Keys are in order and all ascending: nothing here sorts, and a
@@ -296,6 +303,12 @@ public enum SystemCollections {
             throw new IllegalStateException(collectionName + " is a GridFS bucket; ask for the bucket");
         }
         return database.getCollection(collectionName);
+    }
+
+    /** Controlled preparation creates an empty declared collection in its original schema transaction. */
+    void prepareCollectionOn(MongoDatabase database, com.mongodb.client.ClientSession session) {
+        if (kind != Kind.COLLECTION) throw new IllegalStateException("only plain collections have this preparation path");
+        database.createCollection(session, collectionName);
     }
 
     /**
