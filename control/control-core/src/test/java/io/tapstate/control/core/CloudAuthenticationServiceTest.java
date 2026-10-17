@@ -49,12 +49,14 @@ class CloudAuthenticationServiceTest {
                 "address-jti", Scope.WRITE, NOW.plusSeconds(900)), snapshot).orElseThrow().token();
         AtomicReference<CloudEgressAddress> current = new AtomicReference<>(
                 new CloudEgressAddress("org-a", "cluster-a", "203.0.113.42", "STABLE"));
+        AtomicReference<RuntimeException> addressFailure = new AtomicReference<>();
         CloudCodeExchanger provider = new CloudCodeExchanger() {
             @Override public String exchange(String code, String cluster) {
                 throw new AssertionError("context reads must not redeem another code");
             }
             @Override public Optional<CloudEgressAddress> currentEgressAddress(String cluster) {
                 assertThat(cluster).isEqualTo("cluster-a");
+                if (addressFailure.get() != null) throw addressFailure.get();
                 return Optional.ofNullable(current.get());
             }
         };
@@ -70,7 +72,14 @@ class CloudAuthenticationServiceTest {
         assertThat(service.clusterContextView(cookie).orElseThrow().ec2PublicIp()).isNull();
         current.set(new CloudEgressAddress("other-org", "other-cluster", "203.0.113.99", "STABLE"));
         assertThat(service.clusterContextView(cookie).orElseThrow().ec2PublicIp()).isNull();
+        addressFailure.set(new IllegalStateException("Cloud metadata unavailable"));
+        assertThat(service.clusterContextView(cookie).orElseThrow())
+                .isEqualTo(new CloudClusterContextView(
+                        "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", null, null));
         assertThat(service.authenticate(cookie)).isPresent();
+
+        CloudCodeExchanger legacyProvider = (code, cluster) -> "jwt";
+        assertThat(legacyProvider.currentEgressAddress("cluster-a")).isEmpty();
     }
 
     @Test

@@ -30,6 +30,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -92,16 +93,19 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 assertThat(response.statusCode()).isEqualTo(200);
                 assertThat(response.headers().firstValue("Cache-Control")).contains("no-store");
                 assertThat(JsonReader.parse(response.body())).isInstanceOf(Map.class);
-                Map<?, ?> body = (Map<?, ?>) JsonReader.parse(response.body());
-                assertThat(body.get("organizationId")).isEqualTo(ORGANIZATION);
-                assertThat(body.get("clusterId")).isEqualTo(CLUSTER);
-                assertThat(body.get("organizationName")).isEqualTo("Workspace organization");
-                assertThat(body.get("clusterName")).isEqualTo("Workspace cluster");
-                assertThat(body.get("region")).isEqualTo("workspace-region");
-                assertThat(body.get("ec2PublicIp")).isEqualTo(CURRENT_ADDRESS.ec2PublicIp());
-                assertThat(body.get("egressAddressStatus")).isEqualTo(CURRENT_ADDRESS.egressAddressStatus());
-                assertThat(body.containsKey("clusterState")).isTrue();
-                assertThat(body.get("clusterState")).isNull();
+                Map<?, ?> parsedBody = (Map<?, ?>) JsonReader.parse(response.body());
+                Map<String, Object> body = new HashMap<>();
+                parsedBody.forEach((key, value) -> body.put((String) key, value));
+                assertThat(body)
+                        .containsEntry("organizationId", ORGANIZATION)
+                        .containsEntry("clusterId", CLUSTER)
+                        .containsEntry("organizationName", "Workspace organization")
+                        .containsEntry("clusterName", "Workspace cluster")
+                        .containsEntry("region", "workspace-region")
+                        .containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp())
+                        .containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus())
+                        .containsKey("clusterState")
+                        .containsEntry("clusterState", null);
                 assertThat(response.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
 
                 HttpResponse<String> anonymous = client.send(HttpRequest.newBuilder(base.resolve("/api/cluster/context"))
