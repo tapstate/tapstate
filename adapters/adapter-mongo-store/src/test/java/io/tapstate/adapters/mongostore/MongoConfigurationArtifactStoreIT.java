@@ -40,6 +40,163 @@ class MongoConfigurationArtifactStoreIT {
     private static final DslParser PARSER = new DslParser();
 
     @Test
+    void reusableAuthoringDefinitionsRetainTheirExistingStoreContract() {
+        List<Resource> definitions = List.of(
+                PARSER.parse("version: tapstate/v1\nkind: transform\nid: reusable_filter\ntype: filter\nexpr: \"true\"\n"),
+                PARSER.parse("version: tapstate/v1\nkind: view\nid: reusable_view\nprimary_key: id\n"),
+                PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable_serve\n"));
+        withStore((store, database) -> {
+            List<String> unsupported = new java.util.ArrayList<>();
+            for (Resource definition : definitions) {
+                try { store.save(definition); }
+                catch (IllegalArgumentException rejected) { unsupported.add(definition.kind()); }
+            }
+            assertThat(unsupported).as("existing reusable authoring kinds must survive the storage split").isEmpty();
+            assertThat(store.list()).containsExactlyInAnyOrderElementsOf(definitions);
+        });
+    }
+
+    @Test
+    void fiveAuthoringKindsCommitInOneRevisionAndRemainInIndependentCollections() {
+        withStore((store, database) -> {
+            var objects = List.of(source("src", "secret-sentinel"), pipeline("flow"), definition("transform", "filter_def"),
+                    definition("view", "view_def"), definition("serve", "serve_def"));
+            store.saveAll(objects);
+            assertThat(revision(database)).isEqualTo(1);
+            assertThat(store.list()).containsExactlyInAnyOrderElementsOf(objects);
+            for (Resource resource : objects) {
+                assertThat(store.get(resource.id())).contains(resource);
+                assertThat(store.listStored(resource.kind())).singleElement().satisfies(row -> {
+                    assertThat(row.id()).isEqualTo(resource.id());
+                    assertThat(row.contentHash()).isEqualTo(CanonicalHash.of(resource));
+                    assertThat(row.readable()).isTrue();
+                });
+            }
+            for (var table : List.of(SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS)) {
+                assertThat(table.on(database).countDocuments()).isEqualTo(1);
+            }
+            assertThat(SystemCollections.SOURCES.on(database).find().first().toJson()).doesNotContain("secret-sentinel");
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .doesNotContain("artifacts", "operator_state", "srs_meta");
+        });
+    }
+
+    @Test
+    void staleDefinitionDependenciesRejectTheWholeMixedConfigurationBatch() {
+        withStore((store, database) -> {
+            Resource original = definition("view", "reusable");
+            store.save(original);
+            Resource changed = PARSER.parse("version: tapstate/v1\nkind: view\nid: reusable\nprimary_key: changed\n");
+            store.replace(original.id(), CanonicalHash.of(original), changed);
+            var outcome = store.writeAll(List.of(ArtifactWrite.createOnly(source("fresh", "secret"))
+                    .guardedBy(Map.of(original.id(), CanonicalHash.of(original))),
+                    ArtifactWrite.createOnly(definition("serve", "new_serve"))));
+            assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+            assertThat(store.get("fresh")).isEmpty();
+            assertThat(store.get("new_serve")).isEmpty();
+            assertThat(revision(database)).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void aDefinitionWriteFaultRollsBackSourceAndOtherDefinitionSiblings() {
+        withStore((store, database) -> {
+            store.save(definition("view", "existing"));
+            SystemCollections.VIEW_DEFINITIONS.on(database).createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            assertThatThrownBy(() -> store.saveAll(List.of(source("fresh", "secret"), definition("transform", "new_transform"),
+                    definition("view", "new_view"), definition("serve", "new_serve"))))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(store.list()).containsExactly(definition("view", "existing"));
+            assertThat(revision(database)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void fiveClientsRacingDifferentKindsCannotPublishTheSameGlobalId() {
+        withStore((store, database) -> {
+            var candidates = List.of(source("same_id", "secret"), pipeline("same_id"), definition("transform", "same_id"),
+                    definition("view", "same_id"), definition("serve", "same_id"));
+            var clients = new java.util.ArrayList<MongoClient>();
+            CountDownLatch ready = new CountDownLatch(candidates.size());
+            CountDownLatch start = new CountDownLatch(1);
+            try (var executor = Executors.newFixedThreadPool(candidates.size())) {
+                try {
+                    var futures = new java.util.ArrayList<java.util.concurrent.Future<ArtifactMutation>>();
+                    for (Resource candidate : candidates) {
+                        MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl());
+                        clients.add(client);
+                        var independent = new MongoConfigurationArtifactStore(client, client.getDatabase(database.getName()), new SourceConfigCipher(new byte[32]));
+                        futures.add(executor.submit(() -> {
+                            ready.countDown();
+                            if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                            return independent.create(candidate);
+                        }));
+                    }
+                    assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+                    start.countDown();
+                    var outcomes = new java.util.ArrayList<ArtifactMutation>();
+                    for (var future : futures) outcomes.add(future.get(20, TimeUnit.SECONDS));
+                    assertThat(outcomes).filteredOn(ArtifactMutation.CREATED::equals).hasSize(1);
+                    assertThat(outcomes).filteredOn(ArtifactMutation.ALREADY_EXISTS::equals).hasSize(4);
+                    assertThat(store.list()).hasSize(1);
+                    assertThat(revision(database)).isEqualTo(1);
+                } finally {
+                    start.countDown();
+                    clients.forEach(MongoClient::close);
+                }
+            }
+        });
+    }
+
+    @Test
+    void scopedDefinitionBrowseCannotSelectAnAmbiguousGlobalId() {
+        withStore((store, database) -> {
+            store.save(definition("view", "ambiguous"));
+            SystemCollections.TRANSFORM_DEFINITIONS.on(database).insertOne(MongoArtifactStore.toDocument(definition("transform", "ambiguous")));
+            assertThatThrownBy(() -> store.listStored("view")).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThatThrownBy(() -> store.get("ambiguous")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(store::list).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test
+    void definitionBodiesCannotChangeTheirPhysicalKindIdOrDeclaredHash() {
+        withStore((store, database) -> {
+            Resource definition = definition("view", "damaged");
+            store.save(definition);
+            var views = SystemCollections.VIEW_DEFINITIONS.on(database);
+            Document original = views.find().first();
+            for (Document update : List.of(new Document("body", MongoArtifactStore.toDocument(definition("transform", "damaged")).get("body")),
+                    new Document("body.id", "another"), new Document("contentHash", "incorrect"))) {
+                views.replaceOne(new Document("_id", "damaged"), original);
+                views.updateOne(new Document("_id", "damaged"), new Document("$set", update));
+                assertThatThrownBy(() -> store.get("damaged")).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                assertThat(store.listStored("view")).singleElement().satisfies(row -> assertThat(row.readable()).isFalse());
+            }
+        });
+    }
+
+    @Test
+    void normalDefinitionChangesAndKindReplacementPreserveOneIdentityAndVersion() {
+        withStore((store, database) -> {
+            Resource transform = definition("transform", "definition");
+            Resource view = definition("view", "definition");
+            Resource serve = definition("serve", "definition");
+            assertThat(store.create(transform)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(store.create(view)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            assertThat(store.replace("definition", CanonicalHash.of(transform), view)).isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(SystemCollections.TRANSFORM_DEFINITIONS.on(database).countDocuments()).isZero();
+            assertThat(store.replace("definition", CanonicalHash.of(view), serve)).isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(SystemCollections.VIEW_DEFINITIONS.on(database).countDocuments()).isZero();
+            assertThat(store.delete("definition", CanonicalHash.of(serve))).isEqualTo(ArtifactMutation.DELETED);
+            assertThat(store.list()).isEmpty();
+            assertThat(revision(database)).isEqualTo(4);
+        });
+    }
+
+    @Test
     void separateCollectionsRetainEncryptedSourcesAndCanonicalReads() {
         withStore((store, database) -> {
             Resource source = source("input", "private-sentinel");
@@ -527,6 +684,16 @@ class MongoConfigurationArtifactStoreIT {
                 config:
                   password: %s
                 """.formatted(id, secret));
+    }
+
+    private static Resource definition(String kind, String id) {
+        String body = switch (kind) {
+            case "transform" -> "type: filter\nexpr: \"true\"\n";
+            case "view" -> "primary_key: id\n";
+            case "serve" -> "";
+            default -> throw new IllegalArgumentException("definition kind required");
+        };
+        return PARSER.parse("version: tapstate/v1\nkind: " + kind + "\nid: " + id + "\n" + body);
     }
 
     private static Resource pipeline(String id) {

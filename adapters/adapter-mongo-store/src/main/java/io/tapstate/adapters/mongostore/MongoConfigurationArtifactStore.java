@@ -11,6 +11,8 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
@@ -20,6 +22,8 @@ import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -28,14 +32,14 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Configuration resources in separate Source and Pipeline collections. Every mutation writes the same
+ * Configuration resources in separate collections for each authoring kind. Every mutation writes the same
  * configuration revision inside its transaction, including mutations that only read another resource
  * as a precondition. This serializes cross-collection identity and dependency decisions without a
  * separate id directory or a cross-client transaction.
  *
  * <p>The configuration bootstrap must have installed the revision singleton before exposing this
  * store. A missing or malformed singleton is corruption, not permission to initialize an empty store.
- * Only Source and Pipeline resources reach this adapter; authoring translation rejects other kinds.
+ * All five authoring kinds share one identity and revision transaction domain.
  */
 public final class MongoConfigurationArtifactStore implements ArtifactStore {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
@@ -44,8 +48,8 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             .build();
 
     private final MongoClient client;
-    private final MongoCollection<Document> sources;
-    private final MongoCollection<Document> pipelines;
+    private static final CanonicalWriter WRITER = new CanonicalWriter();
+    private final Map<String, MongoCollection<Document>> collections;
     private final MongoCollection<Document> versions;
     private final EncryptedArtifactCodec codec;
     private final MongoPipelineStateMappings stateMappings;
@@ -57,8 +61,13 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     MongoConfigurationArtifactStore(MongoClient client, MongoDatabase database, SourceConfigCipherProvider ciphers) {
         this.client = Objects.requireNonNull(client, "client");
         Objects.requireNonNull(database, "database");
-        this.sources = durable(SystemCollections.SOURCES.on(database));
-        this.pipelines = durable(SystemCollections.PIPELINES.on(database));
+        Map<String, MongoCollection<Document>> tables = new LinkedHashMap<>();
+        tables.put("source", durable(SystemCollections.SOURCES.on(database)));
+        tables.put("pipeline", durable(SystemCollections.PIPELINES.on(database)));
+        tables.put("transform", durable(SystemCollections.TRANSFORM_DEFINITIONS.on(database)));
+        tables.put("view", durable(SystemCollections.VIEW_DEFINITIONS.on(database)));
+        tables.put("serve", durable(SystemCollections.SERVE_DEFINITIONS.on(database)));
+        this.collections = Collections.unmodifiableMap(tables);
         this.versions = durable(SystemCollections.CONFIGURATION_VERSION.on(database));
         this.codec = new EncryptedArtifactCodec(Objects.requireNonNull(ciphers, "ciphers"));
         this.stateMappings = new MongoPipelineStateMappings(client, database);
@@ -187,30 +196,42 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     @Override
     public Optional<Resource> get(String id) {
         Objects.requireNonNull(id, "id");
-        return readSnapshot(session -> Optional.ofNullable(find(session, id)).map(codec::decode));
+        return readSnapshot(session -> Optional.ofNullable(find(session, id)).map(this::decode));
     }
 
     @Override
     public List<Resource> list() {
-        return readSnapshot(session -> documents(session).stream().map(codec::decode).toList());
+        return readSnapshot(session -> documents(session).stream().map(this::decode).toList());
     }
 
     @Override
     public List<StoredArtifactRecord> listStored() {
-        return readSnapshot(session -> documents(session).stream().map(codec::browse).toList());
+        return readSnapshot(session -> documents(session).stream().map(this::browse).toList());
     }
 
     @Override
     public List<StoredArtifactRecord> listStored(String kind) {
         Objects.requireNonNull(kind, "kind");
-        if (!kind.equals("source") && !kind.equals("pipeline")) return List.of();
-        return readSnapshot(session -> read(session, collection(kind), kind).stream().map(codec::browse).toList());
+        if (!collections.containsKey(kind)) return List.of();
+        return readSnapshot(session -> {
+            List<Document> selected = read(session, collection(kind), kind);
+            if (!selected.isEmpty()) {
+                List<String> ids = selected.stream().map(row -> row.getString("_id")).toList();
+                for (var entry : collections.entrySet()) {
+                    if (entry.getKey().equals(kind)) continue;
+                    Document collision = entry.getValue().find(session,
+                            new Document("_id", new Document("$in", ids))).projection(new Document("_id", 1)).first();
+                    if (collision != null) throw unreadable(String.valueOf(collision.get("_id")), "identity");
+                }
+            }
+            return selected.stream().map(this::browse).toList();
+        });
     }
 
     /** Verifies encrypted Source bodies at open without retaining the entire inventory in memory. */
     void verifySourceEnvelopes() {
         readSnapshot(session -> {
-            try (MongoCursor<Document> cursor = sources.find(session).iterator()) {
+            try (MongoCursor<Document> cursor = collection("source").find(session).iterator()) {
                 while (cursor.hasNext()) {
                     Document source = cursor.next();
                     requireKind(source, "source");
@@ -230,17 +251,20 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     private Document find(ClientSession session, String id) {
-        Document source = sources.find(session, new Document("_id", id)).first();
-        Document pipeline = pipelines.find(session, new Document("_id", id)).first();
-        if (source != null) requireKind(source, "source");
-        if (pipeline != null) requireKind(pipeline, "pipeline");
-        if (source != null && pipeline != null) throw unreadable(id, "identity");
-        return source == null ? pipeline : source;
+        Document found = null;
+        for (var entry : collections.entrySet()) {
+            Document candidate = entry.getValue().find(session, new Document("_id", id)).first();
+            if (candidate == null) continue;
+            requireKind(candidate, entry.getKey());
+            if (found != null) throw unreadable(id, "identity");
+            found = candidate;
+        }
+        return found;
     }
 
     private List<Document> documents(ClientSession session) {
-        List<Document> documents = new ArrayList<>(read(session, sources, "source"));
-        documents.addAll(read(session, pipelines, "pipeline"));
+        List<Document> documents = new ArrayList<>();
+        for (var entry : collections.entrySet()) documents.addAll(read(session, entry.getValue(), entry.getKey()));
         Set<String> ids = new HashSet<>();
         for (Document document : documents) {
             if (!ids.add(document.getString("_id"))) throw unreadable(document.getString("_id"), "identity");
@@ -267,15 +291,35 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     private static void requireKind(Document document, String kind) {
-        if (!kind.equals(document.get("kind"))) throw unreadable(String.valueOf(document.get("_id")), "kind");
+        if (!(document.get("_id") instanceof String id) || id.isBlank() || !kind.equals(document.get("kind"))) {
+            throw unreadable(String.valueOf(document.get("_id")), "kind");
+        }
     }
 
     private MongoCollection<Document> collection(String kind) {
-        return switch (kind) {
-            case "source" -> sources;
-            case "pipeline" -> pipelines;
-            default -> throw new IllegalArgumentException("configuration artifact must be a Source or Pipeline");
-        };
+        MongoCollection<Document> table = collections.get(kind);
+        if (table == null) throw new IllegalArgumentException("unsupported configuration resource kind");
+        return table;
+    }
+
+    private Resource decode(Document document) {
+        Resource resource = codec.decode(document);
+        String id = document.getString("_id");
+        if (!id.equals(resource.id()) || !resource.kind().equals(document.get("kind"))
+                || !CanonicalHash.of(resource).equals(document.get("contentHash"))) throw unreadable(id, "body");
+        return resource;
+    }
+
+    private StoredArtifactRecord browse(Document document) {
+        String id = document.getString("_id");
+        String kind = document.getString("kind");
+        String hash = document.get("contentHash") instanceof String value ? value : null;
+        try {
+            return new StoredArtifactRecord(id, kind, WRITER.write(decode(document)), hash, true);
+        } catch (TapstateException invalid) {
+            if (invalid.code() != IoError.DOCUMENT_UNREADABLE) throw invalid;
+            return new StoredArtifactRecord(id, kind, null, hash, false);
+        }
     }
 
     private static TapstateException unreadable(String id, String field) {

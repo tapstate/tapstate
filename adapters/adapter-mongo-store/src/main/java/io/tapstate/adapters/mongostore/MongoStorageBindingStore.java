@@ -42,7 +42,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     private final MongoCollection<Document> identity;
     private final MongoCollection<Document> setup;
     private final MongoCollection<Document> sources;
-    private final MongoCollection<Document> pipelines;
+    private final List<MongoCollection<Document>> otherResources;
     private final MongoCollection<Document> versions;
     private final MongoCollection<Document> noteScopes;
     private final SourceConfigCipherProvider ciphers;
@@ -56,7 +56,9 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         this.identity = durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database));
         this.setup = durable(SystemCollections.STORAGE_SETUP.on(database));
         this.sources = durable(SystemCollections.SOURCES.on(database));
-        this.pipelines = durable(SystemCollections.PIPELINES.on(database));
+        this.otherResources = List.of(durable(SystemCollections.PIPELINES.on(database)),
+                durable(SystemCollections.TRANSFORM_DEFINITIONS.on(database)), durable(SystemCollections.VIEW_DEFINITIONS.on(database)),
+                durable(SystemCollections.SERVE_DEFINITIONS.on(database)));
         this.versions = durable(SystemCollections.CONFIGURATION_VERSION.on(database));
         this.noteScopes = durable(SystemCollections.PDK_NOTE_SCOPES.on(database));
         this.ciphers = Objects.requireNonNull(ciphers, "ciphers");
@@ -71,12 +73,16 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         this.identity = original.identity;
         this.setup = original.setup;
         this.sources = original.sources;
-        this.pipelines = original.pipelines;
+        this.otherResources = original.otherResources;
         this.versions = original.versions;
         this.noteScopes = original.noteScopes;
         this.ciphers = original.ciphers;
         this.codec = original.codec;
         this.requireActive = () -> { original.requireActive.run(); guard.run(); };
+    }
+
+    private boolean hasOtherResource(ClientSession session, String id) {
+        return otherResources.stream().anyMatch(table -> table.find(session, new Document("_id", id)).first() != null);
     }
 
     @Override public StorageBindingStore guardedBy(Runnable guard) {
@@ -135,7 +141,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 Document cluster = identity.find(session, new Document("_id", "cluster")).first();
                 if (!expected.clusterId().equals(cluster.get("clusterId"))) throw refused();
                 if (sources.find(session, new Document("_id", captured.id())).first() != null
-                        || pipelines.find(session, new Document("_id", captured.id())).first() != null
+                        || hasOtherResource(session, captured.id())
                         || sources.find(session, new Document("systemRole", DEFAULT_ROLE)).first() != null) throw refused();
                 new MongoPipelineStateMappings(client, database).requireNoRetainedIdentity(session, captured.id());
                 ConfigurationVersion.advance(session, versions);
@@ -200,7 +206,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     || !scope.operationId().equals(state.get("operationId"))) throw unreadable();
             Document source = sources.find(session, new Document("_id", defaultId)).first();
             if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole"))
-                    || pipelines.find(session, new Document("_id", defaultId)).first() != null
+                    || hasOtherResource(session, defaultId)
                     || !stored.get("sourceHash").equals(CanonicalHash.of(codec.decode(source)))) throw unreadable();
             String cacheJson = ciphers.current().decrypt(bindingContext(clusterId), "cache-binding", stored.getString("cache"));
             StorageBinding.Connection cache = decodeConnection(cacheJson);

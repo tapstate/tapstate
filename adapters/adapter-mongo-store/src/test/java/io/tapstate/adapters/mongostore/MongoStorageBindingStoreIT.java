@@ -48,6 +48,51 @@ class MongoStorageBindingStoreIT {
             "cache", "CA-material-sentinel");
 
     @Test
+    void eachReusableDefinitionKindReservesTheDefaultSourceIdBeforeBinding() {
+        for (String kind : List.of("transform", "view", "serve")) {
+            withPrepared(f -> {
+                var occupied = definition(kind, "views");
+                f.domain.artifacts().create(occupied);
+                assertThatThrownBy(() -> f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "secret")))
+                        .satisfies(MongoStorageBindingStoreIT::refused);
+                assertThat(f.domain.artifacts().get("views")).contains(occupied);
+                assertThat(f.domain.bindings().load()).isEmpty();
+                assertThat(f.revision()).isEqualTo(1);
+                assertThat(SystemCollections.SOURCES.on(f.database).countDocuments()).isZero();
+                assertThat(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(f.database).find().first()).containsEntry("bindingVersion", 0L);
+            });
+        }
+    }
+
+    @Test
+    void definitionsCannotReplaceABoundDefaultSourceAndDuplicateAliasesMakeLoadingRefuse() {
+        withPrepared(f -> {
+            var master = source("views", "secret");
+            f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, master);
+            for (String kind : List.of("transform", "view", "serve")) {
+                var replacement = definition(kind, "views");
+                assertThat(f.domain.artifacts().create(replacement)).isEqualTo(io.tapstate.spi.store.ArtifactMutation.ALREADY_EXISTS);
+                assertThatThrownBy(() -> f.domain.artifacts().replace("views", CanonicalHash.of(master), replacement))
+                        .satisfies(MongoStorageBindingStoreIT::protectedSource);
+                assertThat(f.revision()).isEqualTo(1);
+                SystemCollections table = switch (kind) {
+                    case "transform" -> SystemCollections.TRANSFORM_DEFINITIONS;
+                    case "view" -> SystemCollections.VIEW_DEFINITIONS;
+                    case "serve" -> SystemCollections.SERVE_DEFINITIONS;
+                    default -> throw new AssertionError("kind");
+                };
+                table.on(f.database).insertOne(MongoArtifactStore.toDocument(replacement));
+                assertThatThrownBy(() -> f.domain.bindings().load()).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                assertThat(table.on(f.database).countDocuments()).isEqualTo(1);
+                table.on(f.database).deleteMany(new Document());
+            }
+            assertThat(f.domain.bindings().load()).isPresent();
+            assertThat(f.domain.artifacts().get("views")).contains(master);
+        });
+    }
+
+    @Test
     void publishesAllBindingFactsAndReopensEncryptedInputsWithoutACacheClient() {
         withPrepared(f -> {
             assertThat(f.domain.bindings().load()).isEmpty();
@@ -385,6 +430,16 @@ class MongoStorageBindingStoreIT {
             refused(failure);
             return "refused";
         }
+    }
+
+    private static io.tapstate.core.model.Resource definition(String kind, String id) {
+        String body = switch (kind) {
+            case "transform" -> "type: filter\nexpr: \"true\"\n";
+            case "view" -> "primary_key: id\n";
+            case "serve" -> "";
+            default -> throw new IllegalArgumentException("definition kind required");
+        };
+        return new DslParser().parse("version: tapstate/v1\nkind: " + kind + "\nid: " + id + "\n" + body);
     }
 
     private static SourceResource source(String id, String secret) {

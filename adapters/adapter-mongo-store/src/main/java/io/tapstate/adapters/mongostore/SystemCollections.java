@@ -183,7 +183,10 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.bindingVersion", "_id.namespace"), true, "pdk_note_origin_scope")),
     PDK_NOTE_CARRIES("pdk_note_carries", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("_id.sharedBindingVersion", "_id.sharedNamespace"), false, "pdk_note_carry_target"),
-            new IndexSpec(List.of("_id.sourceBindingVersion", "_id.sourceNamespace", "_id.sourceGeneration"), false, "pdk_note_carry_source"));
+            new IndexSpec(List.of("_id.sourceBindingVersion", "_id.sourceNamespace", "_id.sourceGeneration"), false, "pdk_note_carry_source")),
+    TRANSFORM_DEFINITIONS("transform_definitions", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
+    VIEW_DEFINITIONS("view_definitions", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
+    SERVE_DEFINITIONS("serve_definitions", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
