@@ -67,9 +67,20 @@ public final class CloudAuthenticationService {
 
     /** Projects authenticated display fields without exposing a persistence record to presentation adapters. */
     public Optional<CloudClusterContextView> clusterContextView(String cookie) {
-        return clusterContext(cookie).map(context -> new CloudClusterContextView(
-                context.organizationId(), context.clusterId(), context.organizationName(),
-                context.clusterName(), context.region()));
+        return clusterContext(cookie).map(context -> {
+            Optional<CloudEgressAddress> current;
+            try {
+                current = exchanger.currentEgressAddress(context.clusterId())
+                        .filter(address -> Objects.equals(context.organizationId(), address.organizationId())
+                                && Objects.equals(context.clusterId(), address.clusterId()));
+            } catch (RuntimeException unavailable) {
+                current = Optional.empty();
+            }
+            return new CloudClusterContextView(context.organizationId(), context.clusterId(),
+                    context.organizationName(), context.clusterName(), context.region(),
+                    current.map(CloudEgressAddress::ec2PublicIp).orElse(null),
+                    current.map(CloudEgressAddress::egressAddressStatus).orElse(null));
+        });
     }
 
     public boolean logout(String cookie) {

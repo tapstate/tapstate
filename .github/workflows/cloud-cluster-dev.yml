@@ -1,4 +1,4 @@
-# Rebuild the next release version from main for Cloud development validation.
+# Rebuild the next release version from the selected ref for Cloud development validation.
 # This lane spends no release version: only tags ending in -dev are mutable.
 # Configure cloud-ghcr-dev with VITE_CLOUD_CONSOLE_URL and reuse the Public
 # tapstate-cloud package with workflow write access. The repository's
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Next version from main, using the release version rules. Rebuilds may replace the same dev tag."
+        description: "Next version from the selected ref, using the release version rules. Rebuilds may replace the same dev tag."
         type: choice
         options: [minor, patch, major]
         required: true
@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   image:
-    if: github.repository == 'tapstate/tapstate' && github.ref == 'refs/heads/main'
+    if: github.repository == 'tapstate/tapstate'
     runs-on: ubuntu-latest
     environment: cloud-ghcr-dev
     permissions:
@@ -33,10 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
-      - name: pin current main and calculate the next release version
+      - name: pin the selected ref and calculate the next release version
         id: source
         env:
           BUMP: ${{ inputs.bump }}
@@ -51,17 +51,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: tapstate/tapstate-web
-          ref: main
+          ref: ${{ github.ref_name }}
           token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
           path: tapstate-web
           persist-credentials: false
-      - name: pin the current Web main
+      - name: pin the selected Web ref
         id: web
         run: echo "sha=$(git -C tapstate-web rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: validate the dev version registration configuration
+        if: github.ref == 'refs/heads/main'
         env:
           CLOUD_RELEASE_API_URL: ${{ vars.CLOUD_RELEASE_API_URL }}
           CLOUD_RELEASE_CODE: ${{ vars.CLOUD_RELEASE_CODE }}
@@ -200,14 +201,15 @@ jobs:
           WEB_SHA: ${{ steps.web.outputs.sha }}
         run: |
           test -n "$IMAGE"
-          printf "Dev image: \`%s\`\n\nDigest reference: \`%s\`\n\nTapstate main: \`%s\`\n\nWeb main: \`%s\`\n" \
+          printf "Dev image: \`%s\`\n\nDigest reference: \`%s\`\n\nTapstate source: \`%s\`\n\nWeb source: \`%s\`\n" \
             "$TAG" "$IMAGE" "$TAPSTATE_SHA" "$WEB_SHA" >> "$GITHUB_STEP_SUMMARY"
       - name: register the checked image in the dev Cloud version catalog
+        if: github.ref == 'refs/heads/main'
         env:
           DEV_VERSION: ${{ steps.source.outputs.version }}
           DEV_SHA: ${{ steps.source.outputs.sha }}
           DEV_WEB_SHA: ${{ steps.web.outputs.sha }}
-          DEV_BRANCH: main
+          DEV_BRANCH: ${{ github.ref_name }}
           DEV_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CLOUD_IMAGE: ${{ steps.publish.outputs.image }}
           CLOUD_IMAGE_TAG: ${{ steps.publish.outputs.tag }}

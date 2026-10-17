@@ -4,7 +4,13 @@ import java.util.Objects;
 
 /** Display context returned by a verified Cloud code exchange and bound to one local session. */
 public record CloudSessionContext(
-        String organizationId, String clusterId, String organizationName, String clusterName, String region) {
+        String organizationId, String clusterId, String organizationName, String clusterName, String region,
+        String ec2PublicIp, String egressAddressStatus) {
+
+    public CloudSessionContext(String organizationId, String clusterId, String organizationName,
+            String clusterName, String region) {
+        this(organizationId, clusterId, organizationName, clusterName, region, null, null);
+    }
 
     public CloudSessionContext {
         requireText(organizationId, "organizationId");
