@@ -90,6 +90,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 SystemCollections.CONFIGURATION_VERSION.on(database));
         this.drafts = new MongoConfigurationDraftStore(connection.client(), database, key, artifacts);
         drafts.verify();
+        new MongoRequiredDeadLetterStore(connection.client(), database, clusterId).verify();
     }
 
     /** The caller supplies the trusted Cluster identity from its deployment or installation context. */
@@ -135,6 +136,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     public PipelineDraftStore drafts() { return drafts; }
+
+    public io.tapstate.spi.store.RequiredDeadLetterStore requiredDeadLetters() {
+        return new MongoRequiredDeadLetterStore(connection.client(), connection.database(), clusterId);
+    }
 
     public FirstAdminStore firstAdmin() { return firstAdmin; }
 

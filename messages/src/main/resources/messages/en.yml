@@ -1107,3 +1107,11 @@ io.srs-model-conflict:
 io.srs-event-model-unavailable:
   message: "Ring {ring} cannot prove actual model {version} at capture epoch {epoch}."
   solution: "Stop continuation and restore the exact model and log history, or complete the authorized full rebuild. Do not substitute the latest discovery model."
+
+io.required-dead-letter-fenced:
+  message: "The diagnostic command no longer owns its original storage binding, state generation or retirement operation."
+  solution: "Verify the original Pipeline state and operation. Do not retarget an old callback or clear an active namespace."
+
+io.required-dead-letter-conflict:
+  message: "The same source event names different retained row, deletion or token facts."
+  solution: "Keep the existing diagnostic and verify the original event before retrying through its current authorized execution."

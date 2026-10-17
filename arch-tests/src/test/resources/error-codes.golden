@@ -244,6 +244,8 @@ io.note-referenced
 io.note-scope-unavailable
 io.note-write-conflict
 io.pipeline-intent-fenced
+io.required-dead-letter-conflict
+io.required-dead-letter-fenced
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous

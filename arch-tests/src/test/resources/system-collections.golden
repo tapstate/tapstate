@@ -61,4 +61,5 @@ srs_log_bounds | cache | MongoSrsLogStore | migrated | 1 | -
 workload_claims | cache | MongoWorkloadClaimStore | owned-elsewhere | 1 | -
 srs_chains | cache | MongoSrsMetaStore | migrated | 1 | -
 srs_models | cache | MongoSrsModelStore | immutable | 1 | cacheIncarnation+ringName+_id.captureContext.epoch+_id.modelVersion (unique)
+nest_dead_letters | config | MongoRequiredDeadLetterStore | migrated | 1 | _id.clusterId+_id.bindingVersion+_id.pipelineId+_id.stepId+_id.pathId+_id.stateGeneration+_id.namespace+fact.discardedAt
 srs_model_contexts | cache | MongoSrsModelStore | migrated | 1 | cacheIncarnation+ringName+_id.captureContext.epoch (unique)

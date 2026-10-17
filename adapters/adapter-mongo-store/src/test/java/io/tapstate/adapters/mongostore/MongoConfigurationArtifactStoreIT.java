@@ -395,7 +395,7 @@ class MongoConfigurationArtifactStoreIT {
             assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
                     .containsExactlyInAnyOrder("configuration_version", "cluster_identity", "schema_migrations",
-                            "cluster_keys", "storage_setup", "sources", "pipeline_drafts");
+                            "cluster_keys", "storage_setup", "sources", "pipeline_drafts", "nest_dead_letters");
         });
     }
 
@@ -523,7 +523,7 @@ class MongoConfigurationArtifactStoreIT {
                     .containsEntry("operationId", "setup-a").containsEntry("generation", 1L);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
                     .containsExactlyInAnyOrder("storage_setup", "cluster_identity", "cluster_keys",
-                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts");
+                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "nest_dead_letters");
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();
             for (var table : List.of(SystemCollections.PDK_NOTE_ORIGINS, SystemCollections.PDK_NOTE_CARRIES)) {
@@ -880,6 +880,7 @@ class MongoConfigurationArtifactStoreIT {
                 .append("operationId", "setup-a").append("generation", 1L).append("phase", MongoConfigurationBootstrap.PREPARED));
         MongoStorageBindingStore.prepareIndex(database);
         MongoConfigurationDraftStore.prepareIndexes(database);
+        MongoRequiredDeadLetterStore.prepareIndexes(database);
         SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).insertOne(new Document("_id", "cluster")
                 .append("clusterId", "cluster-a").append("layoutId", MongoConfigurationDomain.LAYOUT)
                 .append("bindingVersion", 0L));

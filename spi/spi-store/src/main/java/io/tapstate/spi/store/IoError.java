@@ -72,6 +72,12 @@ public enum IoError implements TapstateErrorCode {
     /** A note command lost its captured key revision and must not overwrite the current value. */
     NOTE_WRITE_CONFLICT("io.note-write-conflict", Set.of()),
 
+    /** A diagnostic command no longer owns its original configuration binding or state generation. */
+    REQUIRED_DEAD_LETTER_FENCED("io.required-dead-letter-fenced", Set.of()),
+
+    /** One source event cannot describe two different retained row, deletion or token facts. */
+    REQUIRED_DEAD_LETTER_CONFLICT("io.required-dead-letter-conflict", Set.of()),
+
     /** The captured cache authentication generation is no longer current or ready. */
     CACHE_AUTH_FENCED("io.cache-auth-fenced", Set.of()),
 

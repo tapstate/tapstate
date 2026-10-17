@@ -209,6 +209,8 @@ public enum SystemCollections {
     SRS_CHAINS("srs_chains", Database.CACHE, MongoSrsMetaStore.class, Strategy.MIGRATED, 1),
     SRS_MODELS("srs_models", Database.CACHE, MongoSrsModelStore.class, Strategy.IMMUTABLE, 1,
             new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch", "_id.modelVersion"), true, "srs_models_ring_version")),
+    CONFIG_NEST_DEAD_LETTERS("nest_dead_letters", Database.CONFIG, MongoRequiredDeadLetterStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.clusterId", "_id.bindingVersion", "_id.pipelineId", "_id.stepId", "_id.pathId", "_id.stateGeneration", "_id.namespace", "fact.discardedAt"), false, "required_dead_letters_recent")),
     SRS_MODEL_CONTEXTS("srs_model_contexts", Database.CACHE, MongoSrsModelStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch"), true, "srs_model_contexts_ring"));
 
