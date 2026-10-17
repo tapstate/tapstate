@@ -61,7 +61,7 @@ step_tick() {
 step_done() {    # $1 = what is now true
     if [ -t 1 ] && [ -n "$step_open" ]; then printf '\r\033[K'; fi
     step_open=""
-    printf '  ✓ %s\n' "$1"
+    printf '  ok  %s\n' "$1"
 }
 # Ends an unfinished step line, so whatever is printed next starts on a line of its own.
 step_close() {
