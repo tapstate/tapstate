@@ -102,9 +102,16 @@ final class PdkSinkWriter implements SinkWriter {
      */
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo) {
+        this(connector, write, config, targets, stateStore, preparedAhead, letGo,
+                io.tapstate.core.model.PipelineNode.Purpose.SYNC);
+    }
+
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo,
+            io.tapstate.core.model.PipelineNode.Purpose purpose) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
-                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead), letGo);
+                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose), letGo);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,

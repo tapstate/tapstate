@@ -128,12 +128,23 @@ final class PdkConnector implements AutoCloseable {
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
                              ConnectorNoteScopes noteScopes) {
+        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes,
+                PipelineNode.Purpose.CAPTURE);
+    }
+
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
+                             ConnectorNoteScopes noteScopes, PipelineNode.Purpose purpose) {
+        java.util.Objects.requireNonNull(purpose, "purpose");
+        if (notes != null && purpose != PipelineNode.Purpose.CAPTURE) {
+            throw new IllegalArgumentException("shared notes require capture purpose");
+        }
         ensureDeploymentIdentity();
         // The contract's shared static log channel prints to standard output until somebody listens, and
         // the first connector opened is the earliest point at which anybody has.
         ConnectorLog.installSharedChannel();
         String stateNamespace = notes == null
-                ? ConnectorStateNamespace.of(node) : ConnectorStateNamespace.ofShared(notes.sharedBy());
+                ? ConnectorStateNamespace.of(node, purpose) : ConnectorStateNamespace.ofShared(notes.sharedBy());
         List<String> carriedFrom = notes == null ? List.of()
                 : notes.carriedFrom().stream().map(ConnectorStateNamespace::of).toList();
         String pipelineId = node == null ? null : node.pipelineId();

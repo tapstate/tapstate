@@ -832,13 +832,13 @@ final class StoreBackedDagSource implements DagSource {
                 ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), source.id()))));
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             PipelineNode node = new PipelineNode(pipeline.id(), view.id());
-            namespaces.add(ConnectorStateNamespace.of(node));
-            namespaces.add(SinkPreparationNamespace.of(node));
+            namespaces.add(ConnectorStateNamespace.of(node, PipelineNode.Purpose.VIEW));
+            namespaces.add(SinkPreparationNamespace.of(node, PipelineNode.Purpose.VIEW));
         }
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
             serve.sync().forEach(sync -> {
                 PipelineNode node = new PipelineNode(pipeline.id(), syncNodeId(sync));
-                namespaces.add(ConnectorStateNamespace.of(node));
+                namespaces.add(ConnectorStateNamespace.of(node, PipelineNode.Purpose.SYNC));
                 namespaces.add(SinkPreparationNamespace.of(node));
             });
         }
@@ -2078,7 +2078,7 @@ final class StoreBackedDagSource implements DagSource {
             bySourceTable.put(sourceTable,
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
-        SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bind(
+        SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bindView(
                 store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
                 new PipelineNode(pipeline.id(), inline.id()));
         String viewId = inline.id();
@@ -3321,6 +3321,12 @@ final class StoreBackedDagSource implements DagSource {
             return bind(connectorId, settings, writeMode, ddl,
                     targets.size() == 1 ? targets.values().iterator().next() : null, node);
         }
+        default SupplierEx<? extends SinkWriter> bindView(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node) {
+            return bind(connectorId, settings, writeMode, ddl, targets, node);
+        }
+
         default SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                 Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
@@ -3329,6 +3335,14 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     static final class PdkSinkWriterBinder implements SinkWriterBinder {
+
+        @Override
+        public SupplierEx<? extends SinkWriter> bindView(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node) {
+            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets, node,
+                    OnFullLoad.APPEND, true, PipelineNode.Purpose.VIEW);
+        }
 
         @Override
         public SupplierEx<? extends SinkWriter> bind(

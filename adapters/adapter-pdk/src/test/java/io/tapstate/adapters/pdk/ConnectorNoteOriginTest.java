@@ -41,7 +41,7 @@ class ConnectorNoteOriginTest {
     @Test
     void anotherConnectionOrArtifactRefusesBeforeThePluginCanLoad(@TempDir Path dir) {
         var retained = ConnectorNoteOrigin.capture("mongo", "a".repeat(64), Map.of("uri", "database-x"));
-        var scope = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1), 1);
+        var scope = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state.p1.capture.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1), 1);
         RequiredNoteStore store = (RequiredNoteStore) Proxy.newProxyInstance(RequiredNoteStore.class.getClassLoader(),
                 new Class<?>[]{RequiredNoteStore.class}, (proxy, method, args) -> switch (method.getName()) {
                     case "guardedBy" -> proxy;
@@ -62,7 +62,7 @@ class ConnectorNoteOriginTest {
 
     @Test
     void aMissingOriginDoesNotPrepareOneOrFallBackToCurrentSettings(@TempDir Path dir) {
-        var scope = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1), 1);
+        var scope = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state.p1.capture.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1), 1);
         RequiredNoteStore store = (RequiredNoteStore) Proxy.newProxyInstance(RequiredNoteStore.class.getClassLoader(),
                 new Class<?>[]{RequiredNoteStore.class}, (proxy, method, args) -> {
                     if (method.getName().equals("guardedBy")) return proxy;
@@ -111,7 +111,7 @@ class ConnectorNoteOriginTest {
         Map<String, Object> nested = new LinkedHashMap<>(Map.of("uri", "database-x"));
         Map<String, Object> caller = new LinkedHashMap<>(Map.of("connection", nested));
         var retained = ConnectorNoteOrigin.capture("mongo", "a".repeat(64), caller);
-        var primary = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1), 1);
+        var primary = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state.p1.capture.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1), 1);
         var global = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0), 1);
         RequiredNoteStore store = (RequiredNoteStore) Proxy.newProxyInstance(RequiredNoteStore.class.getClassLoader(),
                 new Class<?>[]{RequiredNoteStore.class}, (proxy, method, args) -> switch (method.getName()) {

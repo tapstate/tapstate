@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
@@ -22,6 +23,7 @@ public final class PdkSinkPort implements SinkPort {
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
     private final SharedSinkConnectors sharing;
+    private final PipelineNode.Purpose purpose;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkSinkPort(ConnectorProvisioner provisioner) {
@@ -37,6 +39,15 @@ public final class PdkSinkPort implements SinkPort {
      * {@code sharing} keeps them on this member; null opens one per writer whatever the artifact.
      */
     public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, SharedSinkConnectors sharing) {
+        this(provisioner, stateStore, sharing, PipelineNode.Purpose.SYNC);
+    }
+
+    public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, SharedSinkConnectors sharing,
+            PipelineNode.Purpose purpose) {
+        if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
+            throw new IllegalArgumentException("sink purpose must be view or sync");
+        }
+        this.purpose = purpose;
         this.provisioner = provisioner;
         this.stateStore = stateStore;
         this.sharing = sharing;
@@ -61,14 +72,14 @@ public final class PdkSinkPort implements SinkPort {
      * sink on this member share one, started by the first of them and stopped by the last.
      */
     public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
-        PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values());
+        PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values(), purpose);
         ConnectorRef ref = provisioner.resolve(config.connectorId());
         if (sharing == null || config.node() == null || !ref.shareSafe()) {
             return open(config, ref, targets, true);
         }
-        PdkConnector connector = sharing.acquire(config.node(), config.connectorId(), ref,
+        PdkConnector connector = sharing.acquire(config.node(), purpose, config.connectorId(), ref,
                 () -> started(config, ref));
-        Runnable letGo = () -> sharing.release(config.node(), config.connectorId(), ref);
+        Runnable letGo = () -> sharing.release(config.node(), purpose, config.connectorId(), ref);
         try {
             return writerOver(connector, config, targets, letGo);
         } catch (Throwable t) {
@@ -83,7 +94,7 @@ public final class PdkSinkPort implements SinkPort {
             Runnable letGo) {
         WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
         try {
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
@@ -96,7 +107,7 @@ public final class PdkSinkPort implements SinkPort {
     /** A connector opened and started for the writers that will share it, stopped again if it fails to start. */
     private PdkConnector started(SinkConfig config, ConnectorRef ref) {
         PdkConnector connector = PdkConnector.open(
-                config.connectorId(), ref, config.settings(), config.node(), stateStore);
+                config.connectorId(), ref, config.settings(), config.node(), stateStore, null, null, purpose);
         try {
             connector.underLoader(() -> {
                 connector.connector().init(connector.context());
@@ -120,13 +131,13 @@ public final class PdkSinkPort implements SinkPort {
     public void prepare(SinkConfig config, Map<String, TargetTable> targets) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                config.node(), stateStore);
+                config.node(), stateStore, null, null, purpose);
         try {
             connector.underLoader(() -> {
                 connector.connector().init(connector.context());
                 PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
                         connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
-                        config.node(), stateStore);
+                        config.node(), stateStore, false, purpose);
                 for (TargetTable target : targets.values()) {
                     TapTable table = TargetTapTable.build(target);
                     connector.resolveTargetTypes(table);
@@ -147,7 +158,7 @@ public final class PdkSinkPort implements SinkPort {
     private SinkWriter open(SinkConfig config, ConnectorRef ref, Map<String, TargetTable> targets,
             boolean preparedAhead) {
         PdkConnector connector = PdkConnector.open(config.connectorId(), ref, config.settings(), config.node(),
-                stateStore);
+                stateStore, null, null, purpose);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());
@@ -160,7 +171,7 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {

@@ -139,6 +139,32 @@ class MongoTargetPreparationTest {
                 .prepare(TARGET, TargetTapTable.build(TARGET))).hasMessageContaining("no clear-table function");
     }
 
+    @Test
+    void aViewReceiptDoesNotPrepareTheSameNamedSyncAndEachClearRunsOnce() throws Throwable {
+        List<String> calls = new ArrayList<>();
+        HeapKeyedState state = new HeapKeyedState();
+        ConnectorFunctions functions = functions(calls);
+        functions.supportExecuteCommandFunction((context, command, consumer) -> {
+            calls.add("clear");
+            consumer.accept(new ExecuteResult<Long>().result(0L));
+        });
+        var view = new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.VIEW);
+        view.prepare(TARGET, TargetTapTable.build(TARGET));
+        assertThatThrownBy(() -> PdkTargetPreparation.requirePrepared(NODE, state, List.of(TARGET),
+                PipelineNode.Purpose.SYNC)).hasMessageContaining("not prepared");
+        var sync = new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.SYNC);
+        sync.prepare(TARGET, TargetTapTable.build(TARGET));
+        new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.VIEW).prepare(TARGET, TargetTapTable.build(TARGET));
+        new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.SYNC).prepare(TARGET, TargetTapTable.build(TARGET));
+        assertThat(calls).containsExactly("clear", "create", "clear", "create", "create", "create");
+        PdkTargetPreparation.requirePrepared(NODE, state, List.of(TARGET), PipelineNode.Purpose.VIEW);
+        PdkTargetPreparation.requirePrepared(NODE, state, List.of(TARGET), PipelineNode.Purpose.SYNC);
+    }
+
     private static PdkTargetPreparation preparation(String id, ConnectorFunctions functions, OnFullLoad policy,
             boolean fullLoad, HeapKeyedState state) {
         return new PdkTargetPreparation(id, null, functions, policy, fullLoad, NODE, state);

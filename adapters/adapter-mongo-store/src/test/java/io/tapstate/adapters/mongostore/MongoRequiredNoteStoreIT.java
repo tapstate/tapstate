@@ -380,7 +380,7 @@ class MongoRequiredNoteStoreIT {
     void aRetiringPipelineCannotUseItsOldOrdinaryNoteHandle() {
         withNotes(f -> {
             f.pipelineGeneration("p1", 1);
-            var owner = new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1);
+            var owner = new RequiredNoteOwner(1, "pdk.state.p1.capture.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1);
             var scope = f.initialize(owner);
             assertThat(f.notes.compareAndSet(scope, "key", 0, bytes("retained"), false)).isTrue();
             SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id", "p1"),
@@ -396,7 +396,7 @@ class MongoRequiredNoteStoreIT {
     void anOrdinaryNoteWriteCannotRepairAMissingMappingFence() {
         withNotes(f -> {
             f.pipelineGeneration("p1", 1);
-            var scope = f.initialize(new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1));
+            var scope = f.initialize(new RequiredNoteOwner(1, "pdk.state.p1.capture.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1));
             assertThat(f.notes.compareAndSet(scope, "key", 0, bytes("retained"), false)).isTrue();
             SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id", "p1"),
                     new Document("$unset", new Document("noteWriteFence", "")));
@@ -415,7 +415,7 @@ class MongoRequiredNoteStoreIT {
                 new Document("operationId", 7), new Document("noteWriteFence", 2), new Document("noteWriteFence", -1L))) {
             withNotes(f -> {
                 f.pipelineGeneration("p1", 1);
-                var scope = f.initialize(new RequiredNoteOwner(1, "pdk.state.p1.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1));
+                var scope = f.initialize(new RequiredNoteOwner(1, "pdk.state.p1.capture.src", RequiredNoteOwner.Kind.PIPELINE, "p1", 1));
                 assertThat(f.notes.compareAndSet(scope, "key", 0, bytes("retained"), false)).isTrue();
                 SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id", "p1"),
                         new Document("$set", change));
@@ -936,6 +936,33 @@ class MongoRequiredNoteStoreIT {
         return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
     }
 
+    @Test
+    void aPersistedCarryCannotGrantASharedCaptureAccessToSinkNotes() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            for (var purpose : List.of(io.tapstate.core.model.PipelineNode.Purpose.VIEW,
+                    io.tapstate.core.model.PipelineNode.Purpose.SYNC)) {
+                var shared = f.initialize(chain("chain-" + purpose.segment()));
+                var source = f.initialize(RequiredNoteOwner.forNode(1,
+                        new io.tapstate.core.model.PipelineNode("p1", "shared"), purpose, 1));
+                var id = new Document("sharedBindingVersion", 1L).append("sharedNamespace", shared.owner().namespace())
+                        .append("sharedGeneration", 1L).append("sourceBindingVersion", 1L)
+                        .append("sourceNamespace", source.owner().namespace()).append("sourceGeneration", 1L);
+                SystemCollections.PDK_NOTE_CARRIES.on(f.database).insertOne(new Document("_id", id)
+                        .append("sharedOwnerId", shared.owner().ownerId()).append("sourceOwnerId", "p1")
+                        .append("sourceStateGeneration", 1L));
+                SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(
+                        new Document("_id.bindingVersion", 1L).append("_id.namespace", shared.owner().namespace()),
+                        new Document("$set", new Document("outgoingCarries", 1L)));
+                SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(
+                        new Document("_id.bindingVersion", 1L).append("_id.namespace", source.owner().namespace()),
+                        new Document("$set", new Document("incomingCarries", 1L)));
+                assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(failure ->
+                        assertThat(((TapstateException) failure).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            }
+        });
+    }
+
     private static RequiredNoteOwner global() {
         return new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0);
     }
@@ -945,7 +972,7 @@ class MongoRequiredNoteStoreIT {
     }
 
     private static RequiredNoteOwner pipeline(String id, long generation) {
-        return new RequiredNoteOwner(1, "pdk.state." + id + ".source", RequiredNoteOwner.Kind.PIPELINE, id, generation);
+        return new RequiredNoteOwner(1, "pdk.state." + id + ".capture.source", RequiredNoteOwner.Kind.PIPELINE, id, generation);
     }
 
     private static byte[] bytes(String value) {

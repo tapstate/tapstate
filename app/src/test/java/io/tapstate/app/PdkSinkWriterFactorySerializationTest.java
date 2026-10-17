@@ -64,6 +64,20 @@ class PdkSinkWriterFactorySerializationTest {
         assertThat(restored.fullLoad()).isFalse();
     }
 
+    @Test
+    void actualViewAndSyncBindersRetainTheirDistinctPurposeAcrossSerialization() throws Exception {
+        var binder = new StoreBackedDagSource.PdkSinkWriterBinder();
+        PipelineNode node = new PipelineNode("p1", "shared");
+        var view = (PdkSinkWriterFactory) roundTrip(binder.bindView("mongodb", Map.of(), WriteMode.UPSERT,
+                DdlPolicy.FAIL, Map.of(), node));
+        var sync = (PdkSinkWriterFactory) roundTrip(binder.bind("mongodb", Map.of(), WriteMode.UPSERT,
+                DdlPolicy.FAIL, Map.<String, TargetTable>of(), node));
+        assertThat(view.node()).isEqualTo(node);
+        assertThat(sync.node()).isEqualTo(node);
+        assertThat(view.purpose()).isEqualTo(PipelineNode.Purpose.VIEW);
+        assertThat(sync.purpose()).isEqualTo(PipelineNode.Purpose.SYNC);
+    }
+
     private static Object roundTrip(Object value) throws Exception {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {

@@ -43,7 +43,7 @@ class ConfiguredCaptureNotesTest {
             }
             assertThat(rows).hasSize(1);
             assertThat(rows.getFirst().after()).containsEntry("slot", "recorded-slot");
-            assertThat(fixture.opened).containsExactly("pdk.state.p1.src", "pdk.global-state");
+            assertThat(fixture.opened).containsExactly("pdk.state.p1.capture.src", "pdk.global-state");
         }
     }
 
@@ -53,7 +53,7 @@ class ConfiguredCaptureNotesTest {
             var port = PdkCapturePort.withRequiredNotes(id -> fixture.ref, null, fixture.scopes);
             assertThat(port.release(config())).isEmpty();
             assertThat(fixture.released).containsExactly("recorded-slot");
-            assertThat(fixture.opened).containsExactly("pdk.state.p1.src", "pdk.global-state");
+            assertThat(fixture.opened).containsExactly("pdk.state.p1.capture.src", "pdk.global-state");
         }
     }
 
@@ -82,7 +82,7 @@ class ConfiguredCaptureNotesTest {
         try (Fixture fixture = fixture(dir, false)) {
             AtomicInteger privateOpens = new AtomicInteger();
             var fixed = ConnectorNoteScopes.of(fixture.scopes.store(), namespace -> {
-                if (namespace.equals("pdk.state.p1.src") && privateOpens.incrementAndGet() > 1) {
+                if (namespace.equals("pdk.state.p1.capture.src") && privateOpens.incrementAndGet() > 1) {
                     throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
                 }
                 return fixture.scopes.open(namespace);

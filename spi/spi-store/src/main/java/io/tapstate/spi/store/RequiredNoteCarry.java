@@ -8,9 +8,9 @@ public record RequiredNoteCarry(RequiredNoteScope shared, RequiredNoteScope sour
         Objects.requireNonNull(shared, "shared");
         Objects.requireNonNull(source, "source");
         if (shared.owner().kind() != RequiredNoteOwner.Kind.CHAIN
-                || source.owner().kind() != RequiredNoteOwner.Kind.PIPELINE
+                || !source.owner().hasPurpose(io.tapstate.core.model.PipelineNode.Purpose.CAPTURE)
                 || shared.owner().bindingVersion() != source.owner().bindingVersion()) {
-            throw new IllegalArgumentException("carry requires a shared chain and private scope in the same binding");
+            throw new IllegalArgumentException("carry requires a shared chain and private capture scope in the same binding");
         }
     }
 }

@@ -64,11 +64,18 @@ final class PdkTargetPreparation {
     PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
             OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
             boolean preparedAhead) {
+        this(connectorId, context, functions, onFullLoad, fullLoad, node, stateStore, preparedAhead,
+                PipelineNode.Purpose.SYNC);
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
+            boolean preparedAhead, PipelineNode.Purpose purpose) {
         this.context = context;
         this.functions = functions;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
-        this.namespace = SinkPreparationNamespace.of(node);
+        this.namespace = SinkPreparationNamespace.of(node, purpose);
         this.stateStore = stateStore;
         this.preparedAhead = preparedAhead;
         this.mongoTarget = connectorId != null && MONGO_TARGETS.contains(connectorId);
@@ -122,7 +129,12 @@ final class PdkTargetPreparation {
      * receipt is kept at all there is nothing to check.
      */
     static void requirePrepared(PipelineNode node, KeyedStateStore stateStore, Collection<TargetTable> targets) {
-        String namespace = SinkPreparationNamespace.of(node);
+        requirePrepared(node, stateStore, targets, PipelineNode.Purpose.SYNC);
+    }
+
+    static void requirePrepared(PipelineNode node, KeyedStateStore stateStore, Collection<TargetTable> targets,
+            PipelineNode.Purpose purpose) {
+        String namespace = SinkPreparationNamespace.of(node, purpose);
         if (namespace == null || stateStore == null) {
             return;
         }

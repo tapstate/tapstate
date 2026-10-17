@@ -25,7 +25,12 @@ public final class SharedSinkConnectors {
      */
     synchronized PdkConnector acquire(PipelineNode node, String connectorId, ConnectorRef ref,
             Supplier<PdkConnector> start) {
-        Key key = new Key(node, connectorId, ref.contentHash());
+        return acquire(node, PipelineNode.Purpose.SYNC, connectorId, ref, start);
+    }
+
+    synchronized PdkConnector acquire(PipelineNode node, PipelineNode.Purpose purpose, String connectorId,
+            ConnectorRef ref, Supplier<PdkConnector> start) {
+        Key key = new Key(node, purpose, connectorId, ref.contentHash());
         Lease lease = leases.get(key);
         if (lease == null) {
             lease = new Lease(start.get());
@@ -37,7 +42,11 @@ public final class SharedSinkConnectors {
 
     /** Lets go of one hold on {@code node}'s connector, stopping and closing it with the last. */
     synchronized void release(PipelineNode node, String connectorId, ConnectorRef ref) {
-        Key key = new Key(node, connectorId, ref.contentHash());
+        release(node, PipelineNode.Purpose.SYNC, connectorId, ref);
+    }
+
+    synchronized void release(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, ConnectorRef ref) {
+        Key key = new Key(node, purpose, connectorId, ref.contentHash());
         Lease lease = leases.get(key);
         if (lease == null) {
             throw new IllegalStateException("released a shared connector of " + node + " that nothing holds");
@@ -51,13 +60,20 @@ public final class SharedSinkConnectors {
 
     /** How many writers hold {@code node}'s shared connector of {@code ref}'s artifact on this member. */
     synchronized int holders(PipelineNode node, String connectorId, ConnectorRef ref) {
-        Lease lease = leases.get(new Key(node, connectorId, ref.contentHash()));
+        return holders(node, PipelineNode.Purpose.SYNC, connectorId, ref);
+    }
+
+    synchronized int holders(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, ConnectorRef ref) {
+        Lease lease = leases.get(new Key(node, purpose, connectorId, ref.contentHash()));
         return lease == null ? 0 : lease.holders;
     }
 
-    private record Key(PipelineNode node, String connectorId, String contentHash) {
+    private record Key(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, String contentHash) {
         Key {
             Objects.requireNonNull(node, "node");
+            if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
+                throw new IllegalArgumentException("sink purpose must be view or sync");
+            }
             Objects.requireNonNull(connectorId, "connectorId");
             Objects.requireNonNull(contentHash, "contentHash");
         }

@@ -75,6 +75,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     private final boolean fullLoad;
     private final Map<String, TargetTable> targets;
     private final PipelineNode node;
+    private final PipelineNode.Purpose purpose;
 
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl, TargetTable target,
@@ -92,6 +93,17 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+        this(connectorId, settings, writeMode, ddl, targets, node, onFullLoad, fullLoad, PipelineNode.Purpose.SYNC);
+    }
+
+    PdkSinkWriterFactory(
+            String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad,
+            PipelineNode.Purpose purpose) {
+        if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
+            throw new IllegalArgumentException("sink purpose must be view or sync");
+        }
+        this.purpose = purpose;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
         this.connectorId = connectorId;
@@ -112,6 +124,8 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
         return node;
     }
 
+    PipelineNode.Purpose purpose() { return purpose; }
+
     OnFullLoad onFullLoad() { return onFullLoad; }
 
     boolean fullLoad() { return fullLoad; }
@@ -119,7 +133,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     @Override
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
-        return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member))
+        return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member), purpose)
                 .openPrepared(config(), targets);
     }
 
@@ -131,7 +145,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
 
     @Override
     public void prepareTargets(HazelcastInstance coordinator) {
-        new PdkSinkPort(provisioner(coordinator), stateStore(coordinator)).prepare(config(), targets);
+        new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), null, purpose).prepare(config(), targets);
     }
 
     private SinkConfig config() {

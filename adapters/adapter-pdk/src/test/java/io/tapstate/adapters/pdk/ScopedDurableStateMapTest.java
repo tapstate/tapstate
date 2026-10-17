@@ -373,7 +373,7 @@ class ScopedDurableStateMapTest {
     }
 
     private static RequiredNoteScope pipeline(String id, String node) {
-        return new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state." + id + "." + node,
+        return new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.state." + id + ".capture." + node,
                 RequiredNoteOwner.Kind.PIPELINE, id, 1), 1);
     }
 
