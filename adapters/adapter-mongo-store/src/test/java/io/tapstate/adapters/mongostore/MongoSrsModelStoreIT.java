@@ -824,6 +824,19 @@ class MongoSrsModelStoreIT {
         });
     }
 
+    @Test
+    void anAppendCannotAdvanceItsLastReadableChainFenceIntoAnUnreadableCounter() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("modelWriteFence", Long.MAX_VALUE - 1)));
+            Document before = SystemCollections.SRS_CHAINS.on(f.database()).find().first(); Document claim = claim(f.database());
+            assertThatThrownBy(() -> modelLog(f).store(RING, 1, event(0, 7, f.fence()))).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first()).isEqualTo(before);
+            assertThat(claim(f.database())).isEqualTo(claim);
+            assertThat(f.models().require(key(0))).isEqualTo(model(0, table("id", null)));
+        });
+    }
+
     private static SrsLogRecord event(long version, long epoch, WorkloadClaimFence fence) {
         return new SrsLogRecord("offset", Op.INSERT, 1, null, Map.of("id", 1), version, fence, epoch);
     }

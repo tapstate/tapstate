@@ -113,7 +113,7 @@ final class MongoSrsModelContexts {
         return decode(row);
     }
 
-    private List<Document> heads(Document chain) {
+    List<Document> heads(Document chain) {
         Object value = chain.get("modelContextHeads");
         if (!(value instanceof List<?> entries)) throw unreadable();
         var result = new ArrayList<Document>(); var tables = new HashSet<String>(); var rings = new HashSet<String>();

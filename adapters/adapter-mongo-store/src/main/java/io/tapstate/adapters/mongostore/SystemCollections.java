@@ -206,7 +206,7 @@ public enum SystemCollections {
     SRS_EVENTS("srs_events", Database.CACHE, MongoSrsLogStore.class, Strategy.MIGRATED, 1),
     SRS_LOG_BOUNDS("srs_log_bounds", Database.CACHE, MongoSrsLogStore.class, Strategy.MIGRATED, 1),
     CACHE_WORKLOAD_CLAIMS("workload_claims", Database.CACHE, MongoWorkloadClaimStore.class, Strategy.OWNED_ELSEWHERE, 1),
-    SRS_CHAINS("srs_chains", Database.CACHE, MongoSrsMetaStore.class, Strategy.MIGRATED, 1),
+    SRS_CHAINS("srs_chains", Database.CACHE, MongoSrsChainStore.class, Strategy.MIGRATED, 1),
     SRS_MODELS("srs_models", Database.CACHE, MongoSrsModelStore.class, Strategy.IMMUTABLE, 1,
             new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch", "_id.modelVersion"), true, "srs_models_ring_version")),
     CONFIG_NEST_DEAD_LETTERS("nest_dead_letters", Database.CONFIG, MongoRequiredDeadLetterStore.class, Strategy.MIGRATED, 1,

@@ -1097,6 +1097,9 @@ io.pipeline-intent-fenced:
 io.cache-business-fenced:
   message: "The captured cache business incarnation is unavailable or no longer current."
   solution: "Verify the original storage binding and business recovery state before starting a new operation. Do not retarget an old callback."
+io.srs-checkpoint-unproven:
+  message: "The source checkpoint for chain {chain} cannot prove its durable table and model closure."
+  solution: "Keep the original state and inspect the missing checkpoint, log or model facts before resuming."
 io.srs-model-unavailable:
   message: "Actual model {version} for table {table} on chain {chain} is unavailable in its captured context."
   solution: "Stop continuation and restore the exact retained model or complete the authorized full rebuild. Do not use the latest discovery model as a substitute."

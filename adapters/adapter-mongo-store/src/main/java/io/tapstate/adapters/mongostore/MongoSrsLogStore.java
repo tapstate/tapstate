@@ -309,6 +309,13 @@ public final class MongoSrsLogStore implements SrsLogStore {
         StoreIo.run(() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(true)));
     }
 
+    SrsLogBounds boundsInSession(ClientSession session, String ring) { return splitBounds(session, ring); }
+
+    Optional<SrsLogRecord> loadInSession(ClientSession session, String ring, long sequence) {
+        return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, sequence))).first())
+                .map(row -> checkedRecord(session, ring, row));
+    }
+
     private SrsLogBounds splitBounds(ClientSession session, String ring) {
         if (models != null) models.checkRing(session, ring);
         Document stored = boundsCollection.find(session, new Document("_id", boundsId(ring))).first();

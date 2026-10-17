@@ -1,9 +1,15 @@
 package io.tapstate.adapters.mongostore;
 
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.Document;
 
 import java.util.List;
+import java.util.Map;
 
 /** The one Mongo shape and live-claim filter shared by durable store-side workload fences. */
 final class WorkloadClaimDocuments {
@@ -23,6 +29,22 @@ final class WorkloadClaimDocuments {
                 .append("executionGeneration", fence.executionGeneration())
                 .append("topologyRevision", fence.topologyRevision())
                 .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+    }
+
+    static WorkloadClaimFence readCapture(Document stored) {
+        try {
+            if (!(stored.get("claimGeneration") instanceof Long claim) || !(stored.get("executionGeneration") instanceof Long execution)
+                    || !(stored.get("topologyRevision") instanceof Long topology)) throw unreadable();
+            var fence = new WorkloadClaimFence(new WorkloadClaimKey(stored.getString("clusterId"), WorkloadClaimType.CAPTURE,
+                    stored.getString("resourceId")), new WorkloadOwner(stored.getString("ownerNodeId"), stored.getString("ownerBootId")),
+                    claim, execution, topology);
+            if (!stored.equals(stored(fence))) throw unreadable();
+            return fence;
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
+    }
+
+    private static TapstateException unreadable() {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-chain", "field", "capture-fence"), null);
     }
 
     /** The canonical persisted form of one workload claim fence. */

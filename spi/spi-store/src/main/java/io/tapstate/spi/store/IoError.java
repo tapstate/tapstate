@@ -90,6 +90,9 @@ public enum IoError implements TapstateErrorCode {
     /** An event cannot prove its exact ring, capture epoch and model version. */
     SRS_EVENT_MODEL_UNAVAILABLE("io.srs-event-model-unavailable", Set.of("ring", "epoch", "version")),
 
+    /** A source checkpoint cannot prove its original chain, table frontiers and exact model closure. */
+    SRS_CHECKPOINT_UNPROVEN("io.srs-checkpoint-unproven", Set.of("chain")),
+
     /** An exact actual model is absent or cannot be used for the captured stream context. */
     SRS_MODEL_UNAVAILABLE("io.srs-model-unavailable", Set.of("chain", "table", "version")),
 

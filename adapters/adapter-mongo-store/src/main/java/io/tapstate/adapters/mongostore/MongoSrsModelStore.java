@@ -100,7 +100,9 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
     @Override public Optional<SrsModel> load(SrsModelKey key) {
         requireScope(key);
-        return transaction(session -> {
+        return transaction(session -> loadInSession(session, key));
+    }
+    private Optional<SrsModel> loadInSession(ClientSession session, SrsModelKey key) {
             requireBusiness(session);
             Document chain = requireChain(session, key);
             Document anchor = contexts.head(chain, key.table());
@@ -117,7 +119,15 @@ public final class MongoSrsModelStore implements SrsModelStore {
             }
             SrsModel model = decode(stored); requirePublished(control, model);
             return Optional.of(model);
-        });
+    }
+
+    record ModelReference(SrsModel model, WorkloadClaimFence fence, EventModelRange range) {}
+
+    ModelReference requireReference(ClientSession session, SrsModelKey key) {
+        requireScope(key);
+        SrsModel model = loadInSession(session, key).orElseThrow(() -> unavailable(key));
+        var control = contexts.find(session, key);
+        return new ModelReference(model, control.fence(), range(session, model, control));
     }
 
     private SrsModel requirePublishedHead(ClientSession session, MongoSrsModelContexts.Context control) {
@@ -203,26 +213,9 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (writing && (!fence.key().resourceId().equals(chain.get("captureId"))
                 || !Long.valueOf(event.epoch()).equals(chain.get("epoch")) || control.nextId() != null)) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
         requirePublished(control, model);
-        Long end = null;
-        if (event.schemaVer() < control.publishedVersion()) {
-            if (event.schemaVer() + 1 == control.publishedVersion()) {
-                end = control.publishedSequence();
-            } else {
-                Document next = SystemCollections.SRS_MODELS.on(database).find(session,
-                        new Document("_id", key(version(control, event.schemaVer() + 1)))).first();
-                if (next == null) throw unavailable(model.key());
-                SrsModel successor = decode(next); requirePublished(control, successor);
-                end = successor.ddlSequence();
-            }
-            if (end <= model.ddlSequence()) throw unreadable();
-        }
-        if (control.nextId() != null) {
-            var next = contexts.require(session, control.nextId());
-            if (!next.ring().equals(ring) || !control.nextSequence().equals(next.firstSequence())) throw unreadable();
-            // The independently retained control proves this cut without retaining an unrelated schema body.
-            end = end == null ? next.firstSequence() : Math.min(end, next.firstSequence());
-        }
+        EventModelRange range = range(session, model, control);
         if (writing) {
+            if (chain.getLong("modelWriteFence") >= Long.MAX_VALUE - 1) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
             // Capture replacement and context closure both write this root, including when claim IDs differ.
             Document expected = new Document("_id", chain.get("_id")).append("cacheIncarnation", scope.cacheIncarnation())
                     .append("epoch", event.epoch()).append("captureId", fence.key().resourceId())
@@ -231,6 +224,29 @@ public final class MongoSrsModelStore implements SrsModelStore {
                     new Document("$inc", new Document("modelWriteFence", 1L))).getMatchedCount() != 1) {
                 throw eventUnavailable(ring, event.epoch(), event.schemaVer());
             }
+        }
+        return range;
+    }
+
+    private EventModelRange range(ClientSession session, SrsModel model, MongoSrsModelContexts.Context control) {
+        Long end = null;
+        if (model.key().modelVersion() < control.publishedVersion()) {
+            if (model.key().modelVersion() + 1 == control.publishedVersion()) {
+                end = control.publishedSequence();
+            } else {
+                Document next = SystemCollections.SRS_MODELS.on(database).find(session,
+                        new Document("_id", key(version(control, model.key().modelVersion() + 1)))).first();
+                if (next == null) throw unavailable(model.key());
+                SrsModel successor = decode(next); requirePublished(control, successor);
+                end = successor.ddlSequence();
+            }
+            if (end <= model.ddlSequence()) throw unreadable();
+        }
+        if (control.nextId() != null) {
+            var next = contexts.require(session, control.nextId());
+            if (!next.ring().equals(model.ringName()) || !control.nextSequence().equals(next.firstSequence())) throw unreadable();
+            // The independently retained control proves this cut without retaining an unrelated schema body.
+            end = end == null ? next.firstSequence() : Math.min(end, next.firstSequence());
         }
         return new EventModelRange(model.ddlSequence(), end);
     }
@@ -277,18 +293,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
             return new SrsLogBounds(largest, trimmed);
         }
     }
-    private void requireBusiness(ClientSession session) {
-        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
-        if (identity == null || !scope.clusterId().equals(identity.get("clusterId")) || !Long.valueOf(scope.bindingVersion()).equals(identity.get("bindingVersion"))
-                || !scope.cacheIncarnation().equals(identity.get("cacheIncarnation")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
-                || !MongoCacheIdentity.READY.equals(identity.get("businessPhase"))) throw businessFenced();
-        Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
-        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable();
-        if (version > 1) throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY, Map.of("installed", String.valueOf(version), "supported", "1"), null);
-        if (version != 1 || !MongoCacheIdentity.READY.equals(schema.get("phase"))) throw businessFenced();
-        if (!(identity.get("businessPreparationId") instanceof String operation) || operation.isBlank()
-                || !operation.equals(schema.get("operationId")) || !(schema.get("epoch") instanceof Long epoch) || epoch < 1) throw unreadable();
-    }
+    private void requireBusiness(ClientSession session) { new MongoCacheBusinessIdentity(database, scope).requireReady(session); }
     private Document document(SrsModel model) {
         Document table = MongoSchemaStore.tableDocument(model.table());
         Document row = new Document("_id", key(model.key())).append("formatVersion", 1).append("cacheIncarnation", model.key().cacheIncarnation())
@@ -299,11 +304,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "ringName", "ddlSequence", "schema", "contentHash"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("ddlSequence") instanceof Long sequence)) throw unreadable();
-            Document id = row.get("_id", Document.class); Document context = id.get("captureContext", Document.class);
-            if (!id.keySet().equals(Set.of("chain", "table", "captureContext", "modelVersion"))
-                    || !context.keySet().equals(Set.of("cacheIncarnation", "epoch"))
-                    || !(context.get("epoch") instanceof Long epoch) || !(id.get("modelVersion") instanceof Long version)) throw unreadable();
-            var key = new SrsModelKey(id.getString("chain"), id.getString("table"), context.getString("cacheIncarnation"), epoch, version);
+            SrsModelKey key = readKey(row.get("_id", Document.class));
             requireScope(key);
             Document table = row.get("schema", Document.class);
             var model = new SrsModel(key, row.getString("ringName"), MongoSchemaStore.toTable(table, "srs-model"), sequence);
@@ -313,7 +314,17 @@ public final class MongoSrsModelStore implements SrsModelStore {
             return model;
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
-    private static Document key(SrsModelKey key) {
+    static SrsModelKey readKey(Document id) {
+        try {
+            Document context = id.get("captureContext", Document.class);
+            if (!id.keySet().equals(Set.of("chain", "table", "captureContext", "modelVersion"))
+                    || !context.keySet().equals(Set.of("cacheIncarnation", "epoch"))
+                    || !(context.get("epoch") instanceof Long epoch) || !(id.get("modelVersion") instanceof Long version)) throw unreadable();
+            return new SrsModelKey(id.getString("chain"), id.getString("table"), context.getString("cacheIncarnation"), epoch, version);
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
+    }
+
+    static Document key(SrsModelKey key) {
         return new Document("chain", key.miningChainId()).append("table", key.table())
                 .append("captureContext", new Document("cacheIncarnation", key.cacheIncarnation()).append("epoch", key.captureEpoch()))
                 .append("modelVersion", key.modelVersion());
