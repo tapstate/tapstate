@@ -519,6 +519,12 @@ store.pipeline-retirement-required:
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
+store.storage-connection-unsupported:
+  message: "The storage connection uses unsupported database, authentication or TLS settings."
+  solution: "Use an explicit valid database, verified server TLS and a separate CA bundle. Atlas requires a username and password with SCRAM-SHA-256 and authSource=admin. Client keys and disabled certificate verification are not supported."
+store.tls-trust-invalid:
+  message: "The storage TLS trust bundle is invalid."
+  solution: "Provide a PEM certificate bundle of at most 64 KiB without private keys. Check the server chain and hostname; do not disable verification."
 migration.data-newer-than-binary:
   message: "The store holds system data at version {installed}, which is newer than this build supports (up to {supported})."
   solution: "Start a build at or above the one that wrote it. Downgrading across a system-data version is not supported; to go back, restore the backup taken before the upgrade."

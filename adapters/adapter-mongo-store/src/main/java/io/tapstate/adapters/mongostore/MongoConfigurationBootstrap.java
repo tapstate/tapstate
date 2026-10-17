@@ -34,7 +34,7 @@ public final class MongoConfigurationBootstrap {
         requireText(installationId);
         requireText(operationId);
         if (generation < 1) throw new IllegalArgumentException("bootstrap generation must be positive");
-        MongoConnection connection = new MongoConnection(settings);
+        MongoConnection connection = MongoConnection.forConfiguration(settings);
         byte[] key = new byte[32];
         new SecureRandom().nextBytes(key);
         try {

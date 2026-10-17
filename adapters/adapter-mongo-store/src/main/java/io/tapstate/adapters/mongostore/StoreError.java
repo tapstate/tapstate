@@ -59,7 +59,13 @@ public enum StoreError implements TapstateErrorCode {
      * file path (a filesystem path, not a credential, so it is safe to echo back). Reached only when
      * TLS is enabled (opt-in via the URI) and a CA file is configured.
      */
-    TLS_CA_UNREADABLE("store.tls-ca-unreadable", Set.of("path"));
+    TLS_CA_UNREADABLE("store.tls-ca-unreadable", Set.of("path")),
+
+    /** A normalized storage endpoint violates its database, server TLS or authentication boundary. */
+    STORAGE_CONNECTION_UNSUPPORTED("store.storage-connection-unsupported", Set.of()),
+
+    /** Stored trust material is invalid; no URI, certificate or private-key contents are exposed. */
+    TLS_TRUST_INVALID("store.tls-trust-invalid", Set.of());
 
     private final String code;
     private final Set<String> placeholders;

@@ -327,7 +327,9 @@ store.pipeline-retirement-required
 store.source-config-keyring-invalid
 store.source-config-keyring-not-ready
 store.source-config-keyring-rotation-blocked
+store.storage-connection-unsupported
 store.tls-ca-unreadable
+store.tls-trust-invalid
 store.unreachable
 transform.expression-failed
 transform.script-compile-failed

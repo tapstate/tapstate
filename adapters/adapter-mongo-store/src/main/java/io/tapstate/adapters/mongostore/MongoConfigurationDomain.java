@@ -75,7 +75,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public static MongoConfigurationDomain open(MongoConnectionSettings settings, String expectedClusterId) {
         Objects.requireNonNull(expectedClusterId, "expectedClusterId");
         if (expectedClusterId.isBlank()) throw new IllegalArgumentException("expected Cluster identity must not be blank");
-        MongoConnection connection = new MongoConnection(settings);
+        MongoConnection connection = MongoConnection.forConfiguration(settings);
         try {
             connection.verifyConnectivity();
             return new MongoConfigurationDomain(connection, expectedClusterId);
