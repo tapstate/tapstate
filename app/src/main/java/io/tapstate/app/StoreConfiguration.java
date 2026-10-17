@@ -3,7 +3,6 @@ package io.tapstate.app;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringHandle;
 import io.tapstate.control.restapi.SystemDataVersion;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
@@ -73,13 +72,6 @@ class StoreConfiguration {
         return new MongoStorePort(
                 storeConnection, cloud.operatorStateDatabase(mongo.getOperatorStateDatabase()),
                 history.getRetention());
-    }
-
-    /** The process-local keyring view used by Source storage and the clustered node-session lease. */
-    @Bean
-    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    SourceConfigKeyringHandle sourceConfigKeyring(MongoConnection storeConnection) {
-        return storeConnection.sourceConfigKeyring();
     }
 
     /** The deployment's default and per-Nest operator-state databases over the verified store client. */
