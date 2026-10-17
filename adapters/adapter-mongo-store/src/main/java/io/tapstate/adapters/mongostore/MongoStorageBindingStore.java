@@ -171,6 +171,33 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         });
     }
 
+    @Override public StorageBinding complete(StorageSetupScope expected) {
+        Objects.requireNonNull(expected, "expected");
+        return StoreIo.call(() -> {
+            verifyIndex();
+            return transaction(session -> {
+                StorageBinding bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
+                Document state = setup.find(session, new Document("_id", "cluster")).first();
+                if ("COMPLETE".equals(state.get("phase"))) {
+                    requireSetup(state, expected, "COMPLETE");
+                    new MongoFirstAdminStore(client, database, this).load(session);
+                    return bound;
+                }
+                requireSetup(state, expected, BOUND);
+                ConfigurationVersion.advance(session, versions);
+                MongoFirstAdminStore.preparePending(session, database, expected, bound.bindingVersion(), bound.mode());
+                if (setup.updateOne(session, setupFilter(expected, BOUND),
+                        new Document("$set", new Document("phase", "COMPLETE"))).getMatchedCount() != 1) throw refused();
+                return bound;
+            });
+        });
+    }
+
+    Optional<StorageBinding> loadForTransaction(ClientSession session) {
+        verifyIndex();
+        return load(session).map(Loaded::binding);
+    }
+
     private Optional<Loaded> load(ClientSession session) {
         Document cluster = identity.find(session, new Document("_id", "cluster")).first();
         if (cluster == null || !(cluster.get("clusterId") instanceof String clusterId) || clusterId.isBlank()

@@ -189,7 +189,9 @@ public enum SystemCollections {
     SERVE_DEFINITIONS("serve_definitions", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
     CONFIG_CONNECTIONS("connections", Database.CONFIG, MongoConfigurationCatalogStore.class, Strategy.MIGRATED, 1),
     CONFIG_TOKENS("tokens", Database.CONFIG, MongoConfigurationSecurityStores.class, Strategy.MIGRATED, 1),
-    CONFIG_AUDIT("audit", Database.CONFIG, MongoConfigurationSecurityStores.class, Strategy.MIGRATED, 1);
+    CONFIG_AUDIT("audit", Database.CONFIG, MongoConfigurationSecurityStores.class, Strategy.MIGRATED, 1),
+    CONFIG_USERS("users", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1),
+    OP_BOOTSTRAP("op_bootstrap", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
