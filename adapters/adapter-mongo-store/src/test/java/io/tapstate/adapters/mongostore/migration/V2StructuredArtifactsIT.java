@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore.migration;
 
+import io.tapstate.adapters.mongostore.SharedMongoCase;
+
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -16,11 +18,9 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -39,7 +39,6 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class V2StructuredArtifactsIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
 
@@ -124,15 +123,20 @@ class V2StructuredArtifactsIT {
               schema: public
             """;
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(V2StructuredArtifactsIT.class);
 
     private static MongoClient client;
 
-    @AfterAll
-    static void closeClient() {
-        if (client != null) {
-            client.close();
+    @AfterEach
+    void closeClient() {
+        try {
+            if (client != null) {
+                client.close();
+            }
+        } finally {
+            client = null;
         }
     }
 
@@ -330,7 +334,7 @@ class V2StructuredArtifactsIT {
         if (client == null) {
             client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
         }
-        MongoDatabase database = client.getDatabase(name);
+        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
         database.drop();
         return database;
     }

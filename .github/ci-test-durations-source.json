@@ -212,9 +212,14 @@
     }
   ],
   "cohort_hash": "42f2c8e1810d2c803a424beb77f29964e95e0f34c769852dc57bbd6c1ce73f1a",
-  "comparison_scope": "This serial comparison variant restores original fixture helpers and omits optimization-specific controls, so its source identities and test-source bytes differ from the recorded run. The approved common Preview and SRS controls and all common product changes remain. The recorded thirteen successful selected verify commands do not verify this four-worker variant. Weights remain estimates, not input or performance acceptance.",
+  "comparison_scope": "The recorded run contains 1290 source identities. Current source contains 1291, including one unmeasured file-connector shutdown control, and changes the test CSV fixture. The new class uses the declared fallback; recorded weights remain scheduling estimates. Current test-source bytes and the source identity set therefore differ from that run. Current selected verify commands have not run. These estimates do not establish dependency or whole-input equality, original case applicability, or performance acceptance.",
   "current_selected_verify_provenance_verified": false,
+  "current_source_cohort_hash": "1e16a5d011ffd56bda10d161b61f5b2dc01505fd2adef6abb791b05dcf6b3c94",
+  "current_source_units": 1291,
   "current_test_source_bytes_match_recorded": false,
+  "current_unmeasured_source_units": [
+    "e2e/io.tapstate.e2e.AFileConnectorStopsAfterItsActiveWritesTest"
+  ],
   "duration_hints_sha256": "2e2f025d9d0886af88c60c3b20fb8c5c26cb8aacb0a168900550e4c35eeaa410",
   "estimates_only": true,
   "event": "workflow_dispatch",
