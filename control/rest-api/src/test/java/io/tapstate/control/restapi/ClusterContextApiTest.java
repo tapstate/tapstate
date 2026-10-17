@@ -76,8 +76,8 @@ class ClusterContextApiTest {
             assertThat(body.get("organizationName")).isEqualTo(DISPLAY.organizationName());
             assertThat(body.get("clusterName")).isEqualTo(DISPLAY.clusterName());
             assertThat(body.get("region")).isEqualTo(DISPLAY.region());
-            assertThat(body.get("ec2PublicIp")).isEqualTo("203.0.113.42");
-            assertThat(body.get("egressAddressStatus")).isEqualTo("STABLE");
+            assertThat(body).containsEntry("ec2PublicIp", "203.0.113.42");
+            assertThat(body).containsEntry("egressAddressStatus", "STABLE");
             assertThat(body.keySet().stream().map(Object::toString).toList()).containsExactlyInAnyOrder("organizationId", "organizationName", "clusterId",
                     "clusterName", "region", "clusterState", "ec2PublicIp", "egressAddressStatus");
             // The workspace client accepts a null or string state and rejects an absent property.
