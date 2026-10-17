@@ -172,7 +172,11 @@ public enum SystemCollections {
     SCHEMA_MIGRATIONS("schema_migrations", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1),
     CLUSTER_KEYS("cluster_keys", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1),
     STORAGE_SETUP("storage_setup", Database.CONFIG, MongoConfigurationBootstrap.class, Strategy.MIGRATED, 1),
-    CONFIG_PIPELINE_LAYOUTS("pipeline_layouts", Database.CONFIG, MongoPipelineLayoutStore.class, Strategy.MIGRATED, 1);
+    CONFIG_PIPELINE_LAYOUTS("pipeline_layouts", Database.CONFIG, MongoPipelineLayoutStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTE_SCOPES("pdk_note_scopes", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTES("pdk_notes", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTE_MIGRATIONS("pdk_note_migrations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
+    OPERATOR_GENERATIONS("operator_generations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

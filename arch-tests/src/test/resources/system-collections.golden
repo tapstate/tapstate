@@ -34,3 +34,7 @@ schema_migrations | config | MongoConfigurationDomain | migrated | 1 | -
 cluster_keys | config | MongoConfigurationDomain | migrated | 1 | -
 storage_setup | config | MongoConfigurationBootstrap | migrated | 1 | -
 pipeline_layouts | config | MongoPipelineLayoutStore | migrated | 1 | -
+pdk_note_scopes | config | MongoRequiredNoteStore | migrated | 1 | -
+pdk_notes | config | MongoRequiredNoteStore | migrated | 1 | -
+pdk_note_migrations | config | MongoRequiredNoteStore | migrated | 1 | -
+operator_generations | config | MongoRequiredNoteStore | migrated | 1 | -

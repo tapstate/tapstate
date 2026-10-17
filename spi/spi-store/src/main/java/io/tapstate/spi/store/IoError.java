@@ -66,6 +66,9 @@ public enum IoError implements TapstateErrorCode {
      */
     SINK_WRITER_PROGRESS_AMBIGUOUS("io.sink-writer-progress-ambiguous", Set.of("pipeline")),
 
+    /** Necessary connector notes cannot prove the captured namespace, owner or clear generation. */
+    NOTE_SCOPE_UNAVAILABLE("io.note-scope-unavailable", Set.of()),
+
     /** Legacy pipeline-level progress cannot establish this source node's confirmed recovery cursor. */
     SRS_PROGRESS_UNPROVEN("io.srs-progress-unproven", Set.of("pipeline")),
 
