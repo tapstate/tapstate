@@ -11,6 +11,9 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.PipelineConnectorNodes;
+import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactBatchWrite;
@@ -53,6 +56,9 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     private final MongoCollection<Document> versions;
     private final EncryptedArtifactCodec codec;
     private final MongoPipelineStateMappings stateMappings;
+    private final MongoRequiredNoteStore notes;
+    private final MongoCollection<Document> identity;
+    private final MongoCollection<Document> mappings;
 
     public MongoConfigurationArtifactStore(MongoClient client, MongoDatabase database, SourceConfigCipher cipher) {
         this(client, database, SourceConfigCipherProvider.fixed(Objects.requireNonNull(cipher, "cipher")));
@@ -71,6 +77,9 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         this.versions = durable(SystemCollections.CONFIGURATION_VERSION.on(database));
         this.codec = new EncryptedArtifactCodec(Objects.requireNonNull(ciphers, "ciphers"));
         this.stateMappings = new MongoPipelineStateMappings(client, database);
+        this.notes = new MongoRequiredNoteStore(client, database, ciphers);
+        this.identity = durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database));
+        this.mappings = durable(SystemCollections.OPERATOR_GENERATIONS.on(database));
     }
 
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {
@@ -125,9 +134,60 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                     }
                 }
             }
+            Map<String, Set<PipelineConnectorNodes.Identity>> before = privateNodes(session);
             for (ArtifactWrite write : requested) write(session, write);
+            reservePrivateScopes(session, before, requested);
             return ArtifactBatchWrite.applied();
         }, refused -> ArtifactBatchWrite.refused(refused.id, refused.outcome));
+    }
+
+    private Map<String, Set<PipelineConnectorNodes.Identity>> privateNodes(ClientSession session) {
+        Map<String, Set<PipelineConnectorNodes.Identity>> result = new LinkedHashMap<>();
+        for (Document row : read(session, collection("pipeline"), "pipeline")) {
+            PipelineResource pipeline = (PipelineResource) decode(row);
+            result.put(pipeline.id(), PipelineConnectorNodes.of(pipeline, id -> {
+                Document definition = find(session, id);
+                if (definition == null || !"serve".equals(definition.getString("kind"))) {
+                    throw unreadable(id, "serveDefinition");
+                }
+                return decode(definition);
+            }));
+        }
+        return result;
+    }
+
+    private void reservePrivateScopes(ClientSession session,
+            Map<String, Set<PipelineConnectorNodes.Identity>> before, List<ArtifactWrite> requested) {
+        Map<String, Set<PipelineConnectorNodes.Identity>> after = privateNodes(session);
+        Set<String> writtenPipelines = new HashSet<>();
+        requested.stream().map(ArtifactWrite::resource).filter(PipelineResource.class::isInstance)
+                .forEach(resource -> writtenPipelines.add(resource.id()));
+        for (var entry : after.entrySet()) {
+            Set<PipelineConnectorNodes.Identity> prior = before.getOrDefault(entry.getKey(), Set.of());
+            Set<PipelineConnectorNodes.Identity> current = entry.getValue();
+            if (prior.equals(current) && !writtenPipelines.contains(entry.getKey())) continue;
+            if (prior.isEmpty() && current.isEmpty()) continue;
+            Document cluster = identity.find(session, new Document("_id", "cluster")).first();
+            if (cluster == null || !MongoConfigurationDomain.LAYOUT.equals(cluster.get("layoutId"))
+                    || !(cluster.get("bindingVersion") instanceof Long binding) || binding < 1) {
+                throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            }
+            if (!(cluster.get("clusterId") instanceof String clusterId) || clusterId.isBlank()) {
+                throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            }
+            notes.open(session, new RequiredNoteOwner(binding, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL,
+                    clusterId, 0));
+            stateMappings.requireActive(session, entry.getKey());
+            var mapping = MongoPipelineStateMappings.decode(entry.getKey(),
+                    mappings.find(session, new Document("_id", entry.getKey())).first());
+            for (var node : prior) {
+                notes.open(session, RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), mapping.stateGeneration()));
+            }
+            for (var node : current) {
+                if (prior.contains(node)) continue;
+                notes.initialize(session, RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), mapping.stateGeneration()));
+            }
+        }
     }
 
     private void write(ClientSession session, ArtifactWrite write) {

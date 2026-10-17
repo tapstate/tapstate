@@ -963,6 +963,36 @@ class MongoRequiredNoteStoreIT {
         });
     }
 
+    @Test
+    void aMissingScopeCannotBeInitializedOverAnyRetainedFactFamily() {
+        withNotes(f -> {
+            int sequence = 0;
+            for (String fact : List.of("notes", "origin", "migration", "carry-source", "carry-target")) {
+                String id = "retained-" + sequence++;
+                f.pipelineGeneration(id, 1);
+                var owner = fact.equals("carry-target") ? chain(id) : pipeline(id, 1);
+                Document physical = new Document("bindingVersion", 1L).append("namespace", owner.namespace());
+                switch (fact) {
+                    case "notes" -> SystemCollections.PDK_NOTES.on(f.database).insertOne(new Document("_id",
+                            new Document(physical).append("generation", 2L).append("key", "retained")));
+                    case "origin" -> SystemCollections.PDK_NOTE_ORIGINS.on(f.database).insertOne(new Document("_id", physical)
+                            .append("generation", 2L));
+                    case "migration" -> SystemCollections.PDK_NOTE_MIGRATIONS.on(f.database).insertOne(new Document("_id",
+                            new Document(physical).append("key", "cleared")));
+                    case "carry-source", "carry-target" -> SystemCollections.PDK_NOTE_CARRIES.on(f.database).insertOne(
+                            new Document("_id", new Document("sharedBindingVersion", 1L)
+                                    .append("sharedNamespace", fact.equals("carry-target") ? owner.namespace() : "pdk.chain.shared")
+                                    .append("sharedGeneration", 1L).append("sourceBindingVersion", 1L)
+                                    .append("sourceNamespace", fact.equals("carry-source") ? owner.namespace() : "pdk.state.other.capture.src")
+                                    .append("sourceGeneration", 2L)));
+                    default -> throw new AssertionError(fact);
+                }
+                assertThatThrownBy(() -> f.notes.initialize(owner)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.database).find(new Document("_id", physical)).first()).isNull();
+            }
+        });
+    }
+
     private static RequiredNoteOwner global() {
         return new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0);
     }

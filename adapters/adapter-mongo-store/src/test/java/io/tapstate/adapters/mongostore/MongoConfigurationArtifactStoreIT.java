@@ -523,7 +523,12 @@ class MongoConfigurationArtifactStoreIT {
                     .containsEntry("operationId", "setup-a").containsEntry("generation", 1L);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
                     .containsExactlyInAnyOrder("storage_setup", "cluster_identity", "cluster_keys",
-                            "schema_migrations", "configuration_version", "sources");
+                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries");
+            assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();
+            for (var table : List.of(SystemCollections.PDK_NOTE_ORIGINS, SystemCollections.PDK_NOTE_CARRIES)) {
+                for (var index : table.indexes()) assertThat(IndexEnsure.existing(table.on(database), index)).isNotNull();
+            }
         });
     }
 
@@ -645,6 +650,229 @@ class MongoConfigurationArtifactStoreIT {
             }
         });
     }
+
+    @Test
+    void configurationCommitReservesAllPrivateConnectorScopesWithThePipeline() {
+        withBound((domain, database) -> {
+            Resource pipeline = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: shared
+                    view:
+                      id: shared
+                      from: shared.orders
+                      primary_key: id
+                    serve:
+                      from: shared
+                      sync:
+                        - id: sink
+                          source: shared
+                    """);
+            domain.artifacts().saveAll(List.of(source("shared", "secret"), pipeline));
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow")))
+                    .as("all private scopes must commit with the authoring resource").isEqualTo(3);
+            for (var purpose : io.tapstate.core.model.PipelineNode.Purpose.values()) {
+                var node = new io.tapstate.core.model.PipelineNode("flow",
+                        purpose == io.tapstate.core.model.PipelineNode.Purpose.SYNC ? "sink" : "shared");
+                var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1, node, purpose, 1);
+                assertThat(domain.requiredNotes().open(owner).generation()).isOne();
+            }
+        });
+    }
+
+    @Test
+    void updatingAReferencedServeDefinitionReservesNewSinksFromTheCommittedCandidate() {
+        withBound((domain, database) -> {
+            Resource pipeline = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: src
+                    serve:
+                      use: reusable
+                      from: src.orders
+                    """);
+            Resource original = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}]\n");
+            domain.artifacts().saveAll(List.of(pipeline, original, source("src", "secret"), source("target", "secret")));
+            Resource replacement = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}, {id: sink_b, source: target}]\n");
+            domain.artifacts().replace(original.id(), CanonicalHash.of(original), replacement);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow")))
+                    .as("definition-only mutation includes stored Pipeline referrers").isEqualTo(3);
+            for (String id : List.of("sink_a", "sink_b")) {
+                var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                        new io.tapstate.core.model.PipelineNode("flow", id),
+                        io.tapstate.core.model.PipelineNode.Purpose.SYNC, 1);
+                assertThat(domain.requiredNotes().open(owner).generation()).isOne();
+            }
+            assertThat(domain.artifacts().get("flow")).contains(pipeline);
+            assertThat(revision(database)).isEqualTo(3);
+        });
+    }
+
+    @Test
+    void aKnownScopeKeepsItsGenerationAndMissingFactsAreNeverRecreatedByAuthoring() {
+        withBound((domain, database) -> {
+            Resource pipeline = capturePipeline("flow");
+            domain.artifacts().saveAll(List.of(source("src", "secret"), pipeline));
+            var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                    new io.tapstate.core.model.PipelineNode("flow", "src"),
+                    io.tapstate.core.model.PipelineNode.Purpose.CAPTURE, 1);
+            var original = domain.requiredNotes().open(owner);
+            var origin = new io.tapstate.spi.store.RequiredNoteOrigin("mongodb", "a".repeat(64), new byte[]{1});
+            domain.requiredNotes().prepareOrigin(original, origin);
+            var cleared = domain.requiredNotes().clear(original, false);
+            assertThat(domain.artifacts().replace("flow", CanonicalHash.of(pipeline), pipeline)).isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(domain.requiredNotes().open(owner)).isEqualTo(cleared);
+            assertThat(domain.requiredNotes().origin(cleared)).isEqualTo(origin);
+            long before = revision(database);
+            SystemCollections.PDK_NOTE_SCOPES.on(database).deleteOne(new Document("ownerId", "flow"));
+            assertThatThrownBy(() -> domain.artifacts().replace("flow", CanonicalHash.of(pipeline), pipeline))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+            assertThat(revision(database)).isEqualTo(before);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow"))).isZero();
+        });
+    }
+
+    @Test
+    void scopeInsertionFailureRollsBackResourcesMappingsAndTheConfigurationRevision() {
+        withBound((domain, database) -> {
+            SystemCollections.PDK_NOTE_SCOPES.on(database).createIndex(new Document("ownerId", 1),
+                    new IndexOptions().unique(true));
+            Resource pipeline = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: shared
+                    view:
+                      id: shared
+                      from: shared.orders
+                      primary_key: id
+                    """);
+            long before = revision(database);
+            assertThatThrownBy(() -> domain.artifacts().saveAll(List.of(source("shared", "secret"), pipeline)))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(domain.artifacts().get("shared")).isEmpty();
+            assertThat(domain.artifacts().get("flow")).isEmpty();
+            assertThat(domain.pipelineStates().read("flow")).isEmpty();
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow"))).isZero();
+            assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void concurrentDefinitionUpdateAndPipelineCreationCannotMissEitherCommittedScopeSet() {
+        withBound((domain, database) -> {
+            Resource original = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}]\n");
+            Resource replacement = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}, {id: sink_b, source: target}]\n");
+            Resource first = servedPipeline("first");
+            Resource second = servedPipeline("second");
+            domain.artifacts().saveAll(List.of(source("src", "secret"), source("target", "secret"), original, first));
+            try (var other = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a");
+                    var executor = Executors.newFixedThreadPool(2)) {
+                CountDownLatch ready = new CountDownLatch(2);
+                CountDownLatch start = new CountDownLatch(1);
+                var changed = executor.submit(() -> {
+                    ready.countDown();
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return domain.artifacts().replace("reusable", CanonicalHash.of(original), replacement);
+                });
+                var created = executor.submit(() -> {
+                    ready.countDown();
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return other.artifacts().create(second);
+                });
+                assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+                start.countDown();
+                assertThat(changed.get(20, TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.REPLACED);
+                assertThat(created.get(20, TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.CREATED);
+            } catch (Exception failure) { throw new AssertionError(failure); }
+            for (String pipelineId : List.of("first", "second")) {
+                assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", pipelineId)))
+                        .isEqualTo(3);
+                for (String sink : List.of("sink_a", "sink_b")) {
+                    var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                            new io.tapstate.core.model.PipelineNode(pipelineId, sink),
+                            io.tapstate.core.model.PipelineNode.Purpose.SYNC, 1);
+                    assertThat(domain.requiredNotes().open(owner).generation()).isOne();
+                }
+            }
+            assertThat(revision(database)).isEqualTo(4);
+        });
+    }
+
+    @Test
+    void readdingARemovedNodeCannotRecreateAMissingScopeOverRetainedOriginOrNotes() {
+        withBound((domain, database) -> {
+            Resource original = capturePipeline("flow");
+            domain.artifacts().saveAll(List.of(source("src", "secret"), original));
+            var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                    new io.tapstate.core.model.PipelineNode("flow", "src"),
+                    io.tapstate.core.model.PipelineNode.Purpose.CAPTURE, 1);
+            // Preserve an original context before simulating the control-record loss.
+            var old = domain.requiredNotes().initialize(owner);
+            domain.requiredNotes().prepareOrigin(old,
+                    new io.tapstate.spi.store.RequiredNoteOrigin("mongodb", "a".repeat(64), new byte[]{1}));
+            var current = domain.requiredNotes().clear(old, false);
+            domain.requiredNotes().compareAndSet(current, "identity", 0, new byte[]{2}, false);
+            Resource removed = pipeline("flow");
+            domain.artifacts().replace("flow", CanonicalHash.of(original), removed);
+            SystemCollections.PDK_NOTE_SCOPES.on(database).deleteOne(new Document("ownerId", "flow"));
+            long before = revision(database);
+            assertThatThrownBy(() -> domain.artifacts().replace("flow", CanonicalHash.of(removed), original))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+            assertThat(revision(database)).isEqualTo(before);
+            assertThat(domain.artifacts().get("flow")).contains(removed);
+            assertThatThrownBy(() -> domain.requiredNotes().read(old, "identity"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+        });
+    }
+
+    @Test
+    void newPrivateScopesRequireTheExistingGlobalBindingScope() {
+        withBound((domain, database) -> {
+            SystemCollections.PDK_NOTE_SCOPES.on(database).deleteOne(new Document("ownerKind", "GLOBAL"));
+            long before = revision(database);
+            assertThatThrownBy(() -> domain.artifacts().saveAll(List.of(source("src", "secret"), capturePipeline("flow"))))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+            assertThat(domain.artifacts().get("flow")).isEmpty();
+            assertThat(domain.artifacts().get("src")).isEmpty();
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments()).isZero();
+            assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    private static Resource capturePipeline(String id) {
+        return PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: " + id + "\nsource: src\n");
+    }
+
+    private static Resource servedPipeline(String id) {
+        return PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: " + id
+                + "\nsource: src\nserve: {use: reusable, from: src.orders}\n");
+    }
+
+    private static void withBound(BoundScenario scenario) {
+        try (MongoClient admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = admin.getDatabase("reserved_scopes_" + UUID.randomUUID().toString().replace("-", ""));
+            try (var domain = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                domain.bindings().commit(new io.tapstate.spi.store.StorageSetupScope("cluster-a", "installation-a", "setup-a", 1),
+                        io.tapstate.spi.store.StorageBinding.Mode.OP,
+                        new io.tapstate.spi.store.StorageBinding.Connection(
+                                io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                                "mongodb://cache.invalid/cache?tls=true", "cache", null),
+                        (io.tapstate.core.model.SourceResource) source("views", "secret"));
+                scenario.run(domain, database);
+            } finally { database.drop(); }
+        }
+    }
+
+    @FunctionalInterface
+    private interface BoundScenario { void run(MongoConfigurationDomain domain, MongoDatabase database); }
 
     private static void installConfigFacts(MongoDatabase database) {
         SystemCollections.STORAGE_SETUP.on(database).insertOne(new Document("_id", "cluster")

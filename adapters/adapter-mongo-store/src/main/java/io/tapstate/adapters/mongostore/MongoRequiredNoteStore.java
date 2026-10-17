@@ -87,6 +87,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return new MongoRequiredNoteStore(this, Objects.requireNonNull(additionalGuard, "additionalGuard"));
     }
 
+    /** Controlled installation prepares declared indexes before any private connector scope is published. */
+    static void prepareIndexes(MongoDatabase database) {
+        StoreIo.run(() -> {
+            for (var table : List.of(SystemCollections.PDK_NOTE_ORIGINS, SystemCollections.PDK_NOTE_CARRIES)) {
+                for (var index : table.indexes()) IndexEnsure.createIfAbsent(table.on(database), index);
+            }
+        });
+    }
+
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {
         return collection.withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
@@ -98,18 +107,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         RequiredNoteScope prepared = StoreIo.call(() -> {
             for (int attempt = 0; ; attempt++) {
                 try {
-                    return transaction(session -> {
-                        cipherForWrite(session);
-                        checkOwner(session, owner, true);
-                        Document existing = scopes.find(session, byScope(owner)).first();
-                        if (existing == null) {
-                            existing = new Document("_id", scopeId(owner)).append("ownerKind", owner.kind().name())
-                                    .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
-                                    .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L);
-                            scopes.insertOne(session, existing);
-                        }
-                        return scopeOf(owner, existing);
-                    });
+                    return transaction(session -> initialize(session, owner));
                 } catch (MongoException raced) {
                     if (attempt >= 2 || ErrorCategory.fromErrorCode(raced.getCode()) != ErrorCategory.DUPLICATE_KEY) {
                         throw raced;
@@ -134,13 +132,46 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return prepared;
     }
 
+    /** Authoring reserves new identities inside its existing configuration transaction. */
+    RequiredNoteScope initialize(ClientSession session, RequiredNoteOwner owner) {
+        cipherForWrite(session);
+        checkOwner(session, owner, true);
+        Document existing = scopes.find(session, byScope(owner)).first();
+        if (existing == null) {
+            refuseRetainedFacts(session, owner);
+            existing = new Document("_id", scopeId(owner)).append("ownerKind", owner.kind().name())
+                    .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
+                    .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L);
+            scopes.insertOne(session, existing);
+        }
+        return scopeOf(owner, existing);
+    }
+
+    private void refuseRetainedFacts(ClientSession session, RequiredNoteOwner owner) {
+        Document prefix = new Document("_id.bindingVersion", owner.bindingVersion())
+                .append("_id.namespace", owner.namespace());
+        if (notes.find(session, prefix).projection(new Document("_id", 1)).first() != null
+                || origins.find(session, prefix).projection(new Document("_id", 1)).first() != null
+                || migrations.find(session, prefix).projection(new Document("_id", 1)).first() != null
+                || carryRows.find(session, new Document("$or", List.of(
+                        new Document("_id.sourceBindingVersion", owner.bindingVersion())
+                                .append("_id.sourceNamespace", owner.namespace()),
+                        new Document("_id.sharedBindingVersion", owner.bindingVersion())
+                                .append("_id.sharedNamespace", owner.namespace()))))
+                        .projection(new Document("_id", 1)).first() != null) {
+            throw unavailable();
+        }
+    }
+
+    RequiredNoteScope open(ClientSession session, RequiredNoteOwner owner) {
+        checkOwner(session, owner, false);
+        return scopeOf(owner, scopes.find(session, byScope(owner)).first());
+    }
+
     @Override
     public RequiredNoteScope open(RequiredNoteOwner owner) {
         Objects.requireNonNull(owner, "owner");
-        return StoreIo.call(() -> transaction(session -> {
-            checkOwner(session, owner, false);
-            return scopeOf(owner, scopes.find(session, byScope(owner)).first());
-        }));
+        return StoreIo.call(() -> transaction(session -> open(session, owner)));
     }
 
     @Override

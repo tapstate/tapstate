@@ -828,20 +828,14 @@ final class StoreBackedDagSource implements DagSource {
      */
     private static Set<String> connectorStateNamespaces(PipelineResource pipeline) {
         Set<String> namespaces = new LinkedHashSet<>();
-        pipeline.sources().forEach(source -> namespaces.add(
-                ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), source.id()))));
-        if (pipeline.view() instanceof ViewBlock.Inline view) {
-            PipelineNode node = new PipelineNode(pipeline.id(), view.id());
-            namespaces.add(ConnectorStateNamespace.of(node, PipelineNode.Purpose.VIEW));
-            namespaces.add(SinkPreparationNamespace.of(node, PipelineNode.Purpose.VIEW));
-        }
-        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
-            serve.sync().forEach(sync -> {
-                PipelineNode node = new PipelineNode(pipeline.id(), syncNodeId(sync));
-                namespaces.add(ConnectorStateNamespace.of(node, PipelineNode.Purpose.SYNC));
-                namespaces.add(SinkPreparationNamespace.of(node));
-            });
-        }
+        io.tapstate.core.model.PipelineConnectorNodes.of(pipeline, id -> {
+            throw new IllegalStateException("connector inventory requires an expanded pipeline");
+        }).forEach(identity -> {
+            namespaces.add(ConnectorStateNamespace.of(identity.node(), identity.purpose()));
+            if (identity.purpose() != PipelineNode.Purpose.CAPTURE) {
+                namespaces.add(SinkPreparationNamespace.of(identity.node(), identity.purpose()));
+            }
+        });
         return namespaces;
     }
 
@@ -3189,7 +3183,7 @@ final class StoreBackedDagSource implements DagSource {
      * the fallback.
      */
     private static String syncNodeId(SyncElement element) {
-        return element.id() != null && !element.id().isBlank() ? element.id() : element.source();
+        return io.tapstate.core.model.PipelineConnectorNodes.syncNodeId(element);
     }
 
     /**
