@@ -7,6 +7,11 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerContext;
+import io.tapstate.spi.store.SrsSnapshotPin;
+import io.tapstate.spi.store.SrsModel;
+import io.tapstate.spi.store.SrsModelKey;
+import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SrsConsumerKey;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -218,7 +223,9 @@ class MongoSrsConsumerStoreIT {
             var progress = new io.tapstate.spi.store.ConsumerOffset(A.key().consumerId(), Map.of("orders", 7L), position,
                     List.of("orders"), "saved-seam", 1, Map.of("orders", position), io.tapstate.spi.store.ConsumerProgressKind.SRS);
             var codec = new MongoSrsConsumerRecords(SCOPE);
-            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).replaceOne(id(A), codec.cursor(member, progress, 11));
+            var pins = publishSnapshotModels(f, Set.of("orders"));
+            var pin = new SrsSnapshotPin(1, "saved-seam", pins);
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).replaceOne(id(A), codec.cursor(member, progress, 11, pin));
             var next = f.consumers().attach(A, 1, Set.of("orders", "quiet"), f.fenceA()).orElseThrow();
             var expected = new io.tapstate.spi.store.ConsumerOffset(A.key().consumerId(), Map.of("orders", 7L, "quiet", -1L), position,
                     List.of("orders"), "saved-seam", 1, Map.of("orders", position), io.tapstate.spi.store.ConsumerProgressKind.SRS);
@@ -277,6 +284,199 @@ class MongoSrsConsumerStoreIT {
     private static SrsConsumerContext context(String pipeline, String source, long generation) { return new SrsConsumerContext(new SrsConsumerKey(CHAIN, pipeline, source), generation); }
     private static Document id(SrsConsumerContext context) { return new Document("_id", new MongoSrsConsumerRecords(SCOPE).id(context.key())); }
     private static Document membership(Fixture f, SrsConsumerContext context) { return SystemCollections.SRS_CONSUMERS.on(f.database()).find(id(context)).first(); }
+    @Test
+    void snapshotPinsAreIndependentAndReadableAcrossReopenWithoutAnyCaptureClaim() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var a = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var b = f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            assertThat(new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())).release(f.capture())).isTrue();
+            var before = root(f); var pinA = new SrsSnapshotPin(17, "opaque-seam-a", refs); var pinB = new SrsSnapshotPin(29, "opaque-seam-b", refs);
+            assertThat(f.consumers().pinSnapshot(A, a.revision(), 0, pinA, f.fenceA())).isTrue();
+            var savedA = cursor(f, A);
+            assertThat(f.consumers().pinSnapshot(B, b.revision(), 0, pinB, f.fenceB())).isTrue();
+            assertThat(cursor(f, A)).isEqualTo(savedA);
+            assertThat(root(f).getLong("consumerRevision")).isEqualTo(before.getLong("consumerRevision"));
+            assertThat(root(f).getLong("consumerCount")).isEqualTo(before.getLong("consumerCount"));
+            assertThat(root(f).getLong("modelWriteFence")).isEqualTo(before.getLong("modelWriteFence") + 2);
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var independent = new MongoSrsConsumerStore(other, other.getDatabase(f.database().getName()), SCOPE);
+                var held = independent.progress(A).orElseThrow();
+                assertThat(held.snapshot()).isEqualTo(pinA); assertThat(held.revision()).isOne();
+                assertThat(held.cursor().cdcStartPosition()).isEqualTo("opaque-seam-a"); assertThat(held.cursor().snapshotEpoch()).isEqualTo(17);
+                assertThat(independent.pinSnapshot(A, a.revision(), 0, pinA, f.fenceA())).isTrue();
+                assertThat(independent.progress(A)).contains(held);
+                assertThat(independent.progress(B).orElseThrow().snapshot()).isEqualTo(pinB);
+            }
+        });
+    }
+
+    @Test
+    void addingASelectedTablePreservesOldPinsAndOnlyExtendsTheSavedReferenceSet() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders", "quiet"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var first = new SrsSnapshotPin(91, "original-seam", Map.of("orders", refs.get("orders")));
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, first, f.fenceA())).isTrue();
+            var expanded = f.consumers().attach(A, member.revision(), Set.of("orders", "quiet"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().progress(A).orElseThrow().snapshot()).isEqualTo(first);
+            var full = new SrsSnapshotPin(91, "original-seam", refs);
+            assertThat(f.consumers().pinSnapshot(A, expanded.revision(), 1, full, f.fenceA())).isTrue();
+            assertThat(f.consumers().progress(A).orElseThrow().snapshot()).isEqualTo(full);
+            var reduced = f.consumers().attach(A, expanded.revision(), Set.of("quiet"), f.fenceA()).orElseThrow();
+            var before = cursor(f, A);
+            assertThatThrownBy(() -> f.consumers().pinSnapshot(A, reduced.revision(), 2,
+                    new SrsSnapshotPin(91, "original-seam", Map.of("quiet", refs.get("quiet"))), f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            assertThat(cursor(f, A)).isEqualTo(before); assertThat(f.consumers().progress(A).orElseThrow().snapshot()).isEqualTo(full);
+        });
+    }
+
+    @Test
+    void aSavedSnapshotNeverAdoptsANewerPublishedModelOrSnapshotOrder() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var first = new SrsSnapshotPin(17, "saved-seam", refs); assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, first, f.fenceA())).isTrue();
+            var next = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 1);
+            models(f).publish(new SrsModel(next, ring("orders"), new SourceTable("orders", List.of(new SourceField("changed", "int")), List.of(), List.of()), 1), f.captureFence());
+            var before = cursor(f, A);
+            for (var replacement : List.of(new SrsSnapshotPin(18, "saved-seam", refs), new SrsSnapshotPin(17, "new-seam", refs),
+                    new SrsSnapshotPin(17, "saved-seam", Map.of("orders", next)))) {
+                assertThatThrownBy(() -> f.consumers().pinSnapshot(A, member.revision(), 1, replacement, f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            }
+            assertThat(cursor(f, A)).isEqualTo(before);
+            SystemCollections.SRS_MODELS.on(f.database()).updateOne(new Document("_id.modelVersion", 1L), new Document("$set", new Document("schema", new Document("bad", "secret-sentinel"))));
+            assertThat(f.consumers().progress(A).orElseThrow().snapshot()).isEqualTo(first);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"body", "context", "bounds", "anchor"})
+    void losingARequiredSnapshotFactDoesNotUseLatestDiscoveryOrAnEmptyProgress(String missing) {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(17, "saved-seam", refs); assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+            switch (missing) {
+                case "body" -> SystemCollections.SRS_MODELS.on(f.database()).deleteMany(new Document());
+                case "context" -> SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).deleteMany(new Document());
+                case "bounds" -> SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteMany(new Document());
+                case "anchor" -> SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("modelContextHeads", List.of())));
+                default -> throw new AssertionError(missing);
+            }
+            var before = cursor(f, A);
+            assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isInstanceOf(TapstateException.class);
+            assertThat(cursor(f, A)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void snapshotCasAndTheOriginalMembershipCannotBeReplacedOnRetry() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs); var before = cursor(f, A);
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 7, pin, f.fenceA())).isFalse(); assertThat(cursor(f, A)).isEqualTo(before);
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+            f.consumers().attach(A, member.revision(), Set.of("orders"), f.fenceA()).orElseThrow(); before = cursor(f, A);
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isFalse(); assertThat(cursor(f, A)).isEqualTo(before);
+            assertThatThrownBy(() -> f.consumers().pinSnapshot(A, member.revision() + 1, 1, pin, f.fenceB())).satisfies(MongoSrsConsumerStoreIT::fenced);
+        });
+    }
+
+    @Test
+    void independentClientsCannotPinDifferentSnapshotSeamsAtOneOriginalRevision() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl()); var executor = Executors.newFixedThreadPool(2)) {
+                var second = new MongoSrsConsumerStore(other, other.getDatabase(f.database().getName()), SCOPE); var start = new CountDownLatch(1);
+                var a = executor.submit(() -> { start.await(); return f.consumers().pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "seam-a", refs), f.fenceA()); });
+                var b = executor.submit(() -> { start.await(); return second.pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "seam-b", refs), f.fenceA()); });
+                start.countDown(); assertThat(List.of(a.get(10, TimeUnit.SECONDS), b.get(10, TimeUnit.SECONDS))).containsExactlyInAnyOrder(true, false);
+                assertThat(f.consumers().progress(A).orElseThrow().revision()).isOne();
+            }
+        });
+    }
+
+    @Test
+    void guardLossRollsBackThePinOriginalClaimProofAndChainWriteFence() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var checks = new AtomicInteger(); var root = root(f); var cursor = cursor(f, A);
+            var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id", WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first();
+            var guarded = f.consumers().guardedBy(() -> { if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null); });
+            assertThatThrownBy(() -> guarded.pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "seam", refs), f.fenceA())).isInstanceOf(TapstateException.class);
+            assertThat(root(f)).isEqualTo(root); assertThat(cursor(f, A)).isEqualTo(cursor);
+            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id", WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first()).isEqualTo(claim);
+        });
+    }
+
+    @Test
+    void aLatePinCannotReviveADetachedConsumerOrBorrowAnotherStateGeneration() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs); var detached = f.consumers().detach(A, member.revision(), f.fenceA()).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            var next = new SrsConsumerContext(A.key(), 2); f.consumers().attach(next, detached.revision(), Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().pinSnapshot(A, detached.revision() + 1, 0, pin, f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            assertThat(f.consumers().progress(next).orElseThrow().snapshot()).isNull();
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"snapshot", "snapshotEpoch", "modelEpoch", "seam"})
+    void corruptSnapshotPayloadCannotLoseItsNecessaryReferences(String changed) {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs); assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+            String path = switch (changed) {
+                case "snapshot" -> "snapshot"; case "snapshotEpoch" -> "snapshot.snapshotEpoch";
+                case "modelEpoch" -> "snapshot.models.0.model.captureContext.epoch"; case "seam" -> "progress.cdcStartPosition";
+                default -> throw new AssertionError(changed);
+            };
+            Object value = changed.equals("snapshot") ? null : changed.equals("seam") ? "changed" : 1.0;
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A), new Document("$set", new Document(path, value)));
+            assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test
+    void counterExhaustionCannotLeaveAPinWithoutItsOriginalChainCompetition() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("modelWriteFence", Long.MAX_VALUE - 1)));
+            var before = cursor(f, A); var root = root(f);
+            assertThatThrownBy(() -> f.consumers().pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "seam", refs), f.fenceA())).isInstanceOf(TapstateException.class);
+            assertThat(cursor(f, A)).isEqualTo(before); assertThat(root(f)).isEqualTo(root);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SRS_MODELS", "SRS_MODEL_CONTEXTS"})
+    void aRequiredModelUniqueIndexCannotBeDowngradedToANonUniqueOne(String resource) {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var table = SystemCollections.valueOf(resource); var declared = table.indexes().getFirst();
+            assertThat(declared.unique()).isTrue(); table.on(f.database()).dropIndex(declared.indexName());
+            var keys = new Document(); declared.keys().forEach(key -> keys.put(key, 1));
+            table.on(f.database()).createIndex(keys, new com.mongodb.client.model.IndexOptions().name(declared.indexName()).unique(false));
+            assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        });
+    }
+
+    private static Map<String, SrsModelKey> publishSnapshotModels(Fixture f, Set<String> tables) {
+        assertThat(f.chains().openEpoch(CHAIN, 0, f.captureFence())).hasValue(1);
+        var refs = new java.util.HashMap<String, SrsModelKey>();
+        for (String table : tables) {
+            var key = new SrsModelKey(CHAIN, table, SCOPE.cacheIncarnation(), 1, 0);
+            models(f).publish(new SrsModel(key, ring(table), new SourceTable(table, List.of(new SourceField("id", "int")), List.of(), List.of()), 0), f.captureFence());
+            refs.put(table, key);
+        }
+        return Map.copyOf(refs);
+    }
+    private static String ring(String table) { return "srs." + CHAIN + "." + table; }
+    private static MongoSrsModelStore models(Fixture f) { return new MongoSrsModelStore(f.client(), f.database(), SCOPE); }
+
     private static Document cursor(Fixture f, SrsConsumerContext context) { return SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).find(id(context)).first(); }
     private static Document root(Fixture f) { return SystemCollections.SRS_CHAINS.on(f.database()).find().first(); }
     private static void unavailable(Throwable failure) { code(failure, IoError.SRS_CONSUMER_UNAVAILABLE); }

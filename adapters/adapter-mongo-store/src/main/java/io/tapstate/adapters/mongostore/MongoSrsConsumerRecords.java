@@ -11,6 +11,9 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerContext;
 import io.tapstate.spi.store.SrsConsumerKey;
 import io.tapstate.spi.store.SrsConsumerMembership;
+import io.tapstate.spi.store.SrsConsumerProgress;
+import io.tapstate.spi.store.SrsSnapshotPin;
+import io.tapstate.spi.store.SrsModelKey;
 import org.bson.Document;
 
 import java.util.ArrayList;
@@ -53,9 +56,11 @@ final class MongoSrsConsumerRecords {
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
 
-    record Cursor(ConsumerOffset value, long revision) {}
+    record Cursor(ConsumerOffset value, long revision, SrsSnapshotPin snapshot) {}
 
-    Document cursor(SrsConsumerMembership membership, ConsumerOffset value, long revision) {
+    Document cursor(SrsConsumerMembership membership, ConsumerOffset value, long revision) { return cursor(membership, value, revision, null); }
+    Document cursor(SrsConsumerMembership membership, ConsumerOffset value, long revision, SrsSnapshotPin snapshot) {
+        new SrsConsumerProgress(membership.context(), membership.revision(), revision, value, snapshot);
         if (revision < 0 || revision == Long.MAX_VALUE || membership.detached()
                 || !value.pipelineId().equals(membership.context().key().consumerId()) || value.progressKind() != ConsumerProgressKind.SRS) throw unreadable();
         var read = new ArrayList<Document>();
@@ -67,11 +72,11 @@ final class MongoSrsConsumerRecords {
                 .append("snapshotEpoch", value.snapshotEpoch()).append("sinkAckedByTable", acked).append("progressKind", "SRS");
         return hash(new Document("_id", id(membership.context().key())).append("formatVersion", 1)
                 .append("stateGeneration", membership.context().stateGeneration()).append("membershipRevision", membership.revision())
-                .append("progressRevision", revision).append("progress", progress));
+                .append("progressRevision", revision).append("progress", progress).append("snapshot", snapshot(snapshot)));
     }
     Cursor cursor(SrsConsumerMembership membership, Document row) {
         try {
-            if (row == null || !row.keySet().equals(Set.of("_id", "formatVersion", "stateGeneration", "membershipRevision", "progressRevision", "progress", "contentHash"))
+            if (row == null || !row.keySet().equals(Set.of("_id", "formatVersion", "stateGeneration", "membershipRevision", "progressRevision", "progress", "snapshot", "contentHash"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("progressRevision") instanceof Long revision)
                     || !Long.valueOf(membership.context().stateGeneration()).equals(row.get("stateGeneration"))
                     || !Long.valueOf(membership.revision()).equals(row.get("membershipRevision")) || !id(membership.context().key()).equals(row.get("_id"))) throw unreadable();
@@ -92,9 +97,29 @@ final class MongoSrsConsumerRecords {
             }
             var value = new ConsumerOffset(membership.context().key().consumerId(), read, position(progress.get("sinkAcked", Document.class)),
                     sorted(stringSet(progress.get("snapshotCompletedTables"))), progress.getString("cdcStartPosition"), epoch, acked, ConsumerProgressKind.SRS);
-            if (!read.keySet().containsAll(membership.tables()) || !cursor(membership, value, revision).equals(row)) throw unreadable();
-            return new Cursor(value, revision);
+            SrsSnapshotPin snapshot = snapshot(row.get("snapshot", Document.class));
+            if (!read.keySet().containsAll(membership.tables()) || !cursor(membership, value, revision, snapshot).equals(row)) throw unreadable();
+            return new Cursor(value, revision, snapshot);
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
+    }
+    private static Document snapshot(SrsSnapshotPin pin) {
+        if (pin == null) return null;
+        var models = new ArrayList<Document>();
+        for (String table : sorted(pin.models().keySet())) models.add(new Document("table", table).append("model", MongoSrsModelStore.key(pin.models().get(table))));
+        return new Document("snapshotEpoch", pin.snapshotEpoch()).append("sourcePosition", pin.sourcePosition()).append("models", models);
+    }
+    private static SrsSnapshotPin snapshot(Document row) {
+        if (row == null) return null;
+        if (!row.keySet().equals(Set.of("snapshotEpoch", "sourcePosition", "models")) || !(row.get("snapshotEpoch") instanceof Long epoch)
+                || !(row.get("sourcePosition") instanceof String source)) throw unreadable();
+        var models = new HashMap<String, SrsModelKey>();
+        for (Document entry : documents(row.get("models"))) {
+            if (!entry.keySet().equals(Set.of("table", "model")) || !(entry.get("table") instanceof String table)
+                    || models.put(table, MongoSrsModelStore.readKey(entry.get("model", Document.class))) != null) throw unreadable();
+        }
+        var result = new SrsSnapshotPin(epoch, source, models);
+        if (!snapshot(result).equals(row)) throw unreadable();
+        return result;
     }
     ConsumerOffset initial(SrsConsumerKey key, Set<String> tables) {
         var positions = new HashMap<String, Long>(); tables.forEach(table -> positions.put(table, -1L));

@@ -178,6 +178,16 @@ public final class MongoSrsModelStore implements SrsModelStore {
             return Optional.of(model);
     }
 
+    /** Snapshot decoding needs an exact structural reference, without claiming an event-time range. */
+    SrsModel requireSnapshotReference(ClientSession session, SrsModelKey key) {
+        requireScope(key);
+        SrsModel model = loadInSession(session, key).orElseThrow(() -> unavailable(key));
+        Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(model.ringName()))).first();
+        if (bounds == null) throw unavailable(key);
+        requireBounds(bounds);
+        return model;
+    }
+
     record ModelReference(SrsModel model, WorkloadClaimFence fence, EventModelRange range) {}
 
     ModelReference requireReference(ClientSession session, SrsModelKey key) {

@@ -12,6 +12,8 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsChainState;
 import io.tapstate.spi.store.SrsConsumerContext;
+import io.tapstate.spi.store.SrsConsumerProgress;
+import io.tapstate.spi.store.SrsSnapshotPin;
 import io.tapstate.spi.store.SrsConsumerKey;
 import io.tapstate.spi.store.SrsConsumerMembership;
 import io.tapstate.spi.store.SrsConsumerStore;
@@ -66,14 +68,56 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             return new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
         });
     }
-    @Override public Optional<ConsumerOffset> cursor(SrsConsumerContext context) {
+    @Override public Optional<ConsumerOffset> cursor(SrsConsumerContext context) { return progress(context).map(SrsConsumerProgress::cursor); }
+    @Override public Optional<SrsConsumerProgress> progress(SrsConsumerContext context) {
         Objects.requireNonNull(context, "context");
         return transaction(session -> {
             var view = view(session, context.key().miningChainId()); var member = view.members().get(context.key().consumerId());
             if (member == null) return Optional.empty();
             if (!member.context().equals(context)) throw unavailable(context.key().miningChainId());
-            return member.detached() ? Optional.empty() : Optional.of(view.cursors().get(context.key().consumerId()).value());
+            if (member.detached()) return Optional.empty();
+            var held = view.cursors().get(context.key().consumerId()); validateSnapshot(session, context, held.snapshot());
+            return Optional.of(new SrsConsumerProgress(context, member.revision(), held.revision(), held.value(), held.snapshot()));
         });
+    }
+    @Override public boolean pinSnapshot(SrsConsumerContext context, long membershipRevision, long expectedProgressRevision,
+                                          SrsSnapshotPin snapshot, WorkloadClaimFence fence) {
+        Objects.requireNonNull(context, "context"); Objects.requireNonNull(snapshot, "snapshot");
+        requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
+        return transaction(session -> {
+            prove(session, context.key(), fence); var view = view(session, chain); var member = view.members().get(context.key().consumerId());
+            if (member == null || member.detached() || !member.context().equals(context)) throw unavailable(chain);
+            if (member.revision() != membershipRevision) return false;
+            if (!member.commandFence().equals(fence)) throw fenced();
+            var held = view.cursors().get(context.key().consumerId()); var before = held.snapshot();
+            if (!snapshot.equals(before) && held.revision() != expectedProgressRevision) return false;
+            var required = new java.util.HashSet<>(member.tables()); if (before != null) required.addAll(before.models().keySet());
+            if (!snapshot.models().keySet().equals(required)) throw unavailable(chain);
+            if (before != null && (before.snapshotEpoch() != snapshot.snapshotEpoch() || !before.sourcePosition().equals(snapshot.sourcePosition())
+                    || before.models().entrySet().stream().anyMatch(entry -> !entry.getValue().equals(snapshot.models().get(entry.getKey()))))) throw unavailable(chain);
+            validateSnapshot(session, context, snapshot);
+            if (snapshot.equals(before)) return true;
+            if (held.revision() >= Long.MAX_VALUE - 1) throw unavailable(chain);
+            ConsumerOffset old = held.value();
+            var progress = new ConsumerOffset(old.pipelineId(), old.perTableSeq(), old.sinkAcked(), old.snapshotCompletedTables(),
+                    snapshot.sourcePosition(), snapshot.snapshotEpoch(), old.sinkAckedByTable(), old.progressKind());
+            Document row = records.cursor(member, progress, expectedProgressRevision + 1, snapshot);
+            if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
+                    new Document("_id", records.id(context.key())).append("membershipRevision", membershipRevision)
+                            .append("progressRevision", expectedProgressRevision), row).getMatchedCount() != 1) throw unavailable(chain);
+            chains.replace(session, view.root(), new Document(view.root()));
+            return true;
+        });
+    }
+    private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot) {
+        if (snapshot == null) return;
+        var models = new MongoSrsModelStore(client, database, scope);
+        for (var key : snapshot.models().values()) {
+            if (!context.key().miningChainId().equals(key.miningChainId()) || !scope.cacheIncarnation().equals(key.cacheIncarnation())) {
+                throw unavailable(context.key().miningChainId());
+            }
+            models.requireSnapshotReference(session, key);
+        }
     }
     @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); Set<String> selected = Set.copyOf(Objects.requireNonNull(tables, "tables"));
@@ -89,7 +133,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             var next = new SrsConsumerMembership(context, revision + 1, false, selected, fence);
             var previousCursor = held == null || held.detached() ? null : view.cursors().get(context.key().consumerId());
             ConsumerOffset cursor = previousCursor == null ? records.initial(context.key(), selected) : records.include(previousCursor.value(), selected);
-            Document cursorRow = records.cursor(next, cursor, previousCursor == null ? 0 : previousCursor.revision());
+            Document cursorRow = records.cursor(next, cursor, previousCursor == null ? 0 : previousCursor.revision(), previousCursor == null ? null : previousCursor.snapshot());
             writeMember(session, held, next);
             if (previousCursor == null) SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).insertOne(session, cursorRow);
             else if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
@@ -182,7 +226,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         });
     }
     private void requireStructure() {
-        var tables = List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS);
+        var tables = List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,
+                SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS);
         var names = tables.stream().map(SystemCollections::collectionName).toList();
         var present = database.listCollections().filter(new Document("name", new Document("$in", names))).into(new ArrayList<>());
         if (present.size() != tables.size() || present.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadableStructure();
@@ -192,7 +237,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             for (var declared : table.indexes()) {
                 Document keys = new Document(); declared.keys().forEach(key -> keys.put(key, 1));
                 var found = indexes.stream().filter(index -> declared.indexName().equals(index.get("name"))).findFirst().orElse(null);
-                if (found == null || !keys.equals(found.get("key")) || Boolean.TRUE.equals(found.get("unique"))
+                if (found == null || !keys.equals(found.get("key")) || Boolean.TRUE.equals(found.get("unique")) != declared.unique()
                         || Boolean.TRUE.equals(found.get("sparse")) || Boolean.TRUE.equals(found.get("hidden")) || found.containsKey("partialFilterExpression")) throw unreadableStructure();
             }
         }
