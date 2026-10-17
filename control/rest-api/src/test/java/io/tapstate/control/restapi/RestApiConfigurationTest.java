@@ -26,7 +26,7 @@ class RestApiConfigurationTest {
         new RestApiConfiguration().apiWebMvc().configureAsyncSupport(configurer);
 
         assertThat(configurer.timeout())
-                .isEqualTo(PipelinePreviewService.DEADLINE.plusSeconds(15).toMillis());
+                .isEqualTo(Math.max(PipelinePreviewService.DEADLINE.plusSeconds(15).toMillis(), 105000L));
     }
 
     @Test

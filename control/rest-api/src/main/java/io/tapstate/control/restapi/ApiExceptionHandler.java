@@ -100,6 +100,11 @@ class ApiExceptionHandler {
      */
     static HttpStatus statusFor(TapstateErrorCode code) {
         return switch (code.code()) {
+            case "control.ai-not-configured" -> HttpStatus.CONFLICT;
+            case "control.ai-provider-auth-failed" -> HttpStatus.UNPROCESSABLE_ENTITY;
+            case "control.ai-provider-failed" -> HttpStatus.BAD_GATEWAY;
+            case "control.ai-invalid-proposal" -> HttpStatus.UNPROCESSABLE_ENTITY;
+            case "control.ai-overloaded" -> HttpStatus.TOO_MANY_REQUESTS;
             case "control.auth-failed", "control.unauthenticated" -> HttpStatus.UNAUTHORIZED;
             case "control.cloud-auth-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
             case "control.auth-mode-unavailable" -> HttpStatus.FORBIDDEN;
