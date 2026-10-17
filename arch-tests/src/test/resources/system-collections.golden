@@ -45,3 +45,5 @@ transform_definitions | config | MongoConfigurationArtifactStore | migrated | 1 
 view_definitions | config | MongoConfigurationArtifactStore | migrated | 1 | -
 serve_definitions | config | MongoConfigurationArtifactStore | migrated | 1 | -
 connections | config | MongoConfigurationCatalogStore | migrated | 1 | -
+tokens | config | MongoConfigurationSecurityStores | migrated | 1 | -
+audit | config | MongoConfigurationSecurityStores | migrated | 1 | -

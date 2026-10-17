@@ -7,6 +7,9 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.TokenStore;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.PipelineStateMappings;
@@ -35,6 +38,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final PipelineStateMappings pipelineStates;
     private final RequiredNoteStore requiredNotes;
     private final MongoStorageBindingStore bindings;
+    private final MongoConfigurationSecurityStores security;
 
     MongoConfigurationDomain(MongoConnection connection, String clusterId) {
         this.connection = connection;
@@ -70,6 +74,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         this.pipelineStates = new MongoPipelineStateMappings(connection.client(), database);
         this.bindings = new MongoStorageBindingStore(connection.client(), database, key);
         bindings.load();
+        this.security = new MongoConfigurationSecurityStores(connection.client(), database, clusterId);
+        security.verify();
         this.layouts = new MongoPipelineLayoutStore(connection.client(),
                 SystemCollections.CONFIG_PIPELINE_LAYOUTS.on(database),
                 SystemCollections.CONFIGURATION_VERSION.on(database));
@@ -112,6 +118,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public StorageBindingStore bindings() {
         return bindings;
     }
+
+    public TokenStore tokens() { return security.tokens(); }
+
+    public AuditStore audit() { return security.audit(); }
+
+    public ClusterIdentityStore clusterIdentity() { return security.clusterIdentity(); }
 
     @Override
     public void close() {
