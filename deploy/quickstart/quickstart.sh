@@ -481,8 +481,8 @@ SH
     chmod +x try-cdc.sh
 }
 
-# NEXT.md: what a reader looks for after the first screen, and not on it. Every command starts with a cd
-# into the demo directory, because the file is read from wherever the reader happens to be.
+# NEXT.md: what a reader looks for after the first screen, and not on it. It opens with the cd into the
+# demo directory, because the file is read from wherever the reader happens to be.
 write_next_md() {
     fence='```'
     if [ "${demo_dir_is_ours:-no}" = yes ]; then
@@ -505,13 +505,16 @@ ${fence}"
 <!-- $generated_marker; a re-run of the quickstart rewrites it -->
 # Your Tapstate demo: what next
 
-The demo lives in \`$PWD\`. Every command below starts with a \`cd\` into it, so it works from any
-terminal.
+The demo lives in \`$PWD\`. Run every command below from there:
+
+${fence}sh
+cd $here
+${fence}
 
 ## Look at it from the CLI
 
 ${fence}sh
-${cd_here}./tapstate -w work
+./tapstate -w work
 ${fence}
 
 Then, at the CLI's prompt (the admin password is in \`.env\`):
@@ -538,7 +541,7 @@ and visit http://127.0.0.1:18080 instead.
 ## See change-data-capture
 
 ${fence}sh
-${cd_here}./try-cdc.sh
+./try-cdc.sh
 ${fence}
 
 It adds a shipment in PostgreSQL, renames a customer in MySQL, removes the shipment, and adds an order,
@@ -549,7 +552,7 @@ runs, and copy those lines to make changes of your own.
 
 The store's port is not published, so nothing on your machine can reach it by default. To point a GUI
 or a driver at it, add \`ports: ["127.0.0.1:27017:27017"]\` to the \`mongo\` service in
-\`docker-compose.yml\`, run \`${cd_here}docker compose up -d\`, and connect with:
+\`docker-compose.yml\`, run \`docker compose up -d\`, and connect with:
 
     mongodb://127.0.0.1:27017/views?directConnection=true
 
@@ -560,8 +563,8 @@ discover that name and dial an address on your machine where nothing is listenin
 ## Pause and resume
 
 ${fence}sh
-${cd_here}docker compose stop      # stop the demo and keep its data
-${cd_here}docker compose start     # pick it up again
+docker compose stop      # stop the demo and keep its data
+docker compose start     # pick it up again
 ${fence}
 
 ## Delete it
@@ -569,7 +572,7 @@ ${fence}
 This is not reversible:
 
 ${fence}sh
-${cd_here}docker compose down -v    # stop the demo and delete its data
+docker compose down -v    # stop the demo and delete its data
 ${fence}
 
 $removal
@@ -601,6 +604,12 @@ ${fence}
 The skills teach the agent how Tapstate pipelines are written. Without them, an agent can write a
 pipeline that passes validation and runs, but does not do what you asked -- and still report success.
 
+Run the commands below from the demo folder:
+
+${fence}sh
+cd $here
+${fence}
+
 ## 2. Connect the agent
 
 \`$PWD/$agent_config\` starts Tapstate's MCP server with a token for this demo.
@@ -609,7 +618,7 @@ ${agent_runs:-}
 - **Claude Code:** run
 
   ${fence}sh
-  ${cd_here}claude --mcp-config $agent_config
+  claude --mcp-config $agent_config
   ${fence}
 
 - **Cursor, Claude Desktop, and other clients configured with an \`mcpServers\` JSON block:** copy the
@@ -621,6 +630,10 @@ ${agent_runs:-}
 Every path in the entry is absolute, so it works from any folder on this machine.
 
 ## 3. Ask it something
+
+Start with "How do I work with Tapstate?". The skills include a guided tour: the agent checks its
+connection, shows you what this demo is running, and offers things to try. Or ask for something
+directly:
 
 - "Create a pipeline that keeps a live copy of the shipments in fulfillment_db with only their id,
   carrier and status, start it, and tell me its status."
@@ -639,8 +652,8 @@ you alone, and the quickstart never prints it.
 To revoke it, list the tokens and revoke the agent's by its id:
 
 ${fence}sh
-${cd_here}TAPSTATE_PASSWORD=<the password in .env> ./tapstate -c http://127.0.0.1:8080 -u admin token list
-${cd_here}TAPSTATE_PASSWORD=<the password in .env> ./tapstate -c http://127.0.0.1:8080 -u admin token revoke <id>
+TAPSTATE_PASSWORD=<the password in .env> ./tapstate -c http://127.0.0.1:8080 -u admin token list
+TAPSTATE_PASSWORD=<the password in .env> ./tapstate -c http://127.0.0.1:8080 -u admin token revoke <id>
 ${fence}
 
 Deleting the demo with \`docker compose down -v\` invalidates it too; the next quickstart run writes a
@@ -649,28 +662,34 @@ EOF
 }
 
 # The closing message. It is the first screen a reader acts on, so it carries only the next moves and
-# names the file that holds everything else. Every command on it runs in the demo directory, which the
-# last line names, because a piped run made that directory itself and the reader's shell is not in it.
+# names the file that holds everything else. Every command on it runs in the demo directory. A piped run
+# made that directory itself and the reader's shell is still in its parent -- a script cannot move the
+# shell that started it -- so the message opens by saying so, with the cd to run first.
 print_next_steps() {
     # The agent block names the files only when they exist; otherwise it says why they do not, so the
     # option is never advertised over a configuration that was never written.
     if [ -z "${agent_note:-}" ]; then
-        agent_lines="    You describe what you want, and the agent creates and runs the sources and pipelines.
-    1. Teach it Tapstate:  npx --yes skills add tapstate/tapstate-skills
-    2. Connect it to this demo:
-         Claude Code:     claude --mcp-config $agent_config
-         another agent:   copy the \"tapstate\" entry from $agent_config into its MCP settings
-    3. Ask it, for example:
-         \"Create a pipeline that keeps a live copy of the shipments in fulfillment_db with
-          only their id, carrier and status, start it, and tell me its status.\"
-    Full walkthrough, with setup for other agents: AGENT-SETUP.md in this folder"
+        agent_lines="    1. Install the Tapstate skills:  npx --yes skills add tapstate/tapstate-skills
+    2. Connect it:                   claude --mcp-config $agent_config   (other agents: AGENT-SETUP.md)
+    3. Ask it:                       \"How do I work with Tapstate?\""
     else
         agent_lines="    Not set up: $agent_note"
+    fi
+    if [ "${demo_dir_is_ours:-no}" = yes ]; then
+        where="The demo is in $PWD.
+Go there first -- every command below runs from that folder:
+
+  cd $here
+"
+    else
+        where="Every command below runs from this folder, $PWD.
+"
     fi
     cat <<EOF
 
 quickstart: done. The demo is running.
 
+$where
 What you have: one MongoDB document per order, built from two databases -- the orders are in MySQL,
 their shipments are in PostgreSQL -- and kept up to date as either one changes.
 
@@ -679,7 +698,7 @@ Three ways to use it:
   In the browser
     Open http://127.0.0.1:8080 and sign in as admin. The password is in .env.
 
-  With an AI agent (Claude Code, Cursor, ...)
+  With an AI agent (Claude Code, Cursor, ...) -- it creates and runs pipelines for you
 $agent_lines
 
   From the CLI
@@ -697,9 +716,6 @@ Stop, clean up, or connect your own tools
 
 If something looks wrong
   The full output of every setup step is in quickstart.log.
-
-All commands above run from $here:
-  cd $here
 EOF
 }
 

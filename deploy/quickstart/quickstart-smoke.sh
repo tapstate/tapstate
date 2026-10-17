@@ -514,6 +514,13 @@ if grep -q 'This folder is yours' "$NEXT"; then
 else
   bad "silently omitted the removal line instead of saying why: $(cat "$NEXT")"
 fi
+# Run in place, the reader's shell is already in the demo directory, so there is nowhere to send it.
+if ! printf '%s' "$RUN_OUT" | grep -q 'Go there first' \
+   && printf '%s' "$RUN_OUT" | grep -q 'Every command below runs from this folder'; then
+  ok "a run in place does not send the reader to a directory they are already in"
+else
+  bad "a run in place told the reader to change directory: $(printf '%s' "$RUN_OUT" | sed -n '/^quickstart: done/,/^Three ways/p')"
+fi
 
 # The other half, or the pair proves nothing: a script that never offers removal would pass both
 # assertions above. Run from an empty directory, the quickstart makes tapstate-demo, owns it, and there
@@ -526,14 +533,18 @@ if grep -qx "rm -rf $OWNED/tapstate-demo" "$OWNED/tapstate-demo/NEXT.md" 2>/dev/
 else
   bad "own directory not offered for removal: $(cat "$OWNED/tapstate-demo/NEXT.md" 2>/dev/null)"
 fi
-# A piped run makes that directory and works in it, while the reader's shell stays where it was. So
-# every command handed to the reader carries the cd that makes it work as pasted: the closing message
-# names the directory, and NEXT.md opens each command with it.
-if printf '%s' "$RUN_OUT" | tail -n 1 | grep -qx "  cd $OWNED/tapstate-demo" \
-   && grep -q "^cd $OWNED/tapstate-demo && docker compose down -v" "$OWNED/tapstate-demo/NEXT.md"; then
-  ok "the commands handed to the reader name the directory they run in"
+# A piped run makes that directory and works in it, while the reader's shell stays in the parent -- a
+# script cannot move the shell that started it. So the closing message says so before any command, with
+# the cd to run first, and NEXT.md opens with the same cd.
+cd_at="$(printf '%s\n' "$RUN_OUT" | grep -nx "  cd $OWNED/tapstate-demo" | head -1 | cut -d: -f1)"
+ways_at="$(printf '%s\n' "$RUN_OUT" | grep -n '^Three ways to use it' | cut -d: -f1)"
+if [ -n "$cd_at" ] && [ -n "$ways_at" ] && [ "$cd_at" -lt "$ways_at" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'Go there first' \
+   && grep -qx "cd $OWNED/tapstate-demo" "$OWNED/tapstate-demo/NEXT.md" \
+   && grep -q '^docker compose down -v' "$OWNED/tapstate-demo/NEXT.md"; then
+  ok "after a piped run, the reader is told to cd into the demo before any command"
 else
-  bad "the demo directory is not named with its commands: $(printf '%s' "$RUN_OUT" | tail -n 3)"
+  bad "the demo directory is not named before its commands: $(printf '%s' "$RUN_OUT" | sed -n '/^quickstart: done/,/^Three ways/p')"
 fi
 # ...and so does a failure hint, which is the moment a reader is least likely to know where they are.
 # The re-run lands back in the directory the first one made, so the recording CLI is put there.
@@ -884,7 +895,9 @@ connect_at="$(grep -n 'claude --mcp-config tapstate-mcp.json' "$guide" 2>/dev/nu
 if [ -n "$skills_at" ] && [ -n "$connect_at" ] && [ "$skills_at" -lt "$connect_at" ] \
    && grep -q 'mcpServers' "$guide" && grep -q 'token revoke <id>' "$guide" \
    && ! grep -q 'tsk_fake_agent_token' "$guide" \
-   && printf '%s' "$RUN_OUT" | grep -q 'AGENT-SETUP.md in this folder'; then
+   && grep -q 'How do I work with Tapstate?' "$guide" \
+   && printf '%s' "$RUN_OUT" | grep -q '"How do I work with Tapstate?"' \
+   && printf '%s' "$RUN_OUT" | grep -q 'other agents: AGENT-SETUP.md'; then
   ok "AGENT-SETUP.md walks the agent path, skills first, without the token"
 else
   bad "AGENT-SETUP.md is missing or incomplete: $(cat "$guide" 2>/dev/null)"
