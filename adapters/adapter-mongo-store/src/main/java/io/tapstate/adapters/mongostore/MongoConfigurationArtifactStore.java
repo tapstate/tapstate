@@ -125,20 +125,30 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         if (requested.isEmpty()) return ArtifactBatchWrite.applied();
         requested.forEach(write -> collection(write.resource().kind()));
         return transaction(session -> {
-            // Evaluate all dependencies against one snapshot before applying any sibling write.
-            for (ArtifactWrite write : requested) {
-                for (Map.Entry<String, String> expected : write.readPreconditions().entrySet()) {
-                    Document observed = find(session, expected.getKey());
-                    if (observed == null || !expected.getValue().equals(observed.getString("contentHash"))) {
-                        throw new Refused(expected.getKey(), ArtifactMutation.VERSION_CONFLICT);
-                    }
-                }
-            }
-            Map<String, Set<PipelineConnectorNodes.Identity>> before = privateNodes(session);
-            for (ArtifactWrite write : requested) write(session, write);
-            reservePrivateScopes(session, before, requested);
+            writeAllInTransaction(session, requested);
             return ArtifactBatchWrite.applied();
         }, refused -> ArtifactBatchWrite.refused(refused.id, refused.outcome));
+    }
+
+    /** The caller owns the configuration revision and transaction; a refusal must abort the entire callback. */
+    void writeAllInTransaction(ClientSession session, List<ArtifactWrite> requested) {
+        requested.forEach(write -> collection(write.resource().kind()));
+        // Evaluate all dependencies against one snapshot before applying any sibling write.
+        for (ArtifactWrite write : requested) {
+            for (Map.Entry<String, String> expected : write.readPreconditions().entrySet()) {
+                Document observed = find(session, expected.getKey());
+                if (observed == null || !expected.getValue().equals(observed.getString("contentHash"))) {
+                    throw new Refused(expected.getKey(), ArtifactMutation.VERSION_CONFLICT);
+                }
+            }
+        }
+        Map<String, Set<PipelineConnectorNodes.Identity>> before = privateNodes(session);
+        for (ArtifactWrite write : requested) write(session, write);
+        reservePrivateScopes(session, before, requested);
+    }
+
+    Optional<Resource> getInTransaction(ClientSession session, String id) {
+        return Optional.ofNullable(find(session, id)).map(this::decode);
     }
 
     private Map<String, Set<PipelineConnectorNodes.Identity>> privateNodes(ClientSession session) {
@@ -387,7 +397,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     /** Internal transaction control: a refused condition must abort sibling writes and the revision. */
-    private static final class Refused extends RuntimeException {
+    static final class Refused extends RuntimeException {
         private final String id;
         private final ArtifactMutation outcome;
 

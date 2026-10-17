@@ -49,3 +49,4 @@ tokens | config | MongoConfigurationSecurityStores | migrated | 1 | -
 audit | config | MongoConfigurationSecurityStores | migrated | 1 | -
 users | config | MongoFirstAdminStore | migrated | 1 | -
 op_bootstrap | config | MongoFirstAdminStore | migrated | 1 | -
+pipeline_drafts | config | MongoConfigurationDraftStore | migrated | 1 | revision, updatedAt

@@ -191,7 +191,10 @@ public enum SystemCollections {
     CONFIG_TOKENS("tokens", Database.CONFIG, MongoConfigurationSecurityStores.class, Strategy.MIGRATED, 1),
     CONFIG_AUDIT("audit", Database.CONFIG, MongoConfigurationSecurityStores.class, Strategy.MIGRATED, 1),
     CONFIG_USERS("users", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1),
-    OP_BOOTSTRAP("op_bootstrap", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1);
+    OP_BOOTSTRAP("op_bootstrap", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1),
+    CONFIG_PIPELINE_DRAFTS("pipeline_drafts", Database.CONFIG, MongoConfigurationDraftStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
+            new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

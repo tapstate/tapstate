@@ -96,6 +96,7 @@ public final class MongoConfigurationBootstrap {
             });
             MongoStorageBindingStore.prepareIndex(database);
             MongoRequiredNoteStore.prepareIndexes(database);
+            MongoConfigurationDraftStore.prepareIndexes(database);
             return new MongoConfigurationDomain(connection, clusterId);
         } catch (RuntimeException | Error failure) {
             connection.close();

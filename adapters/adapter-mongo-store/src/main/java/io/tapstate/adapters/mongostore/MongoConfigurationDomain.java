@@ -14,6 +14,7 @@ import io.tapstate.spi.store.FirstAdminStore;
 import io.tapstate.spi.store.UserStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.PipelineStateMappings;
 import io.tapstate.spi.store.RequiredNoteStore;
 import io.tapstate.spi.store.StorageBindingStore;
@@ -42,6 +43,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoStorageBindingStore bindings;
     private final MongoConfigurationSecurityStores security;
     private final MongoFirstAdminStore firstAdmin;
+    private final MongoConfigurationDraftStore drafts;
 
     MongoConfigurationDomain(MongoConnection connection, String clusterId) {
         this.connection = connection;
@@ -84,6 +86,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         this.layouts = new MongoPipelineLayoutStore(connection.client(),
                 SystemCollections.CONFIG_PIPELINE_LAYOUTS.on(database),
                 SystemCollections.CONFIGURATION_VERSION.on(database));
+        this.drafts = new MongoConfigurationDraftStore(connection.client(), database, key, artifacts);
+        drafts.verify();
     }
 
     /** The caller supplies the trusted Cluster identity from its deployment or installation context. */
@@ -123,6 +127,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public StorageBindingStore bindings() {
         return bindings;
     }
+
+    public PipelineDraftStore drafts() { return drafts; }
 
     public FirstAdminStore firstAdmin() { return firstAdmin; }
 
