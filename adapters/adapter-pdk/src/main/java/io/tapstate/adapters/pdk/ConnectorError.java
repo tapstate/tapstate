@@ -187,6 +187,9 @@ public enum ConnectorError implements TapstateErrorCode {
      */
     READ_FAILED("connector.read-failed", Set.of("connector", "detail")),
 
+    /** A snapshot cannot establish its required metadata and replay anchor before reading source rows. */
+    SNAPSHOT_PREPARATION_UNAVAILABLE("connector.snapshot-preparation-unavailable", Set.of("connector", "reason")),
+
     /**
      * The connector gave up part way through a read and returned as if it had not. {@code connector} is
      * the connector id. A read loop asks whether it is still alive between batches and, when it is not,

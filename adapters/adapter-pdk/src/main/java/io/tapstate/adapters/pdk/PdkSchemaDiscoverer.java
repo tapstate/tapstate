@@ -164,6 +164,9 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
         }
     }
 
+    /** Normalizes the actual open session's metadata without launching a separate discovery or count. */
+    static SourceModel structuralModel(List<TapTable> tables) { return toSourceModel(tables, Map.of()); }
+
     private static SourceModel toSourceModel(List<TapTable> tables, Map<TapTable, Long> counts) {
         List<SourceTable> mapped = new ArrayList<>(tables.size());
         for (TapTable table : tables) {

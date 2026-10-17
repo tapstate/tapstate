@@ -1121,3 +1121,7 @@ io.required-dead-letter-fenced:
 io.required-dead-letter-conflict:
   message: "The same source event names different retained row, deletion or token facts."
   solution: "Keep the existing diagnostic and verify the original event before retrying through its current authorized execution."
+
+connector.snapshot-preparation-unavailable:
+  message: "Snapshot preparation for connector `{connector}` could not complete: {reason}."
+  solution: "Keep the saved recovery state and use a capture runtime that can durably accept the session metadata and stream position before reading rows."

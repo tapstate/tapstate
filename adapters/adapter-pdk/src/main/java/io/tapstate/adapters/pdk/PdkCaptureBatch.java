@@ -93,23 +93,35 @@ final class PdkCaptureBatch implements CaptureBatch {
     /** A batch whose enclosing snapshot session keeps the connector for the next table. */
     static PdkCaptureBatch start(
             PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
-        PdkCaptureBatch batch = new PdkCaptureBatch(connector, read, threadName, ownsConnector);
-        batch.reader.start();
+        PdkCaptureBatch batch = unstarted(connector, read, threadName, ownsConnector);
+        batch.startReader();
+        return batch.awaitSeam();
+    }
+
+    /** Registers a session-owned worker before it starts, so closing can interrupt preparation too. */
+    static PdkCaptureBatch unstarted(PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
+        return new PdkCaptureBatch(connector, read, threadName, ownsConnector);
+    }
+    void startReader() { reader.start(); }
+    boolean isClosed() { return closed.get(); }
+    boolean isReading() { return reader.isAlive(); }
+
+    PdkCaptureBatch awaitSeam() {
         try {
-            batch.seam.get();
+            seam.get();
         } catch (InterruptedException interrupted) {
-            batch.close();
+            close();
             Thread.currentThread().interrupt();
             throw new CancellationException("the snapshot read was interrupted before its seam was taken");
         } catch (ExecutionException failed) {
-            batch.close();
+            close();
             throw unchecked(failed.getCause());
         } catch (CancellationException abandoned) {
             // A read abandoned before its seam ends the wait with that as itself, not wrapped as a failure is.
-            batch.close();
+            close();
             throw abandoned;
         }
-        return batch;
+        return this;
     }
 
     /** The connector this batch was read from, and the state scope it was opened under. */
@@ -125,6 +137,7 @@ final class PdkCaptureBatch implements CaptureBatch {
     /** Refuses further rows and wakes the reader; {@link #close()} still joins it. */
     boolean requestClose() {
         boolean first = closed.compareAndSet(false, true);
+        if (first) seam.completeExceptionally(new CancellationException("the snapshot read closed before preparation completed"));
         reader.interrupt();
         return first;
     }
