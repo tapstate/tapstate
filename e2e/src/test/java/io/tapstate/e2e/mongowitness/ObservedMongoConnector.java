@@ -100,6 +100,14 @@ public final class ObservedMongoConnector implements TapConnector {
                 }
             });
         }
+        try (InputStream in = getClass().getClassLoader().getResourceAsStream("mongo-present-witness-path.txt")) {
+            if (in != null) {
+                MongoPresentBoundaryWitness.install(functions,
+                        Path.of(new String(in.readAllBytes(), StandardCharsets.UTF_8)));
+            }
+        } catch (IOException failure) {
+            throw new AssertionError("cannot read numeric present boundary witness path", failure);
+        }
     }
 
     private Path optionalReaderWitness() {
