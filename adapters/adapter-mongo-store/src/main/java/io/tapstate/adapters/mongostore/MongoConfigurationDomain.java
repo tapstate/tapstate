@@ -7,6 +7,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.IoError;
 import org.bson.Document;
 
@@ -25,6 +26,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     static final int SCHEMA_VERSION = 1;
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
+    private final PipelineLayoutStore layouts;
 
     MongoConfigurationDomain(MongoConnection connection, String clusterId) {
         this.connection = connection;
@@ -46,14 +48,17 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
         Document version = StoreIo.call(() -> durable(SystemCollections.CONFIGURATION_VERSION.on(database))
-                .find(new Document("_id", MongoConfigurationArtifactStore.REVISION_ID)).first());
+                .find(new Document("_id", ConfigurationVersion.ID)).first());
         if (version == null || !(version.get("revision") instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE) {
-            throw unreadable(MongoConfigurationArtifactStore.REVISION_ID, "revision");
+            throw unreadable(ConfigurationVersion.ID, "revision");
         }
         PersistentKey key = new PersistentKey(database, clusterId);
         this.artifacts = new MongoConfigurationArtifactStore(connection.client(), database, key);
         artifacts.verifySourceEnvelopes();
+        this.layouts = new MongoPipelineLayoutStore(connection.client(),
+                SystemCollections.CONFIG_PIPELINE_LAYOUTS.on(database),
+                SystemCollections.CONFIGURATION_VERSION.on(database));
     }
 
     /** The caller supplies the trusted Cluster identity from its deployment or installation context. */
@@ -72,6 +77,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public ArtifactStore artifacts() {
         return artifacts;
+    }
+
+    public PipelineLayoutStore layouts() {
+        return layouts;
     }
 
     @Override

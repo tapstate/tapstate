@@ -38,7 +38,6 @@ import java.util.Set;
  * Only Source and Pipeline resources reach this adapter; authoring translation rejects other kinds.
  */
 public final class MongoConfigurationArtifactStore implements ArtifactStore {
-    static final String REVISION_ID = "configuration";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true))
@@ -143,7 +142,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             try (ClientSession session = client.startSession()) {
                 try {
                     return session.withTransaction(() -> {
-                        contendOnRevision(session);
+                        ConfigurationVersion.advance(session, versions);
                         return body.apply(session);
                     }, TRANSACTION);
                 } catch (Refused refused) {
@@ -152,18 +151,6 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 }
             }
         });
-    }
-
-    private void contendOnRevision(ClientSession session) {
-        Document current = versions.find(session, new Document("_id", REVISION_ID)).first();
-        if (current == null || !(current.get("revision") instanceof Long revision)
-                || revision < 0 || revision == Long.MAX_VALUE) {
-            throw unreadable(REVISION_ID, "revision");
-        }
-        long matched = versions.updateOne(session,
-                new Document("_id", REVISION_ID).append("revision", revision),
-                new Document("$inc", new Document("revision", 1L))).getMatchedCount();
-        if (matched != 1) throw new IllegalStateException("revision changed within one transaction snapshot");
     }
 
     @Override

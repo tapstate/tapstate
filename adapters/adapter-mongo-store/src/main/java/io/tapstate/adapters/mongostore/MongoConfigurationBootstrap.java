@@ -82,7 +82,7 @@ public final class MongoConfigurationBootstrap {
                             SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(session,
                                     new Document("_id", "config").append("installedVersion", MongoConfigurationDomain.SCHEMA_VERSION));
                             SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(session,
-                                    new Document("_id", MongoConfigurationArtifactStore.REVISION_ID).append("revision", 0L));
+                                    new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
                             return null;
                         }, TRANSACTION);
                         break;

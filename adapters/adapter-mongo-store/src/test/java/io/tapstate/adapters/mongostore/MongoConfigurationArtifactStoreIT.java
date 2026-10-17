@@ -11,6 +11,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -193,7 +194,7 @@ class MongoConfigurationArtifactStoreIT {
             var versions = SystemCollections.CONFIGURATION_VERSION.on(database);
             for (Object value : new Object[]{null, "0", -1L, Long.MAX_VALUE}) {
                 versions.deleteMany(new Document());
-                if (value != null) versions.insertOne(new Document("_id", MongoConfigurationArtifactStore.REVISION_ID)
+                if (value != null) versions.insertOne(new Document("_id", ConfigurationVersion.ID)
                         .append("revision", value));
                 assertThatThrownBy(() -> store.create(pipeline("forbidden")))
                         .isInstanceOfSatisfying(TapstateException.class,
@@ -448,6 +449,46 @@ class MongoConfigurationArtifactStoreIT {
         });
     }
 
+    @Test
+    void layoutMutationsParticipateInTheSameConfigurationRevision() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            try (var domain = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a")) {
+                domain.artifacts().create(pipeline("flow"));
+                PipelineLayout layout = new PipelineLayout("flow",
+                        Map.of("step", new PipelineLayout.NodePosition(10, 20)),
+                        new PipelineLayout.Viewport(1, 2, 1));
+                domain.layouts().save(layout);
+                assertThat(domain.layouts().get("flow")).contains(layout);
+                assertThat(revision(database)).isEqualTo(2);
+                domain.layouts().delete("flow");
+                assertThat(domain.layouts().get("flow")).isEmpty();
+                assertThat(revision(database)).isEqualTo(3);
+            }
+        });
+    }
+
+    @Test
+    void aFailedLayoutWriteRollsBackTheConfigurationRevision() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            try (var domain = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a")) {
+                domain.artifacts().saveAll(List.of(pipeline("one"), pipeline("two")));
+                PipelineLayout first = new PipelineLayout("one", Map.of(), new PipelineLayout.Viewport(0, 0, 1));
+                domain.layouts().save(first);
+                SystemCollections.CONFIG_PIPELINE_LAYOUTS.on(database).createIndex(new Document("viewport.zoom", 1),
+                        new IndexOptions().unique(true));
+                assertThatThrownBy(() -> domain.layouts().save(new PipelineLayout("two", Map.of(),
+                        new PipelineLayout.Viewport(1, 1, 1))))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                assertThat(revision(database)).isEqualTo(2);
+                assertThat(domain.layouts().get("one")).contains(first);
+                assertThat(domain.layouts().get("two")).isEmpty();
+            }
+        });
+    }
+
     private static void installConfigFacts(MongoDatabase database) {
         SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).insertOne(new Document("_id", "cluster")
                 .append("clusterId", "cluster-a").append("layoutId", MongoConfigurationDomain.LAYOUT)
@@ -498,7 +539,7 @@ class MongoConfigurationArtifactStoreIT {
             MongoDatabase database = client.getDatabase("config_split_" + UUID.randomUUID().toString().replace("-", ""));
             try {
                 SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(
-                        new Document("_id", MongoConfigurationArtifactStore.REVISION_ID).append("revision", 0L));
+                        new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
                 scenario.run(new MongoConfigurationArtifactStore(client, database,
                         new SourceConfigCipher(new byte[32])), database);
             } catch (Exception error) {
