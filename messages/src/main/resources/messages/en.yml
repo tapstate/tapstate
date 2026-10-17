@@ -1089,3 +1089,7 @@ io.note-origin-mismatch:
 io.cache-auth-fenced:
   message: "The captured cache authentication generation is unavailable or no longer current."
   solution: "Load the current trusted storage binding and authentication readiness before retrying."
+
+io.pipeline-intent-fenced:
+  message: "The lifecycle intent no longer owns its captured storage binding or Pipeline state generation."
+  solution: "Load the current trusted storage and Pipeline state before starting a new lifecycle operation. Do not retarget the old operation."

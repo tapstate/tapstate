@@ -201,7 +201,8 @@ public enum SystemCollections {
             new IndexSpec(List.of("secretHash", "issuer"), false)),
     CLOUD_SESSIONS("cloud_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("secretHash", "issuer"), false)),
-    CLOUD_REVOCATIONS("cloud_revocations", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1);
+    CLOUD_REVOCATIONS("cloud_revocations", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1),
+    PIPELINE_INTENTS("pipeline_intents", Database.CONFIG, MongoPipelineIntentStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

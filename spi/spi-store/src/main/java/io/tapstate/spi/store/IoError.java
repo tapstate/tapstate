@@ -75,6 +75,9 @@ public enum IoError implements TapstateErrorCode {
     /** The captured cache authentication generation is no longer current or ready. */
     CACHE_AUTH_FENCED("io.cache-auth-fenced", Set.of()),
 
+    /** A lifecycle intent no longer owns its captured storage binding or stable Pipeline state generation. */
+    PIPELINE_INTENT_FENCED("io.pipeline-intent-fenced", Set.of()),
+
     /** A connector must not reuse retained notes with another connection or artifact. */
     NOTE_ORIGIN_MISMATCH("io.note-origin-mismatch", Set.of()),
 

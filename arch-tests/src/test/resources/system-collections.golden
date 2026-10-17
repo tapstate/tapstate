@@ -55,3 +55,4 @@ schema_migrations | cache | MongoCacheIdentity | migrated | 1 | -
 op_sessions | cache | MongoCacheDomain | migrated | 1 | secretHash+issuer
 cloud_sessions | cache | MongoCacheDomain | migrated | 1 | secretHash+issuer
 cloud_revocations | cache | MongoCacheDomain | migrated | 1 | -
+pipeline_intents | config | MongoPipelineIntentStore | migrated | 1 | -

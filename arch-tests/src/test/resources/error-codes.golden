@@ -242,6 +242,7 @@ io.note-origin-mismatch
 io.note-referenced
 io.note-scope-unavailable
 io.note-write-conflict
+io.pipeline-intent-fenced
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous

@@ -44,9 +44,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoConfigurationSecurityStores security;
     private final MongoFirstAdminStore firstAdmin;
     private final MongoConfigurationDraftStore drafts;
+    private final String clusterId;
 
     MongoConfigurationDomain(MongoConnection connection, String clusterId) {
         this.connection = connection;
+        this.clusterId = clusterId;
         MongoDatabase database = connection.database();
         Document identity = StoreIo.call(() -> durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database))
                 .find(new Document("_id", "cluster")).first());
@@ -126,6 +128,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public StorageBindingStore bindings() {
         return bindings;
+    }
+
+    public io.tapstate.spi.store.PipelineIntentStore intents() {
+        return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId);
     }
 
     public PipelineDraftStore drafts() { return drafts; }
