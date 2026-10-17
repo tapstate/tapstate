@@ -50,6 +50,19 @@ class SessionServiceTest {
     }
 
     @Test
+    void urlSafeSeparatorsSurviveSessionCreationAndExchange() {
+        MemorySessionStore store = new MemorySessionStore();
+        SessionService service = service(store, NOW, "s_01", "session_-secret");
+        CreatedSession created = service.create("admin", Scope.ADMIN, ISSUER);
+
+        assertThat(created.token()).isEqualTo("tss_s_01.session_-secret");
+        assertThat(service.exchange(created.token(), ISSUER)).isPresent();
+        int exchanges = store.exchangeCalls;
+        assertThat(service.exchange("tss_s*01.session_-secret", ISSUER)).isEmpty();
+        assertThat(store.exchangeCalls).isEqualTo(exchanges);
+    }
+
+    @Test
     void issuerSecretAndExpiryMismatchFailClosed() {
         MemorySessionStore store = new MemorySessionStore();
         service(store, NOW).create("admin", Scope.ADMIN, ISSUER);
@@ -128,15 +141,20 @@ class SessionServiceTest {
     }
 
     private static SessionService service(MemorySessionStore store, Instant now) {
+        return service(store, now, "s01", "session-secret");
+    }
+
+    private static SessionService service(
+            MemorySessionStore store, Instant now, String sessionId, String sessionSecret) {
         TokenSecrets secrets = new TokenSecrets() {
             @Override
             public GeneratedSecret generate() {
-                return new GeneratedSecret("s01", "session-secret", "digest-fixture");
+                return new GeneratedSecret(sessionId, sessionSecret, "digest-fixture");
             }
 
             @Override
             public String hash(String presentedSecret) {
-                return "session-secret".equals(presentedSecret) ? "digest-fixture" : "digest-wrong";
+                return sessionSecret.equals(presentedSecret) ? "digest-fixture" : "digest-wrong";
             }
 
             @Override

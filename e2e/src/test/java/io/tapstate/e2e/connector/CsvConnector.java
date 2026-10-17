@@ -50,6 +50,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -263,6 +264,7 @@ public class CsvConnector implements TapConnector {
 
     /** Set by {@code stop}; the tail also honours its thread's interrupt. Both signals arrive on cancel. */
     private volatile boolean stopped;
+    private final ReentrantReadWriteLock sinkWrites = new ReentrantReadWriteLock();
 
     /** How many batches this writer has written, which numbers them in the write witness. */
     private final AtomicLong batches = new AtomicLong();
@@ -362,6 +364,10 @@ public class CsvConnector implements TapConnector {
     @Override
     public void stop(TapConnectionContext context) {
         stopped = true;
+        // A stop releases held callbacks, then waits until none can still mutate the fixture's files.
+        var drain = sinkWrites.writeLock();
+        drain.lock();
+        drain.unlock();
     }
 
     /**
@@ -517,6 +523,20 @@ public class CsvConnector implements TapConnector {
      */
     private WriteListResult<TapRecordEvent> write(
             TapConnectionContext context, List<TapRecordEvent> events, TapTable target) {
+        var active = sinkWrites.readLock();
+        active.lock();
+        try {
+            if (stopped) {
+                throw new IllegalStateException("the file connector has stopped");
+            }
+            return writeWhileRunning(context, events, target);
+        } finally {
+            active.unlock();
+        }
+    }
+
+    private WriteListResult<TapRecordEvent> writeWhileRunning(
+            TapConnectionContext context, List<TapRecordEvent> events, TapTable target) {
         awaitWriteRelease(context);
         if (writesRejected(context)) {
             // The product wraps whatever a connector's write throws into a coded write failure, so the type
@@ -662,7 +682,7 @@ public class CsvConnector implements TapConnector {
     }
 
     /** Holds this target's write at the connector boundary until the harness releases it. */
-    private static void awaitWriteRelease(TapConnectionContext context) {
+    private void awaitWriteRelease(TapConnectionContext context) {
         Object configured = context.getConnectionConfig() == null
                 ? null
                 : context.getConnectionConfig().getObject(HOLD_WRITES);
@@ -677,6 +697,9 @@ public class CsvConnector implements TapConnector {
             throw new UncheckedIOException("publishing the held-write signal at " + signals, failure);
         }
         while (!Files.exists(signals.resolve("release"))) {
+            if (stopped) {
+                throw new IllegalStateException("a held target write was stopped before release");
+            }
             if (!pausedBetweenPolls(20)) {
                 throw new IllegalStateException("a held target write was interrupted before release");
             }

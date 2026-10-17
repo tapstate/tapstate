@@ -93,10 +93,14 @@ final class ControlPlane {
 
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
+        HttpRequest request = get("/healthz");
+        long started = ClusterHealthProbe.started();
         try {
-            HttpResponse<String> response = send(get("/healthz"));
+            HttpResponse<String> response = send(request);
+            ClusterHealthProbe.response(request, response.statusCode(), response.body(), started);
             return response.statusCode() == 200 && "ok".equals(response.body());
         } catch (UncheckedIOException e) {
+            ClusterHealthProbe.failure(request, e, started);
             return false;
         }
     }
@@ -1336,8 +1340,13 @@ final class ControlPlane {
      * its whole bound before saying so.
      */
     Optional<PipelineState> state(String pipelineId) {
-        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
-        return interpretState(response.statusCode(), response.body(), pipelineId);
+        HttpRequest request = authedGet("/api/pipelines/" + pipelineId + "/status");
+        HttpResponse<String> response = send(request);
+        Optional<PipelineState> state = interpretState(response.statusCode(), response.body(), pipelineId);
+        ClusterHealthProbe.pipelineStatus(request, response.statusCode(), response.body(), pipelineId,
+                state,
+                () -> interpretFailureCode(response.statusCode(), response.body(), pipelineId));
+        return state;
     }
 
     /**

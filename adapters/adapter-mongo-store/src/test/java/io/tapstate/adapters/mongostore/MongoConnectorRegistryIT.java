@@ -10,9 +10,7 @@ import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -29,10 +27,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoConnectorRegistryIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoConnectorRegistryIT.class);
 
     private static byte[] jar(String content) {
         return content.getBytes(StandardCharsets.UTF_8);
@@ -127,7 +125,7 @@ class MongoConnectorRegistryIT {
     /** Runs a test body against a fresh registry over a clean GridFS bucket on the real replica-set. */
     private static void withRegistry(RegistryTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoDatabase database = client.getDatabase("tapstate");
+            MongoDatabase database = client.getDatabase(REPLICA_SET.database("tapstate"));
             GridFSBucket bucket = GridFSBuckets.create(database, "connector_artifacts");
             bucket.drop();
             test.run(new MongoConnectorRegistry(bucket));

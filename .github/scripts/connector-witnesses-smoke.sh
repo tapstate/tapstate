@@ -31,6 +31,8 @@ with tempfile.TemporaryDirectory() as tmp:
     put('durations.json',json.dumps({'sample.PublishedExamplesIT':10000, 'sample.PublishedExamplesIT#examples/sample0/case.e2e.yml':100}))
     call('plan','--durations',root/'durations.json','--output',root/'plan.json')
     plan=json.loads((root/'plan.json').read_text()); assert len(plan['shards'])==10
+    put('bin/mvn','#!/bin/sh\nexit 0\n'); (root/'bin/mvn').chmod(0o755)
+    os.environ['PATH']=str(root/'bin')+':'+os.environ['PATH']
     assert {t['class'] for t in plan['expected']}=={'sample.'+n for n in names}, 'deferred external Atlas witnesses must be absent from the active cohort'
     assert plan['connector_deferrals']['classes']==deferred and plan['requires_atlas_fixtures'] is False
     assert len(plan['expected'])==20
@@ -67,6 +69,7 @@ with tempfile.TemporaryDirectory() as tmp:
     def pack(shard,ok=True): call('pack','--plan',root/'plan.json','--shard',shard['id'],'--output',artifacts/shard['id'],ok=ok)
     for shard in plan['shards']:
         shutil.rmtree(root/'e2e/target',ignore_errors=True)
+        call('run','--plan',root/'plan.json','--shard',shard['id'],'--repo-local',root/'m2')
         suites={}; ledger=[]
         for test in shard['tests']:
             name=test['class']; put('e2e/target/test-classes/'+name.replace('.','/')+'.class','bytecode')
@@ -159,5 +162,23 @@ with tempfile.TemporaryDirectory() as tmp:
     selected=next(s for s in plan['shards'] if s['id']==sweep[0])
     assert Counter(selection.split(','))==Counter(t['example'] for t in selected['tests'] if 'example' in t)
     assert '-DforkCount=1' in args and '-DreuseForks=true' in args and '-Djunit.jupiter.execution.parallel.enabled=false' in args
-print('connector-witnesses smoke: explicit Atlas deferral/restoration, policy binding, XML preservation and original 27 adverse scenario types passed')
+    # The wrapper must let the guarded runner preflight before it deletes either ledger.
+    with tempfile.TemporaryDirectory() as external_tmp:
+        outside=pathlib.Path(external_tmp)
+        foreign={'witness-ledger.txt':'external ordinary ledger',
+                 'witness-ledgers/123.txt':'external selected ledger',
+                 'failsafe-reports/TEST-foreign.xml':'external XML',
+                 'jacoco.exec':'external coverage'}
+        for name,value in foreign.items():
+            path=outside/name; path.parent.mkdir(parents=True,exist_ok=True); path.write_text(value)
+        target=root/'e2e/target'; backup_target=root/'e2e/target-owned-backup'
+        target.rename(backup_target); target.symlink_to(outside,target_is_directory=True)
+        (root/'mvn-args').unlink(missing_ok=True)
+        try:
+            rejected=call('run','--plan',root/'plan.json','--shard',sweep[0],'--repo-local',root/'m2',ok=False)
+            assert 'unsafe cleanup path' in rejected.stderr and not (root/'mvn-args').exists()
+            assert all((outside/name).is_file() and (outside/name).read_text()==value for name,value in foreign.items()), 'wrapper modified external evidence before preflight'
+        finally:
+            target.unlink(); backup_target.rename(target)
+print('connector-witnesses smoke: explicit Atlas deferral/restoration, policy binding, XML preservation and 28 adverse admission/run scenario types passed')
 PY

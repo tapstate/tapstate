@@ -100,7 +100,10 @@ enum BootError implements TapstateErrorCode {
     COORDINATION_STORE_REQUIRED("boot.coordination-store-required", Set.of()),
 
     /** Another live boot already holds this stable node id. */
-    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId"));
+    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId")),
+
+    /** The reserved identity stopped being provably owned before member startup completed. */
+    NODE_SESSION_LOST("boot.node-session-lost", Set.of());
 
     private final String code;
     private final Set<String> placeholders;

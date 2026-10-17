@@ -36,6 +36,8 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
      */
     private final AtomicReference<BooleanSupplier> dataPlane = new AtomicReference<>(() -> true);
 
+    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> true);
+
     ClusterMembershipGate(ClusterProperties properties) {
         this.profile = properties.getProfile();
         this.bootstrapMinMembers = properties.getBootstrapMinMembers();
@@ -110,8 +112,14 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         dataPlane.set(Objects.requireNonNull(admits, "admits"));
     }
 
+    /** The pre-join identity must remain proved while the member is starting or carrying work. */
+    void observeNodeSession(BooleanSupplier current) {
+        nodeSession.set(Objects.requireNonNull(current, "current"));
+    }
+
     boolean canCommit(Set<String> visibleNodeIds) {
         rememberVisible(visibleNodeIds);
+        if (!nodeSession.get().getAsBoolean()) return false;
         ClusterMembership current = committed.get();
         if (profile == ClusterProperties.Profile.SINGLE) {
             return true;
@@ -172,6 +180,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     }
 
     private boolean eligible(Set<String> visibleNodeIds) {
+        if (!nodeSession.get().getAsBoolean()) return false;
         if (profile == ClusterProperties.Profile.SINGLE) {
             return true;
         }
