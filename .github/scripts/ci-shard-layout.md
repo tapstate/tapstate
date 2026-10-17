@@ -70,7 +70,7 @@ aggregation limits accompany the duration map; nested suite timers can overlap.
 The duration provenance records 1,290 source units from one complete,
 successful manual CI run. Its thirteen selected verify commands, reports and
 worker packs remain bound to that source/run. The source metadata states each
-variant's current identity and test-source-byte match separately. The current A source set has 1,287 units and one unmeasured shutdown control; the changed test CSV fixture, repetition metadata relocation and new class are common inputs. New assignments
+variant's current identity and test-source-byte match separately. The current B source set has 1,291 units and one unmeasured shutdown control; the changed test CSV fixture, repetition metadata relocation and new class are common inputs. New assignments
 have not run; current-verify and performance flags remain false. The reports
 include classes with no testcase rows and zero aggregate suite times; report
 presence or zero time does not establish executed cases. These are scheduling
