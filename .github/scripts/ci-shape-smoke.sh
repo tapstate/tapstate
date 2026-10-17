@@ -46,7 +46,7 @@ def check(workflows, contexts, inputs):
     namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
     reactor = ET.fromstring(inputs['pom.xml'])
     version = reactor.findtext('m:properties/m:cloud.sdk.version', namespaces=namespace)
-    assert version and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{8}-SNAPSHOT', version), \
+    assert version and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[0-9a-f]{8}-SNAPSHOT', version), \
         'the reactor must declare the published Cloud SDK revision'
     app = ET.fromstring(inputs['app/pom.xml'])
     sdk = [dependency for dependency in app.findall('m:dependencies/m:dependency', namespace)
