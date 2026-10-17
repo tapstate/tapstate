@@ -2,7 +2,7 @@ package io.tapstate.spi.store;
 
 import java.util.Objects;
 
-/** An actual structural table model, without discovery's changing row-count measurement. */
+/** A structural model without row-count measurement; ddlSequence is its inclusive first log position. */
 public record SrsModel(SrsModelKey key, String ringName, SourceTable table, long ddlSequence) {
     public SrsModel {
         Objects.requireNonNull(key, "key"); Objects.requireNonNull(table, "table");

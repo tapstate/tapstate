@@ -247,6 +247,7 @@ io.pipeline-intent-fenced
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous
+io.srs-event-model-unavailable
 io.srs-model-conflict
 io.srs-model-unavailable
 io.srs-progress-unproven

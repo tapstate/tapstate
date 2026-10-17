@@ -5,7 +5,7 @@ public record SrsModelKey(String miningChainId, String table, String cacheIncarn
     public SrsModelKey {
         if (miningChainId == null || miningChainId.isBlank() || table == null || table.isBlank()
                 || cacheIncarnation == null || cacheIncarnation.isBlank() || captureEpoch < 1 || captureEpoch == Long.MAX_VALUE
-                || modelVersion < 1 || modelVersion == Long.MAX_VALUE) {
+                || modelVersion < 0 || modelVersion == Long.MAX_VALUE) {
             throw new IllegalArgumentException("invalid SRS model identity");
         }
     }

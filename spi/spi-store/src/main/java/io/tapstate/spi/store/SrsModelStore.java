@@ -9,7 +9,7 @@ public interface SrsModelStore {
     /** Keeps the original operation authorization before and after every callback attempt. */
     SrsModelStore guardedBy(Runnable requireActive);
 
-    /** Publishes this original key/content under the original capture claim; identical retries are safe. */
+    /** Each table/capture starts at actual version zero and advances by one; identical captured retries are safe. */
     SrsModel publish(SrsModel model, WorkloadClaimFence captureFence);
 
     /** Historical lookup is exact, never a request for the latest discovery result. */

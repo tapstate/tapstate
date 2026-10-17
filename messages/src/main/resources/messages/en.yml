@@ -1103,3 +1103,7 @@ io.srs-model-unavailable:
 io.srs-model-conflict:
   message: "Model {version} for table {table} on chain {chain} already names different content."
   solution: "Keep the original version unchanged and verify the capture context before publishing a new model version."
+
+io.srs-event-model-unavailable:
+  message: "Ring {ring} cannot prove actual model {version} at capture epoch {epoch}."
+  solution: "Stop continuation and restore the exact model and log history, or complete the authorized full rebuild. Do not substitute the latest discovery model."

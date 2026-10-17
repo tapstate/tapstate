@@ -78,6 +78,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
     private final MongoCollection<Document> workloadClaims;
     private final MongoCollection<Document> boundsCollection;
     private final boolean split;
+    private final MongoSrsModelStore models;
 
     public MongoSrsLogStore(MongoCollection<Document> collection) {
         this(null, collection, null);
@@ -88,23 +89,36 @@ public final class MongoSrsLogStore implements SrsLogStore {
             MongoClient client,
             MongoCollection<Document> collection,
             MongoCollection<Document> workloadClaims) {
-        this(client, collection, collection, workloadClaims, false);
+        this(client, collection, collection, workloadClaims, false, null);
     }
 
     /** Events and bounds are independent resources committed on this exact cache client. */
     public MongoSrsLogStore(MongoClient client, MongoCollection<Document> events,
             MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims) {
         this(Objects.requireNonNull(client, "client"), events, bounds,
-                Objects.requireNonNull(workloadClaims, "workloadClaims"), true);
-        if (events.getNamespace().equals(bounds.getNamespace())) {
-            throw new IllegalArgumentException("SRS events and bounds require independent collections");
+                Objects.requireNonNull(workloadClaims, "workloadClaims"), true, null);
+    }
+
+    /** The business assembly supplies the same client's fixed actual-model view. */
+    public MongoSrsLogStore(MongoClient client, MongoCollection<Document> events,
+            MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims, MongoSrsModelStore models) {
+        this(Objects.requireNonNull(client, "client"), events, bounds, Objects.requireNonNull(workloadClaims, "workloadClaims"),
+                true, Objects.requireNonNull(models, "models"));
+        String database = events.getNamespace().getDatabaseName();
+        if (!models.belongsTo(client, database) || !bounds.getNamespace().getDatabaseName().equals(database)
+                || !workloadClaims.getNamespace().getDatabaseName().equals(database)) {
+            throw new IllegalArgumentException("SRS events, bounds, claims and models require one cache client and database");
         }
     }
 
     private MongoSrsLogStore(MongoClient client, MongoCollection<Document> collection,
-            MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims, boolean split) {
+            MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims, boolean split, MongoSrsModelStore models) {
         this.client = client;
         this.split = split;
+        this.models = models;
+        if (split && collection.getNamespace().equals(bounds.getNamespace())) {
+            throw new IllegalArgumentException("SRS events and bounds require independent collections");
+        }
         this.boundsCollection = Objects.requireNonNull(bounds, "bounds")
                 .withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
         this.collection = Objects.requireNonNull(collection, "collection")
@@ -125,15 +139,16 @@ public final class MongoSrsLogStore implements SrsLogStore {
     public void storeAll(String ring, long firstSeq, List<SrsLogRecord> records) {
         Objects.requireNonNull(ring, "ring");
         Objects.requireNonNull(records, "records");
-        if (records.isEmpty()) {
+        List<SrsLogRecord> original = List.copyOf(records);
+        if (original.isEmpty()) {
             return;
         }
         if (split && firstSeq < 0) throw new IllegalArgumentException("SRS sequence must be non-negative");
-        WorkloadClaimFence fence = records.getFirst().captureFence();
-        List<WriteModel<Document>> writes = new ArrayList<>(records.size() + 1);
-        long lastSeq = Math.addExact(firstSeq, records.size() - 1L);
+        WorkloadClaimFence fence = original.getFirst().captureFence();
+        List<WriteModel<Document>> writes = new ArrayList<>(original.size() + 1);
+        long lastSeq = Math.addExact(firstSeq, original.size() - 1L);
         long seq = firstSeq;
-        for (SrsLogRecord record : records) {
+        for (SrsLogRecord record : original) {
             Objects.requireNonNull(record, "record");
             if (!Objects.equals(fence, record.captureFence())) {
                 throw new IllegalArgumentException("one SRS log batch must carry one workload claim fence");
@@ -148,6 +163,15 @@ public final class MongoSrsLogStore implements SrsLogStore {
         if (split) {
             transaction(fence, session -> {
                 splitBounds(session, ring);
+                if (models != null) {
+                    var ranges = new java.util.HashMap<ModelIdentity, MongoSrsModelStore.EventModelRange>();
+                    long at = firstSeq;
+                    for (SrsLogRecord record : original) {
+                        var identity = new ModelIdentity(record.epoch(), record.schemaVer(), record.captureFence());
+                        var range = ranges.computeIfAbsent(identity, ignored -> models.requireEvent(session, ring, record, true));
+                        range.requireAt(at++, ring, record);
+                    }
+                }
                 collection.bulkWrite(session, writes, new BulkWriteOptions().ordered(true));
                 boundsCollection.bulkWrite(session, List.of(appendBounds(ring, lastSeq)));
                 return null;
@@ -172,7 +196,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         Objects.requireNonNull(ring, "ring");
         if (split) return transaction(null, session -> {
             splitBounds(session, ring);
-            return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, seq))).first()).map(MongoSrsLogStore::splitRecord);
+            return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, seq))).first()).map(row -> checkedRecord(session, ring, row));
         });
         Document document = StoreIo.call(() -> collection.find(new Document("_id", key(ring, seq))).first());
         return document == null ? Optional.empty() : Optional.of(toRecord(document));
@@ -225,7 +249,17 @@ public final class MongoSrsLogStore implements SrsLogStore {
             Document range = new Document("_id", new Document("$gte", key(ring, firstSeq)).append("$lte", key(ring, last)));
             var rows = collection.find(session, range).sort(new Document("_id", 1)).into(new ArrayList<>());
             Map<Long, SrsLogRecord> records = new LinkedHashMap<>();
-            for (Document row : rows) records.put(splitSequence(row), splitRecord(row));
+            var ranges = new java.util.HashMap<ModelIdentity, MongoSrsModelStore.EventModelRange>();
+            for (Document row : rows) {
+                SrsLogRecord event = splitRecord(row);
+                long at = splitSequence(row);
+                if (models != null) {
+                    var identity = new ModelIdentity(event.epoch(), event.schemaVer(), event.captureFence());
+                    var modelRange = ranges.computeIfAbsent(identity, ignored -> models.requireEvent(session, ring, event, false));
+                    modelRange.requireAt(at, ring, event);
+                }
+                records.put(at, event);
+            }
             return new SrsLogBatch(observed, records);
         });
         SrsLogBounds observed = bounds(ring);
@@ -276,6 +310,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     private SrsLogBounds splitBounds(ClientSession session, String ring) {
+        if (models != null) models.checkRing(session, ring);
         Document stored = boundsCollection.find(session, new Document("_id", boundsId(ring))).first();
         if (stored == null) {
             if (collection.find(session, ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null) throw unreadableSplit("bounds");
@@ -287,6 +322,14 @@ public final class MongoSrsLogStore implements SrsLogStore {
         }
         try { return new SrsLogBounds(largest, trimmed); }
         catch (IllegalArgumentException invalid) { throw unreadableSplit("bounds"); }
+    }
+
+    private record ModelIdentity(long epoch, long version, WorkloadClaimFence fence) {}
+
+    private SrsLogRecord checkedRecord(ClientSession session, String ring, Document stored) {
+        SrsLogRecord event = splitRecord(stored);
+        if (models != null) models.requireEvent(session, ring, event, false).requireAt(splitSequence(stored), ring, event);
+        return event;
     }
 
     private static long splitSequence(Document stored) {
@@ -313,12 +356,15 @@ public final class MongoSrsLogStore implements SrsLogStore {
         return StoreIo.call(() -> {
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
+                    if (models != null) models.checkDomain(session);
                     if (fence != null) {
                         if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
                             throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
                         }
                     }
-                    return action.apply(session);
+                    T result = action.apply(session);
+                    if (models != null) models.checkDomain(session);
+                    return result;
                 }, DURABLE_APPEND);
             }
         });
