@@ -232,9 +232,9 @@ class MongoRequiredNoteStoreIT {
         withNotes(f -> {
             assertThatThrownBy(() -> f.notes.open(global())).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
             assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.database).countDocuments()).isZero();
-            assertThatThrownBy(() -> f.notes.initialize(new RequiredNoteOwner(1, "pdk.global-state",
+            assertThatThrownBy(() -> f.notes.initialize(new RequiredNoteOwner(2, "pdk.global-state",
                     RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0))).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
-            assertThatThrownBy(() -> f.notes.initialize(new RequiredNoteOwner(0, "pdk.global-state",
+            assertThatThrownBy(() -> f.notes.initialize(new RequiredNoteOwner(1, "pdk.global-state",
                     RequiredNoteOwner.Kind.GLOBAL, "cluster-b", 0))).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
             assertThatThrownBy(() -> f.notes.initialize(pipeline("missing", 1)))
                     .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
@@ -299,16 +299,28 @@ class MongoRequiredNoteStoreIT {
         });
     }
 
+    @Test
+    void anUnboundConfigurationCannotPrepareFormalNoteScopes() {
+        withNotes(f -> {
+            SystemCollections.CONFIG_CLUSTER_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("bindingVersion", 0L)));
+            assertThatThrownBy(() -> f.notes.initialize(global())).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> new RequiredNoteOwner(0, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL,
+                    "cluster-a", 0)).isInstanceOf(IllegalArgumentException.class);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.database).countDocuments()).isZero();
+        });
+    }
+
     private static RequiredNoteOwner global() {
-        return new RequiredNoteOwner(0, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0);
+        return new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0);
     }
 
     private static RequiredNoteOwner chain(String id) {
-        return new RequiredNoteOwner(0, "pdk.chain." + id, RequiredNoteOwner.Kind.CHAIN, id, 0);
+        return new RequiredNoteOwner(1, "pdk.chain." + id, RequiredNoteOwner.Kind.CHAIN, id, 0);
     }
 
     private static RequiredNoteOwner pipeline(String id, long generation) {
-        return new RequiredNoteOwner(0, "pdk.state." + id + ".source", RequiredNoteOwner.Kind.PIPELINE, id, generation);
+        return new RequiredNoteOwner(1, "pdk.state." + id + ".source", RequiredNoteOwner.Kind.PIPELINE, id, generation);
     }
 
     private static byte[] bytes(String value) {
@@ -327,6 +339,8 @@ class MongoRequiredNoteStoreIT {
             MongoConnectionSettings settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(name), null, Duration.ofSeconds(5));
             try (MongoConfigurationDomain domain = MongoConfigurationBootstrap.prepare(settings,
                     "cluster-a", "installation-a", "setup-a", 1)) {
+                SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("bindingVersion", 1L)));
                 scenario.run(new Fixture(admin, database, domain.requiredNotes()));
             } catch (Exception failure) {
                 throw new AssertionError(failure);

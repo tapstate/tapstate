@@ -11,7 +11,7 @@ public record RequiredNoteOwner(long bindingVersion, String namespace, Kind kind
         Objects.requireNonNull(namespace, "namespace");
         Objects.requireNonNull(kind, "kind");
         Objects.requireNonNull(ownerId, "ownerId");
-        if (bindingVersion < 0 || namespace.isBlank() || ownerId.isBlank()
+        if (bindingVersion < 1 || namespace.isBlank() || ownerId.isBlank()
                 || (kind == Kind.PIPELINE ? stateGeneration < 1 : stateGeneration != 0)) {
             throw new IllegalArgumentException("invalid required-note owner");
         }
