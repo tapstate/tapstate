@@ -921,11 +921,20 @@ final class Synthetic {
     private static final String LIFECYCLE_WRITES = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
             + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
 
+    static Path lifecycleSinkThatLosesAuthorityOnActivation(Path dir, Path trace, String channel) {
+        return lifecycleSink(dir, trace, "ActivationLosingSink", LIFECYCLE_WRITES, "mark(\"init\");",
+                "((java.util.concurrent.atomic.AtomicBoolean) System.getProperties().get(\"" + channel + "\")).set(false);");
+    }
+
     private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init) {
+        return lifecycleSink(dir, trace, simpleName, register, init, "");
+    }
+
+    private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init, String ctor) {
         String members = "private void mark(String value) throws Exception {"
                 + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
                 + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
-        String code = source(simpleName, "", register, members)
+        String code = source(simpleName, ctor, register, members)
                 .replace("public void init(TapConnectionContext c) {}",
                         "public void init(TapConnectionContext c) throws Throwable { " + init + " }")
                 .replace("public void stop(TapConnectionContext c) {}",

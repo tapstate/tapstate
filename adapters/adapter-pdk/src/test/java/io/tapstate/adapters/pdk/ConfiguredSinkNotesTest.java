@@ -154,6 +154,43 @@ class ConfiguredSinkNotesTest {
     }
 
     @Test
+    void activationThatLosesAuthorityClosesItsOriginalConnectorBeforeRefusing(@TempDir Path directory) throws Exception {
+        Fixture f = new Fixture(directory);
+        AtomicBoolean active = new AtomicBoolean(true);
+        String channel = "configured-sink-activation-" + java.util.UUID.randomUUID();
+        System.getProperties().put(channel, active);
+        try {
+            Path jar = Synthetic.lifecycleSinkThatLosesAuthorityOnActivation(directory, f.trace, channel);
+            var ref = new ConnectorRef(List.of(jar), "synthetic.ActivationLosingSink", "2.0.8", null, null,
+                    "a".repeat(64), false);
+            var port = PdkSinkPort.withRequiredNotes(id -> ref, null, null, PipelineNode.Purpose.SYNC,
+                    f.scopes(active), fence(1));
+            assertThatThrownBy(() -> port.open(CONFIG)).satisfies(ConfiguredSinkNotesTest::unavailable);
+            assertThat(Files.readAllLines(f.trace)).as("the constructed connector is disconnected without calling init")
+                    .containsExactly("stop");
+        } finally { System.getProperties().remove(channel); }
+    }
+
+    @Test
+    void aQueuedWriteRechecksTheDriveBeforeItCallsTheConnector(@TempDir Path directory) throws Exception {
+        Fixture f = new Fixture(directory);
+        AtomicBoolean active = new AtomicBoolean(true);
+        try (SinkWriter writer = f.port(1, active).open(CONFIG)) {
+            java.util.concurrent.CompletableFuture<io.tapstate.spi.sink.WriteResult> queued;
+            synchronized (writer) {
+                queued = writer.write(List.of(Envelope.insert(1, "orders", Map.of("id", 1), null))).toCompletableFuture();
+                active.set(false);
+            }
+            assertThatThrownBy(queued::join).isInstanceOf(java.util.concurrent.CompletionException.class)
+                    .satisfies(error -> unavailable(error.getCause()));
+            assertThat(Files.readAllLines(f.trace)).as("the queued request must not call the target after losing authority")
+                    .containsExactly("init");
+        }
+        assertThat(Files.readAllLines(f.trace)).as("disconnect cleanup still runs for the original connector")
+                .containsExactly("init", "stop");
+    }
+
+    @Test
     void anExpiredDriveIsRefusedBeforeResolvingOrLoadingAConnector(@TempDir Path directory) throws Exception {
         Fixture f = new Fixture(directory);
         AtomicInteger resolved = new AtomicInteger();

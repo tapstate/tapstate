@@ -67,10 +67,11 @@ final class PdkConnector implements AutoCloseable {
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
     private volatile boolean stopped;
     private final Runnable closeNotes;
+    private final Runnable driveGuard;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes) {
+                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard) {
         this.connectorId = connectorId;
         this.loader = loader;
         this.connector = connector;
@@ -80,6 +81,7 @@ final class PdkConnector implements AutoCloseable {
         this.pipelineId = pipelineId;
         this.codecs = codecs;
         this.closeNotes = closeNotes;
+        this.driveGuard = driveGuard;
     }
 
     /**
@@ -150,6 +152,12 @@ final class PdkConnector implements AutoCloseable {
         String pipelineId = node == null ? null : node.pipelineId();
         gateApiLevel(connectorId, ref);
         java.util.concurrent.atomic.AtomicBoolean notesActive = new java.util.concurrent.atomic.AtomicBoolean(true);
+        Runnable driveGuard = noteScopes == null ? () -> {} : () -> {
+            if (!notesActive.get()) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            }
+            noteScopes.requireActive();
+        };
         Map<String, Object> effectiveSettings = settings;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredState = null;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredGlobal = null;
@@ -192,6 +200,7 @@ final class PdkConnector implements AutoCloseable {
         }
         boolean opened = false;
         try {
+            driveGuard.run();
             Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loader, ref.className());
             ClassLoader restore = Thread.currentThread().getContextClassLoader();
             TapConnector connector;
@@ -201,6 +210,7 @@ final class PdkConnector implements AutoCloseable {
             // read through them. A registry constructed inline at the call and dropped registers the
             // connector's answers into nothing.
             TapCodecsRegistry codecs = new TapCodecsRegistry();
+            driveGuard.run();
             try {
                 // Construct under the connector's own loader so any context-loader-based PDK lookup
                 // resolves against the connector's classpath rather than the host.
@@ -250,7 +260,14 @@ final class PdkConnector implements AutoCloseable {
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
                     connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
-                    () -> notesActive.set(false));
+                    () -> notesActive.set(false), driveGuard);
+            try {
+                result.requireActive();
+            } catch (RuntimeException | Error failure) {
+                result.stopQuietly();
+                result.close();
+                throw failure;
+            }
             opened = true;
             return result;
         } finally {
@@ -452,7 +469,16 @@ final class PdkConnector implements AutoCloseable {
      * itself. Both the loader and the attribution are handed back afterwards -- the threads this runs on
      * are shared and outlive the drive.
      */
+    void requireActive() {
+        driveGuard.run();
+    }
+
     <T> T underLoader(Action<T> action) throws Throwable {
+        requireActive();
+        return underLoaderForCleanup(action);
+    }
+
+    private <T> T underLoaderForCleanup(Action<T> action) throws Throwable {
         ClassLoader restore = Thread.currentThread().getContextClassLoader();
         String previousPipeline = pipelineId == null ? null : ConnectorAttribution.claim(pipelineId);
         try {
@@ -470,7 +496,7 @@ final class PdkConnector implements AutoCloseable {
     void stopQuietly() {
         stopped = true;
         try {
-            underLoader(() -> {
+            underLoaderForCleanup(() -> {
                 connector.stop(context);
                 return null;
             });

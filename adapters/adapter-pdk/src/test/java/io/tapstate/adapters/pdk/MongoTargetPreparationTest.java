@@ -165,6 +165,29 @@ class MongoTargetPreparationTest {
         PdkTargetPreparation.requirePrepared(NODE, state, List.of(TARGET), PipelineNode.Purpose.SYNC);
     }
 
+    @Test
+    void losingAuthorityDuringTheCountCannotCreateOrPublishAPreparationReceipt() {
+        List<String> calls = new ArrayList<>();
+        HeapKeyedState state = new HeapKeyedState();
+        java.util.concurrent.atomic.AtomicBoolean active = new java.util.concurrent.atomic.AtomicBoolean(true);
+        ConnectorFunctions functions = functions(calls);
+        functions.supportCountByPartitionFilterFunction((context, table, filter) -> {
+            calls.add("count");
+            active.set(false);
+            return 0L;
+        });
+        var preparation = new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.FAIL, true, NODE, state,
+                false, PipelineNode.Purpose.SYNC, () -> {
+                    if (!active.get()) throw new io.tapstate.core.common.TapstateException(
+                            io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+                });
+        assertThatThrownBy(() -> preparation.prepare(TARGET, TargetTapTable.build(TARGET)))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE));
+        assertThat(calls).containsExactly("count");
+        assertThat(state.count(SinkPreparationNamespace.of(NODE))).isZero();
+    }
+
     private static PdkTargetPreparation preparation(String id, ConnectorFunctions functions, OnFullLoad policy,
             boolean fullLoad, HeapKeyedState state) {
         return new PdkTargetPreparation(id, null, functions, policy, fullLoad, NODE, state);

@@ -167,7 +167,7 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
                         connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
-                        config.node(), stateStore, false, purpose);
+                        config.node(), stateStore, false, purpose, connector::requireActive);
                 for (TargetTable target : targets.values()) {
                     TapTable table = TargetTapTable.build(target);
                     connector.resolveTargetTypes(table);

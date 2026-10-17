@@ -111,7 +111,7 @@ final class PdkSinkWriter implements SinkWriter {
             io.tapstate.core.model.PipelineNode.Purpose purpose) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
-                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose), letGo);
+                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose, connector::requireActive), letGo);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
@@ -214,6 +214,7 @@ final class PdkSinkWriter implements SinkWriter {
                         rows.forEach(row -> row.setTableId(target.name()));
                     }
                     // A connector may report the batch in several flushes, one callback each; accumulate.
+                    connector.requireActive();
                     write.writeRecord(connector.context(), rows, table,
                             result -> accepted[0] += accepted(result));
                 }

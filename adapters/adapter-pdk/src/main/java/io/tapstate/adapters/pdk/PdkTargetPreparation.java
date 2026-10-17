@@ -39,6 +39,7 @@ final class PdkTargetPreparation {
     private final KeyedStateStore stateStore;
     private final boolean preparedAhead;
     private final boolean mongoTarget;
+    private final Runnable requireActive;
     private final Set<String> prepared = new HashSet<>();
 
     PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
@@ -71,6 +72,13 @@ final class PdkTargetPreparation {
     PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
             OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
             boolean preparedAhead, PipelineNode.Purpose purpose) {
+        this(connectorId, context, functions, onFullLoad, fullLoad, node, stateStore, preparedAhead, purpose, () -> {});
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
+            boolean preparedAhead, PipelineNode.Purpose purpose, Runnable requireActive) {
+        this.requireActive = java.util.Objects.requireNonNull(requireActive, "requireActive");
         this.context = context;
         this.functions = functions;
         this.onFullLoad = onFullLoad;
@@ -82,6 +90,7 @@ final class PdkTargetPreparation {
     }
 
     void prepare(TargetTable target, TapTable table) throws Throwable {
+        requireActive.run();
         if (target == null || prepared.contains(target.name())) {
             return;
         }
@@ -108,6 +117,7 @@ final class PdkTargetPreparation {
             if (namespace != null && stateStore != null) {
                 // Before any row can land, and only after a successful clear/check. Rerun teardown owns
                 // removing this receipt; a member restart must keep it even when no source ack survived.
+                requireActive.run();
                 stateStore.save(namespace, target.name(), new byte[] {(byte) (created ? 2 : 1)});
             }
         }
@@ -115,6 +125,7 @@ final class PdkTargetPreparation {
             var event = TargetTapTable.createIndexEvent(target, primaryKeyAlreadyCreated);
             if (event != null) {
                 event.setTableId(table.getId());
+                requireActive.run();
                 functions.getCreateIndexFunction().createIndex(context, table, event);
             }
         }
@@ -152,6 +163,7 @@ final class PdkTargetPreparation {
         }
         TapCreateTableEvent event = new TapCreateTableEvent().table(table);
         event.setTableId(table.getId());
+        requireActive.run();
         var options = functions.getCreateTableV2Function().createTable(context, event);
         if (options == null || options.getTableExists() == null) {
             throw new IllegalStateException("create-table did not report existence for target table " + table.getId());
@@ -173,6 +185,7 @@ final class PdkTargetPreparation {
                 }
                 TapClearTableEvent event = new TapClearTableEvent();
                 event.setTableId(table.getId());
+                requireActive.run();
                 functions.getClearTableFunction().clearTable(context, event);
             }
             case FAIL -> {
@@ -180,6 +193,7 @@ final class PdkTargetPreparation {
                     throw new IllegalStateException("target table " + table.getId()
                             + " cannot honor on_full_load fail: connector provides no row-count function");
                 }
+                requireActive.run();
                 long rows = functions.getCountByPartitionFilterFunction()
                         .countByPartitionFilter(context, table, TapAdvanceFilter.create());
                 if (rows < 0) {
@@ -203,6 +217,7 @@ final class PdkTargetPreparation {
         // The connector supplies its configured database by updating the mutable parameters.
         AtomicReference<Throwable> failure = new AtomicReference<>();
         AtomicBoolean completed = new AtomicBoolean();
+        requireActive.run();
         functions.getExecuteCommandFunction().execute(context,
                 TapExecuteCommand.create().command("execute").params(params), result -> {
                     if (result != null) {
