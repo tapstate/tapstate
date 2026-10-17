@@ -773,6 +773,57 @@ class MongoSrsModelStoreIT {
         });
     }
 
+    @Test
+    void aMissingUnreferencedHeadPayloadDoesNotHideEarlierModelsWithProvenRanges() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("first", null)), f.fence());
+            f.models().publish(new SrsModel(key(1), RING, table("second", null), 100), f.fence());
+            var log = modelLog(f); log.store(RING, 1, event(0, 7, f.fence())); log.store(RING, 101, event(1, 7, f.fence()));
+            f.models().publish(new SrsModel(key(2), RING, table("future", null), 200), f.fence());
+            models(f.database()).deleteOne(new Document("_id.modelVersion", 2L));
+            assertThat(f.models().require(key(0)).table().fields().getFirst().name()).isEqualTo("first");
+            assertThat(f.models().require(key(1)).table().fields().getFirst().name()).isEqualTo("second");
+            assertThat(log.load(RING, 1)).contains(event(0, 7, f.fence()));
+            assertThat(log.load(RING, 101)).contains(event(1, 7, f.fence()));
+            log.store(RING, 199, event(1, 7, f.fence()));
+            assertThatThrownBy(() -> log.store(RING, 200, event(1, 7, f.fence()))).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            assertThatThrownBy(() -> log.store(RING, 200, event(2, 7, f.fence()))).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+        });
+    }
+
+    @Test
+    void aClosedContextBoundaryDoesNotRequireTheNextContextsUnreferencedSchemaBody() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("old", null)), f.fence()); var log = modelLog(f); log.store(RING, 1, event(0, 7, f.fence()));
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("epoch", 8L)));
+            var next = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 8, 0);
+            f.models().publish(new SrsModel(next, RING, table("next", null), 2), f.fence());
+            models(f.database()).deleteOne(new Document("_id.captureContext.epoch", 8L));
+            assertThat(log.load(RING, 1)).contains(event(0, 7, f.fence()));
+            assertThat(log.readBatch(RING, 1, 1).records()).containsEntry(1L, event(0, 7, f.fence()));
+            assertThatThrownBy(() -> log.store(RING, 2, event(0, 8, f.fence()))).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {0L, 2L})
+    void anUnreferencedCorruptPayloadCannotBlockAnExactlyBoundEvent(long damagedVersion) {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("first", null)), f.fence());
+            f.models().publish(new SrsModel(key(1), RING, table("second", null), 100), f.fence());
+            var log = modelLog(f); log.store(RING, 101, event(1, 7, f.fence()));
+            f.models().publish(new SrsModel(key(2), RING, table("future", null), 200), f.fence());
+            models(f.database()).updateOne(new Document("_id.modelVersion", damagedVersion),
+                    new Document("$set", new Document("schema", new Document("corrupt", "raw-secret-sentinel"))));
+            assertThat(f.models().require(key(1)).table().fields().getFirst().name()).isEqualTo("second");
+            assertThat(log.load(RING, 101)).contains(event(1, 7, f.fence()));
+            assertThat(log.readBatch(RING, 101, 1).records()).containsEntry(101L, event(1, 7, f.fence()));
+            log.store(RING, 199, event(1, 7, f.fence()));
+            assertThatThrownBy(() -> log.store(RING, 200, event(1, 7, f.fence()))).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            assertThatThrownBy(() -> f.models().require(key(damagedVersion))).satisfies(MongoSrsModelStoreIT::unreadable);
+        });
+    }
+
     private static SrsLogRecord event(long version, long epoch, WorkloadClaimFence fence) {
         return new SrsLogRecord("offset", Op.INSERT, 1, null, Map.of("id", 1), version, fence, epoch);
     }

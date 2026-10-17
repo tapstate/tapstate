@@ -111,7 +111,6 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 return Optional.empty();
             }
             contexts.requireAnchor(session, chain, control);
-            requirePublishedHead(session, control);
             if (stored == null) {
                 if (key.modelVersion() <= control.publishedVersion()) throw unavailable(key);
                 return Optional.empty();
@@ -137,7 +136,10 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (!MongoSrsModelContexts.contextId(model.key()).equals(control.id()) || !model.ringName().equals(control.ring())
                 || model.key().modelVersion() > control.publishedVersion() || model.ddlSequence() < control.firstSequence()
                 || (model.key().modelVersion() == 0 && model.ddlSequence() != control.firstSequence())
-                || model.ddlSequence() > control.publishedSequence()) throw unavailable(model.key());
+                || model.ddlSequence() > control.publishedSequence()
+                || (model.key().modelVersion() < control.publishedVersion() && model.ddlSequence() >= control.publishedSequence())) throw unavailable(model.key());
+        if (model.key().modelVersion() == control.publishedVersion()
+                && (model.ddlSequence() != control.publishedSequence() || !control.publishedHash().equals(document(model).get("contentHash")))) throw unreadable();
     }
     private Document requireChain(ClientSession session, SrsModelKey key) {
         Document chain = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", key.miningChainId())).first();
@@ -173,8 +175,6 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
                 throw missing;
             }
-            var model = decode(retained);
-            if (!model.ringName().equals(ring)) throw unreadable();
         }
     }
 
@@ -203,22 +203,23 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (writing && (!fence.key().resourceId().equals(chain.get("captureId"))
                 || !Long.valueOf(event.epoch()).equals(chain.get("epoch")) || control.nextId() != null)) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
         requirePublished(control, model);
-        requirePublishedHead(session, control);
         Long end = null;
         if (event.schemaVer() < control.publishedVersion()) {
-            Document next = SystemCollections.SRS_MODELS.on(database).find(session,
-                    new Document("_id", key(version(control, event.schemaVer() + 1)))).first();
-            if (next == null) throw unavailable(model.key());
-            SrsModel successor = decode(next); requirePublished(control, successor);
-            if (successor.ddlSequence() <= model.ddlSequence()) throw unreadable();
-            end = successor.ddlSequence();
+            if (event.schemaVer() + 1 == control.publishedVersion()) {
+                end = control.publishedSequence();
+            } else {
+                Document next = SystemCollections.SRS_MODELS.on(database).find(session,
+                        new Document("_id", key(version(control, event.schemaVer() + 1)))).first();
+                if (next == null) throw unavailable(model.key());
+                SrsModel successor = decode(next); requirePublished(control, successor);
+                end = successor.ddlSequence();
+            }
+            if (end <= model.ddlSequence()) throw unreadable();
         }
         if (control.nextId() != null) {
             var next = contexts.require(session, control.nextId());
             if (!next.ring().equals(ring) || !control.nextSequence().equals(next.firstSequence())) throw unreadable();
-            Document initial = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", key(next.key()))).first();
-            if (initial == null) throw unavailable(next.key());
-            SrsModel successor = decode(initial); requirePublished(next, successor);
+            // The independently retained control proves this cut without retaining an unrelated schema body.
             end = end == null ? next.firstSequence() : Math.min(end, next.firstSequence());
         }
         if (writing) {
