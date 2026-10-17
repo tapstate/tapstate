@@ -25,6 +25,8 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -309,6 +311,71 @@ class MongoRequiredNoteStoreIT {
                     "cluster-a", 0)).isInstanceOf(IllegalArgumentException.class);
             assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.database).countDocuments()).isZero();
         });
+    }
+
+    @Test
+    void closingADriveDuringAnInFlightWriteAbortsTheConfigurationTransaction() {
+        withNotes(f -> {
+            var scope = f.notes.initialize(global());
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicBoolean active = new AtomicBoolean(true);
+            var guarded = f.paused(entered, release).guardedBy(() -> {
+                if (!active.get()) throw scopeFailure();
+            });
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var pending = executor.submit(() -> guarded.compareAndSet(scope, "key", 0, bytes("late"), false));
+                try {
+                    assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+                    active.set(false);
+                    release.countDown();
+                    assertThatThrownBy(() -> pending.get(20, TimeUnit.SECONDS))
+                            .hasCauseInstanceOf(TapstateException.class).satisfies(error -> scopeUnavailable(error.getCause()));
+                    assertThat(f.notes.read(scope, "key").revision()).isZero();
+                    assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isZero();
+                } finally {
+                    release.countDown();
+                }
+            }
+        });
+    }
+
+    @Test
+    void aDriverTransactionRetryRechecksTheOriginalExecutionGuard() {
+        withNotes(f -> {
+            var scope = f.notes.initialize(global());
+            AtomicInteger checks = new AtomicInteger();
+            var guarded = f.notes.guardedBy(() -> {
+                if (checks.incrementAndGet() > 1) throw scopeFailure();
+            });
+            f.admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("update")).append("errorCode", 112)
+                            .append("errorLabels", List.of("TransientTransactionError"))));
+            try {
+                assertThatThrownBy(() -> guarded.compareAndSet(scope, "key", 0, bytes("stale-retry"), false))
+                        .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            } finally {
+                f.admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+            assertThat(checks.get()).isEqualTo(2);
+            assertThat(f.notes.read(scope, "key").revision()).isZero();
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isZero();
+        });
+    }
+
+    @Test
+    void addingAGuardCannotRemoveAnEarlierLifecycleCheck() {
+        withNotes(f -> {
+            var scope = f.notes.initialize(global());
+            var closed = f.notes.guardedBy(() -> { throw scopeFailure(); });
+            var additional = closed.guardedBy(() -> {});
+            assertThatThrownBy(() -> additional.read(scope, "key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+        });
+    }
+
+    private static TapstateException scopeFailure() {
+        return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
     }
 
     private static RequiredNoteOwner global() {

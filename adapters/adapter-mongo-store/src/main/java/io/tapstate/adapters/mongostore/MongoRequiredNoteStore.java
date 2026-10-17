@@ -38,6 +38,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     private final MongoCollection<Document> identity;
     private final MongoCollection<Document> operators;
     private final SourceConfigCipherProvider ciphers;
+    private final Runnable requireActive;
 
     public MongoRequiredNoteStore(MongoClient client, MongoDatabase database, SourceConfigCipher cipher) {
         this(client, database, SourceConfigCipherProvider.fixed(Objects.requireNonNull(cipher, "cipher")));
@@ -52,6 +53,26 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         this.identity = durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database));
         this.operators = durable(SystemCollections.OPERATOR_GENERATIONS.on(database));
         this.ciphers = Objects.requireNonNull(ciphers, "ciphers");
+        this.requireActive = () -> {};
+    }
+
+    private MongoRequiredNoteStore(MongoRequiredNoteStore original, Runnable additionalGuard) {
+        this.client = original.client;
+        this.scopes = original.scopes;
+        this.notes = original.notes;
+        this.migrations = original.migrations;
+        this.identity = original.identity;
+        this.operators = original.operators;
+        this.ciphers = original.ciphers;
+        this.requireActive = () -> {
+            original.requireActive.run();
+            additionalGuard.run();
+        };
+    }
+
+    @Override
+    public RequiredNoteStore guardedBy(Runnable additionalGuard) {
+        return new MongoRequiredNoteStore(this, Objects.requireNonNull(additionalGuard, "additionalGuard"));
     }
 
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {
@@ -176,13 +197,20 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         // The exact captured upper bound remains safe if another clear commits after verification.
         Document low = notePrefix(scope.owner(), Long.MIN_VALUE).append("key", new MinKey());
         Document high = notePrefix(scope.owner(), scope.generation()).append("key", new MinKey());
-        return StoreIo.call(() -> notes.deleteMany(new Document("_id",
-                new Document("$gte", low).append("$lt", high))).getDeletedCount());
+        return StoreIo.call(() -> {
+            requireActive.run();
+            return notes.deleteMany(new Document("_id", new Document("$gte", low).append("$lt", high))).getDeletedCount();
+        });
     }
 
     private <T> T transaction(Function<ClientSession, T> body) {
         try (ClientSession session = client.startSession()) {
-            return session.withTransaction(() -> body.apply(session), TRANSACTION);
+            return session.withTransaction(() -> {
+                requireActive.run();
+                T result = body.apply(session);
+                requireActive.run();
+                return result;
+            }, TRANSACTION);
         }
     }
 

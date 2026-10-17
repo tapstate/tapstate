@@ -2,6 +2,9 @@ package io.tapstate.spi.store;
 
 /** Necessary PDK notes, namespace generations and carry barriers in one configuration transaction domain. */
 public interface RequiredNoteStore {
+    /** Binds an existing local execution/lifecycle check, rechecked inside every transaction attempt. */
+    RequiredNoteStore guardedBy(Runnable requireActive);
+
     /** Explicit new-scope preparation; ordinary opens must never use it to repair missing facts. */
     RequiredNoteScope initialize(RequiredNoteOwner owner);
 
