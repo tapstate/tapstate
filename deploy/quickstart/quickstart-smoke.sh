@@ -342,12 +342,23 @@ fi
 # and teardown is printed. A recording ./tapstate replaces the stub after prepare; a fake docker reports
 # the server healthy so the wait ends. curl stays real, so the gate's install.sh fetch still works.
 run_phase_fakes() {
-  run_prepare Linux x86_64 glibc            # prepare a dir (installs the stub CLI)
+  run_prepare Linux x86_64 glibc "${RUN_REUSE:-}"   # prepare a dir (installs the stub CLI); RUN_REUSE re-runs one
   RUN="$DEMO"
   RUN_PW="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RUN/.env")"
   cat > "$RUN/tapstate" <<'CLI'
 #!/bin/sh
 printf '%s\n' "$*" >> .cli-argv
+# The agent-token mint and the saved-token check are one-shot commands with nothing on stdin, so they are
+# answered before the session recorder below reads it. The mint records which password it was handed
+# through the environment; FAKE_AGENT_TOKEN empty is a server that issued nothing.
+case " $* " in
+  *" token create "*)
+    printf 'pw=%s\n' "${TAPSTATE_PASSWORD:-}" >> .token-env
+    [ -n "${FAKE_AGENT_TOKEN:-}" ] \
+      && printf '{\n  "tokenId" : "tok-1",\n  "scope" : "WRITE",\n  "token" : "%s"\n}\n' "$FAKE_AGENT_TOKEN"
+    exit 0 ;;
+  *" ls ") [ "${FAKE_TOKEN_ACCEPTED:-no}" = yes ]; exit $? ;;
+esac
 cat >> .cli-stdin
 # A REPL prints its verbs' errors and still exits 0 -- an interactive session does not end because one
 # command was rejected. FAKE_CLI_OUT lets a case reproduce that shape: output that says it failed, over
@@ -360,6 +371,14 @@ CLI
   # the $1 is the fake uname's own argument -- it must stay literal.
   # shellcheck disable=SC2016
   printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo unknown ;; esac\n' > "$shim/uname"
+  # A java whose major version the case chooses, so which way the agent configuration goes does not
+  # depend on whatever runtime the machine running this suite happens to have.
+  mkdir -p "$shim/jdk/bin"
+  cat > "$shim/java" <<JAVA
+#!/bin/sh
+printf '    java.home = $shim/jdk\n    java.specification.version = ${FAKE_JAVA_MAJOR:-17}\n' >&2
+JAVA
+  cp "$shim/java" "$shim/jdk/bin/java"; chmod +x "$shim/jdk/bin/java"
   cat > "$shim/docker" <<'DOCK'
 #!/bin/sh
 # `compose ps ... server` -> report healthy so the wait loop ends; `compose ps -a ... bootstrap` -> report
@@ -380,7 +399,14 @@ bs="${FAKE_BOOTSTRAP_PS:-}"
 # `logs` is answered before the container is looked at, because the bootstrap log query names the
 # container too -- deciding on the container alone would hand a ps line back to a log query.
 case " $* " in *" logs "*) echo "${FAKE_BOOTSTRAP_LOG:-bootstrap: first admin created}"; exit 0 ;; esac
+# The image check before `up`: the images the compose file names, and whether each one is here already.
+# Empty FAKE_IMAGES is a compose too old to list them. Each pull is recorded, so a case can tell whether
+# one happened.
+case " $* " in *" config --images "*) [ -z "${FAKE_IMAGES:-}" ] || echo "$FAKE_IMAGES"; exit 0 ;; esac
+case " $* " in *" image inspect "*) [ "${FAKE_IMAGE_PRESENT:-yes}" = yes ]; exit $? ;; esac
+case " $* " in *" compose pull "*) echo pulled >> .docker-pulls; exit 0 ;; esac
 case " $* " in *" bootstrap "*) echo "$bs"; exit 0 ;; esac
+case "$*" in *"{{.Name}}"*) echo "${FAKE_SERVER_NAME:-tapstate-demo-server-1}"; exit 0 ;; esac
 # The count is answered per collection rather than once for all of them. That is what lets a case drive
 # "the first engine arrived and the second did not" - the shape a demo wired to only one of its two
 # sources actually produces, and the one a check on a single total cannot tell apart from success.
@@ -396,13 +422,16 @@ for a in "$@"; do
 done
 exit 0
 DOCK
-  chmod +x "$shim/uname" "$shim/docker"
+  chmod +x "$shim/uname" "$shim/docker" "$shim/java"
   RUN_OUT="$(cd "${RUN_CWD:-$RUN}" && PATH="$shim:$PATH" \
     TAPSTATE_VERSION="$VERSION" TAPSTATE_BASE_URL="file://$CLI_STUB" \
     TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
     FAKE_TARGET_ROWS="${1:-5}" FAKE_SHIPMENT_ROWS="${2:-6}" \
     FAKE_BOOTSTRAP_PS="${FAKE_BOOTSTRAP_PS:-}" FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
     FAKE_BOOTSTRAP_LOG="${FAKE_BOOTSTRAP_LOG:-}" \
+    FAKE_AGENT_TOKEN="${FAKE_AGENT_TOKEN-tsk_fake_agent_token}" FAKE_TOKEN_ACCEPTED="${FAKE_TOKEN_ACCEPTED:-no}" \
+    FAKE_JAVA_MAJOR="${FAKE_JAVA_MAJOR:-17}" JAVA_HOME='' \
+    FAKE_IMAGES="${FAKE_IMAGES:-}" FAKE_IMAGE_PRESENT="${FAKE_IMAGE_PRESENT:-yes}" \
     TAPSTATE_QUICKSTART_POLL_SECONDS=0 \
     sh "$RUN/quickstart.sh" 2>&1)"; RUN_RC=$?
   rm -rf "$shim"
@@ -461,23 +490,36 @@ check_apply_order() {   # $1 = source id
 }
 check_apply_order orders_db
 check_apply_order fulfillment_db
-if printf '%s' "$RUN_OUT" | grep -q 'down -v' && printf '%s' "$RUN_OUT" | grep -qi 'images remain'; then
-  ok "prints teardown on completion (down -v, images noted)"
+# The reference a reader needs after the first screen -- stopping, deleting, reaching the store -- is in
+# NEXT.md beside the stack, and the closing message names that file.
+NEXT="$RUN/NEXT.md"
+CDC="$RUN/try-cdc.sh"
+FIRST_RUN="$RUN"
+if grep -q 'down -v' "$NEXT" 2>/dev/null && grep -qi 'images remain' "$NEXT" \
+   && printf '%s' "$RUN_OUT" | grep -q 'NEXT.md in this folder'; then
+  ok "writes the teardown to NEXT.md (down -v, images noted) and points at it"
 else
-  bad "no teardown printed: $RUN_OUT"
+  bad "no teardown in NEXT.md: $(cat "$NEXT" 2>/dev/null) / $RUN_OUT"
 fi
 # Run in place -- a saved script executed where it sits -- the directory is the user's and holds their
 # files. Offering `rm -rf` on it is a command that destroys unrelated work, printed to someone who has
 # just been told everything above was safe to copy. This run is exactly that shape.
-if ! printf '%s' "$RUN_OUT" | grep -q 'rm -rf'; then
+if ! printf '%s' "$RUN_OUT" | grep -q 'rm -rf' && ! grep -q 'rm -rf' "$NEXT"; then
   ok "a directory the quickstart did not create is never offered for removal"
 else
-  bad "offered to rm -rf a directory it does not own: $(printf '%s' "$RUN_OUT" | grep 'rm -rf')"
+  bad "offered to rm -rf a directory it does not own: $(grep 'rm -rf' "$NEXT")"
 fi
-if printf '%s' "$RUN_OUT" | grep -q 'this directory is yours'; then
+if grep -q 'This folder is yours' "$NEXT"; then
   ok "and says so, rather than leaving the teardown looking incomplete"
 else
-  bad "silently omitted the removal line instead of saying why: $RUN_OUT"
+  bad "silently omitted the removal line instead of saying why: $(cat "$NEXT")"
+fi
+# Run in place, the reader's shell is already in the demo directory, so there is nowhere to send it.
+if ! printf '%s' "$RUN_OUT" | grep -q 'Go there first' \
+   && printf '%s' "$RUN_OUT" | grep -q 'Every command below runs from this folder'; then
+  ok "a run in place does not send the reader to a directory they are already in"
+else
+  bad "a run in place told the reader to change directory: $(printf '%s' "$RUN_OUT" | sed -n '/^quickstart: done/,/^Three ways/p')"
 fi
 
 # The other half, or the pair proves nothing: a script that never offers removal would pass both
@@ -486,10 +528,35 @@ fi
 saved_out="$RUN_OUT"; saved_rc="$RUN_RC"
 OWNED="$(mktemp -d)"
 RUN_CWD="$OWNED" run_phase_fakes
-if printf '%s' "$RUN_OUT" | grep -q 'rm -rf tapstate-demo'; then
-  ok "a directory the quickstart created is offered for removal by name"
+if grep -qx "rm -rf $OWNED/tapstate-demo" "$OWNED/tapstate-demo/NEXT.md" 2>/dev/null; then
+  ok "a directory the quickstart created is offered for removal by its full path"
 else
-  bad "own directory not offered for removal: $RUN_OUT"
+  bad "own directory not offered for removal: $(cat "$OWNED/tapstate-demo/NEXT.md" 2>/dev/null)"
+fi
+# A piped run makes that directory and works in it, while the reader's shell stays in the parent -- a
+# script cannot move the shell that started it. So the closing message says so before any command, with
+# the cd to run first, and NEXT.md opens with the same cd.
+cd_at="$(printf '%s\n' "$RUN_OUT" | grep -nx "  cd $OWNED/tapstate-demo" | head -1 | cut -d: -f1)"
+ways_at="$(printf '%s\n' "$RUN_OUT" | grep -n '^Three ways to use it' | cut -d: -f1)"
+if [ -n "$cd_at" ] && [ -n "$ways_at" ] && [ "$cd_at" -lt "$ways_at" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'Go there first' \
+   && grep -qx "cd $OWNED/tapstate-demo" "$OWNED/tapstate-demo/NEXT.md" \
+   && grep -q '^docker compose down -v' "$OWNED/tapstate-demo/NEXT.md"; then
+  ok "after a piped run, the reader is told to cd into the demo before any command"
+else
+  bad "the demo directory is not named before its commands: $(printf '%s' "$RUN_OUT" | sed -n '/^quickstart: done/,/^Three ways/p')"
+fi
+# ...and so does a failure hint, which is the moment a reader is least likely to know where they are.
+# The re-run lands back in the directory the first one made, so the recording CLI is put there.
+rm -f "$OWNED/tapstate-demo/tapstate" && cp "$RUN/tapstate" "$OWNED/tapstate-demo/tapstate"
+FAKE_CLI_OUT='error: control.auth-failed' \
+  FAKE_BOOTSTRAP_LOG='bootstrap: an admin already exists, nothing to do' RUN_CWD="$OWNED" run_phase_fakes
+unset FAKE_CLI_OUT FAKE_BOOTSTRAP_LOG
+if [ "$RUN_RC" -ne 0 ] \
+   && printf '%s' "$RUN_OUT" | grep -q "Start clean with: cd $OWNED/tapstate-demo && docker compose down -v && "; then
+  ok "a failure hint after a piped run says which directory to run it in"
+else
+  bad "the failure hint does not name the demo directory (rc=$RUN_RC): $RUN_OUT"
 fi
 if [ -d "$OWNED/tapstate-demo" ]; then
   ok "and that directory is the one it made, not the caller's"
@@ -501,89 +568,86 @@ RUN_OUT="$saved_out"; RUN_RC="$saved_rc"
 # Telling someone to publish the port is the half of the advice that does not work on its own: the
 # set registers its member under a container-internal name, so a driver that discovers the topology
 # dials the host's own loopback and is refused. The note has to carry directConnection with it.
-if printf '%s' "$RUN_OUT" | grep -q 'ports: \["127.0.0.1:27017:27017"\]' \
-   && printf '%s' "$RUN_OUT" | grep -q 'directConnection=true' \
-   && printf '%s' "$RUN_OUT" | grep -qi 'replicaSet=rs0'; then
+if grep -q 'ports: \["127.0.0.1:27017:27017"\]' "$NEXT" \
+   && grep -q 'directConnection=true' "$NEXT" \
+   && grep -qi 'replicaSet=rs0' "$NEXT"; then
   ok "says how to reach the store from the host, and why directConnection is required"
 else
-  bad "host access to the store is undocumented or incomplete: $RUN_OUT"
+  bad "host access to the store is undocumented or incomplete: $(cat "$NEXT")"
 fi
 # Stopping and destroying are different intentions and the demo has to offer both. Until it did, the
 # only documented way out deleted the data, so a user who just wanted their laptop back had to guess
 # -- and guessing wrong on this one is unrecoverable.
-if printf '%s' "$RUN_OUT" | grep -q 'docker compose stop' \
-   && printf '%s' "$RUN_OUT" | grep -qi 'keep its data'; then
+if grep 'docker compose stop' "$NEXT" | grep -qi 'keep its data'; then
   ok "offers a non-destructive stop, and says the data survives it"
 else
-  bad "no non-destructive stop offered: $RUN_OUT"
+  bad "no non-destructive stop offered: $(cat "$NEXT")"
 fi
 # The warning has to sit on the destructive line itself. Asserting that the word appears somewhere in
-# the output is satisfied by the CDC walkthrough's DELETE statement, several screens further up.
-if printf '%s' "$RUN_OUT" | grep 'down -v' | grep -qi 'delet'; then
+# the file is satisfied by the walkthrough's description of removing a shipment.
+if grep 'down -v' "$NEXT" | grep -v '^Deleting' | grep -qi 'delete its data'; then
   ok "the destructive teardown says on its own line that it deletes data"
 else
-  bad "the down -v line does not say what it destroys: $(printf '%s' "$RUN_OUT" | grep 'down -v')"
+  bad "the down -v line does not say what it destroys: $(grep 'down -v' "$NEXT")"
 fi
 # The snapshot payoff is a real row count, printed with no user action, and it names both engines (the
 # fake docker returns 5 orders and 6 shipments). Naming them is the point: one number for the pair
 # would leave the reader unable to tell which engine produced it, and the demo's whole claim is that
 # two of them did.
 if printf '%s' "$RUN_OUT" | grep -q '5 orders from MySQL' \
-   && printf '%s' "$RUN_OUT" | grep -q '6 of them, in one object per order'; then
+   && printf '%s' "$RUN_OUT" | grep -q 'shipments from PostgreSQL (6 in all), one MongoDB document per order'; then
   ok "prints what was assembled automatically (no user action), naming both engines"
 else
   bad "assembly counts not printed: $RUN_OUT"
 fi
-# The CDC section walks all three operations -- consistent with a pipeline that no longer drops deletes.
-# They are spread across the two engines on purpose now: the parent moves in MySQL, the array elements
-# arrive and leave from PostgreSQL, and that spread is the demonstration. A walk that stayed on one
-# engine would show three operations and none of the thing this demo is about.
-if printf '%s' "$RUN_OUT" | grep -q 'INSERT INTO orders' \
-   && printf '%s' "$RUN_OUT" | grep -q 'UPDATE orders' \
-   && printf '%s' "$RUN_OUT" | grep -q 'DELETE FROM shipments'; then
-  ok "the CDC section demonstrates insert, update and delete"
+# The change-data-capture walkthrough is a script beside the stack, try-cdc.sh, that the closing
+# message points at. It walks all three operations, spread across the two engines on purpose: the parent
+# moves in MySQL, the array elements arrive and leave from PostgreSQL, and that spread is the
+# demonstration. A walk that stayed on one engine would show three operations and none of the thing this
+# demo is about.
+if [ -x "$CDC" ] && sh -n "$CDC" \
+   && grep -q 'INSERT INTO orders' "$CDC" && grep -q 'UPDATE orders' "$CDC" \
+   && grep -q 'DELETE FROM shipments' "$CDC" \
+   && printf '%s' "$RUN_OUT" | grep -q 'Run ./try-cdc.sh'; then
+  ok "try-cdc.sh demonstrates insert, update and delete, and the closing message points at it"
 else
-  bad "CDC section does not walk insert/update/delete: $RUN_OUT"
+  bad "try-cdc.sh is missing or does not walk insert/update/delete: $(cat "$CDC" 2>/dev/null)"
 fi
-# And it shows a change made in the second engine reaching the object the first engine roots. This is
-# the whole reason the second engine is wired in, and the read it is verified by has to be the array
-# inside that object -- a walk that inserted into PostgreSQL and then read a collection of its own
-# would demonstrate two syncs, which is what this demo stopped being.
-if printf '%s' "$RUN_OUT" | grep -q 'INSERT INTO shipments' \
-   && printf '%s' "$RUN_OUT" | grep -q 'order_state.findOne({id:1})?.shipments?.length'; then
+# And it shows a change made in the second engine reaching the object the first engine roots, read as
+# the array inside that object -- a walk that inserted into PostgreSQL and then read a collection of its
+# own would demonstrate two syncs, which is what this demo stopped being.
+if grep -q 'INSERT INTO shipments' "$CDC" && grep -q 'findOne({id: 1})?.shipments?.length' "$CDC"; then
   ok "a change in the second engine is shown reaching the first engine's object"
 else
-  bad "no second-engine change demonstrated inside the assembled object: $RUN_OUT"
+  bad "no second-engine change demonstrated inside the assembled object: $(cat "$CDC")"
 fi
-# Every wait printed for the user to paste is bounded. An unbounded `until` returns in a second when
-# the change arrives and hangs forever, in silence, when it does not -- and a recording of this demo
-# structurally cannot show that, because on the recording machine it always returns. Counted rather
-# than spot-checked: one unbounded loop among four is the whole defect.
-unbounded="$(printf '%s' "$RUN_OUT" | grep -c 'until docker compose exec.*; do sleep 1; done' || true)"
-loops="$(printf '%s' "$RUN_OUT" | grep -c '^  i=0; until docker compose exec' || true)"
-if [ "$unbounded" = 0 ] && [ "$loops" -ge 1 ]; then
-  ok "every wait a reader is told to paste is bounded ($loops of them), none can hang"
+
+# What it does, run against a fake docker. A change that arrives lets it walk all four steps and exit 0;
+# one that never arrives must end, say what it saw and where to look, and exit non-zero -- an unbounded
+# wait returns in a second when the change arrives and hangs forever, in silence, when it does not, and
+# on the machine recording a demo it always arrives. The bound is cut to two seconds here, the way the
+# fetch stall bound is, rather than given a knob on the shipped script.
+cdc_shim="$(mktemp -d)"
+# shellcheck disable=SC2016  # the fake's own $* must stay literal
+printf '#!/bin/sh\necho "$*" >> "%s/calls"\ncase "$*" in *"quit("*) [ "${FAKE_ARRIVES:-yes}" = yes ] ;; *) echo "{ id: 1 }" ;; esac\n' "$cdc_shim" > "$cdc_shim/docker"
+chmod +x "$cdc_shim/docker"
+sed 's/^wait_secs=60$/wait_secs=2/' "$CDC" > "$FIRST_RUN/try-cdc-fast.sh"
+cdc_out="$(cd /tmp && PATH="$cdc_shim:$PATH" FAKE_ARRIVES=yes sh "$FIRST_RUN/try-cdc-fast.sh" 2>&1)"; cdc_rc=$?
+if [ "$cdc_rc" -eq 0 ] && printf '%s' "$cdc_out" | grep -q '^4/4' \
+   && grep -q 'compose exec -T postgres psql' "$cdc_shim/calls" && grep -q 'compose exec -T -e MYSQL_PWD=secret mysql' "$cdc_shim/calls"; then
+  ok "try-cdc.sh walks all four changes when each one arrives, from any directory"
 else
-  bad "$unbounded unbounded wait(s) printed, $loops bounded: $(printf '%s' "$RUN_OUT" | grep 'until docker compose')"
+  bad "try-cdc.sh did not complete against changes that arrive (rc=$cdc_rc): $cdc_out"
 fi
-# A bound that gives up silently is the same trap wearing a timer. Each one has to say what it saw, so
-# a reader can tell "nothing is arriving" from "this machine is slow", and where to look next.
-if printf '%s' "$RUN_OUT" | grep -q 'docker compose logs --tail 50 server'; then
-  ok "a wait that runs out says what it observed and where to look"
+cdc_out="$(PATH="$cdc_shim:$PATH" FAKE_ARRIVES=no sh "$FIRST_RUN/try-cdc-fast.sh" 2>&1)"; cdc_rc=$?
+if [ "$cdc_rc" -ne 0 ] && printf '%s' "$cdc_out" | grep -q 'not there after 2s' \
+   && printf '%s' "$cdc_out" | grep -q 'docker compose logs --tail 50 server'; then
+  ok "a change that never arrives ends the wait, says what it saw and where to look, and exits non-zero"
 else
-  bad "a wait can run out with nothing actionable printed: $RUN_OUT"
+  bad "try-cdc.sh did not give up on a change that never arrives (rc=$cdc_rc): $cdc_out"
 fi
-# ...and it has to answer non-zero, or the same lines pasted into a script pass having waited out a
-# change that never came. `false` rather than `exit`: the reader may be standing in that shell, and
-# `exit` would close it. Counted against the loops so a bound left without one is not summed away.
-# The $i here is the reader's shell variable in the printed text, not this script's -- single quotes.
-# shellcheck disable=SC2016
-gaveup="$(printf '%s' "$RUN_OUT" | grep -c 'done; \[ "$i" -lt 60 \] || false' || true)"
-if [ "$gaveup" = "$loops" ] && [ "$loops" -ge 1 ]; then
-  ok "every bounded wait answers non-zero when it gives up ($gaveup of $loops)"
-else
-  bad "$gaveup of $loops bounded waits answer non-zero when they give up"
-fi
+rm -rf "$cdc_shim" "$FIRST_RUN/try-cdc-fast.sh"
+
 # The demo names the collection a reader should find, beside the command that lists it. The whole
 # "no second client, no URI to configure" claim is about what they find when they look, so the name
 # has to be in front of them rather than left to be recognised in a listing.
@@ -593,11 +657,10 @@ fi
 # because it lists what every declared source holds. One collection in the *store* is the claim; the
 # earlier wording made it sound like one line of output, and this assertion held that wording in
 # place until somebody ran it by hand.
-if printf '%s' "$RUN_OUT" | grep -q 'show collections' \
-   && printf '%s' "$RUN_OUT" | grep -q 'views.order_state'; then
+if grep -q 'show collections' "$NEXT" && grep -q 'views.order_state' "$NEXT"; then
   ok "the demo points at exactly one collection, named"
 else
-  bad "the demo does not name the single collection a reader should find: $RUN_OUT"
+  bad "the demo does not name the single collection a reader should find: $(cat "$NEXT")"
 fi
 
 # --- the first admin exists before anyone tries to log in ---------------------------------------------
@@ -697,7 +760,7 @@ fi
 FAKE_CLI_OUT='request failed: 127.0.0.1:8080 is unreachable' run_phase_fakes
 unset FAKE_CLI_OUT
 if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
-   && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+   && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two databases to be combined'; then
   ok "an unreachable server stops setup before the row-count wait"
 else
   bad "a request failure reached the row count (rc=$RUN_RC): $RUN_OUT"
@@ -708,7 +771,7 @@ fi
 FAKE_CLI_OUT="error: lifecycle.illegal-transition
   Cannot start a pipeline in state RUNNING." run_phase_fakes
 unset FAKE_CLI_OUT
-if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q 'waiting for the two databases to be combined'; then
   ok "an already-running pipeline permits a quickstart re-run"
 else
   bad "an already-running pipeline rejected the re-run (rc=$RUN_RC): $RUN_OUT"
@@ -722,12 +785,181 @@ for refusal in 'error: connector.not-registered' \
 $refusal" run_phase_fakes
   unset FAKE_CLI_OUT
   if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
-     && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+     && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two databases to be combined'; then
     ok "an already-running refusal does not hide $refusal"
   else
     bad "another failure was hidden by the re-run exception (rc=$RUN_RC): $RUN_OUT"
   fi
 done
+
+# --- the three ways in: browser, agent, CLI ------------------------------------------------------------
+# The closing message offers the browser first, the agent second and the CLI third. The order is the
+# product's: the browser needs nothing installed, so it is the option a first reader should meet first.
+run_phase_fakes
+browser_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'In the browser' | cut -d: -f1)"
+agent_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'With an AI agent' | cut -d: -f1)"
+cli_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'From the CLI' | cut -d: -f1)"
+if [ -n "$browser_at" ] && [ -n "$agent_at" ] && [ -n "$cli_at" ] \
+   && [ "$browser_at" -lt "$agent_at" ] && [ "$agent_at" -lt "$cli_at" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'Open http://127.0.0.1:8080 and sign in as admin'; then
+  ok "the closing message offers the browser, then an agent, then the CLI"
+else
+  bad "the three ways in are missing or out of order (browser $browser_at, agent $agent_at, cli $cli_at): $RUN_OUT"
+fi
+
+# The agent configuration carries a write credential, so it is written for this user alone and the
+# token itself never reaches the terminal -- a recorded or pasted demo would otherwise publish it. The
+# mint is handed the admin password through the environment, never as an argument.
+config="$RUN/tapstate-mcp.json"
+mode="$(stat -c %a "$config" 2>/dev/null || stat -f %Lp "$config" 2>/dev/null)"
+if [ "$RUN_RC" -eq 0 ] && [ "$mode" = 600 ] && grep -q '"TAPSTATE_TOKEN": "tsk_fake_agent_token"' "$config" \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'tsk_fake_agent_token' \
+   && grep -q "token create --scope write" "$RUN/.cli-argv" \
+   && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fqx "pw=$RUN_PW" "$RUN/.token-env"; then
+  ok "the agent token is written to an owner-only file and never printed"
+else
+  bad "agent token handling (rc=$RUN_RC, mode=$mode): $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null) / $RUN_OUT"
+fi
+
+# A native sidecar beside the CLI needs no Java at all, so the configuration is plain `tapstate mcp`. The
+# stub bundle ships one, which is the shape a release with a native sidecar has.
+if grep -q "\"command\": \"$RUN/tapstate\"" "$config" && ! grep -q JAVA_HOME "$config"; then
+  ok "a native sidecar is run through the CLI with no Java runtime named"
+else
+  bad "the native sidecar configuration is wrong: $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# Without a Java 21 and without a native sidecar, the sidecar runs on the server image's Java inside the
+# server container's network namespace -- the one place the server is loopback, which is all the
+# sidecar will speak plain HTTP to. The token goes in by name, so it is not on docker's command line.
+libexec="$RUN/versions/$VERSION/libexec"
+rm -f "$libexec/tapstate-mcp" && : > "$libexec/tapstate-mcp.jar"
+RUN_REUSE="$RUN" run_phase_fakes
+if grep -q '"--network", "container:tapstate-demo-server-1"' "$config" \
+   && grep -q '"-e", "TAPSTATE_TOKEN"' "$config" \
+   && grep -q '"--server", "http://127.0.0.1:8080"' "$config" \
+   && grep -q "ghcr.io/tapstate/tapstate:$VERSION" "$config" \
+   && ! grep -q JAVA_HOME "$config"; then
+  ok "with no Java 21 the sidecar runs in the server image, beside the server"
+else
+  bad "the Docker sidecar configuration is wrong: $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# With a Java 21 the configuration is the CLI's own `tapstate mcp`, and JAVA_HOME is pinned in it: an
+# agent started from a desktop app does not inherit this shell's PATH and would not find the runtime.
+rm -f "$config"
+FAKE_JAVA_MAJOR=21 RUN_REUSE="$RUN" run_phase_fakes
+if grep -q "\"command\": \"$RUN/tapstate\"" "$config" \
+   && grep -q '"mcp", "--server", "http://127.0.0.1:8080", "--allow-write"' "$config" \
+   && grep -q '"JAVA_HOME": "/.*/jdk"' "$config"; then
+  ok "with a Java 21 the agent runs the CLI's own sidecar, with that runtime pinned"
+else
+  bad "the local sidecar configuration is wrong: $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# A re-run keeps a token the server still accepts, and replaces one it does not -- the store was wiped
+# with down -v -- rather than leaving the agent with a credential that fails on its first call.
+FAKE_AGENT_TOKEN=tsk_second FAKE_TOKEN_ACCEPTED=yes RUN_REUSE="$RUN" run_phase_fakes
+kept="$(grep -c '"TAPSTATE_TOKEN": "tsk_fake_agent_token"' "$config" || true)"
+FAKE_AGENT_TOKEN=tsk_second FAKE_TOKEN_ACCEPTED=no RUN_REUSE="$RUN" run_phase_fakes
+if [ "$kept" = 1 ] && grep -q '"TAPSTATE_TOKEN": "tsk_second"' "$config"; then
+  ok "a re-run keeps an accepted agent token and replaces a rejected one"
+else
+  bad "agent token re-run handling (kept=$kept): $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# The agent path is extra. A server that issues no token still ends in the demo's success, with the
+# browser and CLI paths intact, and says why the agent is not set up instead of naming a missing file.
+FAKE_AGENT_TOKEN='' run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && [ ! -f "$RUN/tapstate-mcp.json" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'Not set up: no agent token could be created' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'claude --mcp-config' \
+   && printf '%s' "$RUN_OUT" | grep -q 'From the CLI'; then
+  ok "a failed agent setup is reported and does not fail the demo"
+else
+  bad "a failed agent setup (rc=$RUN_RC): $RUN_OUT"
+fi
+# ...and with no configuration there is no walkthrough of one.
+if [ ! -f "$RUN/AGENT-SETUP.md" ]; then
+  ok "no agent walkthrough is written over a configuration that was not"
+else
+  bad "AGENT-SETUP.md was written although the agent was not set up"
+fi
+
+# With the agent set up, the walkthrough sits beside its configuration: the skills step first and why,
+# how to connect Claude Code and other clients, and how to revoke the token -- never the token itself.
+run_phase_fakes
+guide="$RUN/AGENT-SETUP.md"
+skills_at="$(grep -n 'npx --yes skills add tapstate/tapstate-skills' "$guide" 2>/dev/null | head -1 | cut -d: -f1)"
+connect_at="$(grep -n 'claude --mcp-config tapstate-mcp.json' "$guide" 2>/dev/null | head -1 | cut -d: -f1)"
+if [ -n "$skills_at" ] && [ -n "$connect_at" ] && [ "$skills_at" -lt "$connect_at" ] \
+   && grep -q 'mcpServers' "$guide" && grep -q 'token revoke <id>' "$guide" \
+   && ! grep -q 'tsk_fake_agent_token' "$guide" \
+   && grep -q 'How do I work with Tapstate?' "$guide" \
+   && printf '%s' "$RUN_OUT" | grep -q '"How do I work with Tapstate?"' \
+   && printf '%s' "$RUN_OUT" | grep -q 'other agents: AGENT-SETUP.md'; then
+  ok "AGENT-SETUP.md walks the agent path, skills first, without the token"
+else
+  bad "AGENT-SETUP.md is missing or incomplete: $(cat "$guide" 2>/dev/null)"
+fi
+
+# A first run spends most of its time downloading images, so a missing image is pulled where the reader
+# can watch it, and a re-run that has every image does not ask the registry at all -- it must still start
+# offline.
+FAKE_IMAGES='ghcr.io/tapstate/tapstate:0.0.0 mongo:7' FAKE_IMAGE_PRESENT=no run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q 'downloading the container images' \
+   && [ -f "$RUN/.docker-pulls" ]; then
+  ok "a missing image is downloaded in view before the stack starts"
+else
+  bad "a missing image was not pulled in view (rc=$RUN_RC): $RUN_OUT"
+fi
+FAKE_IMAGES='ghcr.io/tapstate/tapstate:0.0.0 mongo:7' FAKE_IMAGE_PRESENT=yes run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && [ ! -f "$RUN/.docker-pulls" ] \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'downloading the container images'; then
+  ok "a run with every image already here pulls nothing"
+else
+  bad "a run with every image present still pulled (rc=$RUN_RC): $RUN_OUT"
+fi
+
+# The first screen is the next moves, not a transcript. The CLI session that set the demo up goes to
+# quickstart.log, and reaches the screen only when the run stops because of it.
+FAKE_CLI_OUT='registered  mysql  0123456789abcdef' run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -eq 0 ] && ! printf '%s' "$RUN_OUT" | grep -q '0123456789abcdef' \
+   && grep -q '0123456789abcdef' "$RUN/quickstart.log" \
+   && printf '%s' "$RUN_OUT" | grep -q 'pipeline order_pipeline running'; then
+  ok "a run that works prints one line per step and keeps the CLI session in quickstart.log"
+else
+  bad "the CLI session reached the screen of a working run (rc=$RUN_RC): $RUN_OUT"
+fi
+FAKE_CLI_OUT="registered  mysql  0123456789abcdef
+error: connector.not-registered" run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q '0123456789abcdef' \
+   && printf '%s' "$RUN_OUT" | grep -q 'the CLI.s output is above'; then
+  ok "a run that fails in the CLI session prints that session"
+else
+  bad "a failed session was not shown (rc=$RUN_RC): $RUN_OUT"
+fi
+# The closing message is the screen a first reader acts on, and it stays one screen.
+run_phase_fakes
+closing="$(printf '%s\n' "$RUN_OUT" | sed -n '/^quickstart: done/,$p' | wc -l | tr -d ' ')"
+if [ "$closing" -gt 0 ] && [ "$closing" -le 40 ]; then
+  ok "the closing message fits on one screen ($closing lines)"
+else
+  bad "the closing message is $closing lines long: $RUN_OUT"
+fi
+# Run in place, the demo writes into the user's own directory, where a NEXT.md may be theirs. One the
+# quickstart did not write is left as it was; one it did is rewritten.
+printf 'my own notes\n' > "$RUN/NEXT.md"
+RUN_REUSE="$RUN" run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && [ "$(cat "$RUN/NEXT.md")" = 'my own notes' ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'NEXT.md is not one this script wrote'; then
+  ok "a NEXT.md the quickstart did not write is left alone, and the run says so"
+else
+  bad "a user's NEXT.md was overwritten or the run failed (rc=$RUN_RC): $(cat "$RUN/NEXT.md")"
+fi
+rm -f "$RUN/NEXT.md"
 
 # A run whose online verbs did not take must fail, loudly and non-zero. The REPL is the reason this
 # needs its own check: an interactive session does not end because one command was rejected, so it
@@ -758,7 +990,7 @@ fi
 run_phase_fakes 5 6
 if [ "$RUN_RC" -eq 0 ] \
    && printf '%s' "$RUN_OUT" | grep -q '5 orders from MySQL' \
-   && printf '%s' "$RUN_OUT" | grep -q '6 of them, in one object per order'; then
+   && printf '%s' "$RUN_OUT" | grep -q '(6 in all)'; then
   ok "still succeeds when both engines' seeded rows are in the target"
 else
   bad "a delivering run was rejected (rc=$RUN_RC): $RUN_OUT"

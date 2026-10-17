@@ -58,7 +58,7 @@ class FirstRunWordingGatesTest {
     private static final Path FIRST_RUN_CONTRACT = DOCS.resolve("first-run/README.md");
     private static final Path QUICKSTART = DOCS.resolve("quickstart-online.md");
 
-    /** The README section a new user reads first, and the one the guided path is introduced in. */
+    /** The README section a new user reads first: the demo, then the browser, an agent, or the CLI. */
     private static final String TRY_IT_HEADING = "## Try it";
 
     /** The word the first run does not use for "which server", however it is inflected. */
@@ -121,7 +121,8 @@ class FirstRunWordingGatesTest {
         assertThat(surfaces.keySet())
                 .contains("ServerBinding.SERVER_QUESTION", "GuidedNew.OPENING_LINE", "GuidedNew.RECIPE_QUESTION",
                         "MirroredTableRecipe.TABLE_QUESTION", "RecipeSupport.CONNECTOR_QUESTION");
-        assertThat(surfaces.get("README.md " + TRY_IT_HEADING)).contains("tapstate new").contains("tapstate up");
+        assertThat(surfaces.get("README.md " + TRY_IT_HEADING))
+                .contains("install.tapstate.dev/demo").contains("tapstate-mcp.json");
         assertThat(surfaces.get(relative(FIRST_RUN_CONTRACT))).contains("tapstate up");
         // `new` scaffolds and reaches nothing, so its anchor is its own catalog flag; --server is up's,
         // which is where every question about a server now lives

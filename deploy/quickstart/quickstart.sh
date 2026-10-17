@@ -39,8 +39,42 @@ set -eu
 CLI_VERSION="0.7.0"
 
 die() {
+    step_close
     printf 'quickstart: %s\n' "$1" >&2
     exit 1
+}
+
+# Progress is one line per step. On a terminal the line shows the step in progress and is redrawn in
+# place as finished; anywhere else (a log, CI, a test) both lines are printed, so nothing depends on a
+# cursor that is not there. What each step ran, and everything it printed, goes to quickstart.log: the
+# raw CLI session is what a failure needs and what a first reader does not, so it is printed only when
+# a step fails.
+step_open=""
+step_begin() {   # $1 = what is happening, as a phrase
+    step_open="$1"
+    if [ -t 1 ]; then printf '  ... %s ' "$1"; else printf '  ... %s\n' "$1"; fi
+    [ -z "${log:-}" ] || printf '\n== %s\n' "$1" >> "$log"
+}
+step_tick() {
+    if [ -t 1 ]; then printf '.'; fi
+}
+step_done() {    # $1 = what is now true
+    if [ -t 1 ] && [ -n "$step_open" ]; then printf '\r\033[K'; fi
+    step_open=""
+    printf '  ok  %s\n' "$1"
+}
+# Ends an unfinished step line, so whatever is printed next starts on a line of its own.
+step_close() {
+    if [ -t 1 ] && [ -n "${step_open:-}" ]; then printf '\n'; fi
+    step_open=""
+}
+
+# $1 quoted for a POSIX shell when it needs it, so a printed `cd <dir>` can be pasted as it stands.
+sh_quote() {
+    case "$1" in
+        *[!A-Za-z0-9_./-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 # Download $1 to the file $2 with whichever of curl / wget is present.
@@ -226,103 +260,462 @@ view:
 YAML
 }
 
-# Closing instructions: how to watch the assembled object, exercise CDC on both engines, and remove
-# everything. The teardown is printed because "back to a clean machine" is only honest if the images are
-# called out too.
+# Wire an AI agent to this stack: a write-scoped machine token, and an MCP client configuration in
+# tapstate-mcp.json that starts the sidecar with it. The agent then creates sources and pipelines itself.
 #
-# Every wait printed here is bounded, and that is not tidiness. These lines are copied and pasted by
-# somebody the script will never hear from again: an unbounded `until` returns in a second when the
-# change arrives and hangs forever, silently, when it does not - and a recording of this demo cannot
-# show that, because on the machine doing the recording it always returns. The bound is generous, taken
-# for the slowest healthy machine rather than the fastest, so a normal run is never reported as a
-# failure; when it does run out it says what was actually observed, which is what separates "nothing is
-# arriving" from "this machine is slow": a count still at its starting value is the first, a count that
-# moved and did not finish is the second.
-print_next_steps() {
-    demo_dir="$(basename "$PWD")"
-    # Whole-directory removal is only ever offered for a directory this script made. Run in place --
-    # a saved script executed where it sits -- the directory is the user's and holds their files, so
-    # printing `rm -rf` on it puts a command that destroys unrelated work in front of someone who has
-    # been told, correctly, that everything above was safe to copy.
-    if [ "${demo_dir_is_ours:-no}" = yes ]; then
-        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, .env)"
-    else
-        removal_line="  this directory is yours, so nothing here removes it. What the quickstart added:
-    tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ .env docker-compose.yml"
+# Optional by design. The demo has already succeeded when this runs, so nothing here fails the run: a
+# step that cannot complete leaves agent_note saying why, and the browser and CLI paths stand on their
+# own. The file name is the demo's own rather than .mcp.json, because a saved script run in place sits in
+# the user's directory, and that name may already hold their configuration for something else.
+#
+# The sidecar ships as a jar unless a native one sits beside the CLI. A local Java 21 (or the native
+# sidecar) runs it through `tapstate mcp`, and JAVA_HOME is written into the configuration because an
+# agent launched from a desktop app does not inherit this shell's PATH. Without either, it runs on the
+# server image's own Java, inside the server container's network namespace: the sidecar refuses plain
+# HTTP to anything but loopback, and that namespace is where the server is loopback.
+write_agent_config() {
+    agent_config=tapstate-mcp.json
+    agent_note=""
+    server_url=http://127.0.0.1:8080
+    # A token from an earlier run is kept while the server still accepts it. One it no longer accepts --
+    # the store was wiped with down -v -- is replaced, rather than left to fail inside the agent.
+    if [ -f "$agent_config" ]; then
+        agent_token="$(sed -n 's/.*"TAPSTATE_TOKEN": *"\([^"]*\)".*/\1/p' "$agent_config" | head -n 1)"
+        if [ -n "$agent_token" ] \
+           && TAPSTATE_TOKEN="$agent_token" ./tapstate -c "$server_url" ls >/dev/null 2>&1; then
+            return 0
+        fi
     fi
-    uri="mongodb://mongo:27017/views?directConnection=true"
-    # How long a pasted wait keeps trying. Taken for the slowest healthy machine, not the fastest: a
-    # single change crosses in about a second here, so a minute is not a guess at the duration but a
-    # ceiling far above it - small enough that nobody sits in front of a hung terminal, large enough
-    # that a loaded laptop is never told its working demo failed.
-    cdc_wait_seconds=60
-    cat <<EOF
-quickstart: pipeline started. The stack is running.
 
-What you have: one object per order, assembled out of two different databases. The orders are in
-MySQL, their shipments are in PostgreSQL, and neither engine can see the other's table -- so this is
-not a view and not a join. Tapstate keeps it fresh from both sides at once.
+    # The password travels in the environment, as everywhere else here, never as an argument.
+    token_json="$(TAPSTATE_PASSWORD="$admin_pw" ./tapstate -c "$server_url" -u admin \
+        token create --scope write -o json 2>/dev/null)" || token_json=""
+    agent_token="$(printf '%s' "$token_json" | tr -d '\n' \
+        | sed -n 's/.*"token" *: *"\([A-Za-z0-9._~+\/=-]*\)".*/\1/p')"
+    if [ -z "$agent_token" ]; then
+        agent_note="no agent token could be created; make one yourself with: TAPSTATE_PASSWORD=<.env password> ./tapstate -c $server_url -u admin token create --scope write"
+        return 0
+    fi
 
-Look at it (from this directory):
-  ./tapstate -w work        then: connect http://127.0.0.1:8080 ; login admin
-  then, at the prompt:
-    show collections                      three: the two sources, and views.order_state
-    views.order_state.find({id:1})         one order, with its shipments inside it
-    watch views.order_state {id:1}         the same object, redrawn as it changes
-    status order_pipeline --watch          the pipeline behind it
+    # Every path below is written into JSON unescaped, so one that would need escaping is refused here.
+    case "$PWD" in *\"*|*\\*)
+        agent_note="this directory's path contains a quote or a backslash, so no agent configuration was written"
+        return 0 ;;
+    esac
+    cli_link="$(readlink ./tapstate 2>/dev/null || true)"
+    case "$cli_link" in
+        "") cli_bin_dir="$PWD" ;;
+        /*) cli_bin_dir="$(dirname "$cli_link")" ;;
+        *)  cli_bin_dir="$PWD/$(dirname "$cli_link")" ;;
+    esac
+    libexec_dir=""
+    if [ -d "$cli_bin_dir/../libexec" ]; then libexec_dir="$(cd "$cli_bin_dir/../libexec" && pwd -P)"; fi
 
-See change-data-capture: change either database, watch the same object follow. Each wait below gives
-up after ${cdc_wait_seconds}s, says what it saw, and answers non-zero -- so pasted into a script it
-fails rather than passing quietly. It ends in \`false\` and not \`exit\` on purpose: \`exit\` would close
-the shell you are standing in.
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+        java_bin="$JAVA_HOME/bin/java"
+    else
+        java_bin="$(command -v java 2>/dev/null || true)"
+    fi
+    java_major=""; java_home=""
+    if [ -n "$java_bin" ]; then
+        java_props="$("$java_bin" -XshowSettings:properties -version 2>&1 || true)"
+        java_major="$(printf '%s\n' "$java_props" | sed -n 's/^ *java\.specification\.version = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+        java_home="$(printf '%s\n' "$java_props" | sed -n 's/^ *java\.home = //p' | head -n 1)"
+    fi
+    case "$java_home" in *\"*|*\\*) java_home="" ;; esac
 
-  # add a shipment in PostgreSQL -- it joins the array on order 1, which already has two
-  docker compose exec postgres psql -U postgres -d appdb -c "INSERT INTO shipments VALUES (7,1,'ups','pending');"
-  i=0; until docker compose exec -T mongo mongosh --quiet "$uri" --eval 'quit((db.order_state.findOne({id:1})?.shipments?.length ?? 0) >= 3 ? 0 : 1)'; do
-    i=\$((i+1)); [ "\$i" -lt ${cdc_wait_seconds} ] || { echo "not assembled after ${cdc_wait_seconds}s; order 1 now holds \$(docker compose exec -T mongo mongosh --quiet "$uri" --eval 'print(db.order_state.findOne({id:1})?.shipments?.length ?? 0)') shipments (it started with 2). Look at: docker compose logs --tail 50 server"; break; }
-    sleep 1
-  done; [ "\$i" -lt ${cdc_wait_seconds} ] || false
-  docker compose exec mongo mongosh --quiet "$uri" --eval 'db.order_state.find({id:1}).pretty()'
+    if [ -n "$libexec_dir" ] && [ -x "$libexec_dir/tapstate-mcp" ]; then
+        agent_env=""
+        agent_runs="It runs \`./tapstate mcp\`, which needs nothing else installed."
+    elif [ -n "$java_major" ] && [ "$java_major" -ge 21 ] && [ -x "$java_home/bin/java" ]; then
+        agent_env=",
+        \"JAVA_HOME\": \"$java_home\""
+        agent_runs="It runs \`./tapstate mcp\` on the Java 21 at \`$java_home\`, which is named in the file so an agent started from a desktop app finds it too."
+    else
+        agent_env=docker
+        agent_runs="No Java 21 was found on this machine, so it runs inside Docker, beside the demo's server: Docker has to be running whenever the agent uses it."
+    fi
 
-  # change the order itself in MySQL -- the parent column moves, the array stays where it is
-  docker compose exec mysql mysql -uroot -psecret appdb -e "UPDATE orders SET customer='alicia' WHERE id=1;"
-  i=0; until docker compose exec -T mongo mongosh --quiet "$uri" --eval 'quit(db.order_state.findOne({id:1})?.customer=="alicia"?0:1)'; do
-    i=\$((i+1)); [ "\$i" -lt ${cdc_wait_seconds} ] || { echo "not updated after ${cdc_wait_seconds}s; order 1 still reads \$(docker compose exec -T mongo mongosh --quiet "$uri" --eval 'print(db.order_state.findOne({id:1})?.customer ?? "nothing")'). Look at: docker compose logs --tail 50 server"; break; }
-    sleep 1
-  done; [ "\$i" -lt ${cdc_wait_seconds} ] || false
-  docker compose exec mongo mongosh --quiet "$uri" --eval 'db.order_state.find({id:1}).pretty()'
+    if [ "$agent_env" != docker ]; then
+        agent_command="$PWD/tapstate"
+        agent_args="\"mcp\", \"--server\", \"$server_url\", \"--allow-write\""
+    else
+        docker_bin="$(command -v docker)"
+        server_container="$(docker compose ps --format '{{.Name}}' server 2>/dev/null | head -n 1)"
+        case "$server_container" in
+            ""|*[!A-Za-z0-9_.-]*)
+                agent_note="the server container could not be named, so no agent configuration was written"
+                return 0 ;;
+        esac
+        case "$libexec_dir" in *\"*|*\\*) libexec_dir="" ;; esac
+        if [ -z "$libexec_dir" ] || [ ! -f "$libexec_dir/tapstate-mcp.jar" ]; then
+            agent_note="the MCP sidecar was not found beside the CLI, so no agent configuration was written"
+            return 0
+        fi
+        agent_command="$docker_bin"
+        agent_args="\"run\", \"-i\", \"--rm\", \"--network\", \"container:$server_container\",
+        \"-e\", \"TAPSTATE_TOKEN\", \"-v\", \"$libexec_dir:/opt/tapstate-mcp:ro\",
+        \"--entrypoint\", \"java\", \"ghcr.io/tapstate/tapstate:${CLI_VERSION}\",
+        \"-jar\", \"/opt/tapstate-mcp/tapstate-mcp.jar\", \"--server\", \"$server_url\", \"--allow-write\""
+        agent_env=""
+    fi
 
-  # remove that shipment again -- the array shrinks back, in the same object
-  docker compose exec postgres psql -U postgres -d appdb -c "DELETE FROM shipments WHERE id=7;"
-  i=0; until docker compose exec -T mongo mongosh --quiet "$uri" --eval 'quit((db.order_state.findOne({id:1})?.shipments?.length ?? 0) <= 2 ? 0 : 1)'; do
-    i=\$((i+1)); [ "\$i" -lt ${cdc_wait_seconds} ] || { echo "still there after ${cdc_wait_seconds}s; order 1 holds \$(docker compose exec -T mongo mongosh --quiet "$uri" --eval 'print(db.order_state.findOne({id:1})?.shipments?.length ?? 0)') shipments. Look at: docker compose logs --tail 50 server"; break; }
-    sleep 1
-  done; [ "\$i" -lt ${cdc_wait_seconds} ] || false
+    # The token is a credential, so the file is created readable by this user alone, like .env.
+    (
+        umask 077
+        cat > "$agent_config.tmp" <<EOF
+{
+  "mcpServers": {
+    "tapstate": {
+      "command": "$agent_command",
+      "args": [$agent_args],
+      "env": {
+        "TAPSTATE_TOKEN": "$agent_token"$agent_env
+      }
+    }
+  }
+}
+EOF
+    ) && mv "$agent_config.tmp" "$agent_config" \
+        || agent_note="the agent configuration could not be written to $agent_config"
+}
 
-  # and a whole new order in MySQL, which arrives with no shipments yet
-  docker compose exec mysql mysql -uroot -psecret appdb -e "INSERT INTO orders VALUES (6,'frank',60.00);"
-  i=0; until docker compose exec -T mongo mongosh --quiet "$uri" --eval 'quit(db.order_state.countDocuments({id:6})?0:1)'; do
-    i=\$((i+1)); [ "\$i" -lt ${cdc_wait_seconds} ] || { echo "order 6 did not arrive after ${cdc_wait_seconds}s; the view holds \$(docker compose exec -T mongo mongosh --quiet "$uri" --eval 'print(db.order_state.countDocuments())') orders (it started with 5). Look at: docker compose logs --tail 50 server"; break; }
-    sleep 1
-  done; [ "\$i" -lt ${cdc_wait_seconds} ] || false
-  docker compose exec mongo mongosh --quiet "$uri" --eval 'db.order_state.find({id:6}).pretty()'
+# The files below are written into the demo directory and rewritten by every run, so they always match
+# the stack beside them. A saved script run in place works in the user's own directory, where a file of
+# the same name may be theirs: only a file carrying this marker, or no file at all, is ever written.
+generated_marker="written by the Tapstate quickstart"
+write_generated() {   # $1 = path; the content arrives on stdin
+    if [ -f "$1" ] && ! grep -q "$generated_marker" "$1"; then
+        cat > /dev/null
+        printf 'quickstart: %s is not one this script wrote, so it was left alone\n' "$1" >&2
+        return 0
+    fi
+    cat > "$1.tmp" && mv "$1.tmp" "$1"
+}
 
-Reach the store from your own machine (optional -- the reads above go through the container):
-  The store's port is not published, so nothing on your host can see it by default. To point a GUI or
-  a driver at it, add  ports: ["127.0.0.1:27017:27017"]  to the mongo service in docker-compose.yml,
-  re-run docker compose up -d, and connect with:
+# try-cdc.sh: change-data-capture, seen from the outside. Four changes to the two source databases, one
+# at a time, each followed by the document it should have moved.
+#
+# Every wait is bounded, and that is not tidiness. Somebody the script will never hear from again runs
+# this, and an unbounded wait returns in a second when the change arrives and hangs forever, silently,
+# when it does not. The bound is taken for the slowest healthy machine rather than the fastest -- a
+# change crosses in about a second -- so a normal run is never reported as a failure; when it runs out
+# it says what was actually observed, which is what separates "nothing is arriving" from "this machine
+# is slow", and it exits non-zero.
+write_try_cdc() {
+    write_generated try-cdc.sh <<'SH'
+#!/bin/sh
+# try-cdc.sh -- written by the Tapstate quickstart; a re-run of the quickstart rewrites it.
+#
+# Makes four changes to the demo's source databases, one at a time, and after each one prints the
+# document in MongoDB that it should have changed. Nothing is re-run in between: the pipeline carries
+# each change across on its own. Run it again to repeat it; it first undoes what an earlier run changed.
+set -eu
+cd "$(dirname "$0")"
+
+wait_secs=60
+uri='mongodb://mongo:27017/views?directConnection=true'
+mongo() { docker compose exec -T mongo mongosh --quiet "$uri" --eval "$1"; }
+postgres() { docker compose exec -T postgres psql -q -U postgres -d appdb -c "$1" > /dev/null; }
+mysql() { docker compose exec -T -e MYSQL_PWD=secret mysql mysql -uroot appdb -e "$1"; }
+
+# Waits until $1 (a mongosh expression) is true. On timeout, prints $2 followed by the value of $3, and
+# where to look next, then exits non-zero.
+await() {
+    i=0
+    until mongo "quit(($1) ? 0 : 1)" > /dev/null 2>&1; do
+        i=$((i + 1))
+        if [ "$i" -ge "$wait_secs" ]; then
+            echo "    not there after ${wait_secs}s; $2 $(mongo "print($3)" 2> /dev/null || echo '(unreadable)')." >&2
+            echo "    Look at: docker compose logs --tail 50 server" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+show() { mongo "printjson(db.order_state.findOne({id: $1}, {_id: 0}))" | sed 's/^/    /'; }
+
+order1_shipments='db.order_state.findOne({id: 1})?.shipments?.length ?? 0'
+
+# The seeded state is order 1 owned by alice with two shipments, and no order 6.
+if ! mongo "quit(($order1_shipments) === 2 && db.order_state.findOne({id: 1})?.customer === 'alice' && !db.order_state.countDocuments({id: 6}) ? 0 : 1)" > /dev/null 2>&1; then
+    echo "Undoing the changes from an earlier run first."
+    postgres "DELETE FROM shipments WHERE id = 7;"
+    mysql "DELETE FROM orders WHERE id = 6; UPDATE orders SET customer = 'alice' WHERE id = 1;"
+    await "($order1_shipments) === 2 && db.order_state.findOne({id: 1})?.customer === 'alice' && !db.order_state.countDocuments({id: 6})" \
+        'order 1 holds' "JSON.stringify(db.order_state.findOne({id: 1}, {_id: 0}))"
+fi
+
+echo
+echo "1/4  PostgreSQL: add a shipment to order 1, which has two."
+postgres "INSERT INTO shipments VALUES (7, 1, 'ups', 'pending');"
+await "($order1_shipments) >= 3" 'order 1 holds this many shipments:' "$order1_shipments"
+echo "     Order 1 in MongoDB now has three:"
+show 1
+
+echo
+echo "2/4  MySQL: rename the customer on order 1, from alice to alicia."
+mysql "UPDATE orders SET customer = 'alicia' WHERE id = 1;"
+await "db.order_state.findOne({id: 1})?.customer === 'alicia' && ($order1_shipments) >= 3" \
+    'order 1 reads' "JSON.stringify(db.order_state.findOne({id: 1}, {_id: 0}))"
+echo "     The customer changed, and the shipments from PostgreSQL stayed where they were:"
+show 1
+
+echo
+echo "3/4  PostgreSQL: delete that shipment again."
+postgres "DELETE FROM shipments WHERE id = 7;"
+await "($order1_shipments) <= 2" 'order 1 still holds this many shipments:' "$order1_shipments"
+echo "     Order 1 is back to two:"
+show 1
+
+echo
+echo "4/4  MySQL: add order 6, which has no shipments yet."
+mysql "INSERT INTO orders VALUES (6, 'frank', 60.00);"
+await "db.order_state.countDocuments({id: 6}) === 1" 'MongoDB holds this many orders:' 'db.order_state.countDocuments()'
+echo "     A new document, with no shipments in it:"
+show 6
+
+echo
+echo "Each change reached MongoDB on its own, from either database. Run ./try-cdc.sh again to repeat it."
+SH
+    chmod +x try-cdc.sh
+}
+
+# NEXT.md: what a reader looks for after the first screen, and not on it. It opens with the cd into the
+# demo directory, because the file is read from wherever the reader happens to be.
+write_next_md() {
+    fence='```'
+    if [ "${demo_dir_is_ours:-no}" = yes ]; then
+        # Whole-directory removal is only ever offered for a directory this script made.
+        removal="Then remove the folder, with the CLI, the connector jars, the workspace, \`.env\` and the
+agent configuration in it:
+
+${fence}sh
+rm -rf $here
+${fence}"
+    else
+        # Run in place, the directory is the user's and holds their files, so \`rm -rf\` on it would
+        # destroy unrelated work. Say what was added instead.
+        removal="This folder is yours, so nothing here removes it. What the quickstart added to it:
+
+    tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ .env
+    docker-compose.yml tapstate-mcp.json try-cdc.sh NEXT.md AGENT-SETUP.md quickstart.log"
+    fi
+    write_generated NEXT.md <<EOF
+<!-- $generated_marker; a re-run of the quickstart rewrites it -->
+# Your Tapstate demo: what next
+
+The demo lives in \`$PWD\`. Run every command below from there:
+
+${fence}sh
+cd $here
+${fence}
+
+## Look at it from the CLI
+
+${fence}sh
+./tapstate -w work
+${fence}
+
+Then, at the CLI's prompt (the admin password is in \`.env\`):
+
+${fence}
+connect http://127.0.0.1:8080
+login admin
+show collections                     three: the two sources, and views.order_state
+views.order_state.find({id:1})       one order, with its shipments inside it
+watch views.order_state {id:1}       the same document, redrawn as it changes
+status order_pipeline --watch        the pipeline behind it
+${fence}
+
+## Open the web app from another computer
+
+The server answers on this machine only. From another computer, keep this open:
+
+${fence}sh
+ssh -N -L 127.0.0.1:18080:127.0.0.1:8080 <you>@<this host>
+${fence}
+
+and visit http://127.0.0.1:18080 instead.
+
+## See change-data-capture
+
+${fence}sh
+./try-cdc.sh
+${fence}
+
+It adds a shipment in PostgreSQL, renames a customer in MySQL, removes the shipment, and adds an order,
+printing the MongoDB document after each change. It is a plain shell script: read it to see the SQL it
+runs, and copy those lines to make changes of your own.
+
+## Connect your own tools to MongoDB
+
+The store's port is not published, so nothing on your machine can reach it by default. To point a GUI
+or a driver at it, add \`ports: ["127.0.0.1:27017:27017"]\` to the \`mongo\` service in
+\`docker-compose.yml\`, run \`docker compose up -d\`, and connect with:
+
     mongodb://127.0.0.1:27017/views?directConnection=true
-  Keep directConnection=true. This is a one-member replica set that registers its member under a name
-  meaning something only inside the container, so a URI carrying replicaSet=rs0 makes the driver
-  discover that name and dial an address on your own machine where nothing is listening.
 
-Stop, and pick it up later (run in this directory):
-  docker compose stop        stop the stack and keep its data (docker compose start resumes it)
+Keep \`directConnection=true\`. This is a one-member replica set that registers its member under a name
+that means something only inside the container, so a URI carrying \`replicaSet=rs0\` makes the driver
+discover that name and dial an address on your machine where nothing is listening.
 
-Tear down -- this one is not reversible (run in this directory):
-  docker compose down -v     stop the stack and delete its data (a re-run re-registers the connectors)
-$removal_line
-The pulled images remain; remove them with:  docker image rm <image>
+## Pause and resume
+
+${fence}sh
+docker compose stop      # stop the demo and keep its data
+docker compose start     # pick it up again
+${fence}
+
+## Delete it
+
+This is not reversible:
+
+${fence}sh
+docker compose down -v    # stop the demo and delete its data
+${fence}
+
+$removal
+
+The pulled images remain; remove them with \`docker image rm <image>\`.
+EOF
+}
+
+# AGENT-SETUP.md: the agent path in full, beside the configuration it describes. Written only when that
+# configuration was, so it never walks a reader through a file that is not there. The name is not
+# AGENT.md on purpose: some agents read a file of that name as instructions addressed to them.
+write_agent_md() {
+    [ -z "${agent_note:-}" ] || return 0
+    fence='```'
+    write_generated AGENT-SETUP.md <<EOF
+<!-- $generated_marker; a re-run of the quickstart rewrites it -->
+# Use an AI agent with this demo
+
+Connected to Tapstate over MCP, an AI agent can do what you would do in the browser or the CLI: create
+sources, write and check pipelines, start and stop them, and read their status and their data. You
+describe what you want; the agent does the work and tells you what it did.
+
+## 1. Install the Tapstate skills first
+
+${fence}sh
+npx --yes skills add tapstate/tapstate-skills
+${fence}
+
+The skills teach the agent how Tapstate pipelines are written. Without them, an agent can write a
+pipeline that passes validation and runs, but does not do what you asked -- and still report success.
+
+Run the commands below from the demo folder:
+
+${fence}sh
+cd $here
+${fence}
+
+## 2. Connect the agent
+
+\`$PWD/$agent_config\` starts Tapstate's MCP server with a token for this demo.
+${agent_runs:-}
+
+- **Claude Code:** run
+
+  ${fence}sh
+  claude --mcp-config $agent_config
+  ${fence}
+
+- **Cursor, Claude Desktop, and other clients configured with an \`mcpServers\` JSON block:** copy the
+  \`"tapstate"\` entry from \`$agent_config\` into the client's MCP settings (for Cursor,
+  \`~/.cursor/mcp.json\`; for Claude Desktop, Settings > Developer > Edit Config), then restart the client.
+- **Codex:** add an \`[mcp_servers.tapstate]\` table to \`~/.codex/config.toml\` with the same \`command\`,
+  \`args\` and \`env\` as the entry in \`$agent_config\`.
+
+Every path in the entry is absolute, so it works from any folder on this machine.
+
+## 3. Ask it something
+
+Start with "How do I work with Tapstate?". The skills include a guided tour: the agent checks its
+connection, shows you what this demo is running, and offers things to try. Or ask for something
+directly:
+
+- "Create a pipeline that keeps a live copy of the shipments in fulfillment_db with only their id,
+  carrier and status, start it, and tell me its status."
+- "Show me order 1 in views.order_state."
+- "Is order_pipeline healthy? Explain how far behind it is."
+- "Stop the pipeline you created, and delete it."
+
+Whatever the agent creates also shows up in the browser, at http://127.0.0.1:8080.
+
+## The token
+
+The token in \`$agent_config\` is a write token for this demo's server: whoever holds it can create,
+change, start, stop and delete sources and pipelines there. It is kept in that file only, readable by
+you alone, and the quickstart never prints it.
+
+To revoke it, list the tokens and revoke the agent's by its id:
+
+${fence}sh
+TAPSTATE_PASSWORD=<the password in .env> ./tapstate -c http://127.0.0.1:8080 -u admin token list
+TAPSTATE_PASSWORD=<the password in .env> ./tapstate -c http://127.0.0.1:8080 -u admin token revoke <id>
+${fence}
+
+Deleting the demo with \`docker compose down -v\` invalidates it too; the next quickstart run writes a
+new one.
+EOF
+}
+
+# The closing message. It is the first screen a reader acts on, so it carries only the next moves and
+# names the file that holds everything else. Every command on it runs in the demo directory. A piped run
+# made that directory itself and the reader's shell is still in its parent -- a script cannot move the
+# shell that started it -- so the message opens by saying so, with the cd to run first.
+print_next_steps() {
+    # The agent block names the files only when they exist; otherwise it says why they do not, so the
+    # option is never advertised over a configuration that was never written.
+    if [ -z "${agent_note:-}" ]; then
+        agent_lines="    1. Install the Tapstate skills:  npx --yes skills add tapstate/tapstate-skills
+    2. Connect it:                   claude --mcp-config $agent_config   (other agents: AGENT-SETUP.md)
+    3. Ask it:                       \"How do I work with Tapstate?\""
+    else
+        agent_lines="    Not set up: $agent_note"
+    fi
+    if [ "${demo_dir_is_ours:-no}" = yes ]; then
+        where="The demo is in $PWD.
+Go there first -- every command below runs from that folder:
+
+  cd $here
+"
+    else
+        where="Every command below runs from this folder, $PWD.
+"
+    fi
+    cat <<EOF
+
+quickstart: done. The demo is running.
+
+$where
+What you have: one MongoDB document per order, built from two databases -- the orders are in MySQL,
+their shipments are in PostgreSQL -- and kept up to date as either one changes.
+
+Three ways to use it:
+
+  In the browser
+    Open http://127.0.0.1:8080 and sign in as admin. The password is in .env.
+
+  With an AI agent (Claude Code, Cursor, ...) -- it creates and runs pipelines for you
+$agent_lines
+
+  From the CLI
+    ./tapstate -w work, then at its prompt: connect http://127.0.0.1:8080 ; login admin
+
+See it stay in sync
+  Run ./try-cdc.sh. It makes four small changes to the source databases, one at a time:
+  it adds a shipment in PostgreSQL, renames a customer in MySQL, removes the shipment again,
+  and adds a new order. After each change it prints the combined document from MongoDB, so
+  you can see it update a moment later without anything being re-run.
+
+Stop, clean up, or connect your own tools
+  NEXT.md in this folder has the commands to pause and resume the demo, to delete it and its
+  data, and to open the MongoDB store in a GUI on your machine.
+
+If something looks wrong
+  The full output of every setup step is in quickstart.log.
 EOF
 }
 
@@ -341,6 +734,10 @@ main() {
         demo_dir_is_ours=yes
         printf 'quickstart: working in %s\n' "$PWD"
     fi
+    # Every command this script hands the reader runs in this directory, and a piped run made it, so the
+    # reader's shell is not in it. A hint is therefore printed with the cd that makes it work as pasted.
+    here="$(sh_quote "$PWD")"
+    cd_here="cd $here && "
 
     # The whole product runs as a compose stack, so a machine without Docker is refused here, before
     # anything is downloaded -- an actionable sentence beats "docker: command not found" three
@@ -352,6 +749,15 @@ main() {
         docker compose version >/dev/null 2>&1 \
             || die "Docker is present but the Compose v2 plugin is not ('docker compose version' failed). Update Docker, or install only the offline CLI:  curl -sSL https://install.tapstate.dev/cli | sh"
     fi
+
+    # Say what is about to happen before any of it does. A first reader does not expect one command to
+    # start four databases' worth of containers, and a long quiet run they were not told about reads as
+    # one that has gone wrong.
+    cat <<'EOF'
+quickstart: this sets up a local Tapstate demo in Docker: MySQL and PostgreSQL with sample orders and
+            shipments, MongoDB, the Tapstate server, and one live pipeline that combines the two
+            databases into MongoDB. The first run takes a few minutes while the downloads finish.
+EOF
 
     # Where the stack's assets come from: the same release the CLI is pinned to, derived from that pin
     # rather than named separately. A branch would keep moving after the release, handing a later user a
@@ -463,8 +869,36 @@ main() {
         return
     fi
 
+    # Everything a step runs is written here; the reader sees one line per step instead.
+    log="$PWD/quickstart.log"
+    : > "$log"
+
     # Bring up the stack. The compose file pins the published image, so this pulls rather than builds.
-    docker compose up -d
+    #
+    # A first run spends most of its time downloading images, and that is shown: the fetches above draw
+    # their progress for the same reason, so a long download never looks like a hang. Only when an image
+    # is missing, though -- a pull also asks the registry about images already here, and a re-run must
+    # still start offline. A compose too old to list its images falls back to the plain, visible `up`.
+    if images="$(docker compose config --images 2>/dev/null)" && [ -n "$images" ]; then
+        missing=""
+        for image in $images; do
+            docker image inspect "$image" >/dev/null 2>&1 || missing=yes
+        done
+        if [ -n "$missing" ]; then
+            echo 'quickstart: downloading the container images (first run only)'
+            docker compose pull \
+                || die "the container images could not be downloaded; check the network and run this again"
+        fi
+        step_begin "starting the stack"
+        if ! docker compose up -d >> "$log" 2>&1; then
+            step_close
+            tail -n 20 "$log" >&2
+            die "the stack did not start; the last lines of quickstart.log are above"
+        fi
+    else
+        docker compose up -d
+        step_begin "starting the stack"
+    fi
 
     # Both waits below poll on this interval. It is a knob only so the script's own test suite can drive
     # the waiting paths without spending a minute on each; a run that does not set it waits the same two
@@ -473,17 +907,15 @@ main() {
 
     # Wait until the server container reports healthy -- its image carries the /healthz healthcheck -- so
     # the online verbs are not driven before the server can answer.
-    printf 'quickstart: waiting for the stack to become healthy'
     i=0
     while [ "$i" -lt 90 ]; do
         if docker compose ps --format json server 2>/dev/null | grep -q '"Health":"healthy"'; then
             break
         fi
-        i=$((i + 1)); printf '.'; sleep "$poll"
+        i=$((i + 1)); step_tick; sleep "$poll"
     done
-    printf '\n'
     docker compose ps --format json server 2>/dev/null | grep -q '"Health":"healthy"' \
-        || die "the server did not become healthy in time; inspect it with: docker compose logs server"
+        || die "the server did not become healthy in time; inspect it with: ${cd_here}docker compose logs server"
 
     # Then wait for the first admin to actually exist. Server health is not that moment -- it is the
     # moment before it: the bootstrap sidecar declares depends_on the server being healthy, so health is
@@ -493,20 +925,19 @@ main() {
     # A one-shot container reports State and ExitCode, never Health, so both are checked: `exited` alone
     # would accept a bootstrap that ran and failed. A non-zero exit is reported immediately rather than
     # waited out -- the container is gone, so no amount of further waiting changes the answer.
-    printf 'quickstart: waiting for the first admin to be created'
     i=0
     while [ "$i" -lt 60 ]; do
         bootstrap_ps="$(docker compose ps -a --format json bootstrap 2>/dev/null)"
         if printf '%s' "$bootstrap_ps" | grep -q '"State":"exited"'; then
             printf '%s' "$bootstrap_ps" | grep -q '"ExitCode":0' \
-                || { printf '\n'; die "the first admin could not be created; inspect it with: docker compose logs bootstrap"; }
+                || die "the first admin could not be created; inspect it with: ${cd_here}docker compose logs bootstrap"
             break
         fi
-        i=$((i + 1)); printf '.'; sleep "$poll"
+        i=$((i + 1)); step_tick; sleep "$poll"
     done
-    printf '\n'
     printf '%s' "$bootstrap_ps" | grep -q '"State":"exited"' \
-        || die "the first admin was not created in time; inspect it with: docker compose logs bootstrap"
+        || die "the first admin was not created in time; inspect it with: ${cd_here}docker compose logs bootstrap"
+    step_done "stack running: MySQL, PostgreSQL, MongoDB and the Tapstate server"
 
     # Drive the online verbs through the REPL, feeding the password on stdin (the login prompt reads the
     # next line) so it is never a process argument or a shell-history entry. Workspace paths resolve
@@ -527,6 +958,7 @@ main() {
     # started. Authentication is also the one failure that cascades -- every verb after it reports
     # cli.not-authenticated, so the real cause ends up at the top of a screen of consequences.
     admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+    step_begin "registering the connectors, creating the two sources, starting the pipeline"
     repl_status=0
     repl_out="$(printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nregister ../mysql-connector.jar\nregister ../mongodb-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' "$admin_pw" \
         | ./tapstate -w work 2>&1)" || repl_status=$?
@@ -535,7 +967,12 @@ main() {
     # `case` below it never runs, and everything the CLI said -- a refusal, a stack trace, ten frames of
     # it -- reaches the exit code and nowhere else. The one report of that shape blamed the CPU, and the
     # same silence was reproduced later on hardware where that could not be the cause.
-    printf '%s\n' "$repl_out"
+    #
+    # The session goes to the log either way, and to the screen only when the run stops because of it:
+    # a session that worked is a screen of prompts and checksums that says nothing a reader needs, and
+    # one that did not is the first thing they need.
+    printf '%s\n' "$repl_out" >> "$log"
+    show_session() { step_close; printf '%s\n' "$repl_out"; }
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
             # Ask the bootstrap what it actually did. "Created it" and "found one already there" are both
@@ -555,9 +992,11 @@ main() {
                     else
                         again="curl -sSL https://install.tapstate.dev/demo | sh"
                     fi
-                    die "the CLI could not log in: this stack already had an admin from an earlier run, and the password in .env is not the one it was created with. Start clean with: docker compose down -v && $again" ;;
+                    show_session
+                    die "the CLI could not log in: this stack already had an admin from an earlier run, and the password in .env is not the one it was created with. Start clean with: ${cd_here}docker compose down -v && $again" ;;
                 *)
-                    die "the CLI could not log in, so no verb after it ran; inspect it with: docker compose logs bootstrap" ;;
+                    show_session
+                    die "the CLI could not log in, so no verb after it ran; inspect it with: ${cd_here}docker compose logs bootstrap" ;;
             esac ;;
     esac
     # Anything else the CLI failed on. Two guards, because what one can see the other cannot.
@@ -565,6 +1004,7 @@ main() {
     # A CLI that died -- a crash, a kill -- is what the exit status is for, and the failure it names is
     # the process, not the verb: the session ended, so nothing after it ran at all.
     if [ "$repl_status" -ne 0 ]; then
+        show_session
         die "the CLI exited $repl_status before the pipeline was started; its output is above"
     fi
     # A verb that failed is what the exit status cannot see, and it is the case a session produces: a
@@ -604,13 +1044,17 @@ main() {
         END { if (pending != "") print pending }
     ')"
     if printf '%s\n' "$verb_failures" | grep -q -e 'error: ' -e 'The server refused ' -e 'request failed: '; then
+        show_session
         die "a verb failed during pipeline setup; the CLI's output is above"
     fi
+    step_done "connectors registered: MySQL, PostgreSQL, MongoDB"
+    step_done "sources created: orders_db (MySQL), fulfillment_db (PostgreSQL)"
+    step_done "pipeline order_pipeline running"
 
     # Snapshot verification, printed automatically: the demo's payoff is a real row count in the target,
     # not an "it should have worked". A fresh snapshot of the seeded rows is quick, but the read still
     # retries so a slow first run is not misreported as an empty target.
-    echo 'quickstart: waiting for the two engines to be assembled into one object'
+    step_begin "waiting for the two databases to be combined in MongoDB"
     seeded_orders=5      # rows the demo seed puts in MySQL
     seeded_shipments=6   # rows the demo seed puts in PostgreSQL, spread unevenly across four orders
     # Both halves are waited on, and both are named if the wait runs out. The second number is the one
@@ -622,7 +1066,7 @@ main() {
         orders="$(count_orders)"
         shipments="$(count_embedded_shipments)"
         [ "$orders" -ge "$seeded_orders" ] && [ "$shipments" -ge "$seeded_shipments" ] && break
-        i=$((i + 1)); sleep 2
+        i=$((i + 1)); step_tick; sleep 2
     done
 
     # Falling out of that loop short is a failed run, and it has to be said with a non-zero exit. The
@@ -631,10 +1075,13 @@ main() {
     # only evidence the script has that a pipeline is moving data. The stack is left standing rather
     # than torn down -- the server log is the next thing to read, and a teardown would take it along.
     { [ "$orders" -ge "$seeded_orders" ] && [ "$shipments" -ge "$seeded_shipments" ]; } \
-        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: docker compose logs server"
-    printf 'quickstart: %s orders from MySQL, each carrying its shipments from PostgreSQL -- %s of them, in one object per order\n' \
-        "$orders" "$shipments"
+        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: ${cd_here}docker compose logs server"
+    step_done "$orders orders from MySQL, each with its shipments from PostgreSQL ($shipments in all), one MongoDB document per order"
 
+    write_agent_config
+    write_try_cdc
+    write_next_md
+    write_agent_md
     print_next_steps
 }
 

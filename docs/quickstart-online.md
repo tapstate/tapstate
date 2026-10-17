@@ -169,8 +169,12 @@ should be removed. A failed clear stops the pipeline before it writes rows.
 
 `quickstart.sh` runs everything on this page for you: it makes itself a
 `tapstate-demo` directory, fetches the stack, installs the CLI in place, generates
-the demo workspace, brings the stack up, and runs the pipeline — then prints the
-target row count and the commands to drive CDC and tear down:
+the demo workspace, brings the stack up, and runs the pipeline. It prints one line per
+step, then the three ways in (the browser, an AI agent, the CLI). Beside the stack it
+leaves `try-cdc.sh`, which changes both databases and shows the document follow;
+`NEXT.md`, with the commands to stop, tear down, and reach the store; `AGENT-SETUP.md`,
+which walks through connecting an agent; and `quickstart.log`, the full output of every
+setup step:
 
 ```sh
 curl -sSL https://install.tapstate.dev/demo | sh
