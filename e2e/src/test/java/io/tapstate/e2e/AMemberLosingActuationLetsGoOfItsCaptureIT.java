@@ -57,9 +57,7 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                 Await.until("the original pipeline to deliver its load", BOUND,
                         () -> mongo.count(target, TABLE) == 2,
                         () -> "target rows=" + mongo.count(target, TABLE) + ", state=" + control.state(PIPELINE));
-                Await.until("the target to confirm the original load", BOUND,
-                        () -> control.snapshotTable(PIPELINE, TABLE).filter(TableSnapshot::landed).isPresent(),
-                        () -> "snapshot=" + control.snapshotTable(PIPELINE, TABLE));
+                awaitOriginalSnapshot(control);
                 Map<String, String> captures = control.captureOwnersOf(PIPELINE);
                 assertThat(captures).hasSize(1);
                 String captureId = captures.keySet().iterator().next();
@@ -121,6 +119,15 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                 control.stop(PIPELINE, false);
             }
         }
+    }
+
+    static void awaitOriginalSnapshot(ControlPlane control) {
+        Await.until("the target to confirm the original load", BOUND,
+                () -> {
+                    TableSnapshot snapshot = control.snapshotTables(PIPELINE).get(TABLE);
+                    return snapshot != null && snapshot.landed();
+                },
+                () -> "snapshot=" + control.snapshotTables(PIPELINE));
     }
 
     private static Map<String, String> resources(String sourceUri, String targetUri) {
