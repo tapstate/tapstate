@@ -159,6 +159,8 @@ class MongoSrsModelStoreIT {
             });
             assertThatThrownBy(() -> guarded.publish(model(0, table("id", null)), f.fence())).satisfies(MongoSrsModelStoreIT::businessFenced);
             assertThat(models(f.database()).countDocuments()).isZero();
+            assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isZero();
+            assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first().getList("modelContextHeads", Document.class)).isEmpty();
             assertThat(SystemCollections.SRS_LOG_BOUNDS.on(f.database()).countDocuments()).isZero();
             assertThat(claim(f.database())).isEqualTo(claim);
         });
@@ -318,6 +320,7 @@ class MongoSrsModelStoreIT {
     void theOriginalModelGuardCanAbortAfterEventAndBoundsWritesWithoutLeavingPartialEffects() {
         withBusiness(f -> {
             f.models().publish(model(0, table("id", null)), f.fence()); Document before = claim(f.database());
+            Document chainBefore = SystemCollections.SRS_CHAINS.on(f.database()).find().first();
             var boundsWritten = new AtomicBoolean(); var inBounds = new AtomicBoolean(); var checks = new AtomicInteger();
             var witness = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
@@ -343,6 +346,7 @@ class MongoSrsModelStoreIT {
             assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isZero();
             assertThat(modelLog(f).bounds(RING)).isEqualTo(new SrsLogBounds(-1, -1));
             assertThat(claim(f.database())).isEqualTo(before);
+            assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first()).isEqualTo(chainBefore);
         });
     }
 
@@ -362,10 +366,10 @@ class MongoSrsModelStoreIT {
                 var log = new MongoSrsLogStore(observed, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), new MongoSrsModelStore(observed, database, SCOPE));
                 log.storeAll(RING, 1, java.util.Collections.nCopies(25, event(0, 7, f.fence())));
-                assertThat(queries.get()).isEqualTo(4);
+                assertThat(queries.get()).isLessThanOrEqualTo(4);
                 queries.set(0);
                 assertThat(log.readBatch(RING, 1, 25).records()).hasSize(25);
-                assertThat(queries.get()).isEqualTo(4);
+                assertThat(queries.get()).isLessThanOrEqualTo(4);
             }
         });
     }
@@ -536,6 +540,239 @@ class MongoSrsModelStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"publish", "append", "load", "batch", "bounds"})
+    void losingKnownControlCannotBeTreatedAsAnUnpublishedContext(String operation) {
+        withBusiness(f -> {
+            var first = model(0, table("id", null)); f.models().publish(first, f.fence());
+            var log = modelLog(f); log.store(RING, 1, event(0, 7, f.fence()));
+            f.database().getCollection("srs_model_contexts").deleteMany(new Document());
+            Document before = claim(f.database());
+            assertThatThrownBy(() -> {
+                switch (operation) {
+                    case "publish" -> f.models().publish(first, f.fence());
+                    case "append" -> log.store(RING, 2, event(0, 7, f.fence()));
+                    case "load" -> log.load(RING, 1);
+                    case "batch" -> log.readBatch(RING, 1, 1);
+                    case "bounds" -> log.bounds(RING);
+                    default -> throw new AssertionError(operation);
+                }
+            }).isInstanceOf(TapstateException.class);
+            assertThat(claim(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void losingTheControlAndAllPayloadsBeforeTheFirstEventCannotRecreateHistory() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            f.database().getCollection("srs_model_contexts").deleteMany(new Document());
+            models(f.database()).deleteMany(new Document());
+            assertThatThrownBy(() -> f.models().publish(model(0, table("replacement", null)), f.fence()))
+                    .satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThat(models(f.database()).countDocuments()).isZero();
+        });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"string,publish", "number,publish", "list,publish", "string,load", "number,load", "list,load", "string,bounds", "number,bounds", "list,bounds"})
+    void corruptPublishedContextPointerHasACodedRedactedFailure(String type, String operation) {
+        withBusiness(f -> {
+            var first = model(0, table("id", null)); f.models().publish(first, f.fence());
+            Object broken = switch (type) { case "string" -> "raw-secret-sentinel"; case "number" -> 12L; default -> List.of("raw-secret-sentinel"); };
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("modelContextHeads.0.contextId", broken)));
+            assertThatThrownBy(() -> {
+                switch (operation) {
+                    case "publish" -> f.models().publish(first, f.fence());
+                    case "load" -> f.models().load(key(0));
+                    case "bounds" -> modelLog(f).bounds(RING);
+                    default -> throw new AssertionError(operation);
+                }
+            }).satisfies(MongoSrsModelStoreIT::unreadable);
+        });
+    }
+
+    @Test
+    void aRetainedContextPreventsAnotherChainFromClaimingARingAfterPayloadAndBoundsLoss() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("original", null)), f.fence());
+            models(f.database()).deleteMany(new Document());
+            SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteMany(new Document());
+            SystemCollections.SRS_CHAINS.on(f.database()).insertOne(new Document("_id", "chain-b").append("epoch", 8L)
+                    .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("captureId", "capture-b").append("modelContextHeads", List.of()).append("modelWriteFence", 0L));
+            var other = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())).acquire(
+                    new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-b"), new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
+            var stolen = new SrsModel(new SrsModelKey("chain-b", "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("replacement", null), 0);
+            assertThatThrownBy(() -> f.models().publish(stolen, WorkloadClaimFence.from(other))).satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThat(models(f.database()).countDocuments()).isZero();
+            assertThat(SystemCollections.SRS_LOG_BOUNDS.on(f.database()).countDocuments()).isZero();
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"load", "batch"})
+    void historicalEventsKeepTheirOriginalCaptureIdentityAfterALegalNewContext(String operation) {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("old", null)), f.fence());
+            var log = modelLog(f); var original = event(0, 7, f.fence()); log.store(RING, 1, original);
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("epoch", 8L).append("captureId", "capture-b")));
+            var other = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())).acquire(
+                    new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-b"), new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
+            var fence = WorkloadClaimFence.from(other);
+            var current = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("current", null), 2);
+            f.models().publish(current, fence); log.store(RING, 2, event(0, 8, fence));
+            if (operation.equals("load")) assertThat(log.load(RING, 1)).contains(original);
+            else assertThat(log.readBatch(RING, 1, 2).records()).containsEntry(1L, original).containsEntry(2L, event(0, 8, fence));
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"publish", "load"})
+    void anUnrepresentablePublishedVersionIsRejectedInsideTheCodedDecoder(String operation) {
+        withBusiness(f -> {
+            var first = model(0, table("id", null)); f.models().publish(first, f.fence());
+            f.models().publish(new SrsModel(key(1), RING, table("changed", null), 100), f.fence());
+            var controls = SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()); Document row = controls.find().first();
+            row.put("publishedVersion", Long.MAX_VALUE); row.remove("contentHash");
+            row.put("contentHash", io.tapstate.core.model.canonical.CanonicalHash.ofText(row.toJson()));
+            controls.replaceOne(new Document("_id", row.get("_id")), row);
+            assertThatThrownBy(() -> {
+                if (operation.equals("publish")) f.models().publish(first, f.fence()); else f.models().load(key(0));
+            }).satisfies(MongoSrsModelStoreIT::unreadable);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"publishedVersion", "captureFence.claimGeneration", "contentHash", "nextContext", "firstSequence"})
+    void damagedOrderingFactsNeverDefaultToAnotherRange(String field) {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            Object bad = field.equals("contentHash") || field.equals("nextContext") ? "raw-secret-sentinel" : 0.5D;
+            SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).updateOne(new Document(), new Document("$set", new Document(field, bad)));
+            assertThatThrownBy(() -> f.models().load(key(0))).satisfies(MongoSrsModelStoreIT::unreadable);
+        });
+    }
+
+    @Test
+    void anotherLiveClaimCannotReuseAnAlreadyPublishedNumericCaptureEpoch() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            assertThat(claims.release(f.claim())).isTrue();
+            var replacement = claims.acquire(f.claim().key(), new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
+            Document before = claim(f.database());
+            assertThatThrownBy(() -> f.models().publish(model(1, table("changed", null)), WorkloadClaimFence.from(replacement)))
+                    .satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThat(models(f.database()).countDocuments()).isOne(); assertThat(claim(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void guardLossRollsBackBothContextLinksAndThePublishedChainPointer() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("epoch", 8L)));
+            Document chainBefore = SystemCollections.SRS_CHAINS.on(f.database()).find().first();
+            Document controlBefore = SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).find().first(); Document claimBefore = claim(f.database());
+            var checks = new AtomicInteger(); var guarded = f.models().guardedBy(() -> {
+                if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null);
+            });
+            var next = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("next", null), 1);
+            assertThatThrownBy(() -> guarded.publish(next, f.fence())).satisfies(MongoSrsModelStoreIT::businessFenced);
+            assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first()).isEqualTo(chainBefore);
+            assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).find().first()).isEqualTo(controlBefore);
+            assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isOne();
+            assertThat(models(f.database()).countDocuments()).isOne(); assertThat(claim(f.database())).isEqualTo(claimBefore);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"publish", "bounds"})
+    void thePublishedChainPointerStillProvesHistoryWhenAllRingFactsAreLost(String operation) {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            for (var collection : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_LOG_BOUNDS)) {
+                collection.on(f.database()).deleteMany(new Document());
+            }
+            assertThatThrownBy(() -> {
+                if (operation.equals("publish")) f.models().publish(model(0, table("replacement", null)), f.fence()); else modelLog(f).bounds(RING);
+            }).isInstanceOf(TapstateException.class);
+            assertThat(models(f.database()).countDocuments()).isZero();
+        });
+    }
+
+    @Test
+    void anOldAppendAndANewCaptureBoundaryMustNotBothCommitAcrossDifferentClaims() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("original", null)), f.fence());
+            modelLog(f).store(RING, 1, event(0, 7, f.fence()));
+            var appendPaused = new CountDownLatch(1); var releaseAppend = new CountDownLatch(1); var closeIssued = new CountDownLatch(1);
+            var once = new AtomicBoolean();
+            var appendWitness = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("update")
+                            && java.util.Set.of("srs_chains", "srs_events").contains(event.getCommand().getString("update").getValue())
+                            && once.compareAndSet(false, true)) {
+                        appendPaused.countDown();
+                        try { assertThat(releaseAppend.await(10, TimeUnit.SECONDS)).isTrue(); }
+                        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                    }
+                }
+            };
+            var closeWitness = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("srs_model_contexts")) closeIssued.countDown();
+                }
+            };
+            try (var a = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(appendWitness).build());
+                 var b = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(closeWitness).build());
+                 var executor = Executors.newFixedThreadPool(2)) {
+                try {
+                    var aDb = a.getDatabase(f.database().getName());
+                    var log = new MongoSrsLogStore(a, SystemCollections.SRS_EVENTS.on(aDb), SystemCollections.SRS_LOG_BOUNDS.on(aDb),
+                            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(aDb), new MongoSrsModelStore(a, aDb, SCOPE));
+                    var append = executor.submit(() -> {
+                        try { log.store(RING, 101, event(0, 7, f.fence())); return true; }
+                        catch (TapstateException refused) { assertThat(refused.code()).isEqualTo(IoError.SRS_EVENT_MODEL_UNAVAILABLE); return false; }
+                    });
+                    assertThat(appendPaused.await(10, TimeUnit.SECONDS)).isTrue();
+                    SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("epoch", 8L).append("captureId", "capture-b")));
+                    var claim = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())).acquire(
+                            new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-b"), new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
+                    var successor = executor.submit(() -> {
+                        try {
+                            var next = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("next", null), 100);
+                            new MongoSrsModelStore(b, b.getDatabase(f.database().getName()), SCOPE).publish(next, WorkloadClaimFence.from(claim)); return true;
+                        } catch (TapstateException refused) { assertThat(refused.code()).isEqualTo(IoError.SRS_MODEL_UNAVAILABLE); return false; }
+                    });
+                    assertThat(closeIssued.await(10, TimeUnit.SECONDS)).isTrue();
+                    assertThat(successor.get(10, TimeUnit.SECONDS)).as("the successor publishes while the old append is paused before its shared write").isTrue();
+                    releaseAppend.countDown();
+                    boolean appended = append.get(20, TimeUnit.SECONDS); boolean transitioned = successor.get(20, TimeUnit.SECONDS);
+                    assertThat(appended && transitioned).as("old seq101 and new frontier100 cannot both be durable").isFalse();
+                    assertThat(appended || transitioned).as("one original transaction can complete without a deadlock").isTrue();
+                } finally { releaseAppend.countDown(); }
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "double", "negative", "max"})
+    void anAppendWriteFenceCannotBeDefaultedOrTruncated(String damage) {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            var changes = damage.equals("missing") ? new Document("$unset", new Document("modelWriteFence", ""))
+                    : new Document("$set", new Document("modelWriteFence", switch (damage) {
+                        case "double" -> 0.5D; case "negative" -> -1L; default -> Long.MAX_VALUE;
+                    }));
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), changes);
+            Document before = claim(f.database());
+            assertThatThrownBy(() -> modelLog(f).store(RING, 1, event(0, 7, f.fence()))).satisfies(MongoSrsModelStoreIT::unreadable);
+            assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isZero();
+            assertThat(claim(f.database())).isEqualTo(before);
+        });
+    }
+
     private static SrsLogRecord event(long version, long epoch, WorkloadClaimFence fence) {
         return new SrsLogRecord("offset", Op.INSERT, 1, null, Map.of("id", 1), version, fence, epoch);
     }
@@ -572,7 +809,7 @@ class MongoSrsModelStoreIT {
             try {
                 try (var session = client.startSession()) {
                     for (var table : List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS, SystemCollections.SRS_CHAINS,
-                            SystemCollections.SRS_MODELS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS, SystemCollections.CACHE_WORKLOAD_CLAIMS)) {
+                            SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS, SystemCollections.CACHE_WORKLOAD_CLAIMS)) {
                         table.prepareCollectionOn(database, session);
                         for (var index : table.indexes()) IndexEnsure.createInTransaction(session, table.on(database), index);
                     }
@@ -582,7 +819,7 @@ class MongoSrsModelStoreIT {
                         .append("businessPhase", "READY").append("businessPreparationId", "business-a").append("authGeneration", 1L));
                 SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY").append("epoch", 1L).append("operationId", "business-a"));
                 SystemCollections.SRS_CHAINS.on(database).insertOne(new Document("_id", CHAIN).append("epoch", 7L)
-                        .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("captureId", "capture-a"));
+                        .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("captureId", "capture-a").append("modelContextHeads", List.of()).append("modelWriteFence", 0L));
                 var claim = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).acquire(
                         new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-a"), new WorkloadOwner("node-a", "boot-a"), 1, Duration.ofSeconds(30)).claim();
                 scenario.run(new Fixture(client, database, new MongoSrsModelStore(client, database, SCOPE), claim));

@@ -61,3 +61,4 @@ srs_log_bounds | cache | MongoSrsLogStore | migrated | 1 | -
 workload_claims | cache | MongoWorkloadClaimStore | owned-elsewhere | 1 | -
 srs_chains | cache | MongoSrsMetaStore | migrated | 1 | -
 srs_models | cache | MongoSrsModelStore | immutable | 1 | cacheIncarnation+ringName+_id.captureContext.epoch+_id.modelVersion (unique)
+srs_model_contexts | cache | MongoSrsModelStore | migrated | 1 | cacheIncarnation+ringName+_id.captureContext.epoch (unique)

@@ -208,7 +208,9 @@ public enum SystemCollections {
     CACHE_WORKLOAD_CLAIMS("workload_claims", Database.CACHE, MongoWorkloadClaimStore.class, Strategy.OWNED_ELSEWHERE, 1),
     SRS_CHAINS("srs_chains", Database.CACHE, MongoSrsMetaStore.class, Strategy.MIGRATED, 1),
     SRS_MODELS("srs_models", Database.CACHE, MongoSrsModelStore.class, Strategy.IMMUTABLE, 1,
-            new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch", "_id.modelVersion"), true, "srs_models_ring_version"));
+            new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch", "_id.modelVersion"), true, "srs_models_ring_version")),
+    SRS_MODEL_CONTEXTS("srs_model_contexts", Database.CACHE, MongoSrsModelStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch"), true, "srs_model_contexts_ring"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

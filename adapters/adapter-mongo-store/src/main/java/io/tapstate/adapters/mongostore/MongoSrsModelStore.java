@@ -34,6 +34,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
+    private final MongoSrsModelContexts contexts;
 
     public MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope) {
         this(client, database, scope, () -> {});
@@ -41,6 +42,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
     private MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = requireActive;
+        this.contexts = new MongoSrsModelContexts(database, scope);
     }
     @Override public MongoSrsModelStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
@@ -51,34 +53,47 @@ public final class MongoSrsModelStore implements SrsModelStore {
         requireScope(model.key());
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())) throw claimFenced();
         Document captured = document(model);
-        // Preflight the canonical typed representation before entering a retryable transaction.
         if (!decode(captured).equals(model)) throw unavailable(model.key());
         return transaction(session -> {
             requireBusiness(session);
-            Document chain = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", model.key().miningChainId())).first();
-            if (chain == null || !(chain.get("epoch") instanceof Long epoch) || epoch != model.key().captureEpoch()
-                    || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))
+            Document chain = requireChain(session, model.key());
+            if (!Long.valueOf(model.key().captureEpoch()).equals(chain.get("epoch"))
                     || !fence.key().resourceId().equals(chain.get("captureId"))) throw unavailable(model.key());
             if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_CAPTURE)
                     .getMatchedCount() != 1) throw claimFenced();
+            Document anchor = contexts.head(chain, model.key().table());
+            var control = contexts.find(session, model.key());
             var models = SystemCollections.SRS_MODELS.on(database);
             Document existing = models.find(session, new Document("_id", key(model.key()))).first();
-            SrsLogBounds observed = requireRing(session, model);
-            if (existing != null) {
-                if (!decode(existing).equals(model)) throw conflict(model.key());
-                return model;
-            }
-            Document head = models.find(session, context(model.ringName(), model.key().captureEpoch()))
-                    .sort(new Document("_id.modelVersion", -1)).limit(1).first();
-            if (head == null) {
-                if (model.key().modelVersion() != 0) throw unavailable(model.key());
+            if (control != null) {
+                contexts.requireAnchor(session, chain, control);
+                if (anchor == null || !control.id().equals(anchor.get("contextId")) || control.nextId() != null
+                        || !fence.equals(control.fence()) || !model.ringName().equals(control.ring())) throw unavailable(model.key());
+                requireRing(session, model, false);
+                SrsModel previous = requirePublishedHead(session, control);
+                if (existing != null) {
+                    if (!decode(existing).equals(model)) throw conflict(model.key());
+                    if (model.key().modelVersion() > control.publishedVersion()) throw unavailable(model.key());
+                    return model;
+                }
+                if (model.key().modelVersion() != control.publishedVersion() + 1 || model.ddlSequence() <= previous.ddlSequence()) throw unavailable(model.key());
+                SrsLogBounds observed = requireRing(session, model, false);
+                if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
+                contexts.replace(session, control, contexts.advance(control, model, captured.getString("contentHash")));
             } else {
-                SrsModel previous = decode(head);
-                if (!previous.key().miningChainId().equals(model.key().miningChainId()) || !previous.key().table().equals(model.key().table())
-                        || model.key().modelVersion() != previous.key().modelVersion() + 1
-                        || model.ddlSequence() <= previous.ddlSequence()) throw unavailable(model.key());
+                if (existing != null || model.key().modelVersion() != 0) throw unavailable(model.key());
+                MongoSrsModelContexts.Context previous = anchor == null ? null : contexts.require(session, anchor.get("contextId", Document.class));
+                if (previous != null) {
+                    contexts.requireAnchor(session, chain, previous); requirePublishedHead(session, previous);
+                    if (!previous.ring().equals(model.ringName()) || previous.key().captureEpoch() >= model.key().captureEpoch()) throw unavailable(model.key());
+                }
+                SrsLogBounds observed = requireRing(session, model, previous == null);
+                if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
+                var initial = contexts.initial(model, fence, captured.getString("contentHash"));
+                if (previous != null) contexts.replace(session, previous, contexts.close(previous, initial));
+                contexts.insert(session, initial);
+                contexts.setHead(session, chain, initial);
             }
-            if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
             models.insertOne(session, captured);
             return model;
         });
@@ -87,9 +102,49 @@ public final class MongoSrsModelStore implements SrsModelStore {
         requireScope(key);
         return transaction(session -> {
             requireBusiness(session);
-            return Optional.ofNullable(SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", key(key))).first())
-                    .map(this::decode);
+            Document chain = requireChain(session, key);
+            Document anchor = contexts.head(chain, key.table());
+            var control = contexts.find(session, key);
+            Document stored = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", key(key))).first();
+            if (control == null) {
+                if (stored != null || anchor != null) throw unavailable(key);
+                return Optional.empty();
+            }
+            contexts.requireAnchor(session, chain, control);
+            requirePublishedHead(session, control);
+            if (stored == null) {
+                if (key.modelVersion() <= control.publishedVersion()) throw unavailable(key);
+                return Optional.empty();
+            }
+            SrsModel model = decode(stored); requirePublished(control, model);
+            return Optional.of(model);
         });
+    }
+
+    private SrsModel requirePublishedHead(ClientSession session, MongoSrsModelContexts.Context control) {
+        Document stored = SystemCollections.SRS_MODELS.on(database).find(session,
+                new Document("_id", key(version(control, control.publishedVersion())))).first();
+        if (stored == null) throw unavailable(control.key());
+        SrsModel model = decode(stored); requirePublished(control, model);
+        if (!control.publishedHash().equals(stored.get("contentHash")) || model.ddlSequence() != control.publishedSequence()) throw unreadable();
+        return model;
+    }
+    private static SrsModelKey version(MongoSrsModelContexts.Context control, long version) {
+        var key = control.key();
+        return new SrsModelKey(key.miningChainId(), key.table(), key.cacheIncarnation(), key.captureEpoch(), version);
+    }
+    private void requirePublished(MongoSrsModelContexts.Context control, SrsModel model) {
+        if (!MongoSrsModelContexts.contextId(model.key()).equals(control.id()) || !model.ringName().equals(control.ring())
+                || model.key().modelVersion() > control.publishedVersion() || model.ddlSequence() < control.firstSequence()
+                || (model.key().modelVersion() == 0 && model.ddlSequence() != control.firstSequence())
+                || model.ddlSequence() > control.publishedSequence()) throw unavailable(model.key());
+    }
+    private Document requireChain(ClientSession session, SrsModelKey key) {
+        Document chain = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", key.miningChainId())).first();
+        if (chain == null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))) throw unavailable(key);
+        if (!(chain.get("epoch") instanceof Long epoch) || epoch < 1 || !(chain.get("captureId") instanceof String capture) || capture.isBlank()
+                || !(chain.get("modelWriteFence") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE) throw unreadable();
+        return chain;
     }
 
     boolean belongsTo(MongoClient expectedClient, String expectedDatabase) {
@@ -98,22 +153,39 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     void checkDomain(ClientSession session) { requireActive.run(); requireBusiness(session); }
 
-    /** An empty unseen ring may be inspected, but its first event still requires a published actual model. */
+    /** An unseen ring may be inspected only when no published ordering anchor or retained data contradicts it. */
     void checkRing(ClientSession session, String ring) {
         Document retained = SystemCollections.SRS_MODELS.on(database).find(session,
                 new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).first();
+        var control = contexts.firstOnRing(session, ring);
         Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(ring))).first();
-        if (retained == null) {
-            if (bounds != null || SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null) {
+        if (control == null) {
+            Document known = SystemCollections.SRS_CHAINS.on(database).find(session,
+                    new Document("cacheIncarnation", scope.cacheIncarnation()).append("modelContextHeads.ringName", ring)).first();
+            if (known != null || retained != null || bounds != null
+                    || SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null) {
                 throw eventUnavailable(ring, 0, 0);
             }
         } else {
+            if (bounds == null || retained == null) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
+            try { contexts.requireAnchor(session, requireChain(session, control.key()), control); }
+            catch (TapstateException missing) {
+                if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
+                throw missing;
+            }
             var model = decode(retained);
-            if (bounds == null) throw eventUnavailable(ring, model.key().captureEpoch(), model.key().modelVersion());
+            if (!model.ringName().equals(ring)) throw unreadable();
         }
     }
 
     EventModelRange requireEvent(ClientSession session, String ring, SrsLogRecord event, boolean writing) {
+        try { return eventRange(session, ring, event, writing); }
+        catch (TapstateException missing) {
+            if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+            throw missing;
+        }
+    }
+    private EventModelRange eventRange(ClientSession session, String ring, SrsLogRecord event, boolean writing) {
         if (event.schemaVer() < 0 || event.epoch() < 1 || event.captureFence() == null) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
         var fence = event.captureFence();
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())) throw claimFenced();
@@ -122,35 +194,44 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 .limit(2).into(new java.util.ArrayList<>());
         if (candidates.isEmpty()) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
         if (candidates.size() != 1) throw unreadable();
-        var model = decode(candidates.getFirst());
-        Document chain = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", model.key().miningChainId())).first();
-        if (chain == null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))
-                || !fence.key().resourceId().equals(chain.get("captureId"))) throw claimFenced();
-        if (!(chain.get("epoch") instanceof Long current) || current < 1) throw unreadable();
-        // Historical reads retain their original epoch; only a new append must still own the live capture.
-        if (writing && current != event.epoch()) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
-        Document next = SystemCollections.SRS_MODELS.on(database).find(session, context(ring, event.epoch())
-                .append("_id.modelVersion", new Document("$gt", event.schemaVer())))
-                .sort(new Document("_id.modelVersion", 1)).limit(1).first();
-        Long nextSequence = null;
-        if (next != null) {
-            var successor = decode(next);
-            if (!successor.key().miningChainId().equals(model.key().miningChainId()) || !successor.key().table().equals(model.key().table())
-                    || successor.ddlSequence() <= model.ddlSequence()) throw unreadable();
-            if (successor.key().modelVersion() != model.key().modelVersion() + 1) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
-            nextSequence = successor.ddlSequence();
+        SrsModel model = decode(candidates.getFirst());
+        Document chain = requireChain(session, model.key());
+        var control = contexts.find(session, model.key());
+        if (control == null) throw unavailable(model.key());
+        contexts.requireAnchor(session, chain, control);
+        if (!fence.equals(control.fence())) throw claimFenced();
+        if (writing && (!fence.key().resourceId().equals(chain.get("captureId"))
+                || !Long.valueOf(event.epoch()).equals(chain.get("epoch")) || control.nextId() != null)) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+        requirePublished(control, model);
+        requirePublishedHead(session, control);
+        Long end = null;
+        if (event.schemaVer() < control.publishedVersion()) {
+            Document next = SystemCollections.SRS_MODELS.on(database).find(session,
+                    new Document("_id", key(version(control, event.schemaVer() + 1)))).first();
+            if (next == null) throw unavailable(model.key());
+            SrsModel successor = decode(next); requirePublished(control, successor);
+            if (successor.ddlSequence() <= model.ddlSequence()) throw unreadable();
+            end = successor.ddlSequence();
         }
-        Document nextCapture = SystemCollections.SRS_MODELS.on(database).find(session,
-                new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)
-                        .append("_id.captureContext.epoch", new Document("$gt", event.epoch())))
-                .sort(new Document("_id.captureContext.epoch", 1).append("_id.modelVersion", 1)).limit(1).first();
-        if (nextCapture != null) {
-            var initial = decode(nextCapture);
-            if (!initial.key().miningChainId().equals(model.key().miningChainId()) || !initial.key().table().equals(model.key().table())) throw unreadable();
-            if (initial.key().modelVersion() != 0) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
-            nextSequence = nextSequence == null ? initial.ddlSequence() : Math.min(nextSequence, initial.ddlSequence());
+        if (control.nextId() != null) {
+            var next = contexts.require(session, control.nextId());
+            if (!next.ring().equals(ring) || !control.nextSequence().equals(next.firstSequence())) throw unreadable();
+            Document initial = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", key(next.key()))).first();
+            if (initial == null) throw unavailable(next.key());
+            SrsModel successor = decode(initial); requirePublished(next, successor);
+            end = end == null ? next.firstSequence() : Math.min(end, next.firstSequence());
         }
-        return new EventModelRange(model.ddlSequence(), nextSequence);
+        if (writing) {
+            // Capture replacement and context closure both write this root, including when claim IDs differ.
+            Document expected = new Document("_id", chain.get("_id")).append("cacheIncarnation", scope.cacheIncarnation())
+                    .append("epoch", event.epoch()).append("captureId", fence.key().resourceId())
+                    .append("modelContextHeads", chain.get("modelContextHeads")).append("modelWriteFence", chain.get("modelWriteFence"));
+            if (SystemCollections.SRS_CHAINS.on(database).updateOne(session, expected,
+                    new Document("$inc", new Document("modelWriteFence", 1L))).getMatchedCount() != 1) {
+                throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+            }
+        }
+        return new EventModelRange(model.ddlSequence(), end);
     }
 
     record EventModelRange(long firstSequence, Long nextSequence) {
@@ -161,16 +242,12 @@ public final class MongoSrsModelStore implements SrsModelStore {
         }
     }
 
-    private Document context(String ring, long epoch) {
-        return new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring).append("_id.captureContext.epoch", epoch);
-    }
-
     private static TapstateException eventUnavailable(String ring, long epoch, long version) {
         return new TapstateException(IoError.SRS_EVENT_MODEL_UNAVAILABLE,
                 Map.of("ring", ring, "epoch", String.valueOf(epoch), "version", String.valueOf(version)), null);
     }
 
-    private SrsLogBounds requireRing(ClientSession session, SrsModel model) {
+    private SrsLogBounds requireRing(ClientSession session, SrsModel model, boolean firstContext) {
         Document retained = SystemCollections.SRS_MODELS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
                 .append("ringName", model.ringName())).first();
         if (retained != null) {
@@ -182,8 +259,11 @@ public final class MongoSrsModelStore implements SrsModelStore {
         Document filter = new Document("_id", MongoSrsLogStore.boundsId(model.ringName()));
         var bounds = SystemCollections.SRS_LOG_BOUNDS.on(database);
         Document stored = bounds.find(session, filter).first();
+        if (firstContext && (retained != null || stored != null || contexts.firstOnRing(session, model.ringName()) != null
+                || SystemCollections.SRS_CHAINS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
+                        .append("modelContextHeads.ringName", model.ringName())).first() != null)) throw unavailable(model.key());
         if (stored == null) {
-            if (retained != null || SystemCollections.SRS_EVENTS.on(database).find(session,
+            if (!firstContext || retained != null || SystemCollections.SRS_EVENTS.on(database).find(session,
                     MongoSrsLogStore.ringRange(model.ringName(), Long.MAX_VALUE)).limit(1).first() != null) throw unavailable(model.key());
             bounds.insertOne(session, new Document(filter).append("largestSequence", -1L).append("trimmedThrough", -1L));
             return new SrsLogBounds(-1L, -1L);
