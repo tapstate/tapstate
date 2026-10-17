@@ -1,6 +1,9 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.spi.store.RequiredNoteOrigin;
+import io.tapstate.spi.store.RequiredNoteScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -30,7 +33,12 @@ public final class SharedSinkConnectors {
 
     synchronized PdkConnector acquire(PipelineNode node, PipelineNode.Purpose purpose, String connectorId,
             ConnectorRef ref, Supplier<PdkConnector> start) {
-        Key key = new Key(node, purpose, connectorId, ref.contentHash());
+        return acquire(node, purpose, connectorId, ref, null, start);
+    }
+
+    synchronized PdkConnector acquire(PipelineNode node, PipelineNode.Purpose purpose, String connectorId,
+            ConnectorRef ref, NoteIdentity notes, Supplier<PdkConnector> start) {
+        Key key = new Key(node, purpose, connectorId, ref.contentHash(), notes);
         Lease lease = leases.get(key);
         if (lease == null) {
             lease = new Lease(start.get());
@@ -46,7 +54,12 @@ public final class SharedSinkConnectors {
     }
 
     synchronized void release(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, ConnectorRef ref) {
-        Key key = new Key(node, purpose, connectorId, ref.contentHash());
+        release(node, purpose, connectorId, ref, null);
+    }
+
+    synchronized void release(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, ConnectorRef ref,
+            NoteIdentity notes) {
+        Key key = new Key(node, purpose, connectorId, ref.contentHash(), notes);
         Lease lease = leases.get(key);
         if (lease == null) {
             throw new IllegalStateException("released a shared connector of " + node + " that nothing holds");
@@ -64,11 +77,23 @@ public final class SharedSinkConnectors {
     }
 
     synchronized int holders(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, ConnectorRef ref) {
-        Lease lease = leases.get(new Key(node, purpose, connectorId, ref.contentHash()));
+        Lease lease = leases.get(new Key(node, purpose, connectorId, ref.contentHash(), null));
         return lease == null ? 0 : lease.holders;
     }
 
-    private record Key(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, String contentHash) {
+    /** Existing authority and exact configured facts, never a new lease or a latest-context lookup. */
+    record NoteIdentity(WorkloadClaimFence execution, RequiredNoteScope primary, RequiredNoteScope global,
+            RequiredNoteOrigin origin) {
+        NoteIdentity {
+            Objects.requireNonNull(execution, "execution");
+            Objects.requireNonNull(primary, "primary");
+            Objects.requireNonNull(global, "global");
+            Objects.requireNonNull(origin, "origin");
+        }
+    }
+
+    private record Key(PipelineNode node, PipelineNode.Purpose purpose, String connectorId, String contentHash,
+            NoteIdentity notes) {
         Key {
             Objects.requireNonNull(node, "node");
             if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {

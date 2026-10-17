@@ -6,6 +6,11 @@ import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimType;
+import java.util.Objects;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import io.tapstate.spi.sink.TargetTable;
@@ -24,6 +29,16 @@ public final class PdkSinkPort implements SinkPort {
     private final KeyedStateStore stateStore;
     private final SharedSinkConnectors sharing;
     private final PipelineNode.Purpose purpose;
+    private final ConnectorNoteScopes noteScopes;
+    private final WorkloadClaimFence execution;
+
+    /** Configured writes use already prepared CONFIG notes and the caller's fixed run authority. */
+    public static PdkSinkPort withRequiredNotes(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
+            SharedSinkConnectors sharing, PipelineNode.Purpose purpose, ConnectorNoteScopes noteScopes,
+            WorkloadClaimFence execution) {
+        return new PdkSinkPort(provisioner, stateStore, sharing, purpose,
+                Objects.requireNonNull(noteScopes, "noteScopes"), Objects.requireNonNull(execution, "execution"));
+    }
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkSinkPort(ConnectorProvisioner provisioner) {
@@ -44,10 +59,17 @@ public final class PdkSinkPort implements SinkPort {
 
     public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, SharedSinkConnectors sharing,
             PipelineNode.Purpose purpose) {
+        this(provisioner, stateStore, sharing, purpose, null, null);
+    }
+
+    private PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, SharedSinkConnectors sharing,
+            PipelineNode.Purpose purpose, ConnectorNoteScopes noteScopes, WorkloadClaimFence execution) {
         if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
             throw new IllegalArgumentException("sink purpose must be view or sync");
         }
         this.purpose = purpose;
+        this.noteScopes = noteScopes;
+        this.execution = execution;
         this.provisioner = provisioner;
         this.stateStore = stateStore;
         this.sharing = sharing;
@@ -60,7 +82,9 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
-        return open(config, provisioner.resolve(config.connectorId()), targets, false);
+        requireActive();
+        ConnectorRef ref = provisioner.resolve(config.connectorId());
+        return open(config, ref, targets, false, configuredDrive(config, ref));
     }
 
     /**
@@ -72,14 +96,17 @@ public final class PdkSinkPort implements SinkPort {
      * sink on this member share one, started by the first of them and stopped by the last.
      */
     public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
-        PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values(), purpose);
+        requireActive();
         ConnectorRef ref = provisioner.resolve(config.connectorId());
+        ConfiguredDrive drive = configuredDrive(config, ref);
+        SharedSinkConnectors.NoteIdentity identity = drive.identity();
+        PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values(), purpose);
         if (sharing == null || config.node() == null || !ref.shareSafe()) {
-            return open(config, ref, targets, true);
+            return open(config, ref, targets, true, drive);
         }
-        PdkConnector connector = sharing.acquire(config.node(), purpose, config.connectorId(), ref,
-                () -> started(config, ref));
-        Runnable letGo = () -> sharing.release(config.node(), purpose, config.connectorId(), ref);
+        PdkConnector connector = sharing.acquire(config.node(), purpose, config.connectorId(), ref, identity,
+                () -> started(config, ref, drive));
+        Runnable letGo = () -> sharing.release(config.node(), purpose, config.connectorId(), ref, identity);
         try {
             return writerOver(connector, config, targets, letGo);
         } catch (Throwable t) {
@@ -105,9 +132,9 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     /** A connector opened and started for the writers that will share it, stopped again if it fails to start. */
-    private PdkConnector started(SinkConfig config, ConnectorRef ref) {
+    private PdkConnector started(SinkConfig config, ConnectorRef ref, ConfiguredDrive drive) {
         PdkConnector connector = PdkConnector.open(
-                config.connectorId(), ref, config.settings(), config.node(), stateStore, null, null, purpose);
+                config.connectorId(), ref, config.settings(), config.node(), stateStore, null, drive.scopes(), purpose);
         try {
             connector.underLoader(() -> {
                 connector.connector().init(connector.context());
@@ -129,9 +156,12 @@ public final class PdkSinkPort implements SinkPort {
      * as it was when each writer prepared its own tables.
      */
     public void prepare(SinkConfig config, Map<String, TargetTable> targets) {
+        requireActive();
+        ConnectorRef ref = provisioner.resolve(config.connectorId());
+        ConfiguredDrive drive = configuredDrive(config, ref);
         PdkConnector connector = PdkConnector.open(
-                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                config.node(), stateStore, null, null, purpose);
+                config.connectorId(), ref, config.settings(),
+                config.node(), stateStore, null, drive.scopes(), purpose);
         try {
             connector.underLoader(() -> {
                 connector.connector().init(connector.context());
@@ -156,9 +186,9 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     private SinkWriter open(SinkConfig config, ConnectorRef ref, Map<String, TargetTable> targets,
-            boolean preparedAhead) {
+            boolean preparedAhead, ConfiguredDrive drive) {
         PdkConnector connector = PdkConnector.open(config.connectorId(), ref, config.settings(), config.node(),
-                stateStore, null, null, purpose);
+                stateStore, null, drive.scopes(), purpose);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());
@@ -183,6 +213,42 @@ public final class PdkSinkPort implements SinkPort {
             connector.close();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
+    }
+
+    private void requireActive() {
+        if (noteScopes != null) noteScopes.requireActive();
+    }
+
+    private record ConfiguredDrive(SharedSinkConnectors.NoteIdentity identity, ConnectorNoteScopes scopes) { }
+
+    private ConfiguredDrive configuredDrive(SinkConfig config, ConnectorRef ref) {
+        if (noteScopes == null) return new ConfiguredDrive(null, null);
+        requireActive();
+        if (config.node() == null || execution.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || execution.executionGeneration() < 1 || !config.node().pipelineId().equals(execution.key().resourceId())) {
+            throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+        }
+        var primary = noteScopes.open(ConnectorStateNamespace.of(config.node(), purpose));
+        var global = noteScopes.open(ConnectorStateNamespace.GLOBAL);
+        if (primary.owner().kind() != RequiredNoteOwner.Kind.PIPELINE
+                || !primary.owner().ownerId().equals(config.node().pipelineId()) || !primary.owner().hasPurpose(purpose)
+                || global.owner().kind() != RequiredNoteOwner.Kind.GLOBAL
+                || !global.owner().ownerId().equals(execution.key().clusterId())
+                || primary.owner().bindingVersion() != global.owner().bindingVersion()) {
+            throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+        }
+        var origin = noteScopes.store().origin(primary);
+        if (!origin.equals(ConnectorNoteOrigin.capture(config.connectorId(), ref.contentHash(), config.settings()))) {
+            throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
+        }
+        requireActive();
+        var identity = new SharedSinkConnectors.NoteIdentity(execution, primary, global, origin);
+        ConnectorNoteScopes fixed = ConnectorNoteScopes.of(noteScopes.store(), namespace -> {
+            if (namespace.equals(primary.owner().namespace())) return primary;
+            if (namespace.equals(global.owner().namespace())) return global;
+            throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+        }, noteScopes::requireActive);
+        return new ConfiguredDrive(identity, fixed);
     }
 
     private static WriteRecordFunction requireWriteFunction(WriteRecordFunction function) {
