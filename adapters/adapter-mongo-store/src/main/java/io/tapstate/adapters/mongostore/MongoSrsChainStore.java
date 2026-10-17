@@ -203,7 +203,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
         if (SystemCollections.SRS_CHAINS.on(database).replaceOne(session, new Document("_id", expected.get("_id"))
                 .append("epoch", expected.get("epoch")).append("modelWriteFence", revision), replacement).getMatchedCount() != 1) throw unproven(expected.getString("_id"));
     }
-    private SrsChainState decode(Document row) {
+    private SrsChainState decode(Document row) { return decode(row, scope, new MongoSrsModelContexts(database, scope)); }
+    static SrsChainState decode(Document row, CacheBusinessScope scope, MongoSrsModelContexts contexts) {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "captureId", "captureFence", "retention", "epoch",
                     "requestedTables", "servingTables", "modelContextHeads", "modelWriteFence", "checkpointRevision", "checkpoint", "checkpointAt", "consumerCount", "consumerRevision"))
@@ -214,7 +215,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     || (row.get("retention") != null && !(row.get("retention") instanceof String))) throw unreadable();
             var fence = WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class));
             if (!scope.clusterId().equals(fence.key().clusterId()) || !fence.key().resourceId().equals(row.get("captureId"))) throw unreadable();
-            var heads = new MongoSrsModelContexts(database, scope).heads(row);
+            var heads = contexts.heads(row);
             if (epoch == 0 && (!heads.isEmpty() || !tableSet(row.get("servingTables")).isEmpty())) throw unreadable();
             SrsCaptureCheckpoint checkpoint = row.get("checkpoint") == null ? null : checkpointFrom(row.get("checkpoint", Document.class));
             if (row.get("checkpointAt") != null && !(row.get("checkpointAt") instanceof Date)) throw unreadable();

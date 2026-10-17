@@ -98,6 +98,63 @@ public final class MongoSrsModelStore implements SrsModelStore {
             return model;
         });
     }
+    @Override public Optional<Map<String, SrsModel>> publishedForNewSnapshot(String chainId, Map<String, String> tableRings) {
+        if (chainId == null || chainId.isBlank()) throw new IllegalArgumentException("blank mining chain");
+        Map<String, String> selected = Map.copyOf(Objects.requireNonNull(tableRings, "tableRings"));
+        if (selected.isEmpty() || selected.entrySet().stream().anyMatch(entry -> entry.getKey().isBlank() || entry.getValue().isBlank())
+                || Set.copyOf(selected.values()).size() != selected.size()) throw new IllegalArgumentException("invalid snapshot table rings");
+        return transaction(session -> {
+            requireSnapshotResources(); requireBusiness(session);
+            String firstTable = selected.keySet().iterator().next();
+            Document chain = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chainId)).first();
+            if (chain == null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))) {
+                throw unavailable(new SrsModelKey(chainId, firstTable, scope.cacheIncarnation(), 1, 0));
+            }
+            var checkpoint = MongoSrsChainStore.decode(chain, scope, contexts).checkpoint();
+            var result = new java.util.TreeMap<String, SrsModel>();
+            for (var entry : new java.util.TreeMap<>(selected).entrySet()) {
+                String table = entry.getKey(); String ring = entry.getValue();
+                Document anchor = contexts.head(chain, table);
+                if (anchor == null) {
+                    if (checkpoint != null && checkpoint.tables().containsKey(table)) throw unavailable(checkpoint.tables().get(table).model());
+                    Document identity = new Document("_id.chain", chainId).append("_id.table", table)
+                            .append("_id.captureContext.cacheIncarnation", scope.cacheIncarnation());
+                    if (SystemCollections.SRS_MODELS.on(database).find(session, identity).limit(1).first() != null
+                            || SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session, identity).limit(1).first() != null) {
+                        throw unavailable(new SrsModelKey(chainId, table, scope.cacheIncarnation(), 1, 0));
+                    }
+                    if (SystemCollections.SRS_MODELS.on(database).find(session,
+                            new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).limit(1).first() != null
+                            || contexts.firstOnRing(session, ring) != null
+                            || SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(ring))).first() != null
+                            || SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null
+                            || SystemCollections.SRS_CHAINS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
+                                    .append("modelContextHeads.ringName", ring)).limit(1).first() != null) {
+                        throw unavailable(new SrsModelKey(chainId, table, scope.cacheIncarnation(), 1, 0));
+                    }
+                    continue;
+                }
+                var control = contexts.require(session, anchor.get("contextId", Document.class));
+                contexts.requireAnchor(session, chain, control);
+                if (!ring.equals(control.ring()) || control.nextId() != null) throw unavailable(control.key());
+                SrsModel model = requirePublishedHead(session, control);
+                Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,
+                        new Document("_id", MongoSrsLogStore.boundsId(ring))).first();
+                if (bounds == null) throw unavailable(model.key());
+                requireBounds(bounds);
+                result.put(table, model);
+            }
+            return result.size() == selected.size() ? Optional.of(Map.copyOf(result)) : Optional.empty();
+        });
+    }
+
+    private void requireSnapshotResources() {
+        var names = java.util.List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS,
+                SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS).stream().map(SystemCollections::collectionName).toList();
+        var present = database.listCollections().filter(new Document("name", new Document("$in", names))).into(new java.util.ArrayList<>());
+        if (present.size() != names.size() || present.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadable();
+    }
+
     @Override public Optional<SrsModel> load(SrsModelKey key) {
         requireScope(key);
         return transaction(session -> loadInSession(session, key));
@@ -285,13 +342,16 @@ public final class MongoSrsModelStore implements SrsModelStore {
             bounds.insertOne(session, new Document(filter).append("largestSequence", -1L).append("trimmedThrough", -1L));
             return new SrsLogBounds(-1L, -1L);
         } else {
-            if (!stored.keySet().equals(Set.of("_id", "largestSequence", "trimmedThrough"))
-                    || !(stored.get("largestSequence") instanceof Long largest) || !(stored.get("trimmedThrough") instanceof Long trimmed)) throw unreadable();
-            try { new SrsLogBounds(largest, trimmed); }
-            catch (IllegalArgumentException invalid) { throw unreadable(); }
-            if (retained == null && largest >= 0) throw unavailable(model.key());
-            return new SrsLogBounds(largest, trimmed);
+            SrsLogBounds observed = requireBounds(stored);
+            if (retained == null && observed.largestSequence() >= 0) throw unavailable(model.key());
+            return observed;
         }
+    }
+    private static SrsLogBounds requireBounds(Document stored) {
+        if (!stored.keySet().equals(Set.of("_id", "largestSequence", "trimmedThrough"))
+                || !(stored.get("largestSequence") instanceof Long largest) || !(stored.get("trimmedThrough") instanceof Long trimmed)) throw unreadable();
+        try { return new SrsLogBounds(largest, trimmed); }
+        catch (IllegalArgumentException invalid) { throw unreadable(); }
     }
     private void requireBusiness(ClientSession session) { new MongoCacheBusinessIdentity(database, scope).requireReady(session); }
     private Document document(SrsModel model) {

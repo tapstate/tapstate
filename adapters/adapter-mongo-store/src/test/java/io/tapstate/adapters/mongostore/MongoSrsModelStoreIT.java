@@ -837,6 +837,192 @@ class MongoSrsModelStoreIT {
         });
     }
 
+    @Test
+    void aNewSnapshotWaitsAtPreparedEpochZeroWithoutCreatingAnyFacts() {
+        withBusiness(f -> {
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("epoch", 0L)));
+            var before = snapshotFacts(f.database());
+            assertThat(f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).isEmpty();
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void newSnapshotCandidatesAreActualPublishedModelsWithoutAcquiringCaptureAuthority() {
+        withBusiness(f -> {
+            var first = model(0, table("original", null)); f.models().publish(first, f.fence());
+            assertThat(new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())).release(f.claim())).isTrue();
+            var before = snapshotFacts(f.database());
+            Map<String, SrsModel> selected;
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                selected = new MongoSrsModelStore(other, other.getDatabase(f.database().getName()), SCOPE)
+                        .publishedForNewSnapshot(CHAIN, Map.of("orders", RING)).orElseThrow();
+            }
+            assertThat(selected).containsExactlyEntriesOf(Map.of("orders", first));
+            assertThatThrownBy(() -> selected.clear()).isInstanceOf(UnsupportedOperationException.class);
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+            assertThat(f.models().require(first.key())).isEqualTo(first);
+        });
+    }
+
+    @Test
+    void newSnapshotsSelectPublishedHeadsForTheWholeRequestedSetAndNeverChangeSavedReferences() {
+        withBusiness(f -> {
+            var first = model(0, table("original", null)); f.models().publish(first, f.fence());
+            var orders = table("id", null);
+            var customerTable = new SourceTable("customers", orders.fields(), orders.primaryKey(), orders.indexes());
+            var customerKey = new SrsModelKey(CHAIN, "customers", SCOPE.cacheIncarnation(), 7, 0);
+            String customerRing = "srs.chain-a.customers";
+            var customers = new SrsModel(customerKey, customerRing, customerTable, 0);
+            f.models().publish(customers, f.fence());
+            var selected = Map.of("orders", RING, "customers", customerRing);
+            var saved = f.models().publishedForNewSnapshot(CHAIN, selected).orElseThrow();
+            var changed = model(1, table("changed", null)); f.models().publish(changed, f.fence());
+            assertThat(f.models().publishedForNewSnapshot(CHAIN, selected)).hasValue(Map.of("orders", changed, "customers", customers));
+            assertThat(saved).containsExactlyInAnyOrderEntriesOf(Map.of("orders", first, "customers", customers));
+            assertThat(f.models().require(saved.get("orders").key())).isEqualTo(first);
+            assertThat(f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING, "waiting", "srs.chain-a.waiting"))).isEmpty();
+        });
+    }
+
+    @Test
+    void aNewSnapshotSelectsTheCurrentPublishedContextWithoutDependingOnUnreferencedOldPayloads() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("old", null)), f.fence());
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("epoch", 8L)));
+            var current = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("current", null), 1);
+            f.models().publish(current, f.fence());
+            models(f.database()).updateOne(new Document("_id.captureContext.epoch", 7L),
+                    new Document("$set", new Document("schema", new Document("corrupt", "raw-secret-sentinel"))));
+            assertThat(f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).hasValue(Map.of("orders", current));
+            assertThatThrownBy(() -> f.models().require(key(0))).satisfies(MongoSrsModelStoreIT::unreadable);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"body", "control", "bounds", "anchor"})
+    void aNewSnapshotCannotTreatKnownMissingPublishedFactsAsNotYetReady(String missing) {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            switch (missing) {
+                case "body" -> models(f.database()).deleteMany(new Document());
+                case "control" -> SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).deleteMany(new Document());
+                case "bounds" -> SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteMany(new Document());
+                case "anchor" -> SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(),
+                        new Document("$set", new Document("modelContextHeads", List.of())));
+                default -> throw new AssertionError(missing);
+            }
+            var before = snapshotFacts(f.database());
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SRS_CHAINS", "SRS_MODELS", "SRS_MODEL_CONTEXTS", "SRS_EVENTS", "SRS_LOG_BOUNDS"})
+    void losingAnEmptySnapshotResourceIsNotAnUnpublishedTable(String missing) {
+        withBusiness(f -> {
+            var resource = SystemCollections.valueOf(missing); resource.on(f.database()).drop();
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::unreadable);
+            assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain(resource.collectionName());
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retainedEventsOrTrimmedBoundsPreventUnpublishedSnapshotFallback(boolean trimmed) {
+        withBusiness(f -> {
+            var oldLog = new MongoSrsLogStore(f.client(), SystemCollections.SRS_EVENTS.on(f.database()),
+                    SystemCollections.SRS_LOG_BOUNDS.on(f.database()), SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            oldLog.store(RING, 1, event(0, 7, f.fence())); if (trimmed) oldLog.trim(RING, 1);
+            var before = snapshotFacts(f.database());
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void oneUnpublishedTableCannotHideAnotherRequestedTablesCorruptModel() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            models(f.database()).updateOne(new Document(), new Document("$set", new Document("schema", new Document("corrupt", "raw-secret-sentinel"))));
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("a-waiting", "srs.chain-a.waiting", "orders", RING)))
+                    .satisfies(MongoSrsModelStoreIT::unreadable);
+        });
+    }
+
+    @Test
+    void aPublishedRingCannotBeAliasedToAnUnpublishedSnapshotTable() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("customers", RING)))
+                    .satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", "different-ring")))
+                    .satisfies(MongoSrsModelStoreIT::unavailable);
+        });
+    }
+
+    @Test
+    void corruptBoundsAndLostBusinessContextNeverYieldSnapshotCandidates() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            SystemCollections.SRS_LOG_BOUNDS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("largestSequence", 0)));
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::unreadable);
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document(), new Document("$set", new Document("cacheIncarnation", "new-incarnation")));
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::businessFenced);
+        });
+    }
+
+    @Test
+    void aSnapshotSelectionGuardIsCheckedBeforeReturningAnyCandidate() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence()); var checks = new AtomicInteger();
+            var before = snapshotFacts(f.database());
+            var guarded = f.models().guardedBy(() -> {
+                if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null);
+            });
+            assertThatThrownBy(() -> guarded.publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::businessFenced);
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"retained", "absent", "null"})
+    void aRetainedRealCheckpointPreventsClassifyingLostPublishedHistoryAsWaiting(String checkpointBody) {
+        withBusiness(f -> {
+            SystemCollections.SRS_CHAINS.on(f.database()).deleteMany(new Document());
+            var chains = new MongoSrsChainStore(f.client(), f.database(), SCOPE);
+            chains.prepare(CHAIN, null, f.fence()); chains.requestTables(CHAIN, java.util.Set.of("orders"), f.fence());
+            assertThat(chains.openEpoch(CHAIN, 0, f.fence())).hasValue(1);
+            var first = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0), RING, table("id", null), 0);
+            f.models().publish(first, f.fence()); assertThat(chains.publishServingTables(CHAIN, 1, java.util.Set.of("orders"), f.fence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(
+                    io.tapstate.core.event.SourceOrder.snapshotRow(1), "snapshot-seam"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(first.key(), -1)));
+            assertThat(chains.checkpoint(CHAIN, 0, checkpoint, f.fence())).isPresent();
+            for (var resource : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS,
+                    SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_EVENTS)) resource.on(f.database()).deleteMany(new Document());
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("modelContextHeads", List.of())));
+            if (checkpointBody.equals("absent")) SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$unset", new Document("checkpoint", 1)));
+            if (checkpointBody.equals("null")) SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("checkpoint", null)));
+            var before = snapshotFacts(f.database());
+            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(failure -> {
+                if (checkpointBody.equals("retained")) unavailable(failure); else unreadable(failure);
+            });
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+
+    private static Map<String, List<Document>> snapshotFacts(MongoDatabase database) {
+        var facts = new java.util.TreeMap<String, List<Document>>();
+        for (var resource : List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS, SystemCollections.SRS_CHAINS,
+                SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS,
+                SystemCollections.SRS_LOG_BOUNDS, SystemCollections.CACHE_WORKLOAD_CLAIMS)) {
+            facts.put(resource.collectionName(), resource.on(database).find().sort(new Document("_id", 1)).into(new ArrayList<>()));
+        }
+        return facts;
+    }
+
     private static SrsLogRecord event(long version, long epoch, WorkloadClaimFence fence) {
         return new SrsLogRecord("offset", Op.INSERT, 1, null, Map.of("id", 1), version, fence, epoch);
     }
@@ -882,10 +1068,13 @@ class MongoSrsModelStoreIT {
                         .append("layoutId", MongoConfigurationDomain.LAYOUT).append("bindingVersion", 1L).append("cacheIncarnation", SCOPE.cacheIncarnation())
                         .append("businessPhase", "READY").append("businessPreparationId", "business-a").append("authGeneration", 1L));
                 SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY").append("epoch", 1L).append("operationId", "business-a"));
-                SystemCollections.SRS_CHAINS.on(database).insertOne(new Document("_id", CHAIN).append("epoch", 7L)
-                        .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("captureId", "capture-a").append("modelContextHeads", List.of()).append("modelWriteFence", 0L));
                 var claim = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).acquire(
                         new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-a"), new WorkloadOwner("node-a", "boot-a"), 1, Duration.ofSeconds(30)).claim();
+                SystemCollections.SRS_CHAINS.on(database).insertOne(new Document("_id", CHAIN).append("formatVersion", 1).append("epoch", 7L)
+                        .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("captureId", "capture-a")
+                        .append("captureFence", WorkloadClaimDocuments.stored(WorkloadClaimFence.from(claim))).append("retention", null)
+                        .append("requestedTables", List.of()).append("servingTables", List.of()).append("modelContextHeads", List.of()).append("modelWriteFence", 0L)
+                        .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L));
                 scenario.run(new Fixture(client, database, new MongoSrsModelStore(client, database, SCOPE), claim));
             } catch (Exception failure) { throw new AssertionError(failure); }
             finally { database.drop(); }
