@@ -171,6 +171,13 @@ class ControlPlaneConfiguration {
     // ---- authentication ports over the store (the counterpart to StoreConfiguration's StorePort) ----
 
     @Bean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    io.tapstate.control.core.AiProviderService aiProviderService(
+            io.tapstate.spi.store.AiProviderSettingsStore store, AuditGate auditGate) {
+        return new io.tapstate.control.core.AiProviderService(store, auditGate);
+    }
+
+    @Bean
     MongoAuthStores authStores(MongoConnection storeConnection) {
         return new MongoAuthStores(storeConnection);
     }

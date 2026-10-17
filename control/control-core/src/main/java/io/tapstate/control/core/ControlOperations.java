@@ -30,6 +30,13 @@ public final class ControlOperations {
     private static final Map<Frontend, Maturity> CLI_AND_REST =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT);
 
+    public static final Operation AI_PROVIDER_GET = new Operation("ai-provider.get", Scope.READ, false, null, "Read the current caller provider metadata without a credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_REPLACE = new Operation("ai-provider.replace", Scope.WRITE, true, null, "Replace the current caller encrypted provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_DELETE = new Operation("ai-provider.delete", Scope.WRITE, true, null, "Delete the current caller provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_ASSISTANT = new Operation("pipeline-draft.assistant", Scope.WRITE, false, null, "Stream a validated Pipeline Builder proposal without saving it.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_ASSISTANT_VALIDATE = new Operation("pipeline-draft.assistant-validate", Scope.READ, false, null, "Validate a Pipeline Builder proposal against the current draft revision.", CLI_AND_REST);
+
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
             "system.version", Scope.READ, false, ControlApiSchema.ref("system.version"),
@@ -345,6 +352,12 @@ public final class ControlOperations {
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
     private static final List<Operation> ALL = List.of(
+            AI_PROVIDER_GET,
+            AI_PROVIDER_REPLACE,
+            AI_PROVIDER_DELETE,
+            AI_PROVIDER_CHECK,
+            PIPELINE_DRAFT_ASSISTANT,
+            PIPELINE_DRAFT_ASSISTANT_VALIDATE,
             SYSTEM_VERSION,
             ARTIFACT_APPLY,
             ARTIFACT_VALIDATE,

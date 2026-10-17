@@ -167,6 +167,11 @@ connector.state-unreadable
 connector.state-value-unsupported
 connector.test-failed
 connector.write-failed
+control.ai-invalid-proposal
+control.ai-not-configured
+control.ai-overloaded
+control.ai-provider-auth-failed
+control.ai-provider-failed
 control.audit-blocked
 control.auth-failed
 control.auth-mode-unavailable
