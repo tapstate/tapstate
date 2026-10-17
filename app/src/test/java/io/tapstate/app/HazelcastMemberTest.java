@@ -659,7 +659,10 @@ class HazelcastMemberTest {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
                 .web(WebApplicationType.NONE)
                 .properties("tapstate.store.mongo.enabled=false",
-                        "tapstate.hz.jet.cooperative-thread-count=2")
+                        "tapstate.hz.jet.cooperative-thread-count=2",
+                        "tapstate.cluster.id=local-single",
+                        "tapstate.cluster.node-id=stable-single",
+                        "tapstate.control.advertise-url=http://localhost:28081")
                 .run()) {
             member = context.getBean(HazelcastInstance.class);
             assertThat(member.getLifecycleService().isRunning()).isTrue();
@@ -672,6 +675,12 @@ class HazelcastMemberTest {
             assertThat(member.getConfig().getJetConfig().getCooperativeThreadCount()).isEqualTo(2);
             // The Jet engine is up and reachable; no jobs exist at the substrate level.
             assertThat(member.getJet().getJobs()).isEmpty();
+            assertThat(new HazelcastLiveClusterMembers(member).members()).singleElement()
+                    .satisfies(live -> {
+                        assertThat(live.nodeId()).isEqualTo("stable-single");
+                        assertThat(live.bootId()).isEqualTo(context.getBean(BootId.class).value());
+                        assertThat(live.controlUrl()).isEqualTo("http://localhost:28081");
+                    });
         }
         // The member's lifecycle is bound to the context: closing the context shuts it down.
         assertThat(member.getLifecycleService().isRunning()).isFalse();

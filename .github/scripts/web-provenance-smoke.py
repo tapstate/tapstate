@@ -45,8 +45,11 @@ def add_blob(layout: Path, payload: bytes) -> str:
 def boot_jar(*, profile: str | None = "onprem", console_url: str | None = None,
              html: bytes = HTML, asset: bytes = ASSET,
              overrides: dict[str, str | None] | None = None,
-             extra_entry: tuple[str, bytes] | None = None) -> bytes:
+             extra_entry: tuple[str, bytes] | None = None,
+             producer: dict | None = None) -> bytes:
     files = {"index.html": html, "assets/app.js": asset}
+    if producer is not None:
+        files["tapstate-web-build.json"] = json.dumps(producer).encode()
     manifest = "".join(f"{hashlib.sha256(content).hexdigest()}  ./{name}\n"
                        for name, content in sorted(files.items())).encode()
     properties = {
@@ -268,6 +271,28 @@ class ProvenanceSmoke(unittest.TestCase):
     def test_onprem_declared_input_rejects_cloud_url(self) -> None:
         write_layout(self.layout)
         self.assert_rejected(self.create("onprem", CLOUD_URL), "must not contain a Cloud Console URL")
+
+    def test_local_purpose_is_rejected_even_with_matching_release_hashes_and_labels(self) -> None:
+        for profile in ("onprem", "cloud"):
+            with self.subTest(profile=profile):
+                jar = boot_jar(profile=profile, overrides={"purpose": "local-development"})
+                write_layout(self.layout, profile=profile, distribution=profile, jar_bytes=jar)
+                url = CLOUD_URL if profile == "cloud" else None
+                self.assert_rejected(self.create(profile, url, boot_jar_sha256=hashlib.sha256(jar).hexdigest()),
+                                     "local-development")
+
+    def test_local_producer_cannot_be_relabelled_by_removing_jar_purpose(self) -> None:
+        for profile in ("onprem", "cloud"):
+            with self.subTest(profile=profile):
+                marker = {"schemaVersion": 1, "profile": "cloud" if profile == "cloud" else "op",
+                          "purpose": "local-development"}
+                if profile == "cloud":
+                    marker["cloudConsoleUrl"] = CLOUD_URL
+                jar = boot_jar(profile=profile, producer=marker)
+                write_layout(self.layout, profile=profile, distribution=profile, jar_bytes=jar)
+                url = CLOUD_URL if profile == "cloud" else None
+                self.assert_rejected(self.create(profile, url, boot_jar_sha256=hashlib.sha256(jar).hexdigest()),
+                                     "local-development")
 
     def test_missing_or_unknown_jar_profile_is_not_legacy_onprem(self) -> None:
         for profile in (None, "unknown", "Cloud", ""):
