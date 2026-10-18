@@ -212,10 +212,10 @@
     }
   ],
   "cohort_hash": "42f2c8e1810d2c803a424beb77f29964e95e0f34c769852dc57bbd6c1ce73f1a",
-  "comparison_scope": "The recorded run contains 1290 source identities. Current source contains 1291, including one unmeasured file-connector shutdown control, changes the test CSV fixture, and relocates reflection-only repetition metadata outside test discovery. The new class uses the declared fallback; recorded weights remain scheduling estimates. Current test-source bytes and the source identity set therefore differ from that run. Current selected verify commands have not run. These estimates do not establish dependency or whole-input equality, original case applicability, or performance acceptance.",
+  "comparison_scope": "Variant A contains 1287 current source identities, including the common unmeasured file-connector shutdown control, changed test CSV fixture, and relocated repetition metadata. Its identity set and test-source bytes differ from the recorded 1290-unit run. Recorded weights remain estimates; new classes use the declared fallback. Current selected verify commands have not run. No whole-input, ability, coverage or performance acceptance is established.",
   "current_selected_verify_provenance_verified": false,
-  "current_source_cohort_hash": "1e16a5d011ffd56bda10d161b61f5b2dc01505fd2adef6abb791b05dcf6b3c94",
-  "current_source_units": 1291,
+  "current_source_cohort_hash": "1061779edba6b520d090c0bc86b7e0c0653adf440acc58777489043b65c10c32",
+  "current_source_units": 1287,
   "current_test_source_bytes_match_recorded": false,
   "current_unmeasured_source_units": [
     "e2e/io.tapstate.e2e.AFileConnectorStopsAfterItsActiveWritesTest"

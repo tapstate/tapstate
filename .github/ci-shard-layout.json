@@ -1,7 +1,6 @@
 {
   "schema": 1,
-  "e2e_shards": 6,
-  "app_shards": 2,
+  "e2e_shards": 2,
   "rest_modules": {},
   "new_test_seconds": 30.0
 }

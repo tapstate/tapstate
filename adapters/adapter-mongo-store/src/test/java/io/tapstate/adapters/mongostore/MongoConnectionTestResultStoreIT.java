@@ -8,7 +8,9 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.util.List;
 
@@ -25,10 +27,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoConnectionTestResultStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoConnectionTestResultStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static ConnectionTestResult failedResult() {
         return new ConnectionTestResult(
@@ -87,7 +89,7 @@ class MongoConnectionTestResultStoreIT {
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection =
-                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("connection_test_results");
+                    client.getDatabase("tapstate").getCollection("connection_test_results");
             collection.drop();
             test.run(new MongoConnectionTestResultStore(collection), collection);
         }

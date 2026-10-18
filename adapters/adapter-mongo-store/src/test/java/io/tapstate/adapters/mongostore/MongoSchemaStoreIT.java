@@ -14,7 +14,9 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -43,10 +45,10 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class MongoSchemaStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoSchemaStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static SourceModel ordersModel() {
         return new SourceModel(List.of(
@@ -493,7 +495,7 @@ class MongoSchemaStoreIT {
     /** Runs a test body against a fresh schema store over a clean collection on the real replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("source_schemas");
+            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("source_schemas");
             collection.drop();
             test.run(new MongoSchemaStore(collection), collection);
         }

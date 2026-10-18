@@ -7,7 +7,9 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Instant;
 
@@ -23,11 +25,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoAuditStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final Instant TS = Instant.parse("2026-07-07T10:15:30Z");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoAuditStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
     void recordedEntryLandsWithItsFields() {
@@ -61,7 +63,7 @@ class MongoAuditStoreIT {
     /** Runs a test body against a fresh audit store over a clean collection on the real replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("audit");
+            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("audit");
             collection.drop();
             test.run(new MongoAuditStore(collection), collection);
         }

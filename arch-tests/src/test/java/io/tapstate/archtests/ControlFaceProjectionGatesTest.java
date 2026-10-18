@@ -2,6 +2,8 @@ package io.tapstate.archtests;
 
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaMethod;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.Operation;
@@ -39,7 +41,9 @@ class ControlFaceProjectionGatesTest {
 
     @BeforeAll
     static void importFace() {
-        restApi = ProductionClassImports.packages("io.tapstate.control.restapi");
+        restApi = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("io.tapstate.control.restapi");
     }
 
     /** Every operation id an HTTP handler declares it projects. */

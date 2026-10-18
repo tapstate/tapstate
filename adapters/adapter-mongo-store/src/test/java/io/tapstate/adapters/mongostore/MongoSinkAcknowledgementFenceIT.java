@@ -21,7 +21,9 @@ import java.util.Set;
 import java.util.function.Consumer;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -36,9 +38,9 @@ class MongoSinkAcknowledgementFenceIT {
     private static final String WRITER = "writer-1";
     private static final Map<String, List<String>> PLAN = Map.of(TABLE, List.of(WRITER));
 
-    @RegisterExtension
-    private static final SharedMongoCase MONGO =
-            SharedMongoCase.forSuite(MongoSinkAcknowledgementFenceIT.class);
+    @Container
+    private static final MongoDBContainer MONGO =
+            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
     @Test
     void theCurrentRunCanAdvanceItsWritersAndThePipelinesRecord() {
@@ -189,7 +191,7 @@ class MongoSinkAcknowledgementFenceIT {
 
     private static void withStore(Consumer<Fixture> test) {
         try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            var database = client.getDatabase(MONGO.database("sink_fence_" + System.nanoTime()));
+            var database = client.getDatabase("sink_fence_" + System.nanoTime());
             var consumers = database.getCollection("srs_consumer_offsets");
             var claims = new MongoWorkloadClaimStore(database.getCollection("workload_claims"));
             var store = new MongoSrsMetaStore(client, database.getCollection("srs_meta"), consumers,

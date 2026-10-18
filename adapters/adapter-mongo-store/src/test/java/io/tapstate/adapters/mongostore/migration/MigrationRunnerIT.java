@@ -1,7 +1,5 @@
 package io.tapstate.adapters.mongostore.migration;
 
-import io.tapstate.adapters.mongostore.SharedMongoCase;
-
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -13,9 +11,11 @@ import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Clock;
 import java.io.PrintWriter;
@@ -48,25 +48,21 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 @RequiresDocker
 class MigrationRunnerIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final Duration LOCK_TTL = Duration.ofSeconds(30);
     private static final Duration PATIENT = Duration.ofSeconds(30);
     private static final Clock CLOCK = Clock.systemUTC();
     private static final Document SCHEMA_ID = new Document("_id", "schema");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MigrationRunnerIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static MongoClient client;
 
-    @AfterEach
-    void closeClient() {
-        try {
-            if (client != null) {
-                client.close();
-            }
-        } finally {
-            client = null;
+    @AfterAll
+    static void closeClient() {
+        if (client != null) {
+            client.close();
         }
     }
 
@@ -565,7 +561,7 @@ class MigrationRunnerIT {
         if (client == null) {
             client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
         }
-        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
+        MongoDatabase database = client.getDatabase(name);
         database.drop();
         return database;
     }
