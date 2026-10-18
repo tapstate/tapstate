@@ -27,6 +27,12 @@ public interface StorageBindingStore {
     StorageBinding commit(StorageSetupScope expected, StorageBinding.Mode mode,
             StorageBinding.Connection cache, SourceResource defaultSource);
 
+    /** Only a confirmed first insert may issue a first-cache invocation; retries return facts without one. */
+    default StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
+            StorageBinding.Connection cache, SourceResource defaultSource) {
+        throw new io.tapstate.core.common.TapstateException(IoError.CACHE_BUSINESS_FENCED, java.util.Map.of(), null);
+    }
+
     /**
      * Publish setup completion only after the caller verifies the saved clients, default Source and
      * formal authentication readiness. OP first-admin pending is created in this same transaction;

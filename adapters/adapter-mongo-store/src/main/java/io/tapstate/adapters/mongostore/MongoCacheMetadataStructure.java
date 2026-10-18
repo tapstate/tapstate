@@ -21,6 +21,11 @@ final class MongoCacheMetadataStructure {
             SystemCollections.CACHE_CONNECTOR_CATALOG, SystemCollections.CACHE_CONNECTOR_SPECS,
             SystemCollections.CACHE_CONNECTION_TEST_RESULTS, SystemCollections.CACHE_CONNECTOR_ARTIFACTS,
             SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY);
+    private static final List<SystemCollections> BUSINESS_TABLES = java.util.stream.Stream.concat(TABLES.stream(), java.util.stream.Stream.of(
+            SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION,
+            SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CHAINS, SystemCollections.SRS_MODELS,
+            SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,
+            SystemCollections.CACHE_CLUSTER_MEMBERSHIP)).toList();
     private static final SystemCollections.IndexSpec FILE_NAMES = new SystemCollections.IndexSpec(
             List.of("filename", "uploadDate"), false, "filename_1_uploadDate_1");
     private static final SystemCollections.IndexSpec CHUNK_ORDER = new SystemCollections.IndexSpec(
@@ -44,12 +49,20 @@ final class MongoCacheMetadataStructure {
      * structures are only verified; a partial set is unknown and is never repaired by this helper.
      */
     void prepareInTransaction(ClientSession session, Runnable requireActive) {
+        prepareInTransaction(session, requireActive, TABLES);
+    }
+
+    void prepareBusinessInTransaction(ClientSession session, Runnable requireActive) {
+        prepareInTransaction(session, requireActive, BUSINESS_TABLES);
+    }
+
+    private void prepareInTransaction(ClientSession session, Runnable requireActive, List<SystemCollections> tables) {
         Objects.requireNonNull(session, "session"); Objects.requireNonNull(requireActive, "requireActive");
         if (!session.hasActiveTransaction()) throw new IllegalStateException("metadata preparation requires its owner's transaction");
         requireActive.run();
-        var existing = collections();
-        if (!existing.isEmpty()) { verify(); requireActive.run(); return; }
-        for (var table : TABLES) {
+        var existing = collections(names(tables));
+        if (!existing.isEmpty()) { verify(tables); requireActive.run(); return; }
+        for (var table : tables) {
             requireActive.run();
             if (table == SystemCollections.CACHE_CONNECTOR_ARTIFACTS) {
                 table.prepareGridFsCollectionsOn(database, session);
@@ -63,6 +76,8 @@ final class MongoCacheMetadataStructure {
 
     /** Load-only validation: neither missing collections nor missing or changed indexes cause DDL. */
     void verify() { verify(TABLES); }
+
+    void verifyBusiness() { verify(BUSINESS_TABLES); }
 
     void verifyFacet(SystemCollections table) {
         if (Objects.requireNonNull(table, "table").database() != SystemCollections.Database.CACHE) throw new IllegalArgumentException("not a CACHE resource");

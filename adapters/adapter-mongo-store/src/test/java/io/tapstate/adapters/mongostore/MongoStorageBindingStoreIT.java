@@ -534,6 +534,120 @@ class MongoStorageBindingStoreIT {
         });
     }
 
+    @Test
+    void onlyTheConfirmedFirstBindingWinnerReceivesAnInitialCacheInvocation() {
+        withPrepared(f -> {
+            var first = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            assertThat(first.firstCreation()).isPresent();
+            var replay = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            assertThat(replay.firstCreation()).isEmpty(); assertThat(replay.preparation()).isEqualTo(first.preparation());
+            try (var reopened = MongoConfigurationDomain.open(f.settings, SCOPE.clusterId())) {
+                assertThat(reopened.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master")).firstCreation()).isEmpty();
+            }
+            var invocation = first.firstCreation().orElseThrow();
+            assertThat(MongoStorageBindingStore.consumeFirst(invocation, MongoStorageBindingStore.targetFingerprint(CACHE))).isSameAs(invocation);
+            assertThatThrownBy(() -> MongoStorageBindingStore.consumeFirst(invocation, MongoStorageBindingStore.targetFingerprint(CACHE))).satisfies(MongoStorageBindingStoreIT::refused);
+            assertThat(f.revision()).isOne();
+        });
+    }
+
+    @Test
+    void twoIndependentConfigurationClientsIssueExactlyOneInitialCacheInvocation() {
+        withPrepared(f -> {
+            try (var other = MongoConfigurationDomain.open(f.settings, SCOPE.clusterId()); var executor = Executors.newFixedThreadPool(2)) {
+                var ready = new CountDownLatch(2); var start = new CountDownLatch(1);
+                var a = executor.submit(() -> { ready.countDown(); if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start barrier");
+                    return f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master")); });
+                var b = executor.submit(() -> { ready.countDown(); if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start barrier");
+                    return other.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master")); });
+                assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue(); start.countDown();
+                var results = List.of(a.get(20, TimeUnit.SECONDS), b.get(20, TimeUnit.SECONDS));
+                assertThat(results.stream().filter(result -> result.firstCreation().isPresent()).count()).isOne();
+                assertThat(results.getFirst().preparation()).isEqualTo(results.getLast().preparation()); assertThat(f.revision()).isOne();
+            }
+        });
+    }
+
+    @Test
+    void arbitraryCapabilitiesCannotRunCallbacksAndAWrongTargetConsumesTheNativeInvocation() {
+        withPrepared(f -> {
+            var first = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            io.tapstate.spi.store.FirstCacheCreation forged = new io.tapstate.spi.store.FirstCacheCreation() {
+                @Override public io.tapstate.spi.store.CachePreparation preparation() { throw new AssertionError("forged preparation called"); }
+                @Override public void consume() { throw new AssertionError("forged consume called"); }
+                @Override public void requireActive() { throw new AssertionError("forged guard called"); }
+            };
+            assertThatThrownBy(() -> MongoStorageBindingStore.consumeFirst(forged, MongoStorageBindingStore.targetFingerprint(CACHE))).satisfies(MongoStorageBindingStoreIT::refused);
+            var invocation = first.firstCreation().orElseThrow();
+            var wrong = new StorageBinding.Connection(CACHE.kind(), CACHE.uri(), "other-cache", CACHE.caPem());
+            assertThatThrownBy(() -> MongoStorageBindingStore.consumeFirst(invocation, MongoStorageBindingStore.targetFingerprint(wrong))).satisfies(MongoStorageBindingStoreIT::refused);
+            assertThatThrownBy(() -> MongoStorageBindingStore.consumeFirst(invocation, MongoStorageBindingStore.targetFingerprint(CACHE))).satisfies(MongoStorageBindingStoreIT::refused);
+        });
+    }
+
+    @Test
+    void aLostInvocationBeforeAnyCacheWriteCannotBeReissuedAndAuthRecoveryDoesNotCreateBusiness() {
+        withPrepared(f -> {
+            String name = f.database.getName() + "_cache";
+            var endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, MONGO.getReplicaSetUrl(), name, null);
+            var active = new java.util.concurrent.atomic.AtomicBoolean(true);
+            var guarded = f.domain.bindings().guardedBy(() -> { if (!active.get()) throw new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null); });
+            var first = guarded.commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, endpoint, source("views", "master"));
+            try (var cache = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(10), "birth-it")) {
+                active.set(false);
+                assertThatThrownBy(() -> cache.prepareFirstAuth(first.firstCreation().orElseThrow())).satisfies(MongoStorageBindingStoreIT::refused);
+                active.set(true);
+                assertThatThrownBy(() -> cache.prepareFirstAuth(first.firstCreation().orElseThrow())).satisfies(MongoStorageBindingStoreIT::refused);
+                assertThat(f.admin.getDatabase(name).listCollectionNames().into(new java.util.ArrayList<>())).isEmpty();
+                assertThat(guarded.commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, endpoint, source("views", "master")).firstCreation()).isEmpty();
+                assertThatThrownBy(() -> cache.resumeInitialAuth(first.preparation(), () -> {})).isInstanceOf(TapstateException.class);
+                assertThat(f.admin.getDatabase(name).listCollectionNames().into(new java.util.ArrayList<>())).isEmpty();
+                cache.prepareAuth(first.preparation().authScope(), SCOPE.operationId(), () -> {});
+                assertThat(cache.loadAuthScope(first.preparation().authScope())).isEqualTo(first.preparation().authScope());
+                assertThatThrownBy(() -> cache.prepareInitialBusiness(first.preparation(), () -> {})).satisfies(MongoStorageBindingStoreIT::refused);
+                assertThat(SystemCollections.CACHE_IDENTITY.on(f.admin.getDatabase(name)).find().first()).containsEntry("businessPhase", "ABSENT");
+            } finally { f.admin.getDatabase(name).drop(); }
+        });
+    }
+
+    @Test
+    void aRetainedInitialBusinessBirthCanResumeAfterTheOriginalInvocationWasConsumed() {
+        withPrepared(f -> {
+            String name = f.database.getName() + "_cache";
+            var endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, MONGO.getReplicaSetUrl(), name, null);
+            var armed = new java.util.concurrent.atomic.AtomicBoolean();
+            var guarded = f.domain.bindings().guardedBy(() -> {
+                if (armed.get() && SystemCollections.CACHE_IDENTITY.on(f.admin.getDatabase(name)).countDocuments() != 0)
+                    throw new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null);
+            });
+            var first = guarded.commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, endpoint, source("views", "master")); armed.set(true);
+            try (var cache = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(10), "birth-it")) {
+                assertThatThrownBy(() -> cache.prepareFirstAuth(first.firstCreation().orElseThrow())).satisfies(MongoStorageBindingStoreIT::refused);
+                assertThat(SystemCollections.CACHE_IDENTITY.on(f.admin.getDatabase(name)).find().first()).containsEntry("authPhase", "PREPARING")
+                        .containsEntry("businessPhase", "PREPARING").containsEntry("businessPreparationId", SCOPE.operationId());
+            }
+            try (var restarted = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(10), "birth-restarted")) {
+                restarted.resumeInitialAuth(first.preparation(), () -> {});
+                assertThat(restarted.prepareInitialBusiness(first.preparation(), () -> {})).isEqualTo(first.preparation().businessScope());
+            } finally { f.admin.getDatabase(name).drop(); }
+        });
+    }
+
+    @Test
+    void losingDeliveryAfterConfigurationCommitDoesNotMintACapabilityOnReplay() {
+        withPrepared(f -> {
+            var guarded = f.domain.bindings().guardedBy(() -> {
+                if (SystemCollections.STORAGE_BINDING.on(f.database).countDocuments() != 0)
+                    throw new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null);
+            });
+            assertThatThrownBy(() -> guarded.commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master")))
+                    .satisfies(MongoStorageBindingStoreIT::refused);
+            assertThat(f.domain.bindings().load()).isPresent();
+            var replay = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            assertThat(replay.firstCreation()).isEmpty(); assertThat(f.revision()).isOne();
+        });
+    }
+
     private static String attempt(MongoConfigurationDomain domain, String secret, CountDownLatch ready, CountDownLatch start) throws Exception {
         ready.countDown();
         if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");

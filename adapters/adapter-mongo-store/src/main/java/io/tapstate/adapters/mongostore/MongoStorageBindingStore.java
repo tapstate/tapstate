@@ -124,6 +124,11 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     @Override public StorageBinding commit(StorageSetupScope expected, StorageBinding.Mode mode,
             StorageBinding.Connection cache, SourceResource defaultSource) {
+        return commitWithFirstCache(expected, mode, cache, defaultSource).binding();
+    }
+
+    @Override public io.tapstate.spi.store.StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
+            StorageBinding.Connection cache, SourceResource defaultSource) {
         Objects.requireNonNull(expected, "expected");
         Objects.requireNonNull(mode, "mode");
         Objects.requireNonNull(cache, "cache");
@@ -138,13 +143,13 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return StoreIo.call(() -> {
             requireActive.run();
             verifyIndex();
-            return transaction(session -> {
+            Committed result = transaction(session -> {
                 Optional<Loaded> previous = load(session);
                 if (previous.isPresent()) {
                     Loaded loaded = previous.get();
                     if (!expected.equals(loaded.binding().setup()) || mode != loaded.binding().mode()
                             || !candidateHash.equals(loaded.candidateHash())) throw refused();
-                    return loaded.binding();
+                    return new Committed(loaded.binding(), loaded.cachePreparation(), false);
                 }
                 Document state = setup.find(session, new Document("_id", "cluster")).first();
                 requireSetup(state, expected, MongoConfigurationBootstrap.PREPARED);
@@ -177,8 +182,11 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         .append("ownerId", expected.clusterId()).append("generation", 1L).append("writeFence", 0L)
                         .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L));
                 MongoStorageRecoveryStore.allocate(session, database, binding, incarnation);
-                return binding;
+                return new Committed(binding, MongoStorageRecoveryStore.loadInitial(session, database, binding), true);
             });
+            requireActive.run();
+            return new io.tapstate.spi.store.StorageBindingCommit(result.binding(), result.preparation(), result.won()
+                    ? Optional.of(new Creation(result.preparation(), targetFingerprint(cache), requireActive)) : Optional.empty());
         });
     }
 
@@ -335,5 +343,34 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     private static TapstateException unreadable() {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "storage-binding", "field", "binding"), null);
     }
+    static String targetFingerprint(StorageBinding.Connection target) {
+        return fingerprint(StorageBinding.Mode.OP, encodeConnection(target), "cache-target");
+    }
+
+    static io.tapstate.spi.store.FirstCacheCreation consumeFirst(io.tapstate.spi.store.FirstCacheCreation invocation, String targetFingerprint) {
+        if (!(invocation instanceof Creation creation)) throw refused();
+        creation.consume();
+        if (!creation.targetFingerprint.equals(targetFingerprint)) throw refused();
+        return creation;
+    }
+
+    private record Committed(StorageBinding binding, CachePreparation preparation, boolean won) {}
+    private static final class Creation implements io.tapstate.spi.store.FirstCacheCreation {
+        private final CachePreparation preparation;
+        private final String targetFingerprint;
+        private final Runnable originalActive;
+        private final java.util.concurrent.atomic.AtomicBoolean consumed = new java.util.concurrent.atomic.AtomicBoolean();
+        private Creation(CachePreparation preparation, String targetFingerprint, Runnable originalActive) {
+            this.preparation = preparation; this.targetFingerprint = targetFingerprint; this.originalActive = originalActive;
+        }
+        @Override public CachePreparation preparation() { return preparation; }
+        @Override public void consume() {
+            if (!consumed.compareAndSet(false, true)) throw refused();
+            originalActive.run();
+        }
+        @Override public void requireActive() { originalActive.run(); }
+        @Override public String toString() { return "FirstCacheCreation[redacted]"; }
+    }
+
     private record Loaded(StorageBinding binding, String candidateHash, CachePreparation cachePreparation) {}
 }

@@ -229,10 +229,10 @@ class MongoCacheClusterMembershipStoreIT {
             try (var session = client.startSession()) { session.withTransaction(() -> {
                 SystemCollections.CACHE_CLUSTER_MEMBERSHIP.prepareCollectionOn(database, session); return null;
             }, TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build()); }
-            SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessRetirementId", "retired-operation")));
+            SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessRetirementId", "retired-operation").append("businessPhase", MongoCacheBusinessPreparation.CREATING).append("businessPreparationId", "business-a")));
             Document before = SystemCollections.CACHE_IDENTITY.on(database).find().first();
             try (var session = client.startSession()) {
-                assertUnreadable(() -> session.withTransaction(() -> { MongoCacheClusterMembershipStore.prepareInitial(session, database, SCOPE); return null; }));
+                assertUnreadable(() -> session.withTransaction(() -> { MongoCacheClusterMembershipStore.prepareInitial(session, database, SCOPE, "business-a"); return null; }));
             }
             assertThat(SystemCollections.CACHE_CLUSTER_MEMBERSHIP.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.CACHE_IDENTITY.on(database).find().first()).isEqualTo(before);
@@ -248,7 +248,7 @@ class MongoCacheClusterMembershipStoreIT {
             prepareBusiness(client, database, ACTIVE);
             SystemCollections.CACHE_CLUSTER_MEMBERSHIP.on(database).deleteOne(new Document());
             try (var session = client.startSession()) {
-                assertUnreadable(() -> session.withTransaction(() -> { MongoCacheClusterMembershipStore.prepareInitial(session, database, SCOPE); return null; }));
+                assertUnreadable(() -> session.withTransaction(() -> { MongoCacheClusterMembershipStore.prepareInitial(session, database, SCOPE, "business-a"); return null; }));
             }
             assertThat(SystemCollections.CACHE_CLUSTER_MEMBERSHIP.on(database).countDocuments()).isZero();
         });
@@ -268,7 +268,8 @@ class MongoCacheClusterMembershipStoreIT {
     private static void prepareBusiness(MongoClient client, MongoDatabase database, Runnable afterMarker) {
         try (var session = client.startSession()) { session.withTransaction(() -> {
             SystemCollections.CACHE_WORKLOAD_CLAIMS.prepareCollectionOn(database, session); SystemCollections.CACHE_CLUSTER_MEMBERSHIP.prepareCollectionOn(database, session);
-            MongoCacheClusterMembershipStore.prepareInitial(session, database, SCOPE); afterMarker.run();
+            SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", MongoCacheBusinessPreparation.CREATING).append("businessPreparationId", "business-a")));
+            MongoCacheClusterMembershipStore.prepareInitial(session, database, SCOPE, "business-a"); afterMarker.run();
             SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                     .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
             SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(session, new Document("_id", "business").append("installedVersion", 1)

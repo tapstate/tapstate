@@ -72,6 +72,14 @@ final class MongoCacheIdentity {
 
     /** Only an explicitly authorized first preparation may create missing facts; ordinary loads never call this. */
     void beginPreparation(String operationId, boolean emptyTarget, Runnable requireActive) {
+        beginPreparation(operationId, emptyTarget, requireActive, false);
+    }
+
+    void beginFirstPreparation(String operationId, boolean emptyTarget, Runnable requireActive) {
+        beginPreparation(operationId, emptyTarget, requireActive, true);
+    }
+
+    private void beginPreparation(String operationId, boolean emptyTarget, Runnable requireActive, boolean businessBirth) {
         requireText(operationId);
         StoreIo.run(() -> {
             for (int attempt = 0; ; attempt++) {
@@ -84,11 +92,14 @@ final class MongoCacheIdentity {
                             if (!operationId.equals(row.get("authPreparationId"))) throw refused();
                             String phase = row.getString("authPhase");
                             requireSchema(session, phase, READY.equals(phase) ? AUTH_VERSION : 0, operationId);
+                            if (businessBirth && (!PREPARING.equals(row.get("businessPhase")) || !operationId.equals(row.get("businessPreparationId")))) throw refused();
                         } else {
                             if (!emptyTarget || schemas.find(session).limit(1).first() != null) throw refused();
-                            identity.insertOne(session, scopeFilter(expected).append("layoutId", MongoConfigurationDomain.LAYOUT)
+                            Document initial = scopeFilter(expected).append("layoutId", MongoConfigurationDomain.LAYOUT)
                                     .append("authPhase", PREPARING).append("authPreparationId", operationId)
-                                    .append("authWriteFence", 0L).append("businessPhase", "ABSENT"));
+                                    .append("authWriteFence", 0L).append("businessPhase", businessBirth ? PREPARING : "ABSENT");
+                            if (businessBirth) initial.append("businessPreparationId", operationId);
+                            identity.insertOne(session, initial);
                             schemas.insertOne(session, new Document("_id", "auth").append("installedVersion", 0)
                                     .append("epoch", 1L).append("operationId", operationId).append("phase", PREPARING));
                         }

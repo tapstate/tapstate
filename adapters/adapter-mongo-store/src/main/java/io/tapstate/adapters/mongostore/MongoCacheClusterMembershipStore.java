@@ -39,13 +39,13 @@ final class MongoCacheClusterMembershipStore implements ClusterMembershipStore {
     }
 
     /** Only the original whole-business preparation transaction may allocate this pending fact. */
-    static void prepareInitial(ClientSession session, MongoDatabase database, CacheBusinessScope scope) {
+    static void prepareInitial(ClientSession session, MongoDatabase database, CacheBusinessScope scope, String operationId) {
         if (!session.hasActiveTransaction()) throw new IllegalStateException("membership preparation requires its owner's transaction");
         Document root = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
         if (root == null || !scope.clusterId().equals(root.get("clusterId")) || !Long.valueOf(scope.bindingVersion()).equals(root.get("bindingVersion"))
                 || !scope.cacheIncarnation().equals(root.get("cacheIncarnation")) || !MongoConfigurationDomain.LAYOUT.equals(root.get("layoutId"))
-                || !"READY".equals(root.get("authPhase")) || !"ABSENT".equals(root.get("businessPhase"))
-                || root.containsKey("claimAdmissionFence") || root.containsKey("businessPreparationId") || root.containsKey("businessRetirementId")
+                || !MongoCacheBusinessPreparation.CREATING.equals(root.get("businessPhase")) || operationId == null || operationId.isBlank()
+                || !operationId.equals(root.get("businessPreparationId")) || root.containsKey("claimAdmissionFence") || root.containsKey("businessRetirementId")
                 || SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first() != null
                 || SystemCollections.CACHE_CLUSTER_MEMBERSHIP.on(database).countDocuments(session) != 0) throw unreadable(scope);
         SystemCollections.CACHE_CLUSTER_MEMBERSHIP.on(database).insertOne(session, new Document("_id", scope.clusterId())

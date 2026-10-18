@@ -23,10 +23,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
     private final Duration rateRetention;
+    private final String targetFingerprint;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
-    private MongoCacheDomain(MongoConnection connection, Duration rateRetention) {
-        this.connection = connection; this.client = connection.client(); this.database = connection.database(); this.rateRetention = rateRetention;
+    private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint) {
+        this.connection = connection; this.client = connection.client(); this.database = connection.database(); this.rateRetention = rateRetention; this.targetFingerprint = targetFingerprint;
     }
 
     /** Connectivity alone creates no identity, schema, session, membership or business resource. */
@@ -39,7 +40,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         MongoConnection connection = MongoConnection.forCache(cache, timeout, processId);
         try {
             connection.verifyConnectivity();
-            return new MongoCacheDomain(connection, rateRetention);
+            return new MongoCacheDomain(connection, rateRetention, MongoStorageBindingStore.targetFingerprint(cache));
         } catch (RuntimeException | Error failure) {
             connection.close(); throw failure;
         }
@@ -62,6 +63,31 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
         var facts = facts(scope);
         facts.beginPreparation(operationId, emptyTarget, requireActive);
+        return finishAuth(facts, scope, operationId, requireActive);
+    }
+
+    /** Only the confirmed CONFIG first winner may create the original business birth marker. */
+    public CacheAuthScope prepareFirstAuth(io.tapstate.spi.store.FirstCacheCreation invocation) {
+        var original = MongoStorageBindingStore.consumeFirst(invocation, targetFingerprint);
+        var preparation = original.preparation();
+        Runnable active = () -> { businessActive(); original.requireActive(); };
+        active.run();
+        boolean emptyTarget = StoreIo.call(() -> { try (var names = database.listCollectionNames().iterator()) { return !names.hasNext(); } });
+        var facts = facts(preparation.authScope());
+        facts.beginFirstPreparation(preparation.operationId(), emptyTarget, active);
+        return finishAuth(facts, preparation.authScope(), preparation.operationId(), active);
+    }
+
+    /** A controlled continuation may complete retained facts but never recreate a missing identity. */
+    public CacheAuthScope resumeInitialAuth(io.tapstate.spi.store.CachePreparation original, Runnable requireActive) {
+        Objects.requireNonNull(original, "original"); Objects.requireNonNull(requireActive, "requireActive");
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        active.run(); var facts = facts(original.authScope());
+        facts.beginPreparation(original.operationId(), false, active);
+        return finishAuth(facts, original.authScope(), original.operationId(), active);
+    }
+
+    private CacheAuthScope finishAuth(MongoCacheIdentity facts, CacheAuthScope scope, String operationId, Runnable requireActive) {
         facts.prepareStructure(operationId, requireActive, session -> {
             for (var table : authTables(scope.mode())) {
                 requireActive.run();
@@ -109,6 +135,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 }, businessTransaction());
             } catch (RuntimeException failure) { businessActive(); throw failure; }
         });
+    }
+
+    /** Controlled continuation requires the original operation and already retained authentication facts. */
+    public CacheBusinessScope prepareInitialBusiness(io.tapstate.spi.store.CachePreparation original, Runnable requireActive) {
+        Objects.requireNonNull(original, "original"); Objects.requireNonNull(requireActive, "requireActive");
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        active.run();
+        return new MongoCacheBusinessPreparation(client, database, original, rateRetention, active).prepare();
     }
 
     /** The claims share this exact cache client, original scope and owner lifecycle. */
