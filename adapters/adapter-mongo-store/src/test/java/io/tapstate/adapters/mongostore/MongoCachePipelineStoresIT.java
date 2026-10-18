@@ -70,7 +70,7 @@ class MongoCachePipelineStoresIT {
             observations.save(observation);
             assertThat(observations.read("orders")).contains(observation);
             assertThat(f.domain().pipelineStates(SCOPE).read("orders").orElseThrow().stateJson()).isEqualTo("RUNNING");
-            assertThat(state(f.database())).containsEntry("epoch", 1L).containsEntry("runtimeWriteFence", 3L);
+            assertThat(state(f.database())).containsEntry("epoch", 1L).containsEntry("runtimeWriteFence", 4L);
             assertThat(identity(f.database()).getLong("claimAdmissionFence")).isEqualTo(1);
             f.domain().advanceAuthGeneration(new CacheAuthScope("cluster-a", 1, StorageBinding.Mode.OP, "incarnation-a", 1), 2, "reset-auth", ACTIVE);
             observations.save(observation(PipelineState.PAUSED));
@@ -112,6 +112,9 @@ class MongoCachePipelineStoresIT {
             var held = claims.read(KEY).orElseThrow().claim();
             assertThat(claims.release(held)).isTrue();
             replaceScope(f.database(), scope(2));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                    new Document("$set", new Document("pipelineScope", header(scope(2))).append("pipelinePreparation",
+                            MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(), io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED))));
             var fresh = WorkloadClaimFence.from(claims.acquirePipeline(scope(2), OWNER, 1, Duration.ofSeconds(30)).claim());
             assertThat(fresh.claimGeneration()).isGreaterThan(f.fence().claimGeneration());
             var before = snapshot(f.database());
@@ -165,7 +168,7 @@ class MongoCachePipelineStoresIT {
                 var results = List.of(a.get(15, TimeUnit.SECONDS), b.get(15, TimeUnit.SECONDS));
                 assertThat(results).filteredOn(result -> result instanceof CasOutcome.Applied).hasSize(1);
                 assertThat(results).filteredOn(result -> result instanceof CasOutcome.Fenced).containsExactly(new CasOutcome.Fenced(1));
-                assertThat(state(f.database())).containsEntry("epoch", 1L).containsEntry("runtimeWriteFence", 2L);
+                assertThat(state(f.database())).containsEntry("epoch", 1L).containsEntry("runtimeWriteFence", 3L);
             }
         });
     }
@@ -190,7 +193,7 @@ class MongoCachePipelineStoresIT {
                 assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
                         .satisfies(error -> assertThat(((TapstateException) error.getCause()).code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
                 assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).countDocuments()).isZero();
-                assertThat(state(f.database())).containsEntry("scope", header(scope(2))).containsEntry("runtimeWriteFence", 1L);
+                assertThat(state(f.database())).containsEntry("scope", header(scope(2))).containsEntry("runtimeWriteFence", 2L);
                 assertThat(claim(f.database())).doesNotContainKey("fencedPipelineWrites");
             }
         });
@@ -387,7 +390,13 @@ class MongoCachePipelineStoresIT {
                 SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1)
                         .append("phase", "READY").append("epoch", 1L).append("operationId", "business-a"));
                 SystemCollections.CACHE_PIPELINE_STATE.on(database).insertOne(new Document("_id", "orders").append("scope", header(SCOPE))
-                        .append("stateJson", "NEW").append("epoch", 0L).append("touchMillis", AT.toEpochMilli()).append("runtimeWriteFence", 0L));
+                        .append("stateJson", "NEW").append("epoch", 0L).append("touchMillis", AT.toEpochMilli()).append("runtimeWriteFence", 1L));
+                var raw = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database));
+                var retained = raw.acquire(KEY, OWNER, 1, Duration.ofSeconds(30)).claim();
+                raw.release(retained);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                        new Document("$set", new Document("pipelineScope", header(SCOPE)).append("pipelinePreparation",
+                                MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(), io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED))));
                 var claim = domain.workloadClaims(BUSINESS).acquirePipeline(SCOPE, OWNER, 1, Duration.ofSeconds(30)).claim();
                 scenario.run(new Fixture(admin, database, domain, WorkloadClaimFence.from(claim)));
             } finally { database.drop(); }

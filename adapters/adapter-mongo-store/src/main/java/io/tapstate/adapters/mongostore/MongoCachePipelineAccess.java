@@ -69,9 +69,27 @@ final class MongoCachePipelineAccess {
         if (state == null) throw unreadable("checkpoint");
         requireScope(state);
         if (!(state.get("epoch") instanceof Long epoch) || epoch < 0 || epoch == Long.MAX_VALUE
-                || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE
+                || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 1 || revision == Long.MAX_VALUE
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
+        requirePreparedClaim(session);
         return state;
+    }
+
+    private void requirePreparedClaim(ClientSession session) {
+        MongoCacheWorkloadClaimStore.requireCollection(database);
+        var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+        var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        Document row = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+        if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);
+        new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
+        try {
+            if (!(row.get("pipelineScope") instanceof Document stored)) throw unreadable("pipeline-claim-scope");
+            var decoded = MongoPipelinePreparationFacts.scope(stored);
+            if (!scope.pipelineId().equals(decoded.pipelineId()) || !new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation())
+                    .equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadable("pipeline-claim-scope");
+            if (!scope.equals(decoded)) throw claimFenced();
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable("pipeline-claim-scope"); }
+        if (MongoCachePipelinePreparations.phase(row, scope) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
     }
 
     void requireScope(Document row) {
@@ -88,7 +106,8 @@ final class MongoCachePipelineAccess {
     void proveClaim(ClientSession session) {
         if (original == null) throw fenced();
         MongoCacheWorkloadClaimStore.requireCollection(database);
-        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original),
+        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original)
+                        .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED"),
                 new Document("$inc", new Document("fencedPipelineWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
     }
 

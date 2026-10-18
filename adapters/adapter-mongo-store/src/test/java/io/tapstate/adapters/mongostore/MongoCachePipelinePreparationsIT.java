@@ -202,6 +202,40 @@ class MongoCachePipelinePreparationsIT {
         }
     }
 
+    @Test void ordinaryPortsCannotTurnAReservedPreparationIntoBusinessAuthority() {
+        withFixture(f -> {
+            var grant = f.issue(); var reservation = f.preparations().reserveFirst(grant, TTL);
+            // A partial or out-of-protocol state row must never turn RESERVED into a prepared claim.
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.cacheDatabase).insertOne(new Document("_id", "flow")
+                    .append("scope", MongoPipelinePreparationFacts.scope(f.scope)).append("stateJson", "NEW")
+                    .append("epoch", 0L).append("runtimeWriteFence", 1L).append("touchMillis", AT.toEpochMilli()));
+            var claims = f.cacheDomain.workloadClaims(f.business());
+            var held = new MongoWorkloadClaimStore(f.claims()).read(reservation.claim().key()).orElseThrow().claim();
+            var state = f.cacheDomain.pipelineStates(f.scope, reservation.claim(), ACTIVE);
+            var before = f.snapshot();
+            for (org.assertj.core.api.ThrowableAssert.ThrowingCallable action : List.<org.assertj.core.api.ThrowableAssert.ThrowingCallable>of(
+                    () -> claims.readPipeline(f.scope), () -> claims.read(held.key()), () -> claims.readAll(List.of(held.key())),
+                    () -> claims.acquirePipeline(f.scope, OWNER, 1, TTL), () -> claims.renew(held, TTL), () -> claims.release(held),
+                    () -> claims.advanceExecution(held, 1, java.util.Set.of("node-a")), () -> claims.recordExecutionFailure(held, false),
+                    () -> state.read("flow"), () -> state.compareAndSwap("flow", 0, "RUNNING", AT))) {
+                assertCode(action, IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(f.snapshot()).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void ordinaryPortsCannotRepairOrIgnoreLostPreparationMarkers() {
+        withFixture(f -> {
+            var grant = f.issue(); var reservation = f.preparations().reserveFirst(grant, TTL);
+            f.preparations().seed(reservation, f.configuration.preparations(), AT);
+            f.claims().updateOne(pipelineFilter(f.scope), new Document("$unset", new Document("pipelinePreparation", "")));
+            var before = f.snapshot();
+            assertCode(() -> f.cacheDomain.workloadClaims(f.business()).acquirePipeline(f.scope, OWNER, 1, TTL), IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> f.cacheDomain.pipelineStates(f.scope).read("flow"), IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void damagedNonceScopePhaseAndCheckpointCannotBeRepairedOrTurnedIntoReceipt() {
         withFixture(f -> {
             var grant = f.issue(); var original = f.preparations().reserveFirst(grant, TTL);

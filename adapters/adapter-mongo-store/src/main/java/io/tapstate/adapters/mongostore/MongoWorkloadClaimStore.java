@@ -300,6 +300,9 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 .append("amount", ttl.toMillis()));
     }
 
+    /** Decode a document already read by the caller's transaction, preserving the strict view's validation. */
+    WorkloadClaim decodeStored(Document document) { return read(document); }
+
     private WorkloadClaim read(Document document) {
         if (!strict) return decode(document);
         try {

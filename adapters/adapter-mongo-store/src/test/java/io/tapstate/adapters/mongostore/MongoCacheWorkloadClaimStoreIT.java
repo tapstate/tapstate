@@ -82,14 +82,15 @@ class MongoCacheWorkloadClaimStoreIT {
             try (var second = MongoCacheDomain.connect(f.binding(), Duration.ofSeconds(5), "claims-second");
                  var workers = Executors.newFixedThreadPool(2)) {
                 var one = f.domain().workloadClaims(SCOPE); var two = second.workloadClaims(SCOPE);
+                var absent = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "unclaimed-tail");
                 var start = new CountDownLatch(1);
-                var a = workers.submit(() -> { start.await(); return one.acquirePipeline(PIPELINE, OWNER, 1, TTL); });
-                var b = workers.submit(() -> { start.await(); return two.acquirePipeline(PIPELINE, new WorkloadOwner("node-b", "boot-b"), 1, TTL); });
+                var a = workers.submit(() -> { start.await(); return one.acquire(absent, OWNER, 1, TTL); });
+                var b = workers.submit(() -> { start.await(); return two.acquire(absent, new WorkloadOwner("node-b", "boot-b"), 1, TTL); });
                 start.countDown();
                 var results = List.of(a.get(15, TimeUnit.SECONDS), b.get(15, TimeUnit.SECONDS));
                 assertThat(results).filteredOn(io.tapstate.spi.store.WorkloadClaimAttempt::acquired).hasSize(1);
                 assertThat(results.getFirst().claim()).isEqualTo(results.getLast().claim());
-                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isEqualTo(1);
+                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isEqualTo(2);
                 assertThat(identity(f.database()).getLong("claimAdmissionFence")).isEqualTo(2);
             }
         });
@@ -138,7 +139,7 @@ class MongoCacheWorkloadClaimStoreIT {
                 } finally { proceed.countDown(); }
                 assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
                         .satisfies(error -> fenced(error.getCause()));
-                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isZero();
+                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isEqualTo(1);
                 assertThat(identity(f.database())).containsEntry("businessPhase", "RETIRED").containsEntry("claimAdmissionFence", 0L);
             }
         });
@@ -200,7 +201,7 @@ class MongoCacheWorkloadClaimStoreIT {
                 try { assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced); }
                 finally { f.admin().getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
                 assertThat(failed).hasValue(1); assertThat(modifications).hasValue(1);
-                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isZero();
+                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isEqualTo(1);
                 assertThat(identity(f.database()).getLong("claimAdmissionFence")).isZero();
             }
         });
@@ -212,7 +213,7 @@ class MongoCacheWorkloadClaimStoreIT {
             SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document(),
                     new Document("$set", new Document("claimAdmissionFence", Long.MAX_VALUE - 1)));
             assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
-            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isZero();
+            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isEqualTo(1);
             assertThat(identity(f.database()).getLong("claimAdmissionFence")).isEqualTo(Long.MAX_VALUE - 1);
             f.domain().retireBusiness(SCOPE, "retire-a", ACTIVE);
             f.domain().retireBusiness(SCOPE, "retire-a", ACTIVE);
@@ -237,7 +238,8 @@ class MongoCacheWorkloadClaimStoreIT {
             assertThatThrownBy(() -> f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL))
                     .satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
             assertThat(snapshot(f.database())).isEqualTo(before);
-            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isZero();
+            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isEqualTo(1);
+            replacePreparedScope(f, next);
             var current = f.domain().workloadClaims(SCOPE).acquirePipeline(next, OWNER, 1, TTL);
             assertThat(current.acquired()).isTrue();
             assertThat(identity(f.database()).getLong("claimAdmissionFence")).isEqualTo(1);
@@ -264,9 +266,9 @@ class MongoCacheWorkloadClaimStoreIT {
                 } finally { proceed.countDown(); }
                 assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
                         .satisfies(error -> fenced(error.getCause()));
-                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isZero();
+                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).countDocuments()).isEqualTo(1);
                 assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find().first()).containsEntry("scope", header(next))
-                        .containsEntry("runtimeWriteFence", 0L);
+                        .containsEntry("runtimeWriteFence", 1L);
                 assertThat(identity(f.database()).getLong("claimAdmissionFence")).isZero();
             }
         });
@@ -277,12 +279,14 @@ class MongoCacheWorkloadClaimStoreIT {
             var claims = f.domain().workloadClaims(SCOPE);
             var first = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
             var next = new PipelineIntentScope("cluster-a", 1, "incarnation-a", "orders", 2);
+            String preparationId = UUID.randomUUID().toString();
             try (var session = f.admin().startSession()) {
                 session.withTransaction(() -> {
                     SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(session, new Document("_id", "orders"), new Document("$set", new Document("scope", header(next))));
                     SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(session,
                             WorkloadClaimDocuments.live(io.tapstate.spi.store.WorkloadClaimFence.from(first)),
-                            List.of(new Document("$set", new Document("leaseUntil", "$$NOW"))));
+                            List.of(new Document("$set", new Document("leaseUntil", "$$NOW").append("pipelineScope", header(next))
+                                    .append("pipelinePreparation", MongoCachePipelinePreparations.marker(preparationId, io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED)))));
                     return null;
                 }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
                         .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
@@ -386,7 +390,7 @@ class MongoCacheWorkloadClaimStoreIT {
             SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).deleteMany(new Document());
             var before = snapshot(f.database());
             assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
-                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                    error -> assertThat(error.code()).isEqualTo(IoError.PIPELINE_STATE_REBUILD_REQUIRED));
             assertThat(snapshot(f.database())).isEqualTo(before);
         });
     }
@@ -477,7 +481,7 @@ class MongoCacheWorkloadClaimStoreIT {
         withBusiness(f -> {
             var claims = f.domain().workloadClaims(SCOPE);
             var empty = snapshot(f.database());
-            assertThat(claims.readPipeline(PIPELINE)).isEmpty();
+            assertThat(claims.readPipeline(PIPELINE).orElseThrow().leased()).isFalse();
             assertThat(snapshot(f.database())).isEqualTo(empty);
             var first = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
             assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
@@ -501,7 +505,7 @@ class MongoCacheWorkloadClaimStoreIT {
             var failed = claims.recordExecutionFailure(run, false).orElseThrow();
             assertThat(claims.release(failed)).isTrue();
             var next = nextScope();
-            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document(), new Document("$set", new Document("scope", header(next))));
+            replacePreparedScope(f, next);
             var taken = claims.acquirePipeline(next, OWNER, 1, TTL).claim();
             assertThat(taken.claimGeneration()).isEqualTo(run.claimGeneration() + 1);
             assertThat(taken.executionGeneration()).isEqualTo(run.executionGeneration());
@@ -533,6 +537,7 @@ class MongoCacheWorkloadClaimStoreIT {
             assertThat(snapshot(f.database())).isEqualTo(before);
             assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
             assertThat(claims.release(held)).isTrue();
+            replacePreparedScope(f, next);
             assertThat(claims.acquirePipeline(next, OWNER, 1, TTL).claim().claimGeneration()).isEqualTo(held.claimGeneration() + 1);
         });
     }
@@ -593,7 +598,7 @@ class MongoCacheWorkloadClaimStoreIT {
             var run = claims.advanceExecution(claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim(), 1, Set.of("node-a")).orElseThrow();
             assertThat(claims.release(run)).isTrue();
             var next = nextScope();
-            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document(), new Document("$set", new Document("scope", header(next))));
+            replacePreparedScope(f, next);
             claims.acquirePipeline(next, OWNER, 1, TTL);
             SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$set",
                     new Document("claimGeneration", run.claimGeneration()).append("executionGeneration", run.executionGeneration())));
@@ -609,7 +614,8 @@ class MongoCacheWorkloadClaimStoreIT {
             var claims = f.domain().workloadClaims(SCOPE); claims.acquirePipeline(PIPELINE, OWNER, 1, TTL);
             SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("pipelineScope", header(nextScope()))));
             var before = snapshot(f.database());
-            assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).isInstanceOfSatisfying(TapstateException.class,
                     error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             assertThat(snapshot(f.database())).isEqualTo(before);
@@ -617,6 +623,21 @@ class MongoCacheWorkloadClaimStoreIT {
     }
 
     private static PipelineIntentScope nextScope() { return new PipelineIntentScope("cluster-a", 1, "incarnation-a", "orders", 2); }
+    private static void replacePreparedScope(Fixture f, PipelineIntentScope next) {
+        String preparationId = UUID.randomUUID().toString();
+        try (var session = f.admin().startSession()) {
+            session.withTransaction(() -> {
+                SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(session, new Document(), new Document("$set", new Document("scope", header(next))));
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(session, new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                        new Document("$set", new Document("pipelineScope", header(next)).append("pipelinePreparation",
+                                MongoCachePipelinePreparations.marker(preparationId, io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED))
+                                .append("contextExecutionGeneration", 0L).append("executionClaimGeneration", 0L).append("executionNodeIds", List.of())
+                                .append("failureClaimGeneration", 0L).append("failureAfterMemberLoss", false)));
+                return null;
+            });
+        }
+    }
+
     private static Document claimScope(MongoDatabase database) { return SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find().first().get("pipelineScope", Document.class); }
 
     private static Document header(PipelineIntentScope scope) {
@@ -658,7 +679,14 @@ class MongoCacheWorkloadClaimStoreIT {
                             SystemCollections.CACHE_PIPELINE_OBSERVATION)) table.prepareCollectionOn(database, session);
                 }
                 SystemCollections.CACHE_PIPELINE_STATE.on(database).insertOne(new Document("_id", "orders").append("scope", header(PIPELINE))
-                        .append("stateJson", "NEW").append("epoch", 0L).append("touchMillis", 0L).append("runtimeWriteFence", 0L));
+                        .append("stateJson", "NEW").append("epoch", 0L).append("touchMillis", 0L).append("runtimeWriteFence", 1L));
+                // Explicit retained PREPARED fixture; ordinary acquisition cannot bootstrap a missing claim.
+                var raw = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database));
+                var retained = raw.acquire(KEY, OWNER, 1, TTL).claim();
+                raw.release(retained);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                        new Document("$set", new Document("pipelineScope", header(PIPELINE)).append("pipelinePreparation",
+                                MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(), io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED))));
                 SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"), new Document("$set",
                         new Document("businessPhase", "READY").append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
                 SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1)

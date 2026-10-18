@@ -15,7 +15,6 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
-import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -58,22 +57,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireScope(original);
         var key = pipelineKey(original);
-        return transaction(true, original, (store, session) -> {
-            var previous = storedScope(session, key);
-            if (previous != null && previous.stateGeneration() > original.stateGeneration()) throw MongoCacheBusinessIdentity.businessFenced();
-            if (previous != null && !previous.equals(original) && store.read(key).orElseThrow().leased()) throw claimFenced();
-            var acquired = store.acquire(key, owner, topologyRevision, ttl);
-            if (!acquired.acquired()) return acquired;
-            var values = new Document("pipelineScope", scopeDocument(original));
-            if (previous != null && !previous.equals(original)) {
-                // Keep fencing counters across a rebuild; the prior physical state's run context is unknown here.
-                values.append("contextExecutionGeneration", 0L).append("executionClaimGeneration", 0L)
-                        .append("executionNodeIds", List.of()).append("failureClaimGeneration", 0L).append("failureAfterMemberLoss", false);
-            }
-            if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,
-                    WorkloadClaimDocuments.live(WorkloadClaimFence.from(acquired.claim())), new Document("$set", values)).getMatchedCount() != 1) throw claimFenced();
-            return WorkloadClaimAttempt.acquired(store.read(key).orElseThrow().claim());
-        });
+        return transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl));
     }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
@@ -167,6 +151,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
             var decoded = new PipelineIntentScope(value.getString("clusterId"), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
             if (!value.equals(scopeDocument(decoded)) || !key.resourceId().equals(decoded.pipelineId()) || !key.clusterId().equals(decoded.clusterId())
                     || !scope.equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadableScope();
+            if (MongoCachePipelinePreparations.phase(row, decoded) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
             return decoded;
         } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadableScope(); }
     }
@@ -199,11 +184,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                                 var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
                                 access.verifyStateStructure();
                                 var current = access.state(session);
-                                if (current.getLong("runtimeWriteFence") > 0 && store.read(pipelineKey(pipeline)).isEmpty())
-                                    throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                                            Map.of("id", pipeline.pipelineId(), "field", "pipeline-claim-history"), null);
-                                // A real per-Pipeline write serializes admission with state replacement,
-                                // including a first claim absent from the replacement's claim snapshot.
+                                // A real per-Pipeline write serializes admission with controlled state replacement.
                                 if (admission) access.updateState(session, current, new Document(), false);
                             }
                             T result = operation.apply(store, session);
