@@ -181,7 +181,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             captureCoordinator.stopCapture(pipelineId, false);
         }
         try {
-            prepared.artifactSnapshot().ifPresentOrElse(
+            if (prepared.sourceModels().isPresent()) {
+                captureCoordinator.startCapture(pipelineId,prepared.artifactSnapshot().orElseThrow(),prepared.sourceModels().orElseThrow());
+            } else prepared.artifactSnapshot().ifPresentOrElse(
                     snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
                     () -> captureCoordinator.startCapture(pipelineId));
         } catch (RingNotOpenYet notYet) {

@@ -40,6 +40,11 @@ interface PipelineCaptureCoordinator {
         startCapture(pipelineId);
     }
 
+    /** Explicit model-aware adapters consume the original per-start discovery choices. */
+    default void startCapture(String pipelineId,ArtifactStore artifactSnapshot,SourceModelSnapshot sourceModels) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /**
      * Stops the cdc capture started for the pipeline, tearing down each source run and giving back its hold
      * on each chain it read. {@code purgeState} additionally lets go of what the pipeline left in the

@@ -55,6 +55,17 @@ class StoreBackedDagSourceScopedModelTest {
         assertThat(prepared.artifactSnapshot().orElseThrow().get("p")).contains(f.pipeline);
     }
 
+    @Test void discoveryChosenAtPreparationCannotChangeWhileTheOriginalExecutionIsBeingAllocated() {
+        var f = fixture(false); var pass = f.pass(() -> {});
+        var prepared = f.source.prepareStart(pass,"default");
+        f.store.schemas().save(new DiscoveredSourceModel("src","mysql",1,new SourceModel(List.of(new SourceTable("orders",
+                List.of(new SourceField("replacement","INT")),List.of("replacement"),List.of())))));
+        var advanced = advance(1); f.views.current.set(advanced); pass.advanced(advanced);
+        prepared.plan().build(null);
+        assertThat(f.views.models.latest("p","src.orders").orElseThrow().schema()).containsOnlyKeys("id","customer_ref");
+        assertThat(f.store.schemas().get("src").orElseThrow().model().tables().getFirst().primaryKey()).containsExactly("replacement");
+    }
+
     @Test void aPassWhoseRequestedDefinitionIsAlreadyReplacedNeverRecordsNewerModels() {
         var f = fixture(false); var pass = f.pass(() -> {});
         f.store.artifacts().save(pipeline(false, "newer_step"));

@@ -77,7 +77,8 @@ class EngineLifecycleActuatorTest {
 
     @BeforeEach
     void startMember() {
-        Config config = new Config();
+        Config config = new Config().setClusterName("actuator-"+java.util.UUID.randomUUID());
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
