@@ -45,7 +45,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Concrete app orchestration over isolated CONFIG/CACHE replica sets; business root setup is a fixture. */
+/** Concrete app orchestration over isolated CONFIG/CACHE replica sets. */
 @RequiresDocker
 class PipelineFirstStatePreparerIT {
     @Container private static final MongoDBContainer CONFIG = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
@@ -137,6 +137,47 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void actualMapStoreFactoriesKeepTheirOriginalClaimsOverTheControlledCacheAssembly() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business()); var owned = claims.acquirePipeline(f.scope,OWNER,1,TTL).claim();
+            var first = claims.advanceExecution(owned,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var placement = new io.tapstate.spi.store.OperatorPlacement(f.scope,f.cacheDatabase.getName(),
+                    io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE,"step","root","state");
+            f.cache.nestShapes(f.scope,f.cacheDatabase.getName(),WorkloadClaimFence.from(first),ACTIVE).recordIfAbsent("step",java.util.Set.of("root"));
+            var member = org.mockito.Mockito.mock(com.hazelcast.core.HazelcastInstance.class);
+            org.mockito.Mockito.when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+            org.mockito.Mockito.when(member.getDistributedObjects()).thenReturn(List.of());
+            try (var authorization = ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(10),System::nanoTime,() -> true);
+                 var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,new ScopedOperatorStateProvider(f.cache,authorization))) {
+                var originalFence = new ExecutionFence(f.scope,WorkloadClaimFence.from(first));
+                var original = new io.tapstate.runtime.engine.OperatorMapBinding(placement,originalFence,originalFence.operatorExecutionKey());
+                registry.install(List.of(original)); var old = mapStore(member,original); Object key = List.of("key"); old.store(key,"before");
+                var nextClaim = claims.advanceExecution(first,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+                var nextFence = new ExecutionFence(f.scope,WorkloadClaimFence.from(nextClaim));
+                var next = new io.tapstate.runtime.engine.OperatorMapBinding(placement,nextFence,nextFence.operatorExecutionKey());
+                registry.install(List.of(next)); var current = mapStore(member,next); assertThat(current.load(key)).isEqualTo("before");
+                current.store(key,"after"); var before = f.state();
+                assertCode(() -> old.store(key,"late"),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> old.storeAll(Map.of(key,"late")),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> old.delete(key),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> old.deleteAll(List.of(key)),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> f.cache.operatorState(placement,WorkloadClaimFence.from(first),ACTIVE)
+                        .save(placement.mapName(),"late",new byte[]{1}),IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(f.state()).isEqualTo(before); assertThat(current.load(key)).isEqualTo("after");
+                assertThat(registry.release(original)).isFalse(); assertThat(current.load(key)).isEqualTo("after");
+            }
+        });
+    }
+
+    @SuppressWarnings("unchecked") private static com.hazelcast.map.MapStore<Object,Object> mapStore(com.hazelcast.core.HazelcastInstance member,
+            io.tapstate.runtime.engine.OperatorMapBinding binding) {
+        var properties = new java.util.Properties(); properties.setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY,"true");
+        var loader = new io.tapstate.runtime.engine.nest.NestStateMapStoreFactory().newMapStore(binding.mapName(),properties);
+        ((com.hazelcast.map.MapLoaderLifecycleSupport)loader).init(member,properties,binding.mapName());
+        return (com.hazelcast.map.MapStore<Object,Object>)loader;
+    }
+
     private static void assertCode(org.assertj.core.api.ThrowableAssert.ThrowingCallable action, IoError code) {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(code));
     }
@@ -150,15 +191,10 @@ class PipelineFirstStatePreparerIT {
             try (var configuration = MongoConfigurationBootstrap.prepare(settings, "cluster-a", "installation-a", "setup-a", 1);
                  var cache = MongoCacheDomain.connect(cacheConnection, Duration.ofSeconds(5), "app-preparation-test")) {
                 var master = new SourceResource(StorageBinding.defaultSourceId(StorageBinding.Mode.OP), null, "mongodb", Map.of("uri", "mongodb://master.invalid/master"), null, null, null, null);
-                configuration.bindings().commit(new StorageSetupScope("cluster-a", "installation-a", "setup-a", 1), StorageBinding.Mode.OP, cacheConnection, master);
-                var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
-                cache.prepareAuth(new CacheAuthScope(business.clusterId(), business.bindingVersion(), StorageBinding.Mode.OP, business.cacheIncarnation(), 1), "auth-a", ACTIVE);
-                // Explicit business-schema fixture, not production business-root preparation evidence.
-                for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_OPERATOR_CLEANUP)) cacheDb.createCollection(table.collectionName());
-                SystemCollections.CACHE_IDENTITY.on(cacheDb).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
-                        .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
-                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cacheDb).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY")
-                        .append("epoch", 1L).append("operationId", "business-a"));
+                var committed = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster-a", "installation-a", "setup-a", 1), StorageBinding.Mode.OP, cacheConnection, master);
+                var business = committed.preparation().businessScope();
+                cache.prepareFirstAuth(committed.firstCreation().orElseThrow());
+                cache.prepareInitialBusiness(committed.preparation(),ACTIVE);
                 var pipeline = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: []\n");
                 configuration.artifacts().create(pipeline);
                 var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(), "flow", 1);

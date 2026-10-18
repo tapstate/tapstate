@@ -42,6 +42,21 @@ record ExecutionFence(String pipelineId, long claimGeneration, long executionGen
         }
     }
 
+    /** A deterministic hot-map attempt key; the physical cold address remains independent of it. */
+    String operatorExecutionKey() {
+        if (scope == null) throw new IllegalStateException("an operator binding requires a scoped execution");
+        try {
+            var bytes = new java.io.ByteArrayOutputStream();
+            try (var out = new java.io.DataOutputStream(bytes)) {
+                text(out, scope.clusterId()); out.writeLong(scope.bindingVersion()); text(out, scope.cacheIncarnation());
+                text(out, scope.pipelineId()); out.writeLong(scope.stateGeneration());
+                text(out, ownerNodeId); text(out, ownerBootId); out.writeLong(claimGeneration); out.writeLong(executionGeneration); out.writeLong(topologyRevision);
+            }
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray()));
+        } catch (java.io.IOException | java.security.NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); }
+    }
+    private static void text(java.io.DataOutputStream out, String value) throws java.io.IOException { out.writeInt(value.length()); out.writeChars(value); }
+
     ExecutionFence {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (pipelineId.isBlank()) {
