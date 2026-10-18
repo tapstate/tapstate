@@ -10,7 +10,6 @@ import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaModifier;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.runtime.engine.ProtectedMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -103,9 +102,7 @@ class NestStateMapGatesTest {
 
     @BeforeAll
     static void importClasses() {
-        productionClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        productionClasses = ProductionClassImports.packages("io.tapstate");
         fixtureClasses = new ClassFileImporter().importClasses(AVertexThatOversteps.class);
     }
 

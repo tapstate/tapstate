@@ -5,8 +5,6 @@ import com.mongodb.client.gridfs.GridFSBuckets;
 import com.tngtech.archunit.base.DescribedPredicate;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaMethodCall;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
@@ -64,9 +62,7 @@ class SystemCollectionsGatesTest {
 
     @BeforeAll
     static void importTapstateClasses() {
-        tapstateClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        tapstateClasses = ProductionClassImports.packages("io.tapstate");
     }
 
     @Test
