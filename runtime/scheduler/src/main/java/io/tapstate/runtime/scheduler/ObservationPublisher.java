@@ -1,6 +1,9 @@
 package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.event.Op;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
@@ -707,8 +710,23 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
+        return publish(pipelineId, failure, state, observations, false);
+    }
+
+    /** Projects through the fixed state and original-claim observation views captured by this pass. */
+    public Optional<Observation> publishScoped(PipelineIntentScope scope, StateStore scopedState,
+            ObservationStore scopedObservations, ObservationFailure failure) {
+        Objects.requireNonNull(scope, "scope");
+        return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
+                Objects.requireNonNull(scopedObservations, "scopedObservations"), true);
+    }
+
+    private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
+            ObservationStore observations, boolean requirePreparedState) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        return state.read(pipelineId).map(checkpoint -> {
+        var current = state.read(pipelineId);
+        if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
+        return current.map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
             ObservationFailure carried = failure;
             if (carried == null && actual == PipelineState.FAILED) {
@@ -772,9 +790,24 @@ public final class ObservationPublisher {
      * read it from, unlike positions and failure which are simply carried forward from the last observation.
      */
     public void publishReconcileFailure(String pipelineId, long consecutiveFailures) {
+        publishReconcileFailure(pipelineId, consecutiveFailures, observations, PipelineState.NEW);
+    }
+
+    /** A failed pass still uses its original ports, including when no projection has been made yet. */
+    public void publishReconcileFailureScoped(PipelineIntentScope scope, StateStore scopedState,
+            ObservationStore scopedObservations, long consecutiveFailures) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(scopedState, "scopedState");
+        Objects.requireNonNull(scopedObservations, "scopedObservations");
+        var current = scopedState.read(scope.pipelineId()).orElseThrow(() -> missingCheckpoint(scope.pipelineId()));
+        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations, StateJson.parse(current.stateJson()));
+    }
+
+    private void publishReconcileFailure(String pipelineId, long consecutiveFailures, ObservationStore observations,
+            PipelineState unpublishedState) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation previous = observations.read(pipelineId).orElse(null);
-        PipelineState lastState = previous != null ? previous.state() : PipelineState.NEW;
+        PipelineState lastState = previous != null ? previous.state() : unpublishedState;
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         Instant at = observedNow();
@@ -783,6 +816,10 @@ public final class ObservationPublisher {
         observations.save(new Observation(pipelineId, lastState,
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                 null, lastPositions, lastFailure, at, measured));
+    }
+
+    private static TapstateException missingCheckpoint(String pipelineId) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "checkpoint"), null);
     }
 
     /**

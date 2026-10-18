@@ -7,6 +7,9 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
+import io.tapstate.spi.store.IoError;
+import java.util.Map;
 import io.tapstate.spi.store.StateStore;
 
 import java.time.Clock;
@@ -33,6 +36,7 @@ public final class PipelineConverger {
     private final LifecycleActuator actuator;
     private final Clock clock;
     private final RebuildAdmission rebuilds;
+    private final boolean requirePreparedState;
 
     /** A converge loop that never rebuilds a failed run, which is every run on a single node. */
     public PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock) {
@@ -42,6 +46,12 @@ public final class PipelineConverger {
     public PipelineConverger(
             DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
             RebuildAdmission rebuilds) {
+        this(desired, state, actuator, clock, rebuilds, false);
+    }
+
+    private PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
+            RebuildAdmission rebuilds, boolean requirePreparedState) {
+        this.requirePreparedState = requirePreparedState;
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.actuator = Objects.requireNonNull(actuator, "actuator");
@@ -56,7 +66,22 @@ public final class PipelineConverger {
 
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
     public ConvergeResult converge(String pipelineId) {
-        Optional<DesiredState> intent = desired.read(pipelineId);
+        return converge(pipelineId, desired.read(pipelineId));
+    }
+
+    /**
+     * Consumes one captured CONFIG intent and this pass's bound ports. Retries read only those ports;
+     * neither a newer intent nor another physical state can be adopted in the middle of this pass.
+     * Initial checkpoints belong to controlled preparation, never ordinary scoped convergence.
+     */
+    public ConvergeResult convergeScoped(PipelineIntentSnapshot intent, StateStore scopedState,
+            LifecycleActuator scopedActuator, RebuildAdmission scopedRebuilds) {
+        Objects.requireNonNull(intent, "intent");
+        return new PipelineConverger(desired, scopedState, scopedActuator, clock, scopedRebuilds, true)
+                .converge(intent.scope().pipelineId(), Optional.ofNullable(intent.desired()));
+    }
+
+    private ConvergeResult converge(String pipelineId, Optional<DesiredState> intent) {
         if (intent.isEmpty()) {
             return ConvergeResult.nothingToDo();
         }
@@ -197,6 +222,7 @@ public final class PipelineConverger {
             boolean purgeState, boolean rebuild, boolean evenIfAlreadyThere) {
         String targetJson = StateJson.of(target);
         if (current == null) {
+            if (requirePreparedState) throw missingCheckpoint(pipelineId);
             if (!seedIfAbsent) {
                 return ConvergeResult.nothingToDo();
             }
@@ -314,6 +340,12 @@ public final class PipelineConverger {
 
     private CheckpointDoc requireCheckpoint(String pipelineId) {
         return state.read(pipelineId)
-                .orElseThrow(() -> new IllegalStateException("checkpoint vanished for pipeline " + pipelineId));
+                .orElseThrow(() -> missingCheckpoint(pipelineId));
+    }
+
+    private RuntimeException missingCheckpoint(String pipelineId) {
+        return requirePreparedState
+                ? new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "checkpoint"), null)
+                : new IllegalStateException("checkpoint vanished for pipeline " + pipelineId);
     }
 }
