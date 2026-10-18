@@ -120,12 +120,16 @@ final class MongoCachePipelineAccess {
         } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("scope"); }
     }
 
-    void proveClaim(ClientSession session) {
+    void proveClaim(ClientSession session) { proveClaim(session,"fencedPipelineWrites"); }
+
+    void proveConsumerClaim(ClientSession session) { proveClaim(session,"fencedConsumerWrites"); }
+
+    private void proveClaim(ClientSession session,String counter) {
         if (original == null) throw fenced();
         MongoCacheWorkloadClaimStore.requireCollection(database);
         if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original)
                         .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED"),
-                new Document("$inc", new Document("fencedPipelineWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
+                new Document("$inc",new Document(counter,1L))).getMatchedCount() != 1) throw claimFenced();
     }
 
     /** This real write also serializes an observation with replacement of the current state scope. */

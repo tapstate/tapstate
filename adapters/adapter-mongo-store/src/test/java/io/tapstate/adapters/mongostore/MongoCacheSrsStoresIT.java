@@ -51,6 +51,68 @@ class MongoCacheSrsStoresIT {
         });
     }
 
+    @Test void aConsumerCannotInventAStateGenerationDifferentFromItsNativelyPreparedPipeline() {
+        withFixture(f -> {
+            var prepared = f.pipeline(); var stores = f.domain.srs(f.scope,ACTIVE); stores.chains().prepare(CHAIN,"retention",f.capture);
+            var wrong = new SrsConsumerContext(f.consumer(),2); var before = f.snapshot();
+            assertThatThrownBy(() -> stores.consumers().attach(wrong,0,Set.of("orders"),prepared.fence())).isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void aRetainedConsumerCannotBorrowANewClaimAfterTheCurrentPipelineScopeChanged() {
+        withFixture(f -> {
+            var prepared = f.pipeline(); var stores = f.domain.srs(f.scope,ACTIVE); stores.chains().prepare(CHAIN,"retention",f.capture);
+            var old = new SrsConsumerContext(f.consumer(),1); var held = stores.consumers().attach(old,0,Set.of("orders"),prepared.fence()).orElseThrow();
+            var nextScope = new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"pipeline",2);
+            // Simulate an already published CACHE generation replacement; this is not a recovery-entrypoint test.
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database).updateOne(new Document("_id","pipeline"),
+                    new Document("$set",new Document("scope",MongoPipelinePreparationFacts.scope(nextScope))));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database).updateOne(new Document("_id",MongoWorkloadClaimStore.id(prepared.fence().key())),
+                    new Document("$set",new Document("pipelineScope",MongoPipelinePreparationFacts.scope(nextScope))));
+            var claims = f.domain.workloadClaims(f.scope); var current = claims.acquirePipeline(nextScope,f.node.owner(),1,Duration.ofMinutes(2)).claim();
+            var advanced = claims.advanceExecution(current,1,Set.of(f.node.owner().nodeId())).orElseThrow();
+            var next = WorkloadClaimFence.from(advanced); assertThat(next.executionGeneration()).isGreaterThan(prepared.fence().executionGeneration());
+            assertThat(f.domain.pipelineStates(nextScope).read("pipeline")).isPresent(); var before = f.snapshot();
+            assertThatThrownBy(() -> stores.consumers().attach(old,held.revision(),Set.of("orders"),next)).isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void aNewExecutionOfTheSamePreparedScopeCanReassertItsConsumerWithoutResettingProgress() {
+        withFixture(f -> {
+            var prepared = f.pipeline(); var stores = f.domain.srs(f.scope,ACTIVE); stores.chains().prepare(CHAIN,"retention",f.capture);
+            var context = new SrsConsumerContext(f.consumer(),1);
+            var first = stores.consumers().attach(context,0,Set.of("orders"),prepared.fence()).orElseThrow();
+            var before = stores.consumers().progress(context).orElseThrow();
+            var claims = f.domain.workloadClaims(f.scope); var retained = claims.acquirePipeline(prepared.scope(),f.node.owner(),1,Duration.ofMinutes(2)).claim();
+            var current = WorkloadClaimFence.from(claims.advanceExecution(retained,1,Set.of(f.node.owner().nodeId())).orElseThrow());
+            var next = stores.consumers().attach(context,first.revision(),Set.of("orders"),current).orElseThrow();
+            assertThat(next.commandFence()).isEqualTo(current); assertThat(next.revision()).isEqualTo(first.revision()+1);
+            var progress = stores.consumers().progress(context).orElseThrow();
+            assertThat(progress.revision()).isEqualTo(before.revision()); assertThat(progress.cursor()).isEqualTo(before.cursor());
+        });
+    }
+
+    @Test void everyConsumerMutationWritesTheOriginalCurrentCheckpointFenceExactlyOnce() {
+        withFixture(f -> {
+            var prepared = f.pipeline(); var stores = f.domain.srs(f.scope,ACTIVE); stores.chains().prepare(CHAIN,"retention",f.capture);
+            assertThat(stores.chains().openEpoch(CHAIN,0,f.capture)).hasValue(1); stores.models().publish(f.model(),f.capture);
+            var context = new SrsConsumerContext(f.consumer(),1);
+            long before = checkpointFence(f);
+            var member = stores.consumers().attach(context,0,Set.of("orders"),prepared.fence()).orElseThrow();
+            assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
+            var pin = new SrsSnapshotPin(1,"seam",Map.of("orders",f.model().key()));
+            assertThat(stores.consumers().pinSnapshot(context,member.revision(),0,pin,prepared.fence())).isTrue();
+            assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
+            assertThat(stores.consumers().detach(context,member.revision(),prepared.fence())).isPresent();
+            assertThat(checkpointFence(f)).isEqualTo(before+1);
+        });
+    }
+    private static long checkpointFence(Fixture f) {
+        return SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find(new Document("_id","pipeline")).first().getLong("runtimeWriteFence");
+    }
+
     @Test void allCapturedFacetsAndFurtherFactoriesRefuseAClosedOwner() {
         withFixture(f -> {
             var stores = f.domain.srs(f.scope,ACTIVE); f.domain.close();
@@ -129,14 +191,29 @@ class MongoCacheSrsStoresIT {
                 var committed = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster","installation","setup",1),StorageBinding.Mode.OP,endpoint,source);
                 domain.prepareFirstAuth(committed.firstCreation().orElseThrow()); var scope = domain.prepareInitialBusiness(committed.preparation(),ACTIVE);
                 var claims = domain.workloadClaims(scope); var owner = new WorkloadOwner("node","boot");
-                claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),owner,1,Duration.ofMinutes(2));
+                var node = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),owner,1,Duration.ofMinutes(2)).claim();
                 var capture = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),owner,1,Duration.ofMinutes(2)).claim();
-                action.accept(new Fixture(domain,database,configDatabase,endpoint,scope,committed.preparation().authScope(),WorkloadClaimFence.from(capture)));
+                action.accept(new Fixture(configuration,domain,database,configDatabase,endpoint,scope,committed.preparation().authScope(),WorkloadClaimFence.from(capture),WorkloadClaimFence.from(node)));
             } finally { database.drop(); configDatabase.drop(); }
         }
     }
-    private record Fixture(MongoCacheDomain domain,MongoDatabase database,MongoDatabase configDatabase,
-            StorageBinding.Connection endpoint,CacheBusinessScope scope,CacheAuthScope auth,WorkloadClaimFence capture) {
+    private record PreparedPipeline(PipelineIntentScope scope,WorkloadClaimFence fence) {}
+    private record Fixture(MongoConfigurationDomain configuration,MongoCacheDomain domain,MongoDatabase database,MongoDatabase configDatabase,
+            StorageBinding.Connection endpoint,CacheBusinessScope scope,CacheAuthScope auth,WorkloadClaimFence capture,WorkloadClaimFence node) {
+        PreparedPipeline pipeline() {
+            var pipeline = new io.tapstate.core.model.PipelineResource("pipeline",null,List.of(),null,null,null,null,null);
+            configuration.artifacts().create(pipeline);
+            var physical = new PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),pipeline.id(),1);
+            configuration.intents().compareAndSet(physical,0,new io.tapstate.core.lifecycle.DesiredState(pipeline.id(),io.tapstate.core.lifecycle.PipelineState.RUNNING,
+                    io.tapstate.core.model.canonical.CanonicalHash.of(pipeline),false));
+            var grant = ((FirstPipelineCreationResult.Issued)configuration.preparations().issueFirstCreate(physical,node)).creation();
+            var preparations = domain.pipelinePreparations(scope,ACTIVE); var reservation = preparations.reserveFirst(grant,Duration.ofMinutes(2));
+            var receipt = preparations.seed(reservation,configuration.preparations(),java.time.Instant.parse("2026-10-19T00:00:00Z"));
+            configuration.preparations().complete(receipt);
+            var claims = domain.workloadClaims(scope); var retained = claims.acquirePipeline(physical,node.owner(),1,Duration.ofMinutes(2)).claim();
+            var running = claims.advanceExecution(retained,1,Set.of(node.owner().nodeId())).orElseThrow();
+            return new PreparedPipeline(physical,WorkloadClaimFence.from(running));
+        }
         SrsModel model() { return new SrsModel(new SrsModelKey(CHAIN,"orders",scope.cacheIncarnation(),1,0),RING,
                 new SourceTable("orders",List.of(new SourceField("id","integer")),List.of("id"),List.of()),0); }
         SrsConsumerKey consumer() { return new SrsConsumerKey(CHAIN,"pipeline","source"); }

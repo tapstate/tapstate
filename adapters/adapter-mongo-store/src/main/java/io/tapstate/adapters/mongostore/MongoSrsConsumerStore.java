@@ -90,7 +90,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(snapshot, "snapshot");
         requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
         return transaction(session -> {
-            prove(session, context.key(), fence); var view = view(session, chain); var member = view.members().get(context.key().consumerId());
+            prove(session,context,fence); var view = view(session, chain); var member = view.members().get(context.key().consumerId());
             if (member == null || member.detached() || !member.context().equals(context)) throw unavailable(chain);
             if (member.revision() != membershipRevision) return false;
             if (!member.commandFence().equals(fence)) throw fenced();
@@ -129,7 +129,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if (selected.isEmpty() || selected.stream().anyMatch(String::isBlank)) throw new IllegalArgumentException("an attached consumer requires tables");
         String chain = context.key().miningChainId();
         return transaction(session -> {
-            prove(session, context.key(), fence); var view = view(session, chain); var held = view.members().get(context.key().consumerId());
+            prove(session,context,fence); var view = view(session, chain); var held = view.members().get(context.key().consumerId());
             if (replayed(held, context, expectedRevision, false, selected, fence)) return Optional.of(held);
             long revision = held == null ? 0 : held.revision();
             if (revision != expectedRevision) return Optional.empty();
@@ -150,7 +150,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext context, long expectedRevision, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); String chain = context.key().miningChainId();
         return transaction(session -> {
-            prove(session, context.key(), fence); var view = view(session, chain); var held = view.members().get(context.key().consumerId());
+            prove(session,context,fence); var view = view(session, chain); var held = view.members().get(context.key().consumerId());
             if (replayed(held, context, expectedRevision, true, Set.of(), fence)) return Optional.of(held);
             long revision = held == null ? 0 : held.revision();
             if (revision != expectedRevision) return Optional.empty();
@@ -214,11 +214,16 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if (active != state.consumerCount() || cursors.size() != active || revisions != state.consumerRevision()) throw unavailable(chain);
         return new View(root, state, members, cursors);
     }
-    private void prove(ClientSession session, SrsConsumerKey key, WorkloadClaimFence fence) {
-        Objects.requireNonNull(fence, "originalPipelineFence");
+    private void prove(ClientSession session,SrsConsumerContext context,WorkloadClaimFence fence) {
+        Objects.requireNonNull(fence,"originalPipelineFence");
         if (fence.executionGeneration() < 1 || fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION || !scope.clusterId().equals(fence.key().clusterId())
-                || !key.pipelineId().equals(fence.key().resourceId()) || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,
-                WorkloadClaimDocuments.live(fence), new Document("$inc", new Document("fencedConsumerWrites", 1L))).getMatchedCount() != 1) throw fenced();
+                || !context.key().pipelineId().equals(fence.key().resourceId())) throw fenced();
+        var physical = new io.tapstate.spi.store.PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),
+                context.key().pipelineId(),context.stateGeneration());
+        var pipeline = new MongoCachePipelineAccess(client,database,physical,fence,requireActive);
+        pipeline.verifyStateStructure(); Document current = pipeline.state(session);
+        pipeline.proveConsumerClaim(session);
+        pipeline.updateState(session,current,new Document(),false);
     }
     private <T> T transaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {

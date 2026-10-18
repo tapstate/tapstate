@@ -151,11 +151,11 @@ class MongoSrsConsumerStoreIT {
     void aStateGenerationChangeRequiresExplicitDetachAndCannotReturnTheOldCursor() {
         withBusiness(f -> {
             f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow(); var next = new SrsConsumerContext(A.key(), 2);
-            assertThatThrownBy(() -> f.consumers().attach(next, 1, Set.of("orders"), f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
-            f.consumers().detach(A, 1, f.fenceA()).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().attach(next,1,Set.of("orders"),f.fenceA())).satisfies(error -> code(error,IoError.CACHE_BUSINESS_FENCED));
+            f.consumers().detach(A,1,f.fenceA()).orElseThrow(); replacePipelineScope(f,next);
             f.consumers().attach(next, 2, Set.of("orders"), f.fenceA()).orElseThrow();
             assertThatThrownBy(() -> f.consumers().cursor(A)).satisfies(MongoSrsConsumerStoreIT::unavailable);
-            assertThat(f.consumers().detach(A, 1, f.fenceA())).isEmpty();
+            assertThatThrownBy(() -> f.consumers().detach(A,1,f.fenceA())).satisfies(error -> code(error,IoError.CACHE_BUSINESS_FENCED));
             assertThat(f.consumers().cursor(next)).isPresent();
         });
     }
@@ -185,6 +185,7 @@ class MongoSrsConsumerStoreIT {
     @Test
     void callbackGuardLossRollsBackBothResourcesTheChainAndTheClaimProof() {
         withBusiness(f -> {
+            Document checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first();
             Document root = root(f); Document claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())
                     .find(new Document("_id.resourceId", A.key().pipelineId())).first();
             try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_chains")) {
@@ -192,7 +193,8 @@ class MongoSrsConsumerStoreIT {
                 assertThatThrownBy(() -> guarded.attach(A, 0, Set.of("orders"), f.fenceA())).satisfies(failure -> code(failure,IoError.CACHE_BUSINESS_FENCED));
                 witness.requireCommand();
             }
-            assertThat(root(f)).isEqualTo(root); assertThat(membership(f, A)).isNull(); assertThat(cursor(f, A)).isNull();
+            assertThat(root(f)).isEqualTo(root); assertThat(membership(f,A)).isNull(); assertThat(cursor(f,A)).isNull();
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first()).isEqualTo(checkpoint);
             assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id.resourceId", A.key().pipelineId())).first()).isEqualTo(claim);
         });
     }
@@ -403,7 +405,8 @@ class MongoSrsConsumerStoreIT {
     void guardLossRollsBackThePinOriginalClaimProofAndChainWriteFence() {
         withBusiness(f -> {
             var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
-            var root = root(f); var cursor = cursor(f, A);
+            var root = root(f); var cursor = cursor(f,A);
+            var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first();
             var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id", WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first();
             try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_consumer_offsets")) {
                 var guarded = new MongoSrsConsumerStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
@@ -411,8 +414,9 @@ class MongoSrsConsumerStoreIT {
                         .satisfies(failure -> code(failure,IoError.CACHE_BUSINESS_FENCED));
                 witness.requireCommand();
             }
-            assertThat(root(f)).isEqualTo(root); assertThat(cursor(f, A)).isEqualTo(cursor);
-            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id", WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first()).isEqualTo(claim);
+            assertThat(root(f)).isEqualTo(root); assertThat(cursor(f,A)).isEqualTo(cursor);
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first()).isEqualTo(checkpoint);
+            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id",WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first()).isEqualTo(claim);
         });
     }
 
@@ -422,8 +426,9 @@ class MongoSrsConsumerStoreIT {
             var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
             var pin = new SrsSnapshotPin(1, "seam", refs); var detached = f.consumers().detach(A, member.revision(), f.fenceA()).orElseThrow();
             assertThatThrownBy(() -> f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
-            var next = new SrsConsumerContext(A.key(), 2); f.consumers().attach(next, detached.revision(), Set.of("orders"), f.fenceA()).orElseThrow();
-            assertThatThrownBy(() -> f.consumers().pinSnapshot(A, detached.revision() + 1, 0, pin, f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            var next = new SrsConsumerContext(A.key(),2); replacePipelineScope(f,next);
+            f.consumers().attach(next,detached.revision(),Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().pinSnapshot(A,detached.revision()+1,0,pin,f.fenceA())).satisfies(error -> code(error,IoError.CACHE_BUSINESS_FENCED));
             assertThat(f.consumers().progress(next).orElseThrow().snapshot()).isNull();
         });
     }
@@ -497,7 +502,7 @@ class MongoSrsConsumerStoreIT {
                 try (var session = client.startSession()) {
                     for (var table : List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS, SystemCollections.SRS_CHAINS,
                             SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS,
-                            SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
+                            SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
                         table.prepareCollectionOn(database, session); for (var index : table.indexes()) IndexEnsure.createInTransaction(session, table.on(database), index);
                     }
                 }
@@ -509,12 +514,31 @@ class MongoSrsConsumerStoreIT {
                 var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database));
                 var capture = claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-a"),
                         new WorkloadOwner("node-c", "boot-c"), 1, Duration.ofSeconds(30)).claim();
-                WorkloadClaim a = pipeline(claims, "pipeline-a"); WorkloadClaim b = pipeline(claims, "pipeline-b");
+                WorkloadClaim a = pipeline(claims,"pipeline-a"); WorkloadClaim b = pipeline(claims,"pipeline-b");
+                preparePipelineScope(database,"pipeline-a",1); preparePipelineScope(database,"pipeline-b",1);
                 var chains = new MongoSrsChainStore(client, database, SCOPE); chains.prepare(CHAIN, "retention", WorkloadClaimFence.from(capture));
                 scenario.run(new Fixture(client, database, chains, new MongoSrsConsumerStore(client, database, SCOPE), capture, a, b));
             } catch (Exception failure) { throw new AssertionError(failure); }
             finally { database.drop(); }
         }
+    }
+    /** Explicit checkpoint fixtures support these transaction cases; native preparation is tested separately. */
+    private static void preparePipelineScope(MongoDatabase database,String pipeline,long generation) {
+        var physical = new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),pipeline,generation);
+        var header = MongoPipelinePreparationFacts.scope(physical);
+        SystemCollections.CACHE_PIPELINE_STATE.on(database).insertOne(new Document("_id",pipeline).append("scope",header)
+                .append("stateJson","NEW").append("epoch",0L).append("touchMillis",0L).append("runtimeWriteFence",1L));
+        var key = new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,pipeline);
+        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(new Document("_id",MongoWorkloadClaimStore.id(key)),
+                new Document("$set",new Document("pipelineScope",header).append("pipelinePreparation",
+                        MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(),io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED))));
+    }
+    private static void replacePipelineScope(Fixture f,SrsConsumerContext context) {
+        var physical = new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),context.key().pipelineId(),context.stateGeneration());
+        var header = MongoPipelinePreparationFacts.scope(physical);
+        SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document("_id",context.key().pipelineId()),new Document("$set",new Document("scope",header)));
+        var key = new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,context.key().pipelineId());
+        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id",MongoWorkloadClaimStore.id(key)),new Document("$set",new Document("pipelineScope",header)));
     }
     private static WorkloadClaim pipeline(MongoWorkloadClaimStore claims, String pipeline) {
         var acquired = claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, pipeline),
