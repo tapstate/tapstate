@@ -3,8 +3,6 @@ package io.tapstate.archtests;
 import com.tngtech.archunit.core.domain.Dependency;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.TapstatePrincipal;
@@ -33,10 +31,8 @@ class SecurityBoundaryRulesTest {
 
     @BeforeAll
     static void importProductionClasses() {
-        ClassFileImporter importer = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS);
-        restApi = importer.importPackages(REST_API_PACKAGE);
-        controlCore = importer.importPackages("io.tapstate.control.core");
+        restApi = ProductionClassImports.packages(REST_API_PACKAGE);
+        controlCore = ProductionClassImports.packages("io.tapstate.control.core");
     }
 
     private static Set<String> bearerAuthorityTypes() {

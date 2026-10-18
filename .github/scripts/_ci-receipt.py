@@ -410,7 +410,7 @@ def inputs(args):
     require(not any(name.endswith(('.java', '.py', '.sh', '.xml', '.yml', '.yaml', '.properties'))
                     or '/META-INF/services/' in name for name in untracked), 'untracked source cannot be attributed to the recorded commit')
     start = time.monotonic_ns()
-    input_digest = digest
+    input_digest = input_digest_reader()
     from importlib.util import spec_from_file_location, module_from_spec
     spec = spec_from_file_location('ci_shards', Path(__file__).with_name('_ci-shards.py'))
     shards = module_from_spec(spec)
@@ -458,18 +458,21 @@ def inputs(args):
         if classes.exists():
             for path in safe_files(classes):
                 relative = path.relative_to(root).as_posix()
-                production[relative] = input_digest(path)
                 if path.suffix == '.class':
                     bytecode = path.read_bytes()
+                    production[relative] = hashlib.sha256(bytecode).hexdigest()
                     class_ids[relative] = crc64(bytecode)
                     class_flags[relative] = class_access_flags(bytecode)
+                else:
+                    production[relative] = input_digest(path)
         test_classes = target / 'test-classes'
         if test_classes.exists():
             for path in safe_files(test_classes):
                 if path.suffix == '.class':
                     relative = path.relative_to(root).as_posix()
-                    test_files[relative] = input_digest(path)
-                    test_ids[relative] = crc64(path.read_bytes())
+                    bytecode = path.read_bytes()
+                    test_files[relative] = hashlib.sha256(bytecode).hexdigest()
+                    test_ids[relative] = crc64(bytecode)
                 else:
                     test_resources[path.relative_to(root).as_posix()] = input_digest(path)
         if target.exists():
