@@ -41,23 +41,23 @@ class NodeSessionLeaseStartupIT {
     @Test
     void aLateAdoptedLiveClaimIsRenewedBeforeItsOriginalProofExpires() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            Duration ttl = Duration.ofSeconds(2);
-            Duration interval = Duration.ofSeconds(1);
+            Duration ttl = Duration.ofSeconds(8);
+            Duration interval = Duration.ofSeconds(6);
             Acquired acquired = fixture.acquire("boot-live", ttl);
             fixture.keyring.acknowledge(acquired.claim, ttl);
-            WorkloadClaimReading before = fixture.awaitRemainingBelow(acquired.claim, Duration.ofMillis(650));
+            long proofDeadline = acquired.askedAt + ttl.toNanos();
+            long adoptionAt = proofDeadline - Duration.ofSeconds(3).toNanos();
+            TimeUnit.NANOSECONDS.sleep(Math.max(0, adoptionAt - System.nanoTime()));
+            WorkloadClaimReading before = fixture.claims.read(acquired.claim.key()).orElseThrow();
             assertThat(before.leased()).isTrue();
-            assertThat(before.leaseRemaining()).isBetween(Duration.ofMillis(350), Duration.ofMillis(650));
-            assertThat(System.nanoTime() - acquired.askedAt).isLessThan(ttl.toNanos());
+            assertThat(before.leaseRemaining()).isPositive().isLessThan(interval);
+            assertThat(proofDeadline - System.nanoTime()).isPositive().isLessThan(interval.toNanos());
             TrackingKeyring keyring = new TrackingKeyring(fixture.keyring);
             AtomicInteger stopped = new AtomicInteger();
             try (NodeSessionLease lease = new NodeSessionLease(fixture.claims, acquired.claim, acquired.askedAt,
                     ttl, interval, keyring, stopped::incrementAndGet)) {
-                boolean renewed = keyring.acknowledged.await(800, TimeUnit.MILLISECONDS);
-                if (!renewed) {
-                    assertThat(fixture.claims.read(acquired.claim.key()).orElseThrow().leased())
-                            .as("the real server lease elapsed before the old delayed first renewal").isFalse();
-                }
+                boolean renewed = keyring.acknowledged.await(
+                        Math.max(0, proofDeadline - System.nanoTime()), TimeUnit.NANOSECONDS);
                 assertThat(renewed).as("a still-live late-adopted claim must renew before its original proof expires").isTrue();
                 WorkloadClaimReading after = fixture.claims.read(acquired.claim.key()).orElseThrow();
                 assertThat(after.leased()).isTrue();

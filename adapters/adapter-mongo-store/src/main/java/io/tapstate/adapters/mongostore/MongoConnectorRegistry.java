@@ -7,6 +7,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.gridfs.GridFSBucket;
+import com.mongodb.client.gridfs.GridFSUploadStream;
 import com.mongodb.client.gridfs.model.GridFSFile;
 import com.mongodb.client.gridfs.model.GridFSUploadOptions;
 import com.mongodb.client.model.Accumulators;
@@ -20,16 +21,18 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
 import org.bson.BsonObjectId;
+import org.bson.BsonDocument;
+import org.bson.BsonString;
 import org.bson.Document;
 import org.bson.types.ObjectId;
 
-import java.io.ByteArrayInputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 /**
  * The MongoDB connector distribution registry: stores each registered connector artifact in a GridFS
@@ -102,9 +105,21 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
             // Each contender owns a different upload id. A shared deterministic id would let the
             // driver's failed-upload cleanup remove another contender's chunks.
             BsonObjectId attempt = new BsonObjectId(new ObjectId());
+            GridFSUploadStream upload = artifacts.openUploadStream(attempt, contentHash, options);
             try {
-                artifacts.uploadFromStream(attempt, contentHash, new ByteArrayInputStream(artifact), options);
+                upload.write(artifact, 0, artifact.length);
+            } catch (MongoException failure) {
+                // No file insert has been attempted while writing. This upload owns every such chunk.
+                upload.abort();
+                throw failure;
+            }
+            try {
+                upload.close();
             } catch (MongoWriteException e) {
+                // A definitive write rejection did not publish this file, regardless of its index.
+                // Ambiguous close failures are deliberately not caught here: their file insert may
+                // have committed, so deleting chunks after a missing-file read could corrupt it.
+                chunks.deleteMany(Filters.eq("files_id", attempt));
                 if (!isContentHashDuplicate(e, contentHash)) {
                     throw e;
                 }
@@ -112,9 +127,7 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
                 if (winner == null || winner.getId().equals(attempt)) {
                     throw e;
                 }
-                // The losing file was never published; remove only chunks written by this attempt.
-                // A cleanup failure remains an IO failure rather than claiming an idempotent success.
-                chunks.deleteMany(Filters.eq("files_id", attempt));
+                // Cleanup above must succeed before this race can be reported as idempotent.
                 return new RegistrationOutcome(toRegistration(contentHash, winner.getMetadata()), false);
             }
             return new RegistrationOutcome(
@@ -191,7 +204,13 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
             // Stay within the conservative Java array bound, including the VM header reserve.
             if (length < 0 || length > Integer.MAX_VALUE - 8L) throw unreadable(contentHash, "artifact");
             this.contentHash = contentHash;
-            this.bytes = new byte[(int) length];
+            try {
+                this.bytes = new byte[(int) length];
+            } catch (OutOfMemoryError unavailable) {
+                // The stored length is untrusted. Translate only failure of this exact allocation,
+                // not unrelated VM errors from reading, hashing, or other registry operations.
+                throw unreadable(contentHash, "artifact");
+            }
         }
 
         @Override
@@ -284,11 +303,19 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
 
     /** Only the exact declared filename constraint's duplicate is an idempotent registration race. */
     private boolean isContentHashDuplicate(MongoWriteException failure, String contentHash) {
-        // The sync driver's WriteError details can be empty. Accept only the endpoint's exact
-        // namespace, constraint name and SHA value; an unfamiliar response remains an IO failure.
-        String expected = "E11000 duplicate key error collection: " + filesNamespace
-                + " index: " + contentHashIndex + " dup key: { filename: \"" + contentHash + "\" }";
-        return failure.getError().getCategory() == ErrorCategory.DUPLICATE_KEY
-                && expected.equals(failure.getError().getMessage());
+        if (failure.getError().getCategory() != ErrorCategory.DUPLICATE_KEY) return false;
+        BsonDocument details = failure.getError().getDetails();
+        if (details.containsKey("keyPattern") || details.containsKey("keyValue")) {
+            // Structured fields are authoritative, including evidence contradicting message text.
+            return BsonDocument.parse("{filename: 1}").equals(details.get("keyPattern"))
+                    && new BsonDocument("filename", new BsonString(contentHash)).equals(details.get("keyValue"));
+        }
+        // Older endpoints omit structured fields and vary the dup-key value's prose. Match the
+        // bounded namespace/index tokens, never the entire message or an index-name substring.
+        String message = failure.getError().getMessage();
+        return Pattern.compile("(?:^|\\s)collection:\\s+" + Pattern.quote(filesNamespace) + "(?=\\s|$)")
+                .matcher(message).find()
+                && Pattern.compile("(?:^|\\s)index:\\s+" + Pattern.quote(contentHashIndex) + "(?=\\s|$)")
+                .matcher(message).find();
     }
 }

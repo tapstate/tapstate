@@ -280,10 +280,6 @@ record WebDistribution(Profile profile, String consoleUrl, boolean localDevelopm
         return new TapstateException(BootError.WEB_DEVELOPMENT_ARTIFACT_INVALID, Map.of("reason", reason), null);
     }
 
-    void validate(CloudRuntimeSettings settings) {
-        validate(settings, false);
-    }
-
     void validate(CloudRuntimeSettings settings, boolean confirmedDevelopment) {
         if (localDevelopment && !confirmedDevelopment) {
             throw new TapstateException(BootError.WEB_DEVELOPMENT_CONFIRMATION_REQUIRED, Map.of(), null);

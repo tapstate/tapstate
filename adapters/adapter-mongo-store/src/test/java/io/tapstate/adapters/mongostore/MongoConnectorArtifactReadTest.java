@@ -2,6 +2,9 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoClientSettings;
 import com.mongodb.MongoException;
+import com.mongodb.MongoWriteException;
+import com.mongodb.ServerAddress;
+import com.mongodb.WriteError;
 import com.mongodb.MongoNamespace;
 import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
@@ -35,6 +38,7 @@ import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.function.Consumer;
@@ -51,9 +55,19 @@ class MongoConnectorArtifactReadTest {
 
     @Test
     void aLargeStoredArtifactFitsAHeapThatCanHoldOneArrayButNotGrowingCopies() throws Exception {
+        assertThat(heapWitness("large", "320m"))
+                .contains("artifact-length=" + LARGE_LENGTH, "artifact-sha256=" + LARGE_HASH);
+    }
+
+    @Test
+    void anUntrustedLengthBeyondTheAvailableHeapIsRejectedWithACodedDiagnostic() throws Exception {
+        assertThat(heapWitness("oversized", "64m")).contains("oversized-artifact-rejected");
+    }
+
+    private String heapWitness(String witness, String heap) throws Exception {
         String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
         ProcessBuilder command = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-Xmx320m", "-XX:+UseSerialGC", "-cp", classpath, getClass().getName(), "large");
+                "-Xmx" + heap, "-XX:+UseSerialGC", "-cp", classpath, getClass().getName(), witness);
         for (String variable : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) command.environment().remove(variable);
         command.redirectErrorStream(true);
         Process child = command.start();
@@ -61,8 +75,44 @@ class MongoConnectorArtifactReadTest {
         if (!completed) {child.destroyForcibly(); child.waitFor();}
         String output = new String(child.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         assertThat(completed).as("the isolated heap witness completes without a hung reader").isTrue();
-        assertThat(child.exitValue()).withFailMessage("The one-array heap witness failed:\n%s", output).isZero();
-        assertThat(output).contains("artifact-length=" + LARGE_LENGTH, "artifact-sha256=" + LARGE_HASH);
+        assertThat(child.exitValue()).withFailMessage("The isolated heap witness failed:\n%s", output).isZero();
+        return output;
+    }
+
+    @Test
+    void contentHashRacesDoNotDependOnDuplicateMessageFormatting() throws Exception {
+        String namespace = "artifact_read_test.connector_artifacts.files";
+        for (String message : List.of(
+                "E11000 duplicate key error collection: " + namespace + " index: filename_idx dup key: { : \"" + LARGE_HASH + "\" }",
+                "E11000 duplicate key error collection: " + namespace + " index: filename_idx dup key: {filename: \"" + LARGE_HASH + "\"}",
+                "E11000 duplicate key error collection: " + namespace + " index: filename_idx duplicate value")) {
+            assertThat(hashDuplicate(message, new BsonDocument())).as(message).isTrue();
+        }
+        BsonDocument details = BsonDocument.parse("{keyPattern: {filename: 1}, keyValue: {filename: '" + LARGE_HASH + "'}}");
+        assertThat(hashDuplicate("structured duplicate without server prose", details)).isTrue();
+    }
+
+    @Test
+    void anotherIndexNamespaceOrConflictingKeyDetailsCannotBecomeAnIdempotentRace() throws Exception {
+        for (String message : List.of(
+                "E11000 duplicate key error collection: artifact_read_test.connector_artifacts.files index: another_idx dup key: {}",
+                "E11000 duplicate key error collection: another.files index: filename_idx dup key: {}",
+                "E11000 duplicate key error collection: artifact_read_test.connector_artifacts.files index: filename_idx_extra dup key: {}")) {
+            assertThat(hashDuplicate(message, new BsonDocument())).as(message).isFalse();
+        }
+        String exactMessage = "E11000 duplicate key error collection: artifact_read_test.connector_artifacts.files"
+                + " index: filename_idx dup key: { filename: \"" + LARGE_HASH + "\" }";
+        for (String details : List.of("{keyPattern: {other: 1}, keyValue: {other: 'value'}}",
+                "{keyPattern: {filename: 1}, keyValue: {filename: 'different-hash'}}")) {
+            assertThat(hashDuplicate(exactMessage, BsonDocument.parse(details))).isFalse();
+        }
+    }
+
+    private boolean hashDuplicate(String message, BsonDocument details) throws Exception {
+        MongoWriteException failure = new MongoWriteException(new WriteError(11000, message, details), new ServerAddress(), Set.of());
+        var classifier = MongoConnectorRegistry.class.getDeclaredMethod("isContentHashDuplicate", MongoWriteException.class, String.class);
+        classifier.setAccessible(true);
+        return (boolean) classifier.invoke(new Fixture(0, 0).registry(), failure, LARGE_HASH);
     }
 
     @Test
@@ -146,6 +196,11 @@ class MongoConnectorArtifactReadTest {
     }
 
     public static void main(String[] args) {
+        if (Arrays.equals(args, new String[]{"oversized"})) {
+            assertUnreadable(catchThrowable(() -> new Fixture(1_500_000_000L, 1).registry().artifact(LARGE_HASH)));
+            System.out.println("oversized-artifact-rejected");
+            return;
+        }
         if (!Arrays.equals(args, new String[]{"large"})) throw new IllegalArgumentException("unknown witness");
         byte[] bytes = new Fixture(LARGE_LENGTH, LARGE_LENGTH).registry().artifact(LARGE_HASH).orElseThrow();
         if (bytes.length != LARGE_LENGTH || !ContentHash.of(bytes).equals(LARGE_HASH)) throw new AssertionError("artifact bytes changed");

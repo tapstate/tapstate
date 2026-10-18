@@ -2,10 +2,15 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoException;
+import com.mongodb.MongoWriteConcernException;
+import com.mongodb.ServerAddress;
+import com.mongodb.bulk.WriteConcernError;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
 import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.gridfs.GridFSBucket;
@@ -17,6 +22,7 @@ import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
+import org.bson.BsonDocument;
 import org.bson.types.ObjectId;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -24,6 +30,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.nio.charset.StandardCharsets;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -36,6 +44,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -265,7 +274,96 @@ class MongoConnectorRegistryIT {
             assertThat(registry.artifact(retained.registration().contentHash()).orElseThrow())
                     .isEqualTo(jar("retained-bytes"));
             assertThat(registry.list()).containsExactly(retained.registration());
+            assertThat(database.getCollection("connector_artifacts.chunks").countDocuments())
+                    .as("a failed upload cannot leave chunks beside the retained artifact").isEqualTo(1);
         }
+    }
+
+    @Test
+    void aChunkWriteConcernFailureAbortsOnlyTheUnpublishedAttempt() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("connector_chunk_write_concern");
+            GridFSBuckets.create(database, "connector_artifacts").drop();
+            MongoConnectorRegistry control = new MongoConnectorRegistry(database);
+            byte[] retainedBytes = jar("retained-artifact");
+            RegistrationOutcome retained = control.register("retained", "1.0", RegistrationSource.SEED, retainedBytes);
+            AtomicBoolean fired = new AtomicBoolean();
+            MongoConnectorRegistry failing = new MongoConnectorRegistry(failInsert(
+                    database, "connector_artifacts.chunks", fired, true));
+            byte[] bytes = new byte[3 * 255 * 1024 + 1];
+            Arrays.fill(bytes, (byte) 19);
+
+            Throwable failure = catchThrowable(() -> failing.register("new", "1.0", RegistrationSource.REGISTER, bytes));
+
+            assertThat(fired).isTrue();
+            assertThat(failure).isInstanceOfSatisfying(TapstateException.class,
+                    coded -> assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            assertThat(control.list()).containsExactly(retained.registration());
+            assertThat(control.artifact(retained.registration().contentHash()).orElseThrow()).isEqualTo(retainedBytes);
+            assertThat(database.getCollection("connector_artifacts.chunks").countDocuments()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void anAmbiguousFileInsertDoesNotDeleteThePublishedArtifactAndRetryFindsIt() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("connector_file_write_concern");
+            GridFSBuckets.create(database, "connector_artifacts").drop();
+            MongoConnectorRegistry control = new MongoConnectorRegistry(database);
+            AtomicBoolean fired = new AtomicBoolean();
+            MongoConnectorRegistry failing = new MongoConnectorRegistry(failInsert(
+                    database, "connector_artifacts.files", fired, true));
+            byte[] bytes = jar("published-before-write-concern-failed");
+
+            Throwable failure = catchThrowable(() -> failing.register("new", "1.0", RegistrationSource.REGISTER, bytes));
+
+            assertThat(fired).isTrue();
+            assertThat(failure).isInstanceOfSatisfying(TapstateException.class,
+                    coded -> assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            RegistrationOutcome retry = control.register("new", "1.0", RegistrationSource.REGISTER, bytes);
+            assertThat(retry.newlyRegistered()).isFalse();
+            assertThat(control.artifact(retry.registration().contentHash()).orElseThrow()).isEqualTo(bytes);
+            assertThat(database.getCollection("connector_artifacts.files").countDocuments()).isEqualTo(1);
+            assertThat(database.getCollection("connector_artifacts.chunks").countDocuments()).isEqualTo(1);
+        }
+    }
+
+    /** Injects one driver failure at the real insert boundary, after the selected write was applied. */
+    private static MongoDatabase failInsert(MongoDatabase database, String collection, AtomicBoolean fired, boolean afterWrite) {
+        return (MongoDatabase) Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(), new Class<?>[]{MongoDatabase.class},
+                (proxy, method, args) -> {
+                    try {
+                        Object result = method.invoke(database, args);
+                        if (method.getName().equals("getCollection") && args[0].equals(collection)) {
+                            return failInsert((MongoCollection<?>) result, fired, afterWrite);
+                        }
+                        return result;
+                    } catch (InvocationTargetException wrapped) {
+                        throw wrapped.getCause();
+                    }
+                });
+    }
+
+    private static MongoCollection<?> failInsert(MongoCollection<?> collection, AtomicBoolean fired, boolean afterWrite) {
+        return (MongoCollection<?>) Proxy.newProxyInstance(MongoCollection.class.getClassLoader(), new Class<?>[]{MongoCollection.class},
+                (proxy, method, args) -> {
+                    boolean inject = (method.getName().equals("insertOne") || method.getName().equals("insertMany"))
+                            && fired.compareAndSet(false, true);
+                    try {
+                        if (inject && !afterWrite) throw writeConcernFailure();
+                        Object result = method.invoke(collection, args);
+                        if (inject) throw writeConcernFailure();
+                        if (result instanceof MongoCollection<?> next) return failInsert(next, fired, afterWrite);
+                        return result;
+                    } catch (InvocationTargetException wrapped) {
+                        throw wrapped.getCause();
+                    }
+                });
+    }
+
+    private static MongoException writeConcernFailure() {
+        return new MongoWriteConcernException(new WriteConcernError(64, "WriteConcernFailed",
+                "injected-write-concern-failure", new BsonDocument()), new ServerAddress());
     }
 
     @Test

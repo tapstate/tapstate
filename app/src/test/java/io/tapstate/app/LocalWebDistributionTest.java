@@ -68,6 +68,18 @@ class LocalWebDistributionTest {
     }
 
     @Test
+    void confirmedLocalMetadataStillRejectsDuplicateKeysAndOversizedInput() throws Exception {
+        for (String metadata : new String[]{
+                "purpose=release\npurpose=local-development\nprofile=op\n",
+                "purpose=local-development\nprofile=op\n#" + "x".repeat(65_536)}) {
+            URL owned = origin(metadata);
+            assertThatThrownBy(() -> prepare(owned, false, "true"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(BootError.WEB_PROFILE_INVALID));
+        }
+    }
+
+    @Test
     void existingLocalOpProducerProfileRemainsRestrictedAndCompatible() throws Exception {
         URL owned = origin("purpose=local-development\nprofile=op\n");
         prepare(owned, false, "true");
