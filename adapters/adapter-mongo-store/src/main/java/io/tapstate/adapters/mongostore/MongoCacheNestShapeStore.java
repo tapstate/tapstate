@@ -74,7 +74,7 @@ final class MongoCacheNestShapeStore implements NestShapeStore {
     }
 
     private Set<String> capture(Set<String> paths) {
-        if (paths == null || paths.stream().anyMatch(path -> path == null || (path.isBlank() && !path.isEmpty()))) throw invalid();
+        if (paths == null || paths.stream().anyMatch(path -> path == null || path.isBlank())) throw invalid();
         return Collections.unmodifiableSet(new TreeSet<>(paths));
     }
 
@@ -86,7 +86,7 @@ final class MongoCacheNestShapeStore implements NestShapeStore {
             for (Object entry : encoded) {
                 if (!(entry instanceof String text)) throw access.unreadable("nest-shape");
                 String path = OperatorStateText.decode(text);
-                if ((path.isBlank() && !path.isEmpty()) || (previous != null && previous.compareTo(path) >= 0) || !paths.add(path)) throw access.unreadable("nest-shape");
+                if (path.isBlank() || (previous != null && previous.compareTo(path) >= 0) || !paths.add(path)) throw access.unreadable("nest-shape");
                 previous = path;
             }
             return Collections.unmodifiableSet(paths);

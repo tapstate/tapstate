@@ -36,22 +36,6 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
-    @Test void theActualEmptyNestRootPathSurvivesShapePublicationInventoryAndColdReopen() {
-        withFixture(f -> {
-            var shapes = f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
-            assertThat(shapes.recordIfAbsent("actual-nest",Set.of("","details"))).isEmpty();
-            assertThat(shapes.read("actual-nest")).contains(Set.of("","details"));
-            var at = new OperatorPlacement(SCOPE,f.database.getName(),OperatorPlacement.Resource.NEST_STATE,"actual-nest","","state");
-            var writer = f.writer(at); writer.save(at.mapName(),"key",new byte[]{1,2});
-            try (var reopened = MongoCacheDomain.connect(f.binding,Duration.ofSeconds(5),"root-reopen")) {
-                assertThat(reopened.nestShapes(SCOPE,f.database.getName()).read("actual-nest")).contains(Set.of("","details"));
-                assertThat(reopened.operatorState(at).load(at.mapName(),"key")).hasValue(new byte[]{1,2});
-            }
-            var wrong = new OperatorPlacement(SCOPE,f.database.getName(),OperatorPlacement.Resource.NEST_STATE,"actual-nest","root","state");
-            code(() -> f.writer(wrong).save(wrong.mapName(),"key",new byte[]{9}),IoError.DOCUMENT_UNREADABLE);
-        });
-    }
-
     @Test void losingBothKnownShapeAndColdBytesStillCannotBecomeANewFirstShape() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});
