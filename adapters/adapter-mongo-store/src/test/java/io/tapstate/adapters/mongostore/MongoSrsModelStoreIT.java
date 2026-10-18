@@ -152,6 +152,79 @@ class MongoSrsModelStoreIT {
     }
 
     @Test
+    void aLiveClaimForAnotherCaptureOrRoleCannotTrimThisModelsRing() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            var log = modelLog(f); log.store(RING, 1, event(0, 7, f.fence()));
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            for (var key : List.of(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "another-capture"),
+                    new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, "capture-a"))) {
+                var foreign = claims.acquire(key, new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
+                var before = snapshotFacts(f.database());
+                assertThatThrownBy(() -> log.trim(RING, 1, WorkloadClaimFence.from(foreign)))
+                        .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(snapshotFacts(f.database())).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test
+    void trimmingHistoricalModelsRequiresTheNewCapturesExplicitEpochBinding() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            var log = modelLog(f); log.store(RING, 1, event(0, 7, f.fence()));
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            assertThat(claims.release(f.claim())).isTrue();
+            var next = claims.acquire(f.claim().key(), new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
+            var before = snapshotFacts(f.database());
+            for (var fence : List.of(f.fence(), WorkloadClaimFence.from(next))) {
+                assertThatThrownBy(() -> log.trim(RING, 1, fence)).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(snapshotFacts(f.database())).isEqualTo(before);
+            }
+            assertThat(new MongoSrsChainStore(f.client(), f.database(), SCOPE)
+                    .openEpoch(CHAIN, 7, WorkloadClaimFence.from(next))).hasValue(8);
+            log.trim(RING, 1, WorkloadClaimFence.from(next));
+            assertThat(log.bounds(RING)).isEqualTo(new SrsLogBounds(1, 1));
+            assertThat(log.load(RING, 1)).isEmpty();
+            assertThat(f.models().require(key(0))).isEqualTo(model(0, table("id", null)));
+        });
+    }
+
+    @Test
+    void retirementBeforeTrimClaimProofKeepsEveryRowAndTheOriginalBoundary() {
+        withBusiness(f -> {
+            f.models().publish(model(0, table("id", null)), f.fence());
+            modelLog(f).storeAll(RING, 1, List.of(event(0, 7, f.fence()), event(0, 7, f.fence())));
+            var boundary = SystemCollections.SRS_LOG_BOUNDS.on(f.database()).find().first();
+            var paused = new CountDownLatch(1); var proceed = new CountDownLatch(1); var once = new AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims")
+                            && once.compareAndSet(false, true)) { paused.countDown(); awaitBarrier(proceed); }
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build());
+                 var domain = businessDomain(f.database()); var workers = Executors.newSingleThreadExecutor()) {
+                var database = observed.getDatabase(f.database().getName());
+                var models = new MongoSrsModelStore(observed, database, SCOPE);
+                var log = new MongoSrsLogStore(observed, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models);
+                var result = workers.submit(() -> log.trim(RING, 1, f.fence()));
+                try {
+                    assertThat(paused.await(10, TimeUnit.SECONDS)).isTrue();
+                    domain.retireBusiness(SCOPE, "retire-a", () -> {});
+                } finally { proceed.countDown(); }
+                assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
+                        .satisfies(error -> businessFenced(error.getCause()));
+                assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isEqualTo(2);
+                assertThat(SystemCollections.SRS_LOG_BOUNDS.on(f.database()).find().first()).isEqualTo(boundary);
+            }
+        });
+    }
+
+    @Test
     void actualTypedTableAndImmutableVersionSurviveReopenWithoutDiscoveryMeasurements() {
         withBusiness(f -> {
             var model = model(0, table("id", 999L));
@@ -265,7 +338,7 @@ class MongoSrsModelStoreIT {
             var log = new MongoSrsLogStore(f.client(), SystemCollections.SRS_EVENTS.on(f.database()), SystemCollections.SRS_LOG_BOUNDS.on(f.database()),
                     SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
             log.store(RING, 1, new SrsLogRecord("offset-1", Op.INSERT, 1, null, Map.of("id", 1), 1, f.fence(), 7));
-            log.trim(RING, 1); SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteMany(new Document());
+            log.trim(RING, 1, f.fence()); SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteMany(new Document());
             assertThatThrownBy(() -> f.models().publish(model, f.fence())).satisfies(MongoSrsModelStoreIT::unavailable);
             assertThat(models(f.database()).countDocuments()).isOne();
             assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isZero();
@@ -280,7 +353,7 @@ class MongoSrsModelStoreIT {
             var log = new MongoSrsLogStore(f.client(), SystemCollections.SRS_EVENTS.on(f.database()), SystemCollections.SRS_LOG_BOUNDS.on(f.database()),
                     SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
             log.store(RING, 1, new SrsLogRecord("old-offset", Op.INSERT, 1, null, Map.of("id", 1), 1, f.fence(), 7));
-            if (fullyTrimmed) log.trim(RING, 1);
+            if (fullyTrimmed) log.trim(RING, 1, f.fence());
             Document claim = claim(f.database());
             assertThatThrownBy(() -> f.models().publish(model(0, table("latest", null)), f.fence()))
                     .satisfies(MongoSrsModelStoreIT::unavailable);
@@ -385,7 +458,7 @@ class MongoSrsModelStoreIT {
     void modelAwareReadsAndWritesRefuseLostBoundsEvenWhenAllEventsWereTrimmed() {
         withBusiness(f -> {
             f.models().publish(model(0, table("id", null)), f.fence()); var log = modelLog(f);
-            log.store(RING, 1, event(0, 7, f.fence())); log.trim(RING, 1);
+            log.store(RING, 1, event(0, 7, f.fence())); log.trim(RING, 1, f.fence());
             SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteMany(new Document());
             assertThatThrownBy(() -> log.bounds(RING)).satisfies(MongoSrsModelStoreIT::eventUnavailable);
             assertThatThrownBy(() -> log.readBatch(RING, 1, 2)).satisfies(MongoSrsModelStoreIT::eventUnavailable);
@@ -1026,7 +1099,7 @@ class MongoSrsModelStoreIT {
         withBusiness(f -> {
             var oldLog = new MongoSrsLogStore(f.client(), SystemCollections.SRS_EVENTS.on(f.database()),
                     SystemCollections.SRS_LOG_BOUNDS.on(f.database()), SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
-            oldLog.store(RING, 1, event(0, 7, f.fence())); if (trimmed) oldLog.trim(RING, 1);
+            oldLog.store(RING, 1, event(0, 7, f.fence())); if (trimmed) oldLog.trim(RING, 1, f.fence());
             var before = snapshotFacts(f.database());
             assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::unavailable);
             assertThat(snapshotFacts(f.database())).isEqualTo(before);

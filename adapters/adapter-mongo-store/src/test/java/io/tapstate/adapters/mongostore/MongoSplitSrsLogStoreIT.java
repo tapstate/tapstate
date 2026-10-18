@@ -60,7 +60,7 @@ class MongoSplitSrsLogStoreIT {
             assertThat(SystemCollections.SRS_EVENTS.on(f.database()).find().into(new ArrayList<>()))
                     .allSatisfy(event -> assertThat(event.get("_id")).isInstanceOf(Document.class));
             assertThat(SystemCollections.SRS_LOG_BOUNDS.on(f.database()).find().first().get("_id")).isInstanceOf(String.class);
-            f.log().trim(RING, 100);
+            f.log().trim(RING, 100, f.fence());
             assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isZero();
             try (var reopened = client()) {
                 var log = log(reopened, reopened.getDatabase(f.database().getName()));
@@ -102,16 +102,31 @@ class MongoSplitSrsLogStoreIT {
     }
 
     @Test
+    void anUnclaimedSplitTrimCannotRetireAnyConfirmedRows() {
+        withCache(f -> {
+            f.log().storeAll(RING, 1, List.of(record(1, f.fence()), record(2, f.fence())));
+            Document original = claim(f.database());
+            assertThatThrownBy(() -> f.log().trim(RING, 1)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(f.log().bounds(RING)).isEqualTo(new SrsLogBounds(2, -1));
+            assertThat(f.log().readBatch(RING, 1, 2).records()).hasSize(2);
+            assertThat(claim(f.database())).isEqualTo(original);
+        });
+    }
+
+    @Test
     void failedTrimRollsBackTheBoundaryAndDoesNotRetireAnyRows() {
         withCache(f -> {
             f.log().storeAll(RING, 1, List.of(record(1, f.fence()), record(2, f.fence())));
+            Document beforeClaim = claim(f.database());
             var admin = f.client().getDatabase("admin");
             admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
                     .append("data", new Document("failCommands", List.of("delete")).append("errorCode", 121)));
-            try { assertThatThrownBy(() -> f.log().trim(RING, 1)).isInstanceOf(TapstateException.class); }
+            try { assertThatThrownBy(() -> f.log().trim(RING, 1, f.fence())).isInstanceOf(TapstateException.class); }
             finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
             assertThat(f.log().bounds(RING)).isEqualTo(new SrsLogBounds(2, -1));
             assertThat(f.log().readBatch(RING, 1, 2).records().keySet()).containsExactly(1L, 2L);
+            assertThat(claim(f.database())).isEqualTo(beforeClaim);
         });
     }
 
@@ -124,7 +139,7 @@ class MongoSplitSrsLogStoreIT {
             assertThatThrownBy(() -> f.log().load(RING, 1)).satisfies(MongoSplitSrsLogStoreIT::unreadable);
             assertThatThrownBy(() -> f.log().readBatch(RING, 1, 2)).satisfies(MongoSplitSrsLogStoreIT::unreadable);
             assertThatThrownBy(() -> f.log().store(RING, 2, record(2, f.fence()))).satisfies(MongoSplitSrsLogStoreIT::unreadable);
-            assertThatThrownBy(() -> f.log().trim(RING, 1)).satisfies(MongoSplitSrsLogStoreIT::unreadable);
+            assertThatThrownBy(() -> f.log().trim(RING, 1, f.fence())).satisfies(MongoSplitSrsLogStoreIT::unreadable);
             assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isOne();
             assertThat(SystemCollections.SRS_LOG_BOUNDS.on(f.database()).countDocuments()).isZero();
         });
@@ -138,6 +153,8 @@ class MongoSplitSrsLogStoreIT {
             assertThat(claims.release(f.claim())).isTrue();
             var next = claims.acquire(f.claim().key(), new WorkloadOwner("node-b", "boot-b"), 8, Duration.ofSeconds(30)).claim();
             assertThatThrownBy(() -> f.log().store(RING, 2, record(2, f.fence()))).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThatThrownBy(() -> f.log().trim(RING, 1, f.fence())).isInstanceOfSatisfying(TapstateException.class,
                     failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             assertThat(f.log().bounds(RING)).isEqualTo(new SrsLogBounds(1, -1));
             assertThat(f.log().load(RING, 2)).isEmpty();
@@ -169,7 +186,7 @@ class MongoSplitSrsLogStoreIT {
             f.log().store(OTHER, 11, record(4, f.fence()));
             SystemCollections.SRS_EVENTS.on(f.database()).deleteOne(new Document("_id", new Document("ring", RING).append("seq", 11L)));
             assertThat(f.log().readBatch(RING, 10, 3).records().keySet()).containsExactly(10L, 12L);
-            f.log().trim(RING, 10);
+            f.log().trim(RING, 10, f.fence());
             assertThat(f.log().load(OTHER, 11)).isPresent();
             assertThat(f.log().bounds(RING)).isEqualTo(new SrsLogBounds(12, 10));
         });

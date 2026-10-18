@@ -85,4 +85,12 @@ public interface SrsLogStore {
      * store applies the resolved one.
      */
     void trim(String ring, long throughSeq);
+
+    /**
+     * Retires the caller's resolved confirmed prefix under the original CAPTURE claim. Implementations
+     * without durable claim proof refuse; they must not silently use the unclaimed entry point.
+     */
+    default void trim(String ring, long throughSeq, WorkloadClaimFence originalCaptureFence) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
 }

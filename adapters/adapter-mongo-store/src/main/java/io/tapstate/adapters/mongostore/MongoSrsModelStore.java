@@ -255,6 +255,18 @@ public final class MongoSrsModelStore implements SrsModelStore {
         }
     }
 
+    /** Trimming historical rows belongs to the chain's current original capture tenure. */
+    void requireCaptureForTrim(ClientSession session, String ring, WorkloadClaimFence original) {
+        if (original.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(original.key().clusterId())) throw claimFenced();
+        checkRing(session, ring);
+        var control = contexts.firstOnRing(session, ring);
+        if (control == null) throw eventUnavailable(ring, 0, 0);
+        Document chain = requireChain(session, control.key());
+        if (!(chain.get("captureFence") instanceof Document bound)) throw unreadable();
+        if (!original.key().resourceId().equals(chain.get("captureId"))
+                || !original.equals(WorkloadClaimDocuments.readCapture(bound))) throw claimFenced();
+    }
+
     EventModelRange requireEvent(ClientSession session, String ring, SrsLogRecord event, boolean writing) {
         try { return eventRange(session, ring, event, writing); }
         catch (TapstateException missing) {

@@ -282,8 +282,19 @@ public final class MongoSrsLogStore implements SrsLogStore {
     @Override
     public void trim(String ring, long throughSeq) {
         Objects.requireNonNull(ring, "ring");
+        if (split) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        trimLegacy(ring, throughSeq, null);
+    }
+
+    @Override
+    public void trim(String ring, long throughSeq, WorkloadClaimFence originalCaptureFence) {
+        Objects.requireNonNull(ring, "ring");
+        if (originalCaptureFence == null || originalCaptureFence.key().type() != WorkloadClaimType.CAPTURE) {
+            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        }
         if (split) {
-            transaction(null, session -> {
+            transaction(originalCaptureFence, session -> {
+                if (models != null) models.requireCaptureForTrim(session, ring, originalCaptureFence);
                 SrsLogBounds observed = splitBounds(session, ring);
                 long cut = Math.min(throughSeq, observed.largestSequence());
                 if (cut < 0) return null;
@@ -294,19 +305,21 @@ public final class MongoSrsLogStore implements SrsLogStore {
             });
             return;
         }
+        trimLegacy(ring, throughSeq, originalCaptureFence);
+    }
+
+    private void trimLegacy(String ring, long throughSeq, WorkloadClaimFence fence) {
         SrsLogBounds observed = bounds(ring);
         long cut = Math.min(throughSeq, observed.largestSequence());
-        if (cut < 0) {
-            return;
-        }
-        // Publish the safe retired prefix before deleting it, in the same ordered bulk call. If deletion
-        // fails, keeping already-confirmed rows costs space; losing the high-water mark would reuse keys.
+        if (cut < 0) return;
+        // Publish the retired prefix before deleting it. A fenced owner commits both with its claim.
         List<WriteModel<Document>> writes = List.of(
                 new UpdateOneModel<>(new Document("_id", boundsId(ring)),
                         new Document("$max", new Document(LARGEST_SEQUENCE, observed.largestSequence())
                                 .append(TRIMMED_THROUGH, cut)), new UpdateOptions().upsert(true)),
                 new DeleteManyModel<>(ringRange(ring, cut)));
-        StoreIo.run(() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(true)));
+        if (fence == null) StoreIo.run(() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(true)));
+        else fenced(fence, session -> collection.bulkWrite(session, writes, new BulkWriteOptions().ordered(true)));
     }
 
     SrsLogBounds boundsInSession(ClientSession session, String ring) { return splitBounds(session, ring); }
