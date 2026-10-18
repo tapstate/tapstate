@@ -6,6 +6,7 @@ import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.spi.store.WorkloadClaim;
@@ -34,12 +35,23 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     private static final int DUPLICATE_KEY = 11000;
     private static final String LEASE_REMAINING = "leaseRemainingMillis";
     private final MongoCollection<Document> collection;
+    private final ClientSession session;
 
     public MongoWorkloadClaimStore(MongoCollection<Document> collection) {
+        this(collection, null);
+    }
+
+    private MongoWorkloadClaimStore(MongoCollection<Document> collection, ClientSession session) {
+        this.session = session;
         this.collection = Objects.requireNonNull(collection, "collection")
                 .withReadPreference(ReadPreference.primary())
                 .withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+    }
+
+    /** A callback-local view; the owning cache domain controls transaction scope and authorization. */
+    MongoWorkloadClaimStore inSession(ClientSession original) {
+        return new MongoWorkloadClaimStore(collection, Objects.requireNonNull(original, "session"));
     }
 
     @Override
@@ -57,13 +69,18 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
             return WorkloadClaimAttempt.acquired(read(updated));
         }
 
+        // A duplicate-key error aborts a caller-owned transaction. An existing other tenure is a
+        // normal refusal, so report it before attempting the insert-only upsert below.
+        Optional<WorkloadClaimReading> held = read(key);
+        if (held.isPresent()) return WorkloadClaimAttempt.refused(held.get().claim());
+
         Document absent = new Document("$and", List.of(
                 new Document("_id", id),
                 new Document("ownerNodeId", new Document("$exists", false))));
         try {
-            updated = collection.findOneAndUpdate(absent, acquirePipeline(key, owner, topologyRevision, ttl),
-                    new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
+            updated = rawFindOneAndUpdate(absent, acquirePipeline(key, owner, topologyRevision, ttl), true);
         } catch (MongoException raced) {
+            if (session != null) throw raced;
             if (!duplicateKey(raced)) {
                 throw StoreIo.coded(raced);
             }
@@ -141,7 +158,8 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         List<Document> pipeline = List.of(
                 new Document("$match", new Document("_id", id(key))),
                 leaseRemaining());
-        Document found = StoreIo.call(() -> collection.aggregate(pipeline).first());
+        Document found = io(() -> (session == null ? collection.aggregate(pipeline)
+                : collection.aggregate(session, pipeline)).first());
         return Optional.ofNullable(found).map(MongoWorkloadClaimStore::reading);
     }
 
@@ -170,7 +188,8 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 new Document("$match", new Document("_id",
                         new Document("$in", new ArrayList<>(asked.keySet())))),
                 leaseRemaining());
-        List<Document> found = StoreIo.call(() -> collection.aggregate(pipeline).into(new ArrayList<>()));
+        List<Document> found = io(() -> (session == null ? collection.aggregate(pipeline)
+                : collection.aggregate(session, pipeline)).into(new ArrayList<>()));
         for (Document document : found) {
             readings.put(asked.get(document.get("_id", Document.class)), reading(document));
         }
@@ -184,15 +203,26 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private Document findOneAndUpdate(Document filter, List<Document> update, boolean upsert) {
-        return StoreIo.call(() -> collection.findOneAndUpdate(filter, update,
-                new FindOneAndUpdateOptions().upsert(upsert).returnDocument(ReturnDocument.AFTER)));
+        return io(() -> rawFindOneAndUpdate(filter, update, upsert));
+    }
+
+    /** Let a caller-owned transaction observe Mongo retry labels before IO errors are translated. */
+    private <T> T io(java.util.function.Supplier<T> operation) {
+        return session == null ? StoreIo.call(operation) : operation.get();
+    }
+
+    private Document rawFindOneAndUpdate(Document filter, List<Document> update, boolean upsert) {
+        var options = new FindOneAndUpdateOptions().upsert(upsert).returnDocument(ReturnDocument.AFTER);
+        return session == null ? collection.findOneAndUpdate(filter, update, options)
+                : collection.findOneAndUpdate(session, filter, update, options);
     }
 
     private static List<Document> acquirePipeline(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         Document sameOwner = new Document("$and", List.of(
                 new Document("$eq", List.of("$ownerNodeId", owner.nodeId())),
-                new Document("$eq", List.of("$ownerBootId", owner.bootId()))));
+                new Document("$eq", List.of("$ownerBootId", owner.bootId())),
+                new Document("$gt", List.of("$leaseUntil", "$$NOW"))));
         Document generation = new Document("$cond", List.of(
                 sameOwner,
                 new Document("$ifNull", List.of("$claimGeneration", 1L)),

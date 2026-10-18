@@ -10,7 +10,10 @@ import java.util.Set;
 /** Persistence port for Mongo-time owner leases and their monotonic fencing generations. */
 public interface WorkloadClaimStore {
 
-    /** Acquires an absent, expired, or already-self-owned claim atomically. */
+    /**
+     * Acquires an absent, expired, or already-self-owned claim atomically. Only a still-live same-owner
+     * acquisition keeps its tenure; an expired or released tenure always takes a new claim generation.
+     */
     WorkloadClaimAttempt acquire(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl);
 
