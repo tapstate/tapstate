@@ -1,14 +1,9 @@
 # Source-bound CI shard layouts
 
-The default-reactor planner reads `.github/ci-shard-layout.json`. The checked-in
-configuration records the current comparison candidate: six E2E IT workers,
-two whole-class App workers, `engine` and `rest`. The complete E2E unit module
-stays in `rest`, avoiding a separate worker and its repeated preparation. This
-uses ten test workers; the four-App-worker layout remains a supported comparison
-configuration. The legacy layout has two E2E IT workers plus `engine` and `rest`. E2E
-counts 2, 4 and 6 are supported for ordinary source-commit comparisons; there is
-no separate workflow or benchmark entry point. A staged layout is not a
-performance adoption result.
+The checked-in comparison variant has two E2E IT workers plus `engine` and
+`rest`; App remains in its original residual module group. This fixed four-worker
+layout is staged for source-commit comparisons, not a performance adoption result.
+The planner also supports four/six E2E workers and whole-class App assignments.
 
 The configuration requires `schema: 1`, `e2e_shards`, `rest_modules` and
 `new_test_seconds`. The optional `app_shards` field accepts 2 or 4; omitting it

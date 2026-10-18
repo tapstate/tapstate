@@ -22,12 +22,14 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -51,20 +53,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class SourceConfigKeyringStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(SourceConfigKeyringStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     private static MongoClient client;
 
-    @AfterEach
-    void closeClient() {
-        try {
-            if (client != null) client.close();
-        } finally {
-            client = null;
-        }
+    @AfterAll
+    static void closeClient() {
+        if (client != null) client.close();
     }
 
     @Test
@@ -534,7 +532,7 @@ class SourceConfigKeyringStoreIT {
                 .addCommandListener(ordering).build();
         try (MongoClient firstClient = MongoClients.create(settings)) {
             SourceConfigKeyringHandle first = new SourceConfigKeyringHandle(
-                    new SourceConfigKeyringStore(firstClient, firstClient.getDatabase(REPLICA_SET.database(database.getName()))));
+                    new SourceConfigKeyringStore(firstClient, firstClient.getDatabase(database.getName())));
             first.prepareRotation();
             first.activatePrepared();
         }
@@ -583,7 +581,7 @@ class SourceConfigKeyringStoreIT {
 
     private static MongoDatabase freshDatabase(String name) {
         if (client == null) client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
-        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
+        MongoDatabase database = client.getDatabase(name);
         database.drop();
         return database;
     }
