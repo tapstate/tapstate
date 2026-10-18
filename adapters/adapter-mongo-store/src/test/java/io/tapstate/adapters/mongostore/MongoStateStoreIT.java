@@ -9,7 +9,9 @@ import io.tapstate.core.lifecycle.EpochCas;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Instant;
 import java.util.List;
@@ -34,12 +36,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoStateStoreIT {
 
+    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
     private static final String PIPELINE = "orders-sync";
 
-    @RegisterExtension
-    private static final SharedMongoCase REPLICA_SET =
-            SharedMongoCase.forSuite(MongoStateStoreIT.class);
+    @Container
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
     void createSeedsEpochZeroAndReadReturnsIt() {
@@ -237,7 +239,7 @@ class MongoStateStoreIT {
     /** Runs a test body against a fresh state store over a clean checkpoints collection on the replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("checkpoints");
+            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("checkpoints");
             collection.drop();
             test.run(new MongoStateStore(collection));
         } catch (Exception e) {
