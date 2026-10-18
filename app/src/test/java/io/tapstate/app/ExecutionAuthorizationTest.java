@@ -34,6 +34,10 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -691,6 +695,92 @@ class ExecutionAuthorizationTest {
         PipelineActuationOwnership.Execution execution = nodeA.beginExecution("orders");
         assertThat(execution.allowed()).isTrue();
         return execution.fence();
+    }
+
+    @Test void aReadReturningAfterItsLocalWindowDoesNotAuthorizeEvenOneBatch() {
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var run = claims.advanceExecution(claims.acquire(key, NODE_A, 7, TTL).claim(), 7, Set.of("node-a")).orElseThrow();
+        WorkloadClaimStore slow = mock(WorkloadClaimStore.class);
+        when(slow.read(key)).thenAnswer(call -> {
+            var captured = claims.read(key);
+            nanos.addAndGet(WINDOW.plusSeconds(1).toNanos()); claims.elapse(WINDOW.plusSeconds(1));
+            return captured;
+        });
+        try (var authorization = new ExecutionAuthorization("cluster-a", slow, WINDOW, nanos::get)) {
+            assertThat(authorization.authorized(new ExecutionFence("orders", run.claimGeneration(), run.executionGeneration()))).isFalse();
+        }
+    }
+
+    @Test void aReplyArrivingAfterItsOwnersLeaseBoundDoesNotAuthorizeEvenOneBatch() {
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var run = claims.advanceExecution(claims.acquire(key, NODE_A, 7, Duration.ofMillis(100)).claim(), 7, Set.of("node-a")).orElseThrow();
+        WorkloadClaimStore slow = mock(WorkloadClaimStore.class);
+        when(slow.read(key)).thenAnswer(call -> {
+            var captured = claims.read(key);
+            nanos.addAndGet(Duration.ofMillis(200).toNanos()); claims.elapse(Duration.ofMillis(200));
+            return captured;
+        });
+        try (var authorization = new ExecutionAuthorization("cluster-a", slow, WINDOW, nanos::get)) {
+            assertThat(authorization.authorized(new ExecutionFence("orders", run.claimGeneration(), run.executionGeneration()))).isFalse();
+        }
+    }
+
+    @Test
+    void aConcurrentReplacementCannotLeaveTheOldRunAuthorized() throws Exception {
+        recheckAfterFinalGuard("replace");
+    }
+
+    @Test
+    void aConcurrentRevocationCannotLeaveTheOldRunAuthorized() throws Exception {
+        recheckAfterFinalGuard("revoke");
+    }
+
+    @Test
+    void aConcurrentRefreshOfTheSameRunRemainsAuthorized() throws Exception {
+        recheckAfterFinalGuard("refresh");
+    }
+
+    private void recheckAfterFinalGuard(String action) throws Exception {
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var run = claims.advanceExecution(claims.acquire(key, NODE_A, 7, TTL).claim(), 7, Set.of("node-a")).orElseThrow();
+        ExecutionFence first = new ExecutionFence("orders", run.claimGeneration(), run.executionGeneration());
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch released = new CountDownLatch(1);
+        AtomicReference<Thread> waitingThread = new AtomicReference<>();
+        AtomicInteger checks = new AtomicInteger();
+        try (var authorization = new ExecutionAuthorization("cluster-a", claims, WINDOW, nanos::get, () -> {
+            if (Thread.currentThread() == waitingThread.get() && checks.incrementAndGet() == 2) {
+                entered.countDown();
+                try {
+                    if (!released.await(5, TimeUnit.SECONDS)) throw new AssertionError("final guard was not released");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+            }
+            return true;
+        }); var executor = Executors.newSingleThreadExecutor()) {
+            assertThat(authorization.authorized(first)).isTrue();
+            var waiting = executor.submit(() -> {
+                waitingThread.set(Thread.currentThread());
+                return authorization.authorized(first);
+            });
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                if (action.equals("refresh")) {
+                    elapse(WINDOW);
+                    assertThat(authorization.authorized(first)).isTrue();
+                } else {
+                    var next = claims.advanceExecution(run, 7, Set.of("node-a")).orElseThrow();
+                    if (action.equals("revoke")) assertThat(claims.release(next)).isTrue();
+                    assertThat(authorization.authorized(new ExecutionFence("orders", next.claimGeneration(),
+                            next.executionGeneration()))).isEqualTo(action.equals("replace"));
+                }
+            } finally {
+                released.countDown();
+            }
+            assertThat(waiting.get(5, TimeUnit.SECONDS)).isEqualTo(action.equals("refresh"));
+        }
     }
 
     private ExecutionAuthorization guard(WorkloadClaimStore store) {

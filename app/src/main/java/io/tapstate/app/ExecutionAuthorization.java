@@ -199,10 +199,16 @@ final class ExecutionAuthorization implements AutoCloseable {
         } else if (entry == null || now - entry.deadlineNanos() >= 0) {
             entry = read(fence.pipelineId(), false);
         }
-        return !closed.get() && nodeActive.getAsBoolean() && entry != null
-                && entry.claim().claimGeneration() == fence.claimGeneration()
-                && entry.claim().executionGeneration() == fence.executionGeneration()
-                ? entry
+        // IO or scheduling may have spent the proof's entire window. A concurrent refresh may also
+        // have replaced or revoked it, so use only the matching proof still published at return time.
+        if (closed.get() || !nodeActive.getAsBoolean()) return null;
+        long checkedAt = nanoTime.getAsLong();
+        Entry published = entries.get(fence.pipelineId());
+        return !closed.get() && published != null
+                && checkedAt - published.deadlineNanos() < 0
+                && published.claim().claimGeneration() == fence.claimGeneration()
+                && published.claim().executionGeneration() == fence.executionGeneration()
+                ? published
                 : null;
     }
 
