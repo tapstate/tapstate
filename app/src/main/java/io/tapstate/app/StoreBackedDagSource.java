@@ -218,13 +218,17 @@ final class StoreBackedDagSource implements DagSource {
         PipelineResource original = StoredArtifacts.requirePipeline(snapshot, pipelineId);
         if (!io.tapstate.core.model.canonical.CanonicalHash.of(original).equals(pass.intent().desired().revision()))
             throw new TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
-        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas());
+        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas(),pass);
         pass.requirePipeline(pipelineId);
         return prepared;
     }
 
     private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot, String pipelineId, String defaultDatabase,
             io.tapstate.spi.store.DerivedSchemaStore records) {
+        return prepareCapturedStart(snapshot,pipelineId,defaultDatabase,records,null);
+    }
+    private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot,String pipelineId,String defaultDatabase,
+            io.tapstate.spi.store.DerivedSchemaStore records,PipelineConvergencePass pass) {
         PipelineResource pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,pipelineId),snapshot);
         var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
         SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
@@ -232,14 +236,39 @@ final class StoreBackedDagSource implements DagSource {
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
                 requireMarkedStore, members, parallelismBudget, records, models::model);
         captured.validateStart(pipelineId);
-        NestCapacity capacity = captured.capacityOf(pipelineId);
-        Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
+        PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
+        NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
+        Set<OperatorStateLocation> locations = operators == null ? captured.stateLocations(pipelineId,defaultDatabase) : Set.of();
         // Freshness belongs to the start before capture registers its ring cursor and snapshot seam.
         // Carry that answer into the deferred build rather than re-reading capture's own mutations.
         boolean freshFullLoad = captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                () -> captured.plannedTopology(pipelineId, freshFullLoad), captured.sinkConnectors(pipelineId),Optional.of(models));
+                () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
+                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates));
+    }
+
+    private record PreparedOperators(OperatorCoordinatePlan coordinates,Map<String,NestTable> tables,
+            Map<String,CompiledJoin> joins,PipelineConvergencePass pass,String defaultDatabase) {
+        private PreparedOperators { tables = Map.copyOf(tables); joins = Map.copyOf(joins); }
+        OriginalOperators bind(ExecutionFence fence) {
+            var original = pass.claim(); pass.requirePipeline(pass.scope().pipelineId());
+            if (fence == null || original.executionGeneration() < 1 || !original.equals(pass.claim())
+                    || !new ExecutionFence(pass.scope(),original).equals(fence))
+                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            return new OriginalOperators(coordinates.bind(fence),original);
+        }
+    }
+    private record OriginalOperators(io.tapstate.runtime.engine.OperatorRunManifest manifest,io.tapstate.spi.store.WorkloadClaimFence claim) {}
+    private PreparedOperators prepareOperators(PipelineResource pipeline,String defaultDatabase,PipelineConvergencePass pass) {
+        var sourceTables = sourceTablesByName(sourceVertices(pipeline));
+        var tables = nestTablesByAlias(pipeline,sourceTables); var joins = compiledJoins(pipeline,sourceTables);
+        var dimensions = new LinkedHashMap<String,Set<String>>();
+        joins.forEach((step,compiled) -> dimensions.put(step,compiled.plan().from().sources().stream()
+                .filter(source -> !source.name().equals(compiled.plan().factSource().name()))
+                .map(io.tapstate.core.sql.JoinTree.Source::name).collect(java.util.stream.Collectors.toUnmodifiableSet())));
+        return new PreparedOperators(OperatorCoordinatePlan.compile(pass.scope(),pipeline,defaultDatabase,tables::get,dimensions,nestSettings),
+                tables,joins,pass,defaultDatabase);
     }
 
     /**
@@ -585,7 +614,11 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private Function<ExecutionFence, PlannedDag> plannedTopology(
-            String pipelineId, PipelineResource pipeline, boolean freshFullLoad) {
+            String pipelineId,PipelineResource pipeline,boolean freshFullLoad) {
+        return plannedTopology(pipelineId,pipeline,freshFullLoad,null);
+    }
+    private Function<ExecutionFence,PlannedDag> plannedTopology(
+            String pipelineId,PipelineResource pipeline,boolean freshFullLoad,PreparedOperators operators) {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
@@ -604,7 +637,7 @@ final class StoreBackedDagSource implements DagSource {
         // Compiled once, here, and handed to both the targets below and the join binding. Compiling it
         // twice would mean two answers to the same question with nothing comparing them.
         Map<String, CompiledJoin> compiledJoins =
-                compiledJoins(pipeline, sourceTablesByName(sourceVertices));
+                operators == null ? compiledJoins(pipeline,sourceTablesByName(sourceVertices)) : operators.joins();
         // Held to the columns it was last recorded producing, before anything is built out of them. A
         // join's output columns follow from the SELECT and from what the sources say their columns are,
         // so the same pipeline can start one day producing a differently shaped row than the day before
@@ -678,8 +711,8 @@ final class StoreBackedDagSource implements DagSource {
                         streamOfSourceVertex(sourceVertices),
                         keyColumnsOf(bySourceTable),
                         keyColumnsOf(assembled),
-                        PipelineDagBuilder.nestBlockingVertices(pipeline,
-                                nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices))::get),
+                        operators == null ? PipelineDagBuilder.nestBlockingVertices(pipeline,
+                                nestTablesByAlias(pipeline,sourceTablesByName(sourceVertices))::get) : operators.coordinates().blockingVertices(),
                         sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
         return fence -> {
@@ -687,7 +720,7 @@ final class StoreBackedDagSource implements DagSource {
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
                     bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                            serveLanding, viewLanding, stepIds, frontier, compiledJoins, freshFullLoad, fence),
+                            serveLanding,viewLanding,stepIds,frontier,compiledJoins,freshFullLoad,fence,operators),
                     FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier,
                     shape, drawn);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
@@ -1797,7 +1830,9 @@ final class StoreBackedDagSource implements DagSource {
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins,
             boolean freshFullLoad,
-            ExecutionFence fence) {
+            ExecutionFence fence,PreparedOperators operators) {
+        var originalOperators = operators == null ? null : operators.bind(fence);
+        var manifest = originalOperators == null ? null : originalOperators.manifest();
         ChainAxes axes = frontier.axes();
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
         long snapshotEpoch = snapshotOnly
@@ -1817,8 +1852,14 @@ final class StoreBackedDagSource implements DagSource {
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
                         viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices)), fence),
-                nestBinding(pipeline, sourceTablesByName(sourceVertices)),
-                joinBinding(compiledJoins));
+                operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
+                        new NestBinding(operators.tables()::get,NestBinding.onMap(manifest),
+                                new LoggingNestDeadLetter(new DurableNestDeadLetter()),
+                                new StoreBackedReplayFloorFactory(progressByTable(pipeline)),
+                                new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
+                                nestSettings,NestClock.SYSTEM)
+                                .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests()),
+                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)));
     }
 
     SupplierEx<? extends TransformPort> transformBinding(PipelineResource pipeline, Step step) {
@@ -2675,12 +2716,15 @@ final class StoreBackedDagSource implements DagSource {
      *
      * <p>A pipeline with no join step compiles nothing and asks nothing of the schema store.
      */
-    private JoinBinding joinBinding(Map<String, CompiledJoin> byStep) {
+    private JoinBinding joinBinding(Map<String,CompiledJoin> byStep) {
+        return joinBinding(byStep,JoinStoresBinding.onTheCluster());
+    }
+    private JoinBinding joinBinding(Map<String,CompiledJoin> byStep,JoinStoresBinding stores) {
         return new JoinBinding(
                 step -> compiledJoin(byStep, step).plan(),
                 step -> compiledJoin(byStep, step).factKeyColumns(),
                 step -> compiledJoin(byStep, step).dimensionRowKeyColumns(),
-                JoinStoresBinding.onTheCluster(),
+                stores,
                 new LoggingDimensionRowDisplacedAlert());
     }
 

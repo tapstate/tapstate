@@ -12,5 +12,6 @@ public record OperatorMapBinding(OperatorPlacement placement, Serializable execu
     }
     public String mapName() { return placement.mapName() + ".run." + executionKey; }
     /** A generation's memory and database settings are shared by its successive hot maps. */
-    public String configurationPattern() { return placement.mapName() + ".run.*"; }
+    public String configurationPattern() { return configurationPattern(placement); }
+    public static String configurationPattern(OperatorPlacement placement) { return Objects.requireNonNull(placement,"placement").mapName() + ".run.*"; }
 }

@@ -10,6 +10,10 @@ import java.io.Serializable;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Optional;
+import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.runtime.engine.EngineError;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -34,7 +38,35 @@ public record NestBinding(
         NestStateLedger ledger,
         NestSettings settings,
         NestClock clock,
-        boolean settleMissingReferencesOnComplete) implements Serializable {
+        boolean settleMissingReferencesOnComplete,
+        Optional<CompiledPlan> compiledPlan) implements Serializable {
+
+    public record CompiledStep(NestTopology topology,NestSettings settings) implements Serializable {
+        public CompiledStep { Objects.requireNonNull(topology,"topology"); Objects.requireNonNull(settings,"settings"); }
+    }
+    public record CompiledPlan(String pipelineId,Map<String,CompiledStep> steps) implements Serializable {
+        public CompiledPlan { Objects.requireNonNull(pipelineId,"pipelineId"); steps = Map.copyOf(steps); }
+        private CompiledStep require(String pipeline,String step) {
+            if (!pipelineId.equals(pipeline) || !steps.containsKey(step))
+                throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",pipelineId),null);
+            return steps.get(step);
+        }
+    }
+    public NestBinding { Objects.requireNonNull(compiledPlan,"compiledPlan"); }
+    public NestBinding(Function<String,NestTable> tables,NestStores stores,NestDeadLetter deadLetter,
+            ReplayFloorFactory replayFloor,NestStateLedger ledger,NestSettings settings,NestClock clock,
+            boolean settleMissingReferencesOnComplete) {
+        this(tables,stores,deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete,Optional.empty());
+    }
+    /** Uses only the candidate's original topology and per-step settings during deferred drawing. */
+    public NestBinding withCompiledSteps(String pipelineId,Map<String,CompiledStep> steps) {
+        return new NestBinding(tables,stores,deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete,
+                Optional.of(new CompiledPlan(pipelineId,steps)));
+    }
+    public NestTopology topology(String pipelineId,String stepId,TransformBody.Nest body) {
+        return compiledPlan.map(plan -> plan.require(pipelineId,stepId).topology())
+                .orElseGet(() -> NestTopology.compile(pipelineId,stepId,body,tables));
+    }
 
     /** Keeps bounded preview runs from omitting every root when a referenced row is absent in the sample. */
     public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
@@ -92,7 +124,8 @@ public record NestBinding(
 
     /** Selects an explicit step before any of its stores travels to a processor. */
     public NestBinding forStep(String pipelineId,String stepId) {
-        return new NestBinding(tables,stores.forStep(pipelineId,stepId),deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete);
+        NestSettings selected = compiledPlan.map(plan -> plan.require(pipelineId,stepId).settings()).orElse(settings);
+        return new NestBinding(tables,stores.forStep(pipelineId,stepId),deadLetter,replayFloor,ledger,selected,clock,settleMissingReferencesOnComplete,compiledPlan);
     }
 
     /** Where each kind of nest vertex keeps its state. */

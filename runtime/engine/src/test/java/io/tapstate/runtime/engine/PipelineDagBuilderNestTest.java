@@ -200,6 +200,23 @@ class PipelineDagBuilderNestTest {
         assertThat(vertexNames(dag)).contains("nest:doc","nest:doc:policies");
     }
 
+    @Test void deferredDrawingUsesTheOriginalCompiledTopologyAndPerStepSettingsWithoutDiscoveringAgain() {
+        var base = bindings(); var topology = io.tapstate.runtime.engine.nest.NestTopology.compile("p","doc",tree(),base.nest().tables());
+        var settings = io.tapstate.runtime.engine.nest.NestSettings.defaults().withEntriesHeldInMemory(512)
+                .withElementLimit(topology.assembler().mapName(),31);
+        var steps = new LinkedHashMap<String,NestBinding.CompiledStep>(); steps.put("doc",new NestBinding.CompiledStep(topology,settings));
+        var nest = new NestBinding(alias -> { throw new AssertionError("late topology compilation"); },
+                base.nest().stores(),base.nest().deadLetter()).withCompiledSteps("p",steps);
+        steps.clear();
+        assertThat(nest.forStep("p","doc").settings()).isSameAs(settings);
+        assertThat(nest.forStep("p","doc").topology("p","doc",tree())).isSameAs(topology);
+        var customized = new DagBindings(base.sourceVertices(),base.transformPorts(),base.sinkWriters(),base.upstreams(),nest);
+        var dag = buildWith(tree(),customized,"customer","customers","policy","policies","claim","claims","profile","profiles");
+        assertThat(vertexNames(dag)).contains("nest:doc","nest:doc:policies");
+        assertThatThrownBy(() -> nest.forStep("foreign","doc")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        assertThatThrownBy(() -> nest.topology("p","missing",tree())).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+    }
+
     // ---- doubles ----------------------------------------------------------------------
 
     private static DagBindings bindings() {

@@ -126,8 +126,8 @@ final class PipelineConvergencePass {
     }
 
     /** Captures the same original claim and candidate for both publication and the race verdict. */
-    void recordNestShape(String database, String pipelineId, String step, java.util.Set<String> paths) {
-        WorkloadClaimFence original = claim.get();
+    void recordNestShape(WorkloadClaimFence original,String database,String pipelineId,String step,java.util.Set<String> paths) {
+        Objects.requireNonNull(original,"original");
         var captured = java.util.Collections.unmodifiableSet(new java.util.LinkedHashSet<>(paths));
         requirePipeline(pipelineId);
         views.nestShapes(scope(), database, original, requireActive).recordIfAbsent(step, captured)

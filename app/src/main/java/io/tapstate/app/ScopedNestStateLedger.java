@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.runtime.engine.nest.NestStateLedger;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -9,10 +10,15 @@ import java.util.Set;
 final class ScopedNestStateLedger implements NestStateLedger {
     private static final long serialVersionUID = 1L;
     private final transient PipelineConvergencePass pass;
+    private final WorkloadClaimFence original;
     private final String defaultDatabase;
     private final Map<String, String> databases;
 
     ScopedNestStateLedger(PipelineConvergencePass pass, String defaultDatabase, Map<String, String> databases) {
+        this(pass,defaultDatabase,databases,Objects.requireNonNull(pass,"pass").claim());
+    }
+    ScopedNestStateLedger(PipelineConvergencePass pass,String defaultDatabase,Map<String,String> databases,WorkloadClaimFence original) {
+        this.original = Objects.requireNonNull(original,"original");
         this.pass = Objects.requireNonNull(pass, "pass"); this.defaultDatabase = Objects.requireNonNull(defaultDatabase, "defaultDatabase");
         this.databases = Map.copyOf(databases);
     }
@@ -22,7 +28,7 @@ final class ScopedNestStateLedger implements NestStateLedger {
     }
 
     @Override public void record(String pipelineId, String nodeId, Set<String> paths) {
-        pass.recordNestShape(database(nodeId), pipelineId, nodeId, paths);
+        pass.recordNestShape(original,database(nodeId),pipelineId,nodeId,paths);
     }
 
     private String database(String nodeId) { return databases.getOrDefault(nodeId, defaultDatabase); }

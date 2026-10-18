@@ -19,8 +19,9 @@ class ScopedNestStateLedgerTest {
 
     @Test void theRealLedgerUsesTheFixedScopeResolvedDatabaseAndOwnAdvancedClaim() {
         var f = new Fixture(); var pass = f.pass(() -> {}); var routes = new HashMap<>(Map.of("nest","extra"));
+        f.current.set(advanced()); pass.advanced(advanced());
         var ledger = new ScopedNestStateLedger(pass,"cache",routes); routes.put("nest","changed");
-        assertThat(ledger.recall("orders","nest")).isEmpty(); f.current.set(advanced()); pass.advanced(advanced());
+        assertThat(ledger.recall("orders","nest")).isEmpty();
         NestStateLedger.reconcile(ledger,"orders","nest",Set.of("root","root.items"));
         assertThat(ledger.recall("orders","nest")).containsExactlyInAnyOrder("root","root.items");
         assertThat(f.writes).containsExactly(advanced()); assertThat(f.routes).containsOnly("extra"); assertThat(f.scopes).containsOnly(SCOPE);

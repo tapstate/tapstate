@@ -32,7 +32,7 @@ class StoreBackedDagSourceScopedModelTest {
         var prepared = f.source.prepareStart(pass, "default");
         assertThat(f.views.writes).isEmpty();
         WorkloadClaimFence next = advance(1); f.views.current.set(next); pass.advanced(next);
-        prepared.plan().build(null);
+        prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
         assertThat(f.views.writes).isNotEmpty().containsOnly(next);
         assertThat(f.views.scopes).containsOnly(SCOPE);
         assertThat(f.views.models.latest("p", "src.orders")).isPresent();
@@ -61,7 +61,7 @@ class StoreBackedDagSourceScopedModelTest {
         f.store.schemas().save(new DiscoveredSourceModel("src","mysql",1,new SourceModel(List.of(new SourceTable("orders",
                 List.of(new SourceField("replacement","INT")),List.of("replacement"),List.of())))));
         var advanced = advance(1); f.views.current.set(advanced); pass.advanced(advanced);
-        prepared.plan().build(null);
+        prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
         assertThat(f.views.models.latest("p","src.orders").orElseThrow().schema()).containsOnlyKeys("id","customer_ref");
         assertThat(f.store.schemas().get("src").orElseThrow().model().tables().getFirst().primaryKey()).containsExactly("replacement");
     }
@@ -132,12 +132,117 @@ class StoreBackedDagSourceScopedModelTest {
             bound.add(settings); return (SupplierEx<SinkWriter>) () -> null;
         };
         var source = new StoreBackedDagSource(f.store, binder);
-        var prepared = source.prepareStart(f.pass(() -> {}), "default"); nested.put("label", "changed-input");
+        var pass = f.pass(() -> {});
+        var prepared = source.prepareStart(pass,"default"); nested.put("label","changed-input");
+        f.views.current.set(advance(1)); pass.advanced(advance(1));
         SourceResource exposed = (SourceResource) prepared.artifactSnapshot().orElseThrow().list().stream().filter(row -> row.id().equals("dest")).findFirst().orElseThrow();
         @SuppressWarnings("unchecked") var extra = (Map<String, Object>) exposed.config().get("extra");
         try { extra.put("label", "changed-result"); } catch (UnsupportedOperationException immutable) { /* A detached or immutable result is safe. */ }
-        prepared.plan().build(null);
+        prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
         assertThat(bound).isNotEmpty(); assertThat(bound.getLast()).containsEntry("extra", Map.of("label", "original"));
+    }
+
+    @Test void actualScopedNestUsesItsCapturedTypedPlanAndOriginalShapeClaimWithoutLegacyLocations() {
+        var f = nestFixture(); var pass = f.pass(() -> {}); var prepared = f.source.prepareStart(pass,"cache");
+        var plan = prepared.operatorPlan().orElseThrow();
+        assertThat(prepared.capacity().mapDatabases()).isEmpty(); assertThat(prepared.stateLocations()).isEmpty();
+        assertThat(plan.placements()).hasSize(4).allMatch(p -> p.database().equals("extra-cache"));
+        assertThat(plan.nests().get("doc").shape()).containsExactlyInAnyOrder("[]","[\"customer\"]");
+        assertThat(f.views.writes).isEmpty(); assertThat(f.views.shapes).isEmpty();
+        var advanced = advance(1); f.views.current.set(advanced); pass.advanced(advanced);
+        f.store.artifacts().save(pipeline(false,"later"));
+        var planned = prepared.plan();
+        assertThatThrownBy(() -> planned.build(new ExecutionFence("p",3,1))).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(f.views.shapes).isEmpty();
+        var built = planned.build(new ExecutionFence(SCOPE,advanced));
+        var vertices = new ArrayList<String>(); built.dag().forEach(vertex -> vertices.add(vertex.getName()));
+        assertThat(vertices).contains("nest:doc");
+        assertThat(f.views.shapes).containsEntry("extra-cache/doc",plan.nests().get("doc").shape());
+        assertThat(f.views.writes).containsOnly(advanced);
+        assertThat(f.views.scopes).containsOnly(SCOPE);
+    }
+
+    @Test void anOperatorCandidateCannotBeBuiltBeforeItsOriginalExecutionWasAllocated() {
+        var f = nestFixture(); var pass = f.pass(() -> {}); var planned = f.source.prepareStart(pass,"cache").plan();
+        assertThatThrownBy(() -> planned.build(new ExecutionFence(SCOPE,advance(1))))
+                .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(f.views.shapes).isEmpty();
+    }
+
+    @Test void keylessJoinDimensionsStillHaveTheirOwnTypedMirrorAndReverseIndex() {
+        var f = fixture(true);
+        f.store.schemas().save(new DiscoveredSourceModel("customers_src","mysql",1,new SourceModel(List.of(new SourceTable("customers",
+                List.of(new SourceField("id","INT"),new SourceField("name","VARCHAR")),List.of(),List.of())))));
+        var prepared = f.source.prepareStart(f.pass(() -> {}),"cache");
+        assertThat(prepared.operatorPlan().orElseThrow().placements()).contains(
+                io.tapstate.runtime.engine.OperatorMapCoordinates.join(SCOPE,"cache","widen",OperatorPlacement.Resource.JOIN_DIMENSIONS,"c"),
+                io.tapstate.runtime.engine.OperatorMapCoordinates.join(SCOPE,"cache","widen",OperatorPlacement.Resource.JOIN_INDEXES,"c"));
+        var plan = prepared.operatorPlan().orElseThrow(); var manifest = plan.bind(new ExecutionFence(SCOPE,advance(1)));
+        var config = new com.hazelcast.config.Config().setClusterName("keyless-join-"+java.util.UUID.randomUUID());
+        config.setProperty("hazelcast.phone.home.enabled","false"); config.setProperty("hazelcast.shutdownhook.enabled","false");
+        config.setProperty("hazelcast.logging.type","none"); config.setProperty("hazelcast.operation.thread.count","2");
+        config.setProperty("hazelcast.operation.generic.thread.count","2"); config.setProperty("hazelcast.io.input.thread.count","1");
+        config.setProperty("hazelcast.io.output.thread.count","1");
+        var network = config.getNetworkConfig(); network.setPort(0).setPortAutoIncrement(false);
+        network.getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        var join = network.getJoin(); join.getMulticastConfig().setEnabled(false); join.getTcpIpConfig().setEnabled(false); join.getAutoDetectionConfig().setEnabled(false);
+        plan.configurations(null).forEach(config::addMapConfig);
+        var member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+        try (var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,(binding,active) -> f.store.keyedState())) {
+            registry.install(manifest.bindings());
+            var stores = io.tapstate.runtime.engine.join.JoinStoresBinding.onTheCluster(manifest).bind(member,"p","widen");
+            stores.putDimensionRow("c","d",Map.of("id",1,"name","customer")); stores.indexAdd("c","d","fact-1");
+            assertThat(stores.dimensionRow("c","d")).containsEntry("name","customer");
+            assertThat(stores.indexPage("c","d",0)).containsExactly("fact-1");
+            for (var binding : manifest.bindings()) member.getMap(binding.mapName()).evictAll();
+            assertThat(stores.dimensionRow("c","d")).containsEntry("name","customer");
+            assertThat(stores.indexPage("c","d",0)).containsExactly("fact-1");
+        } finally { member.shutdown(); }
+    }
+
+    @Test void aLateDrawCannotBorrowTheNextExecutionClaimFromItsMutablePassForShapePublication() {
+        var f = nestFixture(); var originalPass = new AtomicReference<PipelineConvergencePass>();
+        var guardCalls = new java.util.concurrent.atomic.AtomicInteger(); var drawing = new AtomicBoolean();
+        var pass = f.pass(() -> {
+            if (drawing.get() && guardCalls.incrementAndGet() == 2) {
+                f.views.current.set(advance(2)); originalPass.get().advanced(advance(2));
+            }
+        });
+        originalPass.set(pass);
+        var prepared = f.source.prepareStart(pass,"cache"); f.views.current.set(advance(1)); pass.advanced(advance(1));
+        var planned = prepared.plan(); drawing.set(true);
+        assertThatThrownBy(() -> planned.build(new ExecutionFence(SCOPE,advance(1))))
+                .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(pass.claim()).isEqualTo(advance(2));
+        assertThat(f.views.shapes).isEmpty(); assertThat(f.views.writes).doesNotContain(advance(2));
+    }
+
+    private static Fixture nestFixture() {
+        var f = fixture(false);
+        var pipeline = (PipelineResource) new io.tapstate.core.dsl.DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, customers_src]
+                transforms:
+                  - id: doc
+                    type: nest
+                    from: {o: orders, c: customers}
+                    state: {database: extra-cache}
+                    root:
+                      from: o
+                      key: [id]
+                      embed:
+                        - from: c
+                          on: {id: customer_ref}
+                          as: object
+                          path: customer
+                serve:
+                  from: doc
+                  sync: [{id: sync_1, source: dest}]
+                """);
+        f.store.artifacts().save(pipeline); return new Fixture(f.store,pipeline,f.source,f.views);
     }
 
     private static Fixture fixture(boolean join) {
@@ -186,6 +291,22 @@ class StoreBackedDagSourceScopedModelTest {
     }
     private static final class Views implements PipelineStoreViews {
         final InMemoryDerivedSchemaStore models = new InMemoryDerivedSchemaStore();
+        final Map<String,java.util.Set<String>> shapes = new java.util.LinkedHashMap<>();
+        @Override public NestShapeStore nestShapes(PipelineIntentScope scope,String database) {
+            scopes.add(scope); return new NestShapeStore() {
+                @Override public Optional<java.util.Set<String>> read(String step) { return Optional.ofNullable(shapes.get(database+"/"+step)); }
+                @Override public Optional<java.util.Set<String>> recordIfAbsent(String step,java.util.Set<String> paths) { throw new AssertionError("read view"); }
+            };
+        }
+        @Override public NestShapeStore nestShapes(PipelineIntentScope scope,String database,WorkloadClaimFence original,Runnable active) {
+            scopes.add(scope); return new NestShapeStore() {
+                @Override public Optional<java.util.Set<String>> read(String step) { return Optional.ofNullable(shapes.get(database+"/"+step)); }
+                @Override public Optional<java.util.Set<String>> recordIfAbsent(String step,java.util.Set<String> paths) {
+                    active.run(); writes.add(original); if (!scope.equals(SCOPE) || !original.equals(current.get())) throw fenced();
+                    return Optional.ofNullable(shapes.putIfAbsent(database+"/"+step,java.util.Set.copyOf(paths)));
+                }
+            };
+        }
         final AtomicReference<WorkloadClaimFence> current = new AtomicReference<>(ORIGINAL);
         final List<WorkloadClaimFence> writes = new ArrayList<>(); final List<PipelineIntentScope> scopes = new ArrayList<>();
         @Override public DerivedSchemaStore pipelineDerivedSchemas(PipelineIntentScope scope) { scopes.add(scope); return models; }
