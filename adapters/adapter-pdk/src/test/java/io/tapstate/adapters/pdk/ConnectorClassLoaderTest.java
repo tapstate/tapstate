@@ -95,6 +95,35 @@ class ConnectorClassLoaderTest {
         }
     }
 
+    @Test
+    void sharesTheLog4jApiFromTheHost(@TempDir Path dir) throws Exception {
+        // A connector built for the Tapdata engine logs through the log4j API and leaves it out of its jar,
+        // because that engine provides it - the Db2 for i journal reader does. Unshared, its first change
+        // read dies on NoClassDefFoundError for LogManager.
+        Path jar = SyntheticJar.compileToJar(dir, "synthetic.JournalReader",
+                "package synthetic; public class JournalReader { public String logger() {"
+                        + " return org.apache.logging.log4j.LogManager.getLogger(\"synthetic.journal\").getName(); } }");
+        try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar))) {
+            assertThat(loader.load("org.apache.logging.log4j.LogManager"))
+                    .isSameAs(org.apache.logging.log4j.LogManager.class);
+            Class<?> reader = loader.load("synthetic.JournalReader");
+            Object logger = reader.getMethod("logger").invoke(reader.getDeclaredConstructor().newInstance());
+            assertThat(logger).isEqualTo("synthetic.journal");
+        }
+    }
+
+    @Test
+    void aLog4jClassTheHostLacksStillLoadsFromTheConnectorJar(@TempDir Path dir) throws Exception {
+        // The host provides the log4j API only. A connector that carries a log4j implementation of its own
+        // must still find it in its jar rather than lose it to a host that has none.
+        Path jar = SyntheticJar.compileToJar(dir, "org.apache.logging.log4j.core.BundledProbe",
+                "package org.apache.logging.log4j.core; public class BundledProbe {}");
+        try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar))) {
+            Class<?> bundled = loader.load("org.apache.logging.log4j.core.BundledProbe");
+            assertThat(bundled.getClassLoader()).isNotNull().isNotSameAs(getClass().getClassLoader());
+        }
+    }
+
     /**
      * Every caller over one artifact gets the one loader, and so the one copy of each class: a connector that
      * binds a JNI library to the loader it was loaded through finds that loader again on its next open.

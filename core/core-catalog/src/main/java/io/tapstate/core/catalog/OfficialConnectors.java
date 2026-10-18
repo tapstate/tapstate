@@ -38,7 +38,7 @@ public final class OfficialConnectors {
      * rather than certified support. Kept apart from the kinds so that accepting a connector and
      * promising its database is verified stay two separate decisions.
      */
-    public static final List<String> PREVIEW_IDS = List.of("db2");
+    public static final List<String> PREVIEW_IDS = List.of("db2", "db2i");
 
     /** The supported ids, in the order a message naming them should read: the kinds', then previews. */
     public static final List<String> IDS = Stream.concat(
@@ -54,7 +54,7 @@ public final class OfficialConnectors {
      * The server's target check and the API listings read the sink off the row, so none of them needs
      * to know this list exists.
      */
-    public static final List<String> SOURCE_ONLY_IDS = List.of("db2");
+    public static final List<String> SOURCE_ONLY_IDS = List.of("db2", "db2i");
 
     private static Map<String, List<String>> databaseKinds() {
         Map<String, List<String>> kinds = new LinkedHashMap<>();

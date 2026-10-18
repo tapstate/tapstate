@@ -25,8 +25,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * contract ({@code io.tapdata.*}), so every connector binds to the same {@code TapConnector} /
  * {@code TapEvent} types and events cross as one contract; and the runtime's own infrastructure a
  * connector links against but does not bundle — bytecode generation ({@code net.sf.cglib.*}) and the
- * logging facade ({@code org.slf4j.*}). Everything else on the host — the tapstate application classes and
- * the service framework libraries — is hidden from the connector.
+ * logging facades ({@code org.slf4j.*}, {@code org.apache.logging.log4j.*}). Everything else on the host —
+ * the tapstate application classes and the service framework libraries — is hidden from the connector.
  *
  * <p>Two lifetimes. {@link #open} gives a loader of its own, which its caller closes. {@link #shared} gives
  * the one loader every open of the same connector artifact uses for the life of the process, the way the
@@ -43,11 +43,14 @@ public final class ConnectorClassLoader implements AutoCloseable {
      * library — mapping connection config generates a {@code BeanMap} subclass and defines it into this
      * loader (the config bean lives here), so the generated subclass cannot link unless this loader
      * resolves cglib from the host. {@code org.slf4j.*} is the logging facade a thin connector and its
-     * bundled driver log through and do not carry themselves. The tapstate application classes and the
-     * service framework (Spring, Hazelcast, Mongo, the web container) stay hidden.
+     * bundled driver log through and do not carry themselves. {@code org.apache.logging.log4j.*} is the
+     * other one: a connector built for the Tapdata engine logs through the log4j API and leaves it out of
+     * its jar, because that engine provides it. The host has the API only, so a log4j class the host lacks
+     * - an implementation a connector bundles - still loads from the connector's own jar. The tapstate
+     * application classes and the service framework (Spring, Hazelcast, Mongo, the web container) stay hidden.
      */
     private static final List<String> SHARED_HOST_PREFIXES =
-            List.of("io.tapdata.", "net.sf.cglib.", "org.slf4j.");
+            List.of("io.tapdata.", "net.sf.cglib.", "org.slf4j.", "org.apache.logging.log4j.");
 
     /** The process-wide loaders, one per connector artifact; never closed, as nothing could reopen them. */
     private static final Map<ArtifactKey, ConnectorClassLoader> SHARED = new ConcurrentHashMap<>();
