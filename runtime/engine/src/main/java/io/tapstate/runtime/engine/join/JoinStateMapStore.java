@@ -80,9 +80,10 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void init(HazelcastInstance member, Properties properties, String mapName) {
-        var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member,
-                scoped || io.tapstate.runtime.engine.OperatorMapBindings.required(properties));
-        this.store = bindings == null ? JoinStateMapStoreFactory.boundTo(member) : bindings.join(namespace);
+        boolean required = scoped || io.tapstate.runtime.engine.OperatorMapBindings.required(properties);
+        var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, required);
+        this.store = bindings == null ? JoinStateMapStoreFactory.boundTo(member)
+                : required ? bindings.initializingJoin(namespace) : bindings.join(namespace);
         this.stats = JoinStateStats.of(member);
     }
 

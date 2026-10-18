@@ -94,6 +94,59 @@ class ScopedOperatorMapsTest {
         } finally { member.shutdown(); }
     }
 
+    @Test void aLateMemberInitializesMigratedMapsWithoutWaitingForItsOriginalDescriptorOrTouchingColdState() throws Exception {
+        var original = binding(placement(SCOPE,OperatorPlacement.Resource.NEST_STATE),1); var next = binding(original.placement(),2);
+        var cold = new Cold(); var current = new AtomicReference<Object>("attempt-1"); var scope = new AtomicReference<>(SCOPE);
+        var firstConfig = config(List.of(original)); firstConfig.setProperty("hazelcast.partition.count","17");
+        firstConfig.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true);
+        HazelcastInstance first = Hazelcast.newHazelcastInstance(firstConfig); HazelcastInstance second = null;
+        var firstRegistry = OperatorMapBindings.bindTo(first,(binding,active) -> cold.guarded(binding,current,scope,active));
+        OperatorMapBindings secondRegistry = null;
+        try {
+            firstRegistry.install(List.of(original)); var map = first.getMap(original.mapName());
+            var keys = java.util.stream.IntStream.range(0,64).mapToObj(index -> List.of("key-"+index)).toList();
+            keys.forEach(key -> map.put(key,"before"));
+            var secondConfig = config(List.of(original)).setClusterName(firstConfig.getClusterName());
+            secondConfig.setProperty("hazelcast.partition.count","17");
+            secondConfig.setProperty("hazelcast.logging.type","jdk");
+            secondConfig.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true)
+                    .addMember("127.0.0.1:"+first.getCluster().getLocalMember().getAddress().getPort());
+            var opens = new java.util.concurrent.atomic.AtomicInteger();
+            secondRegistry = OperatorMapBindings.prepare(secondConfig,(binding,active) -> {
+                opens.incrementAndGet(); return cold.guarded(binding,current,scope,active);
+            });
+            long started = System.nanoTime(); second = Hazelcast.newHazelcastInstance(secondConfig);
+            assertThat(java.time.Duration.ofNanos(System.nanoTime()-started)).isLessThan(java.time.Duration.ofSeconds(20));
+            var joined = second; var registry = secondRegistry;
+            await(() -> registry.awaitingMapNames().contains(original.mapName()));
+            assertThat(opens.get()).isZero();
+            // This pending descriptor came from migration, before any local getMap or explicit factory call.
+            var late = callbacks(second,original); fenced(() -> late.load(keys.getFirst())); assertThat(opens.get()).isZero();
+            secondRegistry.attachExisting(List.of(original)); assertThat(opens.get()).isOne();
+            await(() -> keys.stream().anyMatch(key -> joined.getCluster().getLocalMember().equals(joined.getPartitionService().getPartition(key).getOwner())));
+            var key = keys.stream().filter(candidate -> joined.getCluster().getLocalMember().equals(joined.getPartitionService().getPartition(candidate).getOwner())).findFirst().orElseThrow();
+            var localMap = second.getMap(original.mapName()); assertThat(localMap.get(key)).isEqualTo("before");
+            localMap.evict(key); assertThat(localMap.get(key)).isEqualTo("before"); localMap.put(key,"after");
+            current.set("attempt-2"); firstRegistry.install(List.of(next)); secondRegistry.install(List.of(next));
+            fenced(() -> late.store(key,"late")); fenced(() -> late.deleteAll(List.of(key)));
+            fenced(() -> registry.attachExisting(List.of(original)));
+            var newMap = second.getMap(next.mapName()); assertThat(newMap.get(key)).isEqualTo("after");
+            newMap.evict(key); assertThat(newMap.get(key)).isEqualTo("after");
+            map.destroy(); newMap.destroy();
+        } finally {
+            if (secondRegistry != null) secondRegistry.close(); firstRegistry.close();
+            if (second != null) second.shutdown(); first.shutdown();
+        }
+    }
+
+    private static void await(java.util.function.BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime()+java.time.Duration.ofSeconds(15).toNanos();
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) throw new AssertionError("the member did not finish the expected migration");
+            Thread.sleep(20);
+        }
+    }
+
     private static void fenced(org.assertj.core.api.ThrowableAssert.ThrowingCallable action) { assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class,
         failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED)); }
     private record Key(String namespace,String key) {}

@@ -65,9 +65,9 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void init(HazelcastInstance member, Properties properties, String mapName) {
-        var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member,
-                scoped || io.tapstate.runtime.engine.OperatorMapBindings.required(properties));
-        if (bindings != null) this.store = bindings.nest(namespace, database);
+        boolean required = scoped || io.tapstate.runtime.engine.OperatorMapBindings.required(properties);
+        var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, required);
+        if (bindings != null) this.store = required ? bindings.initializingNest(namespace, database) : bindings.nest(namespace, database);
         else {
             var stores = NestStateMapStoreFactory.boundTo(member);
             String resolved = database == null ? stores.defaultDatabase() : database;

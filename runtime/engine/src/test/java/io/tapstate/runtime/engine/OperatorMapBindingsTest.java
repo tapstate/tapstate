@@ -148,6 +148,54 @@ class OperatorMapBindingsTest {
         assertThat(legacy.calls).isEmpty();
         properties.setProperty(OperatorMapBindings.SCOPED_PROPERTY,"false"); fenced(() -> OperatorMapBindings.required(properties));
     }
+    @Test void anInitializingHandleDoesNoColdIoUntilItsCompleteOriginalDescriptorIsAdmitted() {
+        var original = binding(placement(OperatorPlacement.Resource.NEST_STATE,"root"),1); var cold = new RecordingStore(); var opens = new AtomicInteger();
+        var registry = OperatorMapBindings.bindTo(member(),(binding,active) -> { opens.incrementAndGet(); return cold; });
+        var waiting = registry.initializingNest(original.mapName(),"cache");
+        fenced(() -> waiting.load(original.mapName(),"key")); fenced(() -> waiting.save(original.mapName(),"key",new byte[]{1}));
+        assertThat(opens.get()).isZero(); assertThat(cold.calls).isEmpty(); assertThat(registry.awaitingMapNames()).containsExactly(original.mapName());
+        registry.attachExisting(List.of(original)); waiting.save(original.mapName(),"key",new byte[]{1});
+        assertThat(registry.awaitingMapNames()).isEmpty(); assertThat(opens.get()).isOne();
+        assertThat(cold.calls).containsExactly(new Call("save",original.placement().mapName()));
+        var next = binding(original.placement(),2); registry.install(List.of(next));
+        fenced(() -> waiting.load(original.mapName(),"key")); fenced(() -> registry.attachExisting(List.of(original)));
+        assertThat(registry.nest(next.mapName(),null)).isNotNull();
+    }
+
+    @Test void restorationRequiresALocalScopedHandleWithTheOriginalKindAndDatabase() {
+        var original = binding(placement(OperatorPlacement.Resource.NEST_STATE,"root"),1); var opens = new AtomicInteger();
+        var registry = OperatorMapBindings.bindTo(member(),(binding,active) -> { opens.incrementAndGet(); return new RecordingStore(); });
+        fenced(() -> registry.attachExisting(List.of(original)));
+        registry.initializingJoin(original.mapName()); fenced(() -> registry.attachExisting(List.of(original)));
+        var other = binding(placement(OperatorPlacement.Resource.NEST_STATE,"other"),1);
+        registry.initializingNest(other.mapName(),"wrong"); fenced(() -> registry.attachExisting(List.of(other)));
+        assertThat(opens.get()).isZero();
+    }
+
+    @Test void waitingHandlesCannotObserveAHalfPublishedBatchOrKeepFailedCandidatesAlive() {
+        var first = binding(placement(OperatorPlacement.Resource.NEST_STATE,"root"),1);
+        var second = binding(placement(OperatorPlacement.Resource.JOIN_FACTS,"facts"),1);
+        var firstHandle = new AtomicReference<KeyedStateStore>(); var firstGuard = new AtomicReference<Runnable>();
+        var registry = OperatorMapBindings.bindTo(member(),(binding,active) -> {
+            if (binding.equals(first)) firstGuard.set(active);
+            if (binding.equals(second)) { fenced(() -> firstHandle.get().load(first.mapName(),"key")); throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
+            return new RecordingStore();
+        });
+        firstHandle.set(registry.initializingNest(first.mapName(),null)); var secondHandle = registry.initializingJoin(second.mapName());
+        fenced(() -> registry.attachExisting(List.of(first,second))); fenced(() -> firstGuard.get().run());
+        fenced(() -> firstHandle.get().load(first.mapName(),"key")); fenced(() -> secondHandle.load(second.mapName(),"key"));
+        assertThat(registry.awaitingMapNames()).containsExactlyInAnyOrder(first.mapName(),second.mapName());
+    }
+
+    @Test void closingOrRetiringAnOriginalHandleNeverLetsItsLaterRestorationRebindIt() {
+        var original = binding(placement(OperatorPlacement.Resource.NEST_STATE,"root"),1);
+        var registry = OperatorMapBindings.bindTo(member(),(binding,active) -> new RecordingStore());
+        var waiting = registry.initializingNest(original.mapName(),null); registry.attachExisting(List.of(original));
+        assertThat(registry.release(original)).isTrue(); fenced(() -> waiting.count(original.mapName()));
+        registry.initializingNest(original.mapName(),null); fenced(() -> registry.attachExisting(List.of(original)));
+        registry.close(); fenced(() -> registry.attachExisting(List.of(original))); fenced(() -> waiting.count(original.mapName()));
+    }
+
     private record Call(String operation,String namespace) {}
     private static final class RecordingStore implements KeyedStateStore {
         final List<Call> calls = new ArrayList<>();
