@@ -702,20 +702,9 @@ main() {
                     die "the CLI could not log in, so no verb after it ran; inspect it with: docker compose logs bootstrap" ;;
             esac ;;
     esac
-    # Anything else the CLI failed on. Two guards, because what one can see the other cannot.
-    #
-    # A CLI that died -- a crash, a kill -- is what the exit status is for, and the failure it names is
-    # the process, not the verb: the session ended, so nothing after it ran at all.
-    if [ "$repl_status" -ne 0 ]; then
-        die "the CLI exited $repl_status before the pipeline was started; its output is above"
-    fi
-    # A verb that failed is what the exit status cannot see, and it is the case a session produces: a
-    # rejected line is printed and the read loop takes the next one, so a session in which nothing worked
-    # ends exactly the way a healthy one does -- 0. That is how a refused connector registration reached
-    # the row-count wait, which then reported an empty target and sent the reader to the server log, half
-    # a minute later, for a failure that was neither there nor the server's.
-    #
-    # The verbs' own output carries what the status cannot, in one of two shapes. A failure the CLI can
+    # Check both the session status and its diagnostics: a refusal now leaves the
+    # REPL running but makes it exit 1, while older CLIs can still exit zero.
+    # The verbs' own output carries the refusal's identity in one of two shapes. A failure the CLI can
     # name is a coded diagnostic and opens with `error: <code>`, the header every face of the CLI renders
     # failures with. A refusal whose response body carried no code has none to open with, and arrives as
     # the client's own sentence for it -- `The server refused ...` -- under the same indent a message
@@ -745,6 +734,13 @@ main() {
         { print }
         END { if (pending != "") print pending }
     ')"
+    # Only the normal refusal status can be explained by the removed START/RUNNING
+    # diagnostic. An unexplained exit or a crash must still stop the run; any other
+    # refusal left alongside the tolerated one is rejected by the text guard below.
+    if [ "$repl_status" -ne 0 ] \
+        && { [ "$repl_status" -ne 1 ] || [ "$verb_failures" = "$repl_out" ]; }; then
+        die "the CLI exited $repl_status before the pipeline was started; its output is above"
+    fi
     if printf '%s\n' "$verb_failures" | grep -q -e 'error: ' -e 'The server refused ' -e 'request failed: '; then
         die "a verb failed during pipeline setup; the CLI's output is above"
     fi

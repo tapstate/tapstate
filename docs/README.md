@@ -33,6 +33,7 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 
 | Features | |
 |---|---|
+| [Filter](filter/) | Keep matching rows in a live view, including removals and source before-image requirements. |
 | [Join](join/) | SQL subset, dimension-key uniqueness, output keys, and usage requirements. |
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
 | [Unwind](unwind/) | Expand array elements into individually keyed rows and keep them current. |
