@@ -147,12 +147,27 @@ class ScopedPipelineActuationOwnershipTest {
         verify(store).renew(any(), any());
     }
 
+    @Test void aScopedSubmissionCannotBorrowANewerTopologyAfterReacquisition() {
+        var owner = ownership(); var permit = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
+        membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
+        membership.canCommit(Set.of("node-a","node-b"));
+        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
+        assertThat(owner.permit(FIRST).granted()).isFalse();
+        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
+        var reacquired = owner.permit(FIRST);
+        assertThat(reacquired.claim().topologyRevision()).isEqualTo(8);
+        assertThat(reacquired.claim().claimGeneration()).isEqualTo(run.claimFence().claimGeneration());
+        assertThat(reacquired.claim().executionGeneration()).isEqualTo(run.claimFence().executionGeneration());
+        assertThat(owner.proveExecution(run.fence())).isFalse();
+    }
+
     @Test void anotherBootCannotProveTheSameNumericRun() {
         var owner = ownership();
         var first = owner.permit(FIRST);
         var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(first.claim()));
         var wrong = new ExecutionFence("orders", run.fence().claimGeneration(), run.fence().executionGeneration(),
-                FIRST, "node-a", "different-boot");
+                FIRST, "node-a", "different-boot", run.fence().topologyRevision());
         assertThat(owner.proveExecution(wrong)).isFalse();
         assertThat(reads).hasValue(0);
     }
@@ -264,6 +279,30 @@ class ScopedPipelineActuationOwnershipTest {
             return captured;
         });
         assertThat(owner.proveExecution(run.fence())).isTrue();
+    }
+
+    @Test void aLateProofReadCannotAdoptTheReacquiredHoldersNewTopology() {
+        var owner = ownership(); var permit = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim())); var once = new java.util.concurrent.atomic.AtomicBoolean();
+        when(store.readPipeline(FIRST)).thenAnswer(call -> {
+            var captured = raw.read(KEY);
+            if (once.compareAndSet(false,true)) {
+                membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
+                membership.canCommit(Set.of("node-a","node-b"));
+                raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); assertThat(owner.permit(FIRST).granted()).isFalse();
+                raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
+                assertThat(owner.permit(FIRST).claim().topologyRevision()).isEqualTo(8);
+            }
+            return captured;
+        });
+        assertThat(owner.proveExecution(run.fence())).isFalse();
+    }
+
+    @Test void aScopedExecutionCannotCarryAnotherTopologyOfTheSameNumericRun() {
+        var owner = ownership(); var permit = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
+        var changed = new WorkloadClaimFence(KEY,OWNER,run.claimFence().claimGeneration(),run.claimFence().executionGeneration(),8);
+        assertThatThrownBy(() -> new PipelineActuationOwnership.Execution(true,run.fence(),8L,changed)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test void aScopedExecutionCannotCarryAnotherClaimsOwner() {

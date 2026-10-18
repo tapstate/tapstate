@@ -107,6 +107,36 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void aScopedRunCannotWriteWithTheTopologyOfALaterSameOwnerAcquisition() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var owned = claims.acquirePipeline(f.scope,OWNER,1,TTL).claim();
+            var run = claims.advanceExecution(owned,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var original = new ExecutionFence(f.scope,WorkloadClaimFence.from(run));
+            var later = claims.acquirePipeline(f.scope,OWNER,2,TTL).claim();
+            assertThat(later.claimGeneration()).isEqualTo(run.claimGeneration());
+            assertThat(later.executionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(later.topologyRevision()).isEqualTo(2);
+            var before = f.state();
+            try (var guard = ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(10),System::nanoTime,() -> true)) {
+                assertThatThrownBy(() -> {
+                    var borrowed = guard.require(original);
+                    f.cache.pipelineStates(f.scope,borrowed,ACTIVE).compareAndSwap("flow",0,"RUNNING",CLOCK.instant());
+                }).isInstanceOfSatisfying(TapstateException.class,failure ->
+                        assertThat(failure.code()).isEqualTo(io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED));
+                assertThat(f.state()).isEqualTo(before);
+                assertCode(() -> f.cache.pipelineStates(f.scope,WorkloadClaimFence.from(run),ACTIVE)
+                        .compareAndSwap("flow",0,"RUNNING",CLOCK.instant()),IoError.WORKLOAD_CLAIM_FENCED);
+                guard.recordSinkWriteFailure(original);
+                assertThat(claims.readPipeline(f.scope).orElseThrow().claim().failureClaimGeneration()).isZero();
+                var actual = guard.require(new ExecutionFence(f.scope,WorkloadClaimFence.from(later)));
+                f.cache.pipelineStates(f.scope,actual,ACTIVE).compareAndSwap("flow",0,"RUNNING",CLOCK.instant());
+                assertThat(f.state().getLong("epoch")).isEqualTo(1);
+            }
+        });
+    }
+
     private static void assertCode(org.assertj.core.api.ThrowableAssert.ThrowingCallable action, IoError code) {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(code));
     }

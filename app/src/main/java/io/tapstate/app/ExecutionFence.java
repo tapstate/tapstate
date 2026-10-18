@@ -18,22 +18,23 @@ import java.util.Objects;
  * which is exactly the case that a claim generation alone could not tell apart from being current.
  *
  * <p>A scoped run also carries the fixed physical state identity and submitting owner. Numeric
- * generations alone cannot distinguish two cache incarnations or two physical state generations.
+ * generations alone cannot distinguish two cache incarnations or two physical state generations. Its
+ * original topology revision also stays fixed; reacquiring ownership cannot authorize an older callback.
  *
  * <p>{@link Serializable} because it travels on the DAG to whichever members run the sink vertices, the
  * same way the coordinates behind a sink writer and a durable ack do.
  */
 record ExecutionFence(String pipelineId, long claimGeneration, long executionGeneration,
-        PipelineIntentScope scope, String ownerNodeId, String ownerBootId)
+        PipelineIntentScope scope, String ownerNodeId, String ownerBootId, Long topologyRevision)
         implements Serializable {
 
     ExecutionFence(String pipelineId, long claimGeneration, long executionGeneration) {
-        this(pipelineId, claimGeneration, executionGeneration, null, null, null);
+        this(pipelineId, claimGeneration, executionGeneration, null, null, null, null);
     }
 
     ExecutionFence(PipelineIntentScope scope, WorkloadClaimFence claim) {
         this(Objects.requireNonNull(scope, "scope").pipelineId(), claim.claimGeneration(),
-                claim.executionGeneration(), scope, claim.owner().nodeId(), claim.owner().bootId());
+                claim.executionGeneration(), scope, claim.owner().nodeId(), claim.owner().bootId(), claim.topologyRevision());
         if (claim.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
                 || !claim.key().clusterId().equals(scope.clusterId())
                 || !claim.key().resourceId().equals(scope.pipelineId())) {
@@ -46,9 +47,9 @@ record ExecutionFence(String pipelineId, long claimGeneration, long executionGen
         if (pipelineId.isBlank()) {
             throw new IllegalArgumentException("pipelineId must not be blank");
         }
-        if (scope == null ? ownerNodeId != null || ownerBootId != null
+        if (scope == null ? ownerNodeId != null || ownerBootId != null || topologyRevision != null
                 : !scope.pipelineId().equals(pipelineId) || ownerNodeId == null || ownerNodeId.isBlank()
-                        || ownerBootId == null || ownerBootId.isBlank()) {
+                        || ownerBootId == null || ownerBootId.isBlank() || topologyRevision == null || topologyRevision < 0) {
             throw new IllegalArgumentException("a scoped run carries its original owner and Pipeline identity");
         }
         if (claimGeneration < 1 || executionGeneration < 1) {

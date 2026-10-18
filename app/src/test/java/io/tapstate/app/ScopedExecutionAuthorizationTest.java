@@ -74,7 +74,7 @@ class ScopedExecutionAuthorizationTest {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
             copy = (ExecutionFence) in.readObject();
         }
-        assertThat(copy).isEqualTo(original);
+        assertThat(copy).isEqualTo(original); assertThat(copy.topologyRevision()).isEqualTo(7L);
         try (var guard = guard()) {
             for (int i = 0; i < 20; i++) assertThat(guard.authorized(copy)).isTrue();
             assertThat(guard.require(copy)).isEqualTo(WorkloadClaimFence.from(raw.read(KEY).orElseThrow().claim()));
@@ -244,13 +244,35 @@ class ScopedExecutionAuthorizationTest {
         }
     }
 
-    @Test void aTopologyRevisionChangeDoesNotInventANewSubmittedRun() {
+    @Test void aScopedRunCannotBorrowTheTopologyOfALaterSameOwnerAcquisition() {
         WorkloadClaim run = run();
         try (var guard = guard()) {
-            raw.acquire(KEY, OWNER, 8, TTL);
+            var later = raw.acquire(KEY, OWNER, 8, TTL).claim();
+            assertThat(later.claimGeneration()).isEqualTo(run.claimGeneration());
+            assertThat(later.executionGeneration()).isEqualTo(run.executionGeneration());
             ExecutionFence fence = new ExecutionFence(FIRST, WorkloadClaimFence.from(run));
-            assertThat(guard.authorized(fence)).isTrue();
-            assertThat(guard.require(fence).topologyRevision()).isEqualTo(8);
+            assertThat(guard.authorized(fence)).isFalse();
+            assertThatThrownBy(() -> guard.require(fence)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        }
+    }
+
+    @Test void anOldTopologyCannotMarkTheLaterClaimAsFailed() {
+        WorkloadClaim run = run(); var original = new ExecutionFence(FIRST, WorkloadClaimFence.from(run));
+        raw.acquire(KEY, OWNER, 8, TTL);
+        try (var guard = guard()) {
+            guard.recordSinkWriteFailure(original);
+            assertThat(raw.read(KEY).orElseThrow().claim().failureClaimGeneration()).isZero();
+        }
+    }
+
+    @Test void aFreshScopedTopologyIsRefreshedWithoutWaitingOutTheOldLocalProof() {
+        WorkloadClaim run = run();
+        try (var guard = guard()) {
+            var original = new ExecutionFence(FIRST,WorkloadClaimFence.from(run)); assertThat(guard.authorized(original)).isTrue();
+            var later = raw.acquire(KEY,OWNER,8,TTL).claim(); var actual = new ExecutionFence(FIRST,WorkloadClaimFence.from(later));
+            assertThat(guard.authorized(actual)).isTrue(); assertThat(guard.require(actual)).isEqualTo(WorkloadClaimFence.from(later));
+            assertThat(guard.authorized(original)).isFalse(); assertThat(reads).hasValue(2);
         }
     }
 
@@ -258,9 +280,9 @@ class ScopedExecutionAuthorizationTest {
         var wrong = new WorkloadClaimFence(new WorkloadClaimKey("other", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
                 OWNER, 1, 1, 7);
         assertThatThrownBy(() -> new ExecutionFence(FIRST, wrong)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new ExecutionFence("orders", 1, 1, FIRST, null, null))
+        assertThatThrownBy(() -> new ExecutionFence("orders", 1, 1, FIRST, null, null, 7L))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new ExecutionFence("orders", 1, 1, null, "node", "boot"))
+        assertThatThrownBy(() -> new ExecutionFence("orders", 1, 1, null, "node", "boot", 7L))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 

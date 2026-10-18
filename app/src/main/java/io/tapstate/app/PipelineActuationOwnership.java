@@ -271,7 +271,8 @@ final class PipelineActuationOwnership {
                 throw new IllegalArgumentException("the execution identity must match its original advanced claim");
             if (hasIdentity && fence.scope() != null && (!fence.scope().clusterId().equals(claimFence.key().clusterId())
                     || !fence.ownerNodeId().equals(claimFence.owner().nodeId())
-                    || !fence.ownerBootId().equals(claimFence.owner().bootId())))
+                    || !fence.ownerBootId().equals(claimFence.owner().bootId())
+                    || fence.topologyRevision().longValue() != claimFence.topologyRevision()))
                 throw new IllegalArgumentException("the scoped execution must retain its original claim owner");
         }
 
@@ -533,7 +534,8 @@ final class PipelineActuationOwnership {
      *
      * <p>Read rather than renewed: what is asked is who holds the run's generations now, and a renewal is
      * also refused for a claim granted under a topology revision a member joining has since moved, which
-     * the same owner takes again on its next pass under the same generations. True only in an explicit uncoordinated fixture.
+     * the same owner takes again on its next pass under the same generations. A later scoped claim is a
+     * separate proof and cannot be borrowed here. A missing fence is valid only in an explicit uncoordinated fixture.
      */
     boolean proveExecution(ExecutionFence fence) {
         if (!fenced) return fence == null || fence.scope() == null;
@@ -558,14 +560,16 @@ final class PipelineActuationOwnership {
             Held state = held.get(fence.pipelineId());
             WorkloadClaim claim = reading.get().claim();
             // Include IO and lock waits in the lease bound, then compare the holder after every callback.
-            // Lease-only renewals and topology-only changes do not create another run.
+            // Lease-only renewals preserve this proof; a scoped run retains its original topology.
             return !closing && bound > 0 && checkedAt - askedAt < bound
                     && state != null && Objects.equals(state.scope, fence.scope()) && state.claim != null
                     && state.claim.owner().equals(owner) && state.claim.claimGeneration() == fence.claimGeneration()
                     && state.claim.executionGeneration() == fence.executionGeneration()
+                    && (fence.scope() == null || state.claim.topologyRevision() == fence.topologyRevision())
                     && claim.key().equals(key) && claim.owner().equals(owner)
                     && claim.claimGeneration() == fence.claimGeneration()
-                    && claim.executionGeneration() == fence.executionGeneration();
+                    && claim.executionGeneration() == fence.executionGeneration()
+                    && (fence.scope() == null || claim.topologyRevision() == fence.topologyRevision());
         }
     }
 

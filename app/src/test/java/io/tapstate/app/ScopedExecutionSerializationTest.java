@@ -51,7 +51,7 @@ class ScopedExecutionSerializationTest {
         ExecutionFence received = serializer.toObject(serializer.toData(original));
         assertThat(received).isEqualTo(original);
         assertThat(received.scope()).isEqualTo(FIRST);
-        assertThat(received.ownerBootId()).isEqualTo("boot-a");
+        assertThat(received.ownerBootId()).isEqualTo("boot-a"); assertThat(received.topologyRevision()).isEqualTo(7L);
     }
 
     @Test void aSerializedAckFactoryCarriesTheOriginalScopeToItsReceivingGuard() {
@@ -91,6 +91,29 @@ class ScopedExecutionSerializationTest {
                             failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
             assertThat(landed).hasValue(1);
             verify(store, never()).read(any());
+        }
+    }
+
+    @Test void aSerializedOldAckCannotAdoptASameOwnersNewTopology() {
+        var raw = new InMemoryWorkloadClaimStore();
+        var claimed = raw.acquire(KEY,OWNER,7,Duration.ofSeconds(30)).claim();
+        var run = raw.advanceExecution(claimed,7,Set.of(OWNER.nodeId())).orElseThrow(); var original = WorkloadClaimFence.from(run);
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class); when(store.readPipeline(FIRST)).thenAnswer(call -> raw.read(KEY));
+        var landed = new AtomicInteger(); var actual = new AtomicReference<WorkloadClaimFence>();
+        try (var guard = ExecutionAuthorization.scoped(BUSINESS,store,Duration.ofSeconds(10),System::nanoTime,() -> true)) {
+            HazelcastInstance receiver = mock(HazelcastInstance.class);
+            when(receiver.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY,guard,LANDED,landed,CLAIM,actual)));
+            var serializer = serializer(); SinkAckFactory received = serializer.toObject(serializer.toData(
+                    FencedSinkAckFactory.heldTo(new RecordingFactory(),new ExecutionFence(FIRST,original))));
+            received.beginRun(receiver,Map.of()); var ack = received.resolve(receiver).forWriter("writer-1");
+            ack.advance("items",new ChainPosition(new SourceOrder(1,1),"p1"));
+            var later = raw.acquire(KEY,OWNER,8,Duration.ofSeconds(30)).claim();
+            assertThat(guard.authorized(new ExecutionFence(FIRST,WorkloadClaimFence.from(later)))).isTrue();
+            assertThatThrownBy(() -> received.beginRun(receiver,Map.of())).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            assertThatThrownBy(() -> ack.advance("items",new ChainPosition(new SourceOrder(1,2),"p2"))).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            assertThat(landed).hasValue(1); assertThat(actual.get()).isEqualTo(original);
         }
     }
 

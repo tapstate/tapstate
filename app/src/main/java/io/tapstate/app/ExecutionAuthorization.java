@@ -268,7 +268,8 @@ final class ExecutionAuthorization implements AutoCloseable {
                 && claim.claimGeneration() == fence.claimGeneration()
                 && claim.executionGeneration() == fence.executionGeneration()
                 && (fence.scope() == null || claim.owner().nodeId().equals(fence.ownerNodeId())
-                        && claim.owner().bootId().equals(fence.ownerBootId()));
+                        && claim.owner().bootId().equals(fence.ownerBootId())
+                        && claim.topologyRevision() == fence.topologyRevision());
     }
 
     private Optional<WorkloadClaimReading> readStore(ReadKey key) {
@@ -281,12 +282,15 @@ final class ExecutionAuthorization implements AutoCloseable {
      * Whether {@code entry} was read before the run {@code fence} names was submitted, ordered the way
      * the store advances the pair: taking a claim over takes the next claim generation and carries the
      * execution generation across, and submitting a run under a claim takes that claim's next execution
-     * generation.
+     * generation. Within the same pair, a newer scoped topology also requires a fresh proof rather than
+     * waiting for a cached reading of its predecessor to expire.
      */
     private static boolean precedes(Entry entry, ExecutionFence fence) {
         return entry.claim().claimGeneration() < fence.claimGeneration()
                 || (entry.claim().claimGeneration() == fence.claimGeneration()
-                        && entry.claim().executionGeneration() < fence.executionGeneration());
+                        && (entry.claim().executionGeneration() < fence.executionGeneration()
+                                || (entry.claim().executionGeneration() == fence.executionGeneration() && fence.scope() != null
+                                        && entry.claim().topologyRevision() < fence.topologyRevision())));
     }
 
     private void refreshAll() {
