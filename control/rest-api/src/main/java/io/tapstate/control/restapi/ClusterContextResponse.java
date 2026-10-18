@@ -7,7 +7,8 @@ import io.tapstate.control.core.CloudClusterContextView;
 /** Public projection of the display context bound to the current managed Cloud session. */
 public record ClusterContextResponse(
         String organizationId, String clusterId, String organizationName, String clusterName, String region,
-        String ec2PublicIp, String egressAddressStatus) {
+        @JsonInclude(JsonInclude.Include.ALWAYS) String ec2PublicIp,
+        @JsonInclude(JsonInclude.Include.ALWAYS) String egressAddressStatus) {
 
     /** The local session captures display names while the live Cloud runtime state remains unknown. */
     @JsonProperty("clusterState")

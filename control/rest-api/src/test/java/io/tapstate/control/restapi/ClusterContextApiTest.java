@@ -3,8 +3,6 @@ package io.tapstate.control.restapi;
 import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudSessionService;
-import io.tapstate.control.core.CloudCodeExchanger;
-import io.tapstate.control.core.CloudEgressAddress;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.GeneratedSecret;
@@ -16,12 +14,13 @@ import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionRecord;
 import io.tapstate.spi.store.CloudSessionStore;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.FilterType;
@@ -55,10 +54,11 @@ class ClusterContextApiTest {
             "https://context.example.test", DISPLAY.organizationId(), DISPLAY.clusterId());
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void unknownClusterStateIsExplicitForTheWorkspaceConsumerEvenWhenNullsAreOmitted(boolean omitNulls) {
+    @CsvSource({"false,true", "true,true", "false,false", "true,false"})
+    void contextReturnsTheSessionAddressAndKeepsOptionalKeysExplicit(boolean omitNulls, boolean includeEgress) {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(TestApp.class).run(
                 "--server.address=127.0.0.1", "--server.port=0",
+                "--tapstate.test.include-egress=" + includeEgress,
                 "--spring.jackson.default-property-inclusion=" + (omitNulls ? "non_null" : "always"))) {
             int port = ((WebServerApplicationContext) context).getWebServer().getPort();
             Map<?, ?> rawBody = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
@@ -76,8 +76,13 @@ class ClusterContextApiTest {
             assertThat(body.get("organizationName")).isEqualTo(DISPLAY.organizationName());
             assertThat(body.get("clusterName")).isEqualTo(DISPLAY.clusterName());
             assertThat(body.get("region")).isEqualTo(DISPLAY.region());
-            assertThat(body).containsEntry("ec2PublicIp", "203.0.113.42");
-            assertThat(body).containsEntry("egressAddressStatus", "STABLE");
+            if (includeEgress) {
+                assertThat(body).containsEntry("ec2PublicIp", DISPLAY.ec2PublicIp());
+                assertThat(body).containsEntry("egressAddressStatus", DISPLAY.egressAddressStatus());
+            } else {
+                assertThat(body).containsEntry("ec2PublicIp", null);
+                assertThat(body).containsEntry("egressAddressStatus", null);
+            }
             assertThat(body.keySet().stream().map(Object::toString).toList()).containsExactlyInAnyOrder("organizationId", "organizationName", "clusterId",
                     "clusterName", "region", "clusterState", "ec2PublicIp", "egressAddressStatus");
             // The workspace client accepts a null or string state and rejects an absent property.
@@ -86,12 +91,13 @@ class ClusterContextApiTest {
                     .containsEntry("clusterState", null);
             assertThat(body.toString()).doesNotContain(COOKIE, "password", "jwt", "jti", "secret-sentinel");
             for (String cookie : new String[] {"", COOKIE + "-wrong-secret"}) {
-                RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
+                String errorBody = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
                         .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + cookie)
                         .exchange((request, response) -> {
                             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
-                            return null;
+                            return response.bodyTo(String.class);
                         });
+                assertThat(errorBody).doesNotContain(COOKIE, SECRET, JTI, "hash-" + SECRET);
             }
         }
     }
@@ -114,22 +120,20 @@ class ClusterContextApiTest {
         }
 
         @Bean
-        CloudAuthenticationService authentication() {
+        CloudAuthenticationService authentication(
+                @Value("${tapstate.test.include-egress:true}") boolean includeEgress) {
             TokenSecrets secrets = new TokenSecrets() {
                 @Override public GeneratedSecret generate() { throw new IllegalStateException("context read must not create a session"); }
                 @Override public String hash(String raw) { return "hash-" + raw; }
                 @Override public boolean matches(String raw, String hash) { return hash(raw).equals(hash); }
             };
+            CloudSessionContext sessionContext = includeEgress ? DISPLAY : new CloudSessionContext(
+                    DISPLAY.organizationId(), DISPLAY.clusterId(), DISPLAY.organizationName(), DISPLAY.clusterName(),
+                    DISPLAY.region());
             CloudSessionService sessions = new CloudSessionService(
-                    new ContextStore(), IDENTITY, secrets, Clock.fixed(NOW, ZoneOffset.UTC));
-            return new CloudAuthenticationService(new CloudCodeExchanger() {
-                @Override public String exchange(String code, String cluster) {
-                    throw new IllegalStateException("context read must not exchange a code");
-                }
-                @Override public Optional<CloudEgressAddress> currentEgressAddress(String cluster) {
-                    return Optional.of(new CloudEgressAddress(DISPLAY.organizationId(), DISPLAY.clusterId(),
-                            "203.0.113.42", "STABLE"));
-                }
+                    new ContextStore(sessionContext), IDENTITY, secrets, Clock.fixed(NOW, ZoneOffset.UTC));
+            return new CloudAuthenticationService((code, cluster) -> {
+                throw new IllegalStateException("context read must not call Cloud");
             }, (jwt, identity, audience) -> {
                 throw new IllegalStateException("context read must not verify a JWT");
             }, sessions);
@@ -142,8 +146,12 @@ class ClusterContextApiTest {
     }
 
     private static final class ContextStore implements CloudSessionStore {
-        private final CloudSessionRecord record = new CloudSessionRecord(IDENTITY, JTI, "hash-" + SECRET,
-                "context-user", Scope.READ.name(), false, NOW, NOW, NOW.plusSeconds(1800), DISPLAY);
+        private final CloudSessionRecord record;
+
+        private ContextStore(CloudSessionContext display) {
+            record = new CloudSessionRecord(IDENTITY, JTI, "hash-" + SECRET,
+                    "context-user", Scope.READ.name(), false, NOW, NOW, NOW.plusSeconds(1800), display);
+        }
 
         @Override public boolean create(CloudSessionRecord created) { throw new IllegalStateException("unexpected session creation"); }
         @Override public Optional<CloudSessionRecord> find(CloudSessionIdentity identity, String jwtId) {

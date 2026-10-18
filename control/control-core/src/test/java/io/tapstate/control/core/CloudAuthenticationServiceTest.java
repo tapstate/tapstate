@@ -21,7 +21,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -42,44 +41,35 @@ class CloudAuthenticationServiceTest {
     private final CloudSessionService sessions = new CloudSessionService(store, DEPLOYMENT, secrets, clock);
 
     @Test
-    void currentAddressReadsIgnoreTheLoginSnapshotWithoutRepeatingAuthentication() {
+    void contextViewReturnsTheValidatedLoginSnapshotWithoutCallingCloudAgain() {
         CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
-                "us-east-1", "198.51.100.1", "DYNAMIC");
+                "us-east-1", "203.0.113.42", "STABLE");
         String cookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a", "cluster-a",
                 "address-jti", Scope.WRITE, NOW.plusSeconds(900)), snapshot).orElseThrow().token();
-        AtomicReference<CloudEgressAddress> current = new AtomicReference<>(
-                new CloudEgressAddress("org-a", "cluster-a", "203.0.113.42", "STABLE"));
-        AtomicReference<RuntimeException> addressFailure = new AtomicReference<>();
+        AtomicInteger providerCalls = new AtomicInteger();
         CloudCodeExchanger provider = new CloudCodeExchanger() {
             @Override public String exchange(String code, String cluster) {
-                throw new AssertionError("context reads must not redeem another code");
-            }
-            @Override public Optional<CloudEgressAddress> currentEgressAddress(String cluster) {
-                assertThat(cluster).isEqualTo("cluster-a");
-                if (addressFailure.get() != null) throw addressFailure.get();
-                return Optional.ofNullable(current.get());
+                providerCalls.incrementAndGet();
+                throw new AssertionError("context reads must not call Cloud");
             }
         };
         CloudAuthenticationService service = new CloudAuthenticationService(provider, (jwt, target, audience) -> {
             throw new AssertionError("context reads must not refresh authentication");
         }, sessions);
 
-        assertThat(service.clusterContextView(cookie).orElseThrow().ec2PublicIp()).isEqualTo("203.0.113.42");
-        current.set(new CloudEgressAddress("org-a", "cluster-a", "203.0.113.43", "ATTACHING"));
         assertThat(service.clusterContextView(cookie).orElseThrow()).isEqualTo(new CloudClusterContextView(
-                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", "203.0.113.43", "ATTACHING"));
-        current.set(null);
-        assertThat(service.clusterContextView(cookie).orElseThrow().ec2PublicIp()).isNull();
-        current.set(new CloudEgressAddress("other-org", "other-cluster", "203.0.113.99", "STABLE"));
-        assertThat(service.clusterContextView(cookie).orElseThrow().ec2PublicIp()).isNull();
-        addressFailure.set(new IllegalStateException("Cloud metadata unavailable"));
-        assertThat(service.clusterContextView(cookie).orElseThrow())
-                .isEqualTo(new CloudClusterContextView(
-                        "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", null, null));
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", "203.0.113.42", "STABLE"));
         assertThat(service.authenticate(cookie)).isPresent();
+        assertThat(providerCalls).hasValue(0);
 
-        CloudCodeExchanger legacyProvider = (code, cluster) -> "jwt";
-        assertThat(legacyProvider.currentEgressAddress("cluster-a")).isEmpty();
+        CloudSessionContext missingAddress = new CloudSessionContext(
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1");
+        String missingAddressCookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a",
+                "cluster-a", "missing-address-jti", Scope.WRITE, NOW.plusSeconds(900)), missingAddress)
+                .orElseThrow().token();
+        assertThat(service.clusterContextView(missingAddressCookie).orElseThrow()).isEqualTo(new CloudClusterContextView(
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", null, null));
+        assertThat(providerCalls).hasValue(0);
     }
 
     @Test

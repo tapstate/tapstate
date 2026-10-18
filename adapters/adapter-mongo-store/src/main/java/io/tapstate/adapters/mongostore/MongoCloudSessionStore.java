@@ -225,7 +225,8 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
     private static String optionalText(Document document, String field) {
         Object value = document.get(field);
         if (value == null) return null;
-        if (!(value instanceof String text) || text.isBlank()) throw unreadable(field);
+        if (!(value instanceof String text)) throw unreadable(field);
+        if (text.isBlank()) return null;
         return text;
     }
 

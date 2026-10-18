@@ -47,6 +47,12 @@ class MongoCloudSessionStoreTest {
         assertThat(legacy.clusterContext().egressAddressStatus()).isNull();
         assertThat(legacy.clusterContext().clusterId()).isEqualTo("cluster-one");
         assertThat(legacy.secretHash()).isEqualTo(session.secretHash());
+
+        storedContext.put("ec2PublicIp", "");
+        storedContext.put("egressAddressStatus", "   ");
+        var blankOptionalFields = MongoCloudSessionStore.toRecord(document).orElseThrow();
+        assertThat(blankOptionalFields.clusterContext().ec2PublicIp()).isNull();
+        assertThat(blankOptionalFields.clusterContext().egressAddressStatus()).isNull();
     }
 
     @Test

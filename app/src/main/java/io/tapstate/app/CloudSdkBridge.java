@@ -5,11 +5,11 @@ import io.tapstate.cloud.sdk.ApiException;
 import io.tapstate.cloud.sdk.api.C2StatusReportApi;
 import io.tapstate.cloud.sdk.client.CloudControlPlaneException;
 import io.tapstate.cloud.sdk.client.CloudControlPlaneSdk;
+import io.tapstate.cloud.sdk.client.JwtExchangeResult;
 import io.tapstate.cloud.sdk.client.JwtVerificationException;
 import io.tapstate.cloud.sdk.model.StatusReportRequest;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudCodeExchanger;
-import io.tapstate.control.core.CloudEgressAddress;
 import io.tapstate.control.core.CloudCodeExchangeResult;
 import io.tapstate.control.core.CloudJwtValidator;
 import io.tapstate.control.core.CloudLoginIdentity;
@@ -68,17 +68,6 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             return new CloudCodeExchangeResult(result.jwt(), result.context());
         } catch (ProviderFailure unavailable) {
             throw CloudAuthenticationService.unavailable();
-        }
-    }
-
-    @Override
-    public Optional<CloudEgressAddress> currentEgressAddress(String clusterId) {
-        if (!settings.clusterId().equals(clusterId)) return Optional.empty();
-        try {
-            return Optional.ofNullable(sdk.currentEgressAddress())
-                    .filter(address -> clusterId.equals(address.clusterId()));
-        } catch (ProviderFailure unavailable) {
-            return Optional.empty();
         }
     }
 
@@ -223,7 +212,6 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
 
     interface SdkRuntime {
         ExchangeResult exchange(String code);
-        default CloudEgressAddress currentEgressAddress() { return null; }
         VerifiedClaims verify(String jwt);
         boolean verifyCallback(String method, String timestamp, String nonce, String data, String signature);
         void report(String clusterId, String nonce, CloudRuntimeStatus status, String token);
@@ -273,32 +261,23 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         }
     }
 
-    /** Optional display metadata must not prevent login with an older SDK. */
-    static String optionalExchangeField(Object result, String field) {
-        try {
-            Object value = result.getClass().getMethod(field).invoke(result);
-            if (value == null || value instanceof String) return (String) value;
-            throw new ProviderFailure();
-        } catch (NoSuchMethodException absentInOlderSdk) {
-            return null;
-        } catch (ReflectiveOperationException inaccessibleMetadata) {
+    static ExchangeResult exchangeResult(JwtExchangeResult exchanged) {
+        String jwt = exchanged.jwt();
+        String organizationId = exchanged.orgId();
+        String clusterId = exchanged.clusterId();
+        String organizationName = exchanged.organizationName();
+        String clusterName = exchanged.clusterName();
+        String region = exchanged.region();
+        if (!text(jwt) || !text(organizationId) || !text(clusterId)
+                || !text(organizationName) || !text(clusterName) || !text(region)) {
             throw new ProviderFailure();
         }
+        return new ExchangeResult(jwt, organizationId, clusterId, organizationName, clusterName, region,
+                optionalText(exchanged.ec2PublicIp()), optionalText(exchanged.egressAddressStatus()));
     }
 
-    /** Older SDKs can continue authenticating while current address metadata is unavailable. */
-    static CloudEgressAddress optionalCurrentEgressAddress(Object sdk) {
-        try {
-            Object address = sdk.getClass().getMethod("currentEgressAddress").invoke(sdk);
-            if (address == null) return null;
-            return new CloudEgressAddress(optionalExchangeField(address, "organizationId"),
-                    optionalExchangeField(address, "clusterId"), optionalExchangeField(address, "ec2PublicIp"),
-                    optionalExchangeField(address, "egressAddressStatus"));
-        } catch (NoSuchMethodException olderSdk) {
-            return null;
-        } catch (ReflectiveOperationException unavailable) {
-            throw new ProviderFailure();
-        }
+    private static String optionalText(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     private static final class TypedSdkRuntime implements SdkRuntime {
@@ -318,27 +297,11 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         @Override
         public ExchangeResult exchange(String code) {
             try {
-                var exchanged = sdk.exchangeForJwt(code);
-                String organizationName = exchanged.organizationName();
-                String clusterName = exchanged.clusterName();
-                String region = exchanged.region();
-                String ec2PublicIp = optionalExchangeField(exchanged, "ec2PublicIp");
-                if (!text(exchanged.orgId()) || !text(exchanged.clusterId())
-                        || !text(organizationName) || !text(clusterName) || !text(region)) {
-                    throw new ProviderFailure();
-                }
-                return new ExchangeResult(exchanged.jwt(), exchanged.orgId(), exchanged.clusterId(),
-                        organizationName, clusterName, region, ec2PublicIp,
-                        optionalExchangeField(exchanged, "egressAddressStatus"));
+                return exchangeResult(sdk.exchangeForJwt(code));
             } catch (CloudControlPlaneException failure) {
                 logExchangeFailure(failure);
                 throw new ProviderFailure();
             }
-        }
-
-        @Override
-        public CloudEgressAddress currentEgressAddress() {
-            return optionalCurrentEgressAddress(sdk);
         }
 
         @Override
