@@ -1,16 +1,17 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
-import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.LoadLandings;
-import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.store.*;
 import java.io.Serializable;
 import java.util.*;
+import io.tapstate.app.ScopedSrsConsumerAccess.Bound;
+import static io.tapstate.app.ScopedSrsConsumerAccess.bind;
+import static io.tapstate.app.ScopedSrsConsumerAccess.refused;
 
 /** Writer callbacks retain one prepared source membership and execution; only coordinates cross the wire. */
 final class ScopedSrsSinkAckFactory implements SinkAckFactory {
@@ -64,20 +65,6 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
     private Source source(String stream) {
         var source = sources.get(stream); if (source == null) throw new IllegalStateException("writer reported an uncompiled source stream: " + stream); return source;
     }
-    private static Bound bind(HazelcastInstance member,SrsConsumerRun run) {
-        var authorization = ExecutionAuthorization.of(member); var fence = new ExecutionFence(run.scope(),run.originalClaim());
-        Runnable requireActive = () -> { if (!run.originalClaim().equals(authorization.require(fence))) throw refused(run); };
-        requireActive.run();
-        if (!(member.getUserContext().get(SrsStoreViews.USER_CONTEXT_KEY) instanceof SrsStoreViews views)) throw refused(run);
-        return new Bound(run,views.srs(run.cacheScope(),requireActive).consumers().guardedBy(requireActive),requireActive);
-    }
-    private record Bound(SrsConsumerRun run,SrsConsumerStore store,Runnable requireActive) {
-        void requireClaim(WorkloadClaimFence claimed) { requireActive.run(); if (claimed != null && !run.originalClaim().equals(claimed)) throw refused(run); }
-        SrsConsumerProgress progress() {
-            requireActive.run(); var held = store.progress(run.context()).orElseThrow(() -> refused(run)); requireActive.run();
-            if (held.membershipRevision() != run.membershipRevision()) throw refused(run); return held;
-        }
-    }
     private final class Writer implements SinkAck {
         private static final long serialVersionUID = 1L;
         private final transient Map<SrsConsumerRun,Bound> bound;
@@ -98,8 +85,5 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
             var source = source(stream); var run = source.run(); var handle = bound.get(run); handle.requireClaim(claimed);
             if (!handle.store().advanceWriter(run.context(),run.membershipRevision(),runId,source.table(),writer,progress,run.originalClaim())) throw refused(run);
         }
-    }
-    private static TapstateException refused(SrsConsumerRun run) {
-        return new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",run.scope().pipelineId()),null);
     }
 }

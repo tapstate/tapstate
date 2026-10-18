@@ -30,6 +30,13 @@ public interface SrsConsumerStore {
     boolean advanceWriter(SrsConsumerContext context, long membershipRevision, String runId, String table, String writerId,
                           WriterProgress progress, WorkloadClaimFence originalPipelineFence);
 
+    /**
+     * Saves the original first arrival and its initial read cursor together. A retained confirmed place is never raised by a later arrival.
+     * A held place covering the requested floor succeeds without adopting a later progress revision; a new place uses only the original expected revision.
+     */
+    boolean startReadingAfter(SrsConsumerContext context, long membershipRevision, long expectedProgressRevision, String table, long sequence,
+                              WorkloadClaimFence originalPipelineFence);
+
     /** Advances only this consumer's read cursor; it cannot acknowledge a sink or advance the source checkpoint. */
     boolean advanceReadSequence(SrsConsumerContext context, long membershipRevision, String table, long sequence,
                                 WorkloadClaimFence originalPipelineFence);

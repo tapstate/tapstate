@@ -608,6 +608,7 @@ class MongoSrsConsumerStoreIT {
             f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
             f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
             f.consumers().beginWriterRun(B,1,"b",Map.of("orders",List.of("writer")),f.fenceB());
+            f.consumers().startReadingAfter(B,1,1,"orders",-1,f.fenceB());
             SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(A));
             assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> f.consumers().attached(CHAIN)).isInstanceOf(TapstateException.class);
@@ -637,11 +638,12 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
-    @ParameterizedTest @ValueSource(strings={"begin","ack","read"})
+    @ParameterizedTest @ValueSource(strings={"begin","ack","read","arrival"})
     void losingTheOriginalGuardAfterARealProgressWriteRollsBackCursorClaimAndCheckpoint(String operation) {
         withBusiness(f -> {
             f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
             if (!operation.equals("begin")) f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
+            if (operation.equals("read")) f.consumers().startReadingAfter(A,1,1,"orders",-1,f.fenceA());
             var before = cursor(f,A); var root = root(f);
             var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first();
             var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id",WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first();
@@ -651,6 +653,7 @@ class MongoSrsConsumerStoreIT {
                     switch (operation) {
                         case "begin" -> guarded.beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
                         case "ack" -> guarded.advanceWriter(A,1,"run","orders","writer",point(1,7,"t7"),f.fenceA());
+                        case "arrival" -> guarded.startReadingAfter(A,1,1,"orders",5,f.fenceA());
                         default -> guarded.advanceReadSequence(A,1,"orders",7,f.fenceA());
                     }
                 }).satisfies(error -> code(error,IoError.CACHE_BUSINESS_FENCED)); witness.requireCommand();
@@ -673,6 +676,107 @@ class MongoSrsConsumerStoreIT {
                 if (operation.equals("begin")) f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
                 else f.consumers().advanceReadSequence(A,1,"orders",5,f.fenceA());
             }).isInstanceOf(TapstateException.class);
+            assertThat(cursor(f,A)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void initialArrivalAndReadCursorCommitTogetherButReadAheadNeverMovesTheRecoveryFloor() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().advanceReadSequence(A,1,"orders",9,f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            assertThat(f.consumers().startReadingAfter(A,1,4,"orders",10,f.fenceA())).isFalse();
+            assertThat(f.consumers().startReadingAfter(A,1,0,"orders",10,f.fenceA())).isTrue();
+            var arrival = f.consumers().progress(A).orElseThrow();
+            assertThat(arrival.ringDoneThrough()).containsEntry("orders",10L); assertThat(arrival.cursor().perTableSeq()).containsEntry("orders",10L);
+            assertThat(arrival.cursor().sinkAcked()).isNull();
+            assertThat(f.consumers().advanceReadSequence(A,1,"orders",99,f.fenceA())).isTrue();
+            assertThat(f.consumers().startReadingAfter(A,1,0,"orders",100,f.fenceA())).isFalse();
+            assertThat(f.consumers().startReadingAfter(A,1,0,"orders",10,f.fenceA())).isTrue();
+            var read = f.consumers().progress(A).orElseThrow();
+            assertThat(read.ringDoneThrough()).isEqualTo(arrival.ringDoneThrough()); assertThat(read.cursor().perTableSeq()).containsEntry("orders",99L);
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var reopened = new MongoSrsConsumerStore(other,other.getDatabase(f.database().getName()),SCOPE);
+                assertThat(reopened.progress(A)).contains(read);
+            }
+        });
+    }
+
+    @Test
+    void actualRingConfirmationSurvivesAnEpochEndBoundAndWriterRunReplacement() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().startReadingAfter(A,1,0,"orders",10,f.fenceA());
+            f.consumers().beginWriterRun(A,1,"old",Map.of("orders",List.of("writer")),f.fenceA());
+            f.consumers().advanceWriter(A,1,"old","orders","writer",point(1,12,"t12"),f.fenceA());
+            assertThat(f.consumers().progress(A).orElseThrow().ringDoneThrough()).containsEntry("orders",12L);
+            f.consumers().advanceWriter(A,1,"old","orders","writer",new WriterProgress(new SourceOrder(1,Long.MAX_VALUE),null),f.fenceA());
+            var ended = f.consumers().progress(A).orElseThrow();
+            assertThat(ended.cursor().sinkAckedByTable().get("orders").order().seq()).isEqualTo(Long.MAX_VALUE);
+            assertThat(ended.ringDoneThrough()).containsEntry("orders",12L);
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var next = WorkloadClaimFence.from(claims.advanceExecution(f.pipelineA(),1,Set.of(f.pipelineA().owner().nodeId())).orElseThrow());
+            f.consumers().attach(A,1,Set.of("orders"),next).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A,2,"new",Map.of("orders",List.of("writer")),next)).isTrue();
+            assertThat(f.consumers().progress(A).orElseThrow().ringDoneThrough()).isEqualTo(ended.ringDoneThrough());
+            assertThat(f.consumers().startReadingAfter(A,2,0,"orders",999,next)).isFalse();
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans={true,false})
+    void aFiniteConfirmationArrivingAfterTheEpochEndStillRaisesThePhysicalRingFloor(boolean tokened) {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow(); f.consumers().startReadingAfter(A,1,0,"orders",10,f.fenceA());
+            f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
+            f.consumers().advanceWriter(A,1,"run","orders","writer",new WriterProgress(new SourceOrder(1,Long.MAX_VALUE),null),f.fenceA());
+            f.consumers().advanceWriter(A,1,"run","orders","writer",point(1,12,tokened ? "t12" : null),f.fenceA());
+            var held = f.consumers().progress(A).orElseThrow();
+            assertThat(held.cursor().sinkAckedByTable().get("orders").order().seq()).isEqualTo(Long.MAX_VALUE);
+            assertThat(held.ringDoneThrough()).containsEntry("orders",12L);
+        });
+    }
+
+    @Test
+    void aLateFiniteTokenStillWaitsForTheOtherWritersDurableBound() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow(); f.consumers().startReadingAfter(A,1,0,"orders",10,f.fenceA());
+            f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("fast","slow")),f.fenceA());
+            f.consumers().advanceWriter(A,1,"run","orders","fast",new WriterProgress(new SourceOrder(1,Long.MAX_VALUE),null),f.fenceA());
+            f.consumers().advanceWriter(A,1,"run","orders","fast",point(1,12,"t12"),f.fenceA());
+            assertThat(f.consumers().progress(A).orElseThrow().ringDoneThrough()).containsEntry("orders",10L);
+            f.consumers().advanceWriter(A,1,"run","orders","slow",point(1,11,null),f.fenceA());
+            assertThat(f.consumers().progress(A).orElseThrow().ringDoneThrough()).containsEntry("orders",11L);
+            f.consumers().advanceWriter(A,1,"run","orders","slow",new WriterProgress(new SourceOrder(1,Long.MAX_VALUE),null),f.fenceA());
+            assertThat(f.consumers().progress(A).orElseThrow().ringDoneThrough()).containsEntry("orders",12L);
+        });
+    }
+
+    @Test
+    void concurrentOriginalArrivalsNeverOverwriteTheFirstCommittedSafePlace() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl()); var executor = Executors.newFixedThreadPool(2)) {
+                var second = new MongoSrsConsumerStore(other,other.getDatabase(f.database().getName()),SCOPE); var start = new CountDownLatch(1);
+                var a = executor.submit(() -> { start.await(); return f.consumers().startReadingAfter(A,1,0,"orders",10,f.fenceA()); });
+                var b = executor.submit(() -> { start.await(); return second.startReadingAfter(A,1,0,"orders",20,f.fenceA()); }); start.countDown();
+                assertThat(a.get(15,TimeUnit.SECONDS)).isTrue(); boolean high = b.get(15,TimeUnit.SECONDS);
+                var held = f.consumers().progress(A).orElseThrow(); long floor = held.ringDoneThrough().get("orders");
+                assertThat(floor).isIn(10L,20L); assertThat(high).isEqualTo(floor == 20);
+                assertThat(held.cursor().perTableSeq()).containsEntry("orders",floor); assertThat(held.revision()).isOne();
+            }
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"missing","fraction","unknown-table"})
+    void aMalformedRecoveryFloorCannotFallBackToReadAheadOrADifferentArrival(String fault) {
+        withBusiness(f -> {
+            var member = f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().startReadingAfter(A,1,0,"orders",5,f.fenceA());
+            if (fault.equals("missing")) SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$unset",new Document("ringDoneThrough","")));
+            else SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$set",new Document("ringDoneThrough.0."+(fault.equals("fraction") ? "sequence" : "table"),fault.equals("fraction") ? 5.5D : "unknown")));
+            var before = cursor(f,A);
+            assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.consumers().startReadingAfter(A,member.revision(),1,"orders",99,f.fenceA())).isInstanceOf(TapstateException.class);
             assertThat(cursor(f,A)).isEqualTo(before);
         });
     }

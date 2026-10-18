@@ -62,12 +62,16 @@ class ScopedSrsSinkAckFactoryIT {
                 var context = new SrsConsumerContext(new SrsConsumerKey("chain","pipeline","source"),1);
                 var membership = stores.consumers().attach(context,0,Set.of("orders"),original).orElseThrow();
                 assertThat(stores.consumers().pinSnapshot(context,membership.revision(),0,new SrsSnapshotPin(7,"owner-seam",Map.of("orders",model.key())),original)).isTrue();
-                var run = SrsConsumerRun.of(physical,membership); var factory = copied(new ScopedSrsSinkAckFactory(
+                assertThat(stores.consumers().startReadingAfter(context,membership.revision(),1,"orders",-1,original)).isTrue();
+                var run = SrsConsumerRun.of(physical,membership); var readerFactory = new ScopedSrsReadCursorPublisherFactory(run,"orders"); var factory = copied(new ScopedSrsSinkAckFactory(
                         Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(run,"orders")),"original-run"));
                 var member = mock(HazelcastInstance.class); var local = new ConcurrentHashMap<String,Object>(); when(member.getUserContext()).thenReturn(local);
                 try (var authorization = ExecutionAuthorization.scoped(business,claims,Duration.ofSeconds(2),System::nanoTime,() -> true)) {
                     local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization); local.put(SrsStoreViews.USER_CONTEXT_KEY,cache);
                     factory.beginRun(member,Map.of("source.orders",List.of("fast","slow")),original);
+                    var reader = readerFactory.resolve(member); reader.accept(99);
+                    assertThat(readerFactory.recoverySequence(member)).hasValue(-1);
+                    assertThat(readerFactory.confirmedPosition(member)).isEmpty();
                     var unbound = factory.resolve(member); var fast = unbound.forWriter("fast"); var slow = unbound.forWriter("slow");
                     fast.advance("source.orders",new ChainPosition(new SourceOrder(7,9),"fast-9"),original);
                     assertThat(stores.consumers().cursor(context).orElseThrow().sinkAcked()).isNull();
@@ -78,9 +82,12 @@ class ScopedSrsSinkAckFactoryIT {
                     slow.advance("source.orders",new ChainPosition(new SourceOrder(7,4),"slow-4"),original);
                     var confirmed = stores.consumers().progress(context).orElseThrow();
                     assertThat(confirmed.cursor().sinkAcked()).isEqualTo(new ChainPosition(new SourceOrder(7,4),"slow-4"));
+                    assertThat(readerFactory.recoverySequence(member)).hasValue(4);
+                    assertThat(readerFactory.confirmedPosition(member)).contains(confirmed.cursor().sinkAcked());
                     assertThat(stores.chains().load("chain").orElseThrow().checkpoint()).isNull();
                     claims.advanceExecution(running,1,Set.of(owner.nodeId())).orElseThrow();
                     assertThatThrownBy(() -> slow.advance("source.orders",new ChainPosition(new SourceOrder(7,99),"late"),original)).isInstanceOf(TapstateException.class);
+                    assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);
                     assertThat(stores.consumers().progress(context)).contains(confirmed);
                 }
                 assertThat(observer.getDatabase(configName).listCollectionNames()).doesNotContain("srs_consumer_offsets","srs_consumers","srs_chains");

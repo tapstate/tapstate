@@ -4,9 +4,12 @@ import java.util.Objects;
 
 /** One fixed membership's original progress revision and its saved snapshot references, if any. */
 public record SrsConsumerProgress(SrsConsumerContext context, long membershipRevision, long revision,
-                                  ConsumerOffset cursor,SrsSnapshotPin snapshot,SrsConsumerWriterRun writerRun) {
+                                  ConsumerOffset cursor,SrsSnapshotPin snapshot,SrsConsumerWriterRun writerRun,java.util.Map<String,Long> ringDoneThrough) {
     public SrsConsumerProgress(SrsConsumerContext context,long membershipRevision,long revision,ConsumerOffset cursor,SrsSnapshotPin snapshot) {
-        this(context,membershipRevision,revision,cursor,snapshot,null);
+        this(context,membershipRevision,revision,cursor,snapshot,null,java.util.Map.of());
+    }
+    public SrsConsumerProgress(SrsConsumerContext context,long membershipRevision,long revision,ConsumerOffset cursor,SrsSnapshotPin snapshot,SrsConsumerWriterRun writerRun) {
+        this(context,membershipRevision,revision,cursor,snapshot,writerRun,java.util.Map.of());
     }
     public SrsConsumerProgress {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(cursor, "cursor");
@@ -14,6 +17,10 @@ public record SrsConsumerProgress(SrsConsumerContext context, long membershipRev
                 || !context.key().consumerId().equals(cursor.pipelineId()) || cursor.progressKind() != ConsumerProgressKind.SRS) {
             throw new IllegalArgumentException("invalid consumer progress identity");
         }
+        ringDoneThrough = java.util.Map.copyOf(Objects.requireNonNull(ringDoneThrough,"ringDoneThrough"));
+        if (!cursor.perTableSeq().keySet().containsAll(ringDoneThrough.keySet())
+                || ringDoneThrough.values().stream().anyMatch(sequence -> sequence < -1 || sequence == Long.MAX_VALUE))
+            throw new IllegalArgumentException("invalid per-table recovery floor");
         if (writerRun != null && (writerRun.membershipRevision() > membershipRevision
                 || !writerRun.commandFence().key().resourceId().equals(context.key().pipelineId())
                 || !cursor.perTableSeq().keySet().containsAll(writerRun.expected().keySet())))

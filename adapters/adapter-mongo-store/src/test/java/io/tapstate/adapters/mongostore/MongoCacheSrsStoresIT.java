@@ -119,6 +119,8 @@ class MongoCacheSrsStoresIT {
             assertThat(stores.consumers().advanceWriter(context,member.revision(),"run","orders","writer",
                     new WriterProgress(io.tapstate.core.event.SourceOrder.snapshotRow(1),null),prepared.fence())).isTrue();
             assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
+            assertThat(stores.consumers().startReadingAfter(context,member.revision(),stores.consumers().progress(context).orElseThrow().revision(),"orders",-1,prepared.fence())).isTrue();
+            assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
             assertThat(stores.consumers().advanceReadSequence(context,member.revision(),"orders",0,prepared.fence())).isTrue();
             assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
             assertThat(stores.consumers().detach(context,member.revision(),prepared.fence())).isPresent();
