@@ -76,6 +76,9 @@ class MongoCachePipelinePreparationsIT {
             assertThat(f.claim()).containsEntry("pipelinePreparation", marker(grant.preparation(), "RESERVED"));
             var receipt = f.preparations().seed(reservation, f.configuration.preparations(), AT);
             assertThat(f.state()).containsEntry("epoch", 0L).containsEntry("runtimeWriteFence", 1L).containsEntry("stateJson", "NEW");
+            assertThat(SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.cacheDatabase).find().first())
+                    .containsEntry("_id", MongoPipelinePreparationFacts.scope(f.scope)).containsEntry("preparationId", grant.preparation().preparationId())
+                    .containsEntry("revision", 0L).containsEntry("shapes", List.of()).containsEntry("placements", List.of());
             assertThat(f.claim()).containsEntry("pipelinePreparation", marker(grant.preparation(), "PREPARED"));
             assertThat(f.configuration.intents().loadForActuation("flow")).isEmpty();
             var complete = f.configuration.preparations().complete(receipt);
@@ -415,6 +418,53 @@ class MongoCachePipelinePreparationsIT {
         });
     }
 
+    @Test void missingOrDamagedInventoryGenesisCannotBeRecreatedBySeedReplayOrResume() {
+        withFixture(f -> {
+            var grant = f.issue(); var reserved = f.preparations().reserveFirst(grant,TTL);
+            f.preparations().seed(reserved,f.configuration.preparations(),AT);
+            var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.cacheDatabase); Document saved = table.find().first();
+            table.deleteMany(new Document()); var before = f.snapshot();
+            assertCode(() -> f.preparations().resume(grant.preparation(),f.node,TTL),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> f.preparations().seed(reserved,f.configuration.preparations(),AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.snapshot()).isEqualTo(before); table.insertOne(saved);
+            for (var mutation : List.of(new Document("preparationId",UUID.randomUUID().toString()),new Document("revision",1L),
+                    new Document("revision",0),new Document("formatVersion",1L),new Document("shapes",List.of("private-sentinel")))) {
+                table.updateOne(new Document(),new Document("$set",mutation)); before = f.snapshot();
+                assertCode(() -> f.preparations().resume(grant.preparation(),f.node,TTL),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+                assertCode(() -> f.preparations().seed(reserved,f.configuration.preparations(),AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+                assertThat(f.snapshot()).isEqualTo(before); table.replaceOne(new Document(),saved);
+            }
+        });
+    }
+
+    @Test void retainedInventoryWithoutTheOriginalCheckpointAndClaimCannotBeAdoptedAsFirstPreparation() {
+        withFixture(f -> {
+            var grant = f.issue();
+            try (var session = f.cacheClient.startSession()) { session.withTransaction(() -> {
+                MongoOperatorInventory.prepareInitial(session,f.cacheDatabase,f.scope,grant.preparation().preparationId()); return null;
+            }); }
+            var before = f.snapshot();
+            assertCode(() -> f.preparations().reserveFirst(grant,TTL),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void losingTheOriginalGuardAfterInventoryInsertRollsBackTheCheckpointAndPreparedClaim() {
+        withFixture(f -> {
+            var grant = f.issue(); var reserved = f.preparations().reserveFirst(grant,TTL); var active = new AtomicBoolean(true);
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("insert") && event.getCommand().getString("insert").getValue().equals("operator_cleanup")) active.set(false);
+            }};
+            var before = f.snapshot();
+            try (var observed = cacheClient(listener)) {
+                var store = new MongoCachePipelinePreparations(observed,observed.getDatabase(f.cacheDatabase.getName()),f.business(),
+                        () -> { if (!active.get()) throw MongoCachePipelineAccess.fenced(); });
+                assertCode(() -> store.seed(reserved,f.configuration.preparations(),AT),IoError.CACHE_BUSINESS_FENCED);
+            }
+            assertThat(active).isFalse(); assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     private static Document marker(PipelinePreparation preparation, String phase) { return new Document("preparationId", preparation.preparationId()).append("phase", phase); }
     private static Document pipelineFilter(PipelineIntentScope scope) { return new Document("_id", MongoWorkloadClaimStore.id(new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId()))); }
     private static MongoClient cacheClient(CommandListener listener) { return MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(CACHE.getReplicaSetUrl())).addCommandListener(listener).build()); }
@@ -448,7 +498,7 @@ class MongoCachePipelinePreparationsIT {
                 var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
                 domain.prepareAuth(new CacheAuthScope(business.clusterId(), business.bindingVersion(), StorageBinding.Mode.OP, business.cacheIncarnation(), 1), "auth-a", ACTIVE);
                 try (var session = cacheClient.startSession()) {
-                    for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION)) table.prepareCollectionOn(cache, session);
+                    for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_OPERATOR_CLEANUP)) table.prepareCollectionOn(cache, session);
                 }
                 SystemCollections.CACHE_IDENTITY.on(cache).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                         .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
@@ -478,7 +528,7 @@ class MongoCachePipelinePreparationsIT {
         Document state() { return SystemCollections.CACHE_PIPELINE_STATE.on(cacheDatabase).find(new Document("_id", scope.pipelineId())).first(); }
         Map<String, List<Document>> snapshot() {
             var out = new java.util.TreeMap<String, List<Document>>();
-            for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_IDENTITY))
+            for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_OPERATOR_CLEANUP))
                 out.put(table.collectionName(), table.on(cacheDatabase).find().sort(new Document("_id", 1)).into(new ArrayList<>()));
             return out;
         }

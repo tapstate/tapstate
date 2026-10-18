@@ -61,7 +61,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         return transaction(preparation.scope(), true, original::requireActive, session -> {
             WorkloadClaimFence node = preparation.issuerNode();
             Date serverNow = proveNode(session, node);
-            if (claimRow(session, preparation.scope()) != null || stateRow(session, preparation.scope()) != null) throw rebuild(preparation.scope());
+            if (claimRow(session, preparation.scope()) != null || stateRow(session, preparation.scope()) != null || inventoryExists(session, preparation.scope())) throw rebuild(preparation.scope());
             var key = pipelineKey(preparation.scope());
             Document row = new Document("_id", MongoWorkloadClaimStore.id(key)).append("clusterId", key.clusterId())
                     .append("resourceType", key.type().name()).append("resourceId", key.resourceId())
@@ -86,7 +86,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                 verifyInitial(session, original.scope(), retained.claim());
                 return new Reservation(original.scope(), original.preparationId(), phase, WorkloadClaimFence.from(retained.claim()));
             }
-            if (stateRow(session, original.scope()) != null) throw rebuild(original.scope());
+            if (stateRow(session, original.scope()) != null || inventoryExists(session, original.scope())) throw rebuild(original.scope());
             new MongoCacheBusinessIdentity(database, business).admitClaim(session);
             proveNode(session, currentNode);
             WorkloadClaim claim = retained.claim();
@@ -115,7 +115,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                 return null;
             }
             requireInitialClaim(claim, original.scope());
-            if (stateRow(session, original.scope()) != null) throw rebuild(original.scope());
+            if (stateRow(session, original.scope()) != null || inventoryExists(session, original.scope())) throw rebuild(original.scope());
             Document filter = WorkloadClaimDocuments.live(original.claim())
                     .append("pipelineScope", MongoPipelinePreparationFacts.scope(original.scope()))
                     .append("pipelinePreparation", marker(original.preparationId(), Phase.RESERVED));
@@ -124,6 +124,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
             states.insertOne(session, new Document("_id", original.scope().pipelineId())
                     .append("scope", MongoPipelinePreparationFacts.scope(original.scope())).append("stateJson", StateJson.of(PipelineState.NEW))
                     .append("epoch", 0L).append("touchMillis", touchTime.toEpochMilli()).append("runtimeWriteFence", 1L));
+            MongoOperatorInventory.prepareInitial(session, database, original.scope(), original.preparationId());
             return null;
         });
         requireActive.run();
@@ -164,6 +165,9 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         if (row == null || !MongoPipelinePreparationFacts.scope(scope).equals(row.get("scope"))
                 || !Long.valueOf(0).equals(row.get("epoch")) || !Long.valueOf(1).equals(row.get("runtimeWriteFence"))
                 || !StateJson.of(PipelineState.NEW).equals(row.get("stateJson")) || !(row.get("touchMillis") instanceof Long)) throw rebuild(scope);
+        try { MongoOperatorInventory.requireInitial(session, database, scope,
+                claimRow(session, scope).get("pipelinePreparation", Document.class).getString("preparationId")); }
+        catch (TapstateException invalid) { throw rebuild(scope); }
     }
     private void requireInitialClaim(WorkloadClaim claim, PipelineIntentScope scope) {
         if (claim.executionGeneration() != 0 || claim.contextExecutionGeneration() != 0 || claim.executionClaimGeneration() != 0
@@ -198,6 +202,9 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         Objects.requireNonNull(original, "original");
         if (original.phase() != PipelinePreparation.Phase.ISSUED) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
     }
+    private boolean inventoryExists(ClientSession session, PipelineIntentScope scope) {
+        return SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first() != null;
+    }
     private Document claimRow(ClientSession session, PipelineIntentScope scope) { return claims.find(session, new Document("_id", MongoWorkloadClaimStore.id(pipelineKey(scope)))).first(); }
     private Document stateRow(ClientSession session, PipelineIntentScope scope) { return states.find(session, new Document("_id", scope.pipelineId())).first(); }
     private MongoWorkloadClaimStore raw(ClientSession session) { return new MongoWorkloadClaimStore(claims).inStrictSession(session); }
@@ -221,6 +228,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                         if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
                         MongoCacheWorkloadClaimStore.requireCollection(database);
                         new MongoCachePipelineAccess(client, database, scope, null, requireActive).verifyStateStructure();
+                        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
                         T value = action.apply(session);
                         requireActive.run(); originalActive.run();
                         return value;

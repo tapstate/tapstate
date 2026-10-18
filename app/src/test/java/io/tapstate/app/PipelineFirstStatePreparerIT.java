@@ -124,7 +124,7 @@ class PipelineFirstStatePreparerIT {
                 var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
                 cache.prepareAuth(new CacheAuthScope(business.clusterId(), business.bindingVersion(), StorageBinding.Mode.OP, business.cacheIncarnation(), 1), "auth-a", ACTIVE);
                 // Explicit business-schema fixture, not production business-root preparation evidence.
-                for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION)) cacheDb.createCollection(table.collectionName());
+                for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_OPERATOR_CLEANUP)) cacheDb.createCollection(table.collectionName());
                 SystemCollections.CACHE_IDENTITY.on(cacheDb).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                         .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
                 SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cacheDb).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY")

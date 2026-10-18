@@ -36,6 +36,70 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void losingBothKnownShapeAndColdBytesStillCannotBecomeANewFirstShape() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});
+            SystemCollections.CACHE_NEST_STATE.on(f.database).deleteMany(new Document());
+            SystemCollections.CACHE_NEST_SHAPES.on(f.database).deleteMany(new Document()); var before = f.snapshot();
+            code(() -> f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE)
+                    .recordIfAbsent("step",Set.of("replacement")),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void losingTheInventoryCannotBeHiddenByEmptyShapeAndStateCollections() {
+        withFixture(f -> {
+            SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).deleteMany(new Document());
+            SystemCollections.CACHE_NEST_SHAPES.on(f.database).deleteMany(new Document()); var before = f.snapshot();
+            var shape = f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
+            code(() -> shape.read("step"),IoError.DOCUMENT_UNREADABLE);
+            code(() -> shape.recordIfAbsent("step",Set.of("root")),IoError.DOCUMENT_UNREADABLE);
+            for (var kind : OperatorPlacement.Resource.values()) {
+                var at = f.at(kind); code(() -> f.writer(at).load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+                code(() -> f.writer(at).save(at.mapName(),"key",new byte[]{1}),IoError.DOCUMENT_UNREADABLE);
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void damagedInventoryCountersOrLocationsNeverAuthorizeAReplacementRecord() {
+        withFixture(f -> {
+            var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database); var saved = table.find().first();
+            var at = f.at(OperatorPlacement.Resource.JOIN_FACTS);
+            for (var mutation : List.of(new Document("revision",0L),new Document("preparationId",UUID.randomUUID().toString()),
+                    new Document("shapes",List.of(new Document("database",f.database.getName()).append("stepId","bad!"))),
+                    new Document("placements",List.of(new Document("database","private-sentinel"))))) {
+                table.updateOne(new Document(),new Document("$set",mutation)); var before = f.snapshot();
+                code(() -> f.writer(at).save(at.mapName(),"key",new byte[]{1}),IoError.DOCUMENT_UNREADABLE);
+                code(() -> f.writer(at).load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+                assertThat(f.snapshot()).isEqualTo(before); table.replaceOne(new Document(),saved);
+            }
+        });
+    }
+
+    @Test void aLegalOlderInventoryCannotMakeUnregisteredColdBytesReadable() {
+        withFixture(f -> {
+            var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database); Document original = table.find().first();
+            var at = f.at(OperatorPlacement.Resource.JOIN_FACTS); var writer = f.writer(at); writer.save(at.mapName(),"key",new byte[]{1});
+            table.replaceOne(new Document(),original); var before = f.snapshot();
+            code(() -> writer.load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+            code(() -> writer.loadAll(at.mapName(),List.of("key")),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void aLegalOlderInventoryCannotAdoptUnregisteredColdBytesThroughANewWrite() {
+        withFixture(f -> {
+            var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database); Document original = table.find().first();
+            var at = f.at(OperatorPlacement.Resource.JOIN_FACTS); var writer = f.writer(at); writer.save(at.mapName(),"key",new byte[]{1});
+            table.replaceOne(new Document(),original); var before = f.snapshot();
+            code(() -> writer.save(at.mapName(),"key",new byte[]{2}),IoError.DOCUMENT_UNREADABLE);
+            code(() -> writer.saveIfAbsent(at.mapName(),"other",new byte[]{2}),IoError.DOCUMENT_UNREADABLE);
+            code(() -> writer.delete(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void aMissingShapeMustNotAuthorizeANewInterpretationOfExistingColdBytes() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});
@@ -185,6 +249,7 @@ class MongoCacheOperatorStateStoreIT {
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database).updateOne(new Document("_id","orders"),new Document("$set",new Document("scope",MongoPipelinePreparationFacts.scope(next))));
             f.claims().updateOne(new Document("_id",MongoWorkloadClaimStore.id(KEY)),new Document("$set",new Document("pipelineScope",MongoPipelinePreparationFacts.scope(next))));
             var nextAt = new OperatorPlacement(next,f.database.getName(),oldAt.resource(),oldAt.stepId(),oldAt.pathId(),oldAt.namespace());
+            f.genesis(next);
             f.domain.nestShapes(next,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE).recordIfAbsent("step",Set.of("root"));
             var current = f.domain.operatorState(nextAt,WorkloadClaimFence.from(f.claim),ACTIVE);
             assertThat(nextAt.mapName()).isNotEqualTo(oldAt.mapName()); assertThat(current.load(nextAt.mapName(),"key")).isEmpty();
@@ -335,6 +400,10 @@ class MongoCacheOperatorStateStoreIT {
                 SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(new Document("_id",MongoWorkloadClaimStore.id(KEY)),new Document("$set",
                     new Document("pipelineScope",MongoPipelinePreparationFacts.scope(SCOPE)).append("pipelinePreparation",
                         MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(),PipelineCachePreparations.Phase.PREPARED))));
+                try (var session = client.startSession()) { session.withTransaction(() -> {
+                    String preparationId = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session).first().get("pipelinePreparation",Document.class).getString("preparationId");
+                    MongoOperatorInventory.prepareInitial(session,database,SCOPE,preparationId); return null;
+                }); }
                 var claim = domain.workloadClaims(BUSINESS).acquirePipeline(SCOPE,OWNER,1,Duration.ofMinutes(5)).claim();
                 claim = domain.workloadClaims(BUSINESS).advanceExecution(claim,1,Set.of(OWNER.nodeId())).orElseThrow();
                 domain.nestShapes(SCOPE,name,WorkloadClaimFence.from(claim),ACTIVE).recordIfAbsent("step",Set.of("root"));
@@ -346,10 +415,16 @@ class MongoCacheOperatorStateStoreIT {
         OperatorPlacement at(OperatorPlacement.Resource kind) { return new OperatorPlacement(SCOPE,database.getName(),kind,"step","root","logical.namespace"); }
         KeyedStateStore writer(OperatorPlacement at) { return domain.operatorState(at,WorkloadClaimFence.from(claim),ACTIVE); }
         com.mongodb.client.MongoCollection<Document> claims() { return SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database); }
+        void genesis(PipelineIntentScope scope) {
+            try (var session = client.startSession()) { session.withTransaction(() -> {
+                String id = claims().find(session).first().get("pipelinePreparation",Document.class).getString("preparationId");
+                MongoOperatorInventory.prepareInitial(session,database,scope,id); return null;
+            }); }
+        }
         Map<String,List<Document>> snapshot() {
             var out = new TreeMap<String,List<Document>>();
             for (var kind : OperatorPlacement.Resource.values()) { var table = MongoCacheOperatorStateStore.table(kind); out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>())); }
-            for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.CACHE_NEST_SHAPES)) out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>()));
+            for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.CACHE_NEST_SHAPES,SystemCollections.CACHE_OPERATOR_CLEANUP)) out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>()));
             return out;
         }
     }
