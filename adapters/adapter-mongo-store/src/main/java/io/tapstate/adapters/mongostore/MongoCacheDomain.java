@@ -18,7 +18,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /** One cache client owner, with authentication preparation independent from business-domain assembly. */
-public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineStoreViews, AutoCloseable {
+public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineStoreViews, io.tapstate.spi.store.SrsStoreViews, AutoCloseable {
     private final MongoConnection connection;
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
@@ -163,7 +163,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     /** SRS facets retain one CACHE client, complete business scope and original caller lifecycle. */
-    public io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive) {
+    @Override public io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);

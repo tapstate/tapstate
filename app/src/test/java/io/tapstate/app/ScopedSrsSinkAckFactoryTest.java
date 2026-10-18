@@ -1,0 +1,111 @@
+package io.tapstate.app;
+
+import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.runtime.engine.SinkAckFactory;
+import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.spi.store.*;
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+class ScopedSrsSinkAckFactoryTest {
+    private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster",3,"cache","pipeline",7);
+    private static final WorkloadClaimFence FENCE = new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"pipeline"),new WorkloadOwner("node","boot"),2,5,9);
+    private static final SrsConsumerRun RUN = SrsConsumerRun.of(SCOPE,new SrsConsumerMembership(
+            new SrsConsumerContext(new SrsConsumerKey("chain","pipeline","source"),7),4,false,Set.of("orders"),FENCE));
+    private static ScopedSrsSinkAckFactory factory() { return new ScopedSrsSinkAckFactory(Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(RUN,"orders")),"original-run"); }
+
+    @Test void deserializedFactoryBindsOnlyTheOriginalMembershipAndFullClaimOnItsActualMember() throws Exception {
+        var f = new Fixture(); var original = factory(); var bytes = new ByteArrayOutputStream();
+        try (var out = new ObjectOutputStream(bytes)) { out.writeObject(original); }
+        SinkAckFactory copy;
+        try (var in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) { copy = (SinkAckFactory)in.readObject(); }
+        copy.beginRun(f.member,Map.of("source.orders",List.of("writer")),FENCE);
+        var ack = copy.resolve(f.member).forWriter("writer"); var position = new ChainPosition(new SourceOrder(9,12),"token");
+        ack.advance("source.orders",position,FENCE); ack.bounded("source.orders",new SourceOrder(9,20),FENCE);
+        verify(f.store).beginWriterRun(RUN.context(),4,"original-run",Map.of("orders",List.of("writer")),FENCE);
+        verify(f.store).advanceWriter(RUN.context(),4,"original-run","orders","writer",new WriterProgress(position.order(),position),FENCE);
+        verify(f.store).advanceWriter(RUN.context(),4,"original-run","orders","writer",new WriterProgress(new SourceOrder(9,20),null),FENCE);
+        var guards = ArgumentCaptor.forClass(ExecutionFence.class); verify(f.authorization,atLeastOnce()).require(guards.capture());
+        assertThat(guards.getAllValues()).allSatisfy(fence -> assertThat(fence).isEqualTo(new ExecutionFence(SCOPE,FENCE)));
+    }
+    @Test void storeRefusalCannotBeConvertedToAnAcknowledgedOrRetriedNewerRun() {
+        var f = new Fixture(); when(f.store.advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any())).thenReturn(false);
+        var ack = factory().resolve(f.member).forWriter("writer");
+        assertThatThrownBy(() -> ack.advance("source.orders",new ChainPosition(new SourceOrder(1,2),"t2"),FENCE)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        verify(f.store,never()).find(any()); verify(f.store,never()).attach(any(),anyLong(),anySet(),any());
+    }
+    @Test void missingTypedStoreOrScopedAuthorizationNeverFallsBackToLegacyNoOp() {
+        var f = new Fixture(); f.context.remove(SrsStoreViews.USER_CONTEXT_KEY); f.context.put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY,mock(SrsMetaStore.class));
+        assertThatThrownBy(() -> factory().resolve(f.member)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        var unscoped = new Fixture(); unscoped.context.put(ExecutionAuthorization.USER_CONTEXT_KEY,ExecutionAuthorization.unfenced());
+        assertThatThrownBy(() -> factory().beginRun(unscoped.member,Map.of("source.orders",List.of("writer")))).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        verify(unscoped.store,never()).beginWriterRun(any(),anyLong(),anyString(),anyMap(),any());
+    }
+    @Test void lateLocalGuardLossAndAnotherSuppliedClaimRefuseBeforeDurableWrites() {
+        var f = new Fixture(); var ack = factory().resolve(f.member).forWriter("writer");
+        var other = new WorkloadClaimFence(FENCE.key(),new WorkloadOwner("other","boot"),2,5,9);
+        assertThatThrownBy(() -> ack.bounded("source.orders",new SourceOrder(1,5),other)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        f.active.set(false);
+        assertThatThrownBy(() -> ack.advance("source.orders",new ChainPosition(new SourceOrder(1,5),"t5"),FENCE)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        verify(f.store,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+    }
+    @Test void writerNamesAndStreamsMustBelongToTheCompiledRoster() {
+        var f = new Fixture(); var factory = factory(); var ack = factory.resolve(f.member);
+        assertThatThrownBy(() -> ack.advance("source.orders",new ChainPosition(new SourceOrder(1,1),"t1"))).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> ack.forWriter("writer").bounded("uncompiled",new SourceOrder(1,1))).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> factory.beginRun(f.member,Map.of("other",List.of("writer")),FENCE)).isInstanceOf(IllegalStateException.class);
+        verify(f.store,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+    }
+    @Test void loadBarrierUsesItsOwnPinnedRunAndCompletedStateWithoutBorrowingReadAhead() {
+        var f = new Fixture(); var awaited = new AwaitedLoad("sink","source.orders",List.of("writer"));
+        var landings = factory().loadLandings(f.member);
+        f.held.set(progress(4,List.of(),null)); assertThat(landings.stillLanding(List.of(awaited))).containsExactly(awaited);
+        var point = new WriterProgress(SourceOrder.snapshotRow(7),null);
+        var writers = new SrsConsumerWriterRun(4,FENCE,"original-run",Map.of("orders",List.of("writer","slow")),Map.of("orders",Map.of("writer",point)));
+        f.held.set(progress(4,List.of(),writers)); assertThat(landings.stillLanding(List.of(awaited))).isEmpty();
+        assertThat(landings.stillLanding(List.of(new AwaitedLoad("sink","source.orders",List.of("writer","slow"))))).hasSize(1);
+        f.held.set(progress(4,List.of("orders"),null)); assertThat(landings.stillLanding(List.of(awaited))).isEmpty();
+        f.held.set(progress(5,List.of("orders"),null)); assertThatThrownBy(() -> landings.stillLanding(List.of(awaited))).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+    }
+    private static SrsConsumerProgress progress(long membership,List<String> complete,SrsConsumerWriterRun writer) {
+        var pin = new SrsSnapshotPin(7,"owner-seam",Map.of("orders",new SrsModelKey("chain","orders","cache",1,0)));
+        var cursor = new ConsumerOffset(RUN.context().key().consumerId(),Map.of("orders",99L),null,complete,"owner-seam",7,Map.of(),ConsumerProgressKind.SRS);
+        return new SrsConsumerProgress(RUN.context(),membership,1,cursor,pin,writer);
+    }
+    private static void refused(Throwable failure) { assertThat(failure).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED)); }
+    private static final class Fixture {
+        final HazelcastInstance member = mock(HazelcastInstance.class);
+        final java.util.concurrent.ConcurrentMap<String,Object> context = new ConcurrentHashMap<>();
+        final SrsConsumerStore store = mock(SrsConsumerStore.class);
+        final ExecutionAuthorization authorization = mock(ExecutionAuthorization.class);
+        final AtomicBoolean active = new AtomicBoolean(true);
+        final AtomicReference<SrsConsumerProgress> held = new AtomicReference<>();
+        Fixture() {
+            when(member.getUserContext()).thenReturn(context);
+            when(authorization.require(any())).thenAnswer(call -> { if (!active.get()) throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline","pipeline"),null); return FENCE; });
+            context.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);
+            SrsStoreViews views = (scope,guard) -> {
+                assertThat(scope).isEqualTo(RUN.cacheScope()); guard.run();
+                return new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),store);
+            };
+            context.put(SrsStoreViews.USER_CONTEXT_KEY,views);
+            when(store.guardedBy(any())).thenReturn(store);
+            when(store.beginWriterRun(any(),anyLong(),anyString(),anyMap(),any())).thenReturn(true);
+            when(store.advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any())).thenReturn(true);
+            when(store.progress(any())).thenAnswer(call -> { assertThat(call.getArgument(0,SrsConsumerContext.class)).isEqualTo(RUN.context()); return Optional.ofNullable(held.get()); });
+        }
+    }
+}
