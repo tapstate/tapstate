@@ -15,6 +15,7 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.CachePreparation;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageBindingStore;
 import io.tapstate.spi.store.StorageSetupScope;
@@ -113,6 +114,14 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         });
     }
 
+    @Override public Optional<CachePreparation> cachePreparation() {
+        return StoreIo.call(() -> {
+            requireActive.run();
+            verifyIndex();
+            return transaction(session -> load(session).map(Loaded::cachePreparation));
+        });
+    }
+
     @Override public StorageBinding commit(StorageSetupScope expected, StorageBinding.Mode mode,
             StorageBinding.Connection cache, SourceResource defaultSource) {
         Objects.requireNonNull(expected, "expected");
@@ -125,6 +134,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 || captured.tables() != null || captured.srs() != null || captured.execution() != null) throw refused();
         String cacheJson = encodeConnection(cache);
         String candidateHash = fingerprint(mode, cacheJson, CanonicalHash.of(captured));
+        String incarnation = java.util.UUID.randomUUID().toString();
         return StoreIo.call(() -> {
             requireActive.run();
             verifyIndex();
@@ -166,6 +176,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         .append("namespace", "pdk.global-state")).append("ownerKind", "GLOBAL")
                         .append("ownerId", expected.clusterId()).append("generation", 1L).append("writeFence", 0L)
                         .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L));
+                MongoStorageRecoveryStore.allocate(session, database, binding, incarnation);
                 return binding;
             });
         });
@@ -214,6 +225,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     || (state.containsKey("bindingVersion") && !Long.valueOf(0).equals(state.get("bindingVersion")))
                     || state.containsKey("defaultSourceId") || state.containsKey("candidateHash")) throw unreadable();
             if (stored != null || sources.find(session, new Document("systemRole", DEFAULT_ROLE)).first() != null) throw unreadable();
+            MongoStorageRecoveryStore.requireAbsent(session, database);
             return Optional.empty();
         }
         try {
@@ -247,7 +259,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     || !Long.valueOf(0).equals(global.get("outgoingCarries"))
                     || !Long.valueOf(0).equals(global.get("incomingCarries"))
                     || !Long.valueOf(0).equals(global.get("originGeneration"))) throw unreadable();
-            return Optional.of(new Loaded(new StorageBinding(scope, mode, version, defaultId, cache), candidateHash));
+            StorageBinding binding = new StorageBinding(scope, mode, version, defaultId, cache);
+            return Optional.of(new Loaded(binding, candidateHash, MongoStorageRecoveryStore.loadInitial(session, database, binding)));
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
             // Stored or decrypted values may contain credentials. Never attach parser input or causes.
             throw unreadable();
@@ -312,5 +325,5 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     private static TapstateException unreadable() {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "storage-binding", "field", "binding"), null);
     }
-    private record Loaded(StorageBinding binding, String candidateHash) {}
+    private record Loaded(StorageBinding binding, String candidateHash, CachePreparation cachePreparation) {}
 }

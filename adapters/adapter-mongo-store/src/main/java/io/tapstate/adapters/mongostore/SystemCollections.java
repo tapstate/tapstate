@@ -179,6 +179,7 @@ public enum SystemCollections {
     PDK_NOTE_MIGRATIONS("pdk_note_migrations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
     OPERATOR_GENERATIONS("operator_generations", Database.CONFIG, MongoPipelineStateMappings.class, Strategy.MIGRATED, 1),
     STORAGE_BINDING("storage_binding", Database.CONFIG, MongoStorageBindingStore.class, Strategy.MIGRATED, 1),
+    STORAGE_RECOVERY("storage_recovery", Database.CONFIG, MongoStorageRecoveryStore.class, Strategy.MIGRATED, 1),
     PDK_NOTE_ORIGINS("pdk_note_origins", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("_id.bindingVersion", "_id.namespace"), true, "pdk_note_origin_scope")),
     PDK_NOTE_CARRIES("pdk_note_carries", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1,

@@ -13,6 +13,13 @@ public interface StorageBindingStore {
     Optional<StorageBinding> load();
 
     /**
+     * The original setup allocated these identities in the binding transaction. Ordinary reads validate
+     * the same configuration snapshot and never create, repair, or adopt identities from cache contents.
+     * The caller still needs the original operation authorization and separate cache readiness checks.
+     */
+    Optional<CachePreparation> cachePreparation();
+
+    /**
      * Called only after the operation's formal connection tests and identity checks. The exact setup
      * generation is checked inside the write; a committed retry must match the same original candidate.
      * Publication does not authorize business assembly or declare cache readiness.

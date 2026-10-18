@@ -48,6 +48,118 @@ class MongoStorageBindingStoreIT {
             "cache", "CA-material-sentinel");
 
     @Test
+    void bindingAllocatesOneOriginalCacheIdentityAcrossReplayCompletionAndRestart() {
+        for (var mode : StorageBinding.Mode.values()) {
+            withPrepared(f -> {
+                assertThat(f.domain.bindings().cachePreparation()).isEmpty();
+                var master = source(StorageBinding.defaultSourceId(mode), "secret");
+                f.domain.bindings().commit(SCOPE, mode, CACHE, master);
+                var original = f.domain.bindings().cachePreparation().orElseThrow();
+                assertThat(original.operationId()).isEqualTo(SCOPE.operationId());
+                assertThat(original.authScope().clusterId()).isEqualTo(SCOPE.clusterId());
+                assertThat(original.authScope().mode()).isEqualTo(mode);
+                assertThat(original.authScope().bindingVersion()).isEqualTo(1);
+                assertThat(original.authScope().authGeneration()).isEqualTo(1);
+                assertThat(original.businessScope().cacheIncarnation()).isEqualTo(original.authScope().cacheIncarnation());
+                assertThat(UUID.fromString(original.authScope().cacheIncarnation()).toString())
+                        .isEqualTo(original.authScope().cacheIncarnation());
+                Document stored = SystemCollections.STORAGE_RECOVERY.on(f.database).find().first();
+                assertThat(stored).containsEntry("phase", "INITIAL_PREPARATION").containsEntry("revision", 0L);
+                f.domain.bindings().commit(SCOPE, mode, CACHE, master);
+                f.domain.bindings().complete(SCOPE);
+                try (var second = MongoConfigurationDomain.open(f.settings, SCOPE.clusterId())) {
+                    assertThat(second.bindings().cachePreparation()).contains(original);
+                    assertThat(second.bindings().commit(SCOPE, mode, CACHE, master)).isEqualTo(f.domain.bindings().load().orElseThrow());
+                }
+                assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).countDocuments()).isEqualTo(1);
+                assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).find().first()).isEqualTo(stored);
+                assertThat(f.revision()).isEqualTo(2);
+                assertThat(original.toString()).doesNotContain("cache-secret", "master-secret", "CA-material-sentinel");
+            });
+        }
+    }
+
+    @Test
+    void missingDamagedOrUnrelatedRecoveryFactsRefuseWithoutAllocatingAnotherIdentity() {
+        withPrepared(f -> {
+            f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "secret"));
+            Document original = SystemCollections.STORAGE_RECOVERY.on(f.database).find().first();
+            var faults = new java.util.ArrayList<Document>();
+            for (var field : List.of("formatVersion", "layoutId", "clusterId", "bindingVersion", "recoveryId", "phase", "revision", "authGeneration", "cacheIncarnation")) {
+                var missing = new Document(original); missing.remove(field); faults.add(missing);
+            }
+            faults.add(new Document(original).append("formatVersion", 2));
+            faults.add(new Document(original).append("bindingVersion", 2L));
+            faults.add(new Document(original).append("clusterId", "another-cluster"));
+            faults.add(new Document(original).append("recoveryId", "another-operation"));
+            faults.add(new Document(original).append("authGeneration", 2L));
+            faults.add(new Document(original).append("cacheIncarnation", "not-a-uuid"));
+            faults.add(new Document(original).append("revision", 0));
+            faults.add(new Document(original).append("_id", "another-row"));
+            faults.add(null);
+            for (Document fault : faults) {
+                SystemCollections.STORAGE_RECOVERY.on(f.database).deleteMany(new Document());
+                if (fault != null) SystemCollections.STORAGE_RECOVERY.on(f.database).insertOne(fault);
+                assertThatThrownBy(() -> f.domain.bindings().cachePreparation()).satisfies(MongoStorageBindingStoreIT::unreadable);
+                assertThatThrownBy(() -> f.domain.bindings().load()).satisfies(MongoStorageBindingStoreIT::unreadable);
+                assertThatThrownBy(() -> f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "secret")))
+                        .satisfies(MongoStorageBindingStoreIT::unreadable);
+                assertThatThrownBy(() -> MongoConfigurationDomain.open(f.settings, SCOPE.clusterId())).satisfies(MongoStorageBindingStoreIT::unreadable);
+                assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).countDocuments()).isEqualTo(fault == null ? 0 : 1);
+                if (fault != null) assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).find().first()).isEqualTo(fault);
+                assertThat(f.revision()).isEqualTo(1);
+            }
+            SystemCollections.STORAGE_RECOVERY.on(f.database).insertOne(original);
+            SystemCollections.STORAGE_RECOVERY.on(f.database).insertOne(new Document("_id", "unknown"));
+            assertThatThrownBy(() -> f.domain.bindings().cachePreparation()).satisfies(MongoStorageBindingStoreIT::unreadable);
+        });
+    }
+
+    @Test
+    void unboundConfigurationDoesNotAdoptAnOrphanRecoveryRecord() {
+        withPrepared(f -> {
+            Document orphan = new Document("_id", "cluster").append("cacheIncarnation", UUID.randomUUID().toString());
+            SystemCollections.STORAGE_RECOVERY.on(f.database).insertOne(orphan);
+            assertThatThrownBy(() -> f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "secret")))
+                    .satisfies(MongoStorageBindingStoreIT::unreadable);
+            assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).find().first()).isEqualTo(orphan);
+            assertThat(f.revision()).isZero();
+            assertThat(SystemCollections.STORAGE_BINDING.on(f.database).countDocuments()).isZero();
+            assertThat(SystemCollections.SOURCES.on(f.database).countDocuments()).isZero();
+        });
+    }
+
+    @Test
+    void originalConfigurationScopePreparesOnlyAuthenticationOnItsSeparateCacheClient() {
+        withPrepared(f -> {
+            String cacheName = f.database.getName() + "_cache";
+            var actualCache = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    MONGO.getReplicaSetUrl(cacheName), cacheName, null);
+            try {
+                f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, actualCache, source("views", "secret"));
+                var preparation = f.domain.bindings().cachePreparation().orElseThrow();
+                try (var cache = MongoCacheDomain.connect(actualCache, Duration.ofSeconds(5), "cache-preparation-test")) {
+                    assertThatThrownBy(() -> cache.loadAuthScope(preparation.authScope())).isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.CACHE_AUTH_FENCED));
+                    cache.prepareAuth(preparation.authScope(), preparation.operationId(), () -> {});
+                    assertThat(cache.loadAuthScope(preparation.authScope())).isEqualTo(preparation.authScope());
+                }
+                try (var config = MongoConfigurationDomain.open(f.settings, SCOPE.clusterId());
+                     var cache = MongoCacheDomain.connect(config.bindings().load().orElseThrow().cache(), Duration.ofSeconds(5), "cache-reopen-test")) {
+                    assertThat(config.bindings().cachePreparation()).contains(preparation);
+                    assertThat(cache.loadAuthScope(preparation.authScope())).isEqualTo(preparation.authScope());
+                }
+                var cacheDatabase = f.admin.getDatabase(cacheName);
+                assertThat(SystemCollections.CACHE_IDENTITY.on(cacheDatabase).find().first())
+                        .containsEntry("businessPhase", "ABSENT").containsEntry("cacheIncarnation", preparation.authScope().cacheIncarnation());
+                assertThat(cacheDatabase.listCollectionNames().into(new java.util.ArrayList<>()))
+                        .containsExactlyInAnyOrder("cache_identity", "schema_migrations", "op_sessions");
+                assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).countDocuments()).isEqualTo(1);
+            } finally { f.admin.getDatabase(cacheName).drop(); }
+        });
+    }
+
+    @Test
     void eachReusableDefinitionKindReservesTheDefaultSourceIdBeforeBinding() {
         for (String kind : List.of("transform", "view", "serve")) {
             withPrepared(f -> {
@@ -168,6 +280,8 @@ class MongoStorageBindingStoreIT {
                 assertThat(SystemCollections.SOURCES.on(f.database).countDocuments()).isEqualTo(1);
                 assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.database).countDocuments()).isEqualTo(1);
                 assertThat(f.domain.bindings().load()).isEqualTo(second.bindings().load());
+                assertThat(f.domain.bindings().cachePreparation()).isEqualTo(second.bindings().cachePreparation());
+                assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).countDocuments()).isEqualTo(1);
             }
         });
     }
@@ -455,11 +569,16 @@ class MongoStorageBindingStoreIT {
     }
     private static void assertUnbound(Fixture f) {
         assertThat(f.revision()).isZero();
+        assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).countDocuments()).isZero();
+        assertThat(f.domain.bindings().cachePreparation()).isEmpty();
         assertThat(f.domain.bindings().load()).isEmpty();
         assertThat(SystemCollections.SOURCES.on(f.database).countDocuments()).isZero();
         assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.database).countDocuments()).isZero();
         assertThat(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(f.database).find().first()).containsEntry("bindingVersion", 0L);
         assertThat(SystemCollections.STORAGE_SETUP.on(f.database).find().first()).containsEntry("phase", MongoConfigurationBootstrap.PREPARED);
+    }
+    private static void unreadable(Throwable failure) {
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
     private static void refused(Throwable failure) {
         assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(StoreError.INITIALIZATION_REFUSED));
