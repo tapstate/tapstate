@@ -303,6 +303,22 @@ class HttpControlClientTest {
         }
     }
 
+    @Test
+    void anAsyncResponseHandlerFailureIsRethrownWithoutWrapping() throws Exception {
+        IllegalStateException rejected = new IllegalStateException("response handler rejected the response");
+        HttpServer server = server(exchange -> answer(exchange, 200, "{}"));
+        try (HttpControlClient client = new HttpControlClient()) {
+            java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder(baseOf(server))
+                    .timeout(Duration.ofSeconds(5)).build();
+
+            assertThatThrownBy(() -> client.<String>send(request, responseInfo -> {
+                throw rejected;
+            })).isSameAs(rejected);
+        } finally {
+            server.stop(0);
+        }
+    }
+
     private static HttpServer server(Handler handler) throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.setExecutor(command -> Thread.ofVirtual().name("http-control-test").start(command));
