@@ -102,7 +102,7 @@ final class MongoCachePipelineAccess {
             throw new IllegalStateException("Pipeline state changed within its transaction snapshot");
     }
 
-    private void verifyStructures() {
+    void verifyStructures() {
         for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION)) {
             var found = database.listCollections().filter(new Document("name", table.collectionName())).first();
             if (found == null || !"collection".equals(found.get("type"))) throw unreadable("structure");

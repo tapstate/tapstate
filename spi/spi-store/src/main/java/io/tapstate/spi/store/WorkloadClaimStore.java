@@ -17,6 +17,15 @@ public interface WorkloadClaimStore {
     WorkloadClaimAttempt acquire(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl);
 
+    /**
+     * Admits a Pipeline claim only under the captured current physical state identity. Implementations
+     * without this check refuse; falling back to a bare Pipeline id could revive a retired generation.
+     */
+    default WorkloadClaimAttempt acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     /** Renews only the exact owner and generation while its current lease is still live. */
     Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl);
 

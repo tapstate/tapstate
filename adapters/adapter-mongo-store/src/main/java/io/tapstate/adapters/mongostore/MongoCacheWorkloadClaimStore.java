@@ -10,6 +10,8 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -46,7 +48,15 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
 
     @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireKey(key);
+        if (key.type() == WorkloadClaimType.PIPELINE_ACTUATION) throw MongoCacheBusinessIdentity.businessFenced();
         return transaction(true, store -> store.acquire(key, owner, topologyRevision, ttl));
+    }
+    @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
+        Objects.requireNonNull(original, "scope");
+        if (!scope.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation())))
+            throw MongoCacheBusinessIdentity.businessFenced();
+        var key = new WorkloadClaimKey(original.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, original.pipelineId());
+        return transaction(true, original, store -> store.acquire(key, owner, topologyRevision, ttl));
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
@@ -77,6 +87,10 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private <T> T transaction(boolean admission, Function<MongoWorkloadClaimStore, T> operation) {
+        return transaction(admission, null, operation);
+    }
+
+    private <T> T transaction(boolean admission, PipelineIntentScope pipeline, Function<MongoWorkloadClaimStore, T> operation) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -87,6 +101,14 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                             var identity = new MongoCacheBusinessIdentity(database, scope);
                             if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
                             requireCollection(database);
+                            if (pipeline != null) {
+                                var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
+                                access.verifyStructures();
+                                var current = access.state(session);
+                                // A real per-Pipeline write serializes admission with state replacement,
+                                // including a first claim absent from the replacement's claim snapshot.
+                                access.updateState(session, current, new Document(), false);
+                            }
                             T result = operation.apply(raw.inSession(session));
                             requireActive.run();
                             return result;
