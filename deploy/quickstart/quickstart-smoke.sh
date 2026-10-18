@@ -103,6 +103,7 @@ EOF
 
 printf '\033[1mquickstart smoke — %s\033[0m\n' "$QUICKSTART_SH"
 
+if [ "${1:-}" != --running-rerun ]; then
 # --- platform gate: unsupported platforms fail before any fetch, demo dir left pristine --------------
 # The gate reuses install.sh --print-platform. A refusal must exit non-zero, point the user elsewhere,
 # and leave the demo directory holding nothing but the quickstart.sh they downloaded -- zero side effects.
@@ -337,6 +338,8 @@ else
   bad "xattr called on Linux: $(cat "$LINUX/.xattr-calls" 2>/dev/null)"
 fi
 
+fi
+
 # --- run phase (fakes): the live stack is the end-to-end test's to prove; here fakes pin what must not -
 # regress -- the password reaches the CLI over stdin (never an argument), the online verbs are driven,
 # and teardown is printed. A recording ./tapstate replaces the stub after prepare; a fake docker reports
@@ -349,11 +352,11 @@ run_phase_fakes() {
 #!/bin/sh
 printf '%s\n' "$*" >> .cli-argv
 cat >> .cli-stdin
-# A REPL prints its verbs' errors and still exits 0 -- an interactive session does not end because one
-# command was rejected. FAKE_CLI_OUT lets a case reproduce that shape: output that says it failed, over
-# an exit status that says it did not.
+# A REPL keeps reading after a refusal but retains its status when the session ends.
+# Keep output and status independent so cases can exercise both non-zero exits and
+# diagnostics from a CLI that still exits zero.
 [ -n "${FAKE_CLI_OUT:-}" ] && printf '%s\n' "$FAKE_CLI_OUT"
-exit 0
+exit "${FAKE_CLI_STATUS:-0}"
 CLI
   chmod +x "$RUN/tapstate"
   local shim; shim="$(mktemp -d)"
@@ -402,11 +405,32 @@ DOCK
     TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
     FAKE_TARGET_ROWS="${1:-5}" FAKE_SHIPMENT_ROWS="${2:-6}" \
     FAKE_BOOTSTRAP_PS="${FAKE_BOOTSTRAP_PS:-}" FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
+    FAKE_CLI_STATUS="${FAKE_CLI_STATUS:-0}" \
     FAKE_BOOTSTRAP_LOG="${FAKE_BOOTSTRAP_LOG:-}" \
     TAPSTATE_QUICKSTART_POLL_SECONDS=0 \
     sh "$RUN/quickstart.sh" 2>&1)"; RUN_RC=$?
   rm -rf "$shim"
 }
+
+running_rerun_case() {
+  # START on RUNNING is the session's only refusal, and the real REPL exits 1.
+  FAKE_CLI_STATUS=1 FAKE_CLI_OUT="error: lifecycle.illegal-transition
+  Cannot start a pipeline in state RUNNING." run_phase_fakes
+  unset FAKE_CLI_OUT FAKE_CLI_STATUS
+  if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -Fq 'quickstart: pipeline started. The stack is running.'; then
+    ok "an already-running pipeline permits a quickstart re-run"
+  else
+    bad "an already-running pipeline rejected the re-run (rc=$RUN_RC): $RUN_OUT"
+  fi
+}
+
+# Run only this regression, sharing the suite's local assets and run-phase fakes.
+if [ "${1:-}" = --running-rerun ]; then
+  running_rerun_case
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 run_phase_fakes
 if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.cli-argv" ] && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fq "$RUN_PW" "$RUN/.cli-stdin"; then
   ok "the admin password reaches the CLI over stdin, never as a command argument"
@@ -705,27 +729,40 @@ fi
 
 # A re-run reaches the same START refusal as the real lifecycle machine. Only that
 # exact diagnostic is benign; another failed verb in the session must still stop it.
-FAKE_CLI_OUT="error: lifecycle.illegal-transition
-  Cannot start a pipeline in state RUNNING." run_phase_fakes
-unset FAKE_CLI_OUT
-if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
-  ok "an already-running pipeline permits a quickstart re-run"
-else
-  bad "an already-running pipeline rejected the re-run (rc=$RUN_RC): $RUN_OUT"
-fi
+running_rerun_case
 for refusal in 'error: connector.not-registered' \
                'error: lifecycle.illegal-transition
   Cannot start a pipeline in state FAILED.' \
                'request failed: 127.0.0.1:8080 is unreachable'; do
-  FAKE_CLI_OUT="error: lifecycle.illegal-transition
+  for cli_status in 0 1; do
+    FAKE_CLI_STATUS="$cli_status" FAKE_CLI_OUT="error: lifecycle.illegal-transition
   Cannot start a pipeline in state RUNNING.
 $refusal" run_phase_fakes
-  unset FAKE_CLI_OUT
-  if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+    unset FAKE_CLI_OUT FAKE_CLI_STATUS
+    if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+       && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+      ok "an already-running refusal (CLI exit $cli_status) does not hide $refusal"
+    else
+      bad "another failure was hidden by the re-run exception (rc=$RUN_RC): $RUN_OUT"
+    fi
+  done
+done
+
+# A non-zero exit needs a matching refusal to explain it; abnormal statuses are
+# failures even when the session also printed the tolerated RUNNING diagnostic.
+for cli_status in 1 2 137; do
+  cli_output=""
+  if [ "$cli_status" -ne 1 ]; then
+    cli_output="error: lifecycle.illegal-transition
+  Cannot start a pipeline in state RUNNING."
+  fi
+  FAKE_CLI_STATUS="$cli_status" FAKE_CLI_OUT="$cli_output" run_phase_fakes
+  unset FAKE_CLI_OUT FAKE_CLI_STATUS
+  if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q "the CLI exited $cli_status" \
      && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
-    ok "an already-running refusal does not hide $refusal"
+    ok "an unexplained or abnormal CLI exit $cli_status stops setup"
   else
-    bad "another failure was hidden by the re-run exception (rc=$RUN_RC): $RUN_OUT"
+    bad "an unexplained or abnormal CLI exit $cli_status was tolerated (rc=$RUN_RC): $RUN_OUT"
   fi
 done
 
