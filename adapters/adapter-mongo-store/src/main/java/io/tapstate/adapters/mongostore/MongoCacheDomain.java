@@ -192,6 +192,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); });
     }
 
+    @Override public io.tapstate.spi.store.NestShapeStore nestShapes(io.tapstate.spi.store.PipelineIntentScope scope, String database) {
+        return new MongoCacheNestShapeStore(pipelineAccess(scope, null, () -> {}), database);
+    }
+
+    @Override public io.tapstate.spi.store.NestShapeStore nestShapes(io.tapstate.spi.store.PipelineIntentScope scope, String database,
+            io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
+        if (Objects.requireNonNull(original, "original").executionGeneration() < 1) throw MongoCachePipelineAccess.claimFenced();
+        return new MongoCacheNestShapeStore(pipelineAccess(scope, original, requireActive), database);
+    }
+
     @Override public io.tapstate.spi.store.KeyedStateStore operatorState(io.tapstate.spi.store.OperatorPlacement placement) {
         return new MongoCacheOperatorStateStore(pipelineAccess(placement.scope(), null, () -> {}), placement);
     }

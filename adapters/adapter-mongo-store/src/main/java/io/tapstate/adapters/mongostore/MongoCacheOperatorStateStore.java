@@ -7,8 +7,6 @@ import io.tapstate.spi.store.OperatorPlacement;
 import org.bson.Document;
 import org.bson.types.Binary;
 
-import java.util.Base64;
-import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,18 +19,19 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
     private static final int BATCH_KEYS = 256;
     private static final int BATCH_BYTES = 4 * 1024 * 1024;
     private final MongoCachePipelineAccess access;
+    private final OperatorPlacement placement;
     private final SystemCollections table;
     private final Document address;
     private final String mapName;
     private final long addressBytes;
 
     MongoCacheOperatorStateStore(MongoCachePipelineAccess access, OperatorPlacement placement) {
-        this.access = Objects.requireNonNull(access, "access"); Objects.requireNonNull(placement, "placement");
+        this.access = Objects.requireNonNull(access, "access"); this.placement = Objects.requireNonNull(placement, "placement");
         if (!access.scope.equals(placement.scope()) || !access.database.getName().equals(placement.database())) throw MongoCachePipelineAccess.fenced();
         table = table(placement.resource()); mapName = placement.mapName();
         address = new Document("scope", MongoPipelinePreparationFacts.scope(placement.scope()))
                 .append("database", placement.database()).append("resource", placement.resource().name())
-                .append("stepId", text(placement.stepId())).append("pathId", text(placement.pathId())).append("namespace", text(placement.namespace()));
+                .append("stepId", OperatorStateText.encode(placement.stepId())).append("pathId", OperatorStateText.encode(placement.pathId())).append("namespace", OperatorStateText.encode(placement.namespace()));
         addressBytes = 1024L + 3L * address.toJson().length();
     }
 
@@ -48,14 +47,14 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     @Override public Optional<byte[]> load(String namespace, String key) {
         requireNamespace(namespace); Document id = id(key);
-        return access.metadataTransaction(table, false, session -> Optional.ofNullable(
+        return transaction(false, session -> Optional.ofNullable(
                 table.on(access.database).find(session, new Document("_id", id)).first()).map(row -> decode(row, id)));
     }
 
     @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
         requireNamespace(namespace); var captured = List.copyOf(keys);
         if (captured.isEmpty()) return Map.of();
-        return access.metadataTransaction(table, false, session -> {
+        return transaction(false, session -> {
             Map<String, byte[]> out = new LinkedHashMap<>(); var batch = new LinkedHashMap<Document, String>(); long size = 0;
             for (String key : captured) {
                 Document id = id(key); long bytes = addressBytes + 3L * key.length();
@@ -79,14 +78,14 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     @Override public void save(String namespace, String key, byte[] state) {
         requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
-        access.metadataTransaction(table, true, session -> {
+        transaction(true, session -> {
             table.on(access.database).replaceOne(session, new Document("_id", id), row(id, captured), new ReplaceOptions().upsert(true)); return null;
         });
     }
 
     @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
         requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
-        return access.metadataTransaction(table, true, session -> {
+        return transaction(true, session -> {
             Document before = table.on(access.database).find(session, new Document("_id", id)).first();
             if (before != null) return Optional.of(decode(before, id));
             table.on(access.database).insertOne(session, row(id, captured)); return Optional.empty();
@@ -95,7 +94,7 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     @Override public void delete(String namespace, String key) {
         requireNamespace(namespace); Document id = id(key);
-        access.metadataTransaction(table, true, session -> { table.on(access.database).deleteOne(session, new Document("_id", id)); return null; });
+        transaction(true, session -> { table.on(access.database).deleteOne(session, new Document("_id", id)); return null; });
     }
 
     /** Physical reclamation requires the separate exact retirement path, never an active MapStore. */
@@ -103,17 +102,20 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     @Override public long count(String namespace) {
         requireNamespace(namespace);
-        return access.metadataTransaction(table, false, session -> table.on(access.database).countDocuments(session, new Document("_id.placement", address)));
+        return transaction(false, session -> table.on(access.database).countDocuments(session, new Document("_id.placement", address)));
+    }
+
+    private <T> T transaction(boolean mutation, java.util.function.Function<ClientSession, T> action) {
+        return access.metadataTransaction(table, mutation, session -> {
+            if (placement.resource() == OperatorPlacement.Resource.NEST_STATE) {
+                new MongoCacheNestShapeStore(access, placement.database()).requirePath(session, placement);
+            }
+            return action.apply(session);
+        });
     }
 
     private void requireNamespace(String namespace) { if (!mapName.equals(namespace)) throw MongoCachePipelineAccess.fenced(); }
-    private Document id(String key) { return new Document("placement", address).append("key", text(Objects.requireNonNull(key, "key"))); }
-    /** BSON strings cannot round-trip unpaired UTF-16 units, which are valid opaque key text here. */
-    private static String text(String value) {
-        var bytes = ByteBuffer.allocate(Math.multiplyExact(value.length(), 2));
-        for (int index = 0; index < value.length(); index++) bytes.putChar(value.charAt(index));
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes.array());
-    }
+    private Document id(String key) { return new Document("placement", address).append("key", OperatorStateText.encode(Objects.requireNonNull(key, "key"))); }
     private static Document row(Document id, byte[] value) { return new Document("_id", id).append("formatVersion", 1).append("state", new Binary(value)); }
     private byte[] decode(Document row, Document id) {
         if (!id.equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))

@@ -5,6 +5,10 @@ package io.tapstate.spi.store;
  * view retains one immutable claim through all transaction retries and never resolves a newer claim.
  */
 public interface PipelineStoreViews {
+    default NestShapeStore nestShapes(PipelineIntentScope scope, String database) { throw unsupported(); }
+
+    default NestShapeStore nestShapes(PipelineIntentScope scope, String database, WorkloadClaimFence original, Runnable requireActive) { throw unsupported(); }
+
     /** A fixed physical operator address; opening a view performs no schema creation or placement change. */
     default KeyedStateStore operatorState(OperatorPlacement placement) { throw unsupported(); }
 

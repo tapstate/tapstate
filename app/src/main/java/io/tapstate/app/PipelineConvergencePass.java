@@ -110,6 +110,30 @@ final class PipelineConvergencePass {
     io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() { return derivedSchemas; }
     io.tapstate.spi.store.RateHistoryStore rateHistory() { return rateHistory; }
 
+    io.tapstate.spi.store.NestShapeStore nestShapes(String database) {
+        Objects.requireNonNull(database, "database");
+        return new io.tapstate.spi.store.NestShapeStore() {
+            @Override public Optional<java.util.Set<String>> read(String step) {
+                requirePipeline(scope().pipelineId()); return views.nestShapes(scope(), database).read(step);
+            }
+            @Override public Optional<java.util.Set<String>> recordIfAbsent(String step, java.util.Set<String> paths) {
+                WorkloadClaimFence original = claim.get();
+                var captured = java.util.Collections.unmodifiableSet(new java.util.LinkedHashSet<>(paths));
+                requirePipeline(scope().pipelineId());
+                return views.nestShapes(scope(), database, original, requireActive).recordIfAbsent(step, captured);
+            }
+        };
+    }
+
+    /** Captures the same original claim and candidate for both publication and the race verdict. */
+    void recordNestShape(String database, String pipelineId, String step, java.util.Set<String> paths) {
+        WorkloadClaimFence original = claim.get();
+        var captured = java.util.Collections.unmodifiableSet(new java.util.LinkedHashSet<>(paths));
+        requirePipeline(pipelineId);
+        views.nestShapes(scope(), database, original, requireActive).recordIfAbsent(step, captured)
+                .ifPresent(recorded -> io.tapstate.runtime.engine.nest.NestStateLedger.requireSameShape(step, recorded, captured));
+    }
+
     /** Called before any later start step may throw; no other pass or asynchronous DAG retains this object. */
     void advanced(WorkloadClaimFence actual) {
         Objects.requireNonNull(actual, "actual");

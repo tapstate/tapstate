@@ -36,6 +36,86 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void aMissingShapeMustNotAuthorizeANewInterpretationOfExistingColdBytes() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});
+            SystemCollections.CACHE_NEST_SHAPES.on(f.database).deleteMany(new Document()); var before = f.snapshot();
+            code(() -> f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE)
+                    .recordIfAbsent("step",Set.of("another-path")),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void missingOrIncompatibleShapeRefusesMapStoreReadsAndWrites() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var writer = f.writer(at);
+            SystemCollections.CACHE_NEST_SHAPES.on(f.database).deleteMany(new Document()); var before = f.snapshot();
+            code(() -> writer.save(at.mapName(),"key",new byte[]{1}),IoError.DOCUMENT_UNREADABLE);
+            code(() -> writer.load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE); assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void shapePublicationRetainsOneWinnerAndRoundTripsAllOpaquePaths() {
+        withFixture(f -> {
+            var shapes = f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
+            Set<String> paths = Set.of("root", "root.items\nfield", new String(new char[]{0xd800}), Character.toString(0xfffd));
+            assertThat(shapes.recordIfAbsent("another-step",paths)).isEmpty();
+            assertThat(shapes.recordIfAbsent("another-step",Set.of("different"))).hasValue(paths);
+            assertThat(shapes.read("another-step")).hasValue(paths);
+            assertThat(shapes.recordIfAbsent("empty-step",Set.of())).isEmpty();
+            assertThat(shapes.recordIfAbsent("empty-step",Set.of("root"))).hasValue(Set.of());
+        });
+    }
+
+    @Test void concurrentShapePublicationReturnsTheSameDurableWinnerAcrossClients() {
+        withFixture(f -> {
+            var gate = new CountDownLatch(1);
+            try (var other = MongoCacheDomain.connect(f.binding,Duration.ofSeconds(5),"shape-other"); var workers = Executors.newFixedThreadPool(2)) {
+                var left = f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
+                var right = other.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
+                var one = workers.submit(() -> { await(gate); return left.recordIfAbsent("race",Set.of("one")); });
+                var two = workers.submit(() -> { await(gate); return right.recordIfAbsent("race",Set.of("two")); });
+                gate.countDown(); var first = one.get(15,TimeUnit.SECONDS); var second = two.get(15,TimeUnit.SECONDS);
+                assertThat(List.of(first,second).stream().filter(Optional::isEmpty).count()).isOne();
+                var actual = left.read("race").orElseThrow(); assertThat(first.orElse(Set.of("one"))).isEqualTo(actual);
+                assertThat(second.orElse(Set.of("two"))).isEqualTo(actual);
+            }
+        });
+    }
+
+    @Test void malformedShapesAndMissingShapeStructureNeverBecomeAnEmptyShape() {
+        withFixture(f -> {
+            var shapes = f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
+            var table = SystemCollections.CACHE_NEST_SHAPES.on(f.database); var saved = table.find().first();
+            for (var mutation : List.of(new Document("paths",List.of("bad!")),new Document("paths",List.of("AA")),
+                    new Document("paths",List.of(OperatorStateText.encode("root"),OperatorStateText.encode("root"))),
+                    new Document("formatVersion",1L),new Document("extra","private-sentinel"))) {
+                table.updateOne(new Document(),new Document("$set",mutation));
+                code(() -> shapes.read("step"),IoError.DOCUMENT_UNREADABLE);
+                code(() -> f.writer(f.at(OperatorPlacement.Resource.NEST_STATE)).load(f.at(OperatorPlacement.Resource.NEST_STATE).mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+                table.replaceOne(new Document(),saved);
+            }
+            table.drop(); code(() -> shapes.recordIfAbsent("another",Set.of("root")),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("nest_shapes");
+        });
+    }
+
+    @Test void shapeCandidatesAreCapturedBeforeCallbacksAndOldClaimsCannotPublishAnotherShape() {
+        withFixture(f -> {
+            var paths = new LinkedHashSet<>(Set.of("root")); var once = new AtomicBoolean();
+            var captured = new MongoCacheNestShapeStore(new MongoCachePipelineAccess(f.client,f.database,SCOPE,WorkloadClaimFence.from(f.claim),() -> {
+                if (once.compareAndSet(false,true)) paths.add("mutated");
+            }),f.database.getName());
+            captured.recordIfAbsent("captured",paths);
+            assertThat(captured.read("captured")).hasValue(Set.of("root"));
+            var old = f.domain.nestShapes(SCOPE,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
+            f.domain.workloadClaims(BUSINESS).advanceExecution(f.claim,1,Set.of(OWNER.nodeId())).orElseThrow(); var before = f.snapshot();
+            code(() -> old.recordIfAbsent("late",Set.of("root")),IoError.WORKLOAD_CLAIM_FENCED);
+            code(() -> f.domain.nestShapes(SCOPE,f.database.getName()).recordIfAbsent("readonly",Set.of("root")),IoError.CACHE_BUSINESS_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void resourceTypesUseIndependentCollectionsAndKeyedBatches() {
         withFixture(f -> {
             for (var kind : OperatorPlacement.Resource.values()) {
@@ -105,6 +185,7 @@ class MongoCacheOperatorStateStoreIT {
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database).updateOne(new Document("_id","orders"),new Document("$set",new Document("scope",MongoPipelinePreparationFacts.scope(next))));
             f.claims().updateOne(new Document("_id",MongoWorkloadClaimStore.id(KEY)),new Document("$set",new Document("pipelineScope",MongoPipelinePreparationFacts.scope(next))));
             var nextAt = new OperatorPlacement(next,f.database.getName(),oldAt.resource(),oldAt.stepId(),oldAt.pathId(),oldAt.namespace());
+            f.domain.nestShapes(next,f.database.getName(),WorkloadClaimFence.from(f.claim),ACTIVE).recordIfAbsent("step",Set.of("root"));
             var current = f.domain.operatorState(nextAt,WorkloadClaimFence.from(f.claim),ACTIVE);
             assertThat(nextAt.mapName()).isNotEqualTo(oldAt.mapName()); assertThat(current.load(nextAt.mapName(),"key")).isEmpty();
             current.save(nextAt.mapName(),"key",new byte[]{2}); var before = f.snapshot();
@@ -171,7 +252,7 @@ class MongoCacheOperatorStateStoreIT {
                 assertThatThrownBy(() -> future.get(15,TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
                     .satisfies(failure -> assertThat(((TapstateException)failure.getCause()).code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
                 assertThat(SystemCollections.CACHE_NEST_STATE.on(f.database).countDocuments()).isZero();
-                assertThat(f.claims().find().first().get("fencedPipelineWrites")).isNull();
+                assertThat(f.claims().find().first().get("fencedPipelineWrites")).isEqualTo(1L);
             }
         });
     }
@@ -256,6 +337,7 @@ class MongoCacheOperatorStateStoreIT {
                         MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(),PipelineCachePreparations.Phase.PREPARED))));
                 var claim = domain.workloadClaims(BUSINESS).acquirePipeline(SCOPE,OWNER,1,Duration.ofMinutes(5)).claim();
                 claim = domain.workloadClaims(BUSINESS).advanceExecution(claim,1,Set.of(OWNER.nodeId())).orElseThrow();
+                domain.nestShapes(SCOPE,name,WorkloadClaimFence.from(claim),ACTIVE).recordIfAbsent("step",Set.of("root"));
                 scenario.run(new Fixture(client,database,domain,binding,claim));
             } finally { database.drop(); }
         } catch (RuntimeException | Error e) { throw e; } catch (Exception e) { throw new AssertionError(e); }
@@ -267,7 +349,7 @@ class MongoCacheOperatorStateStoreIT {
         Map<String,List<Document>> snapshot() {
             var out = new TreeMap<String,List<Document>>();
             for (var kind : OperatorPlacement.Resource.values()) { var table = MongoCacheOperatorStateStore.table(kind); out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>())); }
-            for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_WORKLOAD_CLAIMS)) out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>()));
+            for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.CACHE_NEST_SHAPES)) out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>()));
             return out;
         }
     }
