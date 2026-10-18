@@ -225,7 +225,7 @@ public enum SystemCollections {
     CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoCacheConnectorCatalogStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoCacheConnectorSpecStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTION_TEST_RESULTS("connection_test_results", Database.CACHE, MongoCacheConnectionTestResultStore.class, Strategy.MIGRATED, 1),
-    CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
+    CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoCacheConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
             new IndexSpec(List.of("metadata.connectorId"), false)),
     CACHE_DERIVED_SCHEMAS("derived_schemas", Database.CACHE, MongoDerivedSchemaStore.class, Strategy.MIGRATED, 1),
     CACHE_PIPELINE_RATE_HISTORY("pipeline_rate_history", Database.CACHE, MongoRateHistoryStore.class, Strategy.MIGRATED, 1,

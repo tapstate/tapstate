@@ -1129,3 +1129,7 @@ connector.snapshot-preparation-unavailable:
 io.pipeline-state-rebuild-required:
   message: "Pipeline {pipeline} cannot prove its original checkpoint preparation and claim history."
   solution: "Inspect the original operation or explicitly confirm a full rebuild. Do not recreate missing claims, epochs or preparation authority."
+
+io.connector-artifact-cleanup-unconfirmed:
+  message: "Cleanup of artifact {hash} upload {upload} could not be confirmed."
+  solution: "Query the original registration result. Keep an unpublished upload quarantined and clean only that upload after its writes are known to have ended."

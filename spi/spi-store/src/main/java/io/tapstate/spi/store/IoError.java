@@ -45,6 +45,9 @@ public enum IoError implements TapstateErrorCode {
      */
     DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id", "field")),
 
+    /** A failed or losing upload cannot confirm cleanup of its own unpublished GridFS resource. */
+    CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED("io.connector-artifact-cleanup-unconfirmed", Set.of("hash", "upload")),
+
     /** An input value cannot be represented by the store without changing its value. */
     DOCUMENT_INVALID("io.document-invalid", Set.of("id", "field")),
 

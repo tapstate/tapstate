@@ -72,6 +72,6 @@ source_schemas | cache | MongoSchemaStore | migrated | 1 | -
 connector_catalog | cache | MongoCacheConnectorCatalogStore | migrated | 1 | -
 connector_specs | cache | MongoCacheConnectorSpecStore | migrated | 1 | -
 connection_test_results | cache | MongoCacheConnectionTestResultStore | migrated | 1 | -
-connector_artifacts (gridfs) | cache | MongoConnectorRegistry | immutable | 1 | metadata.connectorId
+connector_artifacts (gridfs) | cache | MongoCacheConnectorRegistry | immutable | 1 | metadata.connectorId
 derived_schemas | cache | MongoDerivedSchemaStore | migrated | 1 | -
 pipeline_rate_history | cache | MongoRateHistoryStore | migrated | 1 | observedAt (ttl 1296000s), pipelineId+observedAt+_id

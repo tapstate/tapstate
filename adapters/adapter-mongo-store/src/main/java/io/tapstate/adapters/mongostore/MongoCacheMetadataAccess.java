@@ -32,7 +32,7 @@ final class MongoCacheMetadataAccess {
     MongoCacheMetadataAccess(MongoClient client, MongoDatabase database, CacheBusinessScope scope, SystemCollections table, Runnable requireActive) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.table = Objects.requireNonNull(table, "table");
-        this.requireActive = Objects.requireNonNull(requireActive, "requireActive"); this.collection = table.on(database);
+        this.requireActive = Objects.requireNonNull(requireActive, "requireActive"); this.collection = table.indexTargetOn(database);
         if (table.database() != SystemCollections.Database.CACHE) throw new IllegalArgumentException("metadata must use its CACHE resource");
     }
     void verify() { read(session -> null); }
