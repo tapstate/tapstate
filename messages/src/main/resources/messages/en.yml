@@ -1133,3 +1133,11 @@ io.pipeline-state-rebuild-required:
 io.connector-artifact-cleanup-unconfirmed:
   message: "Cleanup of artifact {hash} upload {upload} could not be confirmed."
   solution: "Query the original registration result. Keep an unpublished upload quarantined and clean only that upload after its writes are known to have ended."
+
+store.invalid-history-retention:
+  message: "Cache history retention must be a positive whole number of seconds."
+  solution: "Configure an exact positive duration in tapstate.metrics.history.retention before initializing or opening the cache. Fractional seconds are not truncated."
+
+store.history-retention-mismatch:
+  message: "Configured history retention is {configuredSeconds} seconds, but the cache TTL is {storedSeconds} seconds."
+  solution: "Stop all Cluster instances, adjust the TTL through database tools, then restart every instance with the same retention. Startup never changes this index."

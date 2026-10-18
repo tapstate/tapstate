@@ -60,6 +60,8 @@ class ScopedConvergenceDriverTest {
     private final List<List<String>> retained = new ArrayList<>();
     private boolean deny;
     private RuntimeException startFailure;
+    private io.tapstate.runtime.scheduler.RateSampler sampler;
+    private boolean sampleMetrics;
     private Consumer<PipelineConvergencePass> onStart = this::advance;
 
     private ConvergenceDriver driver() {
@@ -92,8 +94,9 @@ class ScopedConvergenceDriverTest {
         };
         var converger = new PipelineConverger(poisonDesired, poisonState, poisonActuator,
                 Clock.fixed(T0, ZoneOffset.UTC), poisonRebuilds);
-        return ConvergenceDriver.scoped(converger, new ObservationPublisher(poisonState, poisonObservations),
-                null, MetricsExport.none(), eligible::get, ownership, bindings);
+        return ConvergenceDriver.scoped(converger, new ObservationPublisher(poisonState, poisonObservations,
+                id -> sampleMetrics ? java.util.OptionalLong.of(5) : java.util.OptionalLong.empty(), id -> Map.of()),
+                sampler, MetricsExport.none(), eligible::get, ownership, bindings);
     }
 
     private void advance(PipelineConvergencePass pass) {
@@ -102,6 +105,17 @@ class ScopedConvergenceDriverTest {
         pass.advanced(WorkloadClaimFence.from(actual));
         if (startFailure != null) throw startFailure;
         carrying.set(true);
+    }
+
+    @Test void thePublishedObservationIsSampledOnlyThroughItsSamePassAndActuallyAdvancedClaim() {
+        var legacy = new InMemoryRateHistoryStore(); sampler = new io.tapstate.runtime.scheduler.RateSampler(legacy, Duration.ofSeconds(60)); sampleMetrics = true;
+        driver().reconcile();
+        assertThat(legacy.all()).isEmpty(); assertThat(views.rates.all()).hasSize(1);
+        Observation published = views.observations(FIRST).read("orders").orElseThrow();
+        assertThat(views.rates.all().getFirst().observedAt()).isEqualTo(published.observedAt());
+        assertThat(views.rates.all().getFirst().counters()).containsEntry("recordCount", 5L);
+        assertThat(views.writes.stream().filter(w -> w.kind().equals("rate")).map(w -> w.claim().executionGeneration())).containsExactly(1L);
+        assertThat(views.requested).containsOnly(FIRST);
     }
 
     @Test void oneSnapshotAndPermitDriveThePassAndItsActualAdvancedPublication() {
@@ -245,6 +259,7 @@ class ScopedConvergenceDriverTest {
         private PipelineIntentScope current = FIRST;
         private final Map<PipelineIntentScope, InMemoryStateStore> states = new HashMap<>();
         private final Map<PipelineIntentScope, InMemoryObservationStore> projections = new HashMap<>();
+        private final InMemoryRateHistoryStore rates = new InMemoryRateHistoryStore();
         private final List<PipelineIntentScope> requested = new ArrayList<>();
         private final List<Write> writes = new ArrayList<>();
         private InMemoryStateStore state(PipelineIntentScope scope) {
@@ -257,6 +272,11 @@ class ScopedConvergenceDriverTest {
         private void check(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             active.run(); check(scope);
             if (!original.equals(WorkloadClaimFence.from(claims.read(KEY).orElseThrow().claim()))) throw fenced();
+        }
+        @Override public io.tapstate.spi.store.RateHistoryStore pipelineRateHistory(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
+            var writer = mock(io.tapstate.spi.store.RateHistoryStore.class);
+            org.mockito.Mockito.doAnswer(call -> { check(scope, original, active); writes.add(new Write("rate", scope, original)); rates.append(call.getArgument(0)); return null; })
+                    .when(writer).append(any(io.tapstate.core.lifecycle.RateSample.class)); return writer;
         }
         @Override public StateStore pipelineStates(PipelineIntentScope scope) { check(scope); return state(scope); }
         @Override public StateStore pipelineStates(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {

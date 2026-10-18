@@ -96,6 +96,26 @@ class PipelineConvergencePassTest {
         assertThat(views.writes).containsExactly(ORIGINAL, execution(1));
     }
 
+    @Test void rateSamplesUseTheActualPassClaimAndOrdinaryPassesCannotDeleteHistory() {
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {});
+        var sample = new io.tapstate.core.lifecycle.RateSample("orders", T0, Map.of("records.out", 1L), Map.of(), null);
+        pass.rateHistory().append(sample); var next = execution(1); views.actual.set(next); pass.advanced(next);
+        pass.rateHistory().append(sample); assertThat(views.writes).containsExactly(ORIGINAL, next);
+        assertThat(pass.rateHistory().readPage("orders", T0, T0.plusSeconds(1), null, 10).entries()).hasSize(2);
+        assertThatThrownBy(() -> pass.rateHistory().deleteAll("orders")).isInstanceOf(TapstateException.class);
+    }
+
+    @Test void aRateAppendCapturesItsClaimBeforeAnyGuardCallback() {
+        var owner = new AtomicReference<PipelineConvergencePass>(); var once = new AtomicBoolean();
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {
+            if (once.compareAndSet(false, true)) { var next = execution(1); views.actual.set(next); owner.get().advanced(next); }
+        }); owner.set(pass);
+        var sample = new io.tapstate.core.lifecycle.RateSample("orders", T0, Map.of("records.out", 1L), Map.of(), null);
+        assertThatThrownBy(() -> pass.rateHistory().append(sample)).isInstanceOf(TapstateException.class);
+        assertThat(views.writes).containsExactly(ORIGINAL); assertThat(views.rates.all()).isEmpty();
+        pass.rateHistory().append(sample); assertThat(views.writes).containsExactly(ORIGINAL, execution(1));
+    }
+
     @Test void derivedRecordsAndPinsUseThisPassActualClaimAndNeverDeleteOrWriteAnotherPipeline() {
         var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {});
         pass.derivedSchemas().record("orders", "step", Map.of("id", "int"), "s", "f", "b");
@@ -206,6 +226,7 @@ class PipelineConvergencePassTest {
         private final InMemoryStateStore state = new InMemoryStateStore();
         private final InMemoryObservationStore observations = new InMemoryObservationStore();
         private final InMemoryDerivedSchemaStore derived = new InMemoryDerivedSchemaStore();
+        private final InMemoryRateHistoryStore rates = new InMemoryRateHistoryStore();
         private final AtomicReference<PipelineIntentScope> current = new AtomicReference<>(SCOPE);
         private final AtomicReference<WorkloadClaimFence> actual = new AtomicReference<>(ORIGINAL);
         private final List<PipelineIntentScope> requestedScopes = new ArrayList<>();
@@ -218,6 +239,13 @@ class PipelineConvergencePassTest {
         private void check(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             active.run(); check(scope);
             if (!original.equals(actual.get())) throw fenced();
+        }
+        @Override public io.tapstate.spi.store.RateHistoryStore pipelineRateHistory(PipelineIntentScope scope) { check(scope); return rates; }
+        @Override public io.tapstate.spi.store.RateHistoryStore pipelineRateHistory(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
+            writes.add(original); var writer = org.mockito.Mockito.mock(io.tapstate.spi.store.RateHistoryStore.class);
+            org.mockito.Mockito.doAnswer(call -> { check(scope, original, active); rates.append(call.getArgument(0)); return null; })
+                    .when(writer).append(org.mockito.ArgumentMatchers.any(io.tapstate.core.lifecycle.RateSample.class));
+            return writer;
         }
         @Override public io.tapstate.spi.store.DerivedSchemaStore pipelineDerivedSchemas(PipelineIntentScope scope) { check(scope); return derived; }
         @Override public io.tapstate.spi.store.DerivedSchemaStore pipelineDerivedSchemas(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {

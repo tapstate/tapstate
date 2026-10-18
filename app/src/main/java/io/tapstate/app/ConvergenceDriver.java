@@ -178,8 +178,9 @@ final class ConvergenceDriver {
                 }
                 var projection = scoped == null ? publisher.publish(pipelineId, failure)
                         : publisher.publishScoped(pass.scope(), pass.state(), pass.observations(), failure);
+                PipelineConvergencePass sampledPass = pass;
                 projection.ifPresent(published -> {
-                    sample(published);
+                    sample(published, sampledPass);
                     export(published);
                 });
                 // A clean pass ends the failure streak; the next throw starts counting from one again.
@@ -250,12 +251,13 @@ final class ConvergenceDriver {
      * history a record kept beside it: a history that cannot be written must not cost a pipeline the read
      * face that says it is alive at all.
      */
-    private void sample(io.tapstate.core.lifecycle.Observation published) {
+    private void sample(io.tapstate.core.lifecycle.Observation published, PipelineConvergencePass pass) {
         if (sampler == null) {
             return;
         }
         try {
-            sampler.offer(published);
+            if (pass == null) sampler.offer(published);
+            else sampler.offer(published, pass.scope(), pass.rateHistory());
         } catch (RuntimeException unsampled) {
             LOG.warn("Could not sample the history of pipeline {}", published.pipelineId(), unsampled);
         }

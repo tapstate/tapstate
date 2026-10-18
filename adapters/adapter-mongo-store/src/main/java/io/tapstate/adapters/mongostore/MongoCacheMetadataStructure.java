@@ -29,8 +29,13 @@ final class MongoCacheMetadataStructure {
     private final Duration retention;
 
     MongoCacheMetadataStructure(MongoDatabase database, Duration retention) {
-        this.database = Objects.requireNonNull(database, "database"); this.retention = Objects.requireNonNull(retention, "retention");
-        if (retention.isNegative() || retention.isZero()) throw new IllegalArgumentException("history retention must be positive");
+        this.database = Objects.requireNonNull(database, "database"); this.retention = requireRetention(retention);
+    }
+
+    static Duration requireRetention(Duration retention) {
+        if (retention == null || retention.isNegative() || retention.isZero() || retention.getNano() != 0)
+            throw new TapstateException(StoreError.INVALID_HISTORY_RETENTION, Map.of(), null);
+        return retention;
     }
 
     /**
@@ -120,10 +125,14 @@ final class MongoCacheMetadataStructure {
         Document found = rows.stream().filter(row -> index.indexName().equals(row.get("name"))).findFirst().orElseThrow(() -> unreadable("index"));
         var keys = new Document(); index.keys().forEach(key -> keys.append(key, 1));
         Object ttl = found.get("expireAfterSeconds");
-        boolean exactTtl = index.expireAfterSeconds() == null ? ttl == null
-                : (ttl instanceof Long || ttl instanceof Integer) && ((Number) ttl).longValue() == index.expireAfterSeconds();
-        if (!keys.equals(found.get("key")) || Boolean.TRUE.equals(found.get("unique")) != index.unique() || !exactTtl
+        if (!keys.equals(found.get("key")) || Boolean.TRUE.equals(found.get("unique")) != index.unique()
                 || Boolean.TRUE.equals(found.get("hidden")) || Boolean.TRUE.equals(found.get("sparse")) || found.containsKey("partialFilterExpression")) throw unreadable("index");
+        if (index.expireAfterSeconds() == null) { if (ttl != null) throw unreadable("index"); }
+        else {
+            if (!(ttl instanceof Long || ttl instanceof Integer)) throw unreadable("index");
+            if (((Number) ttl).longValue() != index.expireAfterSeconds()) throw new TapstateException(StoreError.HISTORY_RETENTION_MISMATCH,
+                    Map.of("configuredSeconds", index.expireAfterSeconds(), "storedSeconds", ((Number) ttl).longValue()), null);
+        }
     }
     private static TapstateException unreadable(String field) { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "cache-metadata", "field", field), null); }
 }

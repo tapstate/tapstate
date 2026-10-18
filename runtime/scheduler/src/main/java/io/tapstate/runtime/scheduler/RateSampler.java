@@ -43,7 +43,8 @@ public final class RateSampler {
 
     private final RateHistoryStore history;
     private final Duration interval;
-    private final Map<String, Instant> lastSampledAt = new ConcurrentHashMap<>();
+    private record Cadence(Object scope, Instant at) {}
+    private final Map<String, Cadence> lastSampledAt = new ConcurrentHashMap<>();
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -58,7 +59,18 @@ public final class RateSampler {
      * interval older than this observation and the observation carries something to draw a line from.
      */
     public void offer(Observation observation) {
-        Objects.requireNonNull(observation, "observation");
+        Objects.requireNonNull(observation, "observation"); offer(observation.pipelineId(), observation, history);
+    }
+
+    /** The original Pipeline scope owns both the cadence and this invocation's destination. */
+    public void offer(Observation observation, io.tapstate.spi.store.PipelineIntentScope scope, RateHistoryStore destination) {
+        Objects.requireNonNull(observation, "observation"); Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(destination, "destination");
+        if (!scope.pipelineId().equals(observation.pipelineId())) throw new io.tapstate.core.common.TapstateException(
+                io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        offer(scope, observation, destination);
+    }
+
+    private void offer(Object key, Observation observation, RateHistoryStore destination) {
         if (observation.observedAt() == null) {
             return;
         }
@@ -66,12 +78,12 @@ public final class RateSampler {
         if (sample == null) {
             return;
         }
-        Instant last = lastSampledAt.get(observation.pipelineId());
-        if (last != null && observation.observedAt().isBefore(last.plus(interval))) {
+        Cadence last = lastSampledAt.get(observation.pipelineId());
+        if (last != null && key.equals(last.scope()) && observation.observedAt().isBefore(last.at().plus(interval))) {
             return;
         }
-        history.append(sample);
-        lastSampledAt.put(observation.pipelineId(), observation.observedAt());
+        destination.append(sample);
+        lastSampledAt.put(observation.pipelineId(), new Cadence(key, observation.observedAt()));
     }
 
     /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */

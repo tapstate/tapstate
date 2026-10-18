@@ -333,7 +333,9 @@ source.srs-change-while-running
 source.version-conflict
 store.database-access-failed
 store.default-source-protected
+store.history-retention-mismatch
 store.initialization-refused
+store.invalid-history-retention
 store.invalid-operator-state-database
 store.invalid-uri
 store.not-replica-set

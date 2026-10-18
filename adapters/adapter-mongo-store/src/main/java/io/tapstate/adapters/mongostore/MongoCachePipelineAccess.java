@@ -29,9 +29,16 @@ final class MongoCachePipelineAccess {
     private final MongoClient client;
     private final WorkloadClaimFence original;
     private final Runnable requireActive;
+    final java.time.Duration rateRetention;
 
     MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive) {
+        this(client, database, scope, original, requireActive, MongoRateHistoryStore.DEFAULT_RETENTION);
+    }
+
+    MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention) {
+        this.rateRetention = MongoCacheMetadataStructure.requireRetention(rateRetention);
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.original = original;
         this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
@@ -65,7 +72,7 @@ final class MongoCachePipelineAccess {
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
         T result = transaction(session -> {
             Document current = state(session);
-            new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(table);
+            new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(table);
             if (mutation) { proveClaim(session); updateState(session, current, new Document(), false); }
             return action.apply(session);
         });

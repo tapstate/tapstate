@@ -64,6 +64,12 @@ public enum StoreError implements TapstateErrorCode {
     /** A normalized storage endpoint violates its database, server TLS or authentication boundary. */
     STORAGE_CONNECTION_UNSUPPORTED("store.storage-connection-unsupported", Set.of()),
 
+    /** A cache history retention cannot be represented as an exact positive MongoDB TTL in seconds. */
+    INVALID_HISTORY_RETENTION("store.invalid-history-retention", Set.of()),
+
+    /** Existing cache history indexes require explicit offline maintenance before using a new retention. */
+    HISTORY_RETENTION_MISMATCH("store.history-retention-mismatch", Set.of("configuredSeconds", "storedSeconds")),
+
     /** Stored trust material is invalid; no URI, certificate or private-key contents are exposed. */
     TLS_TRUST_INVALID("store.tls-trust-invalid", Set.of());
 

@@ -69,7 +69,11 @@ class MongoCacheMetadataStructureIT {
     @Test void aChangedRetentionIsDiagnosedWithoutAnImplicitCollMod() {
         withFixture(f -> {
             f.prepare(() -> {}); var before = f.snapshot();
-            assertUnreadable(() -> new MongoCacheMetadataStructure(f.database, Duration.ofDays(4)).verify());
+            assertThatThrownBy(() -> new MongoCacheMetadataStructure(f.database, Duration.ofDays(4)).verify())
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, e -> {
+                        assertThat(e.code()).isEqualTo(StoreError.HISTORY_RETENTION_MISMATCH);
+                        assertThat(e.args()).containsExactlyInAnyOrderEntriesOf(Map.of("configuredSeconds", Duration.ofDays(4).toSeconds(), "storedSeconds", Duration.ofDays(3).toSeconds()));
+                    });
             assertThat(f.snapshot()).isEqualTo(before);
         });
     }

@@ -42,6 +42,20 @@ final class PipelineConvergencePass {
         @Override public void create(String pipelineId, String next, Instant at) { throw fenced(); }
         @Override public void delete(String pipelineId) { throw fenced(); }
     };
+    private final io.tapstate.spi.store.RateHistoryStore rateHistory = new io.tapstate.spi.store.RateHistoryStore() {
+        @Override public void append(io.tapstate.core.lifecycle.RateSample sample) {
+            WorkloadClaimFence original = claim.get(); requirePipeline(sample.pipelineId());
+            views.pipelineRateHistory(scope(), original, requireActive).append(sample);
+        }
+        @Override public Page readPage(String id, Instant from, Instant to, Key after, int limit) {
+            requirePipeline(id); return views.pipelineRateHistory(scope()).readPage(id, from, to, after, limit);
+        }
+        @Override public Optional<Entry> read(String id, Key key) { requirePipeline(id); return views.pipelineRateHistory(scope()).read(id, key); }
+        @Override public Optional<Entry> predecessor(String id, Instant at) { requirePipeline(id); return views.pipelineRateHistory(scope()).predecessor(id, at); }
+        @Override public Optional<Entry> successor(String id, Instant at) { requirePipeline(id); return views.pipelineRateHistory(scope()).successor(id, at); }
+        @Override public void deleteAll(String id) { throw fenced(); }
+        @Override public java.time.Duration retention() { requirePipeline(scope().pipelineId()); return views.pipelineRateHistory(scope()).retention(); }
+    };
     private final io.tapstate.spi.store.DerivedSchemaStore derivedSchemas = new io.tapstate.spi.store.DerivedSchemaStore() {
         @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String id, String step) {
             requirePipeline(id); return views.pipelineDerivedSchemas(scope()).latest(id, step);
@@ -94,6 +108,7 @@ final class PipelineConvergencePass {
     StateStore state() { return state; }
     ObservationStore observations() { return observations; }
     io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() { return derivedSchemas; }
+    io.tapstate.spi.store.RateHistoryStore rateHistory() { return rateHistory; }
 
     /** Called before any later start step may throw; no other pass or asynchronous DAG retains this object. */
     void advanced(WorkloadClaimFence actual) {

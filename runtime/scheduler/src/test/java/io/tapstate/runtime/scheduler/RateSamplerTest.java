@@ -30,7 +30,7 @@ class RateSamplerTest {
     private static final Instant STARTED = Instant.parse("2026-09-17T02:00:00Z");
 
     /** Appends only, like the real store; keeps what it was handed so a case can read it back. */
-    private static final class RecordingHistory implements RateHistoryStore {
+    private static class RecordingHistory implements RateHistoryStore {
         private final List<RateSample> appended = new ArrayList<>();
 
         @Override
@@ -78,6 +78,39 @@ class RateSamplerTest {
                         "recordCount", out, "lag.orders", 4L, "lag.items", 47L,
                         "frontierGap.chain-a", 0L, "nestStateEntries.nest.orders.doc.$root", 12L),
                 Map.of(), Map.of(), null, at, List.of(records));
+    }
+
+    private static io.tapstate.spi.store.PipelineIntentScope scope(long generation) {
+        return new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", generation);
+    }
+
+    @Test void currentScopeCadenceDoesNotRetainEveryPastGenerationOfAStillLivePipeline() throws Exception {
+        var history = new RecordingHistory(); var sampler = new RateSampler(history, Duration.ofSeconds(60));
+        for (int i = 1; i <= 100; i++) sampler.offer(moving(T0.plusSeconds(i), i), scope(i), history);
+        sampler.forgetPipelinesOutside(List.of("orders"));
+        var field = RateSampler.class.getDeclaredField("lastSampledAt"); field.setAccessible(true);
+        assertThat((Map<?, ?>) field.get(sampler)).hasSize(1);
+        assertThat(history.appended).hasSize(100);
+        sampler.forgetPipelinesOutside(List.of()); assertThat((Map<?, ?>) field.get(sampler)).isEmpty();
+    }
+
+    @Test void eachNewScopeSamplesIndependentlyAndNeverUsesTheLegacyDestination() {
+        var legacy = new RecordingHistory(); var first = new RecordingHistory(); var next = new RecordingHistory();
+        var sampler = new RateSampler(legacy, Duration.ofSeconds(60));
+        sampler.offer(moving(T0, 1), scope(1), first); sampler.offer(moving(T0.plusSeconds(1), 2), scope(2), next);
+        sampler.offer(moving(T0.plusSeconds(2), 3), scope(2), next);
+        assertThat(legacy.appended).isEmpty(); assertThat(first.appended).hasSize(1); assertThat(next.appended).hasSize(1);
+    }
+
+    @Test void aRefusedOldScopeDoesNotChangeTheNewScopeCadence() {
+        var current = new RecordingHistory(); var sampler = new RateSampler(new RecordingHistory(), Duration.ofSeconds(60));
+        sampler.offer(moving(T0, 1), scope(2), current);
+        var refused = new RecordingHistory() { @Override public void append(RateSample sample) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        } };
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> sampler.offer(moving(T0.plusSeconds(1), 2), scope(1), refused))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        sampler.offer(moving(T0.plusSeconds(2), 3), scope(2), current); assertThat(current.appended).hasSize(1);
     }
 
     @Test

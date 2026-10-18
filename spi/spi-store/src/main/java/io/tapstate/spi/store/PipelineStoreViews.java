@@ -5,6 +5,10 @@ package io.tapstate.spi.store;
  * view retains one immutable claim through all transaction retries and never resolves a newer claim.
  */
 public interface PipelineStoreViews {
+    default RateHistoryStore pipelineRateHistory(PipelineIntentScope scope) { throw unsupported(); }
+
+    default RateHistoryStore pipelineRateHistory(PipelineIntentScope scope, WorkloadClaimFence original, Runnable requireActive) { throw unsupported(); }
+
     default DerivedSchemaStore pipelineDerivedSchemas(PipelineIntentScope scope) { throw unsupported(); }
 
     default DerivedSchemaStore pipelineDerivedSchemas(PipelineIntentScope scope, WorkloadClaimFence original, Runnable requireActive) { throw unsupported(); }

@@ -74,4 +74,4 @@ connector_specs | cache | MongoCacheConnectorSpecStore | migrated | 1 | -
 connection_test_results | cache | MongoCacheConnectionTestResultStore | migrated | 1 | -
 connector_artifacts (gridfs) | cache | MongoCacheConnectorRegistry | immutable | 1 | metadata.connectorId
 derived_schemas | cache | MongoCacheDerivedSchemaStore | migrated | 1 | -
-pipeline_rate_history | cache | MongoRateHistoryStore | migrated | 1 | observedAt (ttl 1296000s), pipelineId+observedAt+_id
+pipeline_rate_history | cache | MongoCacheRateHistoryStore | migrated | 1 | observedAt (ttl 1296000s), pipelineId+observedAt+_id

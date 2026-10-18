@@ -228,7 +228,7 @@ public enum SystemCollections {
     CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoCacheConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
             new IndexSpec(List.of("metadata.connectorId"), false)),
     CACHE_DERIVED_SCHEMAS("derived_schemas", Database.CACHE, MongoCacheDerivedSchemaStore.class, Strategy.MIGRATED, 1),
-    CACHE_PIPELINE_RATE_HISTORY("pipeline_rate_history", Database.CACHE, MongoRateHistoryStore.class, Strategy.MIGRATED, 1,
+    CACHE_PIPELINE_RATE_HISTORY("pipeline_rate_history", Database.CACHE, MongoCacheRateHistoryStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
             new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false));
 

@@ -22,18 +22,24 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final MongoConnection connection;
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
+    private final Duration rateRetention;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
-    private MongoCacheDomain(MongoConnection connection) {
-        this.connection = connection; this.client = connection.client(); this.database = connection.database();
+    private MongoCacheDomain(MongoConnection connection, Duration rateRetention) {
+        this.connection = connection; this.client = connection.client(); this.database = connection.database(); this.rateRetention = rateRetention;
     }
 
     /** Connectivity alone creates no identity, schema, session, membership or business resource. */
     public static MongoCacheDomain connect(StorageBinding.Connection cache, Duration timeout, String processId) {
+        return connect(cache, timeout, processId, MongoRateHistoryStore.DEFAULT_RETENTION);
+    }
+
+    public static MongoCacheDomain connect(StorageBinding.Connection cache, Duration timeout, String processId, Duration rateRetention) {
+        rateRetention = MongoCacheMetadataStructure.requireRetention(rateRetention);
         MongoConnection connection = MongoConnection.forCache(cache, timeout, processId);
         try {
             connection.verifyConnectivity();
-            return new MongoCacheDomain(connection);
+            return new MongoCacheDomain(connection, rateRetention);
         } catch (RuntimeException | Error failure) {
             connection.close(); throw failure;
         }
@@ -142,6 +148,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); });
     }
 
+    @Override public io.tapstate.spi.store.RateHistoryStore pipelineRateHistory(io.tapstate.spi.store.PipelineIntentScope scope) {
+        return new MongoCacheRateHistoryStore(pipelineAccess(scope, null, () -> {}));
+    }
+    @Override public io.tapstate.spi.store.RateHistoryStore pipelineRateHistory(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
+        return new MongoCacheRateHistoryStore(pipelineAccess(scope, Objects.requireNonNull(original, "original"), requireActive));
+    }
+
     @Override public io.tapstate.spi.store.DerivedSchemaStore pipelineDerivedSchemas(io.tapstate.spi.store.PipelineIntentScope scope) {
         return new MongoCacheDerivedSchemaStore(pipelineAccess(scope, null, () -> {}));
     }
@@ -175,7 +189,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private MongoCachePipelineAccess pipelineAccess(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); });
+        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); }, rateRetention);
     }
 
     /**
