@@ -34,32 +34,43 @@ For how this compares with a streaming stack you assemble yourself, see
 
 ## Try it
 
-Install the CLI, then let it walk you through the first run:
+Start the playground. You need Docker with the Compose plugin; the script starts MySQL,
+PostgreSQL, MongoDB and Tapstate, then keeps a live order object assembled from both
+source databases.
 
 ```sh
-curl -sSL https://install.tapstate.dev | sh
-tapstate new
-tapstate up
+curl -fsSL https://install.tapstate.dev/demo | sh
 ```
 
-`tapstate new` asks what the workspace is for, from a short catalog of outcomes: try it
-with sample data, mirror one table as it changes, assemble several tables into one
-object. It writes that workspace to disk as ordinary `.tap.yml` files you can read and
-edit, and it reaches nothing while doing so — you can author offline, with no server in
-existence. `tapstate up` asks which server to bring it up against the first time — the
-default starts a local development stack in Docker on this machine — then checks the
-server and the sources, applies the workspace, and starts the pipeline.
+Then use it the way you work:
 
-To see the whole thing running before you touch a database of your own, there is a
-disposable demo: it starts MySQL, PostgreSQL, Tapstate, and MongoDB, then maintains a
-live order object assembled from both source databases. Change the source data and
-watch the state update.
+**In the browser.** Open `http://127.0.0.1:8080` and sign in as `admin` with the password
+the script saved in `tapstate-demo/.env`. Inspect the sources and their discovered
+columns, the pipeline that assembles them, and its monitoring and logs, or build a
+pipeline of your own.
+
+**With your AI agent.** Let an agent create and run sources and pipelines for you. Give it
+the Tapstate authoring skills, then connect it with the MCP configuration the script
+wrote to `tapstate-demo/tapstate-mcp.json`, which carries a write token for the
+playground:
 
 ```sh
-curl -sSL https://install.tapstate.dev/demo | sh
+cd tapstate-demo
+npx --yes skills add tapstate/tapstate-skills -a claude-code -y
+claude --mcp-config tapstate-mcp.json
 ```
 
-→ [Follow the quickstart](https://tapstate.dev/docs/overview/quickstart-online)
+Then ask *"How do I work with Tapstate?"*: the skills include a guided tour of what the demo
+runs, with things to try next. For Cursor, Codex and other agents, `tapstate-demo/AGENT-SETUP.md`
+has the steps.
+
+**From the CLI.** For scripts, CI, and machines without a browser or an AI assistant:
+the script installs the CLI as `tapstate-demo/tapstate`, and
+`curl -fsSL https://install.tapstate.dev/cli | sh` installs it on its own. Workspaces
+are ordinary `.tap.yml` files you can validate offline, review in a diff, and apply
+from a pipeline job.
+
+→ [Follow the quickstart](https://tapstate.dev/docs/overview/quickstart)
 
 ## What it's for
 
@@ -82,7 +93,8 @@ Today you can:
 - Capture MySQL and PostgreSQL data with initial load + CDC
 - Incrementally transform and combine data across sources
 - Materialize live state to MongoDB
-- Inspect pipeline status, metrics, and logs
+- Create sources and pipelines and watch their status, metrics, and logs in the web
+  application that ships with the server, through an AI agent over MCP, or from the CLI
 
 That MongoDB ships with the install and is managed by Tapstate: you do not install it,
 supply a URI, or configure its namespaces and indexes. It is the current reference
@@ -115,7 +127,7 @@ Tapstate is evolving toward the complete Capture → Transform → Serve path:
 
 ## Explore Tapstate
 
-- [Quickstart](https://tapstate.dev/docs/overview/quickstart-online) — get Tapstate running and see live state update
+- [Quickstart](https://tapstate.dev/docs/overview/quickstart) — get Tapstate running and see live state update
 - [Concepts](https://tapstate.dev/docs/concepts/dsl) — understand sources, pipelines, resources, and the Tapstate DSL
 - [Architecture](https://tapstate.dev/docs/overview/architecture) — understand the Capture → Transform → Serve architecture
 - [Connectors](https://tapstate.dev/docs/connectors) — supported databases, capabilities, and capture modes
