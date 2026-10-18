@@ -2,8 +2,6 @@ package io.tapstate.archtests;
 
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Domain;
 import org.junit.jupiter.api.BeforeAll;
@@ -66,9 +64,7 @@ class ErrorCodeGatesTest {
 
     @BeforeAll
     static void scanFirstPartyCodes() {
-        JavaClasses classes = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        JavaClasses classes = ProductionClassImports.packages("io.tapstate");
         List<TapstateErrorCode> found = new ArrayList<>();
         for (JavaClass jc : classes) {
             if (jc.isEnum() && jc.isAssignableTo(TapstateErrorCode.class)) {
