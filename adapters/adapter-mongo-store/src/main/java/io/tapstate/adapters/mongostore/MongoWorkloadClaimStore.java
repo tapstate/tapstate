@@ -277,7 +277,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return new Document("ownerNodeId", owner.nodeId()).append("ownerBootId", owner.bootId());
     }
 
-    private static Document id(WorkloadClaimKey key) {
+    static Document id(WorkloadClaimKey key) {
         return new Document("clusterId", key.clusterId())
                 .append("resourceType", key.type().name())
                 .append("resourceId", key.resourceId());

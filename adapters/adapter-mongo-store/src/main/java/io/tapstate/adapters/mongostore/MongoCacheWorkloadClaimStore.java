@@ -5,6 +5,7 @@ import com.mongodb.MongoException;
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
@@ -14,6 +15,7 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -22,11 +24,13 @@ import org.bson.Document;
 
 import java.time.Duration;
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Function;
+import java.util.function.BiFunction;
 
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
@@ -49,48 +53,137 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireKey(key);
         if (key.type() == WorkloadClaimType.PIPELINE_ACTUATION) throw MongoCacheBusinessIdentity.businessFenced();
-        return transaction(true, store -> store.acquire(key, owner, topologyRevision, ttl));
+        return transaction(true, (store, session) -> store.acquire(key, owner, topologyRevision, ttl));
     }
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
-        Objects.requireNonNull(original, "scope");
-        if (!scope.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation())))
-            throw MongoCacheBusinessIdentity.businessFenced();
-        var key = new WorkloadClaimKey(original.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, original.pipelineId());
-        return transaction(true, original, store -> store.acquire(key, owner, topologyRevision, ttl));
+        requireScope(original);
+        var key = pipelineKey(original);
+        return transaction(true, original, (store, session) -> {
+            var previous = storedScope(session, key);
+            if (previous != null && previous.stateGeneration() > original.stateGeneration()) throw MongoCacheBusinessIdentity.businessFenced();
+            if (previous != null && !previous.equals(original) && store.read(key).orElseThrow().leased()) throw claimFenced();
+            var acquired = store.acquire(key, owner, topologyRevision, ttl);
+            if (!acquired.acquired()) return acquired;
+            var values = new Document("pipelineScope", scopeDocument(original));
+            if (previous != null && !previous.equals(original)) {
+                // Keep fencing counters across a rebuild; the prior physical state's run context is unknown here.
+                values.append("contextExecutionGeneration", 0L).append("executionClaimGeneration", 0L)
+                        .append("executionNodeIds", List.of()).append("failureClaimGeneration", 0L).append("failureAfterMemberLoss", false);
+            }
+            if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,
+                    WorkloadClaimDocuments.live(WorkloadClaimFence.from(acquired.claim())), new Document("$set", values)).getMatchedCount() != 1) throw claimFenced();
+            return WorkloadClaimAttempt.acquired(store.read(key).orElseThrow().claim());
+        });
+    }
+    @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
+        requireScope(original);
+        var key = pipelineKey(original);
+        return transaction(false, original, (store, session) -> {
+            var retained = storedScope(session, key);
+            if (retained != null && !retained.equals(original)) throw claimFenced();
+            return store.read(key);
+        });
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, store -> store.renew(expected, ttl));
+        return transaction(false, (store, session) -> {
+            validateMutationScope(session, store, expected);
+            return store.renew(expected, ttl);
+        });
     }
     @Override public boolean release(WorkloadClaim expected) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, store -> store.release(expected));
+        return transaction(false, (store, session) -> {
+            storedScope(session, expected.key());
+            return store.release(expected);
+        });
     }
     @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, store -> store.advanceExecution(expected, topologyRevision, nodeIds));
+        return transaction(false, (store, session) -> {
+            validateMutationScope(session, store, expected);
+            return store.advanceExecution(expected, topologyRevision, nodeIds);
+        });
     }
     @Override public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, store -> store.recordExecutionFailure(expected, afterMemberLoss));
+        return transaction(false, (store, session) -> {
+            validateMutationScope(session, store, expected);
+            return store.recordExecutionFailure(expected, afterMemberLoss);
+        });
     }
     @Override public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
         requireKey(key);
-        return transaction(false, store -> store.read(key));
+        return transaction(false, (store, session) -> {
+            storedScope(session, key);
+            return store.read(key);
+        });
     }
     @Override public Map<WorkloadClaimKey, WorkloadClaimReading> readAll(Collection<WorkloadClaimKey> keys) {
         Objects.requireNonNull(keys, "keys");
-        var captured = java.util.List.copyOf(keys);
+        var captured = List.copyOf(keys);
         if (captured.isEmpty()) return Map.of();
         captured.forEach(this::requireKey);
-        return transaction(false, store -> store.readAll(captured));
+        return transaction(false, (store, session) -> {
+            Map<Document, WorkloadClaimKey> pipelines = new LinkedHashMap<>();
+            for (var key : captured) if (key.type() == WorkloadClaimType.PIPELINE_ACTUATION) pipelines.put(MongoWorkloadClaimStore.id(key), key);
+            if (!pipelines.isEmpty()) {
+                try (var rows = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                        new Document("_id", new Document("$in", List.copyOf(pipelines.keySet())))).iterator()) {
+                    while (rows.hasNext()) {
+                        var row = rows.next(); decodeScope(row, pipelines.get(row.get("_id")));
+                    }
+                }
+            }
+            return store.readAll(captured);
+        });
     }
 
-    private <T> T transaction(boolean admission, Function<MongoWorkloadClaimStore, T> operation) {
+    /** A live tenure's stored scope is immutable; validation never substitutes the current claim for the caller's. */
+    private void validateMutationScope(ClientSession session, MongoWorkloadClaimStore store, WorkloadClaim expected) {
+        var retained = storedScope(session, expected.key());
+        if (retained == null) return;
+        var current = store.read(expected.key());
+        if (current.isPresent() && current.get().leased()) {
+            var claim = current.get().claim();
+            if (claim.owner().equals(expected.owner()) && claim.claimGeneration() == expected.claimGeneration()
+                    && claim.executionGeneration() == expected.executionGeneration()) {
+                var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
+                access.verifyStateStructure(); access.state(session);
+            }
+        }
+    }
+
+    private PipelineIntentScope storedScope(ClientSession session, WorkloadClaimKey key) {
+        if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION) return null;
+        var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+        return row == null ? null : decodeScope(row, key);
+    }
+
+    private PipelineIntentScope decodeScope(Document row, WorkloadClaimKey key) {
+        try {
+            if (!(row.get("pipelineScope") instanceof Document value) || !(value.get("bindingVersion") instanceof Long binding)
+                    || !(value.get("stateGeneration") instanceof Long generation)) throw unreadableScope();
+            var decoded = new PipelineIntentScope(value.getString("clusterId"), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
+            if (!value.equals(scopeDocument(decoded)) || !key.resourceId().equals(decoded.pipelineId()) || !key.clusterId().equals(decoded.clusterId())
+                    || !scope.equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadableScope();
+            return decoded;
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadableScope(); }
+    }
+
+    private static Document scopeDocument(PipelineIntentScope value) {
+        return new Document("clusterId", value.clusterId()).append("bindingVersion", value.bindingVersion())
+                .append("cacheIncarnation", value.cacheIncarnation()).append("pipelineId", value.pipelineId()).append("stateGeneration", value.stateGeneration());
+    }
+    private static WorkloadClaimKey pipelineKey(PipelineIntentScope value) { return new WorkloadClaimKey(value.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, value.pipelineId()); }
+    private static TapstateException unreadableScope() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "workload", "field", "pipeline-claim-scope"), null); }
+    private static TapstateException claimFenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }
+
+    private <T> T transaction(boolean admission, BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation) {
         return transaction(admission, null, operation);
     }
 
-    private <T> T transaction(boolean admission, PipelineIntentScope pipeline, Function<MongoWorkloadClaimStore, T> operation) {
+    private <T> T transaction(boolean admission, PipelineIntentScope pipeline, BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -106,15 +199,14 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                                 var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
                                 access.verifyStateStructure();
                                 var current = access.state(session);
-                                if (current.getLong("runtimeWriteFence") > 0 && store.read(new WorkloadClaimKey(
-                                        pipeline.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, pipeline.pipelineId())).isEmpty())
+                                if (current.getLong("runtimeWriteFence") > 0 && store.read(pipelineKey(pipeline)).isEmpty())
                                     throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                                             Map.of("id", pipeline.pipelineId(), "field", "pipeline-claim-history"), null);
                                 // A real per-Pipeline write serializes admission with state replacement,
                                 // including a first claim absent from the replacement's claim snapshot.
-                                access.updateState(session, current, new Document(), false);
+                                if (admission) access.updateState(session, current, new Document(), false);
                             }
-                            T result = operation.apply(store);
+                            T result = operation.apply(store, session);
                             requireActive.run();
                             return result;
                         }, TRANSACTION);
@@ -132,6 +224,11 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
         });
     }
 
+    private void requireScope(PipelineIntentScope original) {
+        Objects.requireNonNull(original, "scope");
+        if (!scope.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation())))
+            throw MongoCacheBusinessIdentity.businessFenced();
+    }
     private void requireKey(WorkloadClaimKey key) {
         if (!scope.clusterId().equals(Objects.requireNonNull(key, "key").clusterId())) throw MongoCacheBusinessIdentity.businessFenced();
     }

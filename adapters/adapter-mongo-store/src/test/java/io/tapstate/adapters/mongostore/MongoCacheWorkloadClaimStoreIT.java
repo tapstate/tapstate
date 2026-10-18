@@ -337,6 +337,8 @@ class MongoCacheWorkloadClaimStoreIT {
             var raw = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
             assertThatThrownBy(() -> raw.acquirePipeline(PIPELINE, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
                     error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThatThrownBy(() -> raw.readPipeline(PIPELINE)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             assertThat(snapshot(f.database())).isEqualTo(before);
         });
     }
@@ -470,6 +472,152 @@ class MongoCacheWorkloadClaimStoreIT {
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
     }
+
+    @Test void pipelineScopeSurvivesTheOriginalTenureAndAuthorizationReadsAreReadOnly() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var empty = snapshot(f.database());
+            assertThat(claims.readPipeline(PIPELINE)).isEmpty();
+            assertThat(snapshot(f.database())).isEqualTo(empty);
+            var first = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
+            var run = claims.advanceExecution(first, 1, Set.of("node-a")).orElseThrow();
+            var failed = claims.recordExecutionFailure(run, false).orElseThrow();
+            var renewed = claims.renew(failed, TTL).orElseThrow();
+            var before = snapshot(f.database());
+            assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(renewed);
+            assertThat(claims.readPipeline(PIPELINE).orElseThrow().leased()).isTrue();
+            assertThat(snapshot(f.database())).isEqualTo(before);
+            assertThat(claims.release(renewed)).isTrue();
+            assertThat(claims.readPipeline(PIPELINE).orElseThrow().leased()).isFalse();
+            assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
+        });
+    }
+
+    @Test void aNewStateScopeTakesANewTenureAndDoesNotInheritItsOldRunContext() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var run = claims.advanceExecution(claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim(), 1, Set.of("node-a")).orElseThrow();
+            var failed = claims.recordExecutionFailure(run, false).orElseThrow();
+            assertThat(claims.release(failed)).isTrue();
+            var next = nextScope();
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document(), new Document("$set", new Document("scope", header(next))));
+            var taken = claims.acquirePipeline(next, OWNER, 1, TTL).claim();
+            assertThat(taken.claimGeneration()).isEqualTo(run.claimGeneration() + 1);
+            assertThat(taken.executionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(taken.contextExecutionGeneration()).isZero();
+            assertThat(taken.executionClaimGeneration()).isZero(); assertThat(taken.executionNodeIds()).isEmpty();
+            assertThat(taken.failureClaimGeneration()).isZero(); assertThat(taken.failureAfterMemberLoss()).isFalse();
+            assertThat(claimScope(f.database())).isEqualTo(header(next));
+            assertThat(claims.readPipeline(next).orElseThrow().claim()).isEqualTo(taken);
+            assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            assertThat(claims.release(failed)).isFalse();
+            var advanced = claims.advanceExecution(taken, 1, Set.of("node-a")).orElseThrow();
+            assertThat(advanced.contextExecutionGeneration()).isEqualTo(advanced.executionGeneration());
+            assertThat(advanced.executionClaimGeneration()).isEqualTo(taken.claimGeneration());
+            assertThat(claimScope(f.database())).isEqualTo(header(next));
+        });
+    }
+
+    @Test void anUnretiredLiveTenureCannotMoveToAnotherPhysicalScope() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var held = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var next = nextScope();
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document(), new Document("$set", new Document("scope", header(next))));
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.acquirePipeline(next, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThatThrownBy(() -> claims.renew(held, TTL)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            assertThatThrownBy(() -> claims.advanceExecution(held, 1, Set.of("node-a"))).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            assertThat(snapshot(f.database())).isEqualTo(before);
+            assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
+            assertThat(claims.release(held)).isTrue();
+            assertThat(claims.acquirePipeline(next, OWNER, 1, TTL).claim().claimGeneration()).isEqualTo(held.claimGeneration() + 1);
+        });
+    }
+
+    @Test void aKnownMissingScopeCannotBeAdoptedOrRepairedByAnyOrdinaryClaimOperation() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var held = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$unset", new Document("pipelineScope", 1)));
+            var before = snapshot(f.database());
+            List<org.assertj.core.api.ThrowableAssert.ThrowingCallable> operations = List.of(
+                    () -> claims.read(KEY), () -> claims.readAll(List.of(KEY)), () -> claims.readPipeline(PIPELINE),
+                    () -> claims.renew(held, TTL), () -> claims.release(held), () -> claims.advanceExecution(held, 1, Set.of("node-a")),
+                    () -> claims.recordExecutionFailure(held, false), () -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL));
+            for (var operation : operations) {
+                assertThatThrownBy(operation).isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE); assertThat(error.getCause()).isNull();
+                });
+                assertThat(snapshot(f.database())).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void scopeTypesCoordinatesAndUnknownFieldsCannotBeDefaulted() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE); claims.acquirePipeline(PIPELINE, OWNER, 1, TTL);
+            var original = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find().first();
+            for (var change : List.of(new Document("pipelineScope.bindingVersion", 1), new Document("pipelineScope.stateGeneration", 1),
+                    new Document("pipelineScope.clusterId", "another"), new Document("pipelineScope.cacheIncarnation", "private-sentinel-incarnation"),
+                    new Document("pipelineScope.pipelineId", "another"), new Document("pipelineScope.extra", "private-sentinel-field"))) {
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$set", change));
+                var before = snapshot(f.database());
+                assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE); assertThat(error.getCause()).isNull();
+                    assertThat(error.getMessage()).doesNotContain("private-sentinel");
+                });
+                assertThat(snapshot(f.database())).isEqualTo(before);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).replaceOne(new Document(), original);
+            }
+        });
+    }
+
+    @Test void fixedScopeAuthorizationReadsDoNotDependOnTheProjectionCollection() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var held = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).drop();
+            var before = snapshot(f.database());
+            assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(held);
+            assertThat(snapshot(f.database())).isEqualTo(before);
+            assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
+        });
+    }
+
+    @Test void matchingNumericTokensCannotMakeAnOldPhysicalScopeCurrentAgain() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var run = claims.advanceExecution(claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim(), 1, Set.of("node-a")).orElseThrow();
+            assertThat(claims.release(run)).isTrue();
+            var next = nextScope();
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document(), new Document("$set", new Document("scope", header(next))));
+            claims.acquirePipeline(next, OWNER, 1, TTL);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$set",
+                    new Document("claimGeneration", run.claimGeneration()).append("executionGeneration", run.executionGeneration())));
+            var sameNumbers = claims.readPipeline(next).orElseThrow().claim();
+            assertThat(sameNumbers.claimGeneration()).isEqualTo(run.claimGeneration());
+            assertThat(sameNumbers.executionGeneration()).isEqualTo(run.executionGeneration());
+            assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+        });
+    }
+
+    @Test void aLaterRetainedScopeCannotBeOverwrittenByAnOlderAdmission() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE); claims.acquirePipeline(PIPELINE, OWNER, 1, TTL);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("pipelineScope", header(nextScope()))));
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    private static PipelineIntentScope nextScope() { return new PipelineIntentScope("cluster-a", 1, "incarnation-a", "orders", 2); }
+    private static Document claimScope(MongoDatabase database) { return SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find().first().get("pipelineScope", Document.class); }
 
     private static Document header(PipelineIntentScope scope) {
         return new Document("clusterId", scope.clusterId()).append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())

@@ -26,6 +26,14 @@ public interface WorkloadClaimStore {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
     }
 
+    /**
+     * Reads only the claim admitted under this original Pipeline scope. A generic metadata read does
+     * not establish that a run still belongs to its physical state; unsupported stores refuse.
+     */
+    default Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     /** Renews only the exact owner and generation while its current lease is still live. */
     Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl);
 
