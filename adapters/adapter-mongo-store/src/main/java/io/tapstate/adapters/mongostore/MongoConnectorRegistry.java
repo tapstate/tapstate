@@ -1,15 +1,19 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ErrorCategory;
+import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoClient;
 import com.mongodb.MongoWriteException;
 import com.mongodb.MongoException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.gridfs.GridFSBucket;
-import com.mongodb.client.gridfs.GridFSUploadStream;
 import com.mongodb.client.gridfs.model.GridFSFile;
-import com.mongodb.client.gridfs.model.GridFSUploadOptions;
 import com.mongodb.client.model.Accumulators;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
@@ -28,11 +32,14 @@ import org.bson.types.ObjectId;
 
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Pattern;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The MongoDB connector distribution registry: stores each registered connector artifact in a GridFS
@@ -48,19 +55,32 @@ import java.util.regex.Pattern;
  */
 public final class MongoConnectorRegistry implements ConnectorRegistry {
 
+    private static final int CHUNK_SIZE = 255 * 1024;
+    private static final int CHUNKS_PER_TRANSACTION = 16;
+    private static final TransactionOptions UPLOAD_TRANSACTION = TransactionOptions.builder()
+            .readConcern(ReadConcern.LOCAL).readPreference(ReadPreference.primary())
+            .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+
+    private static final TransactionOptions RECOVERY_TRANSACTION = TransactionOptions.builder()
+            .readConcern(ReadConcern.LOCAL).readPreference(ReadPreference.primary())
+            .writeConcern(WriteConcern.MAJORITY.withJournal(true)).timeout(10L, TimeUnit.SECONDS).build();
+
+    private final MongoClient client;
     private final GridFSBucket artifacts;
+    private final MongoCollection<Document> files;
 
     private final MongoCollection<Document> chunks;
     private final String filesNamespace;
     private final String contentHashIndex;
 
     /** Binds the immutable bucket and verifies its content-hash constraint before any registration. */
-    public MongoConnectorRegistry(MongoDatabase database) {
+    public MongoConnectorRegistry(MongoClient client, MongoDatabase database) {
+        this.client = Objects.requireNonNull(client, "client");
         Objects.requireNonNull(database, "database");
         SystemCollections collection = SystemCollections.CONNECTOR_ARTIFACTS;
         this.artifacts = collection.bucketOn(database);
         this.chunks = collection.chunksOn(database);
-        MongoCollection<Document> files = collection.indexTargetOn(database);
+        this.files = collection.indexTargetOn(database);
         this.filesNamespace = files.getNamespace().getFullName();
         SystemCollections.IndexSpec index = collection.indexes().stream()
                 .filter(spec -> spec.keys().equals(List.of("filename")) && spec.unique())
@@ -101,38 +121,93 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
             if (existing != null) {
                 return new RegistrationOutcome(toRegistration(contentHash, existing.getMetadata()), false);
             }
-            GridFSUploadOptions options = new GridFSUploadOptions().metadata(metadata(connectorId, pdkApiVersion, source));
-            // Each contender owns a different upload id. A shared deterministic id would let the
-            // driver's failed-upload cleanup remove another contender's chunks.
-            BsonObjectId attempt = new BsonObjectId(new ObjectId());
-            GridFSUploadStream upload = artifacts.openUploadStream(attempt, contentHash, options);
-            try {
-                upload.write(artifact, 0, artifact.length);
-            } catch (MongoException failure) {
-                // No file insert has been attempted while writing. This upload owns every such chunk.
-                upload.abort();
-                throw failure;
-            }
-            try {
-                upload.close();
-            } catch (MongoWriteException e) {
-                // A definitive write rejection did not publish this file, regardless of its index.
-                // Ambiguous close failures are deliberately not caught here: their file insert may
-                // have committed, so deleting chunks after a missing-file read could corrupt it.
-                chunks.deleteMany(Filters.eq("files_id", attempt));
-                if (!isContentHashDuplicate(e, contentHash)) {
-                    throw e;
+            // Bootstrap the driver's standard GridFS indexes outside transactions. This separate id
+            // can never be mistaken for the upload whose chunks the transactions below will own.
+            artifacts.openUploadStream(new BsonObjectId(new ObjectId()), contentHash).abort();
+            ObjectId attempt = new ObjectId();
+            Document file = new Document("_id", attempt).append("filename", contentHash)
+                    .append("length", (long) artifact.length).append("chunkSize", CHUNK_SIZE)
+                    .append("uploadDate", new Date()).append("metadata", metadata(connectorId, pdkApiVersion, source));
+            try (ClientSession session = client.startSession()) {
+                boolean publishing = false;
+                try {
+                    // Bound transaction memory independently of artifact size. Only the final metadata
+                    // transaction publishes the immutable GridFS file to readers.
+                    int offset = 0;
+                    int ordinal = 0;
+                    while (offset < artifact.length) {
+                        List<Document> batch = new ArrayList<>();
+                        for (int count = 0; count < CHUNKS_PER_TRANSACTION && offset < artifact.length; count++) {
+                            int end = (int) Math.min((long) offset + CHUNK_SIZE, artifact.length);
+                            batch.add(new Document("files_id", attempt).append("n", ordinal++)
+                                    .append("data", new org.bson.types.Binary(Arrays.copyOfRange(artifact, offset, end))));
+                            offset = end;
+                        }
+                        session.startTransaction(UPLOAD_TRANSACTION);
+                        chunks.insertMany(session, batch);
+                        session.commitTransaction();
+                    }
+                    publishing = true;
+                    publish(session, file);
+                } catch (MongoException failure) {
+                    reconcileUpload(session, file);
+                    if (publishing && failure instanceof MongoWriteException rejected
+                            && isContentHashDuplicate(rejected, contentHash)) {
+                        GridFSFile winner = uniqueArtifact(contentHash);
+                        if (winner != null && !winner.getObjectId().equals(attempt)) {
+                            return new RegistrationOutcome(toRegistration(contentHash, winner.getMetadata()), false);
+                        }
+                    }
+                    // Even a committed file does not turn a lost durability acknowledgement into
+                    // success. A later ordinary register can observe the published hash idempotently.
+                    throw failure;
                 }
-                GridFSFile winner = uniqueArtifact(contentHash);
-                if (winner == null || winner.getId().equals(attempt)) {
-                    throw e;
-                }
-                // Cleanup above must succeed before this race can be reported as idempotent.
-                return new RegistrationOutcome(toRegistration(contentHash, winner.getMetadata()), false);
             }
             return new RegistrationOutcome(
                     new ConnectorRegistration(connectorId, contentHash, pdkApiVersion, source), true);
         });
+    }
+
+    /** A transient transaction rejection is known not to have committed; reuse its chunks and id. */
+    private void publish(ClientSession session, Document file) {
+        for (int attempt = 0; ; attempt++) {
+            session.startTransaction(UPLOAD_TRANSACTION);
+            try {
+                files.insertOne(session, file);
+                session.commitTransaction();
+                return;
+            } catch (MongoException failure) {
+                if (attempt >= 2 || !failure.hasErrorLabel("TransientTransactionError")
+                        || failure.hasErrorLabel("UnknownTransactionCommitResult")) throw failure;
+                if (session.hasActiveTransaction()) session.abortTransaction();
+            }
+        }
+    }
+
+    /** Fences the old transaction before interpreting absence or removing this attempt's chunks. */
+    private void reconcileUpload(ClientSession session, Document expected) {
+        try {
+            if (session.hasActiveTransaction()) session.abortTransaction();
+            // The first operation starts a higher transaction number on this same session. MongoDB
+            // then resolves or aborts its older transaction before this local-primary read. A failed
+            // fence, including an unresolved prepared transaction, never licenses chunk deletion.
+            session.startTransaction(RECOVERY_TRANSACTION);
+            Document published = files.find(session, Filters.eq("_id", expected.getObjectId("_id"))).first();
+            if (published != null) {
+                for (String field : expected.keySet()) {
+                    if (!Objects.equals(expected.get(field), published.get(field))) {
+                        throw unreadable(expected.getString("filename"), field);
+                    }
+                }
+                session.commitTransaction();
+                return;
+            }
+            chunks.deleteMany(session, Filters.eq("files_id", expected.getObjectId("_id")));
+            session.commitTransaction();
+        } catch (MongoException unsettled) {
+            throw new TapstateException(IoError.CONNECTOR_UPLOAD_UNSETTLED,
+                    Map.of("hash", expected.getString("filename"), "attempt", expected.getObjectId("_id").toHexString()), null);
+        }
     }
 
     @Override

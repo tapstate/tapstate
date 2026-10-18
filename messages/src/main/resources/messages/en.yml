@@ -525,6 +525,9 @@ migration.lock-timeout:
 migration.changeset-failed:
   message: "System data changeset {changeset} failed: {cause}"
   solution: "Fix what the cause names, then start again -- the migration resumes at this changeset rather than repeating the ones before it."
+io.connector-upload-unsettled:
+  message: "Connector artifact '{hash}' upload '{attempt}' could not be reconciled."
+  solution: "Restore store connectivity and inspect this upload's file and chunks. Retained chunks may still belong to a committed artifact; do not delete them based only on a missing-file read."
 io.store-unavailable:
   message: "A store operation could not complete: {detail}."
   solution: "Check the store is reachable and healthy, then retry."

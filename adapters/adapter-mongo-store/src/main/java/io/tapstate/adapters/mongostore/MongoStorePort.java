@@ -171,7 +171,7 @@ public final class MongoStorePort implements StorePort {
         this.desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
         this.catalog = new MongoCatalogStore(SystemCollections.CONNECTIONS.on(database));
         this.schemas = new MongoSchemaStore(SystemCollections.SOURCE_SCHEMAS.on(database));
-        this.connectors = new MongoConnectorRegistry(database);
+        this.connectors = new MongoConnectorRegistry(connection.client(), database);
         this.connectorCatalog = new MongoConnectorCatalogStore(SystemCollections.CONNECTOR_CATALOG.on(database));
         this.connectorSpecs = new MongoConnectorSpecStore(SystemCollections.CONNECTOR_SPECS.on(database));
         this.connectionTestResults =

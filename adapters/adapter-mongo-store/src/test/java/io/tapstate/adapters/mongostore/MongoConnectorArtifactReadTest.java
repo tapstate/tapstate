@@ -226,7 +226,8 @@ class MongoConnectorArtifactReadTest {
                 case "getCodecRegistry" -> MongoClientSettings.getDefaultCodecRegistry();
                 default -> throw new AssertionError("unexpected database operation: " + method.getName());
             });
-            return new MongoConnectorRegistry(database);
+            return new MongoConnectorRegistry(proxy(com.mongodb.client.MongoClient.class,
+                    (self, method, args) -> { throw new AssertionError(method.getName()); }), database);
         }
 
         private MongoCollection<?> collection(String name) {
