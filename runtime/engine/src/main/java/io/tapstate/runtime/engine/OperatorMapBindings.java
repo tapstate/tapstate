@@ -89,12 +89,21 @@ public final class OperatorMapBindings implements AutoCloseable {
     }
 
     /** All candidates on this member publish together, after callbacks and map-liveness rechecks. */
-    public synchronized void install(Collection<OperatorMapBinding> candidates) { publish(candidates, false); }
+    public synchronized void install(Collection<OperatorMapBinding> candidates) { publish(candidates,false,() -> {}); }
+
+    /** A caller's final preparation check runs after providers, before the purely local slot publication. */
+    public synchronized void install(Collection<OperatorMapBinding> candidates,Runnable requirePrepared) {
+        publish(candidates,false,Objects.requireNonNull(requirePrepared,"requirePrepared"));
+    }
+    synchronized boolean alreadyInstalled(OperatorMapBinding original) {
+        requireOpen(); Bound held = slots.get(original.placement().mapName());
+        return held != null && held.active.get() && held.binding.equals(original);
+    }
 
     /** Restores only original descriptors for scoped handles already initialized on this member. */
-    public synchronized void attachExisting(Collection<OperatorMapBinding> originals) { publish(originals, true); }
+    public synchronized void attachExisting(Collection<OperatorMapBinding> originals) { publish(originals,true,() -> {}); }
 
-    private void publish(Collection<OperatorMapBinding> candidates, boolean existingMaps) {
+    private void publish(Collection<OperatorMapBinding> candidates,boolean existingMaps,Runnable requirePrepared) {
         List<OperatorMapBinding> captured = List.copyOf(candidates); requireOpen();
         Map<String, Bound> before = new LinkedHashMap<>(); Map<String, Bound> next = new LinkedHashMap<>();
         Map<String, PendingStore> pending = new LinkedHashMap<>();
@@ -124,6 +133,7 @@ public final class OperatorMapBindings implements AutoCloseable {
             before.forEach((cold, original) -> {
                 if (!existingMaps && original != next.get(cold)) requireNoMap(next.get(cold).binding.mapName());
             });
+            requirePrepared.run();
             // Finish all external callbacks before the final, purely local publication checks.
             requireOpen();
             before.forEach((cold, original) -> { if (slots.get(cold) != original) throw fenced(); });

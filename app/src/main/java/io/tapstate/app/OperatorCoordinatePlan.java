@@ -6,7 +6,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.OperatorMapBinding;
-import io.tapstate.runtime.engine.OperatorMapBindings;
+import io.tapstate.runtime.engine.OperatorMapCapacity;
 import io.tapstate.runtime.engine.OperatorMapCoordinates;
 import io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap;
 import io.tapstate.runtime.engine.OperatorRunManifest;
@@ -122,18 +122,12 @@ final class OperatorCoordinatePlan {
         return new OperatorRunManifest(scope.pipelineId(),original,placements.stream()
                 .map(position -> new OperatorMapBinding(position,original,original.operatorExecutionKey())).toList());
     }
+    List<OperatorMapCapacity> capacities() {
+        return maps.stream().map(map -> new OperatorMapCapacity(map.placement(),map.entriesHeldInMemory())).toList();
+    }
     /** Fresh mutable configurations; successive attempts share only the stable physical pattern. */
     List<MapConfig> configurations(String splitBrainProtection) {
-        return maps.stream().map(map -> {
-            String pattern = OperatorMapBinding.configurationPattern(map.placement());
-            MapConfig config = map.placement().resource() == Resource.NEST_STATE
-                    ? NestSettings.defaults().withEntriesHeldInMemory(map.entriesHeldInMemory())
-                            .backedStateMaps(pattern,map.placement().database())
-                    : JoinMaps.backedStateMaps(pattern,map.entriesHeldInMemory());
-            config.getMapStoreConfig().getProperties().setProperty(OperatorMapBindings.SCOPED_PROPERTY,"true");
-            if (splitBrainProtection != null) config.setSplitBrainProtectionName(splitBrainProtection);
-            return config;
-        }).toList();
+        return capacities().stream().map(capacity -> capacity.configuration(splitBrainProtection)).toList();
     }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
 }

@@ -51,6 +51,14 @@ class OperatorMapBindingsTest {
         fenced(() -> hot.save("foreign", "key",new byte[]{1}));
     }
 
+    @Test void aFinalPreparationCallbackCannotReviveTheOriginalBindingItRetired() {
+        var member = member(); var original = binding(placement(OperatorPlacement.Resource.JOIN_FACTS,"facts"),1);
+        var registry = OperatorMapBindings.bindTo(member,(binding,active) -> new RecordingStore()); registry.install(List.of(original));
+        var old = registry.join(original.mapName());
+        fenced(() -> registry.install(List.of(original),() -> assertThat(registry.release(original)).isTrue()));
+        fenced(() -> registry.join(original.mapName())); fenced(() -> old.count(original.mapName()));
+    }
+
     @Test void oldHandlesAndLateReleasesCannotTouchTheNewSlot() {
         var member = member(); var cold = new RecordingStore(); var place = placement(OperatorPlacement.Resource.JOIN_FACTS,"facts");
         var first = binding(place,1); var second = binding(place,2);
