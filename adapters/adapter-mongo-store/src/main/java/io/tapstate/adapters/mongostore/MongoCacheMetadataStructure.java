@@ -57,11 +57,19 @@ final class MongoCacheMetadataStructure {
     }
 
     /** Load-only validation: neither missing collections nor missing or changed indexes cause DDL. */
-    void verify() {
+    void verify() { verify(TABLES); }
+
+    void verifyFacet(SystemCollections table) {
+        if (!TABLES.contains(Objects.requireNonNull(table, "table"))) throw new IllegalArgumentException("not a metadata resource");
+        verify(List.of(table));
+    }
+
+    private void verify(List<SystemCollections> tables) {
         StoreIo.run(() -> {
-            var existing = collections();
-            if (!existing.keySet().equals(names())) throw unreadable("collections");
-            for (var table : TABLES) {
+            var required = names(tables);
+            var existing = collections(required);
+            if (!existing.keySet().equals(required)) throw unreadable("collections");
+            for (var table : tables) {
                 for (String name : table.physicalNames()) {
                     Document description = existing.get(name);
                     if (!"collection".equals(description.get("type"))) throw unreadable("collection-type");
@@ -84,16 +92,19 @@ final class MongoCacheMetadataStructure {
         });
     }
 
-    private Map<String, Document> collections() {
+    private Map<String, Document> collections() { return collections(names()); }
+
+    private Map<String, Document> collections(Set<String> required) {
         var result = new java.util.LinkedHashMap<String, Document>();
-        for (Document row : database.listCollections().filter(new Document("name", new Document("$in", new ArrayList<>(names()))))) {
+        for (Document row : database.listCollections().filter(new Document("name", new Document("$in", new ArrayList<>(required))))) {
             String name = row.getString("name");
             if (result.put(name, row) != null) throw unreadable("collections");
         }
         return result;
     }
-    private static Set<String> names() {
-        var names = new LinkedHashSet<String>(); TABLES.forEach(table -> names.addAll(table.physicalNames())); return names;
+    private static Set<String> names() { return names(TABLES); }
+    private static Set<String> names(List<SystemCollections> tables) {
+        var names = new LinkedHashSet<String>(); tables.forEach(table -> names.addAll(table.physicalNames())); return names;
     }
     private List<SystemCollections.IndexSpec> indexes(SystemCollections table) {
         if (table == SystemCollections.CACHE_PIPELINE_RATE_HISTORY) return List.of(

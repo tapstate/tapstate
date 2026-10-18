@@ -112,6 +112,21 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
     }
 
+    public io.tapstate.spi.store.ConnectorCatalogStore connectorCatalog(CacheBusinessScope expected, Runnable requireActive) {
+        return new MongoCacheConnectorCatalogStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_CATALOG, requireActive));
+    }
+    public io.tapstate.spi.store.ConnectorSpecStore connectorSpecs(CacheBusinessScope expected, Runnable requireActive) {
+        return new MongoCacheConnectorSpecStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_SPECS, requireActive));
+    }
+    public io.tapstate.spi.store.ConnectionTestResultStore connectionTestResults(CacheBusinessScope expected, Runnable requireActive) {
+        return new MongoCacheConnectionTestResultStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTION_TEST_RESULTS, requireActive));
+    }
+    private MongoCacheMetadataAccess metadataAccess(CacheBusinessScope expected, SystemCollections table, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        var access = new MongoCacheMetadataAccess(client, database, expected, table, () -> { businessActive(); requireActive.run(); });
+        access.verify(); return access;
+    }
+
     /** Controlled first preparation retains this exact cache domain and caller lifecycle. */
     public io.tapstate.spi.store.PipelineCachePreparations pipelinePreparations(CacheBusinessScope expected, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");

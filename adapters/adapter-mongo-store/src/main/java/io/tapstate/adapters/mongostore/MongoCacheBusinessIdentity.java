@@ -42,6 +42,9 @@ final class MongoCacheBusinessIdentity {
         }
     }
 
+    /** Explicit, low-volume metadata mutations share the root write that serializes retirement. */
+    void admitMetadataWrite(ClientSession session) { admitClaim(session); }
+
     void requireAdmissionState(ClientSession session) { admissionRevision(readyIdentity(session)); }
 
     /** Publish retirement and expire the original domain's claims in this same cache transaction. */
