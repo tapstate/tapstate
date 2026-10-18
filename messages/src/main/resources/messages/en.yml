@@ -59,6 +59,9 @@ actuation.connector-unavailable-on-member:
 actuation.connector-differs-across-members:
   message: "Pipeline {pipeline} was not started: the members load different artifacts for connector {connector} ({artifacts})."
   solution: "Check that every member reads the same store; a registration replaced while the pipeline was starting is picked up by starting it again."
+actuation.operator-state-unavailable-on-member:
+  message: "Pipeline {pipeline} was not submitted: member {member} could not prepare its original operator state ({reason})."
+  solution: "Resolve the reported member, configuration or execution-authority failure before retrying. Keep the original cache state; do not delete claims or change storage to bypass the refusal."
 actuation.schema-sync-while-running:
   message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
   solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."

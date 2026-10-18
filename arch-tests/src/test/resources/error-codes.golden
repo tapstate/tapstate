@@ -16,6 +16,7 @@ actuation.join-source-not-declared
 actuation.join-sql-invalid
 actuation.no-safe-parallelism
 actuation.not-a-pipeline
+actuation.operator-state-unavailable-on-member
 actuation.parallelism-needs-a-key
 actuation.pipeline-not-found
 actuation.preview-refused

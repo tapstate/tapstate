@@ -232,7 +232,11 @@ enum ActuationError implements TapstateErrorCode {
      * replaced while the run was starting.
      */
     CONNECTOR_DIFFERS_ACROSS_MEMBERS("actuation.connector-differs-across-members",
-            Set.of("pipeline", "connector", "artifacts"));
+            Set.of("pipeline", "connector", "artifacts")),
+
+    /** The original run cannot prepare its operator bindings on a required member. */
+    OPERATOR_STATE_UNAVAILABLE_ON_MEMBER("actuation.operator-state-unavailable-on-member",
+            Set.of("pipeline","member","reason"));
 
     private final String code;
     private final Set<String> placeholders;
