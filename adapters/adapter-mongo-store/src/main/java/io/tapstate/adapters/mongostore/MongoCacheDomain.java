@@ -2,6 +2,8 @@ package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheAuthScope;
+import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.CloudSessionStore;
@@ -18,8 +20,13 @@ import java.util.Set;
 /** One cache client owner, with authentication preparation independent from business-domain assembly. */
 public final class MongoCacheDomain implements AutoCloseable {
     private final MongoConnection connection;
+    private final com.mongodb.client.MongoClient client;
+    private final com.mongodb.client.MongoDatabase database;
+    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
-    private MongoCacheDomain(MongoConnection connection) { this.connection = connection; }
+    private MongoCacheDomain(MongoConnection connection) {
+        this.connection = connection; this.client = connection.client(); this.database = connection.database();
+    }
 
     /** Connectivity alone creates no identity, schema, session, membership or business resource. */
     public static MongoCacheDomain connect(StorageBinding.Connection cache, Duration timeout, String processId) {
@@ -83,6 +90,58 @@ public final class MongoCacheDomain implements AutoCloseable {
         return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> verifyAuthPresence(scope.mode()));
     }
 
+    /** Verifies a fixed business identity and its schema; individual facets verify their own structures. */
+    public CacheBusinessScope loadBusinessScope(CacheBusinessScope expected) {
+        businessActive();
+        return StoreIo.call(() -> {
+            try (var session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    businessActive();
+                    new MongoCacheBusinessIdentity(database, expected).requireAdmissionState(session);
+                    businessActive();
+                    return expected;
+                }, businessTransaction());
+            } catch (RuntimeException failure) { businessActive(); throw failure; }
+        });
+    }
+
+    /** The claims share this exact cache client, original scope and owner lifecycle. */
+    public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
+        loadBusinessScope(expected);
+        StoreIo.run(() -> MongoCacheWorkloadClaimStore.requireCollection(database));
+        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
+    }
+
+    /**
+     * Only the original authorized operation may retire a business scope; it does not change auth.
+     * Cache fencing does not establish that external calls already issued have drained; the caller
+     * retains the existing isolation/drain requirements before publishing another running domain.
+     */
+    public void retireBusiness(CacheBusinessScope expected, String operationId, Runnable requireActive) {
+        Objects.requireNonNull(expected, "scope"); Objects.requireNonNull(requireActive, "requireActive");
+        if (operationId == null || operationId.isBlank()) throw new IllegalArgumentException("retirement operation must be fixed");
+        StoreIo.run(() -> {
+            try {
+                businessActive(); requireActive.run();
+                try (var session = client.startSession()) {
+                    session.withTransaction(() -> {
+                        businessActive(); requireActive.run();
+                        MongoCacheWorkloadClaimStore.requireCollection(database);
+                        new MongoCacheBusinessIdentity(database, expected).retire(session, operationId);
+                        businessActive(); requireActive.run();
+                        return null;
+                    }, businessTransaction());
+                }
+            } catch (RuntimeException failure) { businessActive(); requireActive.run(); throw failure; }
+        });
+    }
+
+    private void businessActive() { if (closed.get()) throw MongoCacheBusinessIdentity.businessFenced(); }
+    private static com.mongodb.TransactionOptions businessTransaction() {
+        return com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
+                .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build();
+    }
+
     private MongoCacheIdentity facts(CacheAuthScope scope) {
         return new MongoCacheIdentity(connection.client(), connection.database(), Objects.requireNonNull(scope, "scope"));
     }
@@ -121,5 +180,5 @@ public final class MongoCacheDomain implements AutoCloseable {
     private static TapstateException unreadableIndex() {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "cache-auth", "field", "index"), null);
     }
-    @Override public void close() { connection.close(); }
+    @Override public void close() { if (closed.compareAndSet(false, true)) connection.close(); }
 }

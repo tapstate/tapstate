@@ -60,6 +60,98 @@ class MongoSrsModelStoreIT {
     private static final String RING = "srs.chain-a.orders";
 
     @Test
+    void retirementBeforeOriginalClaimProofRejectsTheWholeDelayedModelPublication() {
+        withBusiness(f -> {
+            var paused = new CountDownLatch(1); var proceed = new CountDownLatch(1); var once = new AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims")
+                            && once.compareAndSet(false, true)) { paused.countDown(); awaitBarrier(proceed); }
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build());
+                 var domain = businessDomain(f.database()); var workers = Executors.newSingleThreadExecutor()) {
+                var store = new MongoSrsModelStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
+                var originalChain = SystemCollections.SRS_CHAINS.on(f.database()).find().first();
+                var result = workers.submit(() -> store.publish(model(0, table("id", null)), f.fence()));
+                try {
+                    assertThat(paused.await(10, TimeUnit.SECONDS)).isTrue();
+                    domain.retireBusiness(SCOPE, "retire-a", () -> {});
+                } finally { proceed.countDown(); }
+                assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
+                        .satisfies(error -> businessFenced(error.getCause()));
+                assertThat(models(f.database()).countDocuments()).isZero();
+                assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isZero();
+                assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first()).isEqualTo(originalChain);
+                assertThat(new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()))
+                        .read(f.claim().key()).orElseThrow().leased()).isFalse();
+            }
+        });
+    }
+
+    @Test
+    void aPublicationAlreadyHoldingItsOriginalClaimCommitsBeforeRetirementCompletes() {
+        withBusiness(f -> {
+            var held = new CountDownLatch(1); var proceed = new CountDownLatch(1); var retirementTried = new CountDownLatch(1);
+            var request = new AtomicInteger(-1); var once = new AtomicBoolean();
+            var writerListener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims"))
+                        request.compareAndSet(-1, event.getRequestId());
+                }
+                @Override public void commandSucceeded(CommandSucceededEvent event) {
+                    if (event.getRequestId() == request.get() && once.compareAndSet(false, true)) { held.countDown(); awaitBarrier(proceed); }
+                }
+            };
+            var retirementListener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims"))
+                        retirementTried.countDown();
+                }
+            };
+            try (var writer = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(writerListener).build());
+                 var retirement = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(retirementListener).build()); var workers = Executors.newFixedThreadPool(2)) {
+                var store = new MongoSrsModelStore(writer, writer.getDatabase(f.database().getName()), SCOPE);
+                var result = workers.submit(() -> store.publish(model(0, table("id", null)), f.fence()));
+                try {
+                    assertThat(held.await(10, TimeUnit.SECONDS)).isTrue();
+                    var retired = workers.submit(() -> {
+                        try (var session = retirement.startSession()) {
+                            return session.withTransaction(() -> {
+                                new MongoCacheBusinessIdentity(retirement.getDatabase(f.database().getName()), SCOPE).retire(session, "retire-a");
+                                return true;
+                            }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
+                                    .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+                        }
+                    });
+                    try { assertThat(retirementTried.await(10, TimeUnit.SECONDS)).isTrue(); }
+                    finally { proceed.countDown(); }
+                    assertThat(result.get(15, TimeUnit.SECONDS)).isEqualTo(model(0, table("id", null)));
+                    assertThat(retired.get(15, TimeUnit.SECONDS)).isTrue();
+                } finally { proceed.countDown(); }
+                assertThat(models(f.database()).countDocuments()).isEqualTo(1);
+                assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isEqualTo(1);
+                assertThat(SystemCollections.CACHE_IDENTITY.on(f.database()).find().first()).containsEntry("businessPhase", "RETIRED");
+                assertThat(new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()))
+                        .read(f.claim().key()).orElseThrow().leased()).isFalse();
+            }
+        });
+    }
+
+    private static MongoCacheDomain businessDomain(MongoDatabase database) {
+        return MongoCacheDomain.connect(new io.tapstate.spi.store.StorageBinding.Connection(
+                io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, MONGO.getReplicaSetUrl(database.getName()), database.getName(), null),
+                Duration.ofSeconds(5), "model-retirement-test");
+    }
+    private static void awaitBarrier(CountDownLatch latch) {
+        try { if (!latch.await(15, TimeUnit.SECONDS)) throw new AssertionError("model test barrier did not open"); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+    }
+
+    @Test
     void actualTypedTableAndImmutableVersionSurviveReopenWithoutDiscoveryMeasurements() {
         withBusiness(f -> {
             var model = model(0, table("id", 999L));
@@ -1066,7 +1158,7 @@ class MongoSrsModelStoreIT {
                 }
                 SystemCollections.CACHE_IDENTITY.on(database).insertOne(new Document("_id", "cluster").append("clusterId", SCOPE.clusterId())
                         .append("layoutId", MongoConfigurationDomain.LAYOUT).append("bindingVersion", 1L).append("cacheIncarnation", SCOPE.cacheIncarnation())
-                        .append("businessPhase", "READY").append("businessPreparationId", "business-a").append("authGeneration", 1L));
+                        .append("businessPhase", "READY").append("businessPreparationId", "business-a").append("authGeneration", 1L).append("claimAdmissionFence", 0L));
                 SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY").append("epoch", 1L).append("operationId", "business-a"));
                 var claim = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).acquire(
                         new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-a"), new WorkloadOwner("node-a", "boot-a"), 1, Duration.ofSeconds(30)).claim();
