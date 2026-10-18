@@ -114,6 +114,18 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
+    void aRuntimeRegisteredPreviewRemainsOutsideTheSeedSetAcrossRestart() throws Exception {
+        var uploaded = stores.register("db2i", "2.0.6-SNAPSHOT", RegistrationSource.REGISTER, new byte[] {4, 2});
+        stores.rows.put("db2i", TapstateCatalog.load().byId("db2i"));
+
+        gate().verifyRegistrations(outcomes);
+        gate().verifyRegistrations(outcomes);
+
+        assertThat(stores.findAll("db2i")).containsExactly(uploaded.registration());
+        assertThat(stores.rows.get("db2i").sink().capable()).isFalse();
+    }
+
+    @Test
     void aBundledDb2RuntimeHasItsOwnBoundAndStillNeedsMatchingArtifactBytes() throws Exception {
         Object originalLength = entry("db2").get("bytes");
         entry("db2").put("bytes", 203_082_147);
