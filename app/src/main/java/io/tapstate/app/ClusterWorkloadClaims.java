@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -31,6 +32,16 @@ final class ClusterWorkloadClaims {
             return Optional.empty();
         }
         return Optional.of(store.acquire(key, owner, topologyRevision, ttl));
+    }
+
+    Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        return membership.businessEligible()
+                ? Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl)) : Optional.empty();
+    }
+
+    Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
+        return membership.businessEligible() ? store.readPipeline(scope) : Optional.empty();
     }
 
     /**
