@@ -220,7 +220,17 @@ public enum SystemCollections {
     CACHE_SRS_CONSUMER_OFFSETS("srs_consumer_offsets", Database.CACHE, MongoSrsConsumerStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("_id.cacheIncarnation", "_id.chain"), false, "srs_offsets_chain")),
     CACHE_PIPELINE_STATE("pipeline_state", Database.CACHE, MongoCachePipelineStateStore.class, Strategy.MIGRATED, 1),
-    CACHE_PIPELINE_OBSERVATION("pipeline_observation", Database.CACHE, MongoCachePipelineObservationStore.class, Strategy.MIGRATED, 1);
+    CACHE_PIPELINE_OBSERVATION("pipeline_observation", Database.CACHE, MongoCachePipelineObservationStore.class, Strategy.MIGRATED, 1),
+    CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoSchemaStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoConnectorCatalogStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoConnectorSpecStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTION_TEST_RESULTS("connection_test_results", Database.CACHE, MongoConnectionTestResultStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
+            new IndexSpec(List.of("metadata.connectorId"), false)),
+    CACHE_DERIVED_SCHEMAS("derived_schemas", Database.CACHE, MongoDerivedSchemaStore.class, Strategy.MIGRATED, 1),
+    CACHE_PIPELINE_RATE_HISTORY("pipeline_rate_history", Database.CACHE, MongoRateHistoryStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
+            new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -344,6 +354,18 @@ public enum SystemCollections {
             throw new IllegalStateException(collectionName + " is a plain collection; ask for the collection");
         }
         return GridFSBuckets.create(database, collectionName);
+    }
+
+    /** Explicit schema preparation owns both GridFS physical collections before any upload. */
+    void prepareGridFsCollectionsOn(MongoDatabase database, com.mongodb.client.ClientSession session) {
+        if (kind != Kind.GRIDFS_BUCKET) throw new IllegalStateException("only GridFS buckets have two physical collections");
+        for (String name : physicalNames()) database.createCollection(session, name);
+    }
+
+    /** The chunk-index handle remains inside this registry, like every other collection handle. */
+    MongoCollection<Document> chunksOn(MongoDatabase database) {
+        if (kind != Kind.GRIDFS_BUCKET) throw new IllegalStateException("only GridFS buckets contain chunks");
+        return database.getCollection(physicalNames().get(1));
     }
 
     public String collectionName() {
