@@ -101,15 +101,20 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                             var identity = new MongoCacheBusinessIdentity(database, scope);
                             if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
                             requireCollection(database);
+                            var store = raw.inStrictSession(session);
                             if (pipeline != null) {
                                 var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
                                 access.verifyStructures();
                                 var current = access.state(session);
+                                if (current.getLong("runtimeWriteFence") > 0 && store.read(new WorkloadClaimKey(
+                                        pipeline.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, pipeline.pipelineId())).isEmpty())
+                                    throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                                            Map.of("id", pipeline.pipelineId(), "field", "pipeline-claim-history"), null);
                                 // A real per-Pipeline write serializes admission with state replacement,
                                 // including a first claim absent from the replacement's claim snapshot.
                                 access.updateState(session, current, new Document(), false);
                             }
-                            T result = operation.apply(raw.inSession(session));
+                            T result = operation.apply(store);
                             requireActive.run();
                             return result;
                         }, TRANSACTION);

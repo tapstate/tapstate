@@ -20,6 +20,8 @@ import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -317,6 +319,9 @@ class MongoCacheWorkloadClaimStoreIT {
 
     @Test void exhaustedPipelineWriteFenceRefusesAdmissionWithoutOverflow() {
         withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var original = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            assertThat(claims.release(original)).isTrue();
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document("_id", "orders"),
                     new Document("$set", new Document("runtimeWriteFence", Long.MAX_VALUE - 1)));
             var before = snapshot(f.database());
@@ -333,6 +338,124 @@ class MongoCacheWorkloadClaimStoreIT {
             assertThatThrownBy(() -> raw.acquirePipeline(PIPELINE, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
                     error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void fractionalClaimGenerationIsUnreadableInsteadOfBeingTruncated() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE); claims.acquirePipeline(PIPELINE, OWNER, 1, TTL);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("claimGeneration", 1.75d)));
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.read(KEY)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void aKnownMissingGenerationCannotBeReconstructedBySameOwnerAcquisition() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE); claims.acquirePipeline(PIPELINE, OWNER, 1, TTL);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$unset", new Document("claimGeneration", 1)));
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void aMalformedClaimTypeUsesACodedDiagnosticWithoutItsRawValueOrCause() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE); claims.acquirePipeline(PIPELINE, OWNER, 1, TTL);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("resourceType", "private-sentinel-type")));
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.read(KEY)).isInstanceOfSatisfying(TapstateException.class, error -> {
+                assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                assertThat(error.getCause()).isNull(); assertThat(error.getMessage()).doesNotContain("private-sentinel-type");
+            });
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void lossOfAKnownPipelineClaimCannotRestartItsGenerationCounters() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var original = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            claims.advanceExecution(original, 1, Set.of("node-a")).orElseThrow();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).deleteMany(new Document());
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"contextExecutionGeneration", "executionClaimGeneration", "executionNodeIds", "failureClaimGeneration", "failureAfterMemberLoss"})
+    void publishedExecutionContextCannotBeDefaultedOrRepairedWhenAFieldIsLost(String field) {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var original = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var run = claims.advanceExecution(original, 1, Set.of("node-a")).orElseThrow();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(), new Document("$unset", new Document(field, 1)));
+            var before = snapshot(f.database());
+            List<org.assertj.core.api.ThrowableAssert.ThrowingCallable> operations = List.of(
+                    () -> claims.read(KEY), () -> claims.readAll(List.of(KEY)), () -> claims.renew(run, TTL),
+                    () -> claims.release(run), () -> claims.advanceExecution(run, 1, Set.of("node-a")),
+                    () -> claims.recordExecutionFailure(run, false), () -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL));
+            for (var operation : operations) {
+                assertThatThrownBy(operation).isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE); assertThat(error.getCause()).isNull();
+                });
+                assertThat(snapshot(f.database())).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void primitiveTypesAndCanonicalClaimKeysCannotBeCoercedIntoValidFacts() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var first = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            claims.advanceExecution(first, 1, Set.of("node-a")).orElseThrow();
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            var original = table.find().first();
+            for (var mutation : List.of(new Document("claimGeneration", 1), new Document("executionGeneration", 1),
+                    new Document("topologyRevision", -1L), new Document("leaseUntil", "private-sentinel-time"),
+                    new Document("ownerBootId", null), new Document("resourceId", "another"),
+                    new Document("executionNodeIds", List.of("node-a", "node-a")), new Document("contextExecutionGeneration", 1.25d),
+                    new Document("failureAfterMemberLoss", "bad"))) {
+                table.updateOne(new Document(), new Document("$set", mutation));
+                var before = snapshot(f.database());
+                for (org.assertj.core.api.ThrowableAssert.ThrowingCallable read : List.<org.assertj.core.api.ThrowableAssert.ThrowingCallable>of(
+                        () -> claims.read(KEY), () -> claims.readAll(List.of(KEY))))
+                    assertThatThrownBy(read).isInstanceOfSatisfying(TapstateException.class, error -> {
+                        assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE); assertThat(error.getCause()).isNull();
+                    });
+                assertThat(snapshot(f.database())).isEqualTo(before);
+                table.replaceOne(new Document(), original);
+            }
+        });
+    }
+
+    @Test void completeExplicitUnknownContextIsSafeButPartialInitialContextIsNotDefaulted() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var first = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            assertThat(first.executionGeneration()).isZero();
+            assertThat(claims.read(KEY).orElseThrow().claim()).isEqualTo(first);
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            var initial = table.find().first();
+            table.updateOne(new Document(), new Document("$set", new Document("contextExecutionGeneration", 0L)));
+            assertThatThrownBy(() -> claims.read(KEY)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            table.replaceOne(new Document(), initial);
+            claims.advanceExecution(first, 1, Set.of("node-a")).orElseThrow();
+            table.updateOne(new Document(), new Document("$set", new Document("contextExecutionGeneration", 0L).append("executionClaimGeneration", 0L)
+                    .append("executionNodeIds", List.of()).append("failureClaimGeneration", 0L).append("failureAfterMemberLoss", false)));
+            var unknown = claims.read(KEY).orElseThrow().claim();
+            assertThat(unknown.contextExecutionGeneration()).isZero();
+            assertThat(claims.recordExecutionFailure(unknown, false)).isEmpty();
+            var next = claims.advanceExecution(unknown, 1, Set.of("node-a")).orElseThrow();
+            assertThat(next.contextExecutionGeneration()).isEqualTo(next.executionGeneration());
         });
     }
 
