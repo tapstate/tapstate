@@ -1,0 +1,275 @@
+package io.tapstate.adapters.mongostore;
+
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.ReadConcern;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.*;
+import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
+import org.bson.types.Binary;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import static org.assertj.core.api.Assertions.*;
+
+/** Actual transactions bind opaque operator bytes to one physical scope and original execution. */
+@RequiresDocker
+class MongoCacheOperatorStateStoreIT {
+    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster-a", 1, "cache-a", "orders", 1);
+    private static final CacheBusinessScope BUSINESS = new CacheBusinessScope("cluster-a", 1, "cache-a");
+    private static final WorkloadClaimKey KEY = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+    private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
+    private static final Runnable ACTIVE = () -> {};
+
+    @Test void resourceTypesUseIndependentCollectionsAndKeyedBatches() {
+        withFixture(f -> {
+            for (var kind : OperatorPlacement.Resource.values()) {
+                var placement = f.at(kind); var store = f.writer(placement);
+                store.save(placement.mapName(), "key", new byte[]{(byte)kind.ordinal()});
+                assertThat(store.saveIfAbsent(placement.mapName(), "key", new byte[]{99})).hasValue(new byte[]{(byte)kind.ordinal()});
+                assertThat(store.saveIfAbsent(placement.mapName(), "other", new byte[]{42})).isEmpty();
+                assertThat(store.loadAll(placement.mapName(), List.of("key", "other", "missing"))).containsOnlyKeys("key", "other");
+                assertThat(store.load(placement.mapName(), "key")).hasValue(new byte[]{(byte)kind.ordinal()});
+                assertThat(store.count(placement.mapName())).isEqualTo(2);
+                store.delete(placement.mapName(), "other"); assertThat(store.count(placement.mapName())).isOne();
+                assertThat(MongoCacheOperatorStateStore.table(kind).on(f.database).countDocuments()).isOne();
+            }
+            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("operator_state", "pdk_notes", "nest_dead_letters");
+        });
+    }
+
+    @Test void originalScopeCanReloadAfterReopenWithoutCreatingOrChangingAnything() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(), "key", new byte[]{1,2}); var before = f.snapshot();
+            try (var reopened = MongoCacheDomain.connect(f.binding, Duration.ofSeconds(5), "reopen")) {
+                assertThat(reopened.operatorState(at).load(at.mapName(), "key")).hasValue(new byte[]{1,2});
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void readOnlyViewsCannotMutateAndAnActiveWriterCannotPerformRetirement() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.JOIN_FACTS); var store = f.domain.operatorState(at); var before = f.snapshot();
+            code(() -> store.save(at.mapName(), "key", new byte[]{1}), IoError.CACHE_BUSINESS_FENCED);
+            code(() -> store.saveIfAbsent(at.mapName(), "key", new byte[]{1}), IoError.CACHE_BUSINESS_FENCED);
+            code(() -> store.delete(at.mapName(), "key"), IoError.CACHE_BUSINESS_FENCED);
+            code(() -> f.writer(at).dropNamespace(at.mapName()), IoError.WORKLOAD_CLAIM_FENCED);
+            code(() -> store.load("join.orders.step.fact", "key"), IoError.CACHE_BUSINESS_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void inputBytesAreCapturedBeforeAnyGuardCallback() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); byte[] bytes = {1,2}; var once = new AtomicBoolean();
+            var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(f.client, f.database, SCOPE, WorkloadClaimFence.from(f.claim), () -> {
+                if (once.compareAndSet(false,true)) bytes[0] = 99;
+            }), at);
+            writer.save(at.mapName(), "key", bytes);
+            assertThat(f.writer(at).load(at.mapName(), "key")).hasValue(new byte[]{1,2}); assertThat(bytes[0]).isEqualTo((byte)99);
+        });
+    }
+
+    @Test void anOldExecutionCannotWriteDeleteOrAllocateWithTheAdvancedClaim() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.JOIN_WRITERS); var old = f.writer(at); old.save(at.mapName(), "key", new byte[]{1});
+            var advanced = f.domain.workloadClaims(BUSINESS).advanceExecution(f.claim,1,Set.of(OWNER.nodeId())).orElseThrow(); var before = f.snapshot();
+            code(() -> old.save(at.mapName(), "key", new byte[]{2}), IoError.WORKLOAD_CLAIM_FENCED);
+            code(() -> old.saveIfAbsent(at.mapName(), "new", new byte[]{2}), IoError.WORKLOAD_CLAIM_FENCED);
+            code(() -> old.delete(at.mapName(), "key"), IoError.WORKLOAD_CLAIM_FENCED); assertThat(f.snapshot()).isEqualTo(before);
+            var current = f.domain.operatorState(at,WorkloadClaimFence.from(advanced),ACTIVE); current.save(at.mapName(), "key", new byte[]{3});
+            assertThat(current.load(at.mapName(), "key")).hasValue(new byte[]{3});
+        });
+    }
+
+    @Test void aNewStableGenerationUsesDifferentHotAndColdAddressesAndDoesNotAdoptOldBytes() {
+        withFixture(f -> {
+            var oldAt = f.at(OperatorPlacement.Resource.NEST_STATE); var old = f.writer(oldAt); old.save(oldAt.mapName(), "key", new byte[]{1});
+            var next = new PipelineIntentScope("cluster-a",1,"cache-a","orders",2);
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database).updateOne(new Document("_id","orders"),new Document("$set",new Document("scope",MongoPipelinePreparationFacts.scope(next))));
+            f.claims().updateOne(new Document("_id",MongoWorkloadClaimStore.id(KEY)),new Document("$set",new Document("pipelineScope",MongoPipelinePreparationFacts.scope(next))));
+            var nextAt = new OperatorPlacement(next,f.database.getName(),oldAt.resource(),oldAt.stepId(),oldAt.pathId(),oldAt.namespace());
+            var current = f.domain.operatorState(nextAt,WorkloadClaimFence.from(f.claim),ACTIVE);
+            assertThat(nextAt.mapName()).isNotEqualTo(oldAt.mapName()); assertThat(current.load(nextAt.mapName(),"key")).isEmpty();
+            current.save(nextAt.mapName(),"key",new byte[]{2}); var before = f.snapshot();
+            code(() -> old.load(oldAt.mapName(),"key"),IoError.CACHE_BUSINESS_FENCED);
+            code(() -> old.save(oldAt.mapName(),"key",new byte[]{99}),IoError.CACHE_BUSINESS_FENCED);
+            code(() -> old.delete(oldAt.mapName(),"key"),IoError.CACHE_BUSINESS_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before); assertThat(SystemCollections.CACHE_NEST_STATE.on(f.database).countDocuments()).isEqualTo(2);
+            assertThat(current.load(nextAt.mapName(),"key")).hasValue(new byte[]{2});
+        });
+    }
+
+    @Test void missingCollectionsAndIndexesAreUnknownAndNeverRepaired() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var table = SystemCollections.CACHE_NEST_STATE.on(f.database);
+            table.dropIndex("operator_placement"); var before = f.snapshot();
+            code(() -> f.writer(at).load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE); assertThat(f.snapshot()).isEqualTo(before);
+            table.drop(); code(() -> f.writer(at).save(at.mapName(),"key",new byte[]{1}),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("nest_state");
+        });
+    }
+
+    @Test void damagedOpaqueRecordsAreNotConvertedToAnEmptyMapOrLeakedThroughCauses() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.JOIN_DIMENSIONS); var writer = f.writer(at); writer.save(at.mapName(),"key",new byte[]{1});
+            var table = MongoCacheOperatorStateStore.table(at.resource()).on(f.database); var saved = table.find().first();
+            for (var mutation : List.of(new Document("formatVersion",1L),new Document("state","private-sentinel"),new Document("state",new Binary((byte)0x80,new byte[]{1})))) {
+                table.updateOne(new Document(),new Document("$set",mutation));
+                code(() -> writer.load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+                code(() -> writer.loadAll(at.mapName(),List.of("key")),IoError.DOCUMENT_UNREADABLE);
+                table.replaceOne(new Document(),saved);
+            }
+        });
+    }
+
+    @Test void losingTheGuardAfterPayloadWriteRollsBackClaimCheckpointAndPayloadTogether() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.JOIN_INDEXES); var before = f.snapshot(); var lost = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("join_indexes")) lost.set(true);
+            }};
+            try (var observed = observed(listener)) {
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(observed,observed.getDatabase(f.database.getName()),SCOPE,WorkloadClaimFence.from(f.claim),() -> {
+                    if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+                }),at);
+                code(() -> writer.save(at.mapName(),"key",new byte[]{1}),IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void aDelayedWriteCannotPassItsOriginalClaimAfterAnotherClientAdvancedTheExecution() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var pause = new CountDownLatch(1); var resume = new CountDownLatch(1); var once = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims") && once.compareAndSet(false,true)) {
+                    pause.countDown(); await(resume);
+                }
+            }};
+            try (var observed = observed(listener); var worker = Executors.newSingleThreadExecutor()) {
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(observed,observed.getDatabase(f.database.getName()),SCOPE,WorkloadClaimFence.from(f.claim),ACTIVE),at);
+                var future = worker.submit(() -> writer.save(at.mapName(),"key",new byte[]{1}));
+                try { assertThat(pause.await(10,TimeUnit.SECONDS)).isTrue(); f.domain.workloadClaims(BUSINESS).advanceExecution(f.claim,1,Set.of(OWNER.nodeId())).orElseThrow(); }
+                finally { resume.countDown(); }
+                assertThatThrownBy(() -> future.get(15,TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
+                    .satisfies(failure -> assertThat(((TapstateException)failure.getCause()).code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(SystemCollections.CACHE_NEST_STATE.on(f.database).countDocuments()).isZero();
+                assertThat(f.claims().find().first().get("fencedPipelineWrites")).isNull();
+            }
+        });
+    }
+
+    @Test void concurrentSaveIfAbsentReturnsOneDurableWinnerToBothCallers() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.JOIN_WRITERS); var gate = new CountDownLatch(1);
+            try (var other = MongoCacheDomain.connect(f.binding,Duration.ofSeconds(5),"other"); var workers = Executors.newFixedThreadPool(2)) {
+                var one = workers.submit(() -> { await(gate); return f.writer(at).saveIfAbsent(at.mapName(),"key",new byte[]{1}); });
+                var two = workers.submit(() -> { await(gate); return other.operatorState(at,WorkloadClaimFence.from(f.claim),ACTIVE).saveIfAbsent(at.mapName(),"key",new byte[]{2}); });
+                gate.countDown(); var first = one.get(15,TimeUnit.SECONDS); var second = two.get(15,TimeUnit.SECONDS);
+                assertThat(List.of(first,second).stream().filter(Optional::isEmpty).count()).isOne();
+                byte[] actual = f.writer(at).load(at.mapName(),"key").orElseThrow();
+                assertThat(first.orElse(new byte[]{1})).isEqualTo(actual); assertThat(second.orElse(new byte[]{2})).isEqualTo(actual);
+                assertThat(f.writer(at).count(at.mapName())).isOne();
+            }
+        });
+    }
+
+    @Test void aMalformedUtf16KeyCannotOverwriteTheReplacementCharacterKey() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var store = f.writer(at);
+            String replacement = Character.toString(0xfffd); String unpaired = new String(new char[]{0xd800});
+            store.save(at.mapName(),replacement,new byte[]{1}); store.save(at.mapName(),unpaired,new byte[]{2});
+            assertThat(store.load(at.mapName(),replacement)).hasValue(new byte[]{1});
+            assertThat(store.load(at.mapName(),unpaired)).hasValue(new byte[]{2});
+            assertThat(store.loadAll(at.mapName(),List.of(replacement,unpaired))).hasSize(2);
+        });
+    }
+
+    @Test void malformedUtf16PlacementTextCannotAliasAnotherOperatorsColdAddress() {
+        withFixture(f -> {
+            var original = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var replacement = new OperatorPlacement(SCOPE,f.database.getName(),original.resource(),"step","root",Character.toString(0xfffd));
+            var unpaired = new OperatorPlacement(SCOPE,f.database.getName(),original.resource(),"step","root",new String(new char[]{0xd800}));
+            f.writer(replacement).save(replacement.mapName(),"key",new byte[]{1}); f.writer(unpaired).save(unpaired.mapName(),"key",new byte[]{2});
+            assertThat(f.writer(replacement).load(replacement.mapName(),"key")).hasValue(new byte[]{1});
+            assertThat(f.writer(unpaired).load(unpaired.mapName(),"key")).hasValue(new byte[]{2});
+            assertThat(SystemCollections.CACHE_NEST_STATE.on(f.database).countDocuments()).isEqualTo(2);
+        });
+    }
+
+    @Test void onlyTheCurrentCacheDatabaseIsAvailableUntilAnExtraPlacementHasBeenPrepared() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+            for (String database : List.of("admin","config","local","configuration","master","other")) {
+                var foreign = new OperatorPlacement(SCOPE,database,at.resource(),at.stepId(),at.pathId(),at.namespace());
+                code(() -> f.domain.operatorState(foreign),IoError.CACHE_BUSINESS_FENCED);
+            }
+        });
+    }
+
+    private static MongoClient observed(CommandListener listener) { return MongoClients.create(MongoClientSettings.builder()
+        .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build()); }
+    private static void await(CountDownLatch latch) { try { if (!latch.await(15,TimeUnit.SECONDS)) throw new AssertionError("test barrier did not open"); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); } }
+    private static void code(org.assertj.core.api.ThrowableAssert.ThrowingCallable action, IoError code) {
+        assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class,e -> {
+            assertThat(e.code()).isEqualTo(code); assertThat(e.getCause()).isNull(); assertThat(e.args().toString()).doesNotContain("private-sentinel");
+        });
+    }
+    private static void withFixture(Scenario scenario) {
+        String name = "cache_operator_"+UUID.randomUUID().toString().replace("-", "");
+        var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,MONGO.getReplicaSetUrl(name),name,null);
+        try (var client = MongoClients.create(MONGO.getReplicaSetUrl()); var domain = MongoCacheDomain.connect(binding,Duration.ofSeconds(5),"operator-it")) {
+            var database = client.getDatabase(name);
+            try {
+                domain.prepareAuth(new CacheAuthScope("cluster-a",1,StorageBinding.Mode.OP,"cache-a",1),"auth-a",ACTIVE);
+                try (var session = client.startSession()) { session.withTransaction(() -> {
+                    new MongoCacheMetadataStructure(database,MongoRateHistoryStore.DEFAULT_RETENTION).prepareBusinessInTransaction(session,ACTIVE); return null;
+                },TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build()); }
+                SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id","cluster"),new Document("$set",new Document("businessPhase","READY")
+                    .append("businessPreparationId","business-a").append("claimAdmissionFence",0L)));
+                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id","business").append("installedVersion",1)
+                    .append("phase","READY").append("epoch",1L).append("operationId","business-a"));
+                SystemCollections.CACHE_PIPELINE_STATE.on(database).insertOne(new Document("_id","orders").append("scope",MongoPipelinePreparationFacts.scope(SCOPE))
+                    .append("stateJson","NEW").append("epoch",0L).append("touchMillis",0L).append("runtimeWriteFence",1L));
+                var raw = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database));
+                var retained = raw.acquire(KEY,OWNER,1,Duration.ofMinutes(5)).claim(); raw.release(retained);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(new Document("_id",MongoWorkloadClaimStore.id(KEY)),new Document("$set",
+                    new Document("pipelineScope",MongoPipelinePreparationFacts.scope(SCOPE)).append("pipelinePreparation",
+                        MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(),PipelineCachePreparations.Phase.PREPARED))));
+                var claim = domain.workloadClaims(BUSINESS).acquirePipeline(SCOPE,OWNER,1,Duration.ofMinutes(5)).claim();
+                claim = domain.workloadClaims(BUSINESS).advanceExecution(claim,1,Set.of(OWNER.nodeId())).orElseThrow();
+                scenario.run(new Fixture(client,database,domain,binding,claim));
+            } finally { database.drop(); }
+        } catch (RuntimeException | Error e) { throw e; } catch (Exception e) { throw new AssertionError(e); }
+    }
+    private record Fixture(MongoClient client, MongoDatabase database, MongoCacheDomain domain, StorageBinding.Connection binding, WorkloadClaim claim) {
+        OperatorPlacement at(OperatorPlacement.Resource kind) { return new OperatorPlacement(SCOPE,database.getName(),kind,"step","root","logical.namespace"); }
+        KeyedStateStore writer(OperatorPlacement at) { return domain.operatorState(at,WorkloadClaimFence.from(claim),ACTIVE); }
+        com.mongodb.client.MongoCollection<Document> claims() { return SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database); }
+        Map<String,List<Document>> snapshot() {
+            var out = new TreeMap<String,List<Document>>();
+            for (var kind : OperatorPlacement.Resource.values()) { var table = MongoCacheOperatorStateStore.table(kind); out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>())); }
+            for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_WORKLOAD_CLAIMS)) out.put(table.collectionName(),table.on(database).find().into(new ArrayList<>()));
+            return out;
+        }
+    }
+    @FunctionalInterface private interface Scenario { void run(Fixture f) throws Exception; }
+}

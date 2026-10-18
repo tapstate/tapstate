@@ -231,7 +231,17 @@ public enum SystemCollections {
     CACHE_PIPELINE_RATE_HISTORY("pipeline_rate_history", Database.CACHE, MongoCacheRateHistoryStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
             new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false)),
-    CACHE_CLUSTER_MEMBERSHIP("cluster_membership", Database.CACHE, MongoCacheClusterMembershipStore.class, Strategy.OWNED_ELSEWHERE, 1);
+    CACHE_CLUSTER_MEMBERSHIP("cluster_membership", Database.CACHE, MongoCacheClusterMembershipStore.class, Strategy.OWNED_ELSEWHERE, 1),
+    CACHE_NEST_STATE("nest_state", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_JOIN_FACTS("join_facts", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_JOIN_DIMENSIONS("join_dimensions", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_JOIN_INDEXES("join_indexes", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_JOIN_WRITERS("join_writers", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

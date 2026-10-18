@@ -5,6 +5,11 @@ package io.tapstate.spi.store;
  * view retains one immutable claim through all transaction retries and never resolves a newer claim.
  */
 public interface PipelineStoreViews {
+    /** A fixed physical operator address; opening a view performs no schema creation or placement change. */
+    default KeyedStateStore operatorState(OperatorPlacement placement) { throw unsupported(); }
+
+    default KeyedStateStore operatorState(OperatorPlacement placement, WorkloadClaimFence original, Runnable requireActive) { throw unsupported(); }
+
     default RateHistoryStore pipelineRateHistory(PipelineIntentScope scope) { throw unsupported(); }
 
     default RateHistoryStore pipelineRateHistory(PipelineIntentScope scope, WorkloadClaimFence original, Runnable requireActive) { throw unsupported(); }
