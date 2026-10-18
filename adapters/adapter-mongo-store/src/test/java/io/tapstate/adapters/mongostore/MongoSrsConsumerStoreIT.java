@@ -18,6 +18,9 @@ import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -473,6 +476,209 @@ class MongoSrsConsumerStoreIT {
             assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOfSatisfying(TapstateException.class,
                     error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
         });
+    }
+
+    @Test
+    void writerAccountingSurvivesReopenAndOnlyTheSlowestWriterAcknowledgesItsOwnConsumer() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var roster = Map.of("orders",List.of("fast","slow"));
+            assertThat(f.consumers().beginWriterRun(A,1,"run-a",roster,f.fenceA())).isTrue();
+            assertThat(f.consumers().advanceWriter(A,1,"run-a","orders","fast",point(1,10,"t10"),f.fenceA())).isTrue();
+            assertThat(f.consumers().cursor(A).orElseThrow().sinkAcked()).isNull();
+            var root = root(f);
+            assertThat(f.consumers().advanceWriter(A,1,"run-a","orders","slow",point(1,6,"t6"),f.fenceA())).isTrue();
+            assertThat(f.consumers().advanceReadSequence(A,1,"orders",20,f.fenceA())).isTrue();
+            var held = f.consumers().progress(A).orElseThrow();
+            assertThat(held.cursor().sinkAcked()).isEqualTo(new ChainPosition(new SourceOrder(1,6),"t6"));
+            assertThat(held.cursor().perTableSeq()).containsEntry("orders",20L);
+            assertThat(held.writerRun().commandFence()).isEqualTo(f.fenceA());
+            assertThat(held.writerRun().membershipRevision()).isOne();
+            assertThat(f.consumers().beginWriterRun(A,1,"run-a",roster,f.fenceA())).isTrue();
+            assertThat(f.consumers().advanceWriter(A,1,"run-a","orders","fast",point(1,3,"late"),f.fenceA())).isTrue();
+            assertThat(f.consumers().advanceReadSequence(A,1,"orders",2,f.fenceA())).isTrue();
+            assertThat(f.consumers().progress(A)).contains(held); assertThat(root(f)).isEqualTo(root);
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var reopened = new MongoSrsConsumerStore(other,other.getDatabase(f.database().getName()),SCOPE);
+                assertThat(reopened.progress(A)).contains(held);
+                assertThat(reopened.advanceWriter(A,1,"run-a","orders","slow",point(1,7,"t7"),f.fenceA())).isTrue();
+                assertThat(reopened.cursor(A).orElseThrow().sinkAcked().token()).isEqualTo("t7");
+            }
+        });
+    }
+
+    @Test
+    void theOwningSnapshotSeamAndTableLocalCdcAcknowledgementsCommitTogether() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f,Set.of("orders","quiet"));
+            f.consumers().attach(A,0,Set.of("orders","quiet"),f.fenceA()).orElseThrow();
+            var roster = Map.of("orders",List.of("a"),"quiet",List.of("b"));
+            assertThat(f.consumers().beginWriterRun(A,1,"run",roster,f.fenceA())).isTrue();
+            assertThat(f.consumers().pinSnapshot(A,1,1,new SrsSnapshotPin(7,"owner-seam",refs),f.fenceA())).isTrue();
+            assertThat(f.consumers().progress(A).orElseThrow().writerRun().runId()).isEqualTo("run");
+            assertThat(f.consumers().advanceWriter(A,1,"run","orders","a",point(7,SourceOrder.SNAPSHOT_SEQ,"other-consumer"),f.fenceA())).isTrue();
+            var partial = f.consumers().cursor(A).orElseThrow();
+            assertThat(partial.snapshotCompletedTables()).containsExactly("orders"); assertThat(partial.sinkAcked()).isNull();
+            assertThat(f.consumers().advanceWriter(A,1,"run","quiet","b",point(7,4,"quiet-cdc"),f.fenceA())).isTrue();
+            var held = f.consumers().cursor(A).orElseThrow();
+            assertThat(held.sinkAcked()).isEqualTo(new ChainPosition(SourceOrder.snapshotRow(7),"owner-seam"));
+            assertThat(held.snapshotCompletedTables()).containsExactly("orders","quiet");
+            assertThat(f.consumers().advanceWriter(A,1,"run","orders","a",point(7,500,"orders-cdc"),f.fenceA())).isTrue();
+            var advanced = f.consumers().cursor(A).orElseThrow();
+            assertThat(advanced.sinkAcked()).isEqualTo(held.sinkAcked());
+            assertThat(advanced.sinkAckedByTable().get("orders").token()).isEqualTo("orders-cdc");
+            assertThat(advanced.sinkAckedByTable().get("quiet").token()).isEqualTo("quiet-cdc");
+        });
+    }
+
+    @Test
+    void aDurableEpochBoundIsNotDecodedAsAPhysicalResumePosition() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA())).isTrue();
+            assertThat(f.consumers().advanceWriter(A,1,"run","orders","writer",new WriterProgress(new SourceOrder(0,Long.MAX_VALUE),null),f.fenceA())).isTrue();
+            var held = f.consumers().progress(A).orElseThrow();
+            assertThat(held.cursor().sinkAcked()).isNull();
+            assertThat(held.cursor().sinkAckedByTable()).containsEntry("orders",new ChainPosition(new SourceOrder(0,Long.MAX_VALUE),null));
+            assertThat(held.writerRun().progress().get("orders").get("writer").durableThrough()).isEqualTo(new SourceOrder(0,Long.MAX_VALUE));
+        });
+    }
+
+    @Test
+    void theSameExecutionCannotReplaceItsOriginalRunRosterOrBorrowANewerMembership() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var roster = Map.of("orders",List.of("writer"));
+            assertThat(f.consumers().beginWriterRun(A,1,"run",roster,f.fenceA())).isTrue();
+            assertThat(f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("replacement")),f.fenceA())).isFalse();
+            assertThat(f.consumers().beginWriterRun(A,1,"replacement",roster,f.fenceA())).isFalse();
+            assertThat(f.consumers().advanceWriter(A,1,"replacement","orders","writer",point(1,1,"t1"),f.fenceA())).isFalse();
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A,1,"run","orders","unknown",point(1,1,"t1"),f.fenceA())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            f.consumers().attach(A,1,Set.of("orders"),f.fenceA()).orElseThrow(); var held = f.consumers().progress(A).orElseThrow();
+            assertThat(held.writerRun().membershipRevision()).isOne();
+            assertThat(f.consumers().advanceWriter(A,1,"run","orders","writer",point(1,1,"t1"),f.fenceA())).isFalse();
+            assertThat(f.consumers().advanceWriter(A,2,"run","orders","writer",point(1,1,"t1"),f.fenceA())).isFalse();
+            assertThat(f.consumers().beginWriterRun(A,2,"replacement",roster,f.fenceA())).isFalse();
+            assertThat(f.consumers().progress(A)).contains(held);
+        });
+    }
+
+    @Test
+    void aNewExecutionReplacesOnlyWriterAccountingAndCannotAcceptLateOriginalReports() {
+        withBusiness(f -> {
+            var roster = Map.of("orders",List.of("writer"));
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow(); f.consumers().beginWriterRun(A,1,"old",roster,f.fenceA());
+            f.consumers().advanceWriter(A,1,"old","orders","writer",point(1,7,"saved"),f.fenceA());
+            f.consumers().advanceReadSequence(A,1,"orders",8,f.fenceA()); var before = f.consumers().progress(A).orElseThrow();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var next = WorkloadClaimFence.from(claims.advanceExecution(f.pipelineA(),1,Set.of(f.pipelineA().owner().nodeId())).orElseThrow());
+            var current = f.consumers().attach(A,1,Set.of("orders"),next).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A,current.revision(),"old",roster,next)).isFalse();
+            assertThat(f.consumers().beginWriterRun(A,current.revision(),"new",roster,next)).isTrue();
+            var after = f.consumers().progress(A).orElseThrow();
+            assertThat(after.cursor()).isEqualTo(before.cursor()); assertThat(after.writerRun().progress()).isEmpty();
+            assertThat(after.writerRun().commandFence()).isEqualTo(next);
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A,1,"old","orders","writer",point(1,99,"late"),f.fenceA())).satisfies(MongoSrsConsumerStoreIT::fenced);
+            assertThat(f.consumers().advanceWriter(A,current.revision(),"old","orders","writer",point(1,99,"late"),next)).isFalse();
+            assertThat(f.consumers().advanceReadSequence(A,1,"orders",99,next)).isFalse();
+            assertThat(f.consumers().progress(A)).contains(after);
+        });
+    }
+
+    @Test
+    void concurrentOriginalWritersFoldWithoutLosingEitherReportOrInventingAFasterMinimum() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("a","b")),f.fenceA());
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl()); var executor = Executors.newFixedThreadPool(2)) {
+                var second = new MongoSrsConsumerStore(other,other.getDatabase(f.database().getName()),SCOPE); var start = new CountDownLatch(1);
+                var a = executor.submit(() -> { start.await(); return f.consumers().advanceWriter(A,1,"run","orders","a",point(1,10,"t10"),f.fenceA()); });
+                var b = executor.submit(() -> { start.await(); return second.advanceWriter(A,1,"run","orders","b",point(1,6,"t6"),f.fenceA()); });
+                start.countDown(); assertThat(List.of(a.get(15,TimeUnit.SECONDS),b.get(15,TimeUnit.SECONDS))).containsOnly(true);
+            }
+            var held = f.consumers().progress(A).orElseThrow();
+            assertThat(held.writerRun().progress().get("orders")).containsKeys("a","b");
+            assertThat(held.cursor().sinkAcked().token()).isEqualTo("t6"); assertThat(held.revision()).isEqualTo(3);
+        });
+    }
+
+    @Test
+    void anUnaffectedConsumerCanKeepReadingAndAcknowledgingWhenAnotherPrivateCursorIsLost() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            f.consumers().beginWriterRun(B,1,"b",Map.of("orders",List.of("writer")),f.fenceB());
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(A));
+            assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.consumers().attached(CHAIN)).isInstanceOf(TapstateException.class);
+            assertThat(f.consumers().advanceReadSequence(B,1,"orders",5,f.fenceB())).isTrue();
+            assertThat(f.consumers().advanceWriter(B,1,"b","orders","writer",point(1,5,"b5"),f.fenceB())).isTrue();
+            var held = f.consumers().progress(B).orElseThrow();
+            assertThat(held.cursor().perTableSeq()).containsEntry("orders",5L); assertThat(held.cursor().sinkAcked().token()).isEqualTo("b5");
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"missing","null-progress","wrong-revision","bad-fence","bad-bound"})
+    void malformedWriterFactsCannotBeTreatedAsANewEmptyRun(String damage) {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow(); f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
+            f.consumers().advanceWriter(A,1,"run","orders","writer",point(1,3,"t3"),f.fenceA());
+            switch (damage) {
+                case "missing" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$unset",new Document("writerRun","")));
+                case "null-progress" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$set",new Document("writerRun.progress",null)));
+                case "wrong-revision" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$set",new Document("writerRun.membershipRevision",2L)));
+                case "bad-fence" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$set",new Document("writerRun.commandFence.executionGeneration",1.5D)));
+                default -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$set",new Document("writerRun.progress.0.writers.0.durableThrough.epoch",1.5D)));
+            }
+            var before = cursor(f,A);
+            assertThatThrownBy(() -> f.consumers().progress(A)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A,1,"run","orders","writer",point(1,4,"t4"),f.fenceA())).isInstanceOf(TapstateException.class);
+            assertThat(cursor(f,A)).isEqualTo(before);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"begin","ack","read"})
+    void losingTheOriginalGuardAfterARealProgressWriteRollsBackCursorClaimAndCheckpoint(String operation) {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            if (!operation.equals("begin")) f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
+            var before = cursor(f,A); var root = root(f);
+            var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first();
+            var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id",WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first();
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_consumer_offsets")) {
+                var guarded = new MongoSrsConsumerStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                assertThatThrownBy(() -> {
+                    switch (operation) {
+                        case "begin" -> guarded.beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
+                        case "ack" -> guarded.advanceWriter(A,1,"run","orders","writer",point(1,7,"t7"),f.fenceA());
+                        default -> guarded.advanceReadSequence(A,1,"orders",7,f.fenceA());
+                    }
+                }).satisfies(error -> code(error,IoError.CACHE_BUSINESS_FENCED)); witness.requireCommand();
+            }
+            assertThat(cursor(f,A)).isEqualTo(before); assertThat(root(f)).isEqualTo(root);
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first()).isEqualTo(checkpoint);
+            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id",WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first()).isEqualTo(claim);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"begin","read"})
+    void hotProgressCannotPassAMissingRequiredSnapshotModel(String operation) {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f,Set.of("orders"));
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().pinSnapshot(A,1,0,new SrsSnapshotPin(1,"seam",refs),f.fenceA());
+            SystemCollections.SRS_MODELS.on(f.database()).deleteMany(new Document());
+            var before = cursor(f,A);
+            assertThatThrownBy(() -> {
+                if (operation.equals("begin")) f.consumers().beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
+                else f.consumers().advanceReadSequence(A,1,"orders",5,f.fenceA());
+            }).isInstanceOf(TapstateException.class);
+            assertThat(cursor(f,A)).isEqualTo(before);
+        });
+    }
+
+    private static WriterProgress point(long epoch,long sequence,String token) {
+        var order = new SourceOrder(epoch,sequence); return new WriterProgress(order,token == null ? null : new ChainPosition(order,token));
     }
 
     private static Map<String, SrsModelKey> publishSnapshotModels(Fixture f, Set<String> tables) {

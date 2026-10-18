@@ -84,6 +84,10 @@ class MongoCacheSrsStoresIT {
             var prepared = f.pipeline(); var stores = f.domain.srs(f.scope,ACTIVE); stores.chains().prepare(CHAIN,"retention",f.capture);
             var context = new SrsConsumerContext(f.consumer(),1);
             var first = stores.consumers().attach(context,0,Set.of("orders"),prepared.fence()).orElseThrow();
+            assertThat(stores.consumers().beginWriterRun(context,first.revision(),"old-run",Map.of("orders",List.of("writer")),prepared.fence())).isTrue();
+            assertThat(stores.consumers().advanceWriter(context,first.revision(),"old-run","orders","writer",
+                    new WriterProgress(new io.tapstate.core.event.SourceOrder(1,4),new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(1,4),"saved")),prepared.fence())).isTrue();
+            assertThat(stores.consumers().advanceReadSequence(context,first.revision(),"orders",7,prepared.fence())).isTrue();
             var before = stores.consumers().progress(context).orElseThrow();
             var claims = f.domain.workloadClaims(f.scope); var retained = claims.acquirePipeline(prepared.scope(),f.node.owner(),1,Duration.ofMinutes(2)).claim();
             var current = WorkloadClaimFence.from(claims.advanceExecution(retained,1,Set.of(f.node.owner().nodeId())).orElseThrow());
@@ -91,6 +95,11 @@ class MongoCacheSrsStoresIT {
             assertThat(next.commandFence()).isEqualTo(current); assertThat(next.revision()).isEqualTo(first.revision()+1);
             var progress = stores.consumers().progress(context).orElseThrow();
             assertThat(progress.revision()).isEqualTo(before.revision()); assertThat(progress.cursor()).isEqualTo(before.cursor());
+            assertThat(progress.writerRun()).isEqualTo(before.writerRun());
+            assertThat(stores.consumers().advanceWriter(context,first.revision(),"old-run","orders","writer",
+                    new WriterProgress(new io.tapstate.core.event.SourceOrder(1,9),null),current)).isFalse();
+            assertThat(stores.consumers().beginWriterRun(context,next.revision(),"new-run",Map.of("orders",List.of("writer")),current)).isTrue();
+            assertThat(stores.consumers().progress(context).orElseThrow().cursor()).isEqualTo(before.cursor());
         });
     }
 
@@ -104,6 +113,13 @@ class MongoCacheSrsStoresIT {
             assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
             var pin = new SrsSnapshotPin(1,"seam",Map.of("orders",f.model().key()));
             assertThat(stores.consumers().pinSnapshot(context,member.revision(),0,pin,prepared.fence())).isTrue();
+            assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
+            assertThat(stores.consumers().beginWriterRun(context,member.revision(),"run",Map.of("orders",List.of("writer")),prepared.fence())).isTrue();
+            assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
+            assertThat(stores.consumers().advanceWriter(context,member.revision(),"run","orders","writer",
+                    new WriterProgress(io.tapstate.core.event.SourceOrder.snapshotRow(1),null),prepared.fence())).isTrue();
+            assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
+            assertThat(stores.consumers().advanceReadSequence(context,member.revision(),"orders",0,prepared.fence())).isTrue();
             assertThat(checkpointFence(f)).isEqualTo(before+1); before = checkpointFence(f);
             assertThat(stores.consumers().detach(context,member.revision(),prepared.fence())).isPresent();
             assertThat(checkpointFence(f)).isEqualTo(before+1);

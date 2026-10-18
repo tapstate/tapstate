@@ -14,6 +14,8 @@ import io.tapstate.spi.store.SrsConsumerMembership;
 import io.tapstate.spi.store.SrsConsumerProgress;
 import io.tapstate.spi.store.SrsSnapshotPin;
 import io.tapstate.spi.store.SrsModelKey;
+import io.tapstate.spi.store.SrsConsumerWriterRun;
+import io.tapstate.spi.store.WriterProgress;
 import org.bson.Document;
 
 import java.util.ArrayList;
@@ -56,27 +58,31 @@ final class MongoSrsConsumerRecords {
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
 
-    record Cursor(ConsumerOffset value, long revision, SrsSnapshotPin snapshot) {}
+    record Cursor(ConsumerOffset value, long revision, SrsSnapshotPin snapshot, SrsConsumerWriterRun writerRun) {}
 
     Document cursor(SrsConsumerMembership membership, ConsumerOffset value, long revision) { return cursor(membership, value, revision, null); }
     Document cursor(SrsConsumerMembership membership, ConsumerOffset value, long revision, SrsSnapshotPin snapshot) {
-        new SrsConsumerProgress(membership.context(), membership.revision(), revision, value, snapshot);
+        return cursor(membership,value,revision,snapshot,null);
+    }
+    Document cursor(SrsConsumerMembership membership, ConsumerOffset value, long revision, SrsSnapshotPin snapshot,SrsConsumerWriterRun writerRun) {
+        new SrsConsumerProgress(membership.context(), membership.revision(), revision, value, snapshot,writerRun);
+        if (writerRun != null && !scope.clusterId().equals(writerRun.commandFence().key().clusterId())) throw unreadable();
         if (revision < 0 || revision == Long.MAX_VALUE || membership.detached()
                 || !value.pipelineId().equals(membership.context().key().consumerId()) || value.progressKind() != ConsumerProgressKind.SRS) throw unreadable();
         var read = new ArrayList<Document>();
         for (String table : sorted(value.perTableSeq().keySet())) read.add(new Document("table", table).append("sequence", value.perTableSeq().get(table)));
         var acked = new ArrayList<Document>();
-        for (String table : sorted(value.sinkAckedByTable().keySet())) acked.add(new Document("table", table).append("position", position(value.sinkAckedByTable().get(table))));
+        for (String table : sorted(value.sinkAckedByTable().keySet())) acked.add(new Document("table", table).append("position", bound(value.sinkAckedByTable().get(table))));
         Document progress = new Document("perTableSeq", read).append("sinkAcked", position(value.sinkAcked()))
                 .append("snapshotCompletedTables", sorted(Set.copyOf(value.snapshotCompletedTables()))).append("cdcStartPosition", value.cdcStartPosition())
                 .append("snapshotEpoch", value.snapshotEpoch()).append("sinkAckedByTable", acked).append("progressKind", "SRS");
         return hash(new Document("_id", id(membership.context().key())).append("formatVersion", 1)
                 .append("stateGeneration", membership.context().stateGeneration()).append("membershipRevision", membership.revision())
-                .append("progressRevision", revision).append("progress", progress).append("snapshot", snapshot(snapshot)));
+                .append("progressRevision", revision).append("progress", progress).append("snapshot", snapshot(snapshot)).append("writerRun",writerRun(writerRun)));
     }
     Cursor cursor(SrsConsumerMembership membership, Document row) {
         try {
-            if (row == null || !row.keySet().equals(Set.of("_id", "formatVersion", "stateGeneration", "membershipRevision", "progressRevision", "progress", "snapshot", "contentHash"))
+            if (row == null || !row.keySet().equals(Set.of("_id", "formatVersion", "stateGeneration", "membershipRevision", "progressRevision", "progress", "snapshot", "writerRun", "contentHash"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("progressRevision") instanceof Long revision)
                     || !Long.valueOf(membership.context().stateGeneration()).equals(row.get("stateGeneration"))
                     || !Long.valueOf(membership.revision()).equals(row.get("membershipRevision")) || !id(membership.context().key()).equals(row.get("_id"))) throw unreadable();
@@ -93,15 +99,80 @@ final class MongoSrsConsumerRecords {
             var acked = new HashMap<String, ChainPosition>();
             for (Document entry : documents(progress.get("sinkAckedByTable"))) {
                 if (!entry.keySet().equals(Set.of("table", "position")) || !(entry.get("table") instanceof String table) || table.isBlank()
-                        || acked.put(table, position(entry.get("position", Document.class))) != null || acked.get(table) == null) throw unreadable();
+                        || acked.put(table, bound(entry.get("position", Document.class))) != null || acked.get(table) == null) throw unreadable();
             }
             var value = new ConsumerOffset(membership.context().key().consumerId(), read, position(progress.get("sinkAcked", Document.class)),
                     sorted(stringSet(progress.get("snapshotCompletedTables"))), progress.getString("cdcStartPosition"), epoch, acked, ConsumerProgressKind.SRS);
             SrsSnapshotPin snapshot = snapshot(row.get("snapshot", Document.class));
-            if (!read.keySet().containsAll(membership.tables()) || !cursor(membership, value, revision, snapshot).equals(row)) throw unreadable();
-            return new Cursor(value, revision, snapshot);
+            SrsConsumerWriterRun writerRun = writerRun(row.get("writerRun",Document.class));
+            if (!read.keySet().containsAll(membership.tables()) || !cursor(membership, value, revision, snapshot,writerRun).equals(row)) throw unreadable();
+            return new Cursor(value, revision, snapshot,writerRun);
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
+    private static Document writerRun(SrsConsumerWriterRun value) {
+        if (value == null) return null;
+        var expected = new ArrayList<Document>(); var progress = new ArrayList<Document>();
+        for (String table : sorted(value.expected().keySet())) {
+            expected.add(new Document("table",table).append("writers",value.expected().get(table)));
+            var writers = new ArrayList<Document>();
+            for (String writer : sorted(value.progress().getOrDefault(table,Map.of()).keySet())) {
+                var point = value.progress().get(table).get(writer);
+                writers.add(new Document("writer",writer).append("durableThrough",order(point.durableThrough()))
+                        .append("lastTokened",position(point.lastTokened())));
+            }
+            if (!writers.isEmpty()) progress.add(new Document("table",table).append("writers",writers));
+        }
+        return new Document("membershipRevision",value.membershipRevision()).append("commandFence",WorkloadClaimDocuments.stored(value.commandFence()))
+                .append("runId",value.runId()).append("expected",expected).append("progress",progress);
+    }
+    private static SrsConsumerWriterRun writerRun(Document row) {
+        if (row == null) return null;
+        if (!row.keySet().equals(Set.of("membershipRevision","commandFence","runId","expected","progress"))
+                || !(row.get("membershipRevision") instanceof Long revision) || !(row.get("runId") instanceof String runId)) throw unreadable();
+        var expected = new HashMap<String,List<String>>();
+        for (Document entry : documents(row.get("expected"))) {
+            if (!entry.keySet().equals(Set.of("table","writers")) || !(entry.get("table") instanceof String table)
+                    || !(entry.get("writers") instanceof List<?> writers) || writers.stream().anyMatch(writer -> !(writer instanceof String))
+                    || expected.put(table,writers.stream().map(String.class::cast).toList()) != null) throw unreadable();
+        }
+        var progress = new HashMap<String,Map<String,WriterProgress>>();
+        for (Document entry : documents(row.get("progress"))) {
+            if (!entry.keySet().equals(Set.of("table","writers")) || !(entry.get("table") instanceof String table)) throw unreadable();
+            var writers = new HashMap<String,WriterProgress>();
+            for (Document point : documents(entry.get("writers"))) {
+                if (!point.keySet().equals(Set.of("writer","durableThrough","lastTokened")) || !(point.get("writer") instanceof String writer)
+                        || writers.put(writer,new WriterProgress(order(point.get("durableThrough",Document.class)),position(point.get("lastTokened",Document.class)))) != null) throw unreadable();
+            }
+            if (writers.isEmpty() || progress.put(table,writers) != null) throw unreadable();
+        }
+        var result = new SrsConsumerWriterRun(revision,WorkloadClaimDocuments.readPipeline(row.get("commandFence",Document.class)),runId,expected,progress);
+        if (!writerRun(result).equals(row)) throw unreadable();
+        return result;
+    }
+    /** Durable bounds may end a prior epoch at MAX_VALUE; they are never physical recovery positions. */
+    private static Document order(SourceOrder order) {
+        if (order == null || order.epoch() < 0 || order.epoch() == Long.MAX_VALUE
+                || order.seq() < -1 && order.seq() != SourceOrder.SNAPSHOT_SEQ) throw unreadable();
+        return new Document("epoch",order.epoch()).append("sequence",order.seq());
+    }
+    private static SourceOrder order(Document row) {
+        if (row == null || !row.keySet().equals(Set.of("epoch","sequence")) || !(row.get("epoch") instanceof Long epoch)
+                || !(row.get("sequence") instanceof Long sequence)) throw unreadable();
+        var result = new SourceOrder(epoch,sequence); if (!order(result).equals(row)) throw unreadable(); return result;
+    }
+    private static Document bound(ChainPosition position) {
+        if (position == null) return null;
+        if (position.token() != null) return position(position);
+        return order(position.order()).append("token",null);
+    }
+    private static ChainPosition bound(Document row) {
+        if (row == null) return null;
+        if (!row.keySet().equals(Set.of("epoch","sequence","token"))) throw unreadable();
+        if (row.get("token") != null) return position(row);
+        var result = new ChainPosition(order(new Document("epoch",row.get("epoch")).append("sequence",row.get("sequence"))),null);
+        if (!bound(result).equals(row)) throw unreadable(); return result;
+    }
+
     private static Document snapshot(SrsSnapshotPin pin) {
         if (pin == null) return null;
         var models = new ArrayList<Document>();

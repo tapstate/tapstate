@@ -1,6 +1,8 @@
 package io.tapstate.spi.store;
 
 import java.util.Optional;
+import java.util.Map;
+import java.util.List;
 import java.util.Set;
 
 /** Logged-capture membership is independent from each consumer's cursor and the source checkpoint. */
@@ -19,6 +21,18 @@ public interface SrsConsumerStore {
     boolean pinSnapshot(SrsConsumerContext context, long membershipRevision, long expectedProgressRevision,
                         SrsSnapshotPin snapshot, WorkloadClaimFence originalPipelineFence);
 
+
+    /** Begins one immutable writer roster per original execution without resetting retained sink progress. */
+    boolean beginWriterRun(SrsConsumerContext context, long membershipRevision, String runId,
+                           Map<String,List<String>> expectedWritersByTable, WorkloadClaimFence originalPipelineFence);
+
+    /** Monotonically folds one original writer's report and its confirmed cursor in the same cache transaction. */
+    boolean advanceWriter(SrsConsumerContext context, long membershipRevision, String runId, String table, String writerId,
+                          WriterProgress progress, WorkloadClaimFence originalPipelineFence);
+
+    /** Advances only this consumer's read cursor; it cannot acknowledge a sink or advance the source checkpoint. */
+    boolean advanceReadSequence(SrsConsumerContext context, long membershipRevision, String table, long sequence,
+                                WorkloadClaimFence originalPipelineFence);
 
     /** Uses the original expected relation revision and Pipeline claim; existing progress is preserved. */
     Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables,
