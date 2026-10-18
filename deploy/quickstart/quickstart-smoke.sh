@@ -345,12 +345,23 @@ fi
 # and teardown is printed. A recording ./tapstate replaces the stub after prepare; a fake docker reports
 # the server healthy so the wait ends. curl stays real, so the gate's install.sh fetch still works.
 run_phase_fakes() {
-  run_prepare Linux x86_64 glibc            # prepare a dir (installs the stub CLI)
+  run_prepare Linux x86_64 glibc "${RUN_REUSE:-}"   # prepare a dir (installs the stub CLI); RUN_REUSE re-runs one
   RUN="$DEMO"
   RUN_PW="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RUN/.env")"
   cat > "$RUN/tapstate" <<'CLI'
 #!/bin/sh
 printf '%s\n' "$*" >> .cli-argv
+# The agent-token mint and the saved-token check are one-shot commands with nothing on stdin, so they are
+# answered before the session recorder below reads it. The mint records which password it was handed
+# through the environment; FAKE_AGENT_TOKEN empty is a server that issued nothing.
+case " $* " in
+  *" token create "*)
+    printf 'pw=%s\n' "${TAPSTATE_PASSWORD:-}" >> .token-env
+    [ -n "${FAKE_AGENT_TOKEN:-}" ] \
+      && printf '{\n  "tokenId" : "tok-1",\n  "scope" : "WRITE",\n  "token" : "%s"\n}\n' "$FAKE_AGENT_TOKEN"
+    exit 0 ;;
+  *" ls ") [ "${FAKE_TOKEN_ACCEPTED:-no}" = yes ]; exit $? ;;
+esac
 cat >> .cli-stdin
 # A REPL keeps reading after a refusal but retains its status when the session ends.
 # Keep output and status independent so cases can exercise both non-zero exits and
@@ -363,6 +374,14 @@ CLI
   # the $1 is the fake uname's own argument -- it must stay literal.
   # shellcheck disable=SC2016
   printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo unknown ;; esac\n' > "$shim/uname"
+  # A java whose major version the case chooses, so which way the agent configuration goes does not
+  # depend on whatever runtime the machine running this suite happens to have.
+  mkdir -p "$shim/jdk/bin"
+  cat > "$shim/java" <<JAVA
+#!/bin/sh
+printf '    java.home = $shim/jdk\n    java.specification.version = ${FAKE_JAVA_MAJOR:-17}\n' >&2
+JAVA
+  cp "$shim/java" "$shim/jdk/bin/java"; chmod +x "$shim/jdk/bin/java"
   cat > "$shim/docker" <<'DOCK'
 #!/bin/sh
 # `compose ps ... server` -> report healthy so the wait loop ends; `compose ps -a ... bootstrap` -> report
@@ -384,6 +403,7 @@ bs="${FAKE_BOOTSTRAP_PS:-}"
 # container too -- deciding on the container alone would hand a ps line back to a log query.
 case " $* " in *" logs "*) echo "${FAKE_BOOTSTRAP_LOG:-bootstrap: first admin created}"; exit 0 ;; esac
 case " $* " in *" bootstrap "*) echo "$bs"; exit 0 ;; esac
+case "$*" in *"{{.Name}}"*) echo "${FAKE_SERVER_NAME:-tapstate-demo-server-1}"; exit 0 ;; esac
 # The count is answered per collection rather than once for all of them. That is what lets a case drive
 # "the first engine arrived and the second did not" - the shape a demo wired to only one of its two
 # sources actually produces, and the one a check on a single total cannot tell apart from success.
@@ -399,7 +419,7 @@ for a in "$@"; do
 done
 exit 0
 DOCK
-  chmod +x "$shim/uname" "$shim/docker"
+  chmod +x "$shim/uname" "$shim/docker" "$shim/java"
   RUN_OUT="$(cd "${RUN_CWD:-$RUN}" && PATH="$shim:$PATH" \
     TAPSTATE_VERSION="$VERSION" TAPSTATE_BASE_URL="file://$CLI_STUB" \
     TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
@@ -407,6 +427,8 @@ DOCK
     FAKE_BOOTSTRAP_PS="${FAKE_BOOTSTRAP_PS:-}" FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
     FAKE_CLI_STATUS="${FAKE_CLI_STATUS:-0}" \
     FAKE_BOOTSTRAP_LOG="${FAKE_BOOTSTRAP_LOG:-}" \
+    FAKE_AGENT_TOKEN="${FAKE_AGENT_TOKEN-tsk_fake_agent_token}" FAKE_TOKEN_ACCEPTED="${FAKE_TOKEN_ACCEPTED:-no}" \
+    FAKE_JAVA_MAJOR="${FAKE_JAVA_MAJOR:-17}" JAVA_HOME='' \
     TAPSTATE_QUICKSTART_POLL_SECONDS=0 \
     sh "$RUN/quickstart.sh" 2>&1)"; RUN_RC=$?
   rm -rf "$shim"
@@ -765,6 +787,94 @@ for cli_status in 1 2 137; do
     bad "an unexplained or abnormal CLI exit $cli_status was tolerated (rc=$RUN_RC): $RUN_OUT"
   fi
 done
+
+# --- the three ways in: browser, agent, CLI ------------------------------------------------------------
+# The closing message offers the browser first, the agent second and the CLI third. The order is the
+# product's: the browser needs nothing installed, so it is the option a first reader should meet first.
+run_phase_fakes
+browser_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'In the browser' | cut -d: -f1)"
+agent_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'With your AI agent' | cut -d: -f1)"
+cli_at="$(printf '%s\n' "$RUN_OUT" | grep -n 'From the CLI' | cut -d: -f1)"
+if [ -n "$browser_at" ] && [ -n "$agent_at" ] && [ -n "$cli_at" ] \
+   && [ "$browser_at" -lt "$agent_at" ] && [ "$agent_at" -lt "$cli_at" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'http://127.0.0.1:8080 on this machine'; then
+  ok "the closing message offers the browser, then an agent, then the CLI"
+else
+  bad "the three ways in are missing or out of order (browser $browser_at, agent $agent_at, cli $cli_at): $RUN_OUT"
+fi
+
+# The agent configuration carries a write credential, so it is written for this user alone and the
+# token itself never reaches the terminal -- a recorded or pasted demo would otherwise publish it. The
+# mint is handed the admin password through the environment, never as an argument.
+config="$RUN/tapstate-mcp.json"
+mode="$(stat -c %a "$config" 2>/dev/null || stat -f %Lp "$config" 2>/dev/null)"
+if [ "$RUN_RC" -eq 0 ] && [ "$mode" = 600 ] && grep -q '"TAPSTATE_TOKEN": "tsk_fake_agent_token"' "$config" \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'tsk_fake_agent_token' \
+   && grep -q "token create --scope write" "$RUN/.cli-argv" \
+   && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fqx "pw=$RUN_PW" "$RUN/.token-env"; then
+  ok "the agent token is written to an owner-only file and never printed"
+else
+  bad "agent token handling (rc=$RUN_RC, mode=$mode): $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null) / $RUN_OUT"
+fi
+
+# A native sidecar beside the CLI needs no Java at all, so the configuration is plain `tapstate mcp`. The
+# stub bundle ships one, which is the shape a release with a native sidecar has.
+if grep -q "\"command\": \"$RUN/tapstate\"" "$config" && ! grep -q JAVA_HOME "$config"; then
+  ok "a native sidecar is run through the CLI with no Java runtime named"
+else
+  bad "the native sidecar configuration is wrong: $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# Without a Java 21 and without a native sidecar, the sidecar runs on the server image's Java inside the
+# server container's network namespace -- the one place the server is loopback, which is all the
+# sidecar will speak plain HTTP to. The token goes in by name, so it is not on docker's command line.
+libexec="$RUN/versions/$VERSION/libexec"
+rm -f "$libexec/tapstate-mcp" && : > "$libexec/tapstate-mcp.jar"
+RUN_REUSE="$RUN" run_phase_fakes
+if grep -q '"--network", "container:tapstate-demo-server-1"' "$config" \
+   && grep -q '"-e", "TAPSTATE_TOKEN"' "$config" \
+   && grep -q '"--server", "http://127.0.0.1:8080"' "$config" \
+   && grep -q "ghcr.io/tapstate/tapstate:$VERSION" "$config" \
+   && ! grep -q JAVA_HOME "$config"; then
+  ok "with no Java 21 the sidecar runs in the server image, beside the server"
+else
+  bad "the Docker sidecar configuration is wrong: $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# With a Java 21 the configuration is the CLI's own `tapstate mcp`, and JAVA_HOME is pinned in it: an
+# agent started from a desktop app does not inherit this shell's PATH and would not find the runtime.
+rm -f "$config"
+FAKE_JAVA_MAJOR=21 RUN_REUSE="$RUN" run_phase_fakes
+if grep -q "\"command\": \"$RUN/tapstate\"" "$config" \
+   && grep -q '"mcp", "--server", "http://127.0.0.1:8080", "--allow-write"' "$config" \
+   && grep -q '"JAVA_HOME": "/.*/jdk"' "$config"; then
+  ok "with a Java 21 the agent runs the CLI's own sidecar, with that runtime pinned"
+else
+  bad "the local sidecar configuration is wrong: $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# A re-run keeps a token the server still accepts, and replaces one it does not -- the store was wiped
+# with down -v -- rather than leaving the agent with a credential that fails on its first call.
+FAKE_AGENT_TOKEN=tsk_second FAKE_TOKEN_ACCEPTED=yes RUN_REUSE="$RUN" run_phase_fakes
+kept="$(grep -c '"TAPSTATE_TOKEN": "tsk_fake_agent_token"' "$config" || true)"
+FAKE_AGENT_TOKEN=tsk_second FAKE_TOKEN_ACCEPTED=no RUN_REUSE="$RUN" run_phase_fakes
+if [ "$kept" = 1 ] && grep -q '"TAPSTATE_TOKEN": "tsk_second"' "$config"; then
+  ok "a re-run keeps an accepted agent token and replaces a rejected one"
+else
+  bad "agent token re-run handling (kept=$kept): $(sed 's/"TAPSTATE_TOKEN": "[^"]*"/<token>/' "$config" 2>/dev/null)"
+fi
+
+# The agent path is extra. A server that issues no token still ends in the demo's success, with the
+# browser and CLI paths intact, and says why the agent is not set up instead of naming a missing file.
+FAKE_AGENT_TOKEN='' run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && [ ! -f "$RUN/tapstate-mcp.json" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'Not set up: no agent token could be created' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'claude --mcp-config' \
+   && printf '%s' "$RUN_OUT" | grep -q 'From the CLI'; then
+  ok "a failed agent setup is reported and does not fail the demo"
+else
+  bad "a failed agent setup (rc=$RUN_RC): $RUN_OUT"
+fi
 
 # A run whose online verbs did not take must fail, loudly and non-zero. The REPL is the reason this
 # needs its own check: an interactive session does not end because one command was rejected, so it
