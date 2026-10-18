@@ -51,8 +51,8 @@ public final class OfficialConnectors {
      * <p>Being listed here is a support boundary, not a statement about the connector: its jar may well
      * implement writes. The same sink rule applies when catalog rows are derived and when previously
      * stored rows are read, so an earlier release's row cannot restore the write role after an upgrade.
-     * The server's target check and the API listings read the sink off the row, so none of them needs
-     * to know this list exists.
+     * API listings read the sink off the row. The server also checks this policy by id so missing
+     * catalog metadata cannot accidentally admit an official source-only connector as a private sink.
      */
     public static final List<String> SOURCE_ONLY_IDS = List.of("db2", "db2i");
 

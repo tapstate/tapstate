@@ -42,12 +42,14 @@ drivers on an isolated class loader:
     governed by IBM's International Program License Agreement.
 
   * db2i-connector.jar bundles IBM Toolbox for Java (JTOpen) 21.0.5, licensed
-    under the IBM Public License 1.0; its source is available from the JTOpen
+    under the IBM Public License 1.0, whose complete text is license.html at the
+    jar root; its source is available from the JTOpen
     project at https://github.com/IBM/JTOpen.
 
 The release carries companion copies of the Oracle Free Use Terms and the
 Microsoft MIT License beside the enterprise jars; the other jars carry their
-dependency notices under META-INF/. Those terms govern only the bundled drivers
+dependency notices under META-INF/ or, for JTOpen, in the jar-root license.html.
+Those terms govern only the bundled drivers
 and dependencies identified above; they do not alter the Apache-2.0 license of
 Tapstate itself. The Oracle, SQL Server, Db2 and Db2 for i implementations are
 paid connector implementations; their use remains subject to the applicable Tapdata agreement.

@@ -25,7 +25,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * contract ({@code io.tapdata.*}), so every connector binds to the same {@code TapConnector} /
  * {@code TapEvent} types and events cross as one contract; and the runtime's own infrastructure a
  * connector links against but does not bundle — bytecode generation ({@code net.sf.cglib.*}) and the
- * logging facades ({@code org.slf4j.*}, {@code org.apache.logging.log4j.*}). Everything else on the host —
+ * logging facade ({@code org.slf4j.*}). Log4j is shared only when the connector classpath does not
+ * bundle its own API; a bundled Log4j stays entirely isolated. Everything else on the host —
  * the tapstate application classes and the service framework libraries — is hidden from the connector.
  *
  * <p>Two lifetimes. {@link #open} gives a loader of its own, which its caller closes. {@link #shared} gives
@@ -43,14 +44,12 @@ public final class ConnectorClassLoader implements AutoCloseable {
      * library — mapping connection config generates a {@code BeanMap} subclass and defines it into this
      * loader (the config bean lives here), so the generated subclass cannot link unless this loader
      * resolves cglib from the host. {@code org.slf4j.*} is the logging facade a thin connector and its
-     * bundled driver log through and do not carry themselves. {@code org.apache.logging.log4j.*} is the
-     * other one: a connector built for the Tapdata engine logs through the log4j API and leaves it out of
-     * its jar, because that engine provides it. The host has the API only, so a log4j class the host lacks
-     * - an implementation a connector bundles - still loads from the connector's own jar. The tapstate
+     * bundled driver log through and do not carry themselves. Log4j is handled separately by the
+     * connector loader so its API and implementation cannot split across the host and connector. The tapstate
      * application classes and the service framework (Spring, Hazelcast, Mongo, the web container) stay hidden.
      */
     private static final List<String> SHARED_HOST_PREFIXES =
-            List.of("io.tapdata.", "net.sf.cglib.", "org.slf4j.", "org.apache.logging.log4j.");
+            List.of("io.tapdata.", "net.sf.cglib.", "org.slf4j.");
 
     /** The process-wide loaders, one per connector artifact; never closed, as nothing could reopen them. */
     private static final Map<ArtifactKey, ConnectorClassLoader> SHARED = new ConcurrentHashMap<>();
@@ -88,7 +87,7 @@ public final class ConnectorClassLoader implements AutoCloseable {
         URL[] urls = classpath.stream().map(ConnectorClassLoader::toUrl).toArray(URL[]::new);
         ClassLoader host = ConnectorClassLoader.class.getClassLoader();
         ClassLoader sharedContract = new SharedContractClassLoader(host);
-        return new ConnectorJarLoader(urls, sharedContract);
+        return new ConnectorJarLoader(urls, sharedContract, host);
     }
 
     /** Loads {@code className} in isolation (from the connector jar or the shared PDK contract). */
@@ -172,8 +171,22 @@ public final class ConnectorClassLoader implements AutoCloseable {
             ClassLoader.registerAsParallelCapable();
         }
 
-        private ConnectorJarLoader(URL[] urls, ClassLoader parent) {
+        private final ClassLoader host;
+        private final boolean bundledLog4j;
+
+        private ConnectorJarLoader(URL[] urls, ClassLoader parent, ClassLoader host) {
             super(urls, parent);
+            this.host = host;
+            bundledLog4j = findResource("org/apache/logging/log4j/LogManager.class") != null;
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (!bundledLog4j && name.startsWith("org.apache.logging.log4j.")) {
+                // Thin connectors use the host facade as a whole; never mix in connector fallbacks.
+                return host.loadClass(name);
+            }
+            return super.loadClass(name, resolve);
         }
 
         @Override

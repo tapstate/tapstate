@@ -130,9 +130,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/cloud-jars"
+          assets="$(jq -r '.connectors[].id + "-connector.jar", .licenseFiles[].name' deploy/cloud/connectors.lock.json)"
+          patterns=()
+          while IFS= read -r asset; do
+            patterns+=(--pattern "$asset")
+          done <<< "$assets"
           gh release download connectors-preview --repo tapstate/tapstate \
-            --pattern '*-connector.jar' --pattern 'MICROSOFT-MIT-LICENSE.txt' \
-            --pattern 'ORACLE-FREE-USE-TERMS.txt' --dir "$RUNNER_TEMP/cloud-jars"
+            "${patterns[@]}" --dir "$RUNNER_TEMP/cloud-jars"
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py \
             --lock deploy/cloud/connectors.lock.json --jar-dir "$RUNNER_TEMP/cloud-jars" \
             --stage-dir "$RUNNER_TEMP/cloud-stage"

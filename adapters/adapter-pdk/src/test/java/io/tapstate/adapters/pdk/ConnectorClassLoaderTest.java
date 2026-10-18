@@ -113,14 +113,24 @@ class ConnectorClassLoaderTest {
     }
 
     @Test
-    void aLog4jClassTheHostLacksStillLoadsFromTheConnectorJar(@TempDir Path dir) throws Exception {
-        // The host provides the log4j API only. A connector that carries a log4j implementation of its own
-        // must still find it in its jar rather than lose it to a host that has none.
-        Path jar = SyntheticJar.compileToJar(dir, "org.apache.logging.log4j.core.BundledProbe",
-                "package org.apache.logging.log4j.core; public class BundledProbe {}");
+    void aBundledLog4jApiAndItsCallersStayInOneLoader(@TempDir Path dir) throws Exception {
+        // The nested caller needs package-private API access. Mixing its bundled API with the host
+        // facade fails at invocation, even when both classes could be looked up independently.
+        Path jar = SyntheticJar.compileToJar(dir, "org.apache.logging.log4j.LogManager", """
+                package org.apache.logging.log4j;
+                public class LogManager {
+                    static String contextName() { return "bundled-context"; }
+                    public static class BundledReader {
+                        public String read() { return LogManager.contextName(); }
+                    }
+                }
+                """);
         try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar))) {
-            Class<?> bundled = loader.load("org.apache.logging.log4j.core.BundledProbe");
-            assertThat(bundled.getClassLoader()).isNotNull().isNotSameAs(getClass().getClassLoader());
+            Class<?> reader = loader.load("org.apache.logging.log4j.LogManager$BundledReader");
+            assertThat(reader.getMethod("read").invoke(reader.getDeclaredConstructor().newInstance()))
+                    .isEqualTo("bundled-context");
+            assertThat(loader.load("org.apache.logging.log4j.LogManager").getClassLoader())
+                    .isSameAs(reader.getClassLoader()).isNotSameAs(getClass().getClassLoader());
         }
     }
 

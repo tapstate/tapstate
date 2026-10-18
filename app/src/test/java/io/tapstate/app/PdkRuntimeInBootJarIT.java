@@ -18,14 +18,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *
  * <p>Connectors are built against these libraries and do not carry them: they declare them
  * {@code provided}, meaning whoever hosts the connector has them, and the connector loader delegates
- * all of {@code io.tapdata} to the host. A server whose boot jar omits one is a server where affected
+ * all of {@code io.tapdata} and an unbundled Log4j API to the host. A server whose boot jar omits one is a server where affected
  * connectors half-work — they load, they connect, and they fail on the first call that reaches a class
- * from the missing library. Neither library is referenced by any app source, so both look unused to
+ * from the missing library. These libraries are not referenced by app source, so they look unused to
  * anyone reading the pom, and neither absence fails a build.
  *
  * <p>What the packaged artifact is inspected for, rather than the classpath: a test fork carries
  * runtime- and test-scope entries alike, so a witness that drives a real connector stays green whether
- * the dependency ships or not. Downgrading either entry to test scope, or dropping it as unused,
+ * the dependency ships or not. Downgrading an entry to test scope, or dropping it as unused,
  * removes it from {@code BOOT-INF/lib} and reds here. Runs on every build that packages the boot jar
  * (no database, no external jar); skips only when no boot jar was produced.
  */
@@ -40,6 +40,7 @@ class PdkRuntimeInBootJarIT {
         // Connectors link against these utilities without bundling them; the change-stream path of the
         // MongoDB connector is one that does, and it dies part-way through a follow when they are absent.
         "tapdata-common, connectors declare this provided and link against it through the host",
+        "log4j-api, thin journal decoders use the host logging facade at runtime",
     })
     void theBootJarBundlesTheHostSideOfThePdk(String artifactId, String why) throws Exception {
         String bootJar = System.getProperty(BOOT_JAR_PROPERTY);

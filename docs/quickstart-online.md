@@ -124,14 +124,22 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle, SQL Server, Db2 and Db2 for i connector jars are published as separate assets on the
+Oracle, SQL Server and Db2 connector jars are published as separate assets on the
 floating `connectors-preview` release. They remain outside versioned Tapstate releases and are
 not downloaded by the three-database quickstart unless you explicitly run `register oracle`,
-`register sqlserver`, `register db2` or `register db2i`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+`register sqlserver` or `register db2`.
+
+The Db2 for i asset is scheduled for publication after this connector change is merged.
+Until `db2i-connector.jar` appears on that release, register an available local JAR with
+`tapstate register /path/to/db2i-connector.jar`. After publication, `tapstate register db2i`
+downloads and verifies the pinned asset automatically.
+
+The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
 the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
 the MIT License; the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
 IBM's International Program License Agreement; the Db2 for i jar bundles IBM Toolbox for Java
-(JTOpen) 21.0.5 under the IBM Public License 1.0. Those dependency terms govern only the bundled drivers and do not change
+(JTOpen) 21.0.5 under the IBM Public License 1.0, with the complete license text in
+`license.html` at the JAR root. Those dependency terms govern only the bundled drivers and do not change
 Tapstate's Apache-2.0 license. The Oracle, SQL Server, Db2 and Db2 for i implementations are paid connector
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;

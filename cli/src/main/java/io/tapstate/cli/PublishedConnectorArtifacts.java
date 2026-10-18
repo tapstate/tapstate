@@ -18,7 +18,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.function.UnaryOperator;
 
-/** Connector jars available from the floating {@code connectors-preview} release. */
+/** Trusted connector pins for the floating {@code connectors-preview} release. */
 final class PublishedConnectorArtifacts {
 
     private static final String RELEASES = "https://github.com/tapstate/tapstate/releases";
@@ -50,7 +50,7 @@ final class PublishedConnectorArtifacts {
             "db2i", new Artifact(34_343_764,
                     "510a34799ee3dc8d55a5f8205d1a96209b45679d68eed4f5283b87289e1848ff"));
 
-    /** Exact public ids with a matching {@code <id>-connector.jar} release asset and trusted digest. */
+    /** Connector ids pinned to an expected {@code <id>-connector.jar} asset and trusted digest. */
     static final List<String> IDS = List.copyOf(ARTIFACTS.keySet());
 
     /** Fetches one complete response body; tests replace the network at this seam. */

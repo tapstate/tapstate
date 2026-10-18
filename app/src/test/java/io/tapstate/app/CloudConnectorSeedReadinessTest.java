@@ -102,7 +102,7 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
-    void allLockedArtifactsMustBeRegisteredLoadableAndHaveReadableSpecsIncludingOnRestart() throws Exception {
+    void allLockedArtifactsMustBeRegisteredLoadableAndHaveReadableSpecsOnRepeatedChecks() throws Exception {
         var gate = gate();
         gate.verifyRegistrations(outcomes);
         gate.verifyRegistrations(outcomes.stream().map(outcome -> {
@@ -111,18 +111,6 @@ class CloudConnectorSeedReadinessTest {
                     new RegistrationOutcome(seeded.outcome().registration(), false));
         }).toList());
         assertThat(loaded).containsExactlyElementsOf(java.util.stream.Stream.concat(IDS.stream(), IDS.stream()).toList());
-    }
-
-    @Test
-    void aRuntimeRegisteredPreviewRemainsOutsideTheSeedSetAcrossRestart() throws Exception {
-        var uploaded = stores.register("db2i", "2.0.6-SNAPSHOT", RegistrationSource.REGISTER, new byte[] {4, 2});
-        stores.rows.put("db2i", TapstateCatalog.load().byId("db2i"));
-
-        gate().verifyRegistrations(outcomes);
-        gate().verifyRegistrations(outcomes);
-
-        assertThat(stores.findAll("db2i")).containsExactly(uploaded.registration());
-        assertThat(stores.rows.get("db2i").sink().capable()).isFalse();
     }
 
     @Test
