@@ -41,6 +41,11 @@ interface DagSource {
                 sinkConnectors(pipelineId));
     }
 
+    /** Scope-aware assembly must be explicitly implemented; it never falls back to a bare Pipeline id. */
+    default StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+    }
+
     /**
      * The connector each of the pipeline's sinks opens, by id, keyed by the sink's node. A sink opens its connector
      * on whichever member runs it, so these are what every member a run takes part on has to be able to load. A

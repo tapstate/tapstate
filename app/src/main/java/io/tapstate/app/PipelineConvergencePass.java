@@ -123,7 +123,7 @@ final class PipelineConvergencePass {
         }
     }
 
-    private void requirePipeline(String pipelineId) {
+    void requirePipeline(String pipelineId) {
         if (!scope().pipelineId().equals(pipelineId)) throw fenced();
         requireActive.run();
     }

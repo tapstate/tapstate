@@ -122,6 +122,7 @@ final class StoreBackedDagSource implements DagSource {
     private final JoinSchemaDrift joinSchemaDrift;
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
+    private final io.tapstate.spi.store.DerivedSchemaStore modelRecords;
     private final SourcePlacement sourcePlacement;
     private final boolean requireMarkedStore;
     // The members a run built now takes part on, by stable id, read at the moment it is built: the widths of its
@@ -204,10 +205,28 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
-        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
+        return prepareCapturedStart(ReadOnlyArtifactSnapshot.capture(artifacts()), pipelineId, defaultDatabase, modelRecords);
+    }
+
+    @Override
+    public StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase) {
+        Objects.requireNonNull(pass, "pass");
+        String pipelineId = pass.scope().pipelineId();
+        pass.requirePipeline(pipelineId);
+        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(artifacts());
+        PipelineResource original = StoredArtifacts.requirePipeline(snapshot, pipelineId);
+        if (!io.tapstate.core.model.canonical.CanonicalHash.of(original).equals(pass.intent().desired().revision()))
+            throw new TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas());
+        pass.requirePipeline(pipelineId);
+        return prepared;
+    }
+
+    private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot, String pipelineId, String defaultDatabase,
+            io.tapstate.spi.store.DerivedSchemaStore records) {
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
-                requireMarkedStore, members, parallelismBudget);
+                requireMarkedStore, members, parallelismBudget, records);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
@@ -304,15 +323,25 @@ final class StoreBackedDagSource implements DagSource {
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
             boolean requireMarkedStore, Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, artifactStore,
+                requireMarkedStore, members, parallelismBudget, Objects.requireNonNull(storePort, "storePort").derivedSchemas());
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
+            boolean requireMarkedStore, Supplier<List<String>> members, ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
         this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore);
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
-        this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
-        this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
-        this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
+        this.modelRecords = Objects.requireNonNull(modelRecords, "modelRecords");
+        this.joinSchemaDrift = new JoinSchemaDrift(this.modelRecords);
+        this.sourceSchemaCopy = new SourceSchemaCopy(this.modelRecords);
+        this.stepSchemaRecord = new StepSchemaRecord(this.modelRecords);
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
         this.requireMarkedStore = requireMarkedStore;
         this.members = Objects.requireNonNull(members, "members");
@@ -905,8 +934,8 @@ final class StoreBackedDagSource implements DagSource {
      */
     private void pinWhatThisRunHolds(String pipelineId, List<String> stepIds) {
         for (String stepId : stepIds) {
-            storePort.derivedSchemas().latest(pipelineId, stepId).ifPresent(recorded ->
-                    storePort.derivedSchemas().pin(pipelineId, stepId, recorded.version()));
+            modelRecords.latest(pipelineId, stepId).ifPresent(recorded ->
+                    modelRecords.pin(pipelineId, stepId, recorded.version()));
         }
     }
 
@@ -1436,7 +1465,7 @@ final class StoreBackedDagSource implements DagSource {
 
     /** This pipeline's own copy of one source table's model, as a node's columns. */
     private NodeColumns copiedColumns(String pipelineId, SourceVertex vertex) {
-        return storePort.derivedSchemas()
+        return modelRecords
                 .latest(pipelineId, SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()))
                 .map(recorded -> NodeColumns.known(recorded.schema()))
                 .orElse(null);
