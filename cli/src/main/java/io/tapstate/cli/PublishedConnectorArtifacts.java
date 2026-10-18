@@ -30,7 +30,7 @@ final class PublishedConnectorArtifacts {
     private static final long MAX_ARTIFACT_BYTES = 256L * 1024 * 1024;
     private static final int COPY_BUFFER_BYTES = 8192;
 
-    private static final Map<String, Artifact> ARTIFACTS = Map.of(
+    static final Map<String, Artifact> ARTIFACTS = Map.of(
             "mysql", new Artifact(47_131_206,
                     "34def7fca33fdf80f9d7e5561b2a2d9b7a2733fd06da9974359bbb77066ca0e2"),
             "mongodb", new Artifact(20_400_364,

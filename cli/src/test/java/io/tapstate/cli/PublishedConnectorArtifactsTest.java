@@ -40,19 +40,19 @@ class PublishedConnectorArtifactsTest {
         assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
                 + "connectors-preview/" + id + "-connector.jar"));
         byte[] bytes = {1, 2, 3};
-        PublishedConnectorArtifacts.Artifact[] trusted = {null};
+        PublishedConnectorArtifacts.Artifact trusted = PublishedConnectorArtifacts.ARTIFACTS.get(id);
         assertThat(PublishedConnectorArtifacts.download(id, source, (from, expected) -> {
             assertThat(from).isEqualTo(source);
             assertThat(expected.bytes()).isPositive();
             assertThat(expected.sha256()).matches("[0-9a-f]{64}");
-            trusted[0] = expected;
+            assertThat(expected).as("the requested connector's release pin").isSameAs(trusted);
             return PublishedConnectorArtifacts.Fetched.verified(bytes);
         })).isEqualTo(bytes);
         URI mirror = URI.create("https://mirror.example.test/" + id + "-connector.jar");
         assertThat(PublishedConnectorArtifacts.download(id, mirror, (from, expected) -> {
             assertThat(from).isEqualTo(mirror);
             assertThat(expected).as("changing the download origin must not change trusted metadata")
-                    .isSameAs(trusted[0]);
+                    .isSameAs(trusted);
             return PublishedConnectorArtifacts.Fetched.verified(bytes);
         })).isEqualTo(bytes);
     }
