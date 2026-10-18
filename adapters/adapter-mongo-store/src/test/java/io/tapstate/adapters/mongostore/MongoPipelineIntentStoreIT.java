@@ -43,17 +43,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class MongoPipelineIntentStoreIT {
     @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
-    private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster-a", 1, "incarnation-a", "flow", 1);
     private static final String HASH = CanonicalHash.of(pipeline());
 
     @Test
     void latestIntentAndCoordinatesSurviveReopenWithoutAnyCacheResource() {
-        withConfiguration((domain, database) -> {
+        withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
             var desired = intent(PipelineState.RUNNING, true, true, 7L);
             long before = revision(database);
-            assertThat(store.compareAndSet(SCOPE, 0, desired)).isTrue();
-            assertThat(store.load("flow")).contains(new PipelineIntentSnapshot(SCOPE, 1, desired));
+            assertThat(store.compareAndSet(scope, 0, desired)).isTrue();
+            assertThat(store.load("flow")).contains(new PipelineIntentSnapshot(scope, 1, desired));
             assertThat(revision(database)).isEqualTo(before + 1);
             try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
                 assertThat(reopened.intents().load("flow")).isEqualTo(store.load("flow"));
@@ -65,13 +64,13 @@ class MongoPipelineIntentStoreIT {
 
     @Test
     void stopThenStartCoalescesIntoOneLatestValueWithTheOriginalOneTimeStamp() {
-        withConfiguration((domain, database) -> {
+        withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
-            assertThat(store.compareAndSet(SCOPE, 0, intent(PipelineState.STOPPED, true, false, null))).isTrue();
-            assertThat(store.compareAndSet(SCOPE, 1, intent(PipelineState.RUNNING, true, true, 12L))).isTrue();
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.STOPPED, true, false, null))).isTrue();
+            assertThat(store.compareAndSet(scope, 1, intent(PipelineState.RUNNING, true, true, 12L))).isTrue();
             assertThat(store.load("flow")).get().satisfies(snapshot -> {
                 assertThat(snapshot.intentRevision()).isEqualTo(2);
-                assertThat(snapshot.scope()).isEqualTo(SCOPE);
+                assertThat(snapshot.scope()).isEqualTo(scope);
                 assertThat(snapshot.desired().revision()).isEqualTo(HASH);
                 assertThat(snapshot.desired().purgeState()).isTrue();
                 assertThat(snapshot.desired().reassemble()).isTrue();
@@ -83,15 +82,15 @@ class MongoPipelineIntentStoreIT {
 
     @Test
     void staleRevisionOrArtifactHashCannotOverwriteTheLatestIntentOrAdvanceVersions() {
-        withConfiguration((domain, database) -> {
+        withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
             var desired = intent(PipelineState.RUNNING, false, false, null);
-            assertThat(store.compareAndSet(SCOPE, 0, desired)).isTrue();
+            assertThat(store.compareAndSet(scope, 0, desired)).isTrue();
             long before = revision(database); Document mapping = mapping(database);
-            assertThat(store.compareAndSet(SCOPE, 0, intent(PipelineState.STOPPED, true, false, null))).isFalse();
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.STOPPED, true, false, null))).isFalse();
             var staleHash = new DesiredState("flow", PipelineState.STOPPED, "old-artifact-hash", true);
-            assertThat(store.compareAndSet(SCOPE, 1, staleHash)).isFalse();
-            assertThat(store.load("flow")).contains(new PipelineIntentSnapshot(SCOPE, 1, desired));
+            assertThat(store.compareAndSet(scope, 1, staleHash)).isFalse();
+            assertThat(store.load("flow")).contains(new PipelineIntentSnapshot(scope, 1, desired));
             assertThat(revision(database)).isEqualTo(before);
             assertThat(mapping(database)).isEqualTo(mapping);
         });
@@ -99,15 +98,15 @@ class MongoPipelineIntentStoreIT {
 
     @Test
     void twoIndependentClientsCanPublishOnlyOneSuccessorOfAnObservedRevision() {
-        withConfiguration((domain, database) -> {
-            assertThat(domain.intents().compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+        withConfiguration((domain, database, scope) -> {
+            assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
             long before = revision(database);
             try (var other = MongoConfigurationDomain.open(settings(database), "cluster-a"); var executor = Executors.newFixedThreadPool(2)) {
                 var ready = new CountDownLatch(2); var start = new CountDownLatch(1);
                 var a = executor.submit(() -> { ready.countDown(); assertThat(start.await(10, TimeUnit.SECONDS)).isTrue();
-                    return domain.intents().compareAndSet(SCOPE, 1, intent(PipelineState.STOPPED, true, false, null)); });
+                    return domain.intents().compareAndSet(scope, 1, intent(PipelineState.STOPPED, true, false, null)); });
                 var b = executor.submit(() -> { ready.countDown(); assertThat(start.await(10, TimeUnit.SECONDS)).isTrue();
-                    return other.intents().compareAndSet(SCOPE, 1, intent(PipelineState.PAUSED, false, false, null)); });
+                    return other.intents().compareAndSet(scope, 1, intent(PipelineState.PAUSED, false, false, null)); });
                 assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue(); start.countDown();
                 assertThat(List.of(a.get(20, TimeUnit.SECONDS), b.get(20, TimeUnit.SECONDS))).containsExactlyInAnyOrder(true, false);
             }
@@ -119,48 +118,117 @@ class MongoPipelineIntentStoreIT {
 
     @Test
     void removingAnAbsentIntentAlsoPreventsADelayedFirstWriterFromRevivingIt() {
-        withConfiguration((domain, database) -> {
-            assertThat(domain.intents().remove(SCOPE, 0)).isTrue();
-            assertThat(domain.intents().compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null)))
+        withConfiguration((domain, database, scope) -> {
+            assertThat(domain.intents().remove(scope, 0)).isTrue();
+            assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null)))
                     .as("an earlier never-written observation cannot revive a removed intent").isFalse();
-            assertThat(domain.intents().load("flow")).contains(new PipelineIntentSnapshot(SCOPE, 1, null));
+            assertThat(domain.intents().load("flow")).contains(new PipelineIntentSnapshot(scope, 1, null));
             assertThat(domain.intents().pipelineIds()).isEmpty();
         });
     }
 
     @Test
     void deletionRetainsASmallRevisionMarkerAndRejectsEarlierWritersAfterRecreation() {
-        withConfiguration((domain, database) -> {
+        withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
-            assertThat(store.compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
-            assertThat(store.remove(SCOPE, 1)).isTrue();
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            assertThat(store.remove(scope, 1)).isTrue();
             var deleted = store.load("flow").orElseThrow();
             assertThat(deleted.deleted()).isTrue(); assertThat(deleted.intentRevision()).isEqualTo(2);
             assertThat(store.pipelineIds()).isEmpty();
             assertThat(SystemCollections.PIPELINE_INTENTS.on(database).find().first())
                     .doesNotContainKeys("targetState", "revision", "assemblyRevision", "purgeState", "reassemble", "rebuiltAtStateEpoch");
             long before = revision(database);
-            assertThat(store.remove(SCOPE, 2)).isTrue(); assertThat(revision(database)).isEqualTo(before);
-            assertThat(store.compareAndSet(SCOPE, 0, intent(PipelineState.STOPPED, true, false, null))).isFalse();
-            assertThat(store.compareAndSet(SCOPE, 2, intent(PipelineState.RUNNING, false, false, null))).isTrue();
-            assertThat(store.compareAndSet(SCOPE, 1, intent(PipelineState.STOPPED, true, false, null))).isFalse();
+            assertThat(store.remove(scope, 2)).isTrue(); assertThat(revision(database)).isEqualTo(before);
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.STOPPED, true, false, null))).isFalse();
+            assertThat(store.compareAndSet(scope, 2, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            assertThat(store.compareAndSet(scope, 1, intent(PipelineState.STOPPED, true, false, null))).isFalse();
             assertThat(store.load("flow")).get().extracting(PipelineIntentSnapshot::intentRevision).isEqualTo(3L);
         });
     }
 
     @Test
-    void staleBindingGenerationAndNonActiveMappingAreNeverSilentlyRetargeted() {
-        withConfiguration((domain, database) -> {
+    void callerCannotChooseADifferentIncarnationForTheCurrentBinding() {
+        withConfiguration((domain, database, scope) -> {
+            var wrong = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), UUID.randomUUID().toString(),
+                    scope.pipelineId(), scope.stateGeneration());
+            var originalMapping = mapping(database); long before = revision(database);
+            assertThatThrownBy(() -> domain.intents().compareAndSet(wrong, 0, intent(PipelineState.RUNNING, false, false, null)))
+                    .satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThat(SystemCollections.PIPELINE_INTENTS.on(database).countDocuments()).isZero();
+            assertThat(mapping(database)).isEqualTo(originalMapping);
+            assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aStoredDifferentIncarnationCannotBeReadRetargetedOrRemovedByAnOrdinaryCommand() {
+        withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
-            for (var wrong : List.of(new PipelineIntentScope("cluster-b", 1, "incarnation-a", "flow", 1),
-                    new PipelineIntentScope("cluster-a", 2, "incarnation-a", "flow", 1),
-                    new PipelineIntentScope("cluster-a", 1, "incarnation-a", "flow", 2))) {
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            SystemCollections.PIPELINE_INTENTS.on(database).updateOne(new Document("_id", "flow"),
+                    new Document("$set", new Document("cacheIncarnation", UUID.randomUUID().toString())));
+            var stored = SystemCollections.PIPELINE_INTENTS.on(database).find().first();
+            var originalMapping = mapping(database); long before = revision(database);
+            assertThat(store.pipelineIds()).containsExactly("flow");
+            assertThatThrownBy(() -> store.load("flow")).satisfies(MongoPipelineIntentStoreIT::unreadable);
+            assertThatThrownBy(() -> store.compareAndSet(scope, 1, intent(PipelineState.STOPPED, true, false, null)))
+                    .satisfies(MongoPipelineIntentStoreIT::unreadable);
+            assertThatThrownBy(() -> store.remove(scope, 1)).satisfies(MongoPipelineIntentStoreIT::unreadable);
+            assertThat(SystemCollections.PIPELINE_INTENTS.on(database).find().first()).isEqualTo(stored);
+            assertThat(mapping(database)).isEqualTo(originalMapping); assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void anOrdinaryCommandCannotAdoptAnotherStoredGenerationAtTheSameRevision() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(new Document("_id", "flow"),
+                    new Document("$set", new Document("stateGeneration", 2L)));
+            var next = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), "flow", 2);
+            var before = SystemCollections.PIPELINE_INTENTS.on(database).find().first();
+            long version = revision(database); var originalMapping = mapping(database);
+            assertThatThrownBy(() -> store.compareAndSet(next, 1, intent(PipelineState.STOPPED, true, false, null)))
+                    .satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThatThrownBy(() -> store.remove(next, 1)).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThat(SystemCollections.PIPELINE_INTENTS.on(database).find().first()).isEqualTo(before);
+            assertThat(mapping(database)).isEqualTo(originalMapping); assertThat(revision(database)).isEqualTo(version);
+        });
+    }
+
+    @Test
+    void missingRecoveryAuthorityCannotBeReconstructedFromAnExistingIntentOrCallerScope() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            SystemCollections.STORAGE_RECOVERY.on(database).deleteMany(new Document());
+            var before = SystemCollections.PIPELINE_INTENTS.on(database).find().first();
+            var originalMapping = mapping(database); long version = revision(database);
+            assertThatThrownBy(() -> store.load("flow")).satisfies(MongoPipelineIntentStoreIT::unreadable);
+            assertThatThrownBy(() -> store.compareAndSet(scope, 1, intent(PipelineState.STOPPED, true, false, null)))
+                    .satisfies(MongoPipelineIntentStoreIT::unreadable);
+            assertThatThrownBy(() -> store.remove(scope, 1)).satisfies(MongoPipelineIntentStoreIT::unreadable);
+            assertThat(SystemCollections.STORAGE_RECOVERY.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.PIPELINE_INTENTS.on(database).find().first()).isEqualTo(before);
+            assertThat(mapping(database)).isEqualTo(originalMapping); assertThat(revision(database)).isEqualTo(version);
+        });
+    }
+
+    @Test
+    void staleBindingGenerationAndNonActiveMappingAreNeverSilentlyRetargeted() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            for (var wrong : List.of(new PipelineIntentScope("cluster-b", 1, scope.cacheIncarnation(), "flow", 1),
+                    new PipelineIntentScope("cluster-a", 2, scope.cacheIncarnation(), "flow", 1),
+                    new PipelineIntentScope("cluster-a", 1, scope.cacheIncarnation(), "flow", 2))) {
                 assertThatThrownBy(() -> store.compareAndSet(wrong, 0, intent(PipelineState.RUNNING, false, false, null)))
                         .satisfies(MongoPipelineIntentStoreIT::fenced);
             }
             SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(new Document("_id", "flow"),
                     new Document("$set", new Document("phase", "REBUILDING").append("operationId", "recovery-a")));
-            assertThatThrownBy(() -> store.compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null)))
+            assertThatThrownBy(() -> store.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null)))
                     .satisfies(MongoPipelineIntentStoreIT::fenced);
             assertThat(store.load("flow")).isEmpty();
         });
@@ -168,12 +236,12 @@ class MongoPipelineIntentStoreIT {
 
     @Test
     void postWriteLossOfOriginalAuthorityRollsBackIntentMappingAndGlobalVersion() {
-        withConfiguration((domain, database) -> {
+        withConfiguration((domain, database, scope) -> {
             var checks = new AtomicInteger(); long before = revision(database); Document mapping = mapping(database);
             var guarded = domain.intents().guardedBy(() -> {
                 if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
             });
-            assertThatThrownBy(() -> guarded.compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null)))
+            assertThatThrownBy(() -> guarded.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null)))
                     .satisfies(MongoPipelineIntentStoreIT::fenced);
             assertThat(domain.intents().load("flow")).isEmpty();
             assertThat(revision(database)).isEqualTo(before); assertThat(mapping(database)).isEqualTo(mapping);
@@ -183,7 +251,7 @@ class MongoPipelineIntentStoreIT {
     @Test
     void aRealTransactionRetryRechecksTheOriginalGuardInsteadOfCreatingANewContext() {
         for (boolean injectFailure : List.of(false, true)) {
-            withConfiguration((domain, database) -> {
+            withConfiguration((domain, database, scope) -> {
                 var failedUpdates = new AtomicInteger(); var startedUpdates = new AtomicInteger(); var checks = new AtomicInteger();
                 var witness = new CommandListener() {
                     @Override public void commandStarted(CommandStartedEvent event) {
@@ -202,18 +270,22 @@ class MongoPipelineIntentStoreIT {
                                     .append("errorLabels", List.of("TransientTransactionError"))));
                     try {
                         long before = revision(database);
-                        var guarded = new MongoPipelineIntentStore(observed, observed.getDatabase(database.getName()), "cluster-a").guardedBy(() -> {
+                        String material = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+                        var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+                        var observedDatabase = observed.getDatabase(database.getName());
+                        var originalBindings = new MongoStorageBindingStore(observed, observedDatabase, ciphers);
+                        var guarded = new MongoPipelineIntentStore(observed, observedDatabase, "cluster-a", originalBindings).guardedBy(() -> {
                             checks.incrementAndGet();
                             if (failedUpdates.get() > 0) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
                         });
                         if (injectFailure) {
-                            assertThatThrownBy(() -> guarded.compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null)))
+                            assertThatThrownBy(() -> guarded.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null)))
                                     .satisfies(MongoPipelineIntentStoreIT::fenced);
                             assertThat(failedUpdates.get()).isOne(); assertThat(startedUpdates.get()).isOne();
                             assertThat(checks.get()).isEqualTo(2); assertThat(revision(database)).isEqualTo(before);
                             assertThat(domain.intents().load("flow")).isEmpty();
                         } else {
-                            assertThat(guarded.compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+                            assertThat(guarded.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
                             assertThat(failedUpdates.get()).isZero(); assertThat(startedUpdates.get()).isEqualTo(2);
                             assertThat(checks.get()).isEqualTo(2); assertThat(revision(database)).isEqualTo(before + 1);
                             assertThat(domain.intents().load("flow")).isPresent();
@@ -229,13 +301,13 @@ class MongoPipelineIntentStoreIT {
     @Test
     void corruptIntentBodiesRemainInTheIdProjectionButAreNeverDefaultedOrOverwritten() {
         for (String field : List.of("reassemble", "rebuiltAtStateEpoch", "cacheIncarnation", "intentRevision")) {
-            withConfiguration((domain, database) -> {
-                assertThat(domain.intents().compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            withConfiguration((domain, database, scope) -> {
+                assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
                 SystemCollections.PIPELINE_INTENTS.on(database).updateOne(new Document(), new Document("$set", new Document(field, field.equals("cacheIncarnation") ? 7L : "raw-secret-sentinel")));
                 long before = revision(database);
                 assertThat(domain.intents().pipelineIds()).containsExactly("flow");
                 assertThatThrownBy(() -> domain.intents().load("flow")).satisfies(MongoPipelineIntentStoreIT::unreadable);
-                assertThatThrownBy(() -> domain.intents().compareAndSet(SCOPE, 1, intent(PipelineState.STOPPED, true, false, null)))
+                assertThatThrownBy(() -> domain.intents().compareAndSet(scope, 1, intent(PipelineState.STOPPED, true, false, null)))
                         .satisfies(MongoPipelineIntentStoreIT::unreadable);
                 assertThat(revision(database)).isEqualTo(before);
             });
@@ -245,9 +317,9 @@ class MongoPipelineIntentStoreIT {
     @Test
     void missingMappingOrConfigurationVersionRefusesWithoutCreatingReplacementFacts() {
         for (var missing : List.of(SystemCollections.OPERATOR_GENERATIONS, SystemCollections.CONFIGURATION_VERSION)) {
-            withConfiguration((domain, database) -> {
+            withConfiguration((domain, database, scope) -> {
                 missing.on(database).deleteMany(new Document());
-                assertThatThrownBy(() -> domain.intents().compareAndSet(SCOPE, 0, intent(PipelineState.RUNNING, false, false, null)))
+                assertThatThrownBy(() -> domain.intents().compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null)))
                         .satisfies(MongoPipelineIntentStoreIT::unreadable);
                 assertThat(domain.intents().load("flow")).isEmpty(); assertThat(missing.on(database).countDocuments()).isZero();
             });
@@ -275,10 +347,13 @@ class MongoPipelineIntentStoreIT {
                 var master = new SourceResource(StorageBinding.defaultSourceId(StorageBinding.Mode.OP), null, "mongodb",
                         Map.of("uri", "mongodb://master.invalid/master"), null, null, null, null);
                 domain.bindings().commit(new StorageSetupScope("cluster-a", "installation-a", "setup-a", 1), StorageBinding.Mode.OP, cache, master);
-                domain.artifacts().create(pipeline()); scenario.run(domain, database);
+                domain.artifacts().create(pipeline());
+                var cacheScope = domain.bindings().cachePreparation().orElseThrow().businessScope();
+                var scope = new PipelineIntentScope(cacheScope.clusterId(), cacheScope.bindingVersion(), cacheScope.cacheIncarnation(), "flow", 1);
+                scenario.run(domain, database, scope);
             } catch (Exception failure) { throw new AssertionError(failure); }
             finally { database.drop(); }
         }
     }
-    @FunctionalInterface private interface Scenario { void run(MongoConfigurationDomain domain, MongoDatabase database) throws Exception; }
+    @FunctionalInterface private interface Scenario { void run(MongoConfigurationDomain domain, MongoDatabase database, PipelineIntentScope scope) throws Exception; }
 }

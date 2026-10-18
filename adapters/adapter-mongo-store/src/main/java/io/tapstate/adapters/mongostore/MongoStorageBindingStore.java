@@ -204,6 +204,16 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         });
     }
 
+    /** Same-client configuration consumers reuse the original transaction's authoritative scope. */
+    Optional<CachePreparation> cachePreparationForTransaction(ClientSession session) {
+        verifyIndex();
+        return load(session).map(Loaded::cachePreparation);
+    }
+
+    boolean belongsTo(MongoClient expectedClient, String expectedDatabase) {
+        return client == expectedClient && database.getName().equals(expectedDatabase);
+    }
+
     Optional<StorageBinding> loadForTransaction(ClientSession session) {
         verifyIndex();
         return load(session).map(Loaded::binding);

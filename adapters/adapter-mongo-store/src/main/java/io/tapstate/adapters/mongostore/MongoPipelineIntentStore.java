@@ -41,13 +41,19 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     private final MongoCollection<Document> identity;
     private final MongoCollection<Document> versions;
     private final String clusterId;
+    private final MongoStorageBindingStore bindings;
     private final Runnable requireActive;
 
-    MongoPipelineIntentStore(MongoClient client, MongoDatabase database, String clusterId) {
-        this(client, database, clusterId, () -> {});
+    MongoPipelineIntentStore(MongoClient client, MongoDatabase database, String clusterId, MongoStorageBindingStore bindings) {
+        this(client, database, clusterId, bindings, () -> {});
     }
-    private MongoPipelineIntentStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive) {
+    private MongoPipelineIntentStore(MongoClient client, MongoDatabase database, String clusterId,
+            MongoStorageBindingStore bindings, Runnable requireActive) {
         this.client = Objects.requireNonNull(client, "client"); this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
+        this.bindings = Objects.requireNonNull(bindings, "bindings");
+        if (!bindings.belongsTo(client, database.getName())) {
+            throw new IllegalArgumentException("configuration intent and binding must share one original client and database");
+        }
         this.intents = SystemCollections.PIPELINE_INTENTS.on(database);
         this.mappings = SystemCollections.OPERATOR_GENERATIONS.on(database);
         this.pipelines = SystemCollections.PIPELINES.on(database);
@@ -57,12 +63,13 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
     @Override public PipelineIntentStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoPipelineIntentStore(client, client.getDatabase(intents.getNamespace().getDatabaseName()), clusterId,
+        return new MongoPipelineIntentStore(client, client.getDatabase(intents.getNamespace().getDatabaseName()), clusterId, bindings,
                 () -> { requireActive.run(); additional.run(); });
     }
     @Override public Optional<PipelineIntentSnapshot> load(String pipelineId) {
         requireId(pipelineId);
-        return transaction(session -> Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first()).map(this::decode));
+        return transaction(session -> Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first())
+                .map(row -> decodeCurrent(session, row)));
     }
     @Override public List<String> pipelineIds() {
         return transaction(session -> intents.find(session, new Document("deleted", new Document("$ne", true)))
@@ -86,9 +93,11 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (expected < 0 || expected >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected intent revision");
         return transaction(session -> {
             Document current = intents.find(session, new Document("_id", scope.pipelineId())).first();
-            long revision = current == null ? 0 : decode(current).intentRevision();
+            PipelineIntentSnapshot held = current == null ? null : decodeCurrent(session, current);
+            long revision = held == null ? 0 : held.intentRevision();
             if (revision != expected) return false;
             Document generation = requireScope(session, scope);
+            if (held != null && !held.scope().equals(scope)) throw fenced();
             Document artifact = pipelines.find(session, new Document("_id", scope.pipelineId())).first();
             if (artifact == null) throw fenced();
             if (desired != null && !desired.revision().equals(artifact.get("contentHash"))) return false;
@@ -116,10 +125,23 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (stored == null || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
                 || !(stored.get("bindingVersion") instanceof Long binding)) throw unreadable();
         if (!clusterId.equals(scope.clusterId()) || !clusterId.equals(stored.get("clusterId")) || binding != scope.bindingVersion()) throw fenced();
+        if (!matchesCurrentCache(session, scope)) throw fenced();
         Document row = mappings.find(session, new Document("_id", scope.pipelineId())).first();
         var state = MongoPipelineStateMappings.decode(scope.pipelineId(), row);
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE || state.stateGeneration() != scope.stateGeneration()) throw fenced();
         return row;
+    }
+    private boolean matchesCurrentCache(ClientSession session, PipelineIntentScope expected) {
+        var preparation = bindings.cachePreparationForTransaction(session);
+        if (preparation.isEmpty()) return false;
+        var current = preparation.get().businessScope();
+        return current.clusterId().equals(expected.clusterId()) && current.bindingVersion() == expected.bindingVersion()
+                && current.cacheIncarnation().equals(expected.cacheIncarnation());
+    }
+    private PipelineIntentSnapshot decodeCurrent(ClientSession session, Document row) {
+        var snapshot = decode(row);
+        if (!matchesCurrentCache(session, snapshot.scope())) throw unreadable();
+        return snapshot;
     }
     private Document header(PipelineIntentScope scope, long revision, boolean deleted) {
         return new Document("_id", scope.pipelineId()).append("formatVersion", 1).append("clusterId", scope.clusterId())

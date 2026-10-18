@@ -132,7 +132,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     public io.tapstate.spi.store.PipelineIntentStore intents() {
-        return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId);
+        return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings);
     }
 
     public PipelineDraftStore drafts() { return drafts; }
