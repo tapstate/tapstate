@@ -40,6 +40,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
+    private final Runnable requireStructure;
     private final MongoSrsChainStore chains;
     private final MongoSrsConsumerRecords records;
 
@@ -47,13 +48,17 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         this(client, database, scope, () -> {});
     }
     private MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
+        this(client, database, scope, requireActive, null);
+    }
+    MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
-        this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = requireActive;
-        this.chains = new MongoSrsChainStore(client, database, scope); this.records = new MongoSrsConsumerRecords(scope);
+        this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
+        this.requireStructure = requireStructure == null ? this::verifyConsumerStructure : requireStructure;
+        this.chains = new MongoSrsChainStore(client, database, scope, requireActive, this.requireStructure); this.records = new MongoSrsConsumerRecords(scope);
     }
     @Override public MongoSrsConsumerStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); });
+        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
     }
     @Override public Optional<SrsConsumerMembership> find(SrsConsumerKey key) {
         Objects.requireNonNull(key, "key");
@@ -111,7 +116,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
     private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot) {
         if (snapshot == null) return;
-        var models = new MongoSrsModelStore(client, database, scope);
+        var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
         for (var key : snapshot.models().values()) {
             if (!context.key().miningChainId().equals(key.miningChainId()) || !scope.cacheIncarnation().equals(key.cacheIncarnation())) {
                 throw unavailable(context.key().miningChainId());
@@ -217,15 +222,18 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
     private <T> T transaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
-            try (var session = client.startSession()) {
-                return session.withTransaction(() -> {
-                    requireActive.run(); requireStructure(); new MongoCacheBusinessIdentity(database, scope).requireReady(session);
-                    T result = action.apply(session); requireActive.run(); return result;
-                }, TRANSACTION);
-            }
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    return session.withTransaction(() -> {
+                        requireActive.run(); requireStructure.run(); requireActive.run(); new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+                        T result = action.apply(session); requireActive.run(); return result;
+                    }, TRANSACTION);
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
         });
     }
-    private void requireStructure() {
+    private void verifyConsumerStructure() {
         var tables = List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,
                 SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS);
         var names = tables.stream().map(SystemCollections::collectionName).toList();

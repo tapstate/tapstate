@@ -318,11 +318,12 @@ class MongoSrsModelStoreIT {
     @Test
     void postPublicationGuardLossRollsBackTheModelInitialBoundaryAndClaimProof() {
         withBusiness(f -> {
-            var checks = new AtomicInteger(); Document claim = claim(f.database());
-            var guarded = f.models().guardedBy(() -> {
-                if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null);
-            });
-            assertThatThrownBy(() -> guarded.publish(model(0, table("id", null)), f.fence())).satisfies(MongoSrsModelStoreIT::businessFenced);
+            Document claim = claim(f.database());
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"insert","srs_models")) {
+                var guarded = new MongoSrsModelStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                assertThatThrownBy(() -> guarded.publish(model(0, table("id", null)), f.fence())).satisfies(MongoSrsModelStoreIT::businessFenced);
+                witness.requireCommand();
+            }
             assertThat(models(f.database()).countDocuments()).isZero();
             assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isZero();
             assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first().getList("modelContextHeads", Document.class)).isEmpty();
@@ -486,27 +487,12 @@ class MongoSrsModelStoreIT {
         withBusiness(f -> {
             f.models().publish(model(0, table("id", null)), f.fence()); Document before = claim(f.database());
             Document chainBefore = SystemCollections.SRS_CHAINS.on(f.database()).find().first();
-            var boundsWritten = new AtomicBoolean(); var inBounds = new AtomicBoolean(); var checks = new AtomicInteger();
-            var witness = new CommandListener() {
-                @Override public void commandStarted(CommandStartedEvent event) {
-                    if (event.getCommandName().equals("update")) inBounds.set(event.getCommand().getString("update").getValue().equals("srs_log_bounds"));
-                }
-                @Override public void commandSucceeded(CommandSucceededEvent event) {
-                    if (event.getCommandName().equals("update") && inBounds.get()) boundsWritten.set(true);
-                }
-            };
-            try (var observed = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
-                    .addCommandListener(witness).build())) {
-                var database = observed.getDatabase(f.database().getName());
-                var guarded = new MongoSrsModelStore(observed, database, SCOPE).guardedBy(() -> {
-                    if (checks.incrementAndGet() == 2) {
-                        assertThat(boundsWritten.get()).isTrue();
-                        throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null);
-                    }
-                });
-                var log = new MongoSrsLogStore(observed, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
-                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), guarded);
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_log_bounds")) {
+                var guarded = new MongoSrsModelStore(witness.client, witness.database, SCOPE).guardedBy(witness::refuseAfterCommand);
+                var log = new MongoSrsLogStore(witness.client, SystemCollections.SRS_EVENTS.on(witness.database), SystemCollections.SRS_LOG_BOUNDS.on(witness.database),
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(witness.database), guarded);
                 assertThatThrownBy(() -> log.store(RING, 1, event(0, 7, f.fence()))).satisfies(MongoSrsModelStoreIT::businessFenced);
+                witness.requireCommand();
             }
             assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isZero();
             assertThat(modelLog(f).bounds(RING)).isEqualTo(new SrsLogBounds(-1, -1));
@@ -839,11 +825,12 @@ class MongoSrsModelStoreIT {
             SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document(), new Document("$set", new Document("epoch", 8L)));
             Document chainBefore = SystemCollections.SRS_CHAINS.on(f.database()).find().first();
             Document controlBefore = SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).find().first(); Document claimBefore = claim(f.database());
-            var checks = new AtomicInteger(); var guarded = f.models().guardedBy(() -> {
-                if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null);
-            });
-            var next = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("next", null), 1);
-            assertThatThrownBy(() -> guarded.publish(next, f.fence())).satisfies(MongoSrsModelStoreIT::businessFenced);
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"insert","srs_models")) {
+                var guarded = new MongoSrsModelStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                var next = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("next", null), 1);
+                assertThatThrownBy(() -> guarded.publish(next, f.fence())).satisfies(MongoSrsModelStoreIT::businessFenced);
+                witness.requireCommand();
+            }
             assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first()).isEqualTo(chainBefore);
             assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).find().first()).isEqualTo(controlBefore);
             assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isOne();
@@ -1141,12 +1128,13 @@ class MongoSrsModelStoreIT {
     @Test
     void aSnapshotSelectionGuardIsCheckedBeforeReturningAnyCandidate() {
         withBusiness(f -> {
-            f.models().publish(model(0, table("id", null)), f.fence()); var checks = new AtomicInteger();
+            f.models().publish(model(0, table("id", null)), f.fence());
             var before = snapshotFacts(f.database());
-            var guarded = f.models().guardedBy(() -> {
-                if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null);
-            });
-            assertThatThrownBy(() -> guarded.publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::businessFenced);
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"find","srs_models")) {
+                var guarded = new MongoSrsModelStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                assertThatThrownBy(() -> guarded.publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::businessFenced);
+                witness.requireCommand();
+            }
             assertThat(snapshotFacts(f.database())).isEqualTo(before);
         });
     }

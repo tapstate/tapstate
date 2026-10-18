@@ -42,6 +42,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
+    private final Runnable requireStructure;
     private final MongoSrsModelStore models;
     private final MongoSrsLogStore log;
 
@@ -49,15 +50,19 @@ public final class MongoSrsChainStore implements SrsChainStore {
         this(client, database, scope, () -> {});
     }
     private MongoSrsChainStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
+        this(client, database, scope, requireActive, () -> {});
+    }
+    MongoSrsChainStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
-        this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = requireActive;
-        this.models = new MongoSrsModelStore(client, database, scope);
+        this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
+        this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
+        this.models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
         this.log = new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                 SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models);
     }
     @Override public MongoSrsChainStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsChainStore(client, database, scope, () -> { requireActive.run(); additional.run(); });
+        return new MongoSrsChainStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
     }
     @Override public SrsChainState prepare(String chain, String retention, WorkloadClaimFence fence) {
         requireName(chain);
@@ -264,12 +269,15 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private static void requireName(String chain) { if (chain == null || chain.isBlank()) throw new IllegalArgumentException("blank mining chain"); }
     private <T> T transaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
-            try (var session = client.startSession()) {
-                return session.withTransaction(() -> {
-                    requireActive.run(); new MongoCacheBusinessIdentity(database, scope).requireReady(session);
-                    T result = action.apply(session); requireActive.run(); return result;
-                }, TRANSACTION);
-            }
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    return session.withTransaction(() -> {
+                        requireActive.run(); requireStructure.run(); requireActive.run(); new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+                        T result = action.apply(session); requireActive.run(); return result;
+                    }, TRANSACTION);
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
         });
     }
     private static TapstateException unproven(String chain) { return new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null); }

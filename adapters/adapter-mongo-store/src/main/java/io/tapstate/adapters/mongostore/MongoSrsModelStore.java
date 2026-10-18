@@ -34,19 +34,24 @@ public final class MongoSrsModelStore implements SrsModelStore {
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
+    private final Runnable requireStructure;
     private final MongoSrsModelContexts contexts;
 
     public MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope) {
         this(client, database, scope, () -> {});
     }
     private MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
+        this(client, database, scope, requireActive, () -> {});
+    }
+    MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
-        this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = requireActive;
+        this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
+        this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
         this.contexts = new MongoSrsModelContexts(database, scope);
     }
     @Override public MongoSrsModelStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); });
+        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
     }
     @Override public SrsModel publish(SrsModel model, WorkloadClaimFence fence) {
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
@@ -229,6 +234,11 @@ public final class MongoSrsModelStore implements SrsModelStore {
     boolean belongsTo(MongoClient expectedClient, String expectedDatabase) {
         return client == expectedClient && database.getName().equals(expectedDatabase);
     }
+
+    void beforeSession() { requireActive.run(); }
+    void checkActive() { requireActive.run(); }
+
+    void beforeAttempt(ClientSession session) { requireActive.run(); requireStructure.run(); checkDomain(session); }
 
     void checkDomain(ClientSession session) { requireActive.run(); requireBusiness(session); }
 
@@ -416,9 +426,12 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
     private <T> T transaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
-            try (var session = client.startSession()) {
-                return session.withTransaction(() -> { requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
-            }
+            try {
+                beforeSession();
+                try (var session = client.startSession()) {
+                    return session.withTransaction(() -> { requireActive.run(); requireStructure.run(); requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
         });
     }
     private static TapstateException unavailable(SrsModelKey key) { return modelError(IoError.SRS_MODEL_UNAVAILABLE, key); }

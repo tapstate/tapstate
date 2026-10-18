@@ -374,22 +374,24 @@ public final class MongoSrsLogStore implements SrsLogStore {
 
     private <T> T transaction(WorkloadClaimFence fence, java.util.function.Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
-            try (var session = client.startSession()) {
-                return session.withTransaction(() -> {
-                    if (models != null) models.checkDomain(session);
-                    if (fence != null) {
-                        if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
-                            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            try {
+                if (models != null) models.beforeSession();
+                try (var session = client.startSession()) {
+                    return session.withTransaction(() -> {
+                        if (models != null) models.beforeAttempt(session);
+                        if (fence != null) {
+                            if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
+                                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                            }
                         }
-                    }
-                    T result = action.apply(session);
-                    if (models != null) models.checkDomain(session);
-                    return result;
-                }, DURABLE_APPEND);
-            }
+                        T result = action.apply(session);
+                        if (models != null) models.checkDomain(session);
+                        return result;
+                    }, DURABLE_APPEND);
+                }
+            } catch (RuntimeException failure) { if (models != null) models.checkActive(); throw failure; }
         });
     }
-
     private static TapstateException unreadableSplit(String field) {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-log", "field", field), null);
     }

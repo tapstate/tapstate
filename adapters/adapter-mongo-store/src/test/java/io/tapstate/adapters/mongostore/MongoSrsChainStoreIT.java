@@ -22,7 +22,6 @@ import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -163,10 +162,13 @@ class MongoSrsChainStoreIT {
     @Test
     void losingTheOriginalCallbackGuardRollsBackTheCheckpointAndClaimProof() {
         withBusiness(f -> {
-            prepare(f, Set.of(ORDERS)); var calls = new AtomicInteger(); Document before = root(f); Document claim = claim(f);
-            var guarded = f.chains().guardedBy(() -> { if (calls.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null); });
-            assertThatThrownBy(() -> guarded.checkpoint(CHAIN, 0, checkpoint(1, 1, "must-rollback", Map.of(ORDERS, -1L)), f.fence()))
-                    .isInstanceOf(TapstateException.class);
+            prepare(f, Set.of(ORDERS)); Document before = root(f); Document claim = claim(f);
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_chains")) {
+                var guarded = new MongoSrsChainStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                assertThatThrownBy(() -> guarded.checkpoint(CHAIN, 0, checkpoint(1, 1, "must-rollback", Map.of(ORDERS, -1L)), f.fence()))
+                        .satisfies(failure -> code(failure,IoError.CACHE_BUSINESS_FENCED));
+                witness.requireCommand();
+            }
             assertThat(root(f)).isEqualTo(before); assertThat(claim(f)).isEqualTo(claim);
         });
     }
@@ -237,7 +239,7 @@ class MongoSrsChainStoreIT {
         withBusiness(f -> {
             prepare(f, Set.of(ORDERS)); f.log().store(ring(ORDERS), 0, event(0, 1, f.fence()));
             var saved = f.chains().checkpoint(CHAIN, 0, checkpoint(1, 1, "saved", Map.of(ORDERS, 0L)), f.fence()).orElseThrow();
-            f.log().trim(ring(ORDERS), 0);
+            f.log().trim(ring(ORDERS), 0, f.fence());
             assertThat(f.chains().load(CHAIN)).contains(saved);
             assertThat(f.chains().openEpoch(CHAIN, 1, f.fence())).hasValue(2);
         });

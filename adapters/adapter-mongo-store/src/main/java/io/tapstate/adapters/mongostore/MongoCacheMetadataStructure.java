@@ -86,6 +86,12 @@ final class MongoCacheMetadataStructure {
         verify(List.of(table));
     }
 
+    void verifySrs() {
+        verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.SRS_CHAINS,
+                SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS,
+                SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS));
+    }
+
     private void verify(List<SystemCollections> tables) {
         StoreIo.run(() -> {
             var required = names(tables);

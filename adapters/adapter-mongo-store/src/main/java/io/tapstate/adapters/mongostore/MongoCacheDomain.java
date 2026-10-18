@@ -162,6 +162,21 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 () -> { businessActive(); requireActive.run(); });
     }
 
+    /** SRS facets retain one CACHE client, complete business scope and original caller lifecycle. */
+    public io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        active.run(); loadBusinessScope(expected);
+        var structure = new MongoCacheMetadataStructure(database, rateRetention);
+        structure.verifySrs(); active.run();
+        var models = new MongoSrsModelStore(client, database, expected, active, structure::verifySrs);
+        return new io.tapstate.spi.store.SrsStores(
+                new MongoSrsChainStore(client, database, expected, active, structure::verifySrs), models,
+                new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models),
+                new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs));
+    }
+
     public io.tapstate.spi.store.SchemaStore schemas(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive));
     }

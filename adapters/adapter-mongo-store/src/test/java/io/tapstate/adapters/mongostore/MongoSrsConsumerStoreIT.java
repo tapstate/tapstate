@@ -35,7 +35,6 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -187,9 +186,12 @@ class MongoSrsConsumerStoreIT {
     void callbackGuardLossRollsBackBothResourcesTheChainAndTheClaimProof() {
         withBusiness(f -> {
             Document root = root(f); Document claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())
-                    .find(new Document("_id.resourceId", A.key().pipelineId())).first(); var calls = new AtomicInteger();
-            var guarded = f.consumers().guardedBy(() -> { if (calls.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null); });
-            assertThatThrownBy(() -> guarded.attach(A, 0, Set.of("orders"), f.fenceA())).isInstanceOf(TapstateException.class);
+                    .find(new Document("_id.resourceId", A.key().pipelineId())).first();
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_chains")) {
+                var guarded = new MongoSrsConsumerStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                assertThatThrownBy(() -> guarded.attach(A, 0, Set.of("orders"), f.fenceA())).satisfies(failure -> code(failure,IoError.CACHE_BUSINESS_FENCED));
+                witness.requireCommand();
+            }
             assertThat(root(f)).isEqualTo(root); assertThat(membership(f, A)).isNull(); assertThat(cursor(f, A)).isNull();
             assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id.resourceId", A.key().pipelineId())).first()).isEqualTo(claim);
         });
@@ -401,10 +403,14 @@ class MongoSrsConsumerStoreIT {
     void guardLossRollsBackThePinOriginalClaimProofAndChainWriteFence() {
         withBusiness(f -> {
             var refs = publishSnapshotModels(f, Set.of("orders")); var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
-            var checks = new AtomicInteger(); var root = root(f); var cursor = cursor(f, A);
+            var root = root(f); var cursor = cursor(f, A);
             var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id", WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first();
-            var guarded = f.consumers().guardedBy(() -> { if (checks.incrementAndGet() == 2) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null); });
-            assertThatThrownBy(() -> guarded.pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "seam", refs), f.fenceA())).isInstanceOf(TapstateException.class);
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_consumer_offsets")) {
+                var guarded = new MongoSrsConsumerStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                assertThatThrownBy(() -> guarded.pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "seam", refs), f.fenceA()))
+                        .satisfies(failure -> code(failure,IoError.CACHE_BUSINESS_FENCED));
+                witness.requireCommand();
+            }
             assertThat(root(f)).isEqualTo(root); assertThat(cursor(f, A)).isEqualTo(cursor);
             assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id", WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first()).isEqualTo(claim);
         });
