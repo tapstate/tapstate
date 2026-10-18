@@ -96,6 +96,50 @@ class PipelineConvergencePassTest {
         assertThat(views.writes).containsExactly(ORIGINAL, execution(1));
     }
 
+    @Test void derivedRecordsAndPinsUseThisPassActualClaimAndNeverDeleteOrWriteAnotherPipeline() {
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {});
+        pass.derivedSchemas().record("orders", "step", Map.of("id", "int"), "s", "f", "b");
+        var next = execution(1); views.actual.set(next); pass.advanced(next);
+        pass.derivedSchemas().pin("orders", "step", 0);
+        assertThat(pass.derivedSchemas().latest("orders", "step")).isPresent();
+        assertThat(pass.derivedSchemas().pinned("orders", "step")).isPresent();
+        assertThat(views.writes).containsExactly(ORIGINAL, next);
+        assertThatThrownBy(() -> pass.derivedSchemas().delete("orders")).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> pass.derivedSchemas().record("other", "step", Map.of(), "s", "f", "b")).isInstanceOf(TapstateException.class);
+        assertThat(views.requestedScopes).containsOnly(SCOPE);
+    }
+
+    @Test void aDerivedWriteCapturesItsColumnsAndClaimBeforeAnyGuardCallback() {
+        var owner = new AtomicReference<PipelineConvergencePass>(); var once = new AtomicBoolean();
+        var columns = new java.util.LinkedHashMap<>(Map.of("id", "int"));
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {
+            if (once.compareAndSet(false, true)) { columns.clear(); var next = execution(1); views.actual.set(next); owner.get().advanced(next); }
+        }); owner.set(pass);
+        assertThatThrownBy(() -> pass.derivedSchemas().record("orders", "step", columns, "s", "f", "b"))
+                .isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(views.writes).containsExactly(ORIGINAL); assertThat(views.derived.latest("orders", "step")).isEmpty();
+    }
+
+    @Test void reentrantColumnsCopyCannotGiveAnAlreadyEnteredCommandALaterExecutionClaim() {
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {}); var once = new AtomicBoolean();
+        var reentrant = new java.util.AbstractMap<String, String>() {
+            @Override public java.util.Set<Map.Entry<String, String>> entrySet() {
+                if (once.compareAndSet(false, true)) { var next = execution(1); views.actual.set(next); pass.advanced(next); }
+                return Map.of("id", "int").entrySet();
+            }
+        };
+        assertThatThrownBy(() -> pass.derivedSchemas().record("orders", "step", reentrant, "s", "f", "b"))
+                .isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(views.writes).containsExactly(ORIGINAL); assertThat(views.derived.latest("orders", "step")).isEmpty();
+    }
+
+    @Test void mutatingTheCallerColumnsInAGuardDoesNotChangeTheAlreadyCapturedDerivation() {
+        var columns = new java.util.LinkedHashMap<>(Map.of("id", "int")); var once = new AtomicBoolean();
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> { if (once.compareAndSet(false, true)) columns.clear(); });
+        pass.derivedSchemas().record("orders", "step", columns, "s", "f", "b");
+        assertThat(views.derived.latest("orders", "step").orElseThrow().schema()).containsExactly(Map.entry("id", "int"));
+    }
+
     @Test void aPassNeverAdoptsAReplacementPhysicalScope() {
         var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {});
         views.current.set(new PipelineIntentScope("cluster", 3, "cache-a", "orders", 2));
@@ -161,6 +205,7 @@ class PipelineConvergencePassTest {
     private static final class Views implements PipelineStoreViews {
         private final InMemoryStateStore state = new InMemoryStateStore();
         private final InMemoryObservationStore observations = new InMemoryObservationStore();
+        private final InMemoryDerivedSchemaStore derived = new InMemoryDerivedSchemaStore();
         private final AtomicReference<PipelineIntentScope> current = new AtomicReference<>(SCOPE);
         private final AtomicReference<WorkloadClaimFence> actual = new AtomicReference<>(ORIGINAL);
         private final List<PipelineIntentScope> requestedScopes = new ArrayList<>();
@@ -173,6 +218,18 @@ class PipelineConvergencePassTest {
         private void check(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             active.run(); check(scope);
             if (!original.equals(actual.get())) throw fenced();
+        }
+        @Override public io.tapstate.spi.store.DerivedSchemaStore pipelineDerivedSchemas(PipelineIntentScope scope) { check(scope); return derived; }
+        @Override public io.tapstate.spi.store.DerivedSchemaStore pipelineDerivedSchemas(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
+            writes.add(original); return new io.tapstate.spi.store.DerivedSchemaStore() {
+                @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String id, String step) { check(scope); return derived.latest(id, step); }
+                @Override public void record(String id, String step, Map<String, String> cols, String statement, String from, String by) {
+                    check(scope, original, active); derived.record(id, step, cols, statement, from, by);
+                }
+                @Override public void pin(String id, String step, long version) { check(scope, original, active); derived.pin(id, step, version); }
+                @Override public Optional<io.tapstate.spi.store.DerivedSchema> pinned(String id, String step) { check(scope); return derived.pinned(id, step); }
+                @Override public void delete(String id) { throw new AssertionError("no delete"); }
+            };
         }
         @Override public StateStore pipelineStates(PipelineIntentScope scope) { check(scope); return state; }
         @Override public StateStore pipelineStates(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {

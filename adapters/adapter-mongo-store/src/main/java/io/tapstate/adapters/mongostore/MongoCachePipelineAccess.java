@@ -62,6 +62,16 @@ final class MongoCachePipelineAccess {
         });
     }
 
+    <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
+        T result = transaction(session -> {
+            Document current = state(session);
+            new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(table);
+            if (mutation) { proveClaim(session); updateState(session, current, new Document(), false); }
+            return action.apply(session);
+        });
+        requireActive.run(); return result;
+    }
+
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
 
     Document state(ClientSession session) {

@@ -42,6 +42,25 @@ final class PipelineConvergencePass {
         @Override public void create(String pipelineId, String next, Instant at) { throw fenced(); }
         @Override public void delete(String pipelineId) { throw fenced(); }
     };
+    private final io.tapstate.spi.store.DerivedSchemaStore derivedSchemas = new io.tapstate.spi.store.DerivedSchemaStore() {
+        @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String id, String step) {
+            requirePipeline(id); return views.pipelineDerivedSchemas(scope()).latest(id, step);
+        }
+        @Override public void record(String id, String step, Map<String, String> schema, String statement, String from, String by) {
+            WorkloadClaimFence original = claim.get();
+            var captured = java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(schema));
+            requirePipeline(id);
+            views.pipelineDerivedSchemas(scope(), original, requireActive).record(id, step, captured, statement, from, by);
+        }
+        @Override public void pin(String id, String step, long version) {
+            WorkloadClaimFence original = claim.get(); requirePipeline(id);
+            views.pipelineDerivedSchemas(scope(), original, requireActive).pin(id, step, version);
+        }
+        @Override public Optional<io.tapstate.spi.store.DerivedSchema> pinned(String id, String step) {
+            requirePipeline(id); return views.pipelineDerivedSchemas(scope()).pinned(id, step);
+        }
+        @Override public void delete(String id) { throw fenced(); }
+    };
     private final ObservationStore observations = new ObservationStore() {
         @Override public Optional<Observation> read(String pipelineId) {
             requirePipeline(pipelineId);
@@ -74,6 +93,7 @@ final class PipelineConvergencePass {
     WorkloadClaimFence claim() { return claim.get(); }
     StateStore state() { return state; }
     ObservationStore observations() { return observations; }
+    io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() { return derivedSchemas; }
 
     /** Called before any later start step may throw; no other pass or asynchronous DAG retains this object. */
     void advanced(WorkloadClaimFence actual) {
