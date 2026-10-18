@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -200,14 +201,23 @@ final class PipelineActuationOwnership {
      * Whether a run may be submitted, the generations that fence it, and the committed topology the claim behind
      * it was held under - none of either in an explicit uncoordinated fixture.
      */
-    record Execution(boolean allowed, ExecutionFence fence, Long topologyRevision) {
+    record Execution(boolean allowed, ExecutionFence fence, Long topologyRevision, WorkloadClaimFence claimFence) {
+        Execution {
+            boolean hasIdentity = fence != null || topologyRevision != null || claimFence != null;
+            if ((!allowed && hasIdentity) || (hasIdentity && (fence == null || topologyRevision == null || claimFence == null)))
+                throw new IllegalArgumentException("an execution carries either its complete identity or none");
+            if (hasIdentity && (claimFence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                    || !fence.pipelineId().equals(claimFence.key().resourceId()) || fence.claimGeneration() != claimFence.claimGeneration()
+                    || fence.executionGeneration() != claimFence.executionGeneration() || topologyRevision.longValue() != claimFence.topologyRevision()))
+                throw new IllegalArgumentException("the execution identity must match its original advanced claim");
+        }
 
         static Execution unfenced() {
-            return new Execution(true, null, null);
+            return new Execution(true, null, null, null);
         }
 
         static Execution refused() {
-            return new Execution(false, null, null);
+            return new Execution(false, null, null, null);
         }
     }
 
@@ -234,6 +244,15 @@ final class PipelineActuationOwnership {
         }
     }
 
+    /** A refusal witnessed by an old pass cannot alter the later held run's failure attribution. */
+    synchronized void startRefusedBeforeItsRun(String pipelineId, WorkloadClaimFence expected) {
+        Objects.requireNonNull(expected, "expected");
+        Held state = held.get(Objects.requireNonNull(pipelineId, "pipelineId"));
+        if (state != null && state.claim != null && expected.equals(WorkloadClaimFence.from(state.claim))) {
+            state.startRefusedAtGeneration = state.claim.executionGeneration();
+        }
+    }
+
     synchronized Execution beginExecution(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing) {
@@ -243,9 +262,16 @@ final class PipelineActuationOwnership {
             return Execution.unfenced();
         }
         Held state = held.get(pipelineId);
-        if (state == null || state.claim == null) {
-            return Execution.refused();
-        }
+        if (state == null || state.claim == null) return Execution.refused();
+        return beginExecution(pipelineId, WorkloadClaimFence.from(state.claim));
+    }
+
+    /** Advances only the immutable claim captured by this pass, never a later claim held under its id. */
+    synchronized Execution beginExecution(String pipelineId, WorkloadClaimFence expected) {
+        Objects.requireNonNull(pipelineId, "pipelineId"); Objects.requireNonNull(expected, "expected");
+        if (closing || !fenced) return Execution.refused();
+        Held state = held.get(pipelineId);
+        if (state == null || state.claim == null || !expected.equals(WorkloadClaimFence.from(state.claim))) return Execution.refused();
         ClusterMembership planned = membership.committed();
         Set<String> runMembers = planned == null ? Set.of() : plannedOver(planned);
         Optional<WorkloadClaim> advanced;
@@ -274,7 +300,7 @@ final class PipelineActuationOwnership {
         // the moment here would make the very next death of this run read as the pipeline's own.
         return new Execution(true, new ExecutionFence(
                 pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()),
-                state.claim.topologyRevision());
+                state.claim.topologyRevision(), WorkloadClaimFence.from(state.claim));
     }
 
     /**
@@ -426,10 +452,10 @@ final class PipelineActuationOwnership {
      * the same owner takes again on its next pass under the same generations. True only in an explicit uncoordinated fixture.
      */
     boolean proveExecution(ExecutionFence fence) {
-        if (!fenced || fence == null) {
+        if (!fenced) {
             return true;
         }
-        if (closing) {
+        if (fence == null || closing) {
             return false;
         }
         WorkloadClaimKey key =

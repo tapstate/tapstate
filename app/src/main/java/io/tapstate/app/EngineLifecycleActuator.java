@@ -6,6 +6,7 @@ import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * Binds the converge loop's lifecycle actuator seam to the Jet execution engine and the source-side capture
@@ -104,6 +106,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void start(String pipelineId) {
+        startOriginal(pipelineId, null, null);
+    }
+
+    /** The callback records this pass's actual advanced claim before any later start operation can fail. */
+    void start(String pipelineId, WorkloadClaimFence expected, Consumer<WorkloadClaimFence> onAdvanced) {
+        Objects.requireNonNull(expected, "expected"); Objects.requireNonNull(onAdvanced, "onAdvanced");
+        startOriginal(pipelineId, expected, onAdvanced);
+    }
+
+    private void startOriginal(String pipelineId, WorkloadClaimFence expected, Consumer<WorkloadClaimFence> onAdvanced) {
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
         // An engine whose member was shut down for want of memory is the first such refusal. Everything
@@ -123,19 +135,22 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // Refused before this start took a run, so the claim still names the run before it. Judged by that
             // run, the failure this refusal records would read as its death - and right after a member left,
             // as the departure again, spending the rebuilds meant for it on a refusal nobody leaving caused.
-            actuation.startRefusedBeforeItsRun(pipelineId);
+            if (expected == null) actuation.startRefusedBeforeItsRun(pipelineId);
+            else actuation.startRefusedBeforeItsRun(pipelineId, expected);
             throw refused;
         }
         // The run's own generation, taken before the first side effect for the same reason: a run this
         // member cannot fence is one nothing could later stop from writing, so it must not be half built.
         // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
         // more (or cannot prove it is), and the member that is will put a run behind it.
-        PipelineActuationOwnership.Execution execution = actuation.beginExecution(pipelineId);
+        PipelineActuationOwnership.Execution execution = expected == null
+                ? actuation.beginExecution(pipelineId) : actuation.beginExecution(pipelineId, expected);
         if (!execution.allowed()) {
             LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
                     + "execution generation", pipelineId);
             return;
         }
+        if (onAdvanced != null) onAdvanced.accept(execution.claimFence());
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.
