@@ -9,20 +9,76 @@ import java.util.Map;
 
 /** Explicit translation between the Builder view and durable Wizard wire shapes. */
 final class AssistantWizardJson {
+    private static final String OUTPUT = "output";
+    private static final String CONFIG = "config";
+    private static final String SOURCE = "source";
+    private static final String SOURCE_ID = "sourceId";
+    private static final String TABLE = "table";
+    private static final String PRIMARY_KEY = "primaryKey";
+    private static final String TRANSFORMS = "transforms";
+    private static final String PRE_TRANSFORMS = "preTransforms";
+    private static final String FLATTEN = "flatten";
+    private static final String SUB_ARRAY = "sub_array";
+    private static final String ARRAY_KEY = "arrayKey";
+    private static final String CHILD_FIELD = "childField";
+    private static final String PARENT_KEY = "parentKey";
+    private static final String PARENT_FIELD = "parentField";
+    private static final String CONDITIONS = "conditions";
+    private static final String CHILD_KEY = "childKey";
+    private static final String FIELDS = "fields";
     private AssistantWizardJson() { }
+    static void validateViewShape(Map<String, Object> view) {
+        requireList(view, "relations");
+        requireList(view, TRANSFORMS);
+        Map<String, Object> root = requireObject(view.get("root"));
+        requireList(root, "keys");
+        requireList(root, "columns");
+        validateTransforms(requireList(root, TRANSFORMS));
+        validateRelations(requireList(view, "relations"), 0);
+        validateTransforms(requireList(view, TRANSFORMS));
+    }
+    private static void validateRelations(List<?> relations, int depth) {
+        if (depth > 32) throw new IllegalArgumentException("relation nesting is too deep");
+        for (Object raw : relations) {
+            Map<String, Object> relation = requireObject(raw);
+            requireList(relation, "primaryKey");
+            requireList(relation, ARRAY_KEY);
+            if (relation.containsKey(CONDITIONS)) requireList(relation, CONDITIONS);
+            validateTransforms(requireList(relation, TRANSFORMS));
+            validateRelations(requireList(relation, "children"), depth + 1);
+        }
+    }
+    private static void validateTransforms(List<?> transforms) {
+        for (Object raw : transforms) {
+            Map<String, Object> transform = requireObject(raw);
+            if (!"map".equals(transform.get("type"))) continue;
+            Map<String, Object> config = requireObject(transform.get(CONFIG));
+            Map<String, Object> map = requireObject(config.get("map"));
+            requireList(map, FIELDS);
+        }
+    }
+    private static List<?> requireList(Map<String, Object> value, String field) {
+        Object raw = value.get(field);
+        if (!(raw instanceof List<?> list)) throw new IllegalArgumentException("expected array: " + field);
+        return list;
+    }
+    @SuppressWarnings("unchecked") private static Map<String, Object> requireObject(Object raw) {
+        if (!(raw instanceof Map<?, ?>)) throw new IllegalArgumentException("expected object");
+        return (Map<String, Object>) raw;
+    }
     static Map<String, Object> view(Map<String, Object> wire) {
         Map<String, Object> root = object(wire.get("root"));
-        Map<String, Object> config = object(object(wire.get("output")).get("config"));
+        Map<String, Object> config = object(object(wire.get(OUTPUT)).get(CONFIG));
         Map<String, Object> value = new LinkedHashMap<>();
-        value.put("root", root.isEmpty() ? null : Map.of("source", text(root.get("sourceId")),
-                "table", text(root.get("table")), "keys", list(root.get("key")),
-                "primaryKey", String.join(", ", list(root.get("key")).stream().map(Object::toString).toList()),
-                "rowCount", "", "columns", List.of(), "transforms", readTransforms(root.get("preTransforms"))));
+        value.put("root", root.isEmpty() ? null : Map.of(SOURCE, text(root.get(SOURCE_ID)),
+                TABLE, text(root.get(TABLE)), "keys", list(root.get("key")),
+                PRIMARY_KEY, String.join(", ", list(root.get("key")).stream().map(Object::toString).toList()),
+                "rowCount", "", "columns", List.of(), TRANSFORMS, readTransforms(root.get(PRE_TRANSFORMS))));
         List<Map<String, Object>> rows = list(wire.get("related")).stream().map(AssistantWizardJson::object).toList();
-        value.put("relations", readRelated(rows, "root", text(root.get("table")), 0));
-        value.put("transforms", readTransforms(wire.get("transforms")));
-        value.put("destinationSourceId", text(config.get("sourceId")));
-        value.put("destinationTable", text(config.get("table")));
+        value.put("relations", readRelated(rows, "root", text(root.get(TABLE)), 0));
+        value.put(TRANSFORMS, readTransforms(wire.get(TRANSFORMS)));
+        value.put("destinationSourceId", text(config.get(SOURCE_ID)));
+        value.put("destinationTable", text(config.get(TABLE)));
         value.put("destinationWriteMode", text(config.getOrDefault("writeMode", "upsert")));
         return value;
     }
@@ -35,16 +91,16 @@ final class AssistantWizardJson {
             List<Object> on = list(relation.get("on"));
             Map<String, Object> first = on.isEmpty() ? Map.of() : object(on.getFirst());
             Map<String, Object> node = new LinkedHashMap<>();
-            node.put("id", row.get("id")); node.put("source", row.get("sourceId")); node.put("table", row.get("table"));
-            node.put("type", switch (text(relation.get("shape"))) { case "flat" -> "flatten"; case "array" -> "sub_array"; default -> "sub_doc"; });
-            node.put("primaryKey", list(relation.get("key"))); node.put("arrayKey", list(relation.get("arrayKey")));
+            node.put("id", row.get("id")); node.put(SOURCE, row.get(SOURCE_ID)); node.put(TABLE, row.get(TABLE));
+            node.put("type", switch (text(relation.get("shape"))) { case "flat" -> FLATTEN; case "array" -> SUB_ARRAY; default -> "sub_doc"; });
+            node.put(PRIMARY_KEY, list(relation.get("key"))); node.put(ARRAY_KEY, list(relation.get(ARRAY_KEY)));
             node.put("targetField", text(relation.get("path")));
-            node.put("key", text(first.get("childField"))); node.put("parentKey", text(first.get("parentField")));
+            node.put("key", text(first.get(CHILD_FIELD))); node.put(PARENT_KEY, text(first.get(PARENT_FIELD)));
             node.put("parentTable", table); node.put("preProcessing", List.of());
-            node.put("conditions", on.stream().map(AssistantWizardJson::object).map(pair -> Map.of(
-                    "childKey", text(pair.get("childField")), "parentKey", text(pair.get("parentField")), "parentTable", table, "operator", "=")).toList());
-            node.put("transforms", readTransforms(row.get("preTransforms")));
-            node.put("children", readRelated(rows, text(row.get("id")), text(row.get("table")) + " · " + row.get("id"), depth + 1));
+            node.put(CONDITIONS, on.stream().map(AssistantWizardJson::object).map(pair -> Map.of(
+                    CHILD_KEY, text(pair.get(CHILD_FIELD)), PARENT_KEY, text(pair.get(PARENT_FIELD)), "parentTable", table, "operator", "=")).toList());
+            node.put(TRANSFORMS, readTransforms(row.get(PRE_TRANSFORMS)));
+            node.put("children", readRelated(rows, text(row.get("id")), text(row.get(TABLE)) + " · " + row.get("id"), depth + 1));
             result.add(node);
         }
         return result;
@@ -53,14 +109,14 @@ final class AssistantWizardJson {
         Map<String, Object> root = object(view.get("root"));
         List<Map<String, Object>> related = new ArrayList<>();
         writeRelated(list(view.get("relations")), "root", related, 0);
-        Map<String, Object> oldOutput = object(original.get("output"));
-        Map<String, Object> output = new LinkedHashMap<>(object(oldOutput.get("config")));
-        output.put("sourceId", text(view.get("destinationSourceId"))); output.put("table", text(view.get("destinationTable")));
-        output.put("inputTable", text(root.get("table"))); output.put("writeMode", text(view.get("destinationWriteMode")));
-        return Map.of("root", Map.of("id", "root", "sourceId", text(root.get("source")),
-                "table", text(root.get("table")), "key", list(root.get("keys")), "preTransforms", writeTransforms(root.get("transforms"))),
-                "related", related, "transforms", writeTransforms(view.get("transforms")),
-                "output", Map.of("kind", oldOutput.getOrDefault("kind", "atlas"), "config", output));
+        Map<String, Object> oldOutput = object(original.get(OUTPUT));
+        Map<String, Object> output = new LinkedHashMap<>(object(oldOutput.get(CONFIG)));
+        output.put(SOURCE_ID, text(view.get("destinationSourceId"))); output.put(TABLE, text(view.get("destinationTable")));
+        output.put("inputTable", text(root.get(TABLE))); output.put("writeMode", text(view.get("destinationWriteMode")));
+        return Map.of("root", Map.of("id", "root", SOURCE_ID, text(root.get(SOURCE)),
+                TABLE, text(root.get(TABLE)), "key", list(root.get("keys")), PRE_TRANSFORMS, writeTransforms(root.get(TRANSFORMS))),
+                "related", related, TRANSFORMS, writeTransforms(view.get(TRANSFORMS)),
+                OUTPUT, Map.of("kind", oldOutput.getOrDefault("kind", "atlas"), CONFIG, output));
     }
     private static void writeRelated(List<Object> nodes, String parent, List<Map<String, Object>> rows, int depth) {
         if (depth > 32 || rows.size() > 100) throw new IllegalArgumentException("too many relations");
@@ -68,38 +124,38 @@ final class AssistantWizardJson {
     }
     private static void writeRelatedNode(Map<String, Object> node, String parent, List<Map<String, Object>> rows, int depth) {
         String type = text(node.get("type"));
-        if (!List.of("flatten", "sub_array", "sub_doc").contains(type)) throw new IllegalArgumentException("invalid relation kind");
+        if (!List.of(FLATTEN, SUB_ARRAY, "sub_doc").contains(type)) throw new IllegalArgumentException("invalid relation kind");
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("id", text(node.get("id")));
         row.put("parentId", parent);
-        row.put("sourceId", text(node.get("source")));
-        row.put("table", text(node.get("table")));
+        row.put(SOURCE_ID, text(node.get(SOURCE)));
+        row.put(TABLE, text(node.get(TABLE)));
         row.put("relation", relation(node, type));
-        row.put("preTransforms", writeTransforms(node.get("transforms")));
+        row.put(PRE_TRANSFORMS, writeTransforms(node.get(TRANSFORMS)));
         rows.add(row);
         writeRelated(list(node.get("children")), text(node.get("id")), rows, depth + 1);
     }
     private static Map<String, Object> relation(Map<String, Object> node, String type) {
         Map<String, Object> value = new LinkedHashMap<>();
         value.put("shape", relationShape(type));
-        value.put("path", type.equals("flatten") ? null : text(node.get("targetField")));
-        value.put("key", list(node.get("primaryKey")));
-        value.put("arrayKey", type.equals("sub_array") ? list(node.get("arrayKey")) : List.of());
+        value.put("path", type.equals(FLATTEN) ? null : text(node.get("targetField")));
+        value.put("key", list(node.get(PRIMARY_KEY)));
+        value.put(ARRAY_KEY, type.equals(SUB_ARRAY) ? list(node.get(ARRAY_KEY)) : List.of());
         value.put("on", relationConditions(node).stream().map(AssistantWizardJson::object)
-                .map(condition -> Map.of("childField", text(condition.get("childKey")),
-                        "parentField", text(condition.get("parentKey")))).toList());
+                .map(condition -> Map.of(CHILD_FIELD, text(condition.get(CHILD_KEY)),
+                        PARENT_FIELD, text(condition.get(PARENT_KEY)))).toList());
         return value;
     }
     private static String relationShape(String type) {
         return switch (type) {
-            case "flatten" -> "flat";
-            case "sub_array" -> "array";
+            case FLATTEN -> "flat";
+            case SUB_ARRAY -> "array";
             default -> "object";
         };
     }
     private static List<Object> relationConditions(Map<String, Object> node) {
-        if (node.containsKey("conditions")) return list(node.get("conditions"));
-        return List.of(Map.of("childKey", text(node.get("key")), "parentKey", text(node.get("parentKey"))));
+        if (node.containsKey(CONDITIONS)) return list(node.get(CONDITIONS));
+        return List.of(Map.of(CHILD_KEY, text(node.get("key")), PARENT_KEY, text(node.get(PARENT_KEY))));
     }
     static List<Map<String, Object>> readTransforms(Object raw) {
         List<Map<String, Object>> result = new ArrayList<>();
@@ -108,11 +164,11 @@ final class AssistantWizardJson {
     }
     private static Map<String, Object> readTransform(Map<String, Object> step) {
         String type = text(step.get("type"));
-        Map<String, Object> fields = object(step.get("fields"));
+        Map<String, Object> fields = object(step.get(FIELDS));
         Map<String, Object> config = "map".equals(type)
-                ? Map.of("fields", readMapRules(step.get("id"), fields), "passthroughUnlisted", true) : fields;
+                ? Map.of(FIELDS, readMapRules(step.get("id"), fields), "passthroughUnlisted", true) : fields;
         return Map.of("id", text(step.get("id")), "name", type, "type", type, "enabled", true,
-                "config", Map.of(type, config));
+                CONFIG, Map.of(type, config));
     }
     private static List<Map<String, Object>> readMapRules(Object id, Map<String, Object> fields) {
         List<Map<String, Object>> rules = new ArrayList<>();
@@ -142,8 +198,8 @@ final class AssistantWizardJson {
     private static Map<String, Object> writeTransform(Map<String, Object> step) {
         String type = text(step.get("type"));
         if (!List.of("filter", "map", "unwind", "js").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
-        Map<String, Object> config = object(object(step.get("config")).get(type));
-        return Map.of("id", text(step.get("id")), "type", type, "fields", writeTransformFields(type, config));
+        Map<String, Object> config = object(object(step.get(CONFIG)).get(type));
+        return Map.of("id", text(step.get("id")), "type", type, FIELDS, writeTransformFields(type, config));
     }
     private static Map<String, Object> writeTransformFields(String type, Map<String, Object> config) {
         return switch (type) {
@@ -155,7 +211,7 @@ final class AssistantWizardJson {
     }
     private static Map<String, Object> writeMapFields(Map<String, Object> config) {
         Map<String, Object> fields = new LinkedHashMap<>();
-        for (Object rawRule : list(config.get("fields"))) {
+        for (Object rawRule : list(config.get(FIELDS))) {
             Map<String, Object> rule = object(rawRule);
             fields.put(text(rule.get("outputField")), writeMapValue(rule));
         }

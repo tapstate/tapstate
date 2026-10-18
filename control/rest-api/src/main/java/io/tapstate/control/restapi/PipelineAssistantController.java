@@ -40,6 +40,18 @@ import java.util.concurrent.Semaphore;
 /** Produces transient proposals only; existing draft CAS remains the sole Apply write. */
 @RestController
 class PipelineAssistantController {
+    private static final String ERROR = "error";
+    private static final String DATA_STATUS = "data-status";
+    private static final String STATE = "state";
+    private static final String STATUS = "status";
+    private static final String FINISH = "finish";
+    private static final String FINISH_REASON = "finishReason";
+    private static final String VALID = "valid";
+    private static final String TRANSFORMS = "transforms";
+    private static final String WIZARD = "wizard";
+    private static final String NODE_ID = "nodeId";
+    private static final String SOURCE_ID = "sourceId";
+    private static final String ERROR_TEXT = "errorText";
     private static final Semaphore CAPACITY = new Semaphore(4);
     private final ObjectProvider<PipelineDraftService> drafts;
     private final ObjectProvider<SourceProjectionService> sources;
@@ -66,52 +78,50 @@ class PipelineAssistantController {
         Map<String, Object> focus = focus(base, body.get("focus"));
         if (!focus.isEmpty()) context.put("focus", focus);
         StreamingResponseBody stream = output -> {
-            Object streamLock = new Object();
+            AssistantStream streamEvents = new AssistantStream(output);
             if (!CAPACITY.tryAcquire()) {
-                event(output, streamLock, Map.of("type", "error", "errorText", ControlError.AI_OVERLOADED.code()));
-                event(output, streamLock, Map.of("type", "data-status", "data", Map.of("state", "error", "status", "error",
+                streamEvents.event(Map.of("type", ERROR, ERROR_TEXT, ControlError.AI_OVERLOADED.code()));
+                streamEvents.event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, ERROR, STATUS, ERROR,
                         "code", ControlError.AI_OVERLOADED.code())));
-                event(output, streamLock, Map.of("type", "finish", "finishReason", "error"));
-                done(output, streamLock);
+                streamEvents.event(Map.of("type", FINISH, FINISH_REASON, ERROR));
+                streamEvents.done();
                 return;
             }
             String textId = UUID.randomUUID().toString();
             Thread worker = Thread.currentThread();
             var heartbeat = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().factory());
             heartbeat.scheduleAtFixedRate(() -> {
-                try { synchronized (streamLock) { output.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8)); output.flush(); } }
-                catch (IOException disconnected) { worker.interrupt(); }
+                try { streamEvents.heartbeat(); }
+                catch (UncheckedIOException disconnected) { worker.interrupt(); }
             }, 5, 5, java.util.concurrent.TimeUnit.SECONDS);
             try {
-                event(output, streamLock, Map.of("type", "start", "messageId", UUID.randomUUID().toString()));
-                status(output, streamLock, "connecting");
-                event(output, streamLock, Map.of("type", "text-start", "id", textId));
-                status(output, streamLock, "streaming");
+                streamEvents.event(Map.of("type", "start", "messageId", UUID.randomUUID().toString()));
+                streamEvents.status("connecting");
+                streamEvents.event(Map.of("type", "text-start", "id", textId));
+                streamEvents.status("streaming");
                 Map<String, Object> candidate = client.propose(settings, messages, context,
-                        delta -> event(output, streamLock, Map.of("type", "text-delta", "id", textId, "delta", delta)));
-                event(output, streamLock, Map.of("type", "text-end", "id", textId));
-                status(output, streamLock, "validating");
+                        delta -> streamEvents.event(Map.of("type", "text-delta", "id", textId, "delta", delta)));
+                streamEvents.event(Map.of("type", "text-end", "id", textId));
+                streamEvents.status("validating");
                 Map<String, Object> validated = validate(id, revision, candidate);
-                if (!Boolean.TRUE.equals(validated.get("valid"))) {
-                    throw AiProviderService.error(ControlError.AI_INVALID_PROPOSAL);
+                if (!Boolean.TRUE.equals(validated.get(VALID))) {
+                    List<Map<String, Object>> diagnostics = diagnostics(validated);
+                    String code = diagnostics.isEmpty()
+                            ? ControlError.AI_INVALID_PROPOSAL.code()
+                            : AssistantWizardJson.text(diagnostics.getFirst().get("code"));
+                    streamEvents.failure(code, diagnostics);
+                    return;
                 }
                 Map<String, Object> proposal = new LinkedHashMap<>(validated);
                 proposal.put("baseRevision", revision);
-                event(output, streamLock, Map.of("type", "data-proposal", "data", proposal));
-                status(output, streamLock, "ready");
-                event(output, streamLock, Map.of("type", "finish", "finishReason", "stop"));
-                done(output, streamLock);
+                streamEvents.event(Map.of("type", "data-proposal", "data", proposal));
+                streamEvents.status("ready");
+                streamEvents.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
+                streamEvents.done();
             } catch (UncheckedIOException disconnected) {
                 // Client cancellation closes the provider body through the streaming consumer.
             } catch (TapstateException failure) {
-                try {
-                    event(output, streamLock, Map.of("type", "error", "errorText", failure.code().code()));
-                    event(output, streamLock, Map.of("type", "data-status", "data", Map.of("state", "error", "status", "error", "code", failure.code().code())));
-                    event(output, streamLock, Map.of("type", "finish", "finishReason", "error"));
-                    done(output, streamLock);
-                } catch (UncheckedIOException disconnected) {
-                    // A canceled client needs no further terminal event.
-                }
+                streamEvents.failure(failure.code().code());
             } finally { heartbeat.shutdownNow(); CAPACITY.release(); }
         };
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
@@ -130,42 +140,49 @@ class PipelineAssistantController {
     Map<String, Object> validate(String id, long revision, Map<String, Object> view) {
         PipelineDraft base = current(id, revision);
         try {
-            if (!view.keySet().containsAll(Set.of("root", "relations", "transforms", "destinationTable", "destinationSourceId", "destinationWriteMode"))) {
+            if (!view.keySet().containsAll(Set.of("root", "relations", TRANSFORMS, "destinationTable", "destinationSourceId", "destinationWriteMode"))) {
                 throw new IllegalArgumentException("candidateWizard is incomplete");
             }
+            AssistantWizardJson.validateViewShape(view);
             Map<String, Object> before = wizard(base);
             Map<String, Object> wire = AssistantWizardJson.wire(view, before);
             enforceScope(base, wire);
             Map<String, Object> input = new LinkedHashMap<>(PipelineDraftJson.write(json, base));
-            input.put("wizard", wire);
+            input.put(WIZARD, wire);
             PipelineDraft candidate = PipelineDraftJson.read(json, input, id, revision, base.updatedBy());
             String afterDsl = new CanonicalWriter().write(service().previewCandidate(id, candidate));
-            String beforeDsl;
-            try { beforeDsl = new CanonicalWriter().write(service().preview(id, revision)); }
-            catch (TapstateException incompleteBase) { beforeDsl = ""; }
+            String beforeDsl = previewBefore(id, revision);
             List<Map<String, Object>> changes = new ArrayList<>();
-            diff("wizard", before, wizard(candidate), changes);
+            diff(WIZARD, before, wizard(candidate), changes);
             current(id, revision);
-            return Map.of("valid", true, "candidateWizard", AssistantWizardJson.view(wizard(candidate)),
-                    "validation", Map.of("valid", true, "diagnostics", List.of()),
+            return Map.of(VALID, true, "candidateWizard", AssistantWizardJson.view(wizard(candidate)),
+                    "validation", Map.of(VALID, true, "diagnostics", List.of()),
                     "diff", Map.of("before", beforeDsl, "after", afterDsl, "changes", changes));
         } catch (IllegalArgumentException malformed) {
-            return invalid("candidateWizard does not match the supported Builder schema");
+            return invalid(ControlError.AI_INVALID_PROPOSAL.code(), Map.of());
         } catch (TapstateException invalid) {
             if (invalid.code() == PipelineDraftError.REVISION_CONFLICT || invalid.code() == PipelineDraftError.NOT_FOUND) throw invalid;
-            return invalid(invalid.code().code());
+            TapstateException diagnostic = nestedDiagnostic(invalid);
+            return invalid(diagnostic.code().code(), safeDiagnosticParams(diagnostic.args()));
+        }
+    }
+    private String previewBefore(String id, long revision) {
+        try {
+            return new CanonicalWriter().write(service().preview(id, revision));
+        } catch (TapstateException incompleteBase) {
+            return "";
         }
     }
     static Map<String, Object> focus(PipelineDraft base, Object raw) {
         if (!(raw instanceof Map<?, ?> input)) return Map.of();
         String kind = AssistantWizardJson.text(input.get("kind"));
-        if (!Set.of("root", "relation", "transforms").contains(kind)) return Map.of();
-        String node = AssistantWizardJson.text(input.get("nodeId"));
+        if (!Set.of("root", "relation", TRANSFORMS).contains(kind)) return Map.of();
+        String node = AssistantWizardJson.text(input.get(NODE_ID));
         if (node.length() > 200) return Map.of();
-        if (kind.equals("root") && node.equals("root")) return Map.of("kind", kind, "nodeId", node);
-        if (kind.equals("transforms") && node.equals("doc_process")) return Map.of("kind", kind, "nodeId", node);
+        if (kind.equals("root") && node.equals("root")) return Map.of("kind", kind, NODE_ID, node);
+        if (kind.equals(TRANSFORMS) && node.equals("doc_process")) return Map.of("kind", kind, NODE_ID, node);
         if (kind.equals("relation") && base.wizard().related().stream().anyMatch(related -> related.id().equals(node))) {
-            return Map.of("kind", kind, "nodeId", node);
+            return Map.of("kind", kind, NODE_ID, node);
         }
         return Map.of("kind", kind);
     }
@@ -181,7 +198,7 @@ class PipelineAssistantController {
             List<Map<String, Object>> tables = schema.tables().stream().map(table -> Map.<String, Object>of(
                     "name", table.name(), "primaryKey", table.primaryKey(), "fields", table.fields().stream()
                             .map(field -> Map.of("name", field.name(), "type", field.type() == null ? "unknown" : field.type())).toList())).toList();
-            inventory.add(Map.of("sourceId", sourceId, "connector", source.connector(), "tables", tables));
+            inventory.add(Map.of(SOURCE_ID, sourceId, "connector", source.connector(), "tables", tables));
         }
         if (inventory.isEmpty()) throw malformed("select a root table before requesting a proposal");
         result.put("sources", inventory);
@@ -193,14 +210,14 @@ class PipelineAssistantController {
         List<Map<String, Object>> inputs = new ArrayList<>(); inputs.add(AssistantWizardJson.object(candidate.get("root")));
         inputs.addAll(AssistantWizardJson.list(candidate.get("related")).stream().map(AssistantWizardJson::object).toList());
         for (var input : inputs) {
-            String source = AssistantWizardJson.text(input.get("sourceId"));
+            String source = AssistantWizardJson.text(input.get(SOURCE_ID));
             if (!allowed.contains(source)) throw malformed("candidate references an unselected Source");
             var schema = schemas.getObject().find(source).orElseThrow(() -> malformed("selected Source has no discovered schema"));
             if (schema.tables().stream().noneMatch(table -> table.name().equals(input.get("table")))) throw malformed("candidate references an unknown table");
         }
         var beforeOutput = AssistantWizardJson.object(AssistantWizardJson.object(wizard(base).get("output")).get("config"));
         var output = AssistantWizardJson.object(AssistantWizardJson.object(candidate.get("output")).get("config"));
-        if (!Objects.equals(beforeOutput.get("sourceId"), output.get("sourceId"))) throw malformed("candidate may not change the selected destination Source");
+        if (!Objects.equals(beforeOutput.get(SOURCE_ID), output.get(SOURCE_ID))) throw malformed("candidate may not change the selected destination Source");
     }
     private Set<String> inputSources(PipelineDraft draft) {
         Set<String> ids = new LinkedHashSet<>();
@@ -215,9 +232,35 @@ class PipelineAssistantController {
         return draft;
     }
     private PipelineDraftService service() { return drafts.getObject(); }
-    private Map<String, Object> wizard(PipelineDraft draft) { return AssistantWizardJson.object(PipelineDraftJson.write(json, draft).get("wizard")); }
-    private static Map<String, Object> invalid(String code) {
-        return Map.of("valid", false, "validation", Map.of("valid", false, "diagnostics", List.of(Map.of("code", code))), "diff", Map.of("changes", List.of()));
+    private Map<String, Object> wizard(PipelineDraft draft) { return AssistantWizardJson.object(PipelineDraftJson.write(json, draft).get(WIZARD)); }
+    private static Map<String, Object> invalid(String code, Map<String, Object> params) {
+        return Map.of(VALID, false, "validation", Map.of(VALID, false,
+                "diagnostics", List.of(Map.of("code", code, "params", params))), "diff", Map.of("changes", List.of()));
+    }
+    private static List<Map<String, Object>> diagnostics(Map<String, Object> validationResult) {
+        Map<String, Object> validation = AssistantWizardJson.object(validationResult.get("validation"));
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object raw : AssistantWizardJson.list(validation.get("diagnostics"))) {
+            if (raw instanceof Map<?, ?>) result.add(AssistantWizardJson.object(raw));
+        }
+        return result;
+    }
+    private static TapstateException nestedDiagnostic(TapstateException failure) {
+        Throwable cause = failure.getCause();
+        while (cause != null) {
+            if (cause instanceof TapstateException diagnostic) return diagnostic;
+            cause = cause.getCause();
+        }
+        return failure;
+    }
+    private static Map<String, Object> safeDiagnosticParams(Map<String, Object> params) {
+        Set<String> safeNames = Set.of("path", "field", "ref", "source", "table");
+        Map<String, Object> safe = new LinkedHashMap<>();
+        for (String name : safeNames) {
+            Object value = params.get(name);
+            if (value instanceof String text && !text.isBlank() && text.length() <= 256) safe.put(name, text);
+        }
+        return Map.copyOf(safe);
     }
     private static void diff(String path, Object before, Object after, List<Map<String, Object>> changes) {
         if (Objects.equals(before, after)) return;
@@ -252,13 +295,59 @@ class PipelineAssistantController {
         catch (ArithmeticException | NumberFormatException error) { throw malformed("revision must be a positive integer"); }
     }
     private static TapstateException malformed(String reason) { return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null); }
-    private static void status(OutputStream output, Object streamLock, String state) { event(output, streamLock, Map.of("type", "data-status", "data", Map.of("state", state, "status", state))); }
-    private static void event(OutputStream output, Object streamLock, Map<String, Object> event) {
-        try { synchronized (streamLock) { output.write(("data: " + JsonWriter.write(event) + "\n\n").getBytes(StandardCharsets.UTF_8)); output.flush(); } }
-        catch (IOException error) { throw new UncheckedIOException(error); }
-    }
-    private static void done(OutputStream output, Object streamLock) {
-        try { synchronized (streamLock) { output.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8)); output.flush(); } }
-        catch (IOException error) { throw new UncheckedIOException(error); }
+    private static final class AssistantStream {
+        private final OutputStream output;
+        private final Object lock = new Object();
+
+        private AssistantStream(OutputStream output) {
+            this.output = output;
+        }
+
+        private void status(String state) {
+            event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, state, STATUS, state)));
+        }
+
+        private void event(Map<String, Object> value) {
+            write("data: " + JsonWriter.write(value) + "\n\n");
+        }
+
+        private void done() {
+            write("data: [DONE]\n\n");
+        }
+
+        private void heartbeat() {
+            write(": heartbeat\n\n");
+        }
+
+        private void failure(String code) {
+            failure(code, List.of());
+        }
+
+        private void failure(String code, List<Map<String, Object>> diagnostics) {
+            try {
+                Map<String, Object> status = new LinkedHashMap<>();
+                status.put(STATE, ERROR);
+                status.put(STATUS, ERROR);
+                status.put("code", code);
+                if (!diagnostics.isEmpty()) status.put("diagnostics", diagnostics);
+                event(Map.of("type", DATA_STATUS, "data", status));
+                event(Map.of("type", ERROR, ERROR_TEXT, code));
+                event(Map.of("type", FINISH, FINISH_REASON, ERROR));
+                done();
+            } catch (UncheckedIOException disconnected) {
+                // A canceled client needs no further terminal event.
+            }
+        }
+
+        private void write(String frame) {
+            try {
+                synchronized (lock) {
+                    output.write(frame.getBytes(StandardCharsets.UTF_8));
+                    output.flush();
+                }
+            } catch (IOException error) {
+                throw new UncheckedIOException(error);
+            }
+        }
     }
 }

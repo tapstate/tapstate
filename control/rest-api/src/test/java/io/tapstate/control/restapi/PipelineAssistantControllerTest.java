@@ -25,11 +25,14 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.http.MediaType;
 import tools.jackson.databind.json.JsonMapper;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
@@ -113,6 +116,7 @@ class PipelineAssistantControllerTest {
             throw new AssertionError(invalid.getMessage(), invalid);
         }
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> proposedCandidate = new AtomicReference<>(candidate);
         AtomicBoolean providerFailure = new AtomicBoolean();
         AtomicInteger providerCalls = new AtomicInteger();
         AiProviderClient fake = new AiProviderClient() {
@@ -123,7 +127,7 @@ class PipelineAssistantControllerTest {
                 sentContext.set(context);
                 text.accept("I used the selected schema.");
                 if (providerFailure.get()) throw AiProviderService.error(ControlError.AI_INVALID_PROPOSAL);
-                return candidate;
+                return proposedCandidate.get();
             }
         };
         var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
@@ -137,7 +141,11 @@ class PipelineAssistantControllerTest {
 
         for (int index = 0; index < 5; index++) responses.add(controller.assistant("orders", body, request));
 
-        for (var response : responses) {
+        assertThat(responses.getFirst().getHeaders().getContentType()).isNotNull();
+        assertThat(responses.getFirst().getHeaders().getContentType().isCompatibleWith(MediaType.TEXT_EVENT_STREAM)).isTrue();
+        assertThat(responses.getFirst().getHeaders().getFirst("x-vercel-ai-ui-message-stream")).isEqualTo("v1");
+        for (int index = 0; index < responses.size(); index++) {
+            var response = responses.get(index);
             var output = new ByteArrayOutputStream();
             response.getBody().writeTo(output);
             String stream = output.toString(StandardCharsets.UTF_8);
@@ -145,6 +153,12 @@ class PipelineAssistantControllerTest {
             assertThat(stream.indexOf("\"type\":\"start\"")).isLessThan(stream.indexOf("\"type\":\"data-proposal\""));
             assertThat(stream.indexOf("\"type\":\"data-proposal\"")).isLessThan(stream.indexOf("\"type\":\"finish\""));
             assertThat(stream).contains("I used the selected schema.", "customer_orders", "\"finishReason\":\"stop\"").doesNotContain("sk-test", "private-row");
+            String fixturePath = System.getProperty("tapstate.assistant.stream-output");
+            if (connector.equals("mysql") && index == 0 && fixturePath != null && !fixturePath.isBlank()) {
+                Path fixture = Path.of(fixturePath);
+                if (fixture.getParent() != null) Files.createDirectories(fixture.getParent());
+                Files.write(fixture, output.toByteArray());
+            }
         }
         providerFailure.set(true);
         var failedOutput = new ByteArrayOutputStream();
@@ -164,6 +178,20 @@ class PipelineAssistantControllerTest {
         controller.assistant("orders", body, request).getBody().writeTo(disconnected);
         assertThat(providerCalls).hasValue(7);
         assertThat(failedStream).doesNotContain("sk-test");
+        assertThat(store.get("orders")).contains(base);
+
+        Map<String, Object> invalidExpressionCandidate = new java.util.LinkedHashMap<>(candidate);
+        invalidExpressionCandidate.put("transforms", List.of(Map.of(
+                "id", "assistant-filter", "name", "filter", "type", "filter", "enabled", true,
+                "config", Map.of("filter", Map.of("expr", "afterr.region == 'US'")))));
+        proposedCandidate.set(invalidExpressionCandidate);
+        var invalidExpressionStreamOutput = new ByteArrayOutputStream();
+        controller.assistant("orders", body, request).getBody().writeTo(invalidExpressionStreamOutput);
+        String invalidExpressionStream = invalidExpressionStreamOutput.toString(StandardCharsets.UTF_8);
+        assertThat(invalidExpressionStream).contains("dsl.illegal-expression", "transforms[0].expr", "\"finishReason\":\"error\"")
+                .doesNotContain("data-proposal", "afterr.region");
+        assertThat(invalidExpressionStream.indexOf("\"type\":\"data-status\""))
+                .isLessThan(invalidExpressionStream.indexOf("\"type\":\"error\""));
         assertThat(store.get("orders")).contains(base);
         assertThat(sentContext.get()).containsKey("sources").containsKey("currentWizard");
         assertThat(sentContext.toString()).doesNotContain("sk-test", "private-row");
@@ -217,6 +245,76 @@ class PipelineAssistantControllerTest {
         assertThat(result).containsEntry("valid", true).containsKey("candidateWizard");
         assertThat(AssistantWizardJson.object(result.get("diff")).get("after").toString()).contains("changed_orders");
         assertThat(store.get("orders")).contains(base);
+
+        for (String arrayField : List.of("relations", "transforms")) {
+            Map<String, Object> nullArrayCandidate = new java.util.LinkedHashMap<>(view);
+            nullArrayCandidate.put(arrayField, null);
+            Map<String, Object> invalidArray = controller.validate("orders", 1, nullArrayCandidate);
+            assertThat(invalidArray).containsEntry("valid", false).doesNotContainKey("candidateWizard");
+            List<?> arrayDiagnostics = (List<?>) AssistantWizardJson.object(invalidArray.get("validation")).get("diagnostics");
+            assertThat(arrayDiagnostics).as("null %s must not normalize into an empty array", arrayField).hasSize(1);
+            assertThat(AssistantWizardJson.object(arrayDiagnostics.getFirst()))
+                    .containsEntry("code", ControlError.AI_INVALID_PROPOSAL.code());
+        }
+
+        Map<String, Object> nullRootTransforms = new java.util.LinkedHashMap<>(view);
+        Map<String, Object> nullRoot = new java.util.LinkedHashMap<>(AssistantWizardJson.object(view.get("root")));
+        nullRoot.put("transforms", null);
+        nullRootTransforms.put("root", nullRoot);
+        assertThat(controller.validate("orders", 1, nullRootTransforms))
+                .containsEntry("valid", false).doesNotContainKey("candidateWizard");
+
+        Map<String, Object> relation = new java.util.LinkedHashMap<>(Map.ofEntries(
+                Map.entry("id", "relation-1"), Map.entry("source", "src"), Map.entry("table", "orders"),
+                Map.entry("type", "flatten"), Map.entry("primaryKey", List.of("id")), Map.entry("arrayKey", List.of()),
+                Map.entry("targetField", ""), Map.entry("key", "id"), Map.entry("parentKey", "id"),
+                Map.entry("parentTable", "orders"), Map.entry("preProcessing", List.of()),
+                Map.entry("conditions", List.of(Map.of("childKey", "id", "parentKey", "id"))),
+                Map.entry("transforms", List.of()), Map.entry("children", List.of())));
+        Map<String, Object> relationCandidate = new java.util.LinkedHashMap<>(view);
+        relationCandidate.put("relations", List.of(relation));
+        assertThat(controller.validate("orders", 1, relationCandidate)).containsEntry("valid", true);
+        for (String arrayField : List.of("transforms", "children")) {
+            Map<String, Object> nullRelationArray = new java.util.LinkedHashMap<>(relation);
+            nullRelationArray.put(arrayField, null);
+            Map<String, Object> nullRelationCandidate = new java.util.LinkedHashMap<>(view);
+            nullRelationCandidate.put("relations", List.of(nullRelationArray));
+            assertThat(controller.validate("orders", 1, nullRelationCandidate))
+                    .as("null relation %s must not be normalized into an empty array", arrayField)
+                    .containsEntry("valid", false).doesNotContainKey("candidateWizard");
+        }
+
+        Map<String, Object> mapTransform = new java.util.LinkedHashMap<>(Map.of("id", "assistant-map", "name", "map",
+                "type", "map", "enabled", true, "config", Map.of("map", Map.of("fields", List.of()))));
+        Map<String, Object> mapCandidate = new java.util.LinkedHashMap<>(view);
+        mapCandidate.put("transforms", List.of(mapTransform));
+        assertThat(controller.validate("orders", 1, mapCandidate)).containsEntry("valid", true);
+        Map<String, Object> nullMapFields = new java.util.LinkedHashMap<>(view);
+        Map<String, Object> invalidMapTransform = new java.util.LinkedHashMap<>(mapTransform);
+        Map<String, Object> mapConfig = new java.util.LinkedHashMap<>(AssistantWizardJson.object(invalidMapTransform.get("config")));
+        Map<String, Object> mapBody = new java.util.LinkedHashMap<>(AssistantWizardJson.object(mapConfig.get("map")));
+        mapBody.put("fields", null);
+        mapConfig.put("map", mapBody);
+        invalidMapTransform.put("config", mapConfig);
+        nullMapFields.put("transforms", List.of(invalidMapTransform));
+        assertThat(controller.validate("orders", 1, nullMapFields))
+                .containsEntry("valid", false).doesNotContainKey("candidateWizard");
+
+        Map<String, Object> invalidExpressionCandidate = new java.util.LinkedHashMap<>(view);
+        invalidExpressionCandidate.put("transforms", List.of(Map.of(
+                "id", "assistant-filter", "name", "filter", "type", "filter", "enabled", true,
+                "config", Map.of("filter", Map.of("expr", "afterr.region == 'US'")))));
+        Map<String, Object> invalidExpression = controller.validate("orders", 1, invalidExpressionCandidate);
+        assertThat(invalidExpression).containsEntry("valid", false).doesNotContainKey("candidateWizard");
+        Map<String, Object> expressionValidation = AssistantWizardJson.object(invalidExpression.get("validation"));
+        List<?> expressionDiagnostics = (List<?>) expressionValidation.get("diagnostics");
+        assertThat(expressionDiagnostics).hasSize(1);
+        Map<String, Object> expressionDiagnostic = AssistantWizardJson.object(expressionDiagnostics.getFirst());
+        assertThat(expressionDiagnostic).containsEntry("code", "dsl.illegal-expression");
+        assertThat(AssistantWizardJson.object(expressionDiagnostic.get("params")))
+                .containsEntry("path", "transforms[0].expr")
+                .doesNotContainKeys("expr", "detail");
+
         view.put("destinationSourceId", "unselected-destination");
         assertThat(controller.validate("orders", 1, view)).containsEntry("valid", false).doesNotContainKey("candidateWizard");
     }
