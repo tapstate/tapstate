@@ -112,6 +112,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
     }
 
+    public io.tapstate.spi.store.SchemaStore schemas(CacheBusinessScope expected, Runnable requireActive) {
+        return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive));
+    }
+
     public io.tapstate.spi.store.ConnectorRegistry connectors(CacheBusinessScope expected, Runnable requireActive) {
         var registry = new MongoCacheConnectorRegistry(client, database, expected, this::businessActive, requireActive);
         registry.verify(); return registry;

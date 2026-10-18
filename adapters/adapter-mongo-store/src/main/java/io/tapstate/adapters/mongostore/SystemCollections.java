@@ -221,7 +221,7 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.cacheIncarnation", "_id.chain"), false, "srs_offsets_chain")),
     CACHE_PIPELINE_STATE("pipeline_state", Database.CACHE, MongoCachePipelineStateStore.class, Strategy.MIGRATED, 1),
     CACHE_PIPELINE_OBSERVATION("pipeline_observation", Database.CACHE, MongoCachePipelineObservationStore.class, Strategy.MIGRATED, 1),
-    CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoSchemaStore.class, Strategy.MIGRATED, 1),
+    CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoCacheSchemaStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoCacheConnectorCatalogStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoCacheConnectorSpecStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTION_TEST_RESULTS("connection_test_results", Database.CACHE, MongoCacheConnectionTestResultStore.class, Strategy.MIGRATED, 1),
