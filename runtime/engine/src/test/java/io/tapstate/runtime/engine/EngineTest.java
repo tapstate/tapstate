@@ -359,6 +359,43 @@ class EngineTest {
     }
 
     @Test
+    void scopedRunIdentitySurvivesSubmissionAndOldHandlesLeaveTheNewExecutionRunning() {
+        Engine engine = new Engine(member);
+        var firstIdentity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 1);
+        var nextIdentity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 2);
+        var first = engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), firstIdentity);
+        awaitStatus(member.getJet().getJob("scoped-pipe"), JobStatus.RUNNING);
+        assertThat((Object) member.getJet().getJob("scoped-pipe").getConfig().getArgument(Engine.RUN_IDENTITY_ARGUMENT)).isEqualTo(firstIdentity);
+        assertThat(engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), firstIdentity).jobId()).isEqualTo(first.jobId());
+        assertThatThrownBy(() -> engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), nextIdentity))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        first.cancel(); assertThat(first.awaitTerminal(Duration.ofSeconds(10))).isTrue();
+        var next = engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), nextIdentity);
+        awaitStatus(member.getJet().getJob("scoped-pipe"), JobStatus.RUNNING);
+        assertThat(next.jobId()).isNotEqualTo(first.jobId());
+        first.cancel(); assertThat(first.awaitTerminal(Duration.ZERO)).isTrue();
+        assertThatThrownBy(first::suspend).isInstanceOf(TapstateException.class);
+        assertThat(next.isCarryingAJob()).isTrue();
+        assertThat(engine.findRun("scoped-pipe", firstIdentity)).isEmpty();
+        assertThat(engine.findRun("scoped-pipe", nextIdentity)).isPresent();
+    }
+
+    @Test
+    void aScopedSinkFailureIsCapturedUnderItsActualJobAndNeverReadOrClearedThroughTheBareId() {
+        Engine engine = new Engine(member); var identity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 1);
+        var run = engine.submitRun("scoped-failed", failingSinkDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), identity);
+        awaitStatus(member.getJet().getJob("scoped-failed"), JobStatus.FAILED);
+        var registry = JobFailureRegistry.of(member);
+        assertThat(registry.existing("scoped-failed", run.jobId(), identity).get()).get().isInstanceOf(TapstateException.class);
+        assertThat(registry.get("scoped-failed")).isEmpty();
+        registry.record("scoped-failed", new IllegalStateException("legacy")); registry.clear("scoped-failed");
+        assertThat(run.failure()).get().isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code().code()).isEqualTo("test.sink-write-failed"));
+        run.cancel(); assertThat(registry.existing("scoped-failed", run.jobId(), identity).get()).isEmpty();
+    }
+
+    private record TestRunIdentity(String incarnation, long stateGeneration, String boot, long claim, long execution) implements java.io.Serializable {}
+
+    @Test
     void submit_is_idempotent_and_does_not_start_a_second_job() {
         Engine engine = new Engine(member);
         engine.submit("orders-pipe", foreverDag());
