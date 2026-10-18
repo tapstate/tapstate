@@ -9,15 +9,16 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Objects;
 
-/** One immutable hot and cold operator-state address, independent of execution attempts. */
+/** One immutable hot and cold operator-state address; the Nest root has the empty logical path. */
 public record OperatorPlacement(PipelineIntentScope scope, String database, Resource resource,
         String stepId, String pathId, String namespace) implements Serializable {
     public enum Resource { NEST_STATE, JOIN_FACTS, JOIN_DIMENSIONS, JOIN_INDEXES, JOIN_WRITERS }
 
     public OperatorPlacement {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(resource, "resource");
+        boolean rootPath = resource == Resource.NEST_STATE && "".equals(pathId);
         if (database == null || database.isBlank() || stepId == null || stepId.isBlank()
-                || pathId == null || pathId.isBlank() || namespace == null || namespace.isBlank()) {
+                || pathId == null || (pathId.isBlank() && !rootPath) || namespace == null || namespace.isBlank()) {
             throw new IllegalArgumentException("operator placement requires complete coordinates");
         }
     }

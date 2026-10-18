@@ -43,7 +43,16 @@ class OperatorPlacementTest {
     @Test void incompletePlacementIsRejectedBeforeAnyStoreCanOpen() {
         assertThatIllegalArgumentException().isThrownBy(() -> at(SCOPE, "", OperatorPlacement.Resource.NEST_STATE, "step", "path", "n"));
         assertThatIllegalArgumentException().isThrownBy(() -> at(SCOPE, "cache", OperatorPlacement.Resource.NEST_STATE, "", "path", "n"));
-        assertThatIllegalArgumentException().isThrownBy(() -> at(SCOPE, "cache", OperatorPlacement.Resource.NEST_STATE, "step", "", "n"));
+        assertThatIllegalArgumentException().isThrownBy(() -> at(SCOPE, "cache", OperatorPlacement.Resource.JOIN_FACTS, "step", "", "n"));
         assertThatIllegalArgumentException().isThrownBy(() -> at(SCOPE, "cache", OperatorPlacement.Resource.NEST_STATE, "step", "path", ""));
     }
+    @Test void aNestRootHasAnExplicitEmptyLogicalPathRatherThanASyntheticFieldName() {
+        var root = at(SCOPE,"cache",OperatorPlacement.Resource.NEST_STATE,"step","","state");
+        var field = at(SCOPE,"cache",OperatorPlacement.Resource.NEST_STATE,"step","root","state");
+        assertThat(root.mapName()).isNotEqualTo(field.mapName());
+        assertThat(root.pathId()).isEmpty();
+        assertThatIllegalArgumentException().isThrownBy(() -> at(SCOPE,"cache",OperatorPlacement.Resource.NEST_STATE,"step",null,"state"));
+        assertThatIllegalArgumentException().isThrownBy(() -> at(SCOPE,"cache",OperatorPlacement.Resource.NEST_STATE,"step"," ","state"));
+    }
+
 }
