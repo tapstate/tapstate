@@ -55,13 +55,14 @@ wrote to `tapstate-demo/tapstate-mcp.json`, which carries a write token for the
 playground:
 
 ```sh
-npx --yes skills add tapstate/tapstate-skills
-cd tapstate-demo && claude --mcp-config tapstate-mcp.json   # or copy its "tapstate" entry into your agent's MCP settings
+cd tapstate-demo
+npx --yes skills add tapstate/tapstate-skills -a claude-code -y
+claude --mcp-config tapstate-mcp.json
 ```
 
-Then ask, for example: *"Create a pipeline that keeps a live copy of the shipments in
-fulfillment_db with only their id, carrier and status, start it, and tell me its
-status."*
+Then ask *"How do I work with Tapstate?"*: the skills include a guided tour of what the demo
+runs, with things to try next. For Cursor, Codex and other agents, `tapstate-demo/AGENT-SETUP.md`
+has the steps.
 
 **From the CLI.** For scripts, CI, and machines without a browser or an AI assistant:
 the script installs the CLI as `tapstate-demo/tapstate`, and

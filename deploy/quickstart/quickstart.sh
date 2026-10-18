@@ -597,9 +597,17 @@ describe what you want; the agent does the work and tells you what it did.
 
 ## 1. Install the Tapstate skills first
 
+From this folder, for the agent you use:
+
 ${fence}sh
-npx --yes skills add tapstate/tapstate-skills
+npx --yes skills add tapstate/tapstate-skills -a claude-code -y    # Claude Code
+npx --yes skills add tapstate/tapstate-skills -a cursor -y         # Cursor
+npx --yes skills add tapstate/tapstate-skills -a codex -y          # Codex
 ${fence}
+
+This installs into this folder, where the agent finds the skills when it is started here; add \`-g\`
+to install them for every project instead. Without \`-a\` and \`-y\` the installer asks which skills,
+which of its many agents, and where, and waits at each question for an answer.
 
 The skills teach the agent how Tapstate pipelines are written. Without them, an agent can write a
 pipeline that passes validation and runs, but does not do what you asked -- and still report success.
@@ -669,9 +677,10 @@ print_next_steps() {
     # The agent block names the files only when they exist; otherwise it says why they do not, so the
     # option is never advertised over a configuration that was never written.
     if [ -z "${agent_note:-}" ]; then
-        agent_lines="    1. Install the Tapstate skills:  npx --yes skills add tapstate/tapstate-skills
-    2. Connect it:                   claude --mcp-config $agent_config   (other agents: AGENT-SETUP.md)
-    3. Ask it:                       \"How do I work with Tapstate?\""
+        agent_lines="    1. Install the Tapstate skills:  npx --yes skills add tapstate/tapstate-skills -a claude-code -y
+    2. Connect it:                   claude --mcp-config $agent_config
+    3. Ask it:                       \"How do I work with Tapstate?\"
+    Another agent? AGENT-SETUP.md has the steps for Cursor, Codex and others."
     else
         agent_lines="    Not set up: $agent_note"
     fi

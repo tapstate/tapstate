@@ -908,7 +908,8 @@ if [ -n "$skills_at" ] && [ -n "$connect_at" ] && [ "$skills_at" -lt "$connect_a
    && ! grep -q 'tsk_fake_agent_token' "$guide" \
    && grep -q 'How do I work with Tapstate?' "$guide" \
    && printf '%s' "$RUN_OUT" | grep -q '"How do I work with Tapstate?"' \
-   && printf '%s' "$RUN_OUT" | grep -q 'other agents: AGENT-SETUP.md'; then
+   && printf '%s' "$RUN_OUT" | grep -q 'skills add tapstate/tapstate-skills -a claude-code -y' \
+   && printf '%s' "$RUN_OUT" | grep -q 'Another agent? AGENT-SETUP.md'; then
   ok "AGENT-SETUP.md walks the agent path, skills first, without the token"
 else
   bad "AGENT-SETUP.md is missing or incomplete: $(cat "$guide" 2>/dev/null)"
