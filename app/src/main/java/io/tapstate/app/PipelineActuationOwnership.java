@@ -51,7 +51,7 @@ import org.springframework.context.event.EventListener;
  */
 final class PipelineActuationOwnership {
 
-    /** Whether this member may drive the pipeline, and the claim that says so ({@code null} on a single node). */
+    /** Whether this member may drive the pipeline, and the claim that says so ({@code null} only in an explicit fixture). */
     record Permit(boolean granted, WorkloadClaim claim) {
 
         static Permit unfenced() {
@@ -131,7 +131,7 @@ final class PipelineActuationOwnership {
         this.fenced = false;
     }
 
-    /** A single-node run has one member, so nothing is fenced and every pipeline is this member's to drive. */
+    /** An explicit fixture owner for a port with no coordinated store. */
     static PipelineActuationOwnership single() {
         return new PipelineActuationOwnership();
     }
@@ -198,7 +198,7 @@ final class PipelineActuationOwnership {
 
     /**
      * Whether a run may be submitted, the generations that fence it, and the committed topology the claim behind
-     * it was held under - none of either on a single node.
+     * it was held under - none of either in an explicit uncoordinated fixture.
      */
     record Execution(boolean allowed, ExecutionFence fence, Long topologyRevision) {
 
@@ -423,8 +423,7 @@ final class PipelineActuationOwnership {
      *
      * <p>Read rather than renewed: what is asked is who holds the run's generations now, and a renewal is
      * also refused for a claim granted under a topology revision a member joining has since moved, which
-     * the same owner takes again on its next pass under the same generations. True on a single node, where
-     * nothing is fenced.
+     * the same owner takes again on its next pass under the same generations. True only in an explicit uncoordinated fixture.
      */
     boolean proveExecution(ExecutionFence fence) {
         if (!fenced || fence == null) {
@@ -628,7 +627,8 @@ final class PipelineActuationOwnership {
     private Permit renew(Held state, long now) {
         Optional<WorkloadClaim> renewed;
         try {
-            renewed = claims.renew(state.claim, ttl);
+            renewed = membership.businessEligible()
+                    ? claims.renew(state.claim, ttl) : claims.renewActuationControl(state.claim, ttl);
         } catch (RuntimeException unreachable) {
             // The coordination store is the only thing that can say this member still owns the pipeline,
             // and it did not answer. Unproved is the same as lost here: the alternative is to keep driving

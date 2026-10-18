@@ -46,6 +46,7 @@ class NodeSessionKeyringIndependenceTest {
         var beans = new DefaultListableBeanFactory();
         beans.registerSingleton("configuration", new HazelcastConfiguration()); beans.registerSingleton("member", member);
         beans.registerSingleton("properties", properties); beans.registerSingleton("claims", store);
+        beans.registerSingleton("membershipGate", new ClusterMembershipGate(properties));
         var attempted = new AtomicInteger(); var poison = new RootBeanDefinition(SourceConfigKeyringSession.class);
         poison.setLazyInit(true); poison.setInstanceSupplier(() -> {
             attempted.incrementAndGet(); throw new IllegalStateException("configuration key session is unavailable");

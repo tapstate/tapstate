@@ -62,6 +62,15 @@ final class ClusterWorkloadClaims {
         return store.renew(expected, ttl);
     }
 
+    /**
+     * Keeps an exact held SINGLE lifecycle claim while its engine is down, solely for control reporting.
+     * This cannot acquire a claim, advance an execution, or authorize a data-plane call. The store still
+     * requires the original live claim; an expired or replaced tenure is never recovered here.
+     */
+    Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl) {
+        return membership.singleControlEligible(expected) ? store.renew(expected, ttl) : Optional.empty();
+    }
+
     boolean release(WorkloadClaim expected) {
         return store.release(expected);
     }

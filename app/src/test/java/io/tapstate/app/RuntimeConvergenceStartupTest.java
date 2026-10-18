@@ -34,6 +34,8 @@ class RuntimeConvergenceStartupTest {
             // configuration, which this context does not bring up -- it is the convergence loop alone.
             .withBean(ClusterMembershipGate.class, () -> new ClusterMembershipGate(new ClusterProperties()))
             .withBean(PipelineActuationOwnership.class, PipelineActuationOwnership::single)
+            .withBean(ClusterProperties.class, ClusterProperties::new)
+            .withBean(NodeSessionLease.class, NodeSessionLease::inactive)
             .withBean(RebuildAdmission.class, RebuildAdmission::never)
             .withUserConfiguration(RuntimeConvergenceConfiguration.class);
 

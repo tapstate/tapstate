@@ -13,6 +13,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * Keeps a pre-join node-session claim live and removes the member when that proof is lost.
@@ -34,6 +35,7 @@ final class NodeSessionLease implements AutoCloseable {
     private static final Duration LAPSE_CHECK = Duration.ofSeconds(1);
 
     private final WorkloadClaimStore store;
+    private final LongSupplier nanoTime;
     private final AtomicReference<WorkloadClaim> current;
     private final Duration ttl;
     private final Runnable lost;
@@ -44,6 +46,7 @@ final class NodeSessionLease implements AutoCloseable {
     private volatile long provenUntil;
 
     private NodeSessionLease() {
+        this.nanoTime = System::nanoTime;
         this.store = null;
         this.current = null;
         this.ttl = Duration.ZERO;
@@ -67,6 +70,12 @@ final class NodeSessionLease implements AutoCloseable {
             Duration ttl,
             Duration renewInterval,
             Runnable lost) {
+        this(store, initial, askedAt, ttl, renewInterval, lost, System::nanoTime);
+    }
+
+    NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl, Duration renewInterval,
+                     Runnable lost, LongSupplier nanoTime) {
+        this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         this.store = Objects.requireNonNull(store, "store");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         this.ttl = Objects.requireNonNull(ttl, "ttl");
@@ -87,14 +96,16 @@ final class NodeSessionLease implements AutoCloseable {
     }
 
     private void renew() {
-        if (closed.get()) {
-            return;
-        }
+        if (!active()) return;
         WorkloadClaim expected = current.get();
-        long askedAt = System.nanoTime();
+        long askedAt = nanoTime.getAsLong();
         try {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
             if (renewed.isPresent()) {
+                if (closed.get()) return;
+                if (nanoTime.getAsLong() - provenUntil >= 0) {
+                    lose("the renewal arrived after the prior proof expired", null); return;
+                }
                 WorkloadClaim accepted = renewed.get();
                 current.set(accepted);
                 provenUntil = askedAt + ttl.toNanos();
@@ -106,8 +117,20 @@ final class NodeSessionLease implements AutoCloseable {
         }
     }
 
+    /** A non-blocking local predicate; an observed expiry is irreversible even if shutdown blocks. */
+    boolean active() {
+        if (closed.get()) return false;
+        if (nanoTime.getAsLong() - provenUntil >= 0) {
+            if (closed.compareAndSet(false, true)) {
+                renewer.execute(() -> stopAfterLoss("the original node-session proof expired", null));
+            }
+            return false;
+        }
+        return !closed.get();
+    }
+
     private void loseALapsedSession() {
-        if (System.nanoTime() - provenUntil >= 0) {
+        if (nanoTime.getAsLong() - provenUntil >= 0) {
             lose("no renewal was accepted within the lease the last one bought", null);
         }
     }
@@ -116,6 +139,10 @@ final class NodeSessionLease implements AutoCloseable {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        stopAfterLoss(reason, cause);
+    }
+
+    private void stopAfterLoss(String reason, RuntimeException cause) {
         if (cause == null) {
             LOG.error("Node session lost: {}. Shutting down the Hazelcast member.", reason);
         } else {

@@ -32,7 +32,7 @@ final class ConvergenceDriver {
     private final PipelineConverger converger;
     private final DesiredStore desired;
     private final ObservationPublisher publisher;
-    private final BooleanSupplier businessEligible;
+    private final BooleanSupplier reconcileEligible;
     private final PipelineActuationOwnership actuation;
 
     // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
@@ -63,31 +63,31 @@ final class ConvergenceDriver {
 
     /** A driver on a member that only acts while the cluster says this member may. */
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
-            BooleanSupplier businessEligible) {
-        this(converger, desired, publisher, businessEligible, PipelineActuationOwnership.single());
+            BooleanSupplier reconcileEligible) {
+        this(converger, desired, publisher, reconcileEligible, PipelineActuationOwnership.single());
     }
 
     /** The same, driving only the pipelines this member holds the actuation claim for. */
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
-            BooleanSupplier businessEligible, PipelineActuationOwnership actuation) {
-        this(converger, desired, publisher, null, MetricsExport.none(), businessEligible, actuation);
+            BooleanSupplier reconcileEligible, PipelineActuationOwnership actuation) {
+        this(converger, desired, publisher, null, MetricsExport.none(), reconcileEligible, actuation);
     }
 
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
-            RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
+            RateSampler sampler, MetricsExport export, BooleanSupplier reconcileEligible,
             PipelineActuationOwnership actuation) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
         this.sampler = sampler;
         this.export = export == null ? MetricsExport.none() : export;
-        this.businessEligible = businessEligible;
+        this.reconcileEligible = reconcileEligible;
         this.actuation = actuation;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
     void reconcile() {
-        if (!businessEligible.getAsBoolean()) {
+        if (!reconcileEligible.getAsBoolean()) {
             return;
         }
         List<String> pipelineIds = desired.pipelineIds();

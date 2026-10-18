@@ -20,6 +20,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,32 +77,39 @@ final class ExecutionAuthorization implements AutoCloseable {
     private final long refreshIntervalNanos;
     private final LongSupplier nanoTime;
     private final boolean fenced;
+    private final BooleanSupplier nodeActive;
+    private final AtomicBoolean closed = new AtomicBoolean();
     private final Map<String, Entry> entries = new ConcurrentHashMap<>();
     private final Map<String, Long> nextReadNanos = new ConcurrentHashMap<>();
     private final ScheduledExecutorService refresher;
 
-    private ExecutionAuthorization() {
+    private ExecutionAuthorization(boolean denied) {
+        this.nodeActive = () -> !denied;
         this.clusterId = "single";
         this.claims = null;
         this.window = Duration.ZERO;
         this.windowNanos = 0;
         this.refreshIntervalNanos = 0;
         this.nanoTime = System::nanoTime;
-        this.fenced = false;
+        this.fenced = denied;
         this.refresher = null;
     }
 
-    /** A single-node run has one member and one run of anything, so nothing here is fenced. */
+    /** An explicit fixture guard for a port with no coordinated store. */
     static ExecutionAuthorization unfenced() {
-        return new ExecutionAuthorization();
+        return new ExecutionAuthorization(false);
     }
 
     ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window) {
         this(clusterId, claims, window, System::nanoTime);
     }
 
-    ExecutionAuthorization(
-            String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime) {
+    ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime) {
+        this(clusterId, claims, window, nanoTime, () -> true);
+    }
+
+    ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime, BooleanSupplier nodeActive) {
+        this.nodeActive = Objects.requireNonNull(nodeActive, "nodeActive");
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.claims = Objects.requireNonNull(claims, "claims");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
@@ -124,13 +133,11 @@ final class ExecutionAuthorization implements AutoCloseable {
     }
 
     /**
-     * The guard bound to {@code member}, or an unfenced one where nothing is bound — a single-node run,
-     * or a member brought up without a coordination store, neither of which has a second run to fence
-     * against.
+     * The guard bound to {@code member}; a missing binding refuses instead of granting unprotected work.
      */
     static ExecutionAuthorization of(HazelcastInstance member) {
         Object bound = member.getUserContext().get(USER_CONTEXT_KEY);
-        return bound instanceof ExecutionAuthorization authorization ? authorization : unfenced();
+        return bound instanceof ExecutionAuthorization authorization ? authorization : new ExecutionAuthorization(true);
     }
 
     /**
@@ -178,6 +185,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     /** The current matching entry, refreshing it under the same rules as the boolean guard. */
     private Entry authorizedEntry(ExecutionFence fence) {
         Objects.requireNonNull(fence, "fence");
+        if (closed.get() || !nodeActive.getAsBoolean()) return null;
         long now = nanoTime.getAsLong();
         Entry entry = entries.get(fence.pipelineId());
         if (entry != null && precedes(entry, fence)) {
@@ -191,7 +199,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         } else if (entry == null || now - entry.deadlineNanos() >= 0) {
             entry = read(fence.pipelineId(), false);
         }
-        return entry != null
+        return !closed.get() && nodeActive.getAsBoolean() && entry != null
                 && entry.claim().claimGeneration() == fence.claimGeneration()
                 && entry.claim().executionGeneration() == fence.executionGeneration()
                 ? entry
@@ -200,7 +208,7 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     /** Files a sink's known independent failure under the exact run while its claim is still live. */
     void recordSinkWriteFailure(ExecutionFence fence) {
-        if (!fenced) {
+        if (!fenced || closed.get() || !nodeActive.getAsBoolean()) {
             return;
         }
         try {
@@ -303,6 +311,7 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     @Override
     public void close() {
+        closed.set(true); entries.clear();
         if (refresher != null) {
             refresher.shutdownNow();
         }
