@@ -159,6 +159,41 @@ public final class SnapshotPhase {
         }
     }
 
+    /** Opens only a host-prepared session; its original model-pin receipt must exist before a load may proceed. */
+    public static Load openPrepared(CapturePort port,CaptureConfig config,SrsSnapshotPreparation preparation) {
+        Objects.requireNonNull(port,"port"); Objects.requireNonNull(config,"config"); Objects.requireNonNull(preparation,"preparation");
+        var run = preparation.run(); var owed = preparation.stillOwed(); var tables = preparation.tables();
+        var order = SourceOrder.snapshotRow(preparation.request().snapshotEpoch());
+        preparation.beginRead(); SnapshotSession session = null; CaptureBatch first = null;
+        try {
+            if (owed.isEmpty()) { preparation.close(); return new Load(null,run.miningChainId(),tables,owed,order,null,null,false); }
+            var opened = SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
+                    new TapstateException(io.tapstate.spi.store.IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",run.miningChainId()),null));
+            session = new SnapshotSession() {
+                @Override public CaptureBatch read(String table) { return opened.read(table); }
+                @Override public void close() { preparation.close(); opened.close(); }
+            };
+            first = session.read(owed.getFirst());
+            seamOf(first,run.miningChainId());
+            var pin = preparation.accepted();
+            return new Load(session,run.miningChainId(),tables,owed,order,pin.sourcePosition(),first,false);
+        } catch (RuntimeException | Error failure) {
+            preparation.close();
+            if (first != null) closing(failure,first::close);
+            if (session != null) closing(failure,session::close);
+            throw failure;
+        }
+    }
+
+    private static Throwable closing(Throwable primary,Runnable close) {
+        try { close.run(); }
+        catch (RuntimeException | Error cleanup) {
+            if (primary == null) return cleanup;
+            if (cleanup != primary) primary.addSuppressed(cleanup);
+        }
+        return primary;
+    }
+
     private static String recordedTailStart(Optional<SrsMeta> record, String pipelineId) {
         return record.map(stored -> stored.sourceReadOffset() != null
                         ? stored.sourceReadOffset()
@@ -385,15 +420,11 @@ public final class SnapshotPhase {
                 batch = open;
                 open = null;
             }
-            try {
-                if (session != null) {
-                    session.close();
-                }
-            } finally {
-                if (batch != null) {
-                    batch.close();
-                }
-            }
+            Throwable failure = null;
+            if (session != null) failure = closing(failure,session::close);
+            if (batch != null) failure = closing(failure,batch::close);
+            if (failure instanceof RuntimeException runtime) throw runtime;
+            if (failure instanceof Error error) throw error;
         }
 
         private long readOpenBatch(Consumer<Envelope> sink) {
