@@ -218,7 +218,9 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.cacheIncarnation", "_id.chain"), false, "srs_consumers_chain"),
             new IndexSpec(List.of("pipelineId"), false, "srs_consumers_pipeline")),
     CACHE_SRS_CONSUMER_OFFSETS("srs_consumer_offsets", Database.CACHE, MongoSrsConsumerStore.class, Strategy.MIGRATED, 1,
-            new IndexSpec(List.of("_id.cacheIncarnation", "_id.chain"), false, "srs_offsets_chain"));
+            new IndexSpec(List.of("_id.cacheIncarnation", "_id.chain"), false, "srs_offsets_chain")),
+    CACHE_PIPELINE_STATE("pipeline_state", Database.CACHE, MongoCachePipelineStateStore.class, Strategy.MIGRATED, 1),
+    CACHE_PIPELINE_OBSERVATION("pipeline_observation", Database.CACHE, MongoCachePipelineObservationStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

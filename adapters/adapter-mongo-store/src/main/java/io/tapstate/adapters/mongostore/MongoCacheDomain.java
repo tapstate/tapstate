@@ -112,6 +112,34 @@ public final class MongoCacheDomain implements AutoCloseable {
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
     }
 
+    /** A fixed read view refuses missing checkpoints rather than interpreting them as a new Pipeline. */
+    public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope) {
+        return new MongoCachePipelineStateStore(pipelineAccess(scope, null, () -> {}));
+    }
+
+    /** A write view retains exactly the original claim; a later pass opens its own view. */
+    public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
+        return new MongoCachePipelineStateStore(pipelineAccess(scope, Objects.requireNonNull(original, "original"), requireActive));
+    }
+
+    /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */
+    public io.tapstate.spi.store.ObservationStore pipelineObservations(io.tapstate.spi.store.PipelineIntentScope scope) {
+        return new MongoCachePipelineObservationStore(pipelineAccess(scope, null, () -> {}));
+    }
+
+    /** Normal observations are protected by the same original actuation claim as transitions. */
+    public io.tapstate.spi.store.ObservationStore pipelineObservations(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
+        return new MongoCachePipelineObservationStore(pipelineAccess(scope, Objects.requireNonNull(original, "original"), requireActive));
+    }
+
+    private MongoCachePipelineAccess pipelineAccess(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); });
+    }
+
     /**
      * Only the original authorized operation may retire a business scope; it does not change auth.
      * Cache fencing does not establish that external calls already issued have drained; the caller

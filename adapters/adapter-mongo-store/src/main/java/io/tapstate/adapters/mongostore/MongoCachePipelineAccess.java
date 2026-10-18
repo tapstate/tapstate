@@ -1,0 +1,123 @@
+package io.tapstate.adapters.mongostore;
+
+import com.mongodb.ReadConcern;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimType;
+import org.bson.Document;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Function;
+
+/** A fixed Pipeline state identity and, for mutations, the original actuation claim. */
+final class MongoCachePipelineAccess {
+    private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
+            .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+    final MongoDatabase database;
+    final PipelineIntentScope scope;
+    private final MongoClient client;
+    private final WorkloadClaimFence original;
+    private final Runnable requireActive;
+
+    MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimFence original, Runnable requireActive) {
+        this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
+        this.scope = Objects.requireNonNull(scope, "scope"); this.original = original;
+        this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
+        if (original != null && (original.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))) throw fenced();
+    }
+
+    <T> T transaction(Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    return session.withTransaction(() -> {
+                        requireActive.run();
+                        new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
+                                .requireAdmissionState(session);
+                        verifyStructures();
+                        T result = action.apply(session);
+                        requireActive.run();
+                        return result;
+                    }, TRANSACTION);
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+        });
+    }
+
+    void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
+
+    Document state(ClientSession session) {
+        Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
+        if (state == null) throw unreadable("checkpoint");
+        requireScope(state);
+        if (!(state.get("epoch") instanceof Long epoch) || epoch < 0 || epoch == Long.MAX_VALUE
+                || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE
+                || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
+        return state;
+    }
+
+    void requireScope(Document row) {
+        if (!scope.pipelineId().equals(row.get("_id"))) throw unreadable("scope");
+        Object stored = row.get("scope");
+        if (!(stored instanceof Document value)) throw unreadable("scope");
+        try {
+            if (!(value.get("bindingVersion") instanceof Long binding) || !(value.get("stateGeneration") instanceof Long generation)) throw unreadable("scope");
+            var decoded = new PipelineIntentScope(value.getString("clusterId"), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
+            if (!scope.equals(decoded)) throw fenced();
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("scope"); }
+    }
+
+    void proveClaim(ClientSession session) {
+        if (original == null) throw fenced();
+        MongoCacheWorkloadClaimStore.requireCollection(database);
+        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original),
+                new Document("$inc", new Document("fencedPipelineWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
+    }
+
+    /** This real write also serializes an observation with replacement of the current state scope. */
+    void updateState(ClientSession session, Document current, Document values, boolean advanceEpoch) {
+        long revision = current.getLong("runtimeWriteFence");
+        if (revision == Long.MAX_VALUE - 1 || (advanceEpoch && current.getLong("epoch") == Long.MAX_VALUE - 1)) throw fenced();
+        Document increments = new Document("runtimeWriteFence", 1L);
+        if (advanceEpoch) increments.append("epoch", 1L);
+        Document update = new Document("$inc", increments);
+        if (!values.isEmpty()) update.append("$set", values);
+        if (SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,
+                new Document("_id", scope.pipelineId()).append("scope", current.get("scope"))
+                        .append("epoch", current.getLong("epoch")).append("runtimeWriteFence", revision), update).getMatchedCount() != 1)
+            throw new IllegalStateException("Pipeline state changed within its transaction snapshot");
+    }
+
+    private void verifyStructures() {
+        for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION)) {
+            var found = database.listCollections().filter(new Document("name", table.collectionName())).first();
+            if (found == null || !"collection".equals(found.get("type"))) throw unreadable("structure");
+            var options = found.get("options", Document.class);
+            if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("structure");
+            var indexes = table.on(database).listIndexes().into(new ArrayList<>());
+            if (indexes.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadable("index");
+            var id = indexes.stream().filter(index -> "_id_".equals(index.get("name"))).findFirst().orElse(null);
+            if (id == null || !new Document("_id", 1).equals(id.get("key")) || Boolean.TRUE.equals(id.get("hidden"))
+                    || Boolean.TRUE.equals(id.get("sparse")) || id.containsKey("partialFilterExpression")) throw unreadable("index");
+        }
+    }
+
+    static TapstateException fenced() { return MongoCacheBusinessIdentity.businessFenced(); }
+    static TapstateException claimFenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }
+    TapstateException unreadable(String field) { return new TapstateException(IoError.DOCUMENT_UNREADABLE,
+            Map.of("id", scope.pipelineId(), "field", field), null); }
+}
