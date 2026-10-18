@@ -142,9 +142,13 @@ class PipelineFirstStatePreparerIT {
             f.preparer(f.configuration,f.cache).prepare(f.scope);
             var claims = f.cache.workloadClaims(f.business()); var owned = claims.acquirePipeline(f.scope,OWNER,1,TTL).claim();
             var first = claims.advanceExecution(owned,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
-            var placement = new io.tapstate.spi.store.OperatorPlacement(f.scope,f.cacheDatabase.getName(),
-                    io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE,"step","root","state");
-            f.cache.nestShapes(f.scope,f.cacheDatabase.getName(),WorkloadClaimFence.from(first),ACTIVE).recordIfAbsent("step",java.util.Set.of("root"));
+            var topology = literalRootTopology();
+            var placement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope,f.cacheDatabase.getName(),"step",List.of(),
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null);
+            var embeddedPlacement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope,f.cacheDatabase.getName(),"step",List.of("$root"),
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null);
+            assertThat(placement.mapName()).isNotEqualTo(embeddedPlacement.mapName());
+            f.cache.nestShapes(f.scope,f.cacheDatabase.getName(),WorkloadClaimFence.from(first),ACTIVE).recordIfAbsent("step",topology.stateIdentityPaths());
             var member = org.mockito.Mockito.mock(com.hazelcast.core.HazelcastInstance.class);
             org.mockito.Mockito.when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
             org.mockito.Mockito.when(member.getDistributedObjects()).thenReturn(List.of());
@@ -152,22 +156,37 @@ class PipelineFirstStatePreparerIT {
                  var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,new ScopedOperatorStateProvider(f.cache,authorization))) {
                 var originalFence = new ExecutionFence(f.scope,WorkloadClaimFence.from(first));
                 var original = new io.tapstate.runtime.engine.OperatorMapBinding(placement,originalFence,originalFence.operatorExecutionKey());
-                registry.install(List.of(original)); var old = mapStore(member,original); Object key = List.of("key"); old.store(key,"before");
+                var embeddedOriginal = new io.tapstate.runtime.engine.OperatorMapBinding(embeddedPlacement,originalFence,originalFence.operatorExecutionKey());
+                registry.install(List.of(original,embeddedOriginal)); var old = mapStore(member,original); var embeddedOld = mapStore(member,embeddedOriginal);
+                Object key = List.of("key"); old.store(key,"before"); embeddedOld.store(key,"embedded-before");
                 var nextClaim = claims.advanceExecution(first,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
                 var nextFence = new ExecutionFence(f.scope,WorkloadClaimFence.from(nextClaim));
                 var next = new io.tapstate.runtime.engine.OperatorMapBinding(placement,nextFence,nextFence.operatorExecutionKey());
-                registry.install(List.of(next)); var current = mapStore(member,next); assertThat(current.load(key)).isEqualTo("before");
-                current.store(key,"after"); var before = f.state();
+                var embeddedNext = new io.tapstate.runtime.engine.OperatorMapBinding(embeddedPlacement,nextFence,nextFence.operatorExecutionKey());
+                registry.install(List.of(next,embeddedNext)); var current = mapStore(member,next); var embeddedCurrent = mapStore(member,embeddedNext);
+                assertThat(current.load(key)).isEqualTo("before"); assertThat(embeddedCurrent.load(key)).isEqualTo("embedded-before");
+                current.store(key,"after"); embeddedCurrent.store(key,"embedded-after"); var before = f.state();
                 assertCode(() -> old.store(key,"late"),IoError.WORKLOAD_CLAIM_FENCED);
                 assertCode(() -> old.storeAll(Map.of(key,"late")),IoError.WORKLOAD_CLAIM_FENCED);
                 assertCode(() -> old.delete(key),IoError.WORKLOAD_CLAIM_FENCED);
                 assertCode(() -> old.deleteAll(List.of(key)),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> embeddedOld.deleteAll(List.of(key)),IoError.WORKLOAD_CLAIM_FENCED);
                 assertCode(() -> f.cache.operatorState(placement,WorkloadClaimFence.from(first),ACTIVE)
                         .save(placement.mapName(),"late",new byte[]{1}),IoError.WORKLOAD_CLAIM_FENCED);
                 assertThat(f.state()).isEqualTo(before); assertThat(current.load(key)).isEqualTo("after");
                 assertThat(registry.release(original)).isFalse(); assertThat(current.load(key)).isEqualTo("after");
+                assertThat(registry.release(embeddedOriginal)).isFalse(); assertThat(embeddedCurrent.load(key)).isEqualTo("embedded-after");
             }
         });
+    }
+
+    private static io.tapstate.runtime.engine.nest.NestTopology literalRootTopology() {
+        var child = new io.tapstate.core.model.Embed("claim",Map.of("policy_id","policy_id"),io.tapstate.core.model.EmbedAs.ARRAY,"child",List.of("claim_id"),null,null,null);
+        var parent = new io.tapstate.core.model.Embed("policy",Map.of("customer_id","customer_id"),io.tapstate.core.model.EmbedAs.ARRAY,"$root",List.of("policy_no"),null,null,List.of(child));
+        var tree = new io.tapstate.core.model.TransformBody.Nest(null,null,new io.tapstate.core.model.NestRoot("customer",List.of("customer_id"),null,null,List.of(parent)));
+        var tables = Map.of("customer",new io.tapstate.runtime.engine.nest.NestTable("customers",List.of("customer_id")),
+                "policy",new io.tapstate.runtime.engine.nest.NestTable("policies",List.of("policy_id")),"claim",new io.tapstate.runtime.engine.nest.NestTable("claims",List.of("claim_id")));
+        return io.tapstate.runtime.engine.nest.NestTopology.compile("flow","step",tree,tables::get);
     }
 
     @SuppressWarnings("unchecked") private static com.hazelcast.map.MapStore<Object,Object> mapStore(com.hazelcast.core.HazelcastInstance member,

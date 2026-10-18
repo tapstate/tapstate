@@ -2,6 +2,9 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.OperatorRunManifest;
+import io.tapstate.runtime.engine.OperatorStepMaps;
+import io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
 import java.io.Serializable;
 import java.util.Map;
@@ -87,8 +90,16 @@ public record NestBinding(
         this(tables, stores, deadLetter, replayFloor, ledger, NestSettings.defaults());
     }
 
+    /** Selects an explicit step before any of its stores travels to a processor. */
+    public NestBinding forStep(String pipelineId,String stepId) {
+        return new NestBinding(tables,stores.forStep(pipelineId,stepId),deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete);
+    }
+
     /** Where each kind of nest vertex keeps its state. */
     public interface NestStores extends Serializable {
+        default NestStores forStep(String pipelineId,String stepId) { return this; }
+        default boolean hasTypedPlacements() { return false; }
+
 
         /**
          * Binds this factory to the member whose vertices it is about to serve, returning what to ask from
@@ -172,8 +183,11 @@ public record NestBinding(
      * is asked for a store. Asking too early is a wiring mistake rather than anything a user did, so it
      * fails on the spot rather than degrading to a store that quietly keeps nothing.
      */
-    public static NestStores onMap() {
-        return new MapNestStores(null);
+    public static NestStores onMap() { return new MapNestStores(null); }
+
+    /** Physical map names come only from this original run's complete typed manifest. */
+    public static NestStores onMap(OperatorRunManifest original) {
+        return new MapNestStores(null,() -> NestStateGauge.NONE,Objects.requireNonNull(original,"original"),null);
     }
 
     /** The factory behind {@link #onMap()}: coordinates while it travels, a live handle once it lands. */
@@ -183,25 +197,34 @@ public record NestBinding(
 
         private final transient HazelcastInstance member;
         private final transient Supplier<NestStateGauge> gauges;
+        private final OperatorRunManifest original;
+        private final String stepId;
+        private final OperatorStepMaps names;
 
         private MapNestStores(HazelcastInstance member) {
             this(member, () -> NestStateGauge.NONE);
         }
 
-        private MapNestStores(HazelcastInstance member, Supplier<NestStateGauge> gauges) {
-            this.member = member;
-            this.gauges = gauges;
+        private MapNestStores(HazelcastInstance member, Supplier<NestStateGauge> gauges) { this(member,gauges,null,null); }
+        private MapNestStores(HazelcastInstance member,Supplier<NestStateGauge> gauges,OperatorRunManifest original,String stepId) {
+            this.member = member; this.gauges = gauges; this.original = original; this.stepId = stepId;
+            this.names = original == null || stepId == null ? null : original.forStep(original.pipelineId(),stepId);
+        }
+        @Override public boolean hasTypedPlacements() { return original != null; }
+        @Override public NestStores forStep(String pipelineId,String stepId) {
+            if (original == null) return this;
+            original.requirePipeline(pipelineId); return new MapNestStores(member,gauges,original,Objects.requireNonNull(stepId,"stepId"));
         }
 
         @Override
         public NestStores bind(HazelcastInstance member) {
-            return new MapNestStores(Objects.requireNonNull(member, "member"));
+            return new MapNestStores(Objects.requireNonNull(member, "member"),() -> NestStateGauge.NONE,original,stepId);
         }
 
         @Override
         public NestStores bind(HazelcastInstance member, Supplier<NestStateGauge> gauges) {
             return new MapNestStores(Objects.requireNonNull(member, "member"),
-                    Objects.requireNonNull(gauges, "gauges"));
+                    Objects.requireNonNull(gauges, "gauges"),original,stepId);
         }
 
         @Override
@@ -229,21 +252,28 @@ public record NestBinding(
 
         @Override
         public NestStore<ParkedSubtree> forParking(NestVertex vertex) {
-            return metered(mapNamed(vertex.name(), vertex.parkingMapName()));
+            return metered(mapNamed(vertex.name(), name(vertex.pathId(),NestMap.PARKING,null,vertex.parkingMapName())));
         }
 
         @Override
         public NestStore<Map<String, Object>> forLookup(NestLookup lookup) {
-            return metered(mapNamed(lookup.name(), lookup.mapName()));
+            return metered(mapNamed(lookup.name(), name(lookup.pathId(),NestMap.LOOKUP,lookup.alias(),lookup.mapName())));
         }
 
         @Override
         public NestStore<Set<Object>> forReferences(NestLookup lookup) {
-            return metered(mapNamed(lookup.name(), lookup.referencesMapName()));
+            return metered(mapNamed(lookup.name(), name(lookup.pathId(),NestMap.REFERENCES,lookup.alias(),lookup.referencesMapName())));
         }
 
         private <S> IMap<Object, S> mapOf(NestVertex vertex) {
-            return mapNamed(vertex.name(), vertex.mapName());
+            return mapNamed(vertex.name(), name(vertex.pathId(),NestMap.STATE,null,vertex.mapName()));
+        }
+
+        private String name(java.util.List<String> path,NestMap kind,String alias,String legacy) {
+            if (original == null) return legacy;
+            if (names == null) throw new io.tapstate.core.common.TapstateException(io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED,
+                    Map.of("pipeline",original.pipelineId()),null);
+            return names.nest(path,kind,alias).mapName();
         }
 
         private <S> IMap<Object, S> mapNamed(String askedFor, String name) {

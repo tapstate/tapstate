@@ -44,7 +44,13 @@ class ImapJoinStoresTest {
     @BeforeEach
     void startMember() {
         cold = new RecordingColdLayer();
-        Config config = new Config();
+        Config config = new Config().setClusterName("join-store-"+java.util.UUID.randomUUID());
+        config.setProperty("hazelcast.phone.home.enabled","false"); config.setProperty("hazelcast.shutdownhook.enabled","false");
+        config.setProperty("hazelcast.operation.thread.count","2"); config.setProperty("hazelcast.operation.generic.thread.count","2");
+        config.setProperty("hazelcast.io.input.thread.count","1"); config.setProperty("hazelcast.io.output.thread.count","1");
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
         config.getJetConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);

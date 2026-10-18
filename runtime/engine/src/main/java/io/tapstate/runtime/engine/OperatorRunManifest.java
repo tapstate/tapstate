@@ -4,6 +4,8 @@ import java.io.Serializable;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import io.tapstate.core.common.TapstateException;
+import java.util.Map;
 
 /** Original run metadata, transported with the job rather than rebuilt from a later artifact. */
 public record OperatorRunManifest(String pipelineId, Serializable executionIdentity,
@@ -22,4 +24,8 @@ public record OperatorRunManifest(String pipelineId, Serializable executionIdent
             }
         }
     }
+    public OperatorStepMaps forStep(String pipeline,String step) {
+        requirePipeline(pipeline); return new OperatorStepMaps(pipelineId,step,bindings);
+    }
+    public void requirePipeline(String pipeline) { if (!pipelineId.equals(pipeline)) throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",pipelineId),null); }
 }

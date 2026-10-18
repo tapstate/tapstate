@@ -25,5 +25,18 @@ class OperatorRunManifestTest {
                 binding("orders",1,"foreign",1),binding("orders",1,"run",2))) {
             assertThatThrownBy(() -> new OperatorRunManifest("orders","run",List.of(original,other))).isInstanceOf(IllegalArgumentException.class);
         }
+    }    @Test void oneStepCannotSilentlyChooseBetweenDifferentDatabasesForTheSameLogicalSlot() {
+        var first = binding("orders",1,"run",1); var at = first.placement();
+        var second = new OperatorMapBinding(new OperatorPlacement(at.scope(),"other",at.resource(),at.stepId(),at.pathId(),at.namespace()),"run",first.executionKey());
+        var manifest = new OperatorRunManifest("orders","run",List.of(first,second));
+        assertThatThrownBy(() -> manifest.forStep("orders","join"))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
     }
+    @Test void missingStepsResourcesAndForeignPipelinesNeverFallBackToALegacyName() {
+        var original = binding("orders",1,"run",1); var manifest = new OperatorRunManifest("orders","run",List.of(original));
+        assertThatThrownBy(() -> manifest.forStep("foreign","join")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        assertThatThrownBy(() -> manifest.forStep("orders","missing").join(OperatorPlacement.Resource.JOIN_FACTS,null)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        assertThatThrownBy(() -> manifest.forStep("orders","join").join(OperatorPlacement.Resource.JOIN_DIMENSIONS,"facts")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+    }
+
 }

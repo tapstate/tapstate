@@ -139,6 +139,52 @@ class ScopedOperatorMapsTest {
         }
     }
 
+    @Test void typedNestAndJoinStoresUseTheOriginalManifestForEveryActualMapAndColdReload() throws Exception {
+        var positions = new ArrayList<OperatorPlacement>();
+        positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of(),OperatorMapCoordinates.NestMap.STATE,null));
+        positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of("$root"),OperatorMapCoordinates.NestMap.STATE,null));
+        positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of(),OperatorMapCoordinates.NestMap.PARKING,null));
+        positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of("ref"),OperatorMapCoordinates.NestMap.LOOKUP,"dimension"));
+        positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of("ref"),OperatorMapCoordinates.NestMap.REFERENCES,"dimension"));
+        for (var kind : OperatorPlacement.Resource.values()) if (kind != OperatorPlacement.Resource.NEST_STATE)
+            positions.add(OperatorMapCoordinates.join(SCOPE,"cache","joined",kind,"dimension"));
+        var bindings = positions.stream().map(place -> binding(place,1)).toList(); var manifest = new OperatorRunManifest(SCOPE.pipelineId(),"attempt-1",bindings);
+        var cold = new Cold(); var current = new AtomicReference<Object>("attempt-1"); var scope = new AtomicReference<>(SCOPE);
+        var member = Hazelcast.newHazelcastInstance(config(bindings));
+        try (var registry = OperatorMapBindings.bindTo(member,(binding,active) -> cold.guarded(binding,current,scope,active))) {
+            registry.install(bindings);
+            var traveling = io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).forStep(SCOPE.pipelineId(),"nested");
+            var bytes = new java.io.ByteArrayOutputStream();
+            try (var out = new java.io.ObjectOutputStream(bytes)) { out.writeObject(traveling); }
+            io.tapstate.runtime.engine.nest.NestBinding.NestStores restored;
+            try (var in = new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(bytes.toByteArray()))) { restored = (io.tapstate.runtime.engine.nest.NestBinding.NestStores)in.readObject(); }
+            var stores = restored.bind(member);
+            var root = new io.tapstate.runtime.engine.nest.NestVertex(List.of(),"logical-root","legacy-root",List.of("id"),List.of(),List.of());
+            var embedded = new io.tapstate.runtime.engine.nest.NestVertex(List.of("$root"),"logical-embed","legacy-embed",List.of("id"),List.of("parent"),List.of());
+            var lookup = new io.tapstate.runtime.engine.nest.NestLookup(List.of("ref"),"dimension","logical-lookup","legacy-lookup",List.of("id"),
+                    "orders",List.of("dimension_id"),List.of("id"),List.of(),0);
+            Object key = List.of("key");
+            stores.forAssembler(root).save(key,new io.tapstate.runtime.engine.nest.RootAssembly());
+            stores.forResolver(embedded).save(key,new io.tapstate.runtime.engine.nest.ResolverState());
+            assertThat(stores.forParking(root).load(key)).isNull();
+            stores.forLookup(lookup).save(key,Map.of("id",1)); stores.forReferences(lookup).save(key,Set.of("fact"));
+            for (var binding : bindings) if (binding.placement().resource() == OperatorPlacement.Resource.NEST_STATE) member.getMap(binding.mapName()).evictAll();
+            assertThat(stores.forAssembler(root).load(key)).isInstanceOf(io.tapstate.runtime.engine.nest.RootAssembly.class);
+            assertThat(stores.forResolver(embedded).load(key)).isInstanceOf(io.tapstate.runtime.engine.nest.ResolverState.class);
+            assertThat(stores.forLookup(lookup).load(key)).containsEntry("id",1); assertThat(stores.forReferences(lookup).load(key)).containsExactly("fact");
+            var joins = io.tapstate.runtime.engine.join.JoinStoresBinding.onTheCluster(manifest).bind(member,SCOPE.pipelineId(),"joined");
+            joins.putFact("f",Map.of("id",1)); joins.putDimensionRow("dimension","d",Map.of("id",2));
+            joins.indexAdd("dimension","d","f"); joins.putBatchesTakenIn("writer",3);
+            for (var binding : bindings) if (binding.placement().resource() != OperatorPlacement.Resource.NEST_STATE) member.getMap(binding.mapName()).evictAll();
+            assertThat(joins.fact("f")).containsEntry("id",1); assertThat(joins.dimensionRow("dimension","d")).containsEntry("id",2);
+            assertThat(joins.indexPage("dimension","d",0)).containsExactly("f"); assertThat(joins.batchesTakenIn("writer")).isEqualTo(3);
+            assertThat(member.getDistributedObjects().stream().map(com.hazelcast.core.DistributedObject::getName).toList())
+                    .containsAll(bindings.stream().map(OperatorMapBinding::mapName).toList()).doesNotContain("legacy-root","legacy-embed","legacy-lookup");
+            assertThatThrownBy(() -> io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).bind(member).forAssembler(root)).isInstanceOf(TapstateException.class);
+            for (var binding : bindings) member.getMap(binding.mapName()).destroy();
+        } finally { member.shutdown(); }
+    }
+
     private static void await(java.util.function.BooleanSupplier condition) throws InterruptedException {
         long deadline = System.nanoTime()+java.time.Duration.ofSeconds(15).toNanos();
         while (!condition.getAsBoolean()) {

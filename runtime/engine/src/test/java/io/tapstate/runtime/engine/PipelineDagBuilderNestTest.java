@@ -72,7 +72,9 @@ class PipelineDagBuilderNestTest {
         return Step.inline(id, FromClause.aliases(aliases), body, null);
     }
 
-    private static DAG buildWith(TransformBody.Nest body, String... aliasToSource) {
+    private static DAG buildWith(TransformBody.Nest body, String... aliasToSource) { return buildWith(body,bindings(),aliasToSource); }
+
+    private static DAG buildWith(TransformBody.Nest body,DagBindings bindings,String... aliasToSource) {
         Step step = nestStep("doc", body, aliasToSource);
         PipelineResource pipeline = new PipelineResource("p", null,
                 List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims"), SourceRef.bare("profiles")),
@@ -80,7 +82,7 @@ class PipelineDagBuilderNestTest {
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
-        return PipelineDagBuilder.build(pipeline, bindings());
+        return PipelineDagBuilder.build(pipeline, bindings);
     }
 
     @Test
@@ -169,6 +171,33 @@ class PipelineDagBuilderNestTest {
         assertThatThrownBy(() -> PipelineDagBuilder.build(pipeline, withoutNest))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("no nest binding");
+    }
+
+    @Test void aTypedNestSelectsItsExplicitStepAndComparesTheCompleteStructuralShape() {
+        var recorded = new java.util.concurrent.atomic.AtomicReference<java.util.Set<String>>(); var selections = new java.util.concurrent.atomic.AtomicInteger();
+        var manifest = new OperatorRunManifest("p","original",List.of());
+        var selecting = new NestBinding.NestStores() {
+            @Override public NestBinding.NestStores forStep(String pipeline,String step) {
+                assertThat(pipeline).isEqualTo("p"); assertThat(step).isEqualTo("doc"); selections.incrementAndGet();
+                return NestBinding.onMap(manifest).forStep(pipeline,step);
+            }
+            @Override public io.tapstate.runtime.engine.nest.NestStore<io.tapstate.runtime.engine.nest.ResolverState> forResolver(io.tapstate.runtime.engine.nest.NestVertex vertex) { throw new AssertionError("step selection was omitted"); }
+            @Override public io.tapstate.runtime.engine.nest.NestStore<io.tapstate.runtime.engine.nest.RootAssembly> forAssembler(io.tapstate.runtime.engine.nest.NestVertex vertex) { throw new AssertionError("step selection was omitted"); }
+            @Override public io.tapstate.runtime.engine.nest.NestStore<io.tapstate.runtime.engine.nest.ParkedSubtree> forParking(io.tapstate.runtime.engine.nest.NestVertex vertex) { throw new AssertionError("step selection was omitted"); }
+        };
+        var ledger = new io.tapstate.runtime.engine.nest.NestStateLedger() {
+            @Override public java.util.Set<String> recall(String pipeline,String step) { return java.util.Set.of(); }
+            @Override public void record(String pipeline,String step,java.util.Set<String> paths) { recorded.set(paths); }
+        };
+        var base = bindings();
+        var nest = new NestBinding(base.nest().tables(),selecting,(from,released) -> {},ReplayFloorFactory.NONE,ledger,
+                io.tapstate.runtime.engine.nest.NestSettings.defaults());
+        var customized = new DagBindings(base.sourceVertices(),base.transformPorts(),base.sinkWriters(),base.upstreams(),nest);
+        var dag = buildWith(tree(),customized,"customer","customers","policy","policies","claim","claims","profile","profiles");
+        assertThat(selections.get()).isOne();
+        assertThat(recorded.get()).containsExactlyInAnyOrder(OperatorMapCoordinates.path(List.of()),OperatorMapCoordinates.path(List.of("policies")),
+                OperatorMapCoordinates.path(List.of("policies","claims")),OperatorMapCoordinates.path(List.of("profile")));
+        assertThat(vertexNames(dag)).contains("nest:doc","nest:doc:policies");
     }
 
     // ---- doubles ----------------------------------------------------------------------

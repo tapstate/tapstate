@@ -410,12 +410,13 @@ public final class PipelineDagBuilder {
                     // named by the tree, so a job built first and refused afterwards would already have
                     // decided which entries it was about to read - and every one of them would be the
                     // wrong entry, silently, with nothing downstream able to tell.
-                    NestStateLedger.reconcile(bindings.nest().ledger(), pipeline.id(), step.id(),
-                            topology.statePaths());
+                    var nestBinding = bindings.nest().forStep(pipeline.id(),step.id());
+                    NestStateLedger.reconcile(nestBinding.ledger(), pipeline.id(), step.id(),
+                            nestBinding.stores().hasTypedPlacements() ? topology.stateIdentityPaths() : topology.statePaths());
                     byKey.put(step.id(), NestDag.attach(dag, topology,
                             step.id(), nest.root().from(), step.id(),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
-                            bindings.nest(),
+                            nestBinding,
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
