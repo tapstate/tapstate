@@ -118,6 +118,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
     }
 
+    public io.tapstate.spi.store.ClusterMembershipStore clusterMembership(CacheBusinessScope expected) {
+        return new MongoCacheClusterMembershipStore(client, database, expected, null, this::businessActive);
+    }
+    public io.tapstate.spi.store.ClusterMembershipStore clusterMembership(CacheBusinessScope expected,
+            io.tapstate.spi.store.WorkloadClaimFence originalNode, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        return new MongoCacheClusterMembershipStore(client, database, expected, Objects.requireNonNull(originalNode, "originalNode"),
+                () -> { businessActive(); requireActive.run(); });
+    }
+
     public io.tapstate.spi.store.SchemaStore schemas(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive));
     }

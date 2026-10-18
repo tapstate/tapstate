@@ -230,7 +230,8 @@ public enum SystemCollections {
     CACHE_DERIVED_SCHEMAS("derived_schemas", Database.CACHE, MongoCacheDerivedSchemaStore.class, Strategy.MIGRATED, 1),
     CACHE_PIPELINE_RATE_HISTORY("pipeline_rate_history", Database.CACHE, MongoCacheRateHistoryStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
-            new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false));
+            new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false)),
+    CACHE_CLUSTER_MEMBERSHIP("cluster_membership", Database.CACHE, MongoCacheClusterMembershipStore.class, Strategy.OWNED_ELSEWHERE, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

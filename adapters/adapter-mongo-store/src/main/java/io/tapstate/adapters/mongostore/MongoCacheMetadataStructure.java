@@ -65,7 +65,7 @@ final class MongoCacheMetadataStructure {
     void verify() { verify(TABLES); }
 
     void verifyFacet(SystemCollections table) {
-        if (!TABLES.contains(Objects.requireNonNull(table, "table"))) throw new IllegalArgumentException("not a metadata resource");
+        if (Objects.requireNonNull(table, "table").database() != SystemCollections.Database.CACHE) throw new IllegalArgumentException("not a CACHE resource");
         verify(List.of(table));
     }
 
