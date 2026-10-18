@@ -142,7 +142,7 @@ final class ConvergenceDriver {
                 if (scoped == null) {
                     permit = actuation.permit(pipelineId);
                 } else {
-                    var snapshot = scoped.intents().load(pipelineId);
+                    var snapshot = scoped.intents().loadForActuation(pipelineId);
                     if (snapshot.isEmpty() || snapshot.get().deleted()) continue;
                     if (!pipelineId.equals(snapshot.get().scope().pipelineId())) {
                         throw new TapstateException(

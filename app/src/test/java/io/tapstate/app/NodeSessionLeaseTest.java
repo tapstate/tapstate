@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -15,6 +16,8 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -127,6 +130,34 @@ class NodeSessionLeaseTest {
         } finally {
             session.close();
         }
+    }
+
+    @Test
+    void aPreparationCapturesOnlyAnActiveOriginalNodeFenceAndCannotRefreshItAfterLoss() throws Exception {
+        var now = new AtomicLong(); var stopped = new CountDownLatch(1);
+        var lease = new NodeSessionLease(new RecordingStore(true), CLAIM, 0, Duration.ofSeconds(30),
+                Duration.ofHours(1), stopped::countDown, now::get);
+        try {
+            assertThat(lease.currentFence()).contains(WorkloadClaimFence.from(CLAIM));
+            now.set(Duration.ofSeconds(30).toNanos());
+            assertThat(lease.currentFence()).isEmpty();
+            assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
+            now.set(0);
+            assertThat(lease.currentFence()).isEmpty();
+        } finally { lease.close(); }
+        assertThat(NodeSessionLease.inactive().currentFence()).isEmpty();
+    }
+
+    @Test
+    void aNodeFenceIsNotReturnedIfItsLocalDeadlineExpiresDuringCapture() throws Exception {
+        var checks = new AtomicInteger(); var stopped = new CountDownLatch(1);
+        var lease = new NodeSessionLease(new RecordingStore(true), CLAIM, 0, Duration.ofSeconds(30),
+                Duration.ofHours(1), stopped::countDown,
+                () -> checks.incrementAndGet() == 1 ? 0L : Duration.ofSeconds(30).toNanos());
+        try {
+            assertThat(lease.currentFence()).isEmpty();
+            assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
+        } finally { lease.close(); }
     }
 
     /** A store whose renewals hang until {@link #answer} lets them go, as a frozen store's do. */

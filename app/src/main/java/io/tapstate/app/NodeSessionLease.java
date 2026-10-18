@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -115,6 +116,13 @@ final class NodeSessionLease implements AutoCloseable {
         } catch (RuntimeException unavailable) {
             lose("the coordination store could not renew the node session", unavailable);
         }
+    }
+
+    /** Fixed input for a new controlled operation; CACHE still proves this exact live claim by a real write. */
+    Optional<WorkloadClaimFence> currentFence() {
+        if (!active()) return Optional.empty();
+        WorkloadClaimFence captured = WorkloadClaimFence.from(current.get());
+        return active() ? Optional.of(captured) : Optional.empty();
     }
 
     /** A non-blocking local predicate; an observed expiry is irreversible even if shutdown blocks. */

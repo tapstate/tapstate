@@ -233,7 +233,8 @@ class ScopedConvergenceDriverTest {
         private PipelineIntentSnapshot snapshot = snapshot(FIRST);
         private RuntimeException loadFailure;
         private int loads;
-        @Override public Optional<PipelineIntentSnapshot> load(String id) { loads++; if (loadFailure != null) throw loadFailure; return Optional.ofNullable(snapshot); }
+        @Override public Optional<PipelineIntentSnapshot> load(String id) { throw new AssertionError("authoring load does not prove preparation readiness"); }
+        @Override public Optional<PipelineIntentSnapshot> loadForActuation(String id) { loads++; if (loadFailure != null) throw loadFailure; return Optional.ofNullable(snapshot); }
         @Override public List<String> pipelineIds() { return List.of("orders"); }
         @Override public PipelineIntentStore guardedBy(Runnable active) { throw new AssertionError("read-only driver"); }
         @Override public boolean compareAndSet(PipelineIntentScope scope, long revision, DesiredState desired) { throw new AssertionError("read-only driver"); }
