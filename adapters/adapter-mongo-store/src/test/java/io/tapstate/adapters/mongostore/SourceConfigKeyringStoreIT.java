@@ -198,31 +198,72 @@ class SourceConfigKeyringStoreIT {
     }
 
     @Test
-    void concurrentRotationPreparationKeepsOneCandidateAndClearsBothLocalCopies() {
+    void concurrentRotationPreparationKeepsOneCandidateAndClearsBothLocalCopies() throws Exception {
         MongoDatabase database = freshDatabase("keyring_prepare_race");
         new SourceConfigKeyringStore(database).loadOrCreateCipher();
         RecordingRandom firstRandom = new RecordingRandom((byte) 3);
         RecordingRandom secondRandom = new RecordingRandom((byte) 4);
-        SourceConfigKeyringStore first = new SourceConfigKeyringStore(database, firstRandom);
-        SourceConfigKeyringStore second = new SourceConfigKeyringStore(database, secondRandom);
-        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch initialReads = new CountDownLatch(2);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Throwable> hookFailure = new AtomicReference<>();
+        CommandListener holdInitialReads = new CommandListener() {
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                if (!"find".equals(event.getCommandName())) return;
+                try {
+                    var cursor = event.getResponse().getDocument("cursor", null);
+                    if (cursor == null || !cursor.containsKey("firstBatch")) return;
+                    var rows = cursor.getArray("firstBatch");
+                    if (rows.size() != 1 || !rows.get(0).isDocument()) return;
+                    var row = rows.get(0).asDocument();
+                    if (!"source-config-keyring".equals(row.getString("_id").getValue())
+                            || row.getNumber("epoch").longValue() != 1
+                            || row.containsKey("preparedKeyId")) return;
+                    // Both callers must hold the unprepared snapshot before either can update it.
+                    initialReads.countDown();
+                    if (!release.await(10, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Keyring preparation reads were not released");
+                    }
+                } catch (Throwable failure) {
+                    hookFailure.compareAndSet(null, failure);
+                    if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl(database.getName())))
+                .addCommandListener(holdInitialReads).build();
+        try (MongoClient observed = MongoClients.create(settings)) {
+            MongoDatabase observedDatabase = observed.getDatabase(database.getName());
+            SourceConfigKeyringStore first = new SourceConfigKeyringStore(observedDatabase, firstRandom);
+            SourceConfigKeyringStore second = new SourceConfigKeyringStore(observedDatabase, secondRandom);
+            CountDownLatch start = new CountDownLatch(1);
+            CompletableFuture<SourceConfigKeyringStore.Loaded> firstPrepare =
+                    CompletableFuture.supplyAsync(() -> prepare(first, start));
+            CompletableFuture<SourceConfigKeyringStore.Loaded> secondPrepare =
+                    CompletableFuture.supplyAsync(() -> prepare(second, start));
+            try {
+                start.countDown();
+                assertThat(initialReads.await(5, TimeUnit.SECONDS))
+                        .as("both callers read the unprepared keyring before either update").isTrue();
+                release.countDown();
+                SourceConfigKeyringStore.Loaded firstResult = firstPrepare.get(10, TimeUnit.SECONDS);
+                SourceConfigKeyringStore.Loaded secondResult = secondPrepare.get(10, TimeUnit.SECONDS);
 
-        CompletableFuture<SourceConfigKeyringStore.Loaded> firstPrepare =
-                CompletableFuture.supplyAsync(() -> prepare(first, start));
-        CompletableFuture<SourceConfigKeyringStore.Loaded> secondPrepare =
-                CompletableFuture.supplyAsync(() -> prepare(second, start));
-        start.countDown();
-        SourceConfigKeyringStore.Loaded firstResult = firstPrepare.join();
-        SourceConfigKeyringStore.Loaded secondResult = secondPrepare.join();
-
-        assertThat(firstResult.epoch()).isEqualTo(2);
-        assertThat(secondResult.epoch()).isEqualTo(2);
-        assertThat(firstResult.preparedKeyId()).isEqualTo(secondResult.preparedKeyId());
-        assertThat(firstRandom.generated()).containsOnly((byte) 0);
-        assertThat(secondRandom.generated()).containsOnly((byte) 0);
-        assertThat(SystemCollections.SYSTEM_META.on(database)
-                .find(new Document("_id", "source-config-keyring")).first()
-                .getList("keys", Document.class)).hasSize(2);
+                assertThat(hookFailure.get()).as("the controlled preparation reads completed").isNull();
+                assertThat(firstResult.epoch()).isEqualTo(2);
+                assertThat(secondResult.epoch()).isEqualTo(2);
+                assertThat(firstResult.preparedKeyId()).isEqualTo(secondResult.preparedKeyId());
+                assertThat(firstRandom.generated()).containsOnly((byte) 0);
+                assertThat(secondRandom.generated()).containsOnly((byte) 0);
+                assertThat(SystemCollections.SYSTEM_META.on(database)
+                        .find(new Document("_id", "source-config-keyring")).first()
+                        .getList("keys", Document.class)).hasSize(2);
+            } finally {
+                release.countDown();
+                CompletableFuture.allOf(firstPrepare.handle((result, failure) -> null),
+                        secondPrepare.handle((result, failure) -> null)).get(10, TimeUnit.SECONDS);
+            }
+        }
     }
 
     @Test
