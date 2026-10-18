@@ -60,6 +60,22 @@ class EngineRunHandleTest {
         assertThat((Object) fixture.submitted.get().getArgument(Engine.RUN_IDENTITY_ARGUMENT)).isEqualTo("run-a");
     }
 
+    @Test void aSubmissionRaceWithTheSameIdentityStillRefusesMissingOrDifferentOriginalPlacements() {
+        var place = new io.tapstate.spi.store.OperatorPlacement(new io.tapstate.spi.store.PipelineIntentScope("cluster",1,"cache","p",1),
+                "cache",io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_FACTS,"join","root","facts");
+        var original = new OperatorRunManifest("p","run-a",java.util.List.of(new OperatorMapBinding(place,"run-a","1".repeat(64))));
+        for (boolean missing : new boolean[]{true,false}) {
+            var replacement = new FakeJob(2,"run-a",JobStatus.RUNNING); var fixture = new Fixture(null);
+            if (!missing) replacement.job.getConfig().setArgument(Engine.OPERATOR_MANIFEST_ARGUMENT,new OperatorRunManifest("p","run-a",java.util.List.of()));
+            fixture.onSubmit = () -> { fixture.named.set(replacement); return replacement.job; };
+            assertThatThrownBy(() -> fixture.engine.submitRun("p",new DAG(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),original))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            assertThat(fixture.submits.get()).isOne(); assertThat(replacement.cancels.get()).isZero();
+            assertThat((Object)fixture.submitted.get().getArgument(Engine.OPERATOR_MANIFEST_ARGUMENT)).isEqualTo(original);
+        }
+    }
+
     @Test void waitingForAnEndingJobUsesTheObjectReadBeforeItsNameWasReused() {
         var first = new FakeJob(1, "run-a", JobStatus.COMPLETING); var second = new FakeJob(2, "run-b", JobStatus.RUNNING);
         var fixture = new Fixture(first); first.future.complete(null); second.future.complete(null);

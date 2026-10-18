@@ -66,6 +66,7 @@ public final class Engine {
 
     /** Reserved job metadata carrying the submitting caller's immutable complete execution identity. */
     public static final String RUN_IDENTITY_ARGUMENT = "tapstate.execution-identity";
+    public static final String OPERATOR_MANIFEST_ARGUMENT = "tapstate.operator-manifest";
 
     private final HazelcastInstance member;
 
@@ -133,16 +134,50 @@ public final class Engine {
     /** Submits under one immutable execution identity, refusing an active same-name job from another run. */
     public Run submitRun(String pipelineId, DAG dag, Map<String, String> stateDatabases, NestSettings settings,
             java.io.Serializable originalIdentity) {
+        return submitRun(pipelineId, dag, stateDatabases, settings, originalIdentity, null);
+    }
+
+    /** New operator-state runs carry their original complete placement set in immutable job metadata. */
+    public Run submitRun(String pipelineId, DAG dag, Map<String, String> stateDatabases, NestSettings settings,
+            OperatorRunManifest original) {
+        Objects.requireNonNull(original, "original");
+        if (!original.pipelineId().equals(pipelineId)) throw new IllegalArgumentException("operator manifest belongs to another pipeline");
+        return submitRun(pipelineId, dag, stateDatabases, settings, original.executionIdentity(), original);
+    }
+
+    private Run submitRun(String pipelineId, DAG dag, Map<String, String> stateDatabases, NestSettings settings,
+            java.io.Serializable originalIdentity, OperatorRunManifest manifest) {
         Objects.requireNonNull(originalIdentity, "originalIdentity");
         refuseIfLost(pipelineId);
         Job previous = jobNamed(pipelineId);
         if (previous != null && !previous.getStatus().isTerminal() && previous.getStatus() != JobStatus.COMPLETING
-                && !originalIdentity.equals(previous.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))) throw runRefused(pipelineId);
+                && (!originalIdentity.equals(previous.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
+                || !Objects.equals(manifest, previous.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT)))) throw runRefused(pipelineId);
         configureNestState(stateDatabases, settings);
-        Job submitted = submitJob(pipelineId, dag, originalIdentity);
-        if (!originalIdentity.equals(submitted.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))) throw runRefused(pipelineId);
+        Job submitted = submitJob(pipelineId, dag, originalIdentity, manifest);
+        if (!originalIdentity.equals(submitted.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
+                || !Objects.equals(manifest, submitted.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
         JobFailureRegistry.of(member).attach(pipelineId, submitted.getId(), originalIdentity);
         return new Run(pipelineId, originalIdentity, submitted);
+    }
+
+    /** Application bootstrap calls this after member startup; MapStore initialization never queries Jet. */
+    public List<OperatorRunManifest> operatorManifests() {
+        var originals = new ArrayList<OperatorRunManifest>();
+        for (Job job : member.getJet().getJobs()) {
+            if (job.getStatus().isTerminal() || job.getStatus() == JobStatus.COMPLETING) continue;
+            JobConfig config = job.getConfig();
+            if (config.getArgument(RUN_IDENTITY_ARGUMENT) == null && config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null) continue;
+            originals.add(requireOperatorManifest(job, config));
+        }
+        return List.copyOf(originals);
+    }
+
+    private static OperatorRunManifest requireOperatorManifest(Job job, JobConfig config) {
+        Object value = config.getArgument(OPERATOR_MANIFEST_ARGUMENT);
+        if (!(value instanceof OperatorRunManifest manifest) || !manifest.pipelineId().equals(job.getName())
+                || !manifest.executionIdentity().equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) throw runRefused(String.valueOf(job.getName()));
+        return manifest;
     }
 
     /** The returned handle never resolves the Pipeline name again, even after another run replaces it. */
@@ -162,6 +197,11 @@ public final class Engine {
             this.pipelineId = pipelineId; this.identity = identity; this.job = job;
         }
         public long jobId() { return job.getId(); }
+        public OperatorRunManifest operatorManifest() {
+            var original = requireOperatorManifest(job, job.getConfig());
+            if (!identity.equals(original.executionIdentity())) throw runRefused(pipelineId);
+            return original;
+        }
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
         public void suspend() { requireLive(); job.suspend(); }
         public void resume() { requireLive(); job.resume(); }
@@ -230,9 +270,9 @@ public final class Engine {
      * no engine-side re-planning of a changed cluster, and a previous run that has to be over first -- is
      * carried here, so an overload cannot be added that quietly starts a run without any of it.
      */
-    private void submitJob(String pipelineId, DAG dag) { submitJob(pipelineId, dag, null); }
+    private void submitJob(String pipelineId, DAG dag) { submitJob(pipelineId, dag, null, null); }
 
-    private Job submitJob(String pipelineId, DAG dag, java.io.Serializable originalIdentity) {
+    private Job submitJob(String pipelineId, DAG dag, java.io.Serializable originalIdentity, OperatorRunManifest manifest) {
         if (originalIdentity == null) JobFailureRegistry.of(member).clear(pipelineId);
         awaitPreviousRunOver(pipelineId);
         JobConfig config = new JobConfig()
@@ -247,6 +287,7 @@ public final class Engine {
                 // whoever holds the pipeline.
                 .setAutoScaling(false);
         if (originalIdentity != null) config.setArgument(RUN_IDENTITY_ARGUMENT, originalIdentity);
+        if (manifest != null) config.setArgument(OPERATOR_MANIFEST_ARGUMENT, manifest);
         return member.getJet().newJobIfAbsent(dag, config);
     }
 

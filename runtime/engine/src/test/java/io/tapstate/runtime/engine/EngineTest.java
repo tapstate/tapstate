@@ -393,6 +393,35 @@ class EngineTest {
         run.cancel(); assertThat(registry.existing("scoped-failed", run.jobId(), identity).get()).isEmpty();
     }
 
+    @Test
+    void originalOperatorManifestsSurviveRealJobSerializationAndCannotBeReplacedOnAnActiveRun() {
+        var engine = new Engine(member); var identity = new TestRunIdentity("cache-a",1,"boot-a",1,1);
+        var scope = new io.tapstate.spi.store.PipelineIntentScope("cluster",1,"cache-a","operator-run",1);
+        var place = new io.tapstate.spi.store.OperatorPlacement(scope,"cache",io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_FACTS,"join","root","facts");
+        var original = new OperatorRunManifest("operator-run",identity,List.of(new OperatorMapBinding(place,identity,"1".repeat(64))));
+        var run = engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),original);
+        awaitStatus(member.getJet().getJob("operator-run"),JobStatus.RUNNING);
+        assertThat(run.operatorManifest()).isEqualTo(original); assertThat(engine.operatorManifests()).containsExactly(original);
+        assertThat(engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),original).jobId()).isEqualTo(run.jobId());
+        var changed = new OperatorRunManifest("operator-run",identity,List.of());
+        assertThatThrownBy(() -> engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),changed))
+                .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThatThrownBy(() -> engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),identity)).isInstanceOf(TapstateException.class);
+        assertThat(run.operatorManifest()).isEqualTo(original); assertThat(run.isCarryingAJob()).isTrue();
+        run.cancel(); assertThat(run.awaitTerminal(Duration.ofSeconds(10))).isTrue(); assertThat(engine.operatorManifests()).isEmpty();
+    }
+
+    @Test
+    void aMissingManifestOnAScopedJobCannotBeReconstructedFromItsNameOrIdentity() {
+        var engine = new Engine(member); var identity = new TestRunIdentity("cache-a",1,"boot-a",1,1);
+        var run = engine.submitRun("missing-manifest",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),identity);
+        awaitStatus(member.getJet().getJob("missing-manifest"),JobStatus.RUNNING);
+        assertThatThrownBy(run::operatorManifest).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThatThrownBy(engine::operatorManifests).isInstanceOf(TapstateException.class);
+        run.cancel(); assertThat(run.awaitTerminal(Duration.ofSeconds(10))).isTrue(); assertThat(engine.operatorManifests()).isEmpty();
+    }
+
     private record TestRunIdentity(String incarnation, long stateGeneration, String boot, long claim, long execution) implements java.io.Serializable {}
 
     @Test
