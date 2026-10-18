@@ -28,6 +28,7 @@ code and is read by running it.
 
 | Features | |
 |---|---|
+| [Filter](filter/) | Keep matching rows in a live view, including removals and source before-image requirements. |
 | [Join](join/) | SQL subset, dimension-key uniqueness, output keys, and usage requirements. |
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
 | [Unwind](unwind/) | Expand array elements into individually keyed rows and keep them current. |
