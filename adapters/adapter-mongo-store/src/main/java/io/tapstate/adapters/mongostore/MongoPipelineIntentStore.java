@@ -71,6 +71,25 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         return transaction(session -> Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first())
                 .map(row -> decodeCurrent(session, row)));
     }
+    @Override public Optional<PipelineIntentSnapshot> loadForActuation(String pipelineId) {
+        requireId(pipelineId);
+        return transaction(session -> {
+            Document row = intents.find(session, new Document("_id", pipelineId)).first();
+            if (row == null) return Optional.empty();
+            var snapshot = decodeCurrent(session, row);
+            if (snapshot.deleted()) return Optional.empty();
+            Document mapping = mappings.find(session, new Document("_id", pipelineId)).first();
+            var identity = MongoPipelineStateMappings.decode(pipelineId, mapping);
+            if (identity.phase() != PipelineStateMapping.Phase.ACTIVE) return Optional.empty();
+            if (identity.stateGeneration() != snapshot.scope().stateGeneration()) throw fenced();
+            if (pipelines.find(session, new Document("_id", pipelineId)).first() == null) throw fenced();
+            var prepared = MongoPipelinePreparationFacts.decode(pipelineId, mapping, clusterId);
+            if (prepared.phase() != io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE) return Optional.empty();
+            if (!snapshot.scope().equals(prepared.scope())) throw fenced();
+            return Optional.of(snapshot);
+        });
+    }
+
     @Override public List<String> pipelineIds() {
         return transaction(session -> intents.find(session, new Document("deleted", new Document("$ne", true)))
                 .projection(new Document("_id", 1)).map(row -> {
@@ -170,9 +189,12 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
     private <T> T transaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
-            try (var session = client.startSession()) {
-                return session.withTransaction(() -> { requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
-            }
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    return session.withTransaction(() -> { requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
         });
     }
     private static void requireId(String id) { if (id == null || id.isBlank()) throw new IllegalArgumentException("Pipeline id must not be blank"); }

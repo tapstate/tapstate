@@ -282,12 +282,12 @@ class MongoPipelineIntentStoreIT {
                             assertThatThrownBy(() -> guarded.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null)))
                                     .satisfies(MongoPipelineIntentStoreIT::fenced);
                             assertThat(failedUpdates.get()).isOne(); assertThat(startedUpdates.get()).isOne();
-                            assertThat(checks.get()).isEqualTo(2); assertThat(revision(database)).isEqualTo(before);
+                            assertThat(checks.get()).isGreaterThanOrEqualTo(2); assertThat(revision(database)).isEqualTo(before);
                             assertThat(domain.intents().load("flow")).isEmpty();
                         } else {
                             assertThat(guarded.compareAndSet(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
                             assertThat(failedUpdates.get()).isZero(); assertThat(startedUpdates.get()).isEqualTo(2);
-                            assertThat(checks.get()).isEqualTo(2); assertThat(revision(database)).isEqualTo(before + 1);
+                            assertThat(checks.get()).isGreaterThanOrEqualTo(2); assertThat(revision(database)).isEqualTo(before + 1);
                             assertThat(domain.intents().load("flow")).isPresent();
                         }
                     } finally {

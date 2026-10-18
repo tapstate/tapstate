@@ -112,6 +112,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
     }
 
+    /** Controlled first preparation retains this exact cache domain and caller lifecycle. */
+    public io.tapstate.spi.store.PipelineCachePreparations pipelinePreparations(CacheBusinessScope expected, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); });
+    }
+
     /** A fixed read view refuses missing checkpoints rather than interpreting them as a new Pipeline. */
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope) {
         return new MongoCachePipelineStateStore(pipelineAccess(scope, null, () -> {}));

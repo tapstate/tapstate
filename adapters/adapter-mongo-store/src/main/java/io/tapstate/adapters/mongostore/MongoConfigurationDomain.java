@@ -45,6 +45,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoFirstAdminStore firstAdmin;
     private final MongoConfigurationDraftStore drafts;
     private final String clusterId;
+    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
     MongoConfigurationDomain(MongoConnection connection, String clusterId) {
         this.connection = connection;
@@ -127,12 +128,18 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return pipelineStates;
     }
 
+    public io.tapstate.spi.store.PipelineStatePreparations preparations() {
+        requireOpen();
+        return new MongoPipelineStatePreparations(connection.client(), connection.database(), clusterId, bindings, this::requireOpen);
+    }
+
     public StorageBindingStore bindings() {
         return bindings;
     }
 
     public io.tapstate.spi.store.PipelineIntentStore intents() {
-        return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings);
+        requireOpen();
+        return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings).guardedBy(this::requireOpen);
     }
 
     public PipelineDraftStore drafts() { return drafts; }
@@ -153,7 +160,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     @Override
     public void close() {
+        closed.set(true);
         connection.close();
+    }
+
+    private void requireOpen() {
+        if (closed.get()) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
     }
 
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {

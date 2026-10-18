@@ -1125,3 +1125,7 @@ io.required-dead-letter-conflict:
 connector.snapshot-preparation-unavailable:
   message: "Snapshot preparation for connector `{connector}` could not complete: {reason}."
   solution: "Keep the saved recovery state and use a capture runtime that can durably accept the session metadata and stream position before reading rows."
+
+io.pipeline-state-rebuild-required:
+  message: "Pipeline {pipeline} cannot prove its original checkpoint preparation and claim history."
+  solution: "Inspect the original operation or explicitly confirm a full rebuild. Do not recreate missing claims, epochs or preparation authority."

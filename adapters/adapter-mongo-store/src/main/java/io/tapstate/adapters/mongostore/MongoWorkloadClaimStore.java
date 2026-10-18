@@ -105,6 +105,17 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return WorkloadClaimAttempt.refused(current);
     }
 
+    /** Existing-only continuation for a retained preparation; this method has no absent-key branch. */
+    WorkloadClaimAttempt acquireExisting(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
+        validate(key, owner, topologyRevision, ttl);
+        var existing = read(key).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null));
+        Document eligible = new Document("_id", id(key)).append("$or", List.of(ownerFilter(owner),
+                new Document("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")))));
+        Document updated = findOneAndUpdate(eligible, acquirePipeline(key, owner, topologyRevision, ttl), false);
+        return updated == null ? WorkloadClaimAttempt.refused(existing.claim()) : WorkloadClaimAttempt.acquired(read(updated));
+    }
+
     @Override
     public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         Objects.requireNonNull(expected, "expected");

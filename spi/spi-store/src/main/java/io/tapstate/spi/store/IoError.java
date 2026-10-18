@@ -84,6 +84,9 @@ public enum IoError implements TapstateErrorCode {
     /** A lifecycle intent no longer owns its captured storage binding or stable Pipeline state generation. */
     PIPELINE_INTENT_FENCED("io.pipeline-intent-fenced", Set.of()),
 
+    /** Issued first-state authority has incomplete or inconsistent CACHE history; no counters may be recreated. */
+    PIPELINE_STATE_REBUILD_REQUIRED("io.pipeline-state-rebuild-required", Set.of("pipeline")),
+
     /** The captured business incarnation is unavailable or no longer current. */
     CACHE_BUSINESS_FENCED("io.cache-business-fenced", Set.of()),
 

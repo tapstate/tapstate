@@ -12,6 +12,15 @@ public interface PipelineIntentStore {
     /** Includes a deletion marker so an earlier writer cannot reuse revision zero after removal. */
     Optional<PipelineIntentSnapshot> load(String pipelineId);
 
+    /**
+     * The runtime-only read also requires this scope's completed CONFIG preparation. Unsupported
+     * implementations refuse rather than using the ordinary authoring read as authorization.
+     */
+    default Optional<PipelineIntentSnapshot> loadForActuation(String pipelineId) {
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, java.util.Map.of(), null);
+    }
+
+
     /** Expected zero means never written; a refusal leaves the latest value and all versions unchanged. */
     boolean compareAndSet(PipelineIntentScope scope, long expectedIntentRevision, DesiredState desired);
 

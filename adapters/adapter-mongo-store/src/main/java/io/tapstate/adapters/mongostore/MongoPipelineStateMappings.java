@@ -53,7 +53,7 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         requireNoRetainedIdentity(session, pipelineId);
         mappings.insertOne(session, new Document("_id", pipelineId).append("stateGeneration", 1L)
                 .append("phase", PipelineStateMapping.Phase.ACTIVE.name()).append("operationId", null)
-                .append("noteWriteFence", 0L));
+                .append("noteWriteFence", 0L).append("cachePreparation", new Document("phase", "UNASSIGNED")));
     }
 
     void requireNoRetainedIdentity(ClientSession session, String resourceId) {
