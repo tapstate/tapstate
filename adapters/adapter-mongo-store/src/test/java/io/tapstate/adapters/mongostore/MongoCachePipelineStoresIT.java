@@ -236,7 +236,8 @@ class MongoCachePipelineStoresIT {
     @Test void missingCollectionsAndTtlIndexesAreNotRepairedByNormalReads() {
         withFixture(f -> {
             SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).drop();
-            assertCode(() -> f.domain().pipelineStates(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.domain().pipelineStates(SCOPE).read("orders")).isPresent();
+            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
             f.database().createCollection("pipeline_observation");
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).createIndex(new Document("touchMillis", 1),
@@ -331,6 +332,18 @@ class MongoCachePipelineStoresIT {
             var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
             writer.save(expected);
             assertThat(writer.read("orders")).contains(expected);
+        });
+    }
+
+    @Test void losingOnlyTheProjectionCollectionDoesNotDisableCheckpointAccess() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).drop();
+            assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> states.read("orders")))
+                    .as("a derived projection is not a prerequisite of the retained checkpoint").isNull();
+            assertThat(states.compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
     }
 

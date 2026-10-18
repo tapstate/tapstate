@@ -104,7 +104,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                             var store = raw.inStrictSession(session);
                             if (pipeline != null) {
                                 var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
-                                access.verifyStructures();
+                                access.verifyStateStructure();
                                 var current = access.state(session);
                                 if (current.getLong("runtimeWriteFence") > 0 && store.read(new WorkloadClaimKey(
                                         pipeline.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, pipeline.pipelineId())).isEmpty())

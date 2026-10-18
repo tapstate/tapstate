@@ -459,6 +459,18 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @Test void pipelineAdmissionDoesNotDependOnTheRebuildableObservationCollection() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).drop();
+            var claim = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL);
+            assertThat(claim.acquired()).isTrue();
+            assertThat(f.domain().pipelineStates(PIPELINE).read("orders")).isPresent();
+            assertThatThrownBy(() -> f.domain().pipelineObservations(PIPELINE).read("orders"))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
+        });
+    }
+
     private static Document header(PipelineIntentScope scope) {
         return new Document("clusterId", scope.clusterId()).append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())
                 .append("pipelineId", scope.pipelineId()).append("stateGeneration", scope.stateGeneration());

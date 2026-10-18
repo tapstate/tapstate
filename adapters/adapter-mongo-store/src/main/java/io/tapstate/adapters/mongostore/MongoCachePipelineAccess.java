@@ -39,7 +39,11 @@ final class MongoCachePipelineAccess {
                 || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))) throw fenced();
     }
 
-    <T> T transaction(Function<ClientSession, T> action) {
+    <T> T transaction(Function<ClientSession, T> action) { return transaction(false, action); }
+
+    <T> T observationTransaction(Function<ClientSession, T> action) { return transaction(true, action); }
+
+    private <T> T transaction(boolean observation, Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -48,7 +52,7 @@ final class MongoCachePipelineAccess {
                         requireActive.run();
                         new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
                                 .requireAdmissionState(session);
-                        verifyStructures();
+                        if (observation) verifyStructures(); else verifyStateStructure();
                         T result = action.apply(session);
                         requireActive.run();
                         return result;
@@ -103,17 +107,21 @@ final class MongoCachePipelineAccess {
     }
 
     void verifyStructures() {
-        for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION)) {
-            var found = database.listCollections().filter(new Document("name", table.collectionName())).first();
-            if (found == null || !"collection".equals(found.get("type"))) throw unreadable("structure");
-            var options = found.get("options", Document.class);
-            if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("structure");
-            var indexes = table.on(database).listIndexes().into(new ArrayList<>());
-            if (indexes.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadable("index");
-            var id = indexes.stream().filter(index -> "_id_".equals(index.get("name"))).findFirst().orElse(null);
-            if (id == null || !new Document("_id", 1).equals(id.get("key")) || Boolean.TRUE.equals(id.get("hidden"))
-                    || Boolean.TRUE.equals(id.get("sparse")) || id.containsKey("partialFilterExpression")) throw unreadable("index");
-        }
+        verifyStateStructure(); verifyStructure(SystemCollections.CACHE_PIPELINE_OBSERVATION);
+    }
+
+    void verifyStateStructure() { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE); }
+
+    private void verifyStructure(SystemCollections table) {
+        var found = database.listCollections().filter(new Document("name", table.collectionName())).first();
+        if (found == null || !"collection".equals(found.get("type"))) throw unreadable("structure");
+        var options = found.get("options", Document.class);
+        if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("structure");
+        var indexes = table.on(database).listIndexes().into(new ArrayList<>());
+        if (indexes.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadable("index");
+        var id = indexes.stream().filter(index -> "_id_".equals(index.get("name"))).findFirst().orElse(null);
+        if (id == null || !new Document("_id", 1).equals(id.get("key")) || Boolean.TRUE.equals(id.get("hidden"))
+                || Boolean.TRUE.equals(id.get("sparse")) || id.containsKey("partialFilterExpression")) throw unreadable("index");
     }
 
     static TapstateException fenced() { return MongoCacheBusinessIdentity.businessFenced(); }

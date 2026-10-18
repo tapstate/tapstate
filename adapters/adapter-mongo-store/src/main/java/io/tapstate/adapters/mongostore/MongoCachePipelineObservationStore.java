@@ -15,7 +15,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
 
     @Override public Optional<Observation> read(String pipelineId) {
         access.requirePipeline(pipelineId);
-        return access.transaction(session -> {
+        return access.observationTransaction(session -> {
             access.state(session);
             Document current = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database).find(session, new Document("_id", pipelineId)).first();
             if (current == null) return Optional.empty();
@@ -35,7 +35,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     @Override public void save(Observation observation) {
         access.requirePipeline(observation.pipelineId());
         Document captured = MongoObservationStore.toDocument(observation);
-        access.transaction(session -> {
+        access.observationTransaction(session -> {
             Document state = access.state(session);
             access.proveClaim(session);
             var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database);
