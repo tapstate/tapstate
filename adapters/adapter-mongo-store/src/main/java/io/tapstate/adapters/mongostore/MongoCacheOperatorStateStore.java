@@ -19,6 +19,7 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
     private static final int BATCH_KEYS = 256;
     private static final int BATCH_BYTES = 4 * 1024 * 1024;
     private final MongoCachePipelineAccess access;
+    private final com.mongodb.client.MongoDatabase target;
     private final OperatorPlacement placement;
     private final SystemCollections table;
     private final Document address;
@@ -27,7 +28,8 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     MongoCacheOperatorStateStore(MongoCachePipelineAccess access, OperatorPlacement placement) {
         this.access = Objects.requireNonNull(access, "access"); this.placement = Objects.requireNonNull(placement, "placement");
-        if (!access.scope.equals(placement.scope()) || !access.database.getName().equals(placement.database())) throw MongoCachePipelineAccess.fenced();
+        if (!access.scope.equals(placement.scope())) throw MongoCachePipelineAccess.fenced();
+        target = access.operatorDatabase(placement.database(), placement.resource());
         table = table(placement.resource()); mapName = placement.mapName();
         address = new Document("scope", MongoPipelinePreparationFacts.scope(placement.scope()))
                 .append("database", placement.database()).append("resource", placement.resource().name())
@@ -48,7 +50,7 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
     @Override public Optional<byte[]> load(String namespace, String key) {
         requireNamespace(namespace); Document id = id(key);
         return transaction(false, session -> Optional.ofNullable(
-                table.on(access.database).find(session, new Document("_id", id)).first()).map(row -> decode(row, id)));
+                table.on(target).find(session, new Document("_id", id)).first()).map(row -> decode(row, id)));
     }
 
     @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
@@ -69,7 +71,7 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     private void readBatch(ClientSession session, Map<Document, String> ids, Map<String, byte[]> out) {
         if (ids.isEmpty()) return;
-        for (Document row : table.on(access.database).find(session, new Document("_id", new Document("$in", List.copyOf(ids.keySet()))))) {
+        for (Document row : table.on(target).find(session, new Document("_id", new Document("$in", List.copyOf(ids.keySet()))))) {
             Object stored = row.get("_id");
             if (!(stored instanceof Document id) || !ids.containsKey(id)) throw access.unreadable("operator-identity");
             out.put(ids.get(id), decode(row, id));
@@ -79,22 +81,22 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
     @Override public void save(String namespace, String key, byte[] state) {
         requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
         transaction(true, session -> {
-            table.on(access.database).replaceOne(session, new Document("_id", id), row(id, captured), new ReplaceOptions().upsert(true)); return null;
+            table.on(target).replaceOne(session, new Document("_id", id), row(id, captured), new ReplaceOptions().upsert(true)); return null;
         });
     }
 
     @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
         requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
         return transaction(true, session -> {
-            Document before = table.on(access.database).find(session, new Document("_id", id)).first();
+            Document before = table.on(target).find(session, new Document("_id", id)).first();
             if (before != null) return Optional.of(decode(before, id));
-            table.on(access.database).insertOne(session, row(id, captured)); return Optional.empty();
+            table.on(target).insertOne(session, row(id, captured)); return Optional.empty();
         });
     }
 
     @Override public void delete(String namespace, String key) {
         requireNamespace(namespace); Document id = id(key);
-        transaction(true, session -> { table.on(access.database).deleteOne(session, new Document("_id", id)); return null; });
+        transaction(true, session -> { table.on(target).deleteOne(session, new Document("_id", id)); return null; });
     }
 
     /** Physical reclamation requires the separate exact retirement path, never an active MapStore. */
@@ -102,14 +104,14 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     @Override public long count(String namespace) {
         requireNamespace(namespace);
-        return transaction(false, session -> table.on(access.database).countDocuments(session, new Document("_id.placement", address)));
+        return transaction(false, session -> table.on(target).countDocuments(session, new Document("_id.placement", address)));
     }
 
     private <T> T transaction(boolean mutation, java.util.function.Function<ClientSession, T> action) {
-        return access.metadataTransaction(table, mutation, session -> {
+        return access.metadataTransaction(table, target, mutation, session -> {
             Document inventory = MongoOperatorInventory.require(session, access.database, placement.scope());
             if (!MongoOperatorInventory.knowsPlacement(inventory, placement)) {
-                if (table.on(access.database).find(session, new Document("_id.placement", address)).projection(new Document("_id", 1)).first() != null)
+                if (table.on(target).find(session, new Document("_id.placement", address)).projection(new Document("_id", 1)).first() != null)
                     throw access.unreadable("operator-inventory");
                 if (mutation) MongoOperatorInventory.rememberPlacement(session, access.database, inventory, placement);
             }

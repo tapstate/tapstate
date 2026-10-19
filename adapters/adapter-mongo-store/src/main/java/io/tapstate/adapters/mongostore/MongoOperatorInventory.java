@@ -17,7 +17,7 @@ import java.util.UUID;
 
 /** Exact operator locations and first-shape facts retained separately from state and shape payloads. */
 final class MongoOperatorInventory {
-    private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "preparationId", "revision", "shapes", "placements");
+    private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "preparationId", "revision", "databases", "shapes", "placements");
     private MongoOperatorInventory() {}
 
     /** Only the original checkpoint seed transaction may allocate a missing inventory root. */
@@ -27,13 +27,13 @@ final class MongoOperatorInventory {
         var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database);
         if (table.find(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first() != null) throw MongoCachePipelinePreparations.rebuild(scope);
         table.insertOne(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope)).append("formatVersion", 1)
-                .append("preparationId", preparationId).append("revision", 0L).append("shapes", List.of()).append("placements", List.of()));
+                .append("preparationId", preparationId).append("revision", 0L).append("databases", List.of()).append("shapes", List.of()).append("placements", List.of()));
     }
 
     static void requireInitial(ClientSession session, MongoDatabase database, PipelineIntentScope scope, String preparationId) {
         Document root = require(session, database, scope);
         if (!preparationId.equals(root.get("preparationId")) || !Long.valueOf(0).equals(root.get("revision"))
-                || !root.getList("shapes", Document.class).isEmpty() || !root.getList("placements", Document.class).isEmpty())
+                || !root.getList("databases", Document.class).isEmpty() || !root.getList("shapes", Document.class).isEmpty() || !root.getList("placements", Document.class).isEmpty())
             throw MongoCachePipelinePreparations.rebuild(scope);
     }
 
@@ -44,6 +44,11 @@ final class MongoOperatorInventory {
     }
 
     private static Document decode(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root, boolean current) {
+        return decode(session, database, scope, root, current, current);
+    }
+
+    private static Document decode(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root,
+                                   boolean current, boolean requireCurrentPreparation) {
         try {
             Set<String> expected = new HashSet<>(FIELDS);
             if (!current) expected.add("retirement");
@@ -52,23 +57,32 @@ final class MongoOperatorInventory {
                     || !Integer.valueOf(1).equals(root.get("formatVersion")) || !(root.get("revision") instanceof Long revision)
                     || revision < 0 || revision == Long.MAX_VALUE || !(root.get("preparationId") instanceof String preparationId)
                     || !UUID.fromString(preparationId).toString().equals(preparationId)) throw unreadable(scope);
+            var databases = documents(root, "databases", scope);
             var shapes = documents(root, "shapes", scope); var placements = documents(root, "placements", scope);
-            if (revision != (long) shapes.size() + placements.size()) throw unreadable(scope);
-            if (current) {
+            if (revision != (long) databases.size() + shapes.size() + placements.size()) throw unreadable(scope);
+            if (requireCurrentPreparation) {
                 var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
                 Document claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
                 if (claim == null || !(claim.get("pipelinePreparation") instanceof Document preparation)
                         || !preparationId.equals(preparation.get("preparationId"))) throw unreadable(scope);
             }
-            Set<Document> unique = new HashSet<>();
+            Set<String> databaseNames = new HashSet<>();
+            for (Document prepared : databases) {
+                if (!prepared.keySet().equals(Set.of("database", "operationId")) || !(prepared.get("database") instanceof String name)
+                        || name.isBlank() || name.equals(database.getName()) || !databaseNames.add(name)
+                        || !(prepared.get("operationId") instanceof String operation) || !UUID.fromString(operation).toString().equals(operation)) throw unreadable(scope);
+            }
+            Set<Document> unique = new HashSet<>(); Set<String> steps = new HashSet<>();
             for (Document shape : shapes) {
                 if (!shape.keySet().equals(Set.of("database", "stepId")) || !(shape.get("database") instanceof String db) || db.isBlank()
-                        || !(shape.get("stepId") instanceof String step) || OperatorStateText.decode(step).isBlank() || !unique.add(shape)) throw unreadable(scope);
+                        || (!db.equals(database.getName()) && !databaseNames.contains(db)) || !(shape.get("stepId") instanceof String step) || OperatorStateText.decode(step).isBlank() || !unique.add(shape) || !steps.add(step)) throw unreadable(scope);
             }
             unique.clear();
             for (Document location : placements) {
                 OperatorPlacement decoded = placement(scope, location);
                 if (!location.equals(location(decoded)) || !unique.add(location)) throw unreadable(scope);
+                if (!decoded.database().equals(database.getName()) && (decoded.resource() != OperatorPlacement.Resource.NEST_STATE
+                        || !databaseNames.contains(decoded.database()))) throw unreadable(scope);
                 if (decoded.resource() == OperatorPlacement.Resource.NEST_STATE && !shapes.contains(shape(decoded.database(), decoded.stepId()))) throw unreadable(scope);
             }
             return root;
@@ -108,14 +122,63 @@ final class MongoOperatorInventory {
     private static String frozenHash(Document root, Document marker) {
         return io.tapstate.core.model.canonical.CanonicalHash.ofText(io.tapstate.core.common.JsonWriter.write(
                 new Document("scope", root.get("_id")).append("preparationId", root.get("preparationId"))
-                        .append("revision", root.get("revision")).append("shapes", root.get("shapes"))
+                        .append("revision", root.get("revision")).append("databases", root.get("databases")).append("shapes", root.get("shapes"))
                         .append("placements", root.get("placements")).append("retirement", marker)));
+    }
+
+    /** Historical identity facts do not borrow another Pipeline's current execution authority. */
+    static java.util.Optional<String> databaseHistory(ClientSession session, MongoDatabase database, io.tapstate.spi.store.CacheBusinessScope scope, String target) {
+        var filter = new Document("_id.clusterId", scope.clusterId()).append("_id.bindingVersion", scope.bindingVersion())
+                .append("_id.cacheIncarnation", scope.cacheIncarnation()).append("databases.database", target);
+        String original = null;
+        try (var rows = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, filter).batchSize(64).iterator()) {
+            while (rows.hasNext()) {
+                Document row = rows.next();
+                PipelineIntentScope owner;
+                try { owner = MongoPipelinePreparationFacts.scope(row.get("_id", Document.class)); }
+                catch (RuntimeException invalid) { throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "operator", "field", "operator-inventory"), null); }
+                decode(session, database, owner, row, !row.containsKey("retirement"), false);
+                for (Document held : row.getList("databases", Document.class)) {
+                    if (!target.equals(held.get("database"))) continue;
+                    String operation = held.getString("operationId");
+                    if (original != null && !original.equals(operation)) throw unreadable(owner);
+                    original = operation;
+                }
+            }
+        }
+        return java.util.Optional.ofNullable(original);
+    }
+
+    static void requireDatabase(Document root, String target, String operationId, PipelineIntentScope scope) {
+        var wanted = new Document("database", target).append("operationId", operationId);
+        if (!root.getList("databases", Document.class).contains(wanted)) throw unreadable(scope);
+    }
+
+    static void rememberDatabase(ClientSession session, MongoDatabase database, PipelineIntentScope scope,
+                                 Document root, String target, String operationId) {
+        var wanted = new Document("database", target).append("operationId", operationId);
+        var prepared = new ArrayList<>(root.getList("databases", Document.class));
+        for (Document held : prepared) {
+            if (target.equals(held.get("database"))) {
+                if (!wanted.equals(held)) throw unreadable(scope);
+                return;
+            }
+        }
+        prepared.add(wanted); update(session, database, scope, root, "databases", prepared);
     }
 
     static boolean knowsShape(Document root, String database, String step) { return root.getList("shapes", Document.class).contains(shape(database, step)); }
 
-    static void rememberShape(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root, String step) {
-        var wanted = shape(database.getName(), step);
+    static void requireShapeDatabase(Document root, String database, String step) {
+        String encoded = OperatorStateText.encode(step);
+        for (Document shape : root.getList("shapes", Document.class)) {
+            if (encoded.equals(shape.get("stepId")) && !database.equals(shape.get("database"))) throw MongoCachePipelineAccess.fenced();
+        }
+    }
+
+    static void rememberShape(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root, String targetDatabase, String step) {
+        requireShapeDatabase(root, targetDatabase, step);
+        var wanted = shape(targetDatabase, step);
         if (root.getList("shapes", Document.class).contains(wanted)) throw unreadable(scope);
         var shapes = new ArrayList<>(root.getList("shapes", Document.class)); shapes.add(wanted);
         update(session, database, scope, root, "shapes", shapes);

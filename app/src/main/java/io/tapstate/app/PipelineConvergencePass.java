@@ -122,6 +122,31 @@ final class PipelineConvergencePass {
                 .ifPresent(recorded -> io.tapstate.runtime.engine.nest.NestStateLedger.requireSameShape(step, recorded, captured));
     }
 
+    /** Prepares the captured Nest databases before any member resource can be opened. */
+    void prepareOperatorDatabases(WorkloadClaimFence original, java.util.Collection<String> databases,
+            Runnable commandGuard) {
+        Objects.requireNonNull(original, "original");
+        Objects.requireNonNull(commandGuard, "commandGuard");
+        var targets = new java.util.TreeMap<String, String>();
+        for (String database : java.util.List.copyOf(databases)) {
+            targets.computeIfAbsent(Objects.requireNonNull(database, "database"),
+                    ignored -> java.util.UUID.randomUUID().toString());
+        }
+        Runnable fixed = () -> {
+            requireActive.run();
+            if (!original.equals(claim.get())) throw fenced();
+            commandGuard.run();
+            requireActive.run();
+            if (!original.equals(claim.get())) throw fenced();
+        };
+        fixed.run();
+        for (var target : targets.entrySet()) {
+            fixed.run();
+            views.prepareOperatorDatabase(scope(), target.getKey(), original, target.getValue(), fixed);
+            fixed.run();
+        }
+    }
+
     /** Called before any later start step may throw; no other pass or asynchronous DAG retains this object. */
     void advanced(WorkloadClaimFence actual) {
         Objects.requireNonNull(actual, "actual");

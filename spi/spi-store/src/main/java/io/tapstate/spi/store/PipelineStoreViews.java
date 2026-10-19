@@ -5,6 +5,10 @@ package io.tapstate.spi.store;
  * view retains one immutable claim through all transaction retries and never resolves a newer claim.
  */
 public interface PipelineStoreViews {
+    /** Explicit coordinator preparation, before map installation; ordinary facet opening never performs DDL. */
+    default void prepareOperatorDatabase(PipelineIntentScope scope, String database, WorkloadClaimFence original,
+                                         String operationId, Runnable requireActive) { throw unsupported(); }
+
     default NestShapeStore nestShapes(PipelineIntentScope scope, String database) { throw unsupported(); }
 
     default NestShapeStore nestShapes(PipelineIntentScope scope, String database, WorkloadClaimFence original, Runnable requireActive) { throw unsupported(); }

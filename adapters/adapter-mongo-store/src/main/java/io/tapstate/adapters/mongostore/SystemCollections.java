@@ -249,7 +249,8 @@ public enum SystemCollections {
     CACHE_JOIN_WRITERS("join_writers", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
     CACHE_NEST_SHAPES("nest_shapes", Database.CACHE, MongoCacheNestShapeStore.class, Strategy.MIGRATED, 1),
-    CACHE_OPERATOR_CLEANUP("operator_cleanup", Database.CACHE, MongoOperatorInventory.class, Strategy.MIGRATED, 1);
+    CACHE_OPERATOR_CLEANUP("operator_cleanup", Database.CACHE, MongoOperatorInventory.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.clusterId", "_id.bindingVersion", "_id.cacheIncarnation", "databases.database"), false, "operator_database_history"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

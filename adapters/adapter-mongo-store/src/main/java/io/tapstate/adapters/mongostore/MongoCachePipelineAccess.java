@@ -30,6 +30,7 @@ final class MongoCachePipelineAccess {
     private final WorkloadClaimFence original;
     private final Runnable requireActive;
     final java.time.Duration rateRetention;
+    final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
 
     MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive) {
@@ -38,6 +39,13 @@ final class MongoCachePipelineAccess {
 
     MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention) {
+        this(client, database, scope, original, requireActive, rateRetention, null);
+    }
+
+    MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
+            io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
+        this.operatorDatabases = operatorDatabases;
         this.rateRetention = MongoCacheMetadataStructure.requireRetention(rateRetention);
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.original = original;
@@ -51,6 +59,10 @@ final class MongoCachePipelineAccess {
     <T> T observationTransaction(Function<ClientSession, T> action) { return transaction(true, action); }
 
     private <T> T transaction(boolean observation, Function<ClientSession, T> action) {
+        return transaction(observation, TRANSACTION, action);
+    }
+
+    private <T> T transaction(boolean observation, TransactionOptions options, Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -63,20 +75,51 @@ final class MongoCachePipelineAccess {
                         T result = action.apply(session);
                         requireActive.run();
                         return result;
-                    }, TRANSACTION);
+                    }, options);
                 }
             } catch (RuntimeException failure) { requireActive.run(); throw failure; }
         });
     }
 
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
+        return metadataTransaction(table, database, mutation, action);
+    }
+
+    <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation, Function<ClientSession, T> action) {
         T result = transaction(session -> {
             Document current = state(session);
-            new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(table);
+            if (!database.getName().equals(target.getName())) {
+                String preparation = MongoCacheOperatorDatabases.require(session, target, operatorDatabases);
+                MongoOperatorInventory.requireDatabase(MongoOperatorInventory.require(session, database, scope), target.getName(), preparation, scope);
+            }
+            new MongoCacheMetadataStructure(target, rateRetention).verifyFacet(table);
             if (mutation) { proveClaim(session); updateState(session, current, new Document(), false); }
             return action.apply(session);
         });
         requireActive.run(); return result;
+    }
+
+    <T> T operatorPreparation(Function<ClientSession, T> action) {
+        var local = TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+        return transaction(false, local, session -> {
+            Document current = state(session); proveClaim(session); updateState(session, current, new Document(), false);
+            return action.apply(session);
+        });
+    }
+
+    MongoDatabase operatorDatabase(String name, io.tapstate.spi.store.OperatorPlacement.Resource resource) {
+        if (database.getName().equals(name)) return database;
+        if (operatorDatabases == null || resource != io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE
+                || !operatorDatabases.scope().equals(new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
+                || !database.getName().equals(operatorDatabases.cacheDatabase())) throw fenced();
+        try {
+            MongoStorePort.requireOperatorStateDatabase(name, "admin");
+            MongoStorePort.requireOperatorStateDatabase(name, operatorDatabases.configurationDatabase());
+            MongoStorePort.requireOperatorStateDatabase(name, operatorDatabases.masterDatabase());
+        } catch (TapstateException rejected) {
+            throw new TapstateException(StoreError.INVALID_OPERATOR_STATE_DATABASE, Map.of(), null);
+        }
+        return client.getDatabase(name);
     }
 
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }

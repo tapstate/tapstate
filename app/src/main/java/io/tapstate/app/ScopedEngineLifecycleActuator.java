@@ -130,6 +130,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         run = null; capture = boundCapture(original);
         boolean submissionAttempted = false;
         try {
+            pass.prepareOperatorDatabases(command,
+                    prepared.operatorPlan().orElseThrow().nestDatabases().values(), this::require); require();
             var planned = prepared.plan(); require();
             var members = planned.members();
             ports.operators().prepare(manifest,prepared.operatorPlan().orElseThrow().capacities(),members,this::require); require();

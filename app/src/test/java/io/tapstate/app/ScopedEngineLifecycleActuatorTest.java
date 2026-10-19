@@ -42,13 +42,21 @@ class ScopedEngineLifecycleActuatorTest {
     private final List<OperatorRunManifest> released = new ArrayList<>();
     private final List<OperatorRunManifest> prepared = new ArrayList<>();
     private final List<PipelineConvergencePass> rebuilds = new ArrayList<>();
+    private final PipelineStoreViews views = mock(PipelineStoreViews.class);
     private final PipelineConvergencePass pass;
     private DagSource.StartPreparation preparation;
     private Runnable onPrepare = () -> {};
+    private Runnable onDatabasePrepare = () -> {};
 
     ScopedEngineLifecycleActuatorTest() {
         var intent = new PipelineIntentSnapshot(SCOPE,1,new DesiredState("p",PipelineState.RUNNING,"hash",false));
-        pass = new PipelineConvergencePass(intent,held.get(),mock(PipelineStoreViews.class),() -> { if (!active.get()) throw fenced(); });
+        pass = new PipelineConvergencePass(intent,held.get(),views,() -> { if (!active.get()) throw fenced(); });
+        doAnswer(call -> {
+            events.add("database:"+call.getArgument(1));
+            assertThat((WorkloadClaimFence)call.getArgument(2)).isEqualTo(claim(2));
+            assertThat(java.util.UUID.fromString(call.getArgument(3)).toString()).isEqualTo((String)call.getArgument(3));
+            onDatabasePrepare.run(); ((Runnable)call.getArgument(4)).run(); return null;
+        }).when(views).prepareOperatorDatabase(eq(SCOPE),anyString(),any(),anyString(),any());
         when(ownership.proveClaim(eq(SCOPE),any())).thenAnswer(call -> active.get() && held.get().equals(call.getArgument(1)));
         when(engine.captureRun("p")).thenReturn(Optional.of(previous));
         when(previous.operatorManifest()).thenReturn(manifest(1));
@@ -195,6 +203,33 @@ class ScopedEngineLifecycleActuatorTest {
         verify(dags,never()).prepareStart(anyString(),anyString());
         verify(ownership).beginExecution(SCOPE,claim(1)); verify(ownership,never()).beginExecution(anyString());
         verify(engine).submitRun(eq("p"),any(),anyMap(),any(),eq(manifest(2)));
+    }
+    @Test void everyDistinctNestDatabaseIsPreparedAfterAdvanceAndBeforeMembersEvenForPassthroughNests() {
+        withNestDatabases(); var actor = actuator(); actor.start("p");
+        assertThat(events).containsSubsequence("advance","bind:2","database:extra-cache","database:second-cache","operators","capture","build","submit");
+        verify(views,times(1)).prepareOperatorDatabase(eq(SCOPE),eq("extra-cache"),eq(claim(2)),anyString(),any());
+        verify(views,times(1)).prepareOperatorDatabase(eq(SCOPE),eq("second-cache"),eq(claim(2)),anyString(),any());
+        assertThat(prepared.getFirst().bindings()).as("passthrough Nests have shape placement but no state maps").isEmpty();
+    }
+    @Test void aDatabasePreparationRefusalOpensNoMemberMapsCaptureOrJob() {
+        withNestDatabases(); onDatabasePrepare = () -> {throw fenced();};
+        assertThatThrownBy(() -> actuator().start("p")).isInstanceOf(TapstateException.class);
+        assertThat(prepared).isEmpty();
+        verify(fixedCapture,never()).startCapture(anyString(),any(ArtifactStore.class),any(SourceModelSnapshot.class));
+        verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
+    }
+    private void withNestDatabases() {
+        var root = new io.tapstate.core.model.NestRoot("s",List.of("id"),null,null,List.of());
+        var steps = new ArrayList<io.tapstate.core.model.Step>();
+        for (var entry : Map.of("one","extra-cache","two","extra-cache","three","second-cache").entrySet()) {
+            var body = new io.tapstate.core.model.TransformBody.Nest(null,null,null,null,new io.tapstate.core.model.NestStateStorage(entry.getValue()),root);
+            steps.add(io.tapstate.core.model.Step.inline(entry.getKey(),io.tapstate.core.model.FromClause.aliases(
+                    Map.of("s",io.tapstate.core.model.FromRef.literal("source"))),body,null));
+        }
+        var pipeline = new PipelineResource("p",null,List.of(io.tapstate.core.model.SourceRef.bare("source")),steps,null,null,null,null);
+        var plan = OperatorCoordinatePlan.compile(SCOPE,pipeline,"cache",alias -> new io.tapstate.runtime.engine.nest.NestTable("rows",List.of("id")),Map.of(),NestSettings.defaults());
+        preparation = new DagSource.StartPreparation(preparation.capacity(),preparation.stateLocations(),preparation.artifactSnapshot(),
+                preparation.planner(),preparation.sinkConnectors(),preparation.sourceModels(),Optional.of(plan));
     }
     @Test void firstExecutionZeroStillRequiresTheOriginalNodeAdmittedPipelineClaim() {
         held.set(claim(0));

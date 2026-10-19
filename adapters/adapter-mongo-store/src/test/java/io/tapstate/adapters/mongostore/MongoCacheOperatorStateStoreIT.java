@@ -360,6 +360,194 @@ class MongoCacheOperatorStateStoreIT {
         });
     }
 
+    @Test void aPreparedExtraDatabaseHoldsNestStateAndShapeWhileControlStaysInTheDefaultCache() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),WorkloadClaimFence.from(f.claim),UUID.randomUUID().toString(),ACTIVE);
+            var shape = bound.nestShapes(SCOPE,target.getName(),WorkloadClaimFence.from(f.claim),ACTIVE);
+            assertThat(shape.recordIfAbsent("extra-step",Set.of("root"))).isEmpty();
+            var at = new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.NEST_STATE,"extra-step","root","extra-logical");
+            var state = bound.operatorState(at,WorkloadClaimFence.from(f.claim),ACTIVE);
+            state.save(at.mapName(),"key",new byte[]{1,2,3});
+            assertThat(state.load(at.mapName(),"key")).hasValue(new byte[]{1,2,3});
+            assertThat(SystemCollections.CACHE_NEST_STATE.on(target).countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.CACHE_NEST_SHAPES.on(target).countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.CACHE_NEST_STATE.on(f.database).countDocuments()).isZero();
+            assertThat(target.listCollectionNames()).containsExactlyInAnyOrder("cache_identity","schema_migrations","nest_state","nest_shapes");
+            var inventory = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find().first();
+            assertThat(inventory.getList("shapes",Document.class)).contains(new Document("database",target.getName()).append("stepId",OperatorStateText.encode("extra-step")));
+            assertThat(inventory.getList("placements",Document.class)).contains(MongoOperatorInventory.location(at));
+            assertThatThrownBy(() -> bound.operatorState(new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.JOIN_FACTS,"join","fact","join-logical")))
+                    .isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
+        }));
+    }
+    @Test void ordinaryExtraDatabaseReadsCannotPrepareAnUnknownTarget() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            var at = new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.NEST_STATE,"extra-step","root","extra-logical");
+            var state = bound.operatorState(at,WorkloadClaimFence.from(f.claim),ACTIVE);
+            assertThatThrownBy(() -> state.load(at.mapName(),"key")).isInstanceOf(TapstateException.class);
+            assertThat(target.listCollectionNames()).isEmpty();
+            assertThatThrownBy(() -> bound.nestShapes(SCOPE,target.getName()).read("extra-step")).isInstanceOf(TapstateException.class);
+            assertThat(target.listCollectionNames()).isEmpty();
+        }));
+    }
+    @Test void theSameStateGenerationCannotMoveAnExistingNestStepToAnotherDatabase() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),WorkloadClaimFence.from(f.claim),UUID.randomUUID().toString(),ACTIVE);
+            var before = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find().first();
+            code(() -> bound.nestShapes(SCOPE,target.getName(),WorkloadClaimFence.from(f.claim),ACTIVE).recordIfAbsent("step",Set.of("root")),IoError.CACHE_BUSINESS_FENCED);
+            assertThat(SystemCollections.CACHE_NEST_SHAPES.on(target).countDocuments()).isZero();
+            assertThat(SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find().first()).isEqualTo(before);
+        }));
+    }
+    @Test void aReleasedOriginalClaimCannotWriteThePreparedExtraDatabase() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            var fence = WorkloadClaimFence.from(f.claim);
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,UUID.randomUUID().toString(),ACTIVE);
+            bound.nestShapes(SCOPE,target.getName(),fence,ACTIVE).recordIfAbsent("extra-step",Set.of("root"));
+            var at = new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.NEST_STATE,"extra-step","root","extra-logical");
+            var writer = bound.operatorState(at,fence,ACTIVE); writer.save(at.mapName(),"kept",new byte[]{1});
+            assertThat(f.domain.workloadClaims(BUSINESS).release(f.claim)).isTrue();
+            var before = SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find().first();
+            var inventory = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find().first();
+            code(() -> writer.save(at.mapName(),"late",new byte[]{2}),IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(SystemCollections.CACHE_NEST_STATE.on(target).countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find().first()).isEqualTo(before);
+            assertThat(SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find().first()).isEqualTo(inventory);
+        }));
+    }
+    @Test void anOccupiedUnknownTargetCannotBeAdoptedOrPartlyPrepareTheControlState() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            try (var session = f.client.startSession()) {
+                session.withTransaction(() -> { SystemCollections.CACHE_NEST_STATE.prepareCollectionOn(target,session); return null; },
+                        TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+            var before = SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find().first();
+            var claim = f.claims().find().first();
+            assertThatThrownBy(() -> bound.prepareOperatorDatabase(SCOPE,target.getName(),WorkloadClaimFence.from(f.claim),UUID.randomUUID().toString(),ACTIVE))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(target.listCollectionNames()).containsExactly("nest_state");
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find().first()).isEqualTo(before);
+            assertThat(f.claims().find().first()).isEqualTo(claim);
+        }));
+    }
+    @Test void trustedConfigurationAndMasterNamesAndSystemDatabasesAreRejectedWithoutRawCauses() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            var before = SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find().first();
+            for (String name : List.of("admin","config","local","configuration","master","bad/private-sentinel")) {
+                assertThatThrownBy(() -> bound.prepareOperatorDatabase(SCOPE,name,WorkloadClaimFence.from(f.claim),UUID.randomUUID().toString(),ACTIVE))
+                        .isInstanceOfSatisfying(TapstateException.class,error -> {
+                            assertThat(error.code()).isEqualTo(StoreError.INVALID_OPERATOR_STATE_DATABASE); assertThat(error.getCause()).isNull();
+                            assertThat(error.args().toString()).doesNotContain("private-sentinel");
+                        });
+            }
+            assertThat(target.listCollectionNames()).isEmpty();
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find().first()).isEqualTo(before);
+        }));
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void aKnownExtraDatabaseCannotBeRecreatedAfterTotalLossEvenBeforeItsFirstStateWrite(boolean used) {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            var fence = WorkloadClaimFence.from(f.claim); String operation = UUID.randomUUID().toString();
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE);
+            if (used) {
+                bound.nestShapes(SCOPE,target.getName(),fence,ACTIVE).recordIfAbsent("extra-step",Set.of("root"));
+                var at = new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.NEST_STATE,"extra-step","root","extra-logical");
+                bound.operatorState(at,fence,ACTIVE).save(at.mapName(),"key",new byte[]{1});
+            }
+            target.drop(); var before = f.snapshot();
+            code(() -> bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE),IoError.DOCUMENT_UNREADABLE);
+            assertThat(target.listCollectionNames()).isEmpty(); assertThat(f.snapshot()).isEqualTo(before);
+        }));
+    }
+    @Test void anotherPipelineCannotAdoptAChildPreparationThatContradictsRetainedHistory() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),WorkloadClaimFence.from(f.claim),UUID.randomUUID().toString(),ACTIVE);
+            var sibling = new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),"billing",1);
+            var fence = f.sibling(sibling);
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(target).updateOne(new Document("_id","operator"),
+                    new Document("$set",new Document("operationId",UUID.randomUUID().toString())));
+            var before = f.snapshot();
+            code(() -> bound.prepareOperatorDatabase(sibling,target.getName(),fence,UUID.randomUUID().toString(),ACTIVE),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        }));
+    }
+    @Test void aSiblingUsesTheOriginalChildPreparationWithoutDependingOnTheOtherPipelinesLiveClaim() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            String first = UUID.randomUUID().toString();
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),WorkloadClaimFence.from(f.claim),first,ACTIVE);
+            var sibling = new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),"billing",1);
+            var fence = f.sibling(sibling);
+            bound.prepareOperatorDatabase(sibling,target.getName(),fence,UUID.randomUUID().toString(),ACTIVE);
+            f.claims().deleteOne(new Document("_id",MongoWorkloadClaimStore.id(KEY)));
+            bound.prepareOperatorDatabase(sibling,target.getName(),fence,UUID.randomUUID().toString(),ACTIVE);
+            assertThat(SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(target).find().first()).containsEntry("operationId",first);
+            var own = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find(new Document("_id",MongoPipelinePreparationFacts.scope(sibling))).first();
+            assertThat(own.getList("databases",Document.class)).containsExactly(new Document("database",target.getName()).append("operationId",first));
+        }));
+    }
+    @Test void defaultDatabasePreparationVerifiesExistingSchemaWithoutOperatorIdentityOrRegistration() {
+        withFixture(f -> {
+            var fence = WorkloadClaimFence.from(f.claim);
+            var inventory = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find().first();
+            f.domain.prepareOperatorDatabase(SCOPE,f.database.getName(),fence,UUID.randomUUID().toString(),ACTIVE);
+            assertThat(SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).find().first()).isEqualTo(inventory);
+            assertThat(SystemCollections.CACHE_IDENTITY.on(f.database).countDocuments(new Document("_id","operator"))).isZero();
+            assertThat(f.domain.workloadClaims(BUSINESS).release(f.claim)).isTrue(); var before = f.snapshot();
+            code(() -> f.domain.prepareOperatorDatabase(SCOPE,f.database.getName(),fence,UUID.randomUUID().toString(),ACTIVE),IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+    @Test void crossDatabasePayloadWriteRollsBackWithDefaultControlAfterTheGuardIsLost() {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            var fence = WorkloadClaimFence.from(f.claim);
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,UUID.randomUUID().toString(),ACTIVE);
+            bound.nestShapes(SCOPE,target.getName(),fence,ACTIVE).recordIfAbsent("extra-step",Set.of("root"));
+            var at = new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.NEST_STATE,"extra-step","root","logical");
+            var before = f.snapshot(); var lost = new AtomicBoolean(); var writing = new AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getDatabaseName().equals(target.getName()) && event.getCommandName().equals("update")
+                            && event.getCommand().getString("update").getValue().equals("nest_state")) writing.set(true);
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if (event.getCommandName().equals("update") && writing.compareAndSet(true,false)) lost.set(true);
+                }
+            };
+            var policy = new OperatorDatabaseBinding(BUSINESS,f.database.getName(),"configuration","master");
+            try (var client = observed(listener)) {
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,client.getDatabase(f.database.getName()),
+                        SCOPE,fence,() -> { if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); },
+                        MongoRateHistoryStore.DEFAULT_RETENTION,policy),at);
+                code(() -> writer.save(at.mapName(),"late",new byte[]{1}),IoError.WORKLOAD_CLAIM_FENCED);
+            }
+            assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(SystemCollections.CACHE_NEST_STATE.on(target).countDocuments()).isZero();
+        }));
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"cache_identity","schema_migrations","nest_state","nest_shapes"})
+    void ordinaryAccessAndPreparationCannotRepairMissingExtraDatabaseStructure(String missing) {
+        withFixture(f -> withExtra(f,(bound,target) -> {
+            var fence = WorkloadClaimFence.from(f.claim); String operation = UUID.randomUUID().toString();
+            bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE);
+            target.getCollection(missing).drop(); var names = new HashSet<>(target.listCollectionNames().into(new ArrayList<>()));
+            var before = f.snapshot();
+            code(() -> bound.nestShapes(SCOPE,target.getName()).read("extra-step"),IoError.DOCUMENT_UNREADABLE);
+            code(() -> bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE),IoError.DOCUMENT_UNREADABLE);
+            assertThat(target.listCollectionNames()).containsExactlyInAnyOrderElementsOf(names);
+            assertThat(f.snapshot()).isEqualTo(before);
+        }));
+    }
+
+    private static void withExtra(Fixture fixture,ExtraScenario scenario) throws Exception {
+        String name = fixture.database.getName()+"_nest";
+        var policy = new io.tapstate.spi.store.OperatorDatabaseBinding(BUSINESS,fixture.database.getName(),"configuration","master");
+        try (var bound = MongoCacheDomain.connect(fixture.binding,Duration.ofSeconds(5),"extra-operator-it",MongoRateHistoryStore.DEFAULT_RETENTION,policy)) {
+            scenario.run(bound,fixture.client.getDatabase(name));
+        } finally { fixture.client.getDatabase(name).drop(); }
+    }
+    @FunctionalInterface private interface ExtraScenario { void run(MongoCacheDomain domain,com.mongodb.client.MongoDatabase target) throws Exception; }
+
     @Test void onlyTheCurrentCacheDatabaseIsAvailableUntilAnExtraPlacementHasBeenPrepared() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE);
@@ -415,6 +603,18 @@ class MongoCacheOperatorStateStoreIT {
         OperatorPlacement at(OperatorPlacement.Resource kind) { return new OperatorPlacement(SCOPE,database.getName(),kind,"step","root","logical.namespace"); }
         KeyedStateStore writer(OperatorPlacement at) { return domain.operatorState(at,WorkloadClaimFence.from(claim),ACTIVE); }
         com.mongodb.client.MongoCollection<Document> claims() { return SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database); }
+        WorkloadClaimFence sibling(PipelineIntentScope scope) {
+            SystemCollections.CACHE_PIPELINE_STATE.on(database).insertOne(new Document("_id",scope.pipelineId()).append("scope",MongoPipelinePreparationFacts.scope(scope))
+                    .append("stateJson","NEW").append("epoch",0L).append("touchMillis",0L).append("runtimeWriteFence",1L));
+            var key = new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId());
+            var raw = new MongoWorkloadClaimStore(claims()); var initial = raw.acquire(key,OWNER,1,Duration.ofMinutes(5)).claim(); raw.release(initial);
+            String preparation = UUID.randomUUID().toString();
+            claims().updateOne(new Document("_id",MongoWorkloadClaimStore.id(key)),new Document("$set",new Document("pipelineScope",MongoPipelinePreparationFacts.scope(scope))
+                    .append("pipelinePreparation",MongoCachePipelinePreparations.marker(preparation,PipelineCachePreparations.Phase.PREPARED))));
+            try (var session = client.startSession()) { session.withTransaction(() -> { MongoOperatorInventory.prepareInitial(session,database,scope,preparation); return null; }); }
+            var original = domain.workloadClaims(BUSINESS).acquirePipeline(scope,OWNER,1,Duration.ofMinutes(5)).claim();
+            return WorkloadClaimFence.from(domain.workloadClaims(BUSINESS).advanceExecution(original,1,Set.of(OWNER.nodeId())).orElseThrow());
+        }
         void genesis(PipelineIntentScope scope) {
             try (var session = client.startSession()) { session.withTransaction(() -> {
                 String id = claims().find(session).first().get("pipelinePreparation",Document.class).getString("preparationId");

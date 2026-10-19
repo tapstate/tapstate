@@ -23,10 +23,13 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
     private final Duration rateRetention;
+    private final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
     private final String targetFingerprint;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
-    private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint) {
+    private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint,
+                             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
+        this.operatorDatabases = operatorDatabases;
         this.connection = connection; this.client = connection.client(); this.database = connection.database(); this.rateRetention = rateRetention; this.targetFingerprint = targetFingerprint;
     }
 
@@ -36,11 +39,18 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     public static MongoCacheDomain connect(StorageBinding.Connection cache, Duration timeout, String processId, Duration rateRetention) {
+        return connect(cache, timeout, processId, rateRetention, null);
+    }
+
+    /** Extra operator databases require names captured by trusted CONFIG assembly, fixed for this owner. */
+    public static MongoCacheDomain connect(StorageBinding.Connection cache, Duration timeout, String processId, Duration rateRetention,
+                                          io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
         rateRetention = MongoCacheMetadataStructure.requireRetention(rateRetention);
+        if (operatorDatabases != null && !cache.database().equals(operatorDatabases.cacheDatabase())) throw MongoCachePipelineAccess.fenced();
         MongoConnection connection = MongoConnection.forCache(cache, timeout, processId);
         try {
             connection.verifyConnectivity();
-            return new MongoCacheDomain(connection, rateRetention, MongoStorageBindingStore.targetFingerprint(cache));
+            return new MongoCacheDomain(connection, rateRetention, MongoStorageBindingStore.targetFingerprint(cache), operatorDatabases);
         } catch (RuntimeException | Error failure) {
             connection.close(); throw failure;
         }
@@ -221,6 +231,27 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCachePipelineRebuilds(client, database, expected, () -> { businessActive(); requireActive.run(); }, rateRetention);
     }
 
+    /** Explicit schema preparation is separate from every ordinary operator facet open. */
+    @Override public void prepareOperatorDatabase(io.tapstate.spi.store.PipelineIntentScope scope, String targetDatabase,
+            io.tapstate.spi.store.WorkloadClaimFence original, String operationId, Runnable requireActive) {
+        if (Objects.requireNonNull(original, "original").executionGeneration() < 1) throw MongoCachePipelineAccess.claimFenced();
+        MongoCachePipelineAccess access = pipelineAccess(scope, original, requireActive);
+        var target = access.operatorDatabase(targetDatabase, io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE);
+        if (target.getName().equals(database.getName())) {
+            access.metadataTransaction(SystemCollections.CACHE_NEST_STATE, true, session -> {
+                new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(SystemCollections.CACHE_NEST_SHAPES);
+                return null;
+            });
+            return;
+        }
+        access.operatorPreparation(session -> {
+            var inventory = MongoOperatorInventory.require(session, database, scope);
+            String stored = MongoCacheOperatorDatabases.prepare(session, database, target, operatorDatabases, operationId, requireActive);
+            MongoOperatorInventory.rememberDatabase(session, database, scope, inventory, target.getName(), stored);
+            return null;
+        });
+    }
+
     @Override public io.tapstate.spi.store.NestShapeStore nestShapes(io.tapstate.spi.store.PipelineIntentScope scope, String database) {
         return new MongoCacheNestShapeStore(pipelineAccess(scope, null, () -> {}), database);
     }
@@ -282,7 +313,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private MongoCachePipelineAccess pipelineAccess(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); }, rateRetention);
+        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases);
     }
 
     /**

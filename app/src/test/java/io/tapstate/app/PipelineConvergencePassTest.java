@@ -216,13 +216,48 @@ class PipelineConvergencePassTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    @Test void databasePreparationFreezesTargetsAndOriginalClaimBeforeGuardsAndRetriedCallbacks() {
+        var targets = new ArrayList<>(List.of("second", "first", "first"));
+        var seen = new ArrayList<String>();
+        var fixed = new AtomicReference<Runnable>();
+        PipelineStoreViews databaseViews = new Views() {
+            @Override public void prepareOperatorDatabase(PipelineIntentScope scope, String database,
+                    WorkloadClaimFence original, String operationId, Runnable active) {
+                assertThat(scope).isEqualTo(SCOPE); assertThat(original).isEqualTo(execution(1));
+                assertThat(java.util.UUID.fromString(operationId).toString()).isEqualTo(operationId);
+                active.run(); active.run(); fixed.set(active); seen.add(database);
+            }
+        };
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, databaseViews, targets::clear);
+        pass.advanced(execution(1));
+        pass.prepareOperatorDatabases(execution(1), targets, () -> {});
+        assertThat(seen).containsExactly("first", "second");
+        pass.advanced(execution(2));
+        assertThatThrownBy(() -> fixed.get().run()).isInstanceOfSatisfying(TapstateException.class,
+                e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+    }
+
+    @Test void reentrantAdvanceCannotGiveADatabasePreparationTheNewerClaim() {
+        var owner = new AtomicReference<PipelineConvergencePass>(); var calls = new AtomicInteger();
+        PipelineStoreViews databaseViews = new Views() {
+            @Override public void prepareOperatorDatabase(PipelineIntentScope scope, String database,
+                    WorkloadClaimFence original, String operationId, Runnable active) { calls.incrementAndGet(); }
+        };
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, databaseViews,
+                () -> owner.get().advanced(execution(2))); owner.set(pass); pass.advanced(execution(1));
+        assertThatThrownBy(() -> pass.prepareOperatorDatabases(execution(1), List.of("extra"), () -> {}))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(calls).hasValue(0);
+    }
+
     private static WorkloadClaimFence execution(long generation) { return new WorkloadClaimFence(KEY, OWNER, 2, generation, 7); }
     private static Observation observation(String id) {
         return new Observation(id, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, T0);
     }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }
 
-    private static final class Views implements PipelineStoreViews {
+    private static class Views implements PipelineStoreViews {
         private final InMemoryStateStore state = new InMemoryStateStore();
         private final InMemoryObservationStore observations = new InMemoryObservationStore();
         private final InMemoryDerivedSchemaStore derived = new InMemoryDerivedSchemaStore();
