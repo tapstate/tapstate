@@ -1,10 +1,12 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -28,9 +30,7 @@ final class ConnectionTestResultRedactor {
     }
 
     static ConnectionTestResult redact(ConnectionTestResult result, List<String> secretValues) {
-        List<String> ordered = new ArrayList<>(new LinkedHashSet<>(secretValues));
-        ordered.removeIf(value -> value == null || value.isBlank());
-        ordered.sort((left, right) -> Integer.compare(right.length(), left.length()));
+        List<String> ordered = orderedSecrets(secretValues);
         if (ordered.isEmpty()) return result;
         List<ConnectionTestItem> items = result.items().stream()
                 .map(item -> new ConnectionTestItem(
@@ -43,6 +43,31 @@ final class ConnectionTestResultRedactor {
                 .toList();
         return new ConnectionTestResult(
                 result.connectionId(), result.connectorId(), result.outcome(), items, result.testedAt());
+    }
+
+    static TapstateException redact(TapstateException failure, List<String> secretValues) {
+        List<String> ordered = orderedSecrets(secretValues);
+        if (ordered.isEmpty()) return failure;
+        Map<String, Object> safeArgs = new LinkedHashMap<>();
+        boolean changed = false;
+        for (Map.Entry<String, Object> entry : failure.args().entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof String text) {
+                String safe = redact(text, ordered);
+                safeArgs.put(entry.getKey(), safe);
+                changed |= !safe.equals(text);
+            } else {
+                safeArgs.put(entry.getKey(), value);
+            }
+        }
+        return changed ? new TapstateException(failure.code(), safeArgs, failure.getCause()) : failure;
+    }
+
+    private static List<String> orderedSecrets(List<String> secretValues) {
+        List<String> ordered = new ArrayList<>(new LinkedHashSet<>(secretValues));
+        ordered.removeIf(value -> value == null || value.isBlank());
+        ordered.sort((left, right) -> Integer.compare(right.length(), left.length()));
+        return ordered;
     }
 
     private static void add(LinkedHashSet<String> values, Object candidate) {

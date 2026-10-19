@@ -1,9 +1,11 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.probe.ConnectionProbe;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -62,21 +64,24 @@ public final class ConnectionTestService {
         ConnectionConfig config = sourceConnections == null
                 ? new ConnectionConfig(connectionId, connectorId, settings)
                 : sourceConnections.resolve(connectionId, connectorId, settings);
-        if (configValidator != null) {
-            configValidator.validate(config.connectorId(), config.settings());
+        List<String> secretValues = sourceConnections == null
+                ? ConnectionTestResultRedactor.sharedSecretValues(config.settings())
+                : sourceConnections.secretValuesForDiagnostics(config.connectorId(), config.settings());
+        try {
+            if (configValidator != null) {
+                configValidator.validate(config.connectorId(), config.settings());
+            }
+            return auditGate.dispatch(
+                    ControlOperations.CONNECTION_TEST,
+                    new AuditContext(principal, config.id()),
+                    () -> {
+                        ConnectionTestResult result = probe.probe(config);
+                        ConnectionTestResult safeResult = ConnectionTestResultRedactor.redact(result, secretValues);
+                        resultStore.save(safeResult);
+                        return ConnectionTestReport.from(safeResult);
+                    });
+        } catch (TapstateException failure) {
+            throw ConnectionTestResultRedactor.redact(failure, secretValues);
         }
-        return auditGate.dispatch(
-                ControlOperations.CONNECTION_TEST,
-                new AuditContext(principal, config.id()),
-                () -> {
-                    ConnectionTestResult result = probe.probe(config);
-                    ConnectionTestResult safeResult = sourceConnections == null
-                            ? ConnectionTestResultRedactor.redact(
-                                    result, ConnectionTestResultRedactor.sharedSecretValues(config.settings()))
-                            : sourceConnections.redactDiagnostics(
-                                    result, config.connectorId(), config.settings());
-                    resultStore.save(safeResult);
-                    return ConnectionTestReport.from(safeResult);
-                });
     }
 }

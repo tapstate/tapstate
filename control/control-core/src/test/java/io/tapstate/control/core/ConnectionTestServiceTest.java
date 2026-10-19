@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
@@ -121,6 +122,29 @@ class ConnectionTestServiceTest {
         assertThat(legacy.checks().toString())
                 .contains("authentication rejected", "use the configured key password", "<redacted>")
                 .doesNotContain(password, tlsKey, tlsKeyPassword, sshPassword);
+    }
+
+    @Test
+    void redactsTransportSecretsFromCodedProbeFailures() {
+        String tlsKey = "private-key-sentinel";
+        TapstateException failure = new TapstateException(
+                ControlError.MALFORMED_REQUEST,
+                Map.of("reason", "connector threw after reading " + tlsKey),
+                null);
+        RecordingResultStore store = new RecordingResultStore();
+        ConnectionTestService service = new ConnectionTestService(
+                config -> { throw failure; }, store, gate(new RecordingAuditStore()));
+
+        Throwable observed = catchThrowable(() -> service.test(
+                "conn-orders", "mysql", Map.of("sslKey", tlsKey), "alice"));
+
+        assertThat(observed).isInstanceOf(TapstateException.class);
+        TapstateException safeFailure = (TapstateException) observed;
+        assertThat(safeFailure.code()).isEqualTo(failure.code());
+        assertThat(safeFailure.args().get("reason"))
+                .isEqualTo("connector threw after reading <redacted>");
+        assertThat(safeFailure.getMessage()).doesNotContain(tlsKey);
+        assertThat(store.saved).isNull();
     }
 
     @Test
