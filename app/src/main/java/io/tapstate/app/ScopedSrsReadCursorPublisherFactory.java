@@ -25,6 +25,24 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
             if (!bound.store().advanceReadSequence(run.context(),run.membershipRevision(),table,sequence,run.originalClaim())) throw ScopedSrsConsumerAccess.refused(run);
         };
     }
+    @Override public io.tapstate.runtime.srs.SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {
+        if (ring == null || ring.isBlank()) throw new IllegalArgumentException("blank original ring");
+        var bound = ScopedSrsConsumerAccess.bind(member,run); var models = bound.models().guardedBy(bound.requireActive());
+        return (item,sequence) -> {
+            bound.requireClaim(null); var progress = bound.progress();
+            if (!progress.cursor().perTableSeq().containsKey(table)) throw ScopedSrsConsumerAccess.refused(run);
+            if (sequence < 0 || sequence == Long.MAX_VALUE || item.epoch() < 1 || item.epoch() == Long.MAX_VALUE
+                    || item.schemaVer() == Long.MAX_VALUE || item.captureFence() == null) throw unavailable(ring,item);
+            var expected = new io.tapstate.spi.store.SrsModelKey(run.miningChainId(),table,run.scope().cacheIncarnation(),item.epoch(),item.schemaVer());
+            var model = models.requireEvent(expected,ring,sequence,item.captureFence());
+            if (model == null || !expected.equals(model.key()) || !ring.equals(model.ringName())) throw unavailable(ring,item);
+            bound.requireClaim(null);
+        };
+    }
+    private static io.tapstate.core.common.TapstateException unavailable(String ring,io.tapstate.runtime.srs.SrsItem item) {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.SRS_EVENT_MODEL_UNAVAILABLE,
+                java.util.Map.of("ring",ring,"epoch",String.valueOf(item.epoch()),"version",String.valueOf(item.schemaVer())),null);
+    }
     @Override public Optional<ChainPosition> confirmedPosition(HazelcastInstance member) {
         var held = progress(member);
         return Optional.ofNullable(held.cursor().sinkAckedByTable().get(table))

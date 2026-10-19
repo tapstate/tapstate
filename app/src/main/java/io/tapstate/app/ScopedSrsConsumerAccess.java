@@ -14,9 +14,10 @@ final class ScopedSrsConsumerAccess {
         Runnable requireActive = () -> { if (!run.originalClaim().equals(authorization.require(fence))) throw refused(run); };
         requireActive.run();
         if (!(member.getUserContext().get(SrsStoreViews.USER_CONTEXT_KEY) instanceof SrsStoreViews views)) throw refused(run);
-        return new Bound(run,views.srs(run.cacheScope(),requireActive).consumers().guardedBy(requireActive),requireActive);
+        var stores = views.srs(run.cacheScope(),requireActive);
+        return new Bound(run,stores.consumers().guardedBy(requireActive),stores.models(),requireActive);
     }
-    record Bound(SrsConsumerRun run,SrsConsumerStore store,Runnable requireActive) {
+    record Bound(SrsConsumerRun run,SrsConsumerStore store,SrsModelStore models,Runnable requireActive) {
         void requireClaim(WorkloadClaimFence claimed) { requireActive.run(); if (claimed != null && !run.originalClaim().equals(claimed)) throw refused(run); }
         SrsConsumerProgress progress() {
             requireActive.run(); var held = store.progress(run.context()).orElseThrow(() -> refused(run)); requireActive.run();

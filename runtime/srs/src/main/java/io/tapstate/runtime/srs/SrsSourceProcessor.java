@@ -94,6 +94,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private ChainPosition confirmed;
     private LongConsumer cursor;
     private SrsRingReader reader;
+    private SrsEventModelVerifier modelVerifier = SrsEventModelVerifier.NONE;
     // When this run of refusals began, so the bound below measures the stretch the cluster has been
     // saying no rather than one attempt. Armed on the first refusal; an answer clears it, because a
     // later refusal is a new stretch and not a continuation of one the cluster already came back from.
@@ -185,6 +186,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             // the ring's first refusable operation on the initialisation path, which has nowhere to wait: the
             // refusal a forming cluster answers with would end the run before it had read anything, and
             // nothing submits another.
+            modelVerifier = Objects.requireNonNull(ringTail.publisherFactory().modelVerifier(context.hazelcastInstance(),ringName),"model verifier");
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
             ring = new SrsRingbuffer(rb);
             cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
@@ -242,6 +244,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (ringTail != null && !awaitingSnapshot && !holding && openReader()) {
             try {
                 reader.fill((item, seq) -> {
+                    modelVerifier.verify(item,seq);
                     SourceOrder order = orderOf(item, seq);
                     pending.add(SrsProjection.toEnvelope(item, src, order));
                     read = order;

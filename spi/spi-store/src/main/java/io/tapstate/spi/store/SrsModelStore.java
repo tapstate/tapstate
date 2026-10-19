@@ -20,6 +20,14 @@ public interface SrsModelStore {
      */
     Optional<Map<String, SrsModel>> publishedForNewSnapshot(String miningChainId, Map<String, String> tableRings);
 
+    /**
+     * Resolve the exact model used by one hot or replayed event. The original recorded CAPTURE fence,
+     * ring and sequence must belong to that model's retained effective range; the capture need not still
+     * be live for historical replay. The caller's original reader lifecycle is retained by guardedBy.
+     * This reads existing facts only and never publishes or falls back to a discovery result.
+     */
+    SrsModel requireEvent(SrsModelKey expected, String ringName, long sequence, WorkloadClaimFence originalCapture);
+
     /** Historical lookup is exact, never a request for the latest discovery result. */
     Optional<SrsModel> load(SrsModelKey key);
 

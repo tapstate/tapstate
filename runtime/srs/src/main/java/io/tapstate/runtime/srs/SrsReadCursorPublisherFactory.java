@@ -39,6 +39,11 @@ public interface SrsReadCursorPublisherFactory extends Serializable {
         return Optional.empty();
     }
 
+    /** Scoped consumers resolve exact model validation on the executing member before projection. */
+    default SrsEventModelVerifier modelVerifier(HazelcastInstance member, String ringName) {
+        return SrsEventModelVerifier.NONE;
+    }
+
     /** The table's confirmed cursor or explicit arrival marker, excluding mere read progress. */
     default java.util.OptionalLong recoverySequence(HazelcastInstance member) {
         return java.util.OptionalLong.empty();

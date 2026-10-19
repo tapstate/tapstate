@@ -103,6 +103,23 @@ public final class MongoSrsModelStore implements SrsModelStore {
             return model;
         });
     }
+    @Override public SrsModel requireEvent(SrsModelKey expected, String ring, long sequence, WorkloadClaimFence originalCapture) {
+        Objects.requireNonNull(expected, "expected"); requireScope(expected);
+        if (ring == null || ring.isBlank() || sequence < 0 || sequence == Long.MAX_VALUE) throw new IllegalArgumentException("invalid event model coordinates");
+        return transaction(session -> {
+            requireBusiness(session);
+            try {
+                var reference = eventReference(session, ring, expected.captureEpoch(), expected.modelVersion(), originalCapture, false);
+                if (!expected.equals(reference.model().key())) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
+                reference.range().requireAt(sequence, ring, expected.captureEpoch(), expected.modelVersion());
+                return reference.model();
+            } catch (TapstateException missing) {
+                if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
+                throw missing;
+            }
+        });
+    }
+
     @Override public Optional<Map<String, SrsModel>> publishedForNewSnapshot(String chainId, Map<String, String> tableRings) {
         if (chainId == null || chainId.isBlank()) throw new IllegalArgumentException("blank mining chain");
         Map<String, String> selected = Map.copyOf(Objects.requireNonNull(tableRings, "tableRings"));
@@ -285,13 +302,15 @@ public final class MongoSrsModelStore implements SrsModelStore {
         }
     }
     private EventModelRange eventRange(ClientSession session, String ring, SrsLogRecord event, boolean writing) {
-        if (event.schemaVer() < 0 || event.epoch() < 1 || event.captureFence() == null) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
-        var fence = event.captureFence();
+        return eventReference(session, ring, event.epoch(), event.schemaVer(), event.captureFence(), writing).range();
+    }
+    private ModelReference eventReference(ClientSession session, String ring, long epoch, long version, WorkloadClaimFence fence, boolean writing) {
+        if (version < 0 || epoch < 1 || fence == null) throw eventUnavailable(ring, epoch, version);
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())) throw claimFenced();
         var candidates = SystemCollections.SRS_MODELS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
-                .append("ringName", ring).append("_id.captureContext.epoch", event.epoch()).append("_id.modelVersion", event.schemaVer()))
+                .append("ringName", ring).append("_id.captureContext.epoch", epoch).append("_id.modelVersion", version))
                 .limit(2).into(new java.util.ArrayList<>());
-        if (candidates.isEmpty()) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+        if (candidates.isEmpty()) throw eventUnavailable(ring, epoch, version);
         if (candidates.size() != 1) throw unreadable();
         SrsModel model = decode(candidates.getFirst());
         Document chain = requireChain(session, model.key());
@@ -300,21 +319,21 @@ public final class MongoSrsModelStore implements SrsModelStore {
         contexts.requireAnchor(session, chain, control);
         if (!fence.equals(control.fence())) throw claimFenced();
         if (writing && (!fence.key().resourceId().equals(chain.get("captureId"))
-                || !Long.valueOf(event.epoch()).equals(chain.get("epoch")) || control.nextId() != null)) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+                || !Long.valueOf(epoch).equals(chain.get("epoch")) || control.nextId() != null)) throw eventUnavailable(ring, epoch, version);
         requirePublished(control, model);
         EventModelRange range = range(session, model, control);
         if (writing) {
-            if (chain.getLong("modelWriteFence") >= Long.MAX_VALUE - 1) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+            if (chain.getLong("modelWriteFence") >= Long.MAX_VALUE - 1) throw eventUnavailable(ring, epoch, version);
             // Capture replacement and context closure both write this root, including when claim IDs differ.
             Document expected = new Document("_id", chain.get("_id")).append("cacheIncarnation", scope.cacheIncarnation())
-                    .append("epoch", event.epoch()).append("captureId", fence.key().resourceId())
+                    .append("epoch", epoch).append("captureId", fence.key().resourceId())
                     .append("modelContextHeads", chain.get("modelContextHeads")).append("modelWriteFence", chain.get("modelWriteFence"));
             if (SystemCollections.SRS_CHAINS.on(database).updateOne(session, expected,
                     new Document("$inc", new Document("modelWriteFence", 1L))).getMatchedCount() != 1) {
-                throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+                throw eventUnavailable(ring, epoch, version);
             }
         }
-        return range;
+        return new ModelReference(model, control.fence(), range);
     }
 
     private EventModelRange range(ClientSession session, SrsModel model, MongoSrsModelContexts.Context control) {
@@ -342,8 +361,11 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     record EventModelRange(long firstSequence, Long nextSequence) {
         void requireAt(long sequence, String ring, SrsLogRecord event) {
+            requireAt(sequence, ring, event.epoch(), event.schemaVer());
+        }
+        void requireAt(long sequence, String ring, long epoch, long version) {
             if (sequence < firstSequence || (nextSequence != null && sequence >= nextSequence)) {
-                throw eventUnavailable(ring, event.epoch(), event.schemaVer());
+                throw eventUnavailable(ring, epoch, version);
             }
         }
     }

@@ -617,6 +617,47 @@ class MongoSrsModelStoreIT {
     }
 
     @Test
+    void eventProjectionResolvesTheExactHistoricalModelAndItsEffectiveRange() {
+        withBusiness(f -> {
+            var first=model(0,table("original",null));var second=new SrsModel(key(1),RING,table("changed",null),100);
+            f.models().publish(first,f.fence());f.models().publish(second,f.fence());
+            assertThat(f.models().requireEvent(first.key(),RING,99,f.fence())).isEqualTo(first);
+            assertThat(f.models().requireEvent(second.key(),RING,100,f.fence())).isEqualTo(second);
+            assertThatThrownBy(() -> f.models().requireEvent(first.key(),RING,100,f.fence())).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            assertThatThrownBy(() -> f.models().requireEvent(second.key(),RING,99,f.fence())).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            var wrongTable=new SrsModelKey(CHAIN,"another-table",SCOPE.cacheIncarnation(),7,0);
+            assertThatThrownBy(() -> f.models().requireEvent(wrongTable,RING,99,f.fence())).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            assertThatThrownBy(() -> f.models().requireEvent(first.key(),"another-ring",99,f.fence())).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            var changedFence=new WorkloadClaimFence(f.fence().key(),f.fence().owner(),f.fence().claimGeneration()+1,f.fence().executionGeneration(),f.fence().topologyRevision());
+            assertThatThrownBy(() -> f.models().requireEvent(first.key(),RING,99,changedFence)).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        });
+    }
+
+    @Test
+    void historicalModelProjectionUsesTheRecordedCaptureFenceAfterItsLeaseEndsWithoutWritingClaims() {
+        withBusiness(f -> {
+            var original=model(0,table("original",null));f.models().publish(original,f.fence());
+            var claims=new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            assertThat(claims.release(f.claim())).isTrue();var before=claim(f.database());
+            assertThat(f.models().requireEvent(original.key(),RING,4,f.fence())).isEqualTo(original);
+            assertThat(claim(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void losingTheSuccessorBodyCannotReopenThePreviousModelRangeForHotProjection() {
+        withBusiness(f -> {
+            var first=model(0,table("original",null));var second=new SrsModel(key(1),RING,table("changed",null),100);
+            f.models().publish(first,f.fence());f.models().publish(second,f.fence());
+            models(f.database()).deleteOne(new Document("_id.modelVersion",1L));
+            assertThat(f.models().requireEvent(first.key(),RING,99,f.fence())).isEqualTo(first);
+            assertThatThrownBy(() -> f.models().requireEvent(first.key(),RING,100,f.fence())).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            assertThatThrownBy(() -> f.models().requireEvent(second.key(),RING,100,f.fence())).satisfies(MongoSrsModelStoreIT::eventUnavailable);
+            assertThat(models(f.database()).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
     void actualVersionZeroIsRequiredBeforeOneAndCannotBeBackfilledAfterItIsLost() {
         withBusiness(f -> {
             assertThatThrownBy(() -> f.models().publish(new SrsModel(key(1), RING, table("no-initial", null), 1), f.fence()))

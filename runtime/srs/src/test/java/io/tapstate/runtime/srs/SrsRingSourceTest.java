@@ -110,6 +110,25 @@ class SrsRingSourceTest {
     }
 
     @Test
+    void modelVerifierMustRunBeforeRawItemsReachThePipeline() throws Exception {
+        String ring="srs.chain.raw-model-rejection",sink="out-raw-model-rejection";fill(ring,1);
+        var checks=new java.util.concurrent.atomic.AtomicInteger();var cursor=new java.util.concurrent.atomic.AtomicLong(-1);
+        hz.getUserContext().put(SrsSourceProcessorTest.MODEL_CHECKS,checks);hz.getUserContext().put(SrsSourceProcessorTest.MODEL_CURSOR,cursor);
+        Pipeline pipeline=Pipeline.create();pipeline.readFrom(SrsRingSource.create(ring,StartFrom.earliest(),new SrsSourceProcessorTest.ModelVerifyingPublisher(),null))
+                .withoutTimestamps().writeTo(Sinks.list(sink));
+        var out=hz.<SrsItem>getList(sink);Job job=hz.getJet().newJob(pipeline);
+        try {
+            long deadline=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+            while(out.isEmpty()&&!job.getFuture().isDone()&&System.nanoTime()<deadline)Thread.sleep(10);
+            assertThat(checks.get()).as("the member model check ran before downstream delivery").isPositive();
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> job.getFuture().get(10,java.util.concurrent.TimeUnit.SECONDS)).hasStackTraceContaining("io.srs-event-model-unavailable");
+            assertThat(out).isEmpty();assertThat(cursor.get()).isEqualTo(-1);
+        } finally {
+            if(!job.getFuture().isDone())job.cancel();hz.getUserContext().remove(SrsSourceProcessorTest.MODEL_CHECKS);hz.getUserContext().remove(SrsSourceProcessorTest.MODEL_CURSOR);out.destroy();
+        }
+    }
+
+    @Test
     void streamsRingChangesToADownstreamJetStageInOrder() throws InterruptedException {
         fill("srs.chain.orders", 5);
 

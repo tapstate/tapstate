@@ -31,6 +31,8 @@ class ScopedSrsReadCursorPublisherFactoryTest {
         verify(f.store).advanceReadSequence(RUN.context(),4,"orders",99,FENCE);
         assertThat(copied.recoverySequence(f.member)).hasValue(5); assertThat(copied.confirmedPosition(f.member)).isEmpty();
         verify(f.store,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+        when(f.models.requireEvent(MODEL,RING,12,CAPTURE)).thenReturn(ACTUAL);
+        copied.modelVerifier(f.member,RING).verify(item(),12);verify(f.models).requireEvent(MODEL,RING,12,CAPTURE);
     }
     @Test void epochEndBoundsAndMissingFloorsNeverBecomePhysicalRecoveryPositions() {
         var f = new Fixture(); var reader = new ScopedSrsReadCursorPublisherFactory(RUN,"orders");
@@ -50,6 +52,52 @@ class ScopedSrsReadCursorPublisherFactoryTest {
         assertThatThrownBy(() -> publish.accept(21)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::refused);
         verify(f.store,never()).advanceReadSequence(any(),anyLong(),anyString(),anyLong(),any());
     }
+    private static final String RING = "ring-original";
+    private static final WorkloadClaimFence CAPTURE = new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),new WorkloadOwner("capture-node","capture-boot"),6,2,9);
+    private static final SrsModelKey MODEL = new SrsModelKey("chain","orders","cache",3,2);
+    private static final SrsModel ACTUAL = new SrsModel(MODEL,RING,new SourceTable("orders",List.of(new SourceField("id","int")),List.of("id"),List.of()),10);
+    private static io.tapstate.runtime.srs.SrsItem item() { return new io.tapstate.runtime.srs.SrsItem(null,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",1),2,CAPTURE,3); }
+
+    @Test void eventModelVerifierUsesTheOriginalConsumerAndHistoricalCaptureContext() {
+        var f=new Fixture();f.held.set(progress(4,5L,null));when(f.models.requireEvent(MODEL,RING,12,CAPTURE)).thenReturn(ACTUAL);
+        new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING).verify(item(),12);
+        verify(f.models).requireEvent(MODEL,RING,12,CAPTURE);verify(f.models,never()).load(any());verify(f.store,never()).advanceReadSequence(any(),anyLong(),anyString(),anyLong(),any());
+    }
+    @Test void eventModelVerifierPropagatesMissingModelWithoutFallingBackToLatest() {
+        var f=new Fixture();f.held.set(progress(4,5L,null));when(f.models.requireEvent(MODEL,RING,12,CAPTURE)).thenThrow(modelUnavailable());
+        assertThatThrownBy(() -> new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING).verify(item(),12)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::missingModel);
+        verify(f.models,never()).load(any());
+    }
+    @Test void eventModelVerifierRejectsAReplacedMembership() {
+        var f=new Fixture();f.held.set(progress(4,5L,null));var verifier=new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING);
+        f.held.set(progress(5,5L,null));assertThatThrownBy(() -> verifier.verify(item(),12)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::refused);
+        verify(f.models,never()).requireEvent(any(),anyString(),anyLong(),any());
+    }
+    @Test void eventModelVerifierRechecksAuthorizationAfterTheModelRead() {
+        var f=new Fixture();f.held.set(progress(4,5L,null));when(f.models.requireEvent(MODEL,RING,12,CAPTURE)).thenAnswer(call -> {f.active.set(false);return ACTUAL;});
+        assertThatThrownBy(() -> new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING).verify(item(),12)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::refused);
+    }
+    @Test void eventModelVerifierDoesNotAdoptAWrongReturnedModel() {
+        var f=new Fixture();f.held.set(progress(4,5L,null));when(f.models.requireEvent(MODEL,RING,12,CAPTURE)).thenReturn(new SrsModel(new SrsModelKey("chain","orders","cache",3,1),RING,ACTUAL.table(),1));
+        assertThatThrownBy(() -> new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING).verify(item(),12)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::missingModel);
+    }
+    @Test void eventModelVerifierAcceptsActualVersionZero() {
+        var f=new Fixture();f.held.set(progress(4,5L,null));var key=new SrsModelKey("chain","orders","cache",3,0);
+        var actual=new SrsModel(key,RING,ACTUAL.table(),0);when(f.models.requireEvent(key,RING,0,CAPTURE)).thenReturn(actual);
+        var event=new io.tapstate.runtime.srs.SrsItem(null,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",1),0,CAPTURE,3);
+        new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING).verify(event,0);verify(f.models).requireEvent(key,RING,0,CAPTURE);
+    }
+    @Test void eventModelVerifierRejectsMissingCaptureIdentityBeforeLookingUpAModel() {
+        var f=new Fixture();f.held.set(progress(4,5L,null));var verifier=new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING);
+        for(var event:List.of(new io.tapstate.runtime.srs.SrsItem(null,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",1),0,null,3),
+                new io.tapstate.runtime.srs.SrsItem(null,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",1),0,CAPTURE,0))) {
+            assertThatThrownBy(() -> verifier.verify(event,0)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::missingModel);
+        }
+        verify(f.models,never()).requireEvent(any(),anyString(),anyLong(),any());
+    }
+    private static TapstateException modelUnavailable() { return new TapstateException(IoError.SRS_EVENT_MODEL_UNAVAILABLE,Map.of("ring",RING,"epoch","3","version","2"),null); }
+    private static void missingModel(Throwable failure) {assertThat(failure).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(IoError.SRS_EVENT_MODEL_UNAVAILABLE));}
+
     private static SrsConsumerProgress progress(long membership,Long floor,ChainPosition confirmed) {
         var cursor = new ConsumerOffset(RUN.context().key().consumerId(),Map.of("orders",99L),null,List.of(),null,0,
                 confirmed == null ? Map.of() : Map.of("orders",confirmed),ConsumerProgressKind.SRS);
@@ -59,6 +107,7 @@ class ScopedSrsReadCursorPublisherFactoryTest {
     private static final class Fixture {
         final HazelcastInstance member = mock(HazelcastInstance.class);
         final SrsConsumerStore store = mock(SrsConsumerStore.class);
+        final SrsModelStore models = mock(SrsModelStore.class);
         final AtomicReference<SrsConsumerProgress> held = new AtomicReference<>();
         final AtomicBoolean active = new AtomicBoolean(true);
         Fixture() {
@@ -69,8 +118,9 @@ class ScopedSrsReadCursorPublisherFactoryTest {
                 if (!active.get()) throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline","pipeline"),null); return FENCE;
             });
             context.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);
-            SrsStoreViews views = (scope,guard) -> { assertThat(scope).isEqualTo(RUN.cacheScope()); guard.run(); return new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),store); };
+            SrsStoreViews views = (scope,guard) -> { assertThat(scope).isEqualTo(RUN.cacheScope()); guard.run(); return new SrsStores(mock(SrsChainStore.class),models,mock(SrsLogStore.class),store); };
             context.put(SrsStoreViews.USER_CONTEXT_KEY,views);
+            when(models.guardedBy(any())).thenReturn(models);
             when(store.guardedBy(any())).thenReturn(store); when(store.progress(RUN.context())).thenAnswer(call -> Optional.ofNullable(held.get()));
             when(store.advanceReadSequence(any(),anyLong(),anyString(),anyLong(),any())).thenReturn(true);
         }

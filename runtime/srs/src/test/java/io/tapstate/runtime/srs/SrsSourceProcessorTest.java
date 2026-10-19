@@ -90,6 +90,37 @@ class SrsSourceProcessorTest {
         }
     }
 
+    static final String MODEL_CHECKS = "test.source.model.checks";
+    static final String MODEL_CURSOR = "test.source.model.cursor";
+    @Test
+    void modelVerifierMustRunBeforeAHotItemIsProjectedOrItsReadCursorAdvances() throws Exception {
+        String ring="srs.chain.model-rejection",sink="out-model-rejection";fill(ring,1);
+        var checks=new AtomicInteger();var cursor=new java.util.concurrent.atomic.AtomicLong(-1);
+        hz.getUserContext().put(MODEL_CHECKS,checks);hz.getUserContext().put(MODEL_CURSOR,cursor);
+        var out=hz.<String>getList(sink);Job job=hz.getJet().newJob(projectedDag(ring,"orders",sink,1024,new ModelVerifyingPublisher()));
+        try {
+            long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
+            while(out.isEmpty()&&!job.getFuture().isDone()&&System.nanoTime()<deadline) Thread.sleep(10);
+            assertThat(checks.get()).as("the member model check ran before projection").isPositive();
+            assertThatThrownBy(() -> job.getFuture().get(10,TimeUnit.SECONDS)).hasStackTraceContaining("io.srs-event-model-unavailable");
+            assertThat(out).isEmpty();assertThat(cursor.get()).isEqualTo(-1);
+        } finally {
+            if(!job.getFuture().isDone())job.cancel();hz.getUserContext().remove(MODEL_CHECKS);hz.getUserContext().remove(MODEL_CURSOR);out.destroy();
+        }
+    }
+    record ModelVerifyingPublisher() implements SrsReadCursorPublisherFactory {
+        @Override public LongConsumer resolve(HazelcastInstance member) {
+            return sequence -> ((java.util.concurrent.atomic.AtomicLong)member.getUserContext().get(MODEL_CURSOR)).set(sequence);
+        }
+        @Override public SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {
+            return (item,sequence) -> {
+                ((AtomicInteger)member.getUserContext().get(MODEL_CHECKS)).incrementAndGet();
+                throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.SRS_EVENT_MODEL_UNAVAILABLE,
+                        Map.of("ring",ring,"epoch",String.valueOf(item.epoch()),"version",String.valueOf(item.schemaVer())),null);
+            };
+        }
+    }
+
     @Test
     void streams_changes_projected_to_envelopes_carrying_the_stream_name_and_source_position()
             throws InterruptedException {

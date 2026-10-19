@@ -162,6 +162,7 @@ class SrsSnapshotPreparationTest {
             if (!published) return Optional.empty(); var answer = new HashMap<String,SrsModel>(); rings.forEach((table,ring) -> answer.put(table,model(table,2))); return Optional.of(answer);
         }
         @Override public Optional<SrsModel> load(SrsModelKey key) { exactReads++; assertThat(key.modelVersion()).isEqualTo(2); return Optional.of(model(key.table(),2)); }
+        @Override public SrsModel requireEvent(SrsModelKey key,String ring,long sequence,WorkloadClaimFence fence) { throw new AssertionError("snapshot pinning must not resolve an event range"); }
         @Override public SrsModel publish(SrsModel model,WorkloadClaimFence fence) { throw new AssertionError("Pipeline pin cannot publish a model"); }
         @Override public Optional<SrsConsumerMembership> find(SrsConsumerKey key) { throw new AssertionError(); }
         @Override public SrsConsumerTopology attached(String chain) { throw new AssertionError(); }
