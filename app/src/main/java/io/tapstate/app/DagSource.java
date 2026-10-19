@@ -243,12 +243,34 @@ interface DagSource {
         Function<ExecutionFence, PlannedDag> plan();
     }
 
+    /** The exact member snapshot used by a deferred topology, available before its capture opens. */
+    record PlannedTopology(List<String> members, Function<ExecutionFence, PlannedDag> builder)
+            implements Function<ExecutionFence, PlannedDag> {
+        public PlannedTopology {
+            members = List.copyOf(members); Objects.requireNonNull(builder, "builder");
+            if (members.isEmpty() || members.stream().anyMatch(String::isBlank)
+                    || Set.copyOf(members).size() != members.size()) throw new IllegalArgumentException("invalid planned member set");
+        }
+        @Override public PlannedDag apply(ExecutionFence fence) {
+            PlannedDag built = Objects.requireNonNull(builder.apply(fence), "built topology");
+            if (!members.equals(built.members())) throw new IllegalStateException("built topology changed its planned members");
+            return built;
+        }
+    }
+
     /** A start whose run has been planned, and whose topology is built once its capture is open. */
     record PlannedStart(StartPreparation preparation, Function<ExecutionFence, PlannedDag> dagBuilder) {
 
         public PlannedStart {
             Objects.requireNonNull(preparation, "preparation");
             Objects.requireNonNull(dagBuilder, "dagBuilder");
+        }
+
+        /** Scoped preparation cannot certify a topology whose member snapshot was not retained. */
+        List<String> members() {
+            if (!(dagBuilder instanceof PlannedTopology topology))
+                throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            return topology.members();
         }
 
         /**

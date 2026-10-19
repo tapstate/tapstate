@@ -715,7 +715,7 @@ final class StoreBackedDagSource implements DagSource {
                                 nestTablesByAlias(pipeline,sourceTablesByName(sourceVertices))::get) : operators.coordinates().blockingVertices(),
                         sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
-        return fence -> {
+        return new PlannedTopology(planned, fence -> {
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
@@ -725,7 +725,7 @@ final class StoreBackedDagSource implements DagSource {
                     shape, drawn);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
                     drawn.feedingByNode());
-        };
+        });
     }
 
     /**

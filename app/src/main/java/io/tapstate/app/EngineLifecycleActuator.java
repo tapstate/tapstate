@@ -67,6 +67,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final Clock clock;
     private final ConnectorReadiness connectors;
     private final Map<String, Long> waitingForCapture = new ConcurrentHashMap<>();
+    private final ScopedEngineLifecycleActuator.Submissions scopedSubmissions = new ScopedEngineLifecycleActuator.Submissions();
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
@@ -102,6 +103,12 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.connectors = Objects.requireNonNull(connectors, "connectors");
         captureCoordinator.runOnlyWhileDriving(actuation::isDriving);
+    }
+
+    /** Reuses this assembly without registering a second global capture ownership predicate. */
+    LifecycleActuator forPass(PipelineConvergencePass pass, ScopedEngineLifecycleActuator.Ports ports) {
+        return new ScopedEngineLifecycleActuator(pass, engine, dagSource, captureCoordinator, actuation,
+                stateTeardown.defaultDatabase(), connectors, clock, ports, scopedSubmissions);
     }
 
     @Override

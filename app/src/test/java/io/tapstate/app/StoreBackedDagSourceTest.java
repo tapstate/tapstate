@@ -1231,6 +1231,27 @@ class StoreBackedDagSourceTest {
                 });
     }
 
+    @Test
+    void operatorPreparationAndTheDeferredTopologyKeepTheSameOriginalMembers() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("src", "orders")); store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("src", true)), null,
+                null, serve(FromRef.literal("src"), sync("sync", "dest")), null, null));
+        store.schemas.save(new DiscoveredSourceModel("src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(new SourceField("id", "bigint", TapstateType.INT64)),
+                        List.of("id"), List.of())))));
+        var members = new java.util.ArrayList<>(List.of("node-a", "node-b"));
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var source = new StoreBackedDagSource(store, io.tapstate.runtime.engine.nest.NestSettings.defaults(),
+                StoreReachability.assumingReachable(), io.tapstate.runtime.srs.SourcePlacement.anyMember(),
+                () -> { reads.incrementAndGet(); return members; }, io.tapstate.core.lifecycle.ParallelismBudget.DEFAULTS);
+        var planned = source.prepareStart("p", "tapstate").plan();
+        assertThat(planned.members()).containsExactly("node-a", "node-b");
+        members.clear(); members.add("replacement");
+        assertThat(planned.build(null).planned().members()).containsExactly("node-a", "node-b");
+        assertThat(planned.members()).containsExactly("node-a", "node-b"); assertThat(reads.get()).isOne();
+    }
+
     // ---- fixtures ----------------------------------------------------------------------
 
     private static SourceResource cdcSource(String id, String table) {

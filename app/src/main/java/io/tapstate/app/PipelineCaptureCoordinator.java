@@ -15,6 +15,11 @@ import java.util.function.Predicate;
  */
 interface PipelineCaptureCoordinator {
 
+    /** A scoped lifecycle captures the original run separately from its current command authority. */
+    default PipelineCaptureCoordinator forRun(io.tapstate.spi.store.PipelineIntentScope commandScope, io.tapstate.spi.store.WorkloadClaimFence command, ExecutionFence original) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /** Keeps a shared claim only while the capture serves a pipeline driven here, preserving durable positions. */
     default void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
     }
