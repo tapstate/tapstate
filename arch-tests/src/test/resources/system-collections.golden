@@ -66,6 +66,8 @@ nest_dead_letters | config | MongoRequiredDeadLetterStore | migrated | 1 | _id.c
 srs_model_contexts | cache | MongoSrsModelStore | migrated | 1 | cacheIncarnation+ringName+_id.captureContext.epoch (unique)
 srs_consumers | cache | MongoSrsConsumerStore | migrated | 1 | _id.cacheIncarnation+_id.chain, pipelineId
 srs_consumer_offsets | cache | MongoSrsConsumerStore | migrated | 1 | _id.cacheIncarnation+_id.chain
+direct_channel_offsets | cache | MongoDirectChannelStore | migrated | 1 | -
+direct_batches | cache | MongoDirectChannelStore | migrated | 1 | _id.channel+_id.epoch+_id.ordinal
 pipeline_state | cache | MongoCachePipelineStateStore | migrated | 1 | -
 pipeline_observation | cache | MongoCachePipelineObservationStore | migrated | 1 | -
 source_schemas | cache | MongoCacheSchemaStore | migrated | 1 | -

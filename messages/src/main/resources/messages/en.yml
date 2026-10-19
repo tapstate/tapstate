@@ -1144,3 +1144,7 @@ store.invalid-history-retention:
 store.history-retention-mismatch:
   message: "Configured history retention is {configuredSeconds} seconds, but the cache TTL is {storedSeconds} seconds."
   solution: "Stop all Cluster instances, adjust the TTL through database tools, then restart every instance with the same retention. Startup never changes this index."
+
+io.direct-channel-unavailable:
+  message: "Private direct channel {channel} cannot prove its retained recovery state."
+  solution: "Restore the original cache facts or explicitly confirm a full rebuild before continuing."

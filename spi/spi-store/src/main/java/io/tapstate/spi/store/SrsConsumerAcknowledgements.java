@@ -18,14 +18,8 @@ public final class SrsConsumerAcknowledgements {
         Objects.requireNonNull(original,"original"); Objects.requireNonNull(cursor,"cursor"); Objects.requireNonNull(report,"report");
         if (cursor.progressKind() != ConsumerProgressKind.SRS || !original.expected().getOrDefault(table,java.util.List.of()).contains(writer))
             throw new IllegalArgumentException("the report must belong to this consumer run's expected writer");
-        var progress = new LinkedHashMap<>(original.progress());
-        var byWriter = new LinkedHashMap<>(progress.getOrDefault(table,Map.of()));
-        WriterProgress before = byWriter.get(writer);
-        SourceOrder durable = before == null || report.durableThrough().compareTo(before.durableThrough()) > 0 ? report.durableThrough() : before.durableThrough();
-        ChainPosition tokened = before == null ? null : before.lastTokened();
-        if (report.lastTokened() != null && (tokened == null || report.lastTokened().order().compareTo(tokened.order()) > 0)) tokened = report.lastTokened();
-        byWriter.put(writer,new WriterProgress(durable,tokened)); progress.put(table,byWriter);
-        var saved = new SrsConsumerWriterRun(original.membershipRevision(),original.commandFence(),original.runId(),original.expected(),progress);
+        var merged = original.withSnapshotEpoch(cursor.snapshotEpoch() == 0 ? null : cursor.snapshotEpoch()).advance(table,writer,report);
+        var saved = new SrsConsumerWriterRun(original.membershipRevision(),original.commandFence(),original.runId(),original.expected(),merged.progress());
         WriterRun run = saved.withSnapshotEpoch(cursor.snapshotEpoch() == 0 ? null : cursor.snapshotEpoch());
         var answer = WriterFrontier.landed(run,table);
         if (answer.isEmpty() || run.snapshotEpoch() != null && !WriterFrontier.passedLoad(answer.get(),run.snapshotEpoch())) return new Advance(saved,cursor);

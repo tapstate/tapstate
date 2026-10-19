@@ -177,6 +177,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs));
     }
 
+    /** The private direct-channel view retains this exact CACHE identity, client and lifecycle. */
+    public io.tapstate.spi.store.DirectChannelStore directChannels(CacheBusinessScope expected,Runnable requireActive) {
+        Objects.requireNonNull(requireActive,"requireActive");
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        active.run(); loadBusinessScope(expected); new MongoCacheMetadataStructure(database,rateRetention).verifyDirect();
+        return new MongoDirectChannelStore(client,database,expected,active,rateRetention);
+    }
+
     public io.tapstate.spi.store.SchemaStore schemas(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive));
     }

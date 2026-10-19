@@ -25,6 +25,7 @@ final class MongoCacheMetadataStructure {
             SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION,
             SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CHAINS, SystemCollections.SRS_MODELS,
             SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,
+            SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES,
             SystemCollections.CACHE_CLUSTER_MEMBERSHIP, SystemCollections.CACHE_NEST_STATE, SystemCollections.CACHE_JOIN_FACTS,
             SystemCollections.CACHE_JOIN_DIMENSIONS, SystemCollections.CACHE_JOIN_INDEXES, SystemCollections.CACHE_JOIN_WRITERS,
             SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_OPERATOR_CLEANUP)).toList();
@@ -90,6 +91,10 @@ final class MongoCacheMetadataStructure {
         verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.SRS_CHAINS,
                 SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS,
                 SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS));
+    }
+
+    void verifyDirect() {
+        verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.DIRECT_CHANNEL_OFFSETS,SystemCollections.DIRECT_BATCHES));
     }
 
     private void verify(List<SystemCollections> tables) {
