@@ -46,6 +46,51 @@ class HazelcastOperatorReadinessTest {
         }
     }
 
+    @Test void exactHotReleasePreservesColdValuesAndALateOldReleaseLeavesTheReplacementAlone() {
+        try (var f = new RealMembers()) {
+            var readiness = new HazelcastOperatorReadiness(f.a,Duration.ofSeconds(5));
+            var old = manifest(1); readiness.prepare(old,CAPACITIES,List.of("a","b"),() -> {});
+            for (var binding : old.bindings()) {
+                Object key = binding.placement().resource() == OperatorPlacement.Resource.NEST_STATE ? List.of("key") : "key";
+                f.a.getMap(binding.mapName()).set(key,"retained");
+            }
+            assertThat(f.bytes.values).isNotEmpty(); int coldSize = f.bytes.values.size();
+            readiness.releaseHot(old);
+            for (var binding : old.bindings()) {
+                assertThat(f.a.getDistributedObjects()).noneMatch(object -> object.getName().equals(binding.mapName()));
+                if (binding.placement().resource() == OperatorPlacement.Resource.JOIN_FACTS)
+                    assertThatThrownBy(() -> f.registryB.join(binding.mapName())).isInstanceOf(TapstateException.class);
+            }
+            assertThat(f.bytes.values).hasSize(coldSize);
+            var next = manifest(2); readiness.prepare(next,CAPACITIES,List.of("a","b"),() -> {});
+            for (var binding : next.bindings()) {
+                Object key = binding.placement().resource() == OperatorPlacement.Resource.NEST_STATE ? List.of("key") : "key";
+                assertThat(f.b.getMap(binding.mapName()).get(key)).isEqualTo("retained");
+            }
+            readiness.releaseHot(old);
+            for (var binding : next.bindings()) {
+                Object key = binding.placement().resource() == OperatorPlacement.Resource.NEST_STATE ? List.of("key") : "key";
+                f.a.getMap(binding.mapName()).evictAll();
+                assertThat(f.b.getMap(binding.mapName()).get(key)).isEqualTo("retained");
+                var first = binding.placement().resource() == OperatorPlacement.Resource.NEST_STATE
+                        ? f.registryA.nest(binding.mapName(),"cache") : f.registryA.join(binding.mapName());
+                var second = binding.placement().resource() == OperatorPlacement.Resource.NEST_STATE
+                        ? f.registryB.nest(binding.mapName(),"cache") : f.registryB.join(binding.mapName());
+                assertThat(first.count(binding.mapName())).isOne(); assertThat(second.count(binding.mapName())).isOne();
+            }
+            assertThat(f.bytes.values).hasSize(coldSize);
+        }
+    }
+
+    @Test void releaseNeverCreatesAnAbsentHotMapAndRefusesForgedCoordinatesBeforeCleanup() {
+        var f = new MockMembers(); f.readiness().releaseHot(manifest(1));
+        verify(f.member,never()).getMap(anyString());
+        var wrong = new OperatorRunManifest("p",fence(1),List.of(new OperatorMapBinding(CAPACITIES.getFirst().placement(),fence(1),"0".repeat(64))));
+        clearInvocations(f.member);
+        assertThatThrownBy(() -> f.readiness().releaseHot(wrong)).isInstanceOf(TapstateException.class);
+        verify(f.member,never()).getDistributedObjects();
+    }
+
     @Test void oneActualMemberRefusalIsReturnedAsACanonicalCodeAndCannotBeMistakenForPreparation() {
         try (var f = new RealMembers()) {
             f.refuseB.set(true);
@@ -155,6 +200,9 @@ class HazelcastOperatorReadinessTest {
             var executor = mock(IExecutorService.class); when(member.getExecutorService(HazelcastOperatorReadiness.EXECUTOR)).thenReturn(executor);
             answers.put(a,CompletableFuture.completedFuture(new HazelcastOperatorReadiness.Result(identity(a),null)));
             answers.put(b,CompletableFuture.completedFuture(new HazelcastOperatorReadiness.Result(identity(b),null)));
+            when(executor.submitToMembers(any(HazelcastOperatorReadiness.Release.class),anyCollection())).thenAnswer(invocation -> {
+                dispatches.incrementAndGet(); dispatch.run(); return answers;
+            });
             when(executor.submitToMembers(any(HazelcastOperatorReadiness.Install.class),anyCollection())).thenAnswer(invocation -> {
                 var bytes = new ByteArrayOutputStream(); try (var out = new ObjectOutputStream(bytes)) { out.writeObject(invocation.getArgument(0)); }
                 serializedTask.set(bytes.toByteArray()); dispatches.incrementAndGet(); dispatch.run(); return answers;

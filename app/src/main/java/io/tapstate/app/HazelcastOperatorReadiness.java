@@ -71,6 +71,42 @@ final class HazelcastOperatorReadiness {
         }
     }
 
+    /** The caller has already stopped the original writer. Only its exact hot names are released. */
+    void releaseHot(OperatorRunManifest original) {
+        requireOriginal(original);
+        try {
+            Snapshot before = snapshot(original.pipelineId());
+            var names = original.bindings().stream().map(io.tapstate.runtime.engine.OperatorMapBinding::mapName)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
+            // Enumerate existing objects: getMap would recreate a missing old namespace during cleanup.
+            for (var object : member.getDistributedObjects()) {
+                if (object instanceof com.hazelcast.map.IMap<?,?> map && names.contains(object.getName())) {
+                    map.flush(); map.destroy();
+                }
+            }
+            long deadline = System.nanoTime()+timeout.toNanos();
+            Map<Member,Future<Result>> answers = member.getExecutorService(EXECUTOR).submitToMembers(
+                    new Release(original,before.identities()),before.members().values());
+            for (var target : before.members().entrySet()) {
+                Result result = answer(original.pipelineId(),target.getKey(),answers.get(target.getValue()),deadline);
+                if (result == null || !before.identities().get(target.getKey()).equals(result.identity()))
+                    throw refused(original.pipelineId(),target.getKey(),"identity-changed");
+                if (result.refusalCode() != null) throw refused(original.pipelineId(),target.getKey(),result.refusalCode());
+            }
+            if (!before.identities().equals(snapshot(original.pipelineId()).identities()))
+                throw refused(original.pipelineId(),"cluster","membership-changed");
+        } catch (HazelcastInstanceNotActiveException | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
+            throw refused(original.pipelineId(),"cluster","member-unavailable");
+        }
+    }
+    private static void requireOriginal(OperatorRunManifest original) {
+        Objects.requireNonNull(original,"original");
+        if (!(original.executionIdentity() instanceof ExecutionFence fence) || fence.scope() == null
+                || !fence.pipelineId().equals(original.pipelineId())
+                || original.bindings().stream().anyMatch(binding -> !fence.scope().equals(binding.placement().scope())
+                        || !fence.operatorExecutionKey().equals(binding.executionKey()))) throw fenced();
+    }
+
     private Snapshot snapshot(String pipeline) {
         var members = new LinkedHashMap<String,Member>(); var identities = new LinkedHashMap<String,Identity>();
         for (var candidate : member.getCluster().getMembers()) {
@@ -126,6 +162,27 @@ final class HazelcastOperatorReadiness {
                 // Carry only the canonical code, never the enum, credentials or storage exception arguments.
                 return new Result(actual,refused.code().code());
             }
+        }
+    }
+    static final class Release implements Callable<Result>,Serializable,HazelcastInstanceAware {
+        private final OperatorRunManifest original;
+        private final Map<String,Identity> expected;
+        private transient HazelcastInstance member;
+        Release(OperatorRunManifest original,Map<String,Identity> expected) {
+            this.original = Objects.requireNonNull(original,"original"); this.expected = Map.copyOf(expected);
+        }
+        @Override public void setHazelcastInstance(HazelcastInstance member) { this.member = member; }
+        @Override public Result call() {
+            Identity actual = null;
+            try {
+                actual = identity(member.getCluster().getLocalMember());
+                if (!actual.equals(expected.get(actual.nodeId()))) throw fenced();
+                requireOriginal(original);
+                var registry = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member,true);
+                // A later slot is untouched; an already released original is an idempotent result.
+                for (var binding : original.bindings()) registry.release(binding);
+                return new Result(actual,null);
+            } catch (TapstateException refused) { return new Result(actual,refused.code().code()); }
         }
     }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
