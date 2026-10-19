@@ -69,6 +69,8 @@ public final class MongoConfigurationBootstrap {
                             }
                             if (!emptyTarget) throw refused();
                             SystemCollections.CAPTURE_PREPARATIONS.prepareCollectionOn(database,session);
+                            for(var index:SystemCollections.CAPTURE_PREPARATIONS.indexes())
+                                IndexEnsure.createInTransaction(session,SystemCollections.CAPTURE_PREPARATIONS.on(database),index);
                             SystemCollections.STORAGE_SETUP.on(database).insertOne(session,
                                     new Document("_id", "cluster").append("clusterId", clusterId)
                                             .append("installationId", installationId).append("operationId", operationId)

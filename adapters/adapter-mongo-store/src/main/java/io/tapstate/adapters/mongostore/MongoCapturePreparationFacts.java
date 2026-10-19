@@ -33,6 +33,13 @@ final class MongoCapturePreparationFacts {
         if(indexes.stream().anyMatch(index -> index.containsKey("expireAfterSeconds")))throw unreadable();
         var id=indexes.stream().filter(index -> "_id_".equals(index.get("name"))).findFirst().orElse(null);
         if(id==null || !new Document("_id",1).equals(id.get("key")) || Boolean.TRUE.equals(id.get("hidden")) || Boolean.TRUE.equals(id.get("sparse")) || id.containsKey("partialFilterExpression"))throw unreadable();
+        for(var expected:table.indexes()) {
+            var keys=new Document();expected.keys().forEach(key -> keys.append(key,1));
+            var foundIndex=indexes.stream().filter(index -> expected.indexName().equals(index.get("name"))).findFirst().orElse(null);
+            if(foundIndex==null || !keys.equals(foundIndex.get("key")) || Boolean.TRUE.equals(foundIndex.get("unique"))
+                    || Boolean.TRUE.equals(foundIndex.get("hidden")) || Boolean.TRUE.equals(foundIndex.get("sparse"))
+                    || foundIndex.containsKey("partialFilterExpression"))throw unreadable();
+        }
     }
     static TapstateException unreadable(){return new TapstateException(IoError.DOCUMENT_UNREADABLE,Map.of("id","capture-preparation","field","original-facts"),null);}
     static TapstateException fenced(){return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}

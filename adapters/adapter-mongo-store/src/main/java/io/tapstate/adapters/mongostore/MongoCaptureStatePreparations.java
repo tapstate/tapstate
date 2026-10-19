@@ -60,6 +60,16 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
             // This is the existing CONFIG contention point used by authoring, binding and rebuild.
             // A dependency changed after our snapshot must abort and revalidate before any grant.
             ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            if(mode==CapturePreparation.Mode.SHARED_SRS) {
+                var prior=table.find(session,new Document("_id.clusterId",scope.clusterId()).append("_id.bindingVersion",scope.bindingVersion())
+                        .append("_id.capture",OperatorStateText.encode(capture))).first();
+                if(prior!=null) {
+                    var previous=MongoCapturePreparationFacts.decode(prior);
+                    if(previous.mode()!=mode || !previous.chainId().equals(chain))throw MongoCapturePreparationFacts.unreadable();
+                }
+                // Necessary notes survive CACHE replacement; a prior incarnation forbids scope repair.
+                artifacts.prepareSharedCaptureNotes(session,scope.bindingVersion(),chain,prior!=null);
+            }
             table.insertOne(session,MongoCapturePreparationFacts.row(preparation));
             return new Issuance(preparation,true,MongoStorageBindingStore.targetFingerprint(binding.cache()),source.srs()==null?null:source.srs().retention());
         });

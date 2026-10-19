@@ -202,6 +202,14 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return result;
     }
 
+    /** The first committed capture control reserves this known-new shared namespace in its CONFIG transaction. */
+    void prepareSharedCaptureNotes(ClientSession session,long binding,String chain,boolean knownCapture) {
+        var owner=new io.tapstate.spi.store.RequiredNoteOwner(binding,"pdk.chain."+chain,
+                io.tapstate.spi.store.RequiredNoteOwner.Kind.CHAIN,chain,0);
+        if(knownCapture)notes.open(session,owner);
+        else notes.initialize(session,owner);
+    }
+
     private void reservePrivateScopes(ClientSession session,
             Map<String, Set<PipelineConnectorNodes.Identity>> before, List<ArtifactWrite> requested) {
         Map<String, Set<PipelineConnectorNodes.Identity>> after = privateNodes(session);

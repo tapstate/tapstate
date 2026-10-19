@@ -257,6 +257,51 @@ class MongoCapturePreparationsIT {
             }
         });
     }
+    @ParameterizedTest @EnumSource(CapturePreparation.Mode.class)
+    void onlyTheWinningSharedCaptureReservesNecessaryChainNotes(CapturePreparation.Mode mode) {
+        withFixture(mode,f -> {
+            var first=f.issue(f.request);var owner=new RequiredNoteOwner(f.scope.bindingVersion(),"pdk.chain."+first.preparation().chainId(),RequiredNoteOwner.Kind.CHAIN,first.preparation().chainId(),0);
+            var filter=new Document("ownerKind","CHAIN").append("ownerId",owner.ownerId());
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.config).countDocuments(filter)).isEqualTo(mode==CapturePreparation.Mode.SHARED_SRS?1:0);
+            if(mode==CapturePreparation.Mode.SHARED_SRS) {
+                var token=f.configuration.requiredNotes().open(owner);
+                assertThat(f.configuration.capturePreparations().issueFirstCreate(f.request)).isInstanceOf(CaptureCreationResult.AlreadyIssued.class);
+                assertThat(f.configuration.requiredNotes().open(owner)).isEqualTo(token);
+                SystemCollections.PDK_NOTE_SCOPES.on(f.config).deleteOne(filter);
+                assertThat(f.configuration.capturePreparations().issueFirstCreate(f.request)).isInstanceOf(CaptureCreationResult.AlreadyIssued.class);
+                assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.config).countDocuments(filter)).isZero();
+                assertCode(() -> f.configuration.requiredNotes().open(owner),IoError.NOTE_SCOPE_UNAVAILABLE);
+            }
+        });
+    }
+    @Test void knownCaptureInAnotherCacheIncarnationCannotRecreateLostNecessaryNotes() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
+            var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+            String chain=io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(source.connector(),source.config(),null);
+            String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain);
+            var previous=new CapturePreparation(new CacheBusinessScope(f.scope.clusterId(),f.scope.bindingVersion(),UUID.randomUUID().toString()),CapturePreparation.Mode.SHARED_SRS,
+                    chain,capture,io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),source.config()),UUID.randomUUID().toString());
+            f.controls().insertOne(MongoCapturePreparationFacts.row(previous));
+            assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request),IoError.NOTE_SCOPE_UNAVAILABLE);
+            assertThat(f.controls().countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.config).countDocuments(new Document("ownerKind","CHAIN"))).isZero();
+        });
+    }
+    @ParameterizedTest @ValueSource(strings={"missing","keys","unique"})
+    void ordinaryPreparationNeverRepairsTheDeclaredHistoryIndex(String damage) {
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
+            var expected=SystemCollections.CAPTURE_PREPARATIONS.indexes().getFirst();
+            f.controls().dropIndex(expected.indexName());
+            if(!damage.equals("missing")) {
+                var keys=new Document();for(String key:expected.keys())keys.append(key,1);
+                if(damage.equals("keys"))keys=new Document("unrelated",1);
+                f.controls().createIndex(keys,new com.mongodb.client.model.IndexOptions().name(expected.indexName()).unique(damage.equals("unique")));
+            }
+            var indexes=f.controls().listIndexes().into(new ArrayList<>());
+            assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.controls().listIndexes().into(new ArrayList<>())).isEqualTo(indexes);assertThat(f.controls().countDocuments()).isZero();
+        });
+    }
     private static void assertCode(Runnable action,TapstateErrorCode expected){assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(expected));}
     private static TapstateException fenced(){return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}
     private static void withFixture(CapturePreparation.Mode mode,Scenario scenario) {
