@@ -1,8 +1,6 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.core.lifecycle.CasOutcome;
-import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
@@ -29,19 +27,8 @@ final class PipelineConvergencePass {
     private final AtomicReference<WorkloadClaimFence> claim;
     private final PipelineStoreViews views;
     private final Runnable requireActive;
-    private final StateStore state = new StateStore() {
-        @Override public Optional<CheckpointDoc> read(String pipelineId) {
-            requirePipeline(pipelineId);
-            return views.pipelineStates(scope()).read(pipelineId);
-        }
-        @Override public CasOutcome compareAndSwap(String pipelineId, long epoch, String next, Instant at) {
-            WorkloadClaimFence original = claim.get();
-            requirePipeline(pipelineId);
-            return views.pipelineStates(scope(), original, requireActive).compareAndSwap(pipelineId, epoch, next, at);
-        }
-        @Override public void create(String pipelineId, String next, Instant at) { throw fenced(); }
-        @Override public void delete(String pipelineId) { throw fenced(); }
-    };
+    private final StateStore state;
+
     private final io.tapstate.spi.store.RateHistoryStore rateHistory = new io.tapstate.spi.store.RateHistoryStore() {
         @Override public void append(io.tapstate.core.lifecycle.RateSample sample) {
             WorkloadClaimFence original = claim.get(); requirePipeline(sample.pipelineId());
@@ -100,6 +87,7 @@ final class PipelineConvergencePass {
         this.claim = new AtomicReference<>(original);
         this.views = Objects.requireNonNull(views, "views");
         this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
+        this.state = new io.tapstate.runtime.scheduler.ScopedPipelineStateStore(intent.scope(),claim::get,views,requireActive);
     }
 
     PipelineIntentSnapshot intent() { return intent; }
