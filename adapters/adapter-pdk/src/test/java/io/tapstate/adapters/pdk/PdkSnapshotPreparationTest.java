@@ -29,8 +29,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PdkSnapshotPreparationTest {
     private final Map<String, Object> state = new HashMap<>();
     @BeforeEach void install() {
-        for (String key : List.of("inits", "stops", "reads", "earlyReads", "discoveries")) state.put(key, new AtomicInteger());
-        state.put("pinned", new AtomicBoolean()); state.put("reportSeam", new AtomicBoolean(true));
+        for (String key : List.of("inits", "stops", "reads", "earlyReads", "discoveries", "streams", "earlyStreams")) state.put(key, new AtomicInteger());
+        state.put("pinned", new AtomicBoolean()); state.put("streamPrepared",new AtomicBoolean()); state.put("reportSeam", new AtomicBoolean(true));
         System.getProperties().put(PreparedSnapshotSource.STATE, state);
     }
     @AfterEach void clear() { System.getProperties().remove(PreparedSnapshotSource.STATE); }
@@ -42,6 +42,144 @@ class PdkSnapshotPreparationTest {
         return new PdkCapturePort(id -> new ConnectorRef(List.of(classes), PreparedSnapshotSource.class.getName(), "2.0.8", null));
     }
     private static void drain(CaptureBatch batch) { try (batch) { assertThat(batch.hasNext()).isFalse(); } }
+
+    @Test void cdcPublishesActualSelectedSessionMetadataBeforeItCanStream() throws Exception {
+        var calls=new AtomicInteger();var delivered=new CountDownLatch(1);var host=Thread.currentThread().getContextClassLoader();
+        var port=port().withStreamPreparation(tables -> {
+            calls.incrementAndGet();assertThat(Thread.currentThread().getContextClassLoader()).isSameAs(host);
+            assertThat(counter("streams")).hasValue(0);assertThat(tables.keySet()).containsExactly("t1");
+            var actual=tables.get("t1");assertThat(actual.fields()).extracting(field -> field.name()).containsExactly("session_id");
+            assertThat(actual.fields().getFirst().dataType()).isEqualTo("int");assertThat(actual.primaryKey()).containsExactly("session_id");
+            assertThat(actual.indexes()).extracting(index -> index.name()).containsExactly("idx_session");assertThat(actual.approximateRowCount()).isNull();
+            assertThatThrownBy(tables::clear).isInstanceOf(UnsupportedOperationException.class);flag("streamPrepared").set(true);
+        });
+        var batch=new AtomicReference<List<io.tapstate.core.event.Envelope>>();var failure=new AtomicReference<Throwable>();
+        var listener=new io.tapstate.spi.capture.CaptureListener() {
+            @Override public void onBatch(List<io.tapstate.core.event.Envelope> events,java.util.Optional<SourcePosition> position){batch.set(events);delivered.countDown();}
+            @Override public void onError(Throwable error){failure.set(error);delivered.countDown();}
+        };
+        try(var subscription=port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),listener)) {
+            assertThat(delivered.await(5,TimeUnit.SECONDS)).isTrue();assertThat(failure.get()).isNull();assertThat(batch.get()).hasSize(1);
+            assertThat(batch.get().getFirst().after()).containsEntry("session_id",1L);
+        }
+        assertThat(calls).hasValue(1);assertThat(counter("streams")).hasValue(1);assertThat(counter("earlyStreams")).hasValue(0);
+        assertThat(counter("inits")).hasValue(1);assertThat(counter("discoveries")).hasValue(1);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void cdcHostRefusalIsReturnedUnchangedBeforeAnySourceStreamOrDelivery() throws Exception {
+        var refused=new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,Map.of("chain","chain","table","t1","version","0"),null);var deliveries=new AtomicInteger();
+        var port=port().withStreamPreparation(tables -> {throw refused;});
+        assertThatThrownBy(() -> port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> deliveries.incrementAndGet())).isSameAs(refused);
+        assertThat(counter("streams")).hasValue(0);assertThat(deliveries).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void missingCdcSelectionUsesACaptureDiagnosticBeforeCallingTheModelOwner() throws Exception {
+        var calls=new AtomicInteger();var port=port().withStreamPreparation(tables -> calls.incrementAndGet());
+        assertThatThrownBy(() -> port.cdc(config("absent"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> {}))
+                .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+        assertThat(calls).hasValue(0);assertThat(counter("streams")).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void cdcHostInvariantIsNotLaunderedIntoAConnectorFailure() throws Exception {
+        var defect=new AssertionError("host model invariant");var port=port().withStreamPreparation(tables -> {throw defect;});
+        assertThatThrownBy(() -> port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> {})).isSameAs(defect);
+        assertThat(counter("streams")).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void immutableCopiesKeepBothSnapshotAndStreamPreparationInEitherOrder() throws Exception {
+        var snapshots=new AtomicInteger();var streams=new AtomicInteger();
+        PdkCapturePort.SnapshotPreparer snapshot=(request,seam,tables) -> {snapshots.incrementAndGet();flag("pinned").set(true);};
+        PdkCapturePort.StreamPreparer stream=tables -> {streams.incrementAndGet();flag("streamPrepared").set(true);};
+        for(var port:List.of(port().withStreamPreparation(stream).withSnapshotPreparation(snapshot),port().withSnapshotPreparation(snapshot).withStreamPreparation(stream))) {
+            flag("pinned").set(false);flag("streamPrepared").set(false);
+            try(var session=SnapshotSession.openPrepared(port,config("t1"),new SnapshotPreparation(1,null)).orElseThrow()){drain(session.read("t1"));}
+            var delivered=new CountDownLatch(1);
+            try(var subscription=port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> delivered.countDown())){assertThat(delivered.await(5,TimeUnit.SECONDS)).isTrue();}
+        }
+        assertThat(snapshots).hasValue(2);assertThat(streams).hasValue(2);assertThat(counter("earlyReads")).hasValue(0);assertThat(counter("earlyStreams")).hasValue(0);assertThat(counter("stops")).hasValue(4);
+    }
+
+    @Test void aTimedOutHostPreparationCannotStartTheSourceWhenItReturnsLate() throws Exception {
+        Path classes=Path.of(PreparedSnapshotSource.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var exited=new CountDownLatch(1);var worker=new AtomicReference<Thread>();
+        var port=new PdkCapturePort(id -> new ConnectorRef(List.of(classes),PreparedSnapshotSource.class.getName(),"2.0.8",null),null,java.time.Duration.ofSeconds(1))
+                .withStreamPreparation(tables -> {
+                    worker.set(Thread.currentThread());entered.countDown();
+                    try {
+                        boolean interrupted=false;
+                        while(true) {try{release.await();break;}catch(InterruptedException ignored){interrupted=true;}}
+                        flag("streamPrepared").set(true);if(interrupted)Thread.currentThread().interrupt();
+                    } finally {exited.countDown();}
+                });
+        var deliveries=new AtomicInteger();
+        try(var callers=Executors.newSingleThreadExecutor()) {
+            var opened=callers.submit(() -> port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> deliveries.incrementAndGet()));
+            try {
+                assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> opened.get(5,TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class).satisfies(failure ->
+                        assertThat(((TapstateException)failure.getCause()).code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                assertThat(exited.getCount()).as("the host callback deliberately ignores cancellation until released").isEqualTo(1);
+                assertThat(counter("streams")).hasValue(0);assertThat(counter("stops")).hasValue(1);
+            } finally {release.countDown();assertThat(exited.await(5,TimeUnit.SECONDS)).isTrue();worker.get().join(5000);assertThat(worker.get().isAlive()).isFalse();}
+        }
+        assertThat(counter("streams")).hasValue(0);assertThat(deliveries).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void aBlockedConnectorStopCannotHideTheOriginalHostRefusal() throws Exception {
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var exited = new CountDownLatch(1);
+        state.put("stopEntered", entered); state.put("stopRelease", release); state.put("stopExited", exited);
+        var refused = new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,
+                Map.of("chain", "chain", "table", "t1", "version", "0"), null);
+        var port = port().withStreamPreparation(tables -> { throw refused; });
+        try (var callers = Executors.newSingleThreadExecutor()) {
+            var opened = callers.submit(() -> port.cdc(config("t1"), io.tapstate.spi.capture.CaptureStart.present(), (events, position) -> {}));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> opened.get(5, TimeUnit.SECONDS)).hasCause(refused);
+                assertThat(exited.getCount()).as("cleanup remains pending until its own stop returns").isOne();
+                assertThat(counter("streams")).hasValue(0);
+            } finally { release.countDown(); assertThat(exited.await(5, TimeUnit.SECONDS)).isTrue(); }
+        }
+        assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void aBlockedStopAndLateHostPreparationCannotDefeatThePreflightDeadline() throws Exception {
+        Path classes = Path.of(PreparedSnapshotSource.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        var stopEntered = new CountDownLatch(1); var stopRelease = new CountDownLatch(1); var stopExited = new CountDownLatch(1);
+        state.put("stopEntered", stopEntered); state.put("stopRelease", stopRelease); state.put("stopExited", stopExited);
+        var hostEntered = new CountDownLatch(1); var hostRelease = new CountDownLatch(1); var hostExited = new CountDownLatch(1);
+        var worker = new AtomicReference<Thread>(); var deliveries = new AtomicInteger();
+        var port = new PdkCapturePort(id -> new ConnectorRef(List.of(classes), PreparedSnapshotSource.class.getName(), "2.0.8", null),
+                null, java.time.Duration.ofSeconds(1)).withStreamPreparation(tables -> {
+            worker.set(Thread.currentThread()); hostEntered.countDown();
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try { hostRelease.await(); break; }
+                    catch (InterruptedException ignored) { interrupted = true; }
+                }
+                flag("streamPrepared").set(true);
+            } finally { hostExited.countDown(); if (interrupted) Thread.currentThread().interrupt(); }
+        });
+        try (var callers = Executors.newSingleThreadExecutor()) {
+            var opened = callers.submit(() -> port.cdc(config("t1"), io.tapstate.spi.capture.CaptureStart.present(),
+                    (events, position) -> deliveries.incrementAndGet()));
+            try {
+                assertThat(hostEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(stopEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> opened.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
+                        .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                assertThat(stopExited.getCount()).as("plugin cleanup is still unknown").isOne();
+                assertThat(hostExited.getCount()).as("host preparation is still pending").isOne();
+            } finally {
+                hostRelease.countDown(); stopRelease.countDown();
+                assertThat(hostExited.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(stopExited.await(5, TimeUnit.SECONDS)).isTrue();
+                worker.get().join(5000); assertThat(worker.get().isAlive()).isFalse();
+            }
+        }
+        assertThat(counter("streams")).hasValue(0); assertThat(deliveries).hasValue(0); assertThat(counter("stops")).hasValue(1);
+    }
 
     @Test void noPreparationOwnerRefusesBeforeProvisioningAnyConnector() {
         var provisions = new AtomicInteger();

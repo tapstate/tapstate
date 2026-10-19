@@ -492,6 +492,12 @@ final class PdkConnector implements AutoCloseable {
         }
     }
 
+    /** Revokes host-owned drive and note access before potentially blocking plugin cleanup. */
+    void cancelDrive() {
+        stopped = true;
+        closeNotes.run();
+    }
+
     /** Stops the connector, swallowing failures — used on the cleanup path where the real error already won. */
     void stopQuietly() {
         stopped = true;

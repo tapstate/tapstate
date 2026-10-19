@@ -26,6 +26,11 @@ public final class PreparedSnapshotSource implements TapConnector {
     @Override public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
         functions.supportTimestampToStreamOffset((context, timestamp) ->
                 ((AtomicBoolean) state().get("reportSeam")).get() ? "session-seam" : null);
+        functions.supportStreamRead((context,tables,offset,size,consumer) -> {
+            counter("streams").incrementAndGet();
+            if (!((AtomicBoolean)state().get("streamPrepared")).get()) counter("earlyStreams").incrementAndGet();
+            consumer.accept(List.of(io.tapdata.entity.event.dml.TapInsertRecordEvent.create().table("t1").referenceTime(1L).after(Map.of("session_id",1))),"stream-offset");
+        });
         functions.supportBatchRead((context, table, offset, size, consumer) -> {
             counter("reads").incrementAndGet();
             if (!((AtomicBoolean) state().get("pinned")).get()) counter("earlyReads").incrementAndGet();
@@ -33,7 +38,24 @@ public final class PreparedSnapshotSource implements TapConnector {
         });
     }
     @Override public void init(TapConnectionContext context) { counter("inits").incrementAndGet(); }
-    @Override public void stop(TapConnectionContext context) { counter("stops").incrementAndGet(); }
+    @Override public void stop(TapConnectionContext context) {
+        counter("stops").incrementAndGet();
+        var entered = (java.util.concurrent.CountDownLatch) state().get("stopEntered");
+        if (entered == null) return;
+        var release = (java.util.concurrent.CountDownLatch) state().get("stopRelease");
+        var exited = (java.util.concurrent.CountDownLatch) state().get("stopExited");
+        entered.countDown();
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try { release.await(); break; }
+                catch (InterruptedException ignored) { interrupted = true; }
+            }
+        } finally {
+            exited.countDown();
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
     @Override public void discoverSchema(TapConnectionContext context, List<String> tables, int size, Consumer<List<TapTable>> consumer) {
         counter("discoveries").incrementAndGet();
         consumer.accept(List.of(table("t1"), table("t2")));
