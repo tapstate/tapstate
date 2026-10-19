@@ -76,6 +76,48 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             return new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
         });
     }
+    /**
+     * Read-only closure check for a caller that fences the original claim and checkpoint in this same
+     * CACHE transaction. It cannot detach, repair missing history or establish retirement by itself.
+     */
+    void requireDetachedPipeline(ClientSession session, io.tapstate.spi.store.PipelineIntentScope original) {
+        Objects.requireNonNull(session, "session"); Objects.requireNonNull(original, "original");
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("consumer retirement preflight requires its original CACHE transaction");
+        if (!scope.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation())))
+            throw MongoCacheBusinessIdentity.businessFenced();
+        requireActive.run(); requireStructure.run();
+        new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+        var names = new java.util.TreeSet<String>();
+        try (var rows = SystemCollections.SRS_CHAINS.on(database).find(session).iterator()) {
+            while (rows.hasNext()) {
+                requireActive.run(); Document row = rows.next();
+                if (!(row.get("_id") instanceof String id) || id.isBlank()) throw unreadableStructure();
+                names.add(id);
+            }
+        }
+        try (var rows = SystemCollections.SRS_CONSUMERS.on(database).find(session).iterator()) {
+            while (rows.hasNext()) { requireActive.run(); names.add(records.membership(rows.next()).context().key().miningChainId()); }
+        }
+        try (var rows = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(session).iterator()) {
+            while (rows.hasNext()) {
+                requireActive.run(); Document row = rows.next();
+                if (!(row.get("_id") instanceof Document id)
+                        || !id.keySet().equals(Set.of("cacheIncarnation", "chain", "consumer"))
+                        || !scope.cacheIncarnation().equals(id.get("cacheIncarnation"))
+                        || !(id.get("chain") instanceof String chain) || chain.isBlank()
+                        || !(id.get("consumer") instanceof String consumer) || consumer.isBlank()) throw unreadableStructure();
+                names.add(chain);
+            }
+        }
+        for (String name : names) {
+            requireActive.run(); var retained = view(session, name);
+            for (var member : retained.members().values()) if (member.context().key().pipelineId().equals(original.pipelineId())
+                    && (!member.detached() || member.context().stateGeneration() > original.stateGeneration()))
+                throw MongoCachePipelinePreparations.rebuild(original);
+        }
+        requireActive.run();
+    }
+
     @Override public Optional<ConsumerOffset> cursor(SrsConsumerContext context) { return progress(context).map(SrsConsumerProgress::cursor); }
     @Override public Optional<SrsConsumerProgress> progress(SrsConsumerContext context) {
         Objects.requireNonNull(context, "context");

@@ -805,6 +805,55 @@ class MongoSrsConsumerStoreIT {
     private static void code(Throwable failure, IoError expected) {
         assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> { assertThat(error.code()).isEqualTo(expected); assertThat(error.getCause()).isNull(); });
     }
+    @Test void rebuildPreflightRequiresOnlyAConsumerDetachedAndKeepsBUnchanged() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            var bMember = membership(f,B); var bCursor = cursor(f,B);
+            assertThatThrownBy(() -> rebuildPreflight(f)).satisfies(failure ->
+                    assertThat(((TapstateException)failure).code()).isEqualTo(IoError.PIPELINE_STATE_REBUILD_REQUIRED));
+            f.consumers().detach(A,1,f.fenceA()).orElseThrow(); var chain = root(f);
+            rebuildPreflight(f);
+            assertThat(membership(f,B)).isEqualTo(bMember); assertThat(cursor(f,B)).isEqualTo(bCursor);
+            assertThat(root(f)).isEqualTo(chain).containsEntry("consumerCount",1L);
+        });
+    }
+    @Test void rebuildPreflightCannotIgnoreAnOrphanOffsetEvenWithoutAnAMembership() {
+        withBusiness(f -> {
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            var orphan = new Document(cursor(f,B)); var oldId = orphan.get("_id",Document.class);
+            orphan.put("_id",new Document(oldId).append("consumer","unknown-consumer"));
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).insertOne(orphan);
+            assertThatThrownBy(() -> rebuildPreflight(f)).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            assertThat(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).countDocuments()).isEqualTo(2);
+        });
+    }
+    @Test void rebuildPreflightCannotInterpretMissingCollectionOrUnclosedCountsAsNoAConsumer() {
+        withBusiness(f -> {
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id",CHAIN),new Document("$inc",new Document("consumerCount",1L).append("consumerRevision",1L)));
+            assertThatThrownBy(() -> rebuildPreflight(f)).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            SystemCollections.SRS_CONSUMERS.on(f.database()).drop();
+            assertThatThrownBy(() -> rebuildPreflight(f)).satisfies(failure ->
+                    assertThat(((TapstateException)failure).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.database().listCollectionNames().into(new java.util.ArrayList<>())).doesNotContain("srs_consumers");
+        });
+    }
+    @Test void rebuildPreflightFindsMembershipsWhoseChainRootWasLost() {
+        withBusiness(f -> {
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            SystemCollections.SRS_CHAINS.on(f.database()).deleteMany(new Document());
+            assertThatThrownBy(() -> rebuildPreflight(f)).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            assertThat(SystemCollections.SRS_CHAINS.on(f.database()).countDocuments()).isZero();
+        });
+    }
+    private static void rebuildPreflight(Fixture f) {
+        var original = new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration());
+        try (var session = f.client().startSession()) {
+            session.withTransaction(() -> { f.consumers().requireDetachedPipeline(session,original); return null; });
+        }
+    }
+
     private static void withBusiness(Scenario scenario) {
         try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var database = client.getDatabase("srs_consumer_" + UUID.randomUUID().toString().replace("-", ""));
