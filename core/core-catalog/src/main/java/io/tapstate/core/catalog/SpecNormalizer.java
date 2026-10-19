@@ -198,11 +198,18 @@ public final class SpecNormalizer {
             Map<String, String> label = resolveLabel(str(def.get("title")), key, defaultLocale, locales);
             boolean required = Boolean.TRUE.equals(def.get("required"));
             String defaultValue = textOf(def.get("default"));
-            boolean secret = "Password".equals(str(def.get("x-component")));
+            boolean secret = isSecretField(key, def);
             List<EnumOption> options = parseEnum(def.get("enum"), defaultLocale, locales);
             out.add(new ConfigField(key, type, label, required, defaultValue, secret, options,
                     reactions.get(key)));
         }
+    }
+
+    private static boolean isSecretField(String name, Map<String, Object> definition) {
+        String component = str(definition.get("x-component"));
+        // A Kerberos keytab is a reusable credential even though PDK renders it as a file upload.
+        return "Password".equals(component)
+                || ("krb5Keytab".equals(name) && "TextFileReader".equals(component));
     }
 
     /** A void node, or an object that holds nested properties, is a container to flatten — not a field. */

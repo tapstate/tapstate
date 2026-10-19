@@ -235,6 +235,23 @@ class SourceRepresentationTest {
     }
 
     @Test
+    void redactsKerberosKeytabFromSourceResponses() {
+        for (String connector : List.of("kafka", "kafka_enhanced", "kafka_avro")) {
+            SourceResource model = source(connector, linkedMap(
+                    "krb5Keytab", "base64-keytab-secret", "krb5KeytabFile", "client.keytab",
+                    "krb5Conf", "base64-config"));
+
+            SourceView view = representation.toView(model, hash(model));
+
+            assertThat(view.config()).doesNotContainKey("krb5Keytab");
+            assertThat(view.config()).containsEntry("krb5KeytabFile", "client.keytab")
+                    .containsEntry("krb5Conf", "base64-config");
+            assertThat(view.configuredSecrets()).contains("krb5Keytab");
+            assertThat(view.config().toString()).doesNotContain("base64-keytab-secret");
+        }
+    }
+
+    @Test
     void preservesOmittedTransportSecretsWhileReplacingOtherSettings() {
         SourceResource existing = source("mysql", linkedMap(
                 "sslKey", "private-key", "sslKeyPassword", "key-password",

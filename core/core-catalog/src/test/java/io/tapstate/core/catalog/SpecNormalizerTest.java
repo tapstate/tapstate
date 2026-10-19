@@ -169,6 +169,14 @@ class SpecNormalizerTest {
     }
 
     @Test
+    void classifiesKerberosKeytabUploadsAsSecrets() {
+        NormalizedSpec kafka = normalize("kafka");
+
+        assertThat(field(kafka, "krb5Keytab").secret()).isTrue();
+        assertThat(field(kafka, "krb5Conf").secret()).isFalse();
+    }
+
+    @Test
     void keepsLiteralEnumLabelsUnderTheDefaultLocale() {
         ConfigField mechanism = field(normalize("kafka"), "kafkaSaslMechanism");
 
