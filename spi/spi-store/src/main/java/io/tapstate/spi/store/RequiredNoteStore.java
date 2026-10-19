@@ -40,6 +40,11 @@ public interface RequiredNoteStore {
      */
     RequiredNoteScope retireShared(RequiredNoteScope shared);
 
+    /** The fixed original private token may be used only by its persisted retirement operation. */
+    default RequiredNoteRetirement retirement(RequiredNoteScope original, String operationId) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
+    }
+
     /** Null bytes delete logically; a shared removal may atomically block carry from earlier private notes. */
     boolean compareAndSet(RequiredNoteScope scope, String key, long expectedRevision, byte[] bytes,
             boolean blockEarlierValue);

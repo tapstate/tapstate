@@ -20,6 +20,7 @@ import io.tapstate.spi.store.RequiredNoteOrigin;
 import io.tapstate.spi.store.RequiredNoteCarry;
 import io.tapstate.spi.store.RequiredNoteScope;
 import io.tapstate.spi.store.RequiredNoteStore;
+import io.tapstate.spi.store.RequiredNoteRetirement;
 import io.tapstate.spi.store.RequiredNoteValue;
 import org.bson.Document;
 import org.bson.types.MinKey;
@@ -47,6 +48,8 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     private final MongoCollection<Document> operators;
     private final SourceConfigCipherProvider ciphers;
     private final Runnable requireActive;
+    private final Retirement retirement;
+    private record Retirement(RequiredNoteScope scope, String operationId) {}
 
     public MongoRequiredNoteStore(MongoClient client, MongoDatabase database, SourceConfigCipher cipher) {
         this(client, database, SourceConfigCipherProvider.fixed(Objects.requireNonNull(cipher, "cipher")));
@@ -64,9 +67,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         this.operators = durable(SystemCollections.OPERATOR_GENERATIONS.on(database));
         this.ciphers = Objects.requireNonNull(ciphers, "ciphers");
         this.requireActive = () -> {};
+        this.retirement = null;
     }
 
     private MongoRequiredNoteStore(MongoRequiredNoteStore original, Runnable additionalGuard) {
+        this(original, additionalGuard, original.retirement);
+    }
+
+    private MongoRequiredNoteStore(MongoRequiredNoteStore original, Runnable additionalGuard, Retirement retirement) {
+        this.retirement = retirement;
         this.client = original.client;
         this.scopes = original.scopes;
         this.notes = original.notes;
@@ -103,6 +112,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     @Override
     public RequiredNoteScope initialize(RequiredNoteOwner owner) {
+        requireOrdinary();
         Objects.requireNonNull(owner, "owner");
         RequiredNoteScope prepared = StoreIo.call(() -> {
             for (int attempt = 0; ; attempt++) {
@@ -185,6 +195,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     @Override
     public RequiredNoteOrigin prepareOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
+        requireOrdinary();
         requireOriginScope(scope);
         Objects.requireNonNull(origin, "origin");
         return withOriginIndexes(() -> transaction(session -> {
@@ -267,6 +278,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     @Override
     public RequiredNoteScope clear(RequiredNoteScope scope, boolean blockEarlierValues) {
+        requireOrdinary();
         return StoreIo.call(() -> transaction(session -> {
             SourceConfigCipher cipher = cipherForWrite(session);
             Document metadata = verifyScope(session, scope, true);
@@ -289,6 +301,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     @Override
     public long reclaimBefore(RequiredNoteScope scope) {
+        requireOrdinary();
         Objects.requireNonNull(scope, "scope");
         StoreIo.run(() -> transaction(session -> {
             checkOwner(session, scope.owner(), false);
@@ -313,6 +326,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     @Override
     public RequiredNoteCarry prepareCarry(RequiredNoteCarry carry) {
+        requireOrdinary();
         Objects.requireNonNull(carry, "carry");
         return withCarryIndexes(() -> transaction(session -> {
             cipherForWrite(session);
@@ -382,6 +396,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     @Override
     public RequiredNoteScope retireShared(RequiredNoteScope shared) {
+        requireOrdinary();
         requireShared(shared);
         return withCarryIndexes(() -> transaction(session -> {
             cipherForWrite(session);
@@ -421,6 +436,94 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         if (current.phase() == PipelineStateMapping.Phase.RETIRED
                 || current.stateGeneration() < source.owner().stateGeneration()) throw unavailable();
         return verifyPhysicalScope(session, source, write);
+    }
+
+    @Override
+    public RequiredNoteRetirement retirement(RequiredNoteScope original, String operationId) {
+        requireOrdinary(); Objects.requireNonNull(original, "original");
+        if (original.owner().kind() != RequiredNoteOwner.Kind.PIPELINE || operationId == null || operationId.isBlank()) throw unavailable();
+        var fixed = new Retirement(original, operationId);
+        var view = new MongoRequiredNoteStore(this, () -> {}, fixed);
+        withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
+            checkRetiringOwner(session, fixed, false);
+            Document metadata = scopes.find(session, byScope(original.owner())).first();
+            if (retiredResult(fixed, metadata) == null) checkRetirementToken(session, fixed);
+            return null;
+        })));
+        return new RequiredNoteRetirement() {
+            @Override public RequiredNoteScope scope() { return original; }
+            @Override public String operationId() { return operationId; }
+            @Override public RequiredNoteStore notes() { return view; }
+            @Override public java.util.Optional<RequiredNoteOrigin> origin() {
+                return view.withOriginIndexes(() -> view.transaction(session -> java.util.Optional.ofNullable(
+                        view.retainedOrigin(session, original, view.verifyPhysicalScope(session, original, false)))));
+            }
+            @Override public RequiredNoteScope completeAfterVerifiedRelease() { return completePrivate(fixed); }
+        };
+    }
+
+    /** The completed result is checked before trying to reuse the now-retired private token. */
+    private RequiredNoteScope completePrivate(Retirement fixed) {
+        return withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
+            checkRetiringOwner(session, fixed, false);
+            var original = fixed.scope();
+            Document metadata = scopes.find(session, byScope(original.owner())).first();
+            RequiredNoteScope completed = retiredResult(fixed, metadata);
+            if (completed != null) return completed;
+            checkRetirementToken(session, fixed);
+            if (original.generation() >= Long.MAX_VALUE - 1) throw unreadable("generation");
+            cipherForWrite(session); checkRetiringOwner(session, fixed, true);
+            verifyPhysicalScope(session, original, true);
+            long next = original.generation() + 1;
+            Document result = new Document("operationId", fixed.operationId())
+                    .append("stateGeneration", original.owner().stateGeneration())
+                    .append("fromGeneration", original.generation()).append("toGeneration", next);
+            Document low = notePrefix(original.owner(), Long.MIN_VALUE).append("key", new MinKey());
+            Document high = notePrefix(original.owner(), next).append("key", new MinKey());
+            notes.deleteMany(session, new Document("_id", new Document("$gte", low).append("$lt", high)));
+            origins.deleteOne(session, byScope(original.owner()).append("generation", original.generation()));
+            if (scopes.updateOne(session, byScope(original.owner()).append("generation", original.generation()),
+                    new Document("$set", new Document("generation", next).append("originGeneration", 0L)
+                            .append("lastRetirement", result))).getMatchedCount() != 1) throw unavailable();
+            return new RequiredNoteScope(original.owner(), next);
+        })));
+    }
+
+    private RequiredNoteScope retiredResult(Retirement fixed, Document metadata) {
+        var original = fixed.scope(); scopeOf(original.owner(), metadata);
+        if (metadata.get("lastRetirement") instanceof Document result && fixed.operationId().equals(result.get("operationId"))) {
+            if (!Long.valueOf(original.owner().stateGeneration()).equals(result.get("stateGeneration"))
+                    || !Long.valueOf(original.generation()).equals(result.get("fromGeneration"))) throw unavailable();
+            return new RequiredNoteScope(original.owner(), result.getLong("toGeneration"));
+        }
+        return null;
+    }
+
+    private void requireOrdinary() { if (retirement != null) throw unavailable(); }
+
+    private void checkRetirementToken(ClientSession session, Retirement fixed) {
+        Document metadata = verifyPhysicalScope(session, fixed.scope(), false);
+        requirePrivateUnreferenced(session, fixed.scope());
+        RequiredNoteOrigin origin = retainedOrigin(session, fixed.scope(), metadata);
+        if (origin == null && notes.find(session, new Document("_id.bindingVersion", fixed.scope().owner().bindingVersion())
+                .append("_id.namespace", fixed.scope().owner().namespace())).projection(new Document("_id", 1)).first() != null)
+            throw unavailable();
+    }
+
+    /** Every retirement mutation, including GLOBAL writes, competes with completion on this exact row. */
+    private void checkRetiringOwner(ClientSession session, Retirement fixed, boolean write) {
+        var owner = fixed.scope().owner(); checkBinding(session, owner);
+        Document operator = operators.find(session, new Document("_id", owner.ownerId())).first();
+        PipelineStateMapping mapping = MongoPipelineStateMappings.decode(owner.ownerId(), operator);
+        if (mapping.stateGeneration() != owner.stateGeneration()
+                || (mapping.phase() != PipelineStateMapping.Phase.REBUILDING && mapping.phase() != PipelineStateMapping.Phase.RETIRING)
+                || !fixed.operationId().equals(mapping.operationId())) throw unavailable();
+        if (write) {
+            long fence = operator.getLong("noteWriteFence"); if (fence >= Long.MAX_VALUE - 1) throw unreadable("noteWriteFence");
+            if (operators.updateOne(session, new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
+                            .append("phase", mapping.phase().name()).append("operationId", fixed.operationId()).append("noteWriteFence", fence),
+                    new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw unavailable();
+        }
     }
 
     private void requirePrivateUnreferenced(ClientSession session, RequiredNoteScope scope) {
@@ -586,6 +689,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         try (ClientSession session = client.startSession()) {
             return session.withTransaction(() -> {
                 requireActive.run();
+                if (retirement != null) {
+                    checkRetiringOwner(session, retirement, false);
+                    checkRetirementToken(session, retirement);
+                }
                 T result = body.apply(session);
                 requireActive.run();
                 return result;
@@ -604,6 +711,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         RequiredNoteScope observed = scopeOf(scope.owner(), document);
         if (observed.generation() != scope.generation()) throw unavailable();
         if (write) {
+            if (document.getLong("writeFence") >= Long.MAX_VALUE - 1) throw unreadable("writeFence");
             if (scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
                     new Document("$inc", new Document("writeFence", 1L))).getMatchedCount() != 1) throw unavailable();
         }
@@ -621,6 +729,12 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     private void checkOwner(ClientSession session, RequiredNoteOwner owner, boolean write) {
         checkBinding(session, owner);
+        if (retirement != null) {
+            if (owner.kind() != RequiredNoteOwner.Kind.GLOBAL && !retirement.scope().owner().equals(owner)) throw unavailable();
+            checkRetiringOwner(session, retirement, write);
+            checkRetirementToken(session, retirement);
+            return;
+        }
         if (owner.kind() == RequiredNoteOwner.Kind.PIPELINE) {
             Document operator = operators.find(session, new Document("_id", owner.ownerId())).first();
             PipelineStateMapping mapping;
@@ -660,6 +774,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         if (!(document.get("originGeneration") instanceof Long originGeneration)
                 || (originGeneration != 0 && originGeneration != generation)
                 || (owner.kind() == RequiredNoteOwner.Kind.GLOBAL && originGeneration != 0)) throw unreadable("originGeneration");
+        if (document.containsKey("lastRetirement")) {
+            if (!(document.get("lastRetirement") instanceof Document result)
+                    || !result.keySet().equals(java.util.Set.of("operationId", "stateGeneration", "fromGeneration", "toGeneration"))
+                    || !(result.get("operationId") instanceof String operation) || operation.isBlank()
+                    || !(result.get("stateGeneration") instanceof Long state) || state < 1 || state == Long.MAX_VALUE
+                    || !(result.get("fromGeneration") instanceof Long from) || from < 1 || from >= Long.MAX_VALUE - 1
+                    || !(result.get("toGeneration") instanceof Long to) || to != from + 1 || to > generation
+                    || owner.kind() != RequiredNoteOwner.Kind.PIPELINE) throw unreadable("lastRetirement");
+        }
         long outgoing = carryCount(document, "outgoingCarries");
         long incoming = carryCount(document, "incomingCarries");
         if ((owner.kind() != RequiredNoteOwner.Kind.CHAIN && outgoing != 0)

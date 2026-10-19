@@ -993,6 +993,185 @@ class MongoRequiredNoteStoreIT {
         });
     }
 
+    @Test
+    void privateRetirementKeepsTheOldContextUntilConfirmedAndThenPermitsANewContext() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var old = f.notes.initialize(pipeline("p1",1));
+            var original = origin("database-x"); f.notes.prepareOrigin(old,original);
+            f.notes.compareAndSet(old,"slot",0,bytes("slot-x"),false);
+            var global = f.initialize(global()); f.notes.compareAndSet(global,"global",0,bytes("keep-global"),false);
+            retireMapping(f,"p1","rebuild-operation");
+            assertThatThrownBy(() -> f.notes.open(old.owner())).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            var retirement = f.notes.retirement(old,"rebuild-operation"); var release = retirement.notes();
+            assertThat(retirement.scope()).isEqualTo(old); assertThat(retirement.operationId()).isEqualTo("rebuild-operation");
+            assertThat(release.origin(old)).isEqualTo(original); assertThat(release.read(old,"slot").bytes()).containsExactly(bytes("slot-x"));
+            assertThat(release.compareAndSet(old,"release-result",0,bytes("verified"),false)).isTrue();
+            assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(f.database).countDocuments()).isOne();
+            assertThat(release.read(global,"global").bytes()).containsExactly(bytes("keep-global"));
+            var retired = retirement.completeAfterVerifiedRelease();
+            assertThat(retired.generation()).isEqualTo(old.generation()+1);
+            assertThat(retirement.completeAfterVerifiedRelease()).isEqualTo(retired);
+            var replay = f.notes.retirement(old,"rebuild-operation");
+            assertThat(replay.completeAfterVerifiedRelease()).isEqualTo(retired);
+            assertThatThrownBy(replay::origin).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(scopeMetadata(f,retired).getLong("originGeneration")).isZero();
+            assertThatThrownBy(() -> release.read(global,"global")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            f.pipelineGeneration("p1",2); var current = f.notes.open(pipeline("p1",2));
+            assertThat(current.generation()).isEqualTo(2); assertThat(f.notes.read(current,"slot").revision()).isZero();
+            f.notes.prepareOrigin(current,origin("database-y")); f.notes.compareAndSet(current,"slot",0,bytes("slot-y"),false);
+            assertThatThrownBy(retirement::completeAfterVerifiedRelease).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(f.notes.origin(current)).isEqualTo(origin("database-y"));
+            assertThat(f.notes.read(current,"slot").bytes()).containsExactly(bytes("slot-y"));
+            assertThat(f.notes.read(global,"global").bytes()).containsExactly(bytes("keep-global"));
+            assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.database).find().first().getLong("revision")).isZero();
+        });
+    }
+    @Test
+    void privateRetirementRefusesOtherOperationsOwnersAndOrdinaryScopeManagement() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); f.pipelineGeneration("p2",1);
+            var one = f.initialize(pipeline("p1",1)); var two = f.initialize(pipeline("p2",1));
+            assertThatThrownBy(() -> f.notes.retirement(one,"operation")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            retireMapping(f,"p1","operation");
+            assertThatThrownBy(() -> f.notes.retirement(one,"other-operation")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            var release = f.notes.retirement(one,"operation").notes();
+            assertThatThrownBy(() -> release.read(two,"key")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> release.initialize(one.owner())).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> release.prepareOrigin(one,origin("new"))).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> release.clear(one,false)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> release.reclaimBefore(one)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(scopeMetadata(f,one).getLong("generation")).isEqualTo(1);
+        });
+    }
+    @Test
+    void aSharedCarryBlocksPrivateReleaseWhileItsConsumerCanStillReadTheOldNotes() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var privateNotes = f.initialize(pipeline("p1",1));
+            var shared = f.initialize(chain("still-used")); f.notes.compareAndSet(privateNotes,"slot",0,bytes("keep-slot"),false);
+            var carry = f.notes.prepareCarry(new RequiredNoteCarry(shared,privateNotes));
+            retireMapping(f,"p1","operation");
+            assertThatThrownBy(() -> f.notes.retirement(privateNotes,"operation")).satisfies(failure ->
+                    assertThat(((TapstateException)failure).code()).isEqualTo(IoError.NOTE_REFERENCED));
+            assertThat(f.notes.readCarried(carry,"slot").bytes()).containsExactly(bytes("keep-slot"));
+            f.notes.retireShared(shared);
+            var retirement = f.notes.retirement(privateNotes,"operation");
+            assertThat(retirement.notes().read(privateNotes,"slot").bytes()).containsExactly(bytes("keep-slot"));
+        });
+    }
+    @Test
+    void missingOriginalContextCannotBecomeAPrivateReleaseOrCleanupPermission() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var old = f.notes.initialize(pipeline("p1",1));
+            f.notes.compareAndSet(old,"slot",0,bytes("unknown-context"),false); retireMapping(f,"p1","operation");
+            assertThatThrownBy(() -> f.notes.retirement(old,"operation")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(scopeMetadata(f,old).getLong("generation")).isEqualTo(1);
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isOne();
+            assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(f.database).countDocuments()).isZero();
+        });
+    }
+    @Test
+    void anUnusedPrivateScopeCanRetireButAPublishedMissingOriginCannot() {
+        withNotes(f -> {
+            f.pipelineGeneration("unused",1); var unused = f.notes.initialize(pipeline("unused",1));
+            retireMapping(f,"unused","unused-operation");
+            var retirement = f.notes.retirement(unused,"unused-operation");
+            assertThat(retirement.origin()).isEmpty(); assertThat(retirement.notes().read(unused,"key").revision()).isZero();
+            assertThat(retirement.completeAfterVerifiedRelease().generation()).isEqualTo(2);
+            f.pipelineGeneration("damaged",1); var damaged = f.initialize(pipeline("damaged",1));
+            SystemCollections.PDK_NOTE_ORIGINS.on(f.database).deleteOne(new Document("_id",
+                    new Document("bindingVersion",1L).append("namespace",damaged.owner().namespace())));
+            retireMapping(f,"damaged","damaged-operation");
+            assertThatThrownBy(() -> f.notes.retirement(damaged,"damaged-operation")).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThat(scopeMetadata(f,damaged).getLong("generation")).isEqualTo(1);
+        });
+    }
+    @Test
+    void aLateGlobalReleaseWriteCannotCommitAfterPrivateRetirementCompletes() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var old = f.initialize(pipeline("p1",1));
+            var global = f.initialize(global()); f.notes.compareAndSet(global,"global",0,bytes("original"),false);
+            retireMapping(f,"p1","operation"); var retirement = f.notes.retirement(old,"operation");
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+            var paused = f.paused(entered,release).retirement(old,"operation").notes();
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var late = executor.submit(() -> paused.compareAndSet(global,"global",1,bytes("late"),false));
+                try {
+                    assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();
+                    assertThat(retirement.completeAfterVerifiedRelease().generation()).isEqualTo(2);
+                } finally { release.countDown(); }
+                assertThatThrownBy(() -> late.get(10,TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.ExecutionException.class)
+                        .cause().satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            }
+            assertThat(f.notes.read(global,"global").bytes()).containsExactly(bytes("original"));
+            assertThat(f.notes.read(global,"global").revision()).isEqualTo(1);
+        });
+    }
+    @Test
+    void independentRetirementClientsReturnOneExactCleanupGeneration() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var old = f.initialize(pipeline("p1",1));
+            f.notes.compareAndSet(old,"slot",0,bytes("old"),false); retireMapping(f,"p1","operation");
+            var first = f.notes.retirement(old,"operation"); var begin = new CountDownLatch(1);
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl()); var executor = Executors.newFixedThreadPool(2)) {
+                var second = new MongoRequiredNoteStore(other,other.getDatabase(f.database.getName()),f.cipher()).retirement(old,"operation");
+                var a = executor.submit(() -> { begin.await(); return first.completeAfterVerifiedRelease(); });
+                var b = executor.submit(() -> { begin.await(); return second.completeAfterVerifiedRelease(); });
+                begin.countDown(); var result = a.get(20,TimeUnit.SECONDS);
+                assertThat(result.generation()).isEqualTo(2); assertThat(b.get(20,TimeUnit.SECONDS)).isEqualTo(result);
+                assertThat(second.completeAfterVerifiedRelease()).isEqualTo(result);
+            }
+            assertThat(scopeMetadata(f,old).getLong("generation")).isEqualTo(2);
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isZero();
+            assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(f.database).countDocuments()).isZero();
+        });
+    }
+
+    @Test
+    void privateRetirementRefusesAnExhaustedScopeWriteFenceBeforeAnyCleanup() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var old = f.initialize(pipeline("p1",1));
+            f.notes.compareAndSet(old,"slot",0,bytes("keep"),false); retireMapping(f,"p1","operation");
+            var retirement = f.notes.retirement(old,"operation");
+            SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(new Document("_id",scopeMetadata(f,old).get("_id")),
+                    new Document("$set",new Document("writeFence",Long.MAX_VALUE-1)));
+            var metadata = scopeMetadata(f,old);
+            assertThatThrownBy(retirement::completeAfterVerifiedRelease).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThat(scopeMetadata(f,old)).isEqualTo(metadata);
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isOne();
+            assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(f.database).countDocuments()).isOne();
+        });
+    }
+    @Test
+    void aCompletedOperationCannotRetireItsReturnedTokenAgain() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var old = f.initialize(pipeline("p1",1)); retireMapping(f,"p1","operation");
+            var retired = f.notes.retirement(old,"operation").completeAfterVerifiedRelease();
+            assertThatThrownBy(() -> f.notes.retirement(retired,"operation")).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThat(scopeMetadata(f,old).getLong("generation")).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void exhaustedGlobalWriteFenceAlsoRollsBackTheRetirementMappingWrite() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1",1); var old = f.initialize(pipeline("p1",1)); var global = f.initialize(global());
+            SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(new Document("_id",scopeMetadata(f,global).get("_id")),
+                    new Document("$set",new Document("writeFence",Long.MAX_VALUE-1)));
+            assertThatThrownBy(() -> f.notes.compareAndSet(global,"key",0,bytes("ordinary"),false)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            retireMapping(f,"p1","operation"); var release = f.notes.retirement(old,"operation").notes();
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(f.database).find(new Document("_id","p1")).first();
+            assertThatThrownBy(() -> release.compareAndSet(global,"key",0,bytes("late"),false)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.database).find(new Document("_id","p1")).first()).isEqualTo(mapping);
+            assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isZero();
+            assertThat(scopeMetadata(f,global).getLong("writeFence")).isEqualTo(Long.MAX_VALUE-1);
+        });
+    }
+
+    private static void retireMapping(Fixture f,String pipeline,String operation) {
+        SystemCollections.OPERATOR_GENERATIONS.on(f.database).updateOne(new Document("_id",pipeline),
+                new Document("$set",new Document("phase","REBUILDING").append("operationId",operation)));
+    }
+
     private static RequiredNoteOwner global() {
         return new RequiredNoteOwner(1, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, "cluster-a", 0);
     }
