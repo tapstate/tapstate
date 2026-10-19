@@ -247,6 +247,7 @@ io.note-origin-mismatch
 io.note-referenced
 io.note-scope-unavailable
 io.note-write-conflict
+io.pipeline-capture-identity-unproven
 io.pipeline-intent-fenced
 io.pipeline-state-rebuild-required
 io.required-dead-letter-conflict

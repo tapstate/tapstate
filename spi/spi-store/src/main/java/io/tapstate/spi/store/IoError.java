@@ -123,6 +123,9 @@ public enum IoError implements TapstateErrorCode {
     /** The private direct source cannot prove the retained progress and ordered pending batches. */
     DIRECT_CHANNEL_UNAVAILABLE("io.direct-channel-unavailable", Set.of("channel")),
 
+    /** The requested private source/read contract cannot reuse the prepared physical state. */
+    PIPELINE_CAPTURE_IDENTITY_UNPROVEN("io.pipeline-capture-identity-unproven", Set.of("pipeline")),
+
     /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is
      * the document's id, or {@code unknown} where the failing call did not name one.

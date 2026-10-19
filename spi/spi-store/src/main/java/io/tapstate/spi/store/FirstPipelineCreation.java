@@ -7,6 +7,9 @@ package io.tapstate.spi.store;
 public interface FirstPipelineCreation {
     PipelinePreparation preparation();
 
+    /** The original CONFIG winner carries these immutable inputs only in memory. */
+    PipelinePreparationInputs inputs();
+
     /** Consumes the sole CACHE logical invocation before callbacks or IO; a second call refuses. */
     void consume();
 

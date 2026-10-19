@@ -112,6 +112,7 @@ class MongoCachePipelinePreparationsIT {
             var issued = f.issue().preparation(); var callbacks = new AtomicInteger();
             FirstPipelineCreation forged = new FirstPipelineCreation() {
                 @Override public PipelinePreparation preparation() { callbacks.incrementAndGet(); return issued; }
+                @Override public io.tapstate.spi.store.PipelinePreparationInputs inputs() { callbacks.incrementAndGet(); return null; }
                 @Override public void consume() { callbacks.incrementAndGet(); }
                 @Override public void requireActive() { callbacks.incrementAndGet(); }
             };
@@ -418,6 +419,30 @@ class MongoCachePipelinePreparationsIT {
         });
     }
 
+    @Test void lossAfterTheActualPrivateOffsetInsertRollsBackTheWholeInitialClosure() {
+        withFixture(f -> {
+            var source = new SourceResource("input",null,"mongodb",Map.of("uri","mongodb://source.invalid/source"),io.tapstate.core.model.SourceMode.CDC,
+                    List.of(io.tapstate.core.model.TableRef.literal("orders")),null,null);
+            var pipeline = new io.tapstate.core.model.PipelineResource("flow",null,List.of(io.tapstate.core.model.SourceRef.spec("input",false)),null,null,null,
+                    new io.tapstate.core.model.Settings(null,null,null,null,io.tapstate.core.model.ReadMode.CDC_ONLY,"latest"),null);
+            f.configuration.artifacts().saveAll(List.of(source,pipeline));
+            var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(f.scope,pipeline,Map.of("input",source),Map.of("input",java.util.Set.of("orders")));
+            var grant = ((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(f.scope,f.node,inputs)).creation();
+            var original = f.preparations().reserveFirst(grant,TTL); var before = f.snapshot();
+            try (var witness = new MongoCommandWitness(CACHE.getReplicaSetUrl(),f.cacheDatabase.getName(),"insert","direct_channel_offsets")) {
+                var store = new MongoCachePipelinePreparations(witness.client,witness.database,f.business(),witness::refuseAfterCommand);
+                assertCode(() -> store.seed(original,f.configuration.preparations(),AT),IoError.CACHE_BUSINESS_FENCED);
+                witness.requireCommand();
+            }
+            assertThat(f.snapshot()).isEqualTo(before); assertThat(SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.cacheDatabase).countDocuments()).isZero();
+            assertThat(SystemCollections.DIRECT_BATCHES.on(f.cacheDatabase).countDocuments()).isZero();
+            assertThat(f.claim().get("pipelinePreparation",Document.class).getString("phase")).isEqualTo("RESERVED");
+            var receipt = f.preparations().seed(original,f.configuration.preparations(),AT);
+            assertThat(receipt.preparationId()).isEqualTo(original.preparationId());
+            assertThat(SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.cacheDatabase).countDocuments()).isOne();
+        });
+    }
+
     @Test void missingOrDamagedInventoryGenesisCannotBeRecreatedBySeedReplayOrResume() {
         withFixture(f -> {
             var grant = f.issue(); var reserved = f.preparations().reserveFirst(grant,TTL);
@@ -498,7 +523,9 @@ class MongoCachePipelinePreparationsIT {
                 var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
                 domain.prepareAuth(new CacheAuthScope(business.clusterId(), business.bindingVersion(), StorageBinding.Mode.OP, business.cacheIncarnation(), 1), "auth-a", ACTIVE);
                 try (var session = cacheClient.startSession()) {
-                    for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_OPERATOR_CLEANUP)) table.prepareCollectionOn(cache, session);
+                    for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_OPERATOR_CLEANUP, SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES)) {
+                        table.prepareCollectionOn(cache, session); for (var index : table.indexes()) IndexEnsure.createInTransaction(session,table.on(cache),index);
+                    }
                 }
                 SystemCollections.CACHE_IDENTITY.on(cache).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                         .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));

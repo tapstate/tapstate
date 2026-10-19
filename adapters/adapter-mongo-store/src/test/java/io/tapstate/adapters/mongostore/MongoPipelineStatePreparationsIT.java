@@ -293,7 +293,7 @@ class MongoPipelineStatePreparationsIT {
                     var cipher = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
                     var database = observed.getDatabase(f.database.getName());
                     var bindings = new MongoStorageBindingStore(observed, database, cipher);
-                    var store = new MongoPipelineStatePreparations(observed, database, "cluster-a", bindings,
+                    var store = new MongoPipelineStatePreparations(observed, database, "cluster-a", bindings, new MongoConfigurationArtifactStore(observed,database,cipher),
                             () -> { if (revoke && failed.get() > 0) throw failure(); });
                     admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
                             .append("data", new Document("failCommands", List.of("update")).append("errorCode", 112)
@@ -338,7 +338,7 @@ class MongoPipelineStatePreparationsIT {
                 String material = SystemCollections.CLUSTER_KEYS.on(f.database).find().first().getString("material");
                 var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
                 var bindings = new MongoStorageBindingStore(observed, database, ciphers);
-                var store = new MongoPipelineStatePreparations(observed, database, "cluster-a", bindings, () -> {});
+                var store = new MongoPipelineStatePreparations(observed, database, "cluster-a", bindings, new MongoConfigurationArtifactStore(observed,database,ciphers), () -> {});
                 admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
                         .append("data", new Document("failCommands", List.of("commitTransaction"))
                                 .append("writeConcernError", new Document("code", 91).append("errmsg", "test commit reply lost"))

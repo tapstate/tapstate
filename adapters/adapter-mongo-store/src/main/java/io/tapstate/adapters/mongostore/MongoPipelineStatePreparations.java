@@ -9,6 +9,8 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.FirstPipelineCreation;
+import io.tapstate.spi.store.PipelinePreparationInputs;
+import io.tapstate.core.model.*;
 import io.tapstate.spi.store.FirstPipelineCreationResult;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
@@ -35,12 +37,15 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     private final MongoCollection<Document> mappings;
     private final MongoCollection<Document> pipelines;
     private final String clusterId;
+    private final MongoConfigurationArtifactStore artifacts;
     private final MongoStorageBindingStore bindings;
     private final Runnable requireActive;
 
     MongoPipelineStatePreparations(MongoClient client, MongoDatabase database, String clusterId,
-            MongoStorageBindingStore bindings, Runnable requireActive) {
+            MongoStorageBindingStore bindings, MongoConfigurationArtifactStore artifacts, Runnable requireActive) {
         this.client = Objects.requireNonNull(client, "client"); this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
+        this.artifacts = Objects.requireNonNull(artifacts,"artifacts");
+        if (!artifacts.belongsTo(client,database.getName())) throw new IllegalArgumentException("preparation resources must share the original CONFIG client");
         this.bindings = Objects.requireNonNull(bindings, "bindings"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         if (!bindings.belongsTo(client, database.getName())) throw new IllegalArgumentException("preparation and binding must share one CONFIG client");
         this.mappings = SystemCollections.OPERATOR_GENERATIONS.on(database);
@@ -50,7 +55,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     @Override public PipelineStatePreparations guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
         return new MongoPipelineStatePreparations(client, client.getDatabase(mappings.getNamespace().getDatabaseName()),
-                clusterId, bindings, () -> { requireActive.run(); additional.run(); });
+                clusterId, bindings, artifacts, () -> { requireActive.run(); additional.run(); });
     }
 
     @Override public Optional<PipelinePreparation> read(String pipelineId) {
@@ -68,6 +73,12 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     }
 
     @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode) {
+        return issue(scope,originalNode,null);
+    }
+    @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode,PipelinePreparationInputs inputs) {
+        return issue(scope,originalNode,Objects.requireNonNull(inputs,"inputs"));
+    }
+    private FirstPipelineCreationResult issue(PipelineIntentScope scope,WorkloadClaimFence originalNode,PipelinePreparationInputs requested) {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(originalNode, "originalNode");
         if (originalNode.key().type() != WorkloadClaimType.NODE_SESSION || !clusterId.equals(originalNode.key().clusterId())
                 || !originalNode.key().resourceId().equals(originalNode.owner().nodeId())) throw fenced();
@@ -77,17 +88,58 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
             PipelinePreparation previous = MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId);
             if (previous.phase() != PipelinePreparation.Phase.UNASSIGNED) {
                 if (!scope.equals(previous.scope())) throw fenced();
-                return new Issuance(previous, false);
+                return new Issuance(previous, false, null);
             }
+            var fixed = verifyInputs(session,scope,requested);
             var issued = new PipelinePreparation(scope.pipelineId(), scope.stateGeneration(), PipelinePreparation.Phase.ISSUED,
                     scope, preparationId, originalNode);
             replaceAnnex(session, scope, row, issued);
-            return new Issuance(issued, true);
+            return new Issuance(issued, true, fixed);
         });
         // The grant is constructed only after withTransaction has confirmed its commit.
         requireActive.run();
-        return result.won() ? new FirstPipelineCreationResult.Issued(new Creation(result.preparation(), requireActive))
+        return result.won() ? new FirstPipelineCreationResult.Issued(new Creation(result.preparation(), result.inputs(), requireActive))
                 : new FirstPipelineCreationResult.AlreadyIssued(result.preparation());
+    }
+
+    @Override public void validateSources(PipelineIntentScope scope,PipelinePreparationInputs inputs) {
+        Objects.requireNonNull(inputs,"inputs");
+        transaction(session -> { requireCurrent(session,scope); verifyInputs(session,scope,inputs); return null; });
+    }
+    private PipelinePreparationInputs verifyInputs(ClientSession session,PipelineIntentScope scope,PipelinePreparationInputs requested) {
+        var resource = artifacts.getInTransaction(session,scope.pipelineId()).orElseThrow(MongoPipelineStatePreparations::fenced);
+        if (!(resource instanceof PipelineResource pipeline)) throw fenced();
+        var sources = new java.util.HashMap<String,SourceResource>();
+        for (var id : pipeline.sourceIds()) {
+            var source = artifacts.getInTransaction(session,id).orElseThrow(MongoPipelineStatePreparations::fenced);
+            if (!(source instanceof SourceResource actual) || sources.put(id,actual) != null) throw fenced();
+        }
+        var selected = new java.util.HashMap<String,java.util.Set<String>>();
+        if (requested == null) {
+            var settings = pipeline.settings(); ReadMode mode = settings == null || settings.readMode() == null ? ReadMode.SNAPSHOT_AND_CDC : settings.readMode();
+            if (mode != ReadMode.SNAPSHOT_ONLY && pipeline.sources().stream().anyMatch(ref -> ref instanceof SourceRef.Spec spec && !spec.srs()))
+                throw MongoPipelineSourcePreparations.identityUnproven(scope);
+            sources.keySet().forEach(id -> selected.put(id,java.util.Set.of()));
+        } else selected.putAll(requested.selectedTables());
+        for (var entry : selected.entrySet()) {
+            var source = sources.get(entry.getKey()); if (source == null) throw fenced();
+            if (source.tables() != null) for (String table : entry.getValue()) {
+                boolean accepted;
+                try {
+                    accepted = source.tables().stream().anyMatch(selector -> switch (selector) {
+                        case TableRef.Literal literal -> literal.name().equals(table);
+                        case TableRef.Spec spec -> spec.name().equals(table);
+                        case TableRef.Regex regex -> java.util.regex.Pattern.matches(regex.pattern(),table);
+                    });
+                } catch (IllegalArgumentException invalid) { throw fenced(); }
+                if (!accepted) throw fenced();
+            }
+        }
+        PipelinePreparationInputs actual;
+        try { actual = PipelinePreparationInputs.of(scope,pipeline,sources,selected); }
+        catch (IllegalArgumentException invalid) { throw fenced(); }
+        if (requested != null && !actual.equals(requested)) throw fenced();
+        return actual;
     }
 
     @Override public void requireIssued(PipelineIntentScope scope, String preparationId) {
@@ -155,17 +207,19 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         return invocation;
     }
 
-    private record Issuance(PipelinePreparation preparation, boolean won) {}
+    private record Issuance(PipelinePreparation preparation, boolean won, PipelinePreparationInputs inputs) {}
 
     /** The implementation is neither a persistent DTO nor serializable. */
     private static final class Creation implements FirstPipelineCreation {
         private final PipelinePreparation preparation;
         private final Runnable originalActive;
+        private final PipelinePreparationInputs inputs;
         private final AtomicBoolean consumed = new AtomicBoolean();
-        private Creation(PipelinePreparation preparation, Runnable originalActive) {
-            this.preparation = preparation; this.originalActive = originalActive;
+        private Creation(PipelinePreparation preparation, PipelinePreparationInputs inputs, Runnable originalActive) {
+            this.preparation = preparation; this.inputs = Objects.requireNonNull(inputs,"inputs"); this.originalActive = originalActive;
         }
         @Override public PipelinePreparation preparation() { return preparation; }
+        @Override public PipelinePreparationInputs inputs() { return inputs; }
         @Override public void consume() {
             if (!consumed.compareAndSet(false, true)) throw fenced();
             originalActive.run();

@@ -147,6 +147,10 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         reservePrivateScopes(session, before, requested);
     }
 
+    boolean belongsTo(MongoClient expected,String database) {
+        return client == expected && versions.getNamespace().getDatabaseName().equals(database);
+    }
+
     Optional<Resource> getInTransaction(ClientSession session, String id) {
         return Optional.ofNullable(find(session, id)).map(this::decode);
     }

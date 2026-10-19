@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.*;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -24,6 +25,16 @@ final class SourceModelSnapshot {
     SourceModel model(SourceResource source) {
         Optional<DiscoveredSourceModel> captured = models.get(source.id());
         if (captured == null) throw fenced(); return SourceDiscovery.matched(captured,source);
+    }
+    PipelinePreparationInputs preparationInputs(PipelineIntentScope scope,PipelineResource original,PipelineResource selected,Map<String,SourceResource> sources) {
+        requirePipeline(scope.pipelineId());
+        if (!original.id().equals(scope.pipelineId()) || !selected.id().equals(original.id()) || !original.sources().equals(selected.sources())) throw fenced();
+        var selections = new LinkedHashMap<String,java.util.Set<String>>();
+        for (String id : original.sourceIds()) {
+            var source = sources.get(id); if (source == null) throw fenced();
+            selections.put(id,java.util.Set.copyOf(PipelineTableSelection.resolve(selected,source,model(source))));
+        }
+        return PipelinePreparationInputs.of(scope,original,sources,selections);
     }
     void requirePipeline(String pipeline) { if (!this.pipeline.equals(pipeline)) throw fenced(); }
     private TapstateException fenced() { return new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null); }

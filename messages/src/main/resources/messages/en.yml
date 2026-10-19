@@ -1148,3 +1148,7 @@ store.history-retention-mismatch:
 io.direct-channel-unavailable:
   message: "Private direct channel {channel} cannot prove its retained recovery state."
   solution: "Restore the original cache facts or explicitly confirm a full rebuild before continuing."
+
+io.pipeline-capture-identity-unproven:
+  message: "Pipeline {pipeline} cannot prove that its capture identity matches the prepared state."
+  solution: "Keep the retained recovery facts. If source references, coordinates, SRS mode or selection changed, explicitly confirm a full rebuild."

@@ -34,6 +34,16 @@ class SourceModelSnapshotTest {
                 failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
         assertThatThrownBy(() -> snapshot.requirePipeline("foreign")).isInstanceOf(TapstateException.class);
     }
+    @Test void privatePreparationUsesThisStartsFrozenSelectionRatherThanLaterDiscovery() {
+        var store = new InMemoryStorePort(); var source = source("src","mysql"); store.schemas().save(discovered("src","mysql","id"));
+        var pipeline = new io.tapstate.core.model.PipelineResource("p",null,List.of(io.tapstate.core.model.SourceRef.spec("src",false)),null,null,null,null,null);
+        var scope = new PipelineIntentScope("cluster",1,"incarnation","p",1); var snapshot = SourceModelSnapshot.capture("p",List.of(source),store.schemas());
+        store.schemas().save(new DiscoveredSourceModel("src","mysql",2,new SourceModel(List.of(new SourceTable("orders",List.of(),List.of(),List.of()),new SourceTable("quiet",List.of(),List.of(),List.of())))));
+        var fixed = snapshot.preparationInputs(scope,pipeline,pipeline,Map.of("src",source));
+        assertThat(fixed.directChannels().getFirst().tables()).containsExactly("orders");
+        var next = SourceModelSnapshot.capture("p",List.of(source),store.schemas()).preparationInputs(scope,pipeline,pipeline,Map.of("src",source));
+        assertThat(next.directChannels().getFirst().tables()).containsExactlyInAnyOrder("orders","quiet"); assertThat(next.sameRecovery(fixed)).isFalse();
+    }
     @Test void aModelAwareStartNeverFallsBackToAnUnadaptedCaptureCoordinator() {
         var calls = new AtomicInteger(); var store = new InMemoryStorePort();
         var models = SourceModelSnapshot.capture("p",List.of(),store.schemas());

@@ -200,10 +200,13 @@ class PipelineFirstStatePreparerTest {
             return otherWon ? new FirstPipelineCreationResult.AlreadyIssued(facts) : new FirstPipelineCreationResult.Issued(new FirstPipelineCreation() {
                 private boolean consumed;
                 @Override public PipelinePreparation preparation() { return issued(); }
+                @Override public io.tapstate.spi.store.PipelinePreparationInputs inputs() { return new io.tapstate.spi.store.PipelinePreparationInputs("a".repeat(64),Map.of(),Map.of(),List.of()); }
                 @Override public void consume() { assertThat(consumed).isFalse(); consumed = true; calls.add("consume"); guard.run(); }
                 @Override public void requireActive() { guard.run(); }
             });
         }
+        @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope,WorkloadClaimFence node,io.tapstate.spi.store.PipelinePreparationInputs inputs) { return issueFirstCreate(scope,node); }
+        @Override public void validateSources(PipelineIntentScope scope,io.tapstate.spi.store.PipelinePreparationInputs inputs) { guard.run(); }
         @Override public void requireIssued(PipelineIntentScope scope, String id) {
             guard.run(); calls.add("require-issued");
             if (revoked || !facts.scope().equals(scope) || !facts.preparationId().equals(id) || facts.phase() != PipelinePreparation.Phase.ISSUED) throw fail(IoError.PIPELINE_INTENT_FENCED);
@@ -219,6 +222,7 @@ class PipelineFirstStatePreparerTest {
             if (resumeFailure != null) throw resumeFailure;
             return new Reservation(SCOPE, ID, Phase.RESERVED, PIPELINE);
         }
+        @Override public void verifySources(PipelineIntentScope scope,io.tapstate.spi.store.PipelinePreparationInputs inputs) {}
         @Override public PipelinePreparationReceipt seed(Reservation original, PipelineStatePreparations configuration, Instant time) {
             calls.add("seed"); this.original = original; this.seedTime = time; beforeSeed.run(); configuration.requireIssued(original.scope(), original.preparationId());
             return new Receipt(SCOPE, receiptId);

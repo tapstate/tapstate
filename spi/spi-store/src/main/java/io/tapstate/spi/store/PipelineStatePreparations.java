@@ -12,6 +12,12 @@ public interface PipelineStatePreparations {
     /** Only this call's winning CAS may return a first-creation invocation, after commit is confirmed. */
     FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode);
 
+    /** A source snapshot and resolved selection are mandatory when first preparing a private direct tail. */
+    FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode, PipelinePreparationInputs inputs);
+
+    /** Read-only same-domain validation of captured Pipeline and Source definitions. */
+    void validateSources(PipelineIntentScope scope, PipelinePreparationInputs inputs);
+
     /** Performed after obtaining an existing CACHE reservation and before seeding with its original fence. */
     void requireIssued(PipelineIntentScope scope, String preparationId);
 

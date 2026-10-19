@@ -12,6 +12,9 @@ public interface PipelineCachePreparations {
     /** Continues only retained original facts; missing claims or checkpoints are never reconstructed. */
     Reservation resume(PipelinePreparation original, WorkloadClaimFence currentNode, Duration ttl);
 
+    /** Loads the retained original source manifest and necessary progress; it grants no creation authority. */
+    void verifySources(PipelineIntentScope scope, PipelinePreparationInputs expected);
+
     /** Rechecks CONFIG outside the CACHE transaction, then verifies or publishes the original initial receipt. */
     PipelinePreparationReceipt seed(Reservation original, PipelineStatePreparations configuration, Instant touchTime);
 

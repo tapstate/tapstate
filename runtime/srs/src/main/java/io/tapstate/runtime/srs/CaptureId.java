@@ -44,15 +44,15 @@ public record CaptureId(String value) {
         }
         String reader = Objects.requireNonNull(spec.pipelineId(), "spec.pipelineId");
         String source = Objects.requireNonNull(spec.sourceId(), "spec.sourceId");
-        return of(spec.config(), spec.srsKey(), "tail:direct:" + directStart(spec.startFrom())
-                + '|' + reader.length() + ':' + reader + '|' + source.length() + ':' + source, true);
+        return new CaptureId(io.tapstate.core.model.canonical.SourceCaptureIdentity.directCapture(
+                spec.config().connectorId(),spec.config().settings(),spec.srsKey(),reader,source,directStart(spec.startFrom()),spec.config().streams()));
     }
 
     private static String directStart(StartFrom startFrom) {
         return switch (startFrom) {
             case StartFrom.Earliest ignored -> "earliest";
             case StartFrom.Latest ignored -> "latest";
-            case StartFrom.At at -> "at:" + at.instant();
+            case StartFrom.At at -> at.instant().toString();
         };
     }
 

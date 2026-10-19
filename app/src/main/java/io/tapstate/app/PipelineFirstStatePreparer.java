@@ -7,6 +7,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineCachePreparations;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelinePreparation;
+import io.tapstate.spi.store.PipelinePreparationInputs;
 import io.tapstate.spi.store.PipelinePreparationReceipt;
 import io.tapstate.spi.store.PipelineStatePreparations;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -41,7 +42,17 @@ final class PipelineFirstStatePreparer {
         if (ttl.isNegative() || ttl.isZero() || ttl.toMillis() < 1) throw new IllegalArgumentException("preparation ttl must be at least one millisecond");
     }
 
-    PipelinePreparation prepare(PipelineIntentScope original) {
+    PipelinePreparation prepare(PipelineIntentScope original) { return prepareAttempt(original,null); }
+
+    /** Runtime preparation requires the current captured source contract even when CONFIG already says COMPLETE. */
+    PipelinePreparation prepare(PipelineIntentScope original,PipelinePreparationInputs inputs) {
+        Objects.requireNonNull(inputs,"inputs"); requireActive.run();
+        configuration.validateSources(original,inputs); requireActive.run();
+        var result = prepareAttempt(original,inputs); requireActive.run();
+        cache.verifySources(original,inputs); requireActive.run(); return result;
+    }
+
+    private PipelinePreparation prepareAttempt(PipelineIntentScope original,PipelinePreparationInputs inputs) {
         Objects.requireNonNull(original, "original");
         if (!business.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation()))) throw fenced();
         requireActive.run();
@@ -53,7 +64,7 @@ final class PipelineFirstStatePreparer {
         requireNode(node);
         requireActive.run();
         if (facts.phase() == PipelinePreparation.Phase.UNASSIGNED) {
-            var issued = configuration.issueFirstCreate(original, node);
+            var issued = inputs == null ? configuration.issueFirstCreate(original,node) : configuration.issueFirstCreate(original,node,inputs);
             requireActive.run();
             if (issued instanceof FirstPipelineCreationResult.Issued winner) {
                 facts = winner.creation().preparation();

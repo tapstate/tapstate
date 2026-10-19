@@ -144,10 +144,13 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
         return new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,current,retained,cursor,run);
     }
     private record Held(DirectChannelProgress value,List<DirectBatch> current,List<DirectBatch> retained) {}
+    void requireChannel(ClientSession session,DirectChannelContext context) { held(session,context); }
     private Held held(ClientSession session,DirectChannelContext context) {
         var row = SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(session,new Document("_id",MongoDirectChannelRecords.id(context))).first();
         if (row == null) throw unavailable(context);
-        var progress = MongoDirectChannelRecords.progress(row); var byEpoch = new HashMap<Long,List<DirectBatch>>();
+        var progress = MongoDirectChannelRecords.progress(row);
+        MongoPipelineSourcePreparations.requireDirect(session,database,context,progress.tables());
+        var byEpoch = new HashMap<Long,List<DirectBatch>>();
         for (var batchRow : SystemCollections.DIRECT_BATCHES.on(database).find(session,new Document("_id.channel",MongoDirectChannelRecords.id(context)))) {
             var batch = MongoDirectChannelRecords.batch(batchRow); if (!batch.context().equals(context)) throw unavailable(context);
             byEpoch.computeIfAbsent(batch.epoch(),ignored -> new ArrayList<>()).add(batch);

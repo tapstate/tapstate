@@ -269,7 +269,9 @@ class MongoDirectChannelStoreIT {
                 SystemCollections.CACHE_PIPELINE_STATE.on(database).insertOne(new Document("_id","pipeline").append("scope",header).append("stateJson","NEW")
                         .append("epoch",0L).append("touchMillis",0L).append("runtimeWriteFence",1L));
                 SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(new Document("_id",MongoWorkloadClaimStore.id(pipeline.key())),new Document("$set",new Document("pipelineScope",header)
-                        .append("pipelinePreparation",MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(),PipelineCachePreparations.Phase.PREPARED))));
+                        .append("pipelinePreparation",MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(),PipelineCachePreparations.Phase.PREPARED))
+                        .append("pipelineSources",MongoPipelineSourcePreparations.encode(new PipelinePreparationInputs("a".repeat(64),Map.of("source","b".repeat(64)),
+                                Map.of("source",roster().keySet()),List.of(new DirectChannelPreparation(CONTEXT,roster().keySet(),io.tapstate.core.model.ReadMode.CDC_ONLY,"mc-"+"c".repeat(64))))))));
                 SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).insertOne(MongoDirectChannelRecords.progress(MongoDirectChannelRecords.initial(CONTEXT,roster().keySet())));
                 scenario.run(new Fixture(client,database,claims,store(client,database),capture,pipeline));
             } catch (Exception failure) { throw new AssertionError(failure); }
