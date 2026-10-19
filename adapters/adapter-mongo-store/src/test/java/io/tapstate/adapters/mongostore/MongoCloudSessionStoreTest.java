@@ -6,6 +6,7 @@ import com.mongodb.WriteError;
 import com.mongodb.client.MongoCollection;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionRecord;
 import io.tapstate.spi.store.IoError;
 import org.bson.BsonDocument;
@@ -29,6 +30,30 @@ class MongoCloudSessionStoreTest {
     private static final Instant CREATED = Instant.parse("2026-09-28T10:00:00Z");
     private static final CloudSessionIdentity IDENTITY =
             new CloudSessionIdentity("https://cloud.example", "org-one", "cluster-one");
+
+    @Test
+    void egressContextRoundTripsAndPreEgressSessionDocumentsRemainReadable() {
+        var context = new CloudSessionContext("org-one", "cluster-one", "Organization", "Cluster", "us-east-1",
+                "203.0.113.42", "STABLE");
+        var session = new CloudSessionRecord(IDENTITY, "jwt-one", "cookie-hash", "user-one", "workload:read",
+                false, CREATED, CREATED, CREATED.plusSeconds(1800), context);
+        Document document = MongoCloudSessionStore.toDocument(session);
+        assertThat(MongoCloudSessionStore.toRecord(document)).contains(session);
+        Document storedContext = document.get("clusterContext", Document.class);
+        storedContext.remove("ec2PublicIp");
+        storedContext.remove("egressAddressStatus");
+        var legacy = MongoCloudSessionStore.toRecord(document).orElseThrow();
+        assertThat(legacy.clusterContext().ec2PublicIp()).isNull();
+        assertThat(legacy.clusterContext().egressAddressStatus()).isNull();
+        assertThat(legacy.clusterContext().clusterId()).isEqualTo("cluster-one");
+        assertThat(legacy.secretHash()).isEqualTo(session.secretHash());
+
+        storedContext.put("ec2PublicIp", "");
+        storedContext.put("egressAddressStatus", "   ");
+        var blankOptionalFields = MongoCloudSessionStore.toRecord(document).orElseThrow();
+        assertThat(blankOptionalFields.clusterContext().ec2PublicIp()).isNull();
+        assertThat(blankOptionalFields.clusterContext().egressAddressStatus()).isNull();
+    }
 
     @Test
     void onlyMinimalLoginFactsAndTheCookieHashRoundTrip() {

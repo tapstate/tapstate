@@ -77,10 +77,31 @@ jobs:
       - name: Build the reactor without running tests
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Prepare pinned public inputs for Cloud startup witnesses
-        if: matrix.shard == 'rest'
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
-          echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
+          needs_cloud_release=false
+          if [ "$SHARD" = rest ]; then
+            needs_cloud_release=true
+          else
+            needs_cloud_release="$(python3 - "$RUNNER_TEMP/shards.json" "$SHARD" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              plan = json.load(source)
+          shard = next((item for item in plan["shards"] if item["id"] == sys.argv[2]), None)
+          if shard is None:
+              raise SystemExit("unknown test shard")
+          cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"
+          print("true" if any(test["class"] == cloud_context_test for test in shard["tests"]) else "false")
+          PY
+          )"
+          fi
+          if [ "$needs_cloud_release" = true ]; then
+            python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
+            echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
+          fi
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
