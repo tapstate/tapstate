@@ -58,27 +58,9 @@ final class ClusterMemberPreflight {
                         && cluster.getBootstrapMinMembers() != 2)) {
             throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
         }
-        String clusterId = required(cluster.getId(), BootError.CLUSTER_ID_REQUIRED);
-        try {
-            new ClusterIdentity(clusterId);
-        } catch (IllegalArgumentException invalid) {
-            throw new TapstateException(BootError.CLUSTER_ID_INVALID, Map.of(), invalid);
-        }
+        String clusterId = clusterId(cluster.getId());
         String nodeId = required(cluster.getNodeId(), BootError.NODE_ID_REQUIRED);
-        String advertised = required(control.getAdvertiseUrl(), BootError.CONTROL_ADVERTISE_URL_INVALID);
-        URI controlUrl;
-        try {
-            controlUrl = URI.create(advertised);
-        } catch (IllegalArgumentException invalid) {
-            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), invalid);
-        }
-        if (!controlUrl.isAbsolute()
-                || controlUrl.getHost() == null
-                || !reachableFromElsewhere(controlUrl.getHost())
-                || !("http".equalsIgnoreCase(controlUrl.getScheme())
-                        || "https".equalsIgnoreCase(controlUrl.getScheme()))) {
-            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), null);
-        }
+        URI controlUrl = controlUrl(control.getAdvertiseUrl(), true);
         if (cluster.getNodeSessionTtl() == null || cluster.getNodeSessionTtl().isNegative()
                 || cluster.getNodeSessionTtl().isZero()) {
             throw new TapstateException(BootError.NODE_SESSION_TTL_INVALID, Map.of(), null);
@@ -106,6 +88,34 @@ final class ClusterMemberPreflight {
             throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
         }
         return new Identity(clusterId, nodeId, controlUrl);
+    }
+
+    /** Applies the same cluster identity syntax in both standalone and discoverable modes. */
+    static String clusterId(String configured) {
+        String value = required(configured, BootError.CLUSTER_ID_REQUIRED);
+        try {
+            new ClusterIdentity(value);
+            return value;
+        } catch (IllegalArgumentException invalid) {
+            throw new TapstateException(BootError.CLUSTER_ID_INVALID, Map.of(), invalid);
+        }
+    }
+
+    /** Standalone members may advertise loopback; syntax and error codes are shared by both modes. */
+    static URI controlUrl(String configured, boolean remoteAddressRequired) {
+        String advertised = required(configured, BootError.CONTROL_ADVERTISE_URL_INVALID);
+        URI url;
+        try {
+            url = URI.create(advertised);
+        } catch (IllegalArgumentException invalid) {
+            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), invalid);
+        }
+        if (!url.isAbsolute() || url.getHost() == null
+                || !("http".equalsIgnoreCase(url.getScheme()) || "https".equalsIgnoreCase(url.getScheme()))
+                || (remoteAddressRequired && !reachableFromElsewhere(url.getHost()))) {
+            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), null);
+        }
+        return url;
     }
 
     private static void validateHeartbeat(HazelcastProperties hazelcast) {

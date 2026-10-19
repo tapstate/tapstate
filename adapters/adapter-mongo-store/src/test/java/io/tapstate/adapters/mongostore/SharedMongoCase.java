@@ -36,7 +36,6 @@ public final class SharedMongoCase implements BeforeEachCallback, AfterEachCallb
             "io.tapstate.adapters.mongostore.MongoClusterMembershipStoreIT",
             "io.tapstate.adapters.mongostore.MongoConnectionTestResultStoreIT",
             "io.tapstate.adapters.mongostore.MongoConnectorCatalogStoreIT",
-            "io.tapstate.adapters.mongostore.MongoConnectorRegistryIT",
             "io.tapstate.adapters.mongostore.MongoConnectorSpecStoreIT",
             "io.tapstate.adapters.mongostore.MongoDataVersionGateIT",
             "io.tapstate.adapters.mongostore.MongoDerivedSchemaStoreIT",

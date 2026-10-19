@@ -23,6 +23,7 @@ class SharedMongoCaseTest {
     @Test
     void theAtomicSaveFailureSuiteCannotShareAReplicaSet() {
         refuses(MongoKeyedStateStoreSaveIfAbsentIT.class);
+        refuses(MongoConnectorRegistryIT.class);
     }
 
     @Test

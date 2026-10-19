@@ -1,6 +1,7 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
+import io.tapstate.core.catalog.OfficialConnectors;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
@@ -115,7 +116,7 @@ public final class TargetConnectorRules {
         String supported = cloudDeployment
                 ? "mongodb, mongodb-atlas"
                 : catalog.all().stream().filter(entry -> entry.sink().capable()
-                        && !"aws-rds-mysql".equals(entry.id()))
+                        && !OfficialConnectors.isSourceOnly(entry.id()) && !"aws-rds-mysql".equals(entry.id()))
                         .map(ConnectorCatalogEntry::id).sorted().collect(Collectors.joining(", "));
         for (int i = 0; i < sync.size(); i++) {
             SyncElement element = sync.get(i);
@@ -129,7 +130,8 @@ public final class TargetConnectorRules {
             }
             // A declared upstream write function does not authorize a source-only preview as a target.
             // On-prem may register private sinks; cloud targets remain restricted to MongoDB and Atlas.
-            boolean sourceOnly = "aws-rds-mysql".equals(target.connector());
+            boolean sourceOnly = OfficialConnectors.isSourceOnly(target.connector())
+                    || "aws-rds-mysql".equals(target.connector());
             if (!sourceOnly && connector == null && !cloudDeployment) continue;
             if (!sourceOnly && connector != null && connector.sink().capable()
                     && (!cloudDeployment || "mongodb".equals(connector.id())
