@@ -34,6 +34,42 @@ class EngineRunHandleTest {
         assertThat(second.futures.get()).isZero(); assertThat(second.status.get()).isEqualTo(JobStatus.RUNNING);
     }
 
+    @Test void capturingOriginalPlacementsDoesNotControlTheJobThatLaterReusesItsName() {
+        var first = new FakeJob(1, "run-a", JobStatus.RUNNING); var second = new FakeJob(2, "run-b", JobStatus.RUNNING);
+        var manifest = new OperatorRunManifest("p", "run-a", java.util.List.of());
+        first.job.getConfig().setArgument(Engine.OPERATOR_MANIFEST_ARGUMENT, manifest);
+        var fixture = new Fixture(first);
+        fixture.onJobLookup = () -> fixture.named.set(second);
+        var captured = fixture.engine.captureRun("p").orElseThrow();
+        assertThat(captured.operatorManifest()).isEqualTo(manifest);
+        captured.cancel(); assertThat(captured.awaitTerminal(Duration.ZERO)).isTrue();
+        assertThat(first.cancels.get()).isOne(); assertThat(second.cancels.get()).isZero();
+        assertThat(second.futures.get()).isZero();
+    }
+
+    @Test void capturedPlacementsCannotBeReplacedThroughTheSameMutableJobConfiguration() {
+        var job = new FakeJob(1, "run-a", JobStatus.RUNNING); var fixture = new Fixture(job);
+        var original = new OperatorRunManifest("p", "run-a", java.util.List.of());
+        job.job.getConfig().setArgument(Engine.OPERATOR_MANIFEST_ARGUMENT, original);
+        var captured = fixture.engine.captureRun("p").orElseThrow();
+        var place = new io.tapstate.spi.store.OperatorPlacement(
+                new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "p", 1), "cache",
+                io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_FACTS, "join", "root", "facts");
+        job.job.getConfig().setArgument(Engine.OPERATOR_MANIFEST_ARGUMENT, new OperatorRunManifest("p", "run-a",
+                java.util.List.of(new OperatorMapBinding(place, "run-a", "1".repeat(64)))));
+        assertThatThrownBy(captured::operatorManifest).isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThat(job.cancels.get()).isZero();
+    }
+
+    @Test void capturingAnUnmarkedOrMismatchedJobRefusesBeforeAnyJobOperation() {
+        var job = new FakeJob(1, "run-a", JobStatus.RUNNING); var fixture = new Fixture(job);
+        assertThatThrownBy(() -> fixture.engine.captureRun("p")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        job.job.getConfig().setArgument(Engine.OPERATOR_MANIFEST_ARGUMENT, new OperatorRunManifest("p", "other", java.util.List.of()));
+        assertThatThrownBy(() -> fixture.engine.captureRun("p")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        assertThat(job.cancels.get()).isZero(); assertThat(job.futures.get()).isZero();
+    }
+
     @Test void aLateLookupDoesNotAdoptAnotherRunOrAnUnmarkedJob() {
         for (String identity : new String[]{"run-b", null}) {
             var replacement = new FakeJob(2, identity, JobStatus.RUNNING); var fixture = new Fixture(replacement);

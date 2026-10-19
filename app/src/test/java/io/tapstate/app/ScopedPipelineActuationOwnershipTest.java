@@ -64,6 +64,19 @@ class ScopedPipelineActuationOwnershipTest {
                 new ClusterWorkloadClaims(store, membership), TTL, RENEW, nanos::get);
     }
 
+    @Test void aFirstCommandCanProveOnlyItsExactZeroExecutionClaim() {
+        var owner = ownership(); var permit = owner.permit(FIRST);
+        var expected = WorkloadClaimFence.from(permit.claim());
+        assertThat(expected.executionGeneration()).isZero();
+        assertThat(owner.proveClaim(FIRST, expected)).isTrue();
+        var advanced = owner.beginExecution(FIRST, expected);
+        assertThat(owner.proveClaim(FIRST, expected)).isFalse();
+        assertThat(owner.proveClaim(FIRST, advanced.claimFence())).isTrue();
+        assertThat(owner.proveClaim(scope(2), advanced.claimFence())).isFalse();
+        assertThat(owner.proveClaim(FIRST, new WorkloadClaimFence(KEY, new WorkloadOwner("node-a", "other-boot"),
+                expected.claimGeneration(), expected.executionGeneration(), expected.topologyRevision()))).isFalse();
+    }
+
     @Test void aScopedPermitAdvancesOnlyItsOriginalClaimAndReturnsItsExactRunIdentity() {
         var owner = ownership();
         var permit = owner.permit(FIRST);

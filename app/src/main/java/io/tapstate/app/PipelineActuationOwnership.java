@@ -542,12 +542,28 @@ final class PipelineActuationOwnership {
         if (fence == null || closing || (businessScope == null ? fence.scope() != null
                 : fence.scope() == null || !accepts(fence.scope())
                         || !owner.nodeId().equals(fence.ownerNodeId()) || !owner.bootId().equals(fence.ownerBootId()))) return false;
-        WorkloadClaimKey key =
-                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId());
+        WorkloadClaimFence expected = new WorkloadClaimFence(
+                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId()),
+                owner, fence.claimGeneration(), fence.executionGeneration(),
+                fence.scope() == null ? 0 : fence.topologyRevision());
+        return proveClaim(fence.scope(), expected, fence.scope() != null);
+    }
+
+    /** Proves the exact admitted command, including a first claim whose execution counter is still zero. */
+    boolean proveClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(expected, "expected");
+        return proveClaim(scope, expected, true);
+    }
+
+    private boolean proveClaim(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology) {
+        if (!fenced || closing || (scope != null && !accepts(scope)) || !expected.owner().equals(owner)
+                || expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || !clusterId.equals(expected.key().clusterId())
+                || (scope != null && !scope.pipelineId().equals(expected.key().resourceId()))) return false;
         long askedAt = nanoTime.getAsLong();
         Optional<WorkloadClaimReading> reading;
         try {
-            reading = fence.scope() == null ? claims.read(key) : claims.readPipeline(fence.scope());
+            reading = scope == null ? claims.read(expected.key()) : claims.readPipeline(scope);
         } catch (RuntimeException unreachable) {
             return false;
         }
@@ -557,20 +573,20 @@ final class PipelineActuationOwnership {
             Duration remaining = reading.get().leaseRemaining();
             long bound = remaining.compareTo(ttl) < 0 ? remaining.toNanos() : ttl.toNanos();
             long checkedAt = nanoTime.getAsLong();
-            Held state = held.get(fence.pipelineId());
+            Held state = held.get(expected.key().resourceId());
             WorkloadClaim claim = reading.get().claim();
-            // Include IO and lock waits in the lease bound, then compare the holder after every callback.
-            // Lease-only renewals preserve this proof; a scoped run retains its original topology.
             return !closing && bound > 0 && checkedAt - askedAt < bound
-                    && state != null && Objects.equals(state.scope, fence.scope()) && state.claim != null
-                    && state.claim.owner().equals(owner) && state.claim.claimGeneration() == fence.claimGeneration()
-                    && state.claim.executionGeneration() == fence.executionGeneration()
-                    && (fence.scope() == null || state.claim.topologyRevision() == fence.topologyRevision())
-                    && claim.key().equals(key) && claim.owner().equals(owner)
-                    && claim.claimGeneration() == fence.claimGeneration()
-                    && claim.executionGeneration() == fence.executionGeneration()
-                    && (fence.scope() == null || claim.topologyRevision() == fence.topologyRevision());
+                    && state != null && Objects.equals(state.scope, scope) && state.claim != null
+                    && sameClaim(WorkloadClaimFence.from(state.claim), expected, compareTopology)
+                    && sameClaim(WorkloadClaimFence.from(claim), expected, compareTopology);
         }
+    }
+
+    private static boolean sameClaim(WorkloadClaimFence actual, WorkloadClaimFence expected, boolean compareTopology) {
+        return actual.key().equals(expected.key()) && actual.owner().equals(expected.owner())
+                && actual.claimGeneration() == expected.claimGeneration()
+                && actual.executionGeneration() == expected.executionGeneration()
+                && (!compareTopology || actual.topologyRevision() == expected.topologyRevision());
     }
 
     /** Whether a local capture still serves a pipeline this member holds; never acquires or renews a claim. */

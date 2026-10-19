@@ -158,7 +158,7 @@ public final class Engine {
         if (!originalIdentity.equals(submitted.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
                 || !Objects.equals(manifest, submitted.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
         JobFailureRegistry.of(member).attach(pipelineId, submitted.getId(), originalIdentity);
-        return new Run(pipelineId, originalIdentity, submitted);
+        return new Run(pipelineId, originalIdentity, submitted, manifest);
     }
 
     /** Application bootstrap calls this after member startup; MapStore initialization never queries Jet. */
@@ -184,8 +184,20 @@ public final class Engine {
     public Optional<Run> findRun(String pipelineId, java.io.Serializable originalIdentity) {
         Objects.requireNonNull(originalIdentity, "originalIdentity");
         Job job = jobNamed(pipelineId);
-        return job != null && originalIdentity.equals(job.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
-                ? Optional.of(new Run(pipelineId, originalIdentity, job)) : Optional.empty();
+        if (job == null) return Optional.empty();
+        JobConfig config = job.getConfig();
+        if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) return Optional.empty();
+        OperatorRunManifest manifest = config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null
+                ? null : requireOperatorManifest(job, config);
+        return Optional.of(new Run(pipelineId, originalIdentity, job, manifest));
+    }
+
+    /** Captures one marked job and its original placements; later operations never resolve its name again. */
+    public Optional<Run> captureRun(String pipelineId) {
+        Job job = jobNamed(pipelineId);
+        if (job == null) return Optional.empty();
+        OperatorRunManifest original = requireOperatorManifest(job, job.getConfig());
+        return Optional.of(new Run(pipelineId, original.executionIdentity(), job, original));
     }
 
     /** A local, non-serializable handle for the one concrete job whose configuration was verified. */
@@ -193,14 +205,16 @@ public final class Engine {
         private final String pipelineId;
         private final java.io.Serializable identity;
         private final Job job;
-        private Run(String pipelineId, java.io.Serializable identity, Job job) {
+        private final OperatorRunManifest originalManifest;
+        private Run(String pipelineId, java.io.Serializable identity, Job job, OperatorRunManifest originalManifest) {
             this.pipelineId = pipelineId; this.identity = identity; this.job = job;
+            this.originalManifest = originalManifest;
         }
         public long jobId() { return job.getId(); }
         public OperatorRunManifest operatorManifest() {
-            var original = requireOperatorManifest(job, job.getConfig());
-            if (!identity.equals(original.executionIdentity())) throw runRefused(pipelineId);
-            return original;
+            if (originalManifest == null || !identity.equals(originalManifest.executionIdentity())
+                    || !originalManifest.equals(requireOperatorManifest(job, job.getConfig()))) throw runRefused(pipelineId);
+            return originalManifest;
         }
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
         public void suspend() { requireLive(); job.suspend(); }

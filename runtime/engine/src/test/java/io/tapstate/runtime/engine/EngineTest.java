@@ -402,6 +402,8 @@ class EngineTest {
         var run = engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),original);
         awaitStatus(member.getJet().getJob("operator-run"),JobStatus.RUNNING);
         assertThat(run.operatorManifest()).isEqualTo(original); assertThat(engine.operatorManifests()).containsExactly(original);
+        var captured = engine.captureRun("operator-run").orElseThrow();
+        assertThat(captured.jobId()).isEqualTo(run.jobId()); assertThat(captured.operatorManifest()).isEqualTo(original);
         assertThat(engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),original).jobId()).isEqualTo(run.jobId());
         var changed = new OperatorRunManifest("operator-run",identity,List.of());
         assertThatThrownBy(() -> engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),changed))
@@ -409,6 +411,13 @@ class EngineTest {
         assertThatThrownBy(() -> engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),identity)).isInstanceOf(TapstateException.class);
         assertThat(run.operatorManifest()).isEqualTo(original); assertThat(run.isCarryingAJob()).isTrue();
         run.cancel(); assertThat(run.awaitTerminal(Duration.ofSeconds(10))).isTrue(); assertThat(engine.operatorManifests()).isEmpty();
+        var nextIdentity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 2);
+        var nextManifest = new OperatorRunManifest("operator-run", nextIdentity, List.of());
+        var next = engine.submitRun("operator-run", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), nextManifest);
+        awaitStatus(member.getJet().getJob("operator-run"), JobStatus.RUNNING);
+        captured.cancel(); assertThat(captured.awaitTerminal(Duration.ofSeconds(10))).isTrue();
+        assertThat(captured.operatorManifest()).isEqualTo(original); assertThat(next.isCarryingAJob()).isTrue();
+        next.cancel(); assertThat(next.awaitTerminal(Duration.ofSeconds(10))).isTrue();
     }
 
     @Test
