@@ -18,6 +18,7 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
         this.run = Objects.requireNonNull(run,"run"); this.table = Objects.requireNonNull(table,"table");
         if (table.isBlank()) throw new IllegalArgumentException("blank original consumer table");
     }
+    @Override public boolean requiresDurableLog() { return true; }
     @Override public LongConsumer resolve(HazelcastInstance member) {
         var bound = ScopedSrsConsumerAccess.bind(member,run);
         return sequence -> {

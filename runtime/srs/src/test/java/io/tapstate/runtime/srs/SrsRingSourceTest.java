@@ -65,6 +65,24 @@ class SrsRingSourceTest {
         }
     }
 
+    @Test void nativePipelineSourceCannotReadAHotRingWithoutItsDurableLog() throws Exception {
+        String ring="srs.native-unbound-pipeline.orders",sink="native-unbound-pipeline-target"; fill(ring,1);
+        Pipeline pipeline=Pipeline.create(); pipeline.readFrom(SrsRingSource.create(ring,StartFrom.earliest(),new NativePublisher(),null))
+                .withoutTimestamps().writeTo(Sinks.list(sink));
+        Job job=hz.getJet().newJob(pipeline); IList<SrsItem> target=hz.getList(sink);
+        try {
+            long until=System.nanoTime()+Duration.ofSeconds(10).toNanos();
+            while(target.isEmpty() && !job.getFuture().isDone() && System.nanoTime()<until) Thread.sleep(10);
+            assertThat(job.getFuture().isCompletedExceptionally()).isTrue();
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> job.getFuture().join()).hasStackTraceContaining(CaptureError.SRS_NOT_RECOVERABLE.code());
+            assertThat(target).isEmpty();
+        } finally { if(!job.getFuture().isDone()) job.cancel(); target.destroy(); }
+    }
+    private record NativePublisher() implements SrsReadCursorPublisherFactory {
+        @Override public boolean requiresDurableLog() { return true; }
+        @Override public java.util.function.LongConsumer resolve(HazelcastInstance member) { return ignored -> {}; }
+    }
+
     /** Pre-fills a ring with {@code count} inserts at sequences {@code 0..count-1}. */
     private static void fill(String ringName, int count) {
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(ringName));

@@ -92,6 +92,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private SrsRingbuffer ring;
     private SrsLogStore log;
     private ChainPosition confirmed;
+    private Long recoveryAfter;
     private LongConsumer cursor;
     private SrsRingReader reader;
     private SrsEventModelVerifier modelVerifier = SrsEventModelVerifier.NONE;
@@ -186,13 +187,20 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             // the ring's first refusable operation on the initialisation path, which has nowhere to wait: the
             // refusal a forming cluster answers with would end the run before it had read anything, and
             // nothing submits another.
+            Object durable = context.hazelcastInstance().getUserContext().get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+            log = durable instanceof SrsLogStore resolved ? resolved : null;
+            if (log == null && ringTail.publisherFactory().requiresDurableLog())
+                throw new TapstateException(CaptureError.SRS_NOT_RECOVERABLE,Map.of("chain",ringName),null);
             modelVerifier = Objects.requireNonNull(ringTail.publisherFactory().modelVerifier(context.hazelcastInstance(),ringName),"model verifier");
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
             ring = new SrsRingbuffer(rb);
             cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
-            Object durable = context.hazelcastInstance().getUserContext()
-                    .get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
-            log = durable instanceof SrsLogStore resolved ? resolved : null;
+            var recovery = ringTail.publisherFactory().recoverySequence(context.hazelcastInstance());
+            recoveryAfter = ringTail.resumeAfter();
+            if (recovery.isPresent()) recoveryAfter = recovery.getAsLong();
+            if (recovery.isPresent() && ringTail.resumeAfter() != null && recovery.getAsLong() < ringTail.resumeAfter())
+                throw new TapstateException(CaptureError.RECOVERY_LOG_GAP,Map.of("ring",ringName,"sequence",recovery.getAsLong(),
+                        "reason","the original saved recovery floor moved backwards"),null);
             confirmed = ringTail.publisherFactory().confirmedPosition(context.hazelcastInstance()).orElse(null);
         }
     }
@@ -291,7 +299,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         }
         try {
             if (log == null) {
-                Long resumeAfter = ringTail.resumeAfter();
+                Long resumeAfter = recoveryAfter;
                 if (confirmed != null && confirmed.order() != null && confirmed.order().seq() >= 0L) {
                     // A resumed job reuses its graph, but its sink may have confirmed more since assembly.
                     long confirmedSeq = confirmed.order().seq();
@@ -301,9 +309,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                         ? SrsRingReader.resumingAfter(ring, resumeAfter, cursor)
                         : SrsRingReader.from(ring, ringTail.start(), cursor);
             } else {
-                reader = ringTail.resumeAfter() != null
+                reader = recoveryAfter != null
                         ? SrsRingReader.resumingAfter(
-                                ring, ringTail.resumeAfter(), confirmed, cursor, ringName, log)
+                                ring, recoveryAfter, confirmed, cursor, ringName, log)
                         : SrsRingReader.from(ring, ringTail.start(), cursor, null, ringName, log);
             }
             refused = false;

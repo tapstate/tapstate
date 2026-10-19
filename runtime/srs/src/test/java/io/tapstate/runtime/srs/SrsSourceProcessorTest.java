@@ -90,6 +90,52 @@ class SrsSourceProcessorTest {
         }
     }
 
+    @Test void nativeRecoveryUsesTheSavedArrivalFloorBeforeTheRequestedFreshStart() throws Exception {
+        String ring = "srs.chain.native-floor", sink = "out-native-floor";
+        var rows = new java.util.TreeMap<Long,io.tapstate.spi.store.SrsLogRecord>();
+        var hot = new SrsRingbuffer(hz.getRingbuffer(ring));
+        for (int i=0;i<4;i++) {
+            hot.append(new SrsItem(new SourcePosition("w"+i),Op.INSERT,1,null,Map.of("id",i),0,null,1));
+            rows.put((long)i,new io.tapstate.spi.store.SrsLogRecord("w"+i,Op.INSERT,1,null,Map.of("id",i),0,1));
+        }
+        io.tapstate.spi.store.SrsLogStore log = new io.tapstate.spi.store.SrsLogStore() {
+            @Override public long largestSequence(String name) { return 3; }
+            @Override public java.util.Optional<io.tapstate.spi.store.SrsLogRecord> load(String name,long seq) { return java.util.Optional.ofNullable(rows.get(seq)); }
+            @Override public void store(String r,long q,io.tapstate.spi.store.SrsLogRecord value) { throw new AssertionError(); }
+            @Override public void storeAll(String r,long q,List<io.tapstate.spi.store.SrsLogRecord> value) { throw new AssertionError(); }
+            @Override public void trim(String r,long q) { throw new AssertionError(); }
+        };
+        hz.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY,log);
+        var cursor = new java.util.concurrent.atomic.AtomicLong(-1); hz.getUserContext().put("native-floor-read",cursor);
+        var out = hz.<String>getList(sink); var job = hz.getJet().newJob(projectedDag(ring,"orders",sink,1024,new NativeRecoveryPublisher(1)));
+        try {
+            long until = System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
+            while(cursor.get()!=3 && !job.getFuture().isDone() && System.nanoTime()<until) Thread.sleep(10);
+            assertThat(cursor).hasValue(3); awaitSize(out,2);
+            assertThat(out).containsExactly("orders|w2|2|1:2","orders|w3|3|1:3");
+        } finally {
+            job.cancel(); hz.getUserContext().remove(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY); hz.getUserContext().remove("native-floor-read"); out.destroy();
+        }
+    }
+    @Test void aNativeReaderWithNoDurableLogRefusesBeforeAnyHotProjection() throws Exception {
+        String ring="srs.chain.native-unbound",sink="out-native-unbound"; fill(ring,1);
+        var out=hz.<String>getList(sink); var job=hz.getJet().newJob(projectedDag(ring,"orders",sink,1024,new NativeRecoveryPublisher(-1)));
+        try {
+            long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
+            while(out.isEmpty() && !job.getFuture().isDone() && System.nanoTime()<until) Thread.sleep(10);
+            assertThat(job.getFuture().isCompletedExceptionally()).isTrue();
+            assertThatThrownBy(() -> job.getFuture().join()).hasStackTraceContaining(CaptureError.SRS_NOT_RECOVERABLE.code());
+            assertThat(out).isEmpty();
+        } finally { if(!job.getFuture().isDone()) job.cancel(); out.destroy(); }
+    }
+    private record NativeRecoveryPublisher(long floor) implements SrsReadCursorPublisherFactory {
+        @Override public boolean requiresDurableLog() { return true; }
+        @Override public java.util.OptionalLong recoverySequence(HazelcastInstance member) { return java.util.OptionalLong.of(floor); }
+        @Override public LongConsumer resolve(HazelcastInstance member) {
+            return sequence -> { var counter=member.getUserContext().get("native-floor-read"); if(counter instanceof java.util.concurrent.atomic.AtomicLong value) value.set(sequence); };
+        }
+    }
+
     static final String MODEL_CHECKS = "test.source.model.checks";
     static final String MODEL_CURSOR = "test.source.model.cursor";
     @Test

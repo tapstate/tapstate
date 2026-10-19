@@ -58,9 +58,11 @@ public final class SrsRingSource {
         return SourceBuilder
                 .stream("srs-source-" + ringName, ctx -> {
                     var verifier = Objects.requireNonNull(publisherFactory.modelVerifier(ctx.hazelcastInstance(),ringName),"model verifier");
+                    Object persisted = ctx.hazelcastInstance().getUserContext().get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+                    if (!(persisted instanceof io.tapstate.spi.store.SrsLogStore) && publisherFactory.requiresDurableLog())
+                        throw new io.tapstate.core.common.TapstateException(CaptureError.SRS_NOT_RECOVERABLE,java.util.Map.of("chain",ringName),null);
                     Ringbuffer<SrsItem> rb = ctx.hazelcastInstance().getRingbuffer(ringName);
                     SrsRingbuffer ring = new SrsRingbuffer(rb);
-                    Object persisted = ctx.hazelcastInstance().getUserContext().get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
                     SrsRingReader reader;
                     if (persisted instanceof io.tapstate.spi.store.SrsLogStore log) {
                         var cursor = publisherFactory.resolve(ctx.hazelcastInstance());
