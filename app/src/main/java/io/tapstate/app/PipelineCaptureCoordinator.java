@@ -20,6 +20,11 @@ interface PipelineCaptureCoordinator {
         throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
     }
 
+    /** Only a scoped successful start can supply the immutable source results for its deferred DAG. */
+    default PipelineCaptureBindings captureBindings() {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /** Keeps a shared claim only while the capture serves a pipeline driven here, preserving durable positions. */
     default void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
     }

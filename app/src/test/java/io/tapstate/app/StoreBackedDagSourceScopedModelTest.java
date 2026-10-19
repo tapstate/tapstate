@@ -32,7 +32,7 @@ class StoreBackedDagSourceScopedModelTest {
         var prepared = f.source.prepareStart(pass, "default");
         assertThat(f.views.writes).isEmpty();
         WorkloadClaimFence next = advance(1); f.views.current.set(next); pass.advanced(next);
-        prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
+        bindCapturedSources(prepared,pass); prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
         assertThat(f.views.writes).isNotEmpty().containsOnly(next);
         assertThat(f.views.scopes).containsOnly(SCOPE);
         assertThat(f.views.models.latest("p", "src.orders")).isPresent();
@@ -61,7 +61,7 @@ class StoreBackedDagSourceScopedModelTest {
         f.store.schemas().save(new DiscoveredSourceModel("src","mysql",1,new SourceModel(List.of(new SourceTable("orders",
                 List.of(new SourceField("replacement","INT")),List.of("replacement"),List.of())))));
         var advanced = advance(1); f.views.current.set(advanced); pass.advanced(advanced);
-        prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
+        bindCapturedSources(prepared,pass); prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
         assertThat(f.views.models.latest("p","src.orders").orElseThrow().schema()).containsOnlyKeys("id","customer_ref");
         assertThat(f.store.schemas().get("src").orElseThrow().model().tables().getFirst().primaryKey()).containsExactly("replacement");
     }
@@ -138,7 +138,7 @@ class StoreBackedDagSourceScopedModelTest {
         SourceResource exposed = (SourceResource) prepared.artifactSnapshot().orElseThrow().list().stream().filter(row -> row.id().equals("dest")).findFirst().orElseThrow();
         @SuppressWarnings("unchecked") var extra = (Map<String, Object>) exposed.config().get("extra");
         try { extra.put("label", "changed-result"); } catch (UnsupportedOperationException immutable) { /* A detached or immutable result is safe. */ }
-        prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
+        bindCapturedSources(prepared,pass); prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
         assertThat(bound).isNotEmpty(); assertThat(bound.getLast()).containsEntry("extra", Map.of("label", "original"));
     }
 
@@ -155,7 +155,7 @@ class StoreBackedDagSourceScopedModelTest {
         assertThatThrownBy(() -> planned.build(new ExecutionFence("p",3,1))).isInstanceOfSatisfying(TapstateException.class,
                 failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
         assertThat(f.views.shapes).isEmpty();
-        var built = planned.build(new ExecutionFence(SCOPE,advanced));
+        bindCapturedSources(prepared,pass); var built = planned.build(new ExecutionFence(SCOPE,advanced));
         var vertices = new ArrayList<String>(); built.dag().forEach(vertex -> vertices.add(vertex.getName()));
         assertThat(vertices).contains("nest:doc");
         assertThat(f.views.shapes).containsEntry("extra-cache/doc",plan.nests().get("doc").shape());
@@ -216,6 +216,45 @@ class StoreBackedDagSourceScopedModelTest {
                 .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
         assertThat(pass.claim()).isEqualTo(advance(2));
         assertThat(f.views.shapes).isEmpty(); assertThat(f.views.writes).doesNotContain(advance(2));
+    }
+
+    @Test void scopedTopologyNeverConsultsLegacyMetaKeyedStateOrOperatorStores() {
+        var f = nestFixture();
+        var guarded = org.mockito.Mockito.mock(StorePort.class,org.mockito.AdditionalAnswers.delegatesTo(f.store));
+        org.mockito.Mockito.doThrow(new AssertionError("legacy SRS meta must not serve a scoped run")).when(guarded).meta();
+        org.mockito.Mockito.doThrow(new AssertionError("legacy state must not serve a scoped run")).when(guarded).keyedState();
+        org.mockito.Mockito.doThrow(new AssertionError("legacy operator routes must not serve a scoped run")).when(guarded).operatorStateStores();
+        org.mockito.Mockito.doThrow(new AssertionError("unscoped derivations must not be opened before a scoped pass")).when(guarded).derivedSchemas();
+        var source = new StoreBackedDagSource(guarded,f.source.sinkWriterBinder()); var pass = f.pass(() -> {});
+        var prepared = source.prepareStart(pass,"cache"); f.views.current.set(advance(1)); pass.advanced(advance(1));
+        bindCapturedSources(prepared,pass); assertThat(prepared.plan().build(new ExecutionFence(SCOPE,advance(1))).dag()).isNotNull();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).meta();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).keyedState();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).operatorStateStores();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).derivedSchemas();
+    }
+
+    @Test void aScopedSourceMissingItsOriginalCaptureResultCannotBuildFromLegacyProgress() {
+        var f = fixture(false); var pass = f.pass(() -> {}); var prepared = f.source.prepareStart(pass,"cache");
+        f.views.current.set(advance(1)); pass.advanced(advance(1));
+        pass.bindCapture(advance(1),new PipelineCaptureBindings(new ExecutionFence(SCOPE,advance(1)),Map.of(),false));
+        assertThatThrownBy(() -> prepared.plan().build(new ExecutionFence(SCOPE,advance(1))))
+                .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
+    }
+
+    private static void bindCapturedSources(DagSource.StartPreparation prepared,PipelineConvergencePass pass) {
+        var artifacts = prepared.artifactSnapshot().orElseThrow();
+        var pipeline = (PipelineResource) artifacts.get(pass.scope().pipelineId()).orElseThrow();
+        var sources = new java.util.LinkedHashMap<String,PipelineCaptureBindings.LoggedSource>();
+        for (String id : pipeline.sourceIds()) {
+            var source = (SourceResource) artifacts.get(id).orElseThrow();
+            var resolution = SourceCaptureResolution.forPipeline(pipeline,source,prepared.sourceModels().orElseThrow().model(source)).orElseThrow();
+            var context = new SrsConsumerContext(new SrsConsumerKey(resolution.chainId().value(),pipeline.id(),id),pass.scope().stateGeneration());
+            var membership = new SrsConsumerMembership(context,1,false,java.util.Set.copyOf(resolution.tables()),pass.claim());
+            var floors = new java.util.LinkedHashMap<String,Long>(); resolution.tables().forEach(table -> floors.put(table,-1L));
+            sources.put(id,new PipelineCaptureBindings.LoggedSource(SrsConsumerRun.of(pass.scope(),membership),1,floors));
+        }
+        pass.bindCapture(pass.claim(),new PipelineCaptureBindings(new ExecutionFence(pass.scope(),pass.claim()),sources,true));
     }
 
     private static Fixture nestFixture() {

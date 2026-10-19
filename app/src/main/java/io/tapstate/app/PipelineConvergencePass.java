@@ -28,6 +28,7 @@ final class PipelineConvergencePass {
     private final PipelineStoreViews views;
     private final Runnable requireActive;
     private final StateStore state;
+    private final AtomicReference<PipelineCaptureBindings> captures = new AtomicReference<>();
 
     private final io.tapstate.spi.store.RateHistoryStore rateHistory = new io.tapstate.spi.store.RateHistoryStore() {
         @Override public void append(io.tapstate.core.lifecycle.RateSample sample) {
@@ -120,6 +121,24 @@ final class PipelineConvergencePass {
         requirePipeline(pipelineId);
         views.nestShapes(scope(), database, original, requireActive).recordIfAbsent(step, captured)
                 .ifPresent(recorded -> io.tapstate.runtime.engine.nest.NestStateLedger.requireSameShape(step, recorded, captured));
+    }
+
+    /** A successful capture publishes only the exact source identities of this execution. */
+    void bindCapture(WorkloadClaimFence original,PipelineCaptureBindings bindings) {
+        Objects.requireNonNull(original,"original"); Objects.requireNonNull(bindings,"bindings");
+        requirePipeline(scope().pipelineId());
+        if (!original.equals(claim.get()) || !bindings.original().equals(new ExecutionFence(scope(),original))) throw fenced();
+        requirePipeline(scope().pipelineId());
+        if (!original.equals(claim.get())) throw fenced();
+        // No callback can observe a candidate before every admission check has succeeded.
+        var before = captures.compareAndExchange(null,bindings);
+        if (before != null && !before.equals(bindings)) throw fenced();
+    }
+    PipelineCaptureBindings captureBindings(WorkloadClaimFence original) {
+        Objects.requireNonNull(original,"original"); requirePipeline(scope().pipelineId());
+        var fixed = captures.get();
+        if (!original.equals(claim.get()) || fixed == null || !fixed.original().equals(new ExecutionFence(scope(),original))) throw fenced();
+        return fixed;
     }
 
     /** Prepares the captured Nest databases before any member resource can be opened. */

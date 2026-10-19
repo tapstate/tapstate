@@ -65,6 +65,7 @@ class ScopedEngineLifecycleActuatorTest {
         when(captures.forRun(any(),any(),any())).thenAnswer(call -> { events.add("bind:"+((ExecutionFence)call.getArgument(2)).executionGeneration()); return fixedCapture; });
         doAnswer(call -> { events.add("capture"); return null; }).when(fixedCapture).startCapture(eq("p"),any(ArtifactStore.class),any(SourceModelSnapshot.class));
         when(fixedCapture.loadDelivered("p")).thenReturn(true);
+        when(fixedCapture.captureBindings()).thenAnswer(call -> new PipelineCaptureBindings(new ExecutionFence(SCOPE,held.get()),Map.of(),false));
         when(ownership.beginExecution(eq(SCOPE),any())).thenAnswer(call -> {
             WorkloadClaimFence before = call.getArgument(1); assertThat(before).isEqualTo(held.get());
             var next = claim(before.executionGeneration()+1); held.set(next); events.add("advance");
@@ -204,6 +205,14 @@ class ScopedEngineLifecycleActuatorTest {
         verify(ownership).beginExecution(SCOPE,claim(1)); verify(ownership,never()).beginExecution(anyString());
         verify(engine).submitRun(eq("p"),any(),anyMap(),any(),eq(manifest(2)));
     }
+    @Test void aCaptureResultFromAnotherExecutionCannotBuildOrSubmitTheNewRun() {
+        when(fixedCapture.captureBindings()).thenReturn(new PipelineCaptureBindings(new ExecutionFence(SCOPE,claim(1)),Map.of(),false));
+        assertThatThrownBy(() -> actuator().start("p")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(events).doesNotContain("build","submit");
+        verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
+    }
+
     @Test void everyDistinctNestDatabaseIsPreparedAfterAdvanceAndBeforeMembersEvenForPassthroughNests() {
         withNestDatabases(); var actor = actuator(); actor.start("p");
         assertThat(events).containsSubsequence("advance","bind:2","database:extra-cache","database:second-cache","operators","capture","build","submit");

@@ -80,6 +80,22 @@ class ScopedSrsSinkAckFactoryTest {
         f.held.set(progress(4,List.of("orders"),null)); assertThat(landings.stillLanding(List.of(awaited))).isEmpty();
         f.held.set(progress(5,List.of("orders"),null)); assertThatThrownBy(() -> landings.stillLanding(List.of(awaited))).satisfies(ScopedSrsSinkAckFactoryTest::refused);
     }
+    @Test void operatorReplayFloorUsesOnlyTheSameOriginalTableSinkConfirmation() throws Exception {
+        var f = new Fixture(); var source = new ScopedSrsSinkAckFactory.Source(RUN,"orders");
+        var factory = new ScopedSrsReplayFloorFactory(Map.of("source.orders",source));
+        var bytes = new ByteArrayOutputStream(); try(var out=new ObjectOutputStream(bytes)) { out.writeObject(factory); }
+        io.tapstate.runtime.engine.ReplayFloorFactory copy;
+        try(var in=new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) { copy=(io.tapstate.runtime.engine.ReplayFloorFactory)in.readObject(); }
+        var floors=copy.resolve(f.member); f.held.set(progress(4,List.of(),null));
+        assertThat(floors.of("source.orders")).isEmpty();
+        var prior=f.held.get(); var old=prior.cursor(); var table=new ChainPosition(new SourceOrder(7,10),"table-token");
+        var cursor=new ConsumerOffset(old.pipelineId(),Map.of("orders",99L),new ChainPosition(new SourceOrder(7,50),"aggregate"),
+                old.snapshotCompletedTables(),old.cdcStartPosition(),old.snapshotEpoch(),Map.of("orders",table),ConsumerProgressKind.SRS);
+        f.held.set(new SrsConsumerProgress(RUN.context(),4,2,cursor,prior.snapshot()));
+        assertThat(floors.of("source.orders")).contains(table.order()); assertThat(floors.of("uncompiled")).isEmpty();
+        f.active.set(false); assertThatThrownBy(() -> floors.of("source.orders")).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+    }
+
     private static SrsConsumerProgress progress(long membership,List<String> complete,SrsConsumerWriterRun writer) {
         var pin = new SrsSnapshotPin(7,"owner-seam",Map.of("orders",new SrsModelKey("chain","orders","cache",1,0)));
         var cursor = new ConsumerOffset(RUN.context().key().consumerId(),Map.of("orders",99L),null,complete,"owner-seam",7,Map.of(),ConsumerProgressKind.SRS);

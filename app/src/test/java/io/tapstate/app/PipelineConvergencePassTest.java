@@ -251,6 +251,35 @@ class PipelineConvergencePassTest {
         assertThat(calls).hasValue(0);
     }
 
+    @Test void captureResultsRemainBoundToTheirOriginalExecutionAndCannotBeReplaced() {
+        var pass = new PipelineConvergencePass(INTENT,ORIGINAL,views,() -> {}); pass.advanced(execution(1));
+        var result = new PipelineCaptureBindings(new ExecutionFence(SCOPE,execution(1)),Map.of(),false);
+        pass.bindCapture(execution(1),result); assertThat(pass.captureBindings(execution(1))).isSameAs(result);
+        pass.advanced(execution(2));
+        assertThatThrownBy(() -> pass.captureBindings(execution(2))).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> pass.bindCapture(execution(2),new PipelineCaptureBindings(new ExecutionFence(SCOPE,execution(2)),Map.of(),false)))
+                .isInstanceOf(TapstateException.class);
+    }
+
+    @Test void aRejectedCapturePublicationCannotBecomeReadableWhenItsGuardRecovers() {
+        var checks = new AtomicInteger();
+        var pass = new PipelineConvergencePass(INTENT,ORIGINAL,views,() -> { if(checks.incrementAndGet()==2) throw fenced(); });
+        pass.advanced(execution(1)); var result=new PipelineCaptureBindings(new ExecutionFence(SCOPE,execution(1)),Map.of(),false);
+        assertThatThrownBy(() -> pass.bindCapture(execution(1),result)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> pass.captureBindings(execution(1))).isInstanceOf(TapstateException.class);
+        pass.bindCapture(execution(1),result); assertThat(pass.captureBindings(execution(1))).isSameAs(result);
+    }
+    @Test void aReentrantGuardCannotReadACaptureCandidateBeforeItsPublicationCommits() {
+        var owner = new AtomicReference<PipelineConvergencePass>(); var checks=new AtomicInteger();
+        var once=new AtomicBoolean();
+        var pass=new PipelineConvergencePass(INTENT,ORIGINAL,views,() -> {
+            if(checks.incrementAndGet()==2 && once.compareAndSet(false,true))
+                assertThatThrownBy(() -> owner.get().captureBindings(execution(1))).isInstanceOf(TapstateException.class);
+        }); owner.set(pass); pass.advanced(execution(1));
+        var result=new PipelineCaptureBindings(new ExecutionFence(SCOPE,execution(1)),Map.of(),false);
+        pass.bindCapture(execution(1),result); assertThat(once).isTrue(); assertThat(pass.captureBindings(execution(1))).isSameAs(result);
+    }
+
     private static WorkloadClaimFence execution(long generation) { return new WorkloadClaimFence(KEY, OWNER, 2, generation, 7); }
     private static Observation observation(String id) {
         return new Observation(id, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, T0);

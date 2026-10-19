@@ -241,7 +241,7 @@ final class StoreBackedDagSource implements DagSource {
         Set<OperatorStateLocation> locations = operators == null ? captured.stateLocations(pipelineId,defaultDatabase) : Set.of();
         // Freshness belongs to the start before capture registers its ring cursor and snapshot seam.
         // Carry that answer into the deferred build rather than re-reading capture's own mutations.
-        boolean freshFullLoad = captured.freshFullLoad(pipeline);
+        boolean freshFullLoad = pass == null && captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
                 () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
@@ -355,7 +355,21 @@ final class StoreBackedDagSource implements DagSource {
             StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
             boolean requireMarkedStore, Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
         this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, artifactStore,
-                requireMarkedStore, members, parallelismBudget, Objects.requireNonNull(storePort, "storePort").derivedSchemas());
+                requireMarkedStore, members, parallelismBudget, unscopedModelRecords(storePort));
+    }
+
+    /** Constructing a source for a later scoped pass must not open an unscoped model store. */
+    private static io.tapstate.spi.store.DerivedSchemaStore unscopedModelRecords(StorePort store) {
+        Objects.requireNonNull(store,"store");
+        return new io.tapstate.spi.store.DerivedSchemaStore() {
+            @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String pipeline,String step) { return store.derivedSchemas().latest(pipeline,step); }
+            @Override public void record(String pipeline,String step,Map<String,String> columns,String statement,String from,String by) {
+                store.derivedSchemas().record(pipeline,step,columns,statement,from,by);
+            }
+            @Override public void pin(String pipeline,String step,long version) { store.derivedSchemas().pin(pipeline,step,version); }
+            @Override public Optional<io.tapstate.spi.store.DerivedSchema> pinned(String pipeline,String step) { return store.derivedSchemas().pinned(pipeline,step); }
+            @Override public void delete(String pipeline) { store.derivedSchemas().delete(pipeline); }
+        };
     }
 
     private StoreBackedDagSource(
@@ -622,7 +636,7 @@ final class StoreBackedDagSource implements DagSource {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
-        refuseProgressNoSinkCanAnswerFor(pipelineId, pipeline, sourceVertices);
+        if (operators == null) refuseProgressNoSinkCanAnswerFor(pipelineId, pipeline, sourceVertices);
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
         // re-discovery change the shape of this run's input while the run is already using it.
@@ -716,12 +730,17 @@ final class StoreBackedDagSource implements DagSource {
                         sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
         return new PlannedTopology(planned, fence -> {
+            var original = operators == null ? null : operators.bind(fence);
+            var capturedSources = original == null ? null : operators.pass().captureBindings(original.claim());
+            var scopedSources = capturedSources == null ? null : scopedSources(sourceVertices,capturedSources);
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
                     bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                            serveLanding,viewLanding,stepIds,frontier,compiledJoins,freshFullLoad,fence,operators),
-                    FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier,
+                            serveLanding,viewLanding,stepIds,frontier,compiledJoins,
+                            capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources),
+                    FencedSinkAckFactory.heldTo(scopedSources == null ? sinkAckFactory(pipeline,pipelineId,fence) :
+                            scopedSources.isEmpty() ? SinkAckFactory.NONE : new ScopedSrsSinkAckFactory(scopedSources,runIdOf(fence)),fence),frontier,
                     shape, drawn);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
                     drawn.feedingByNode());
@@ -1830,21 +1849,21 @@ final class StoreBackedDagSource implements DagSource {
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins,
             boolean freshFullLoad,
-            ExecutionFence fence,PreparedOperators operators) {
+            ExecutionFence fence,PreparedOperators operators,PipelineCaptureBindings captureBindings,
+            Map<String,ScopedSrsSinkAckFactory.Source> scopedSources) {
         var originalOperators = operators == null ? null : operators.bind(fence);
         var manifest = originalOperators == null ? null : originalOperators.manifest();
         ChainAxes axes = frontier.axes();
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
-        long snapshotEpoch = snapshotOnly
-                ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id())
-                : 0L;
+        long snapshotEpoch = snapshotOnly && captureBindings == null
+                ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id()) : 0L;
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
-                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE),
+                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
@@ -1855,7 +1874,7 @@ final class StoreBackedDagSource implements DagSource {
                 operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
                         new NestBinding(operators.tables()::get,NestBinding.onMap(manifest),
                                 new LoggingNestDeadLetter(new DurableNestDeadLetter()),
-                                new StoreBackedReplayFloorFactory(progressByTable(pipeline)),
+                                new ScopedSrsReplayFloorFactory(scopedSources),
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests()),
@@ -3055,7 +3074,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private ProcessorMetaSupplier sourceVertex(
             SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
-            boolean direct) {
+            boolean direct,PipelineCaptureBindings captureBindings) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -3064,6 +3083,14 @@ final class StoreBackedDagSource implements DagSource {
         // here rather than reached for from the source.
         String chain = vertex.stream();
         byte axis = axes.axisOf(chain);
+        if (captureBindings != null) {
+            if (snapshotOnly || direct) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+            var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+            return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
+                    source.recoveryAfter().get(vertex.table()),source.snapshotEpoch(),new ScopedSrsReadCursorPublisherFactory(source.run(),vertex.table()),
+                    order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
+                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.sourceId())));
+        }
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
                     vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.stream(), snapshotEpoch,
@@ -3091,6 +3118,16 @@ final class StoreBackedDagSource implements DagSource {
                         vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
                 readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.sourceId())));
+    }
+
+    private static Map<String,ScopedSrsSinkAckFactory.Source> scopedSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var sources = new LinkedHashMap<String,ScopedSrsSinkAckFactory.Source>(); var selected = new HashSet<String>();
+        for (var vertex : vertices.values()) {
+            var source = bindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); selected.add(vertex.sourceId());
+            sources.put(vertex.stream(),new ScopedSrsSinkAckFactory.Source(source.run(),vertex.table()));
+        }
+        if (!selected.equals(bindings.logged().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        return Map.copyOf(sources);
     }
 
     /**
