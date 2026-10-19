@@ -29,6 +29,7 @@ nest_dead_letters | nest | MongoNestDeadLetterStore | nest-excluded | 0 | -
 sources | config | MongoConfigurationArtifactStore | migrated | 1 | systemRole (unique) (partial {"systemRole":"DEFAULT_TARGET"})
 pipelines | config | MongoConfigurationArtifactStore | migrated | 1 | -
 configuration_version | config | MongoConfigurationArtifactStore | migrated | 1 | -
+configuration_imports | config | MongoConfigurationImportStore | migrated | 1 | activeSlot (unique) (partial {"activeSlot":{"$exists":true}}), historySlot (unique) (partial {"historySlot":{"$exists":true}})
 cluster_identity | config | MongoConfigurationDomain | migrated | 1 | -
 schema_migrations | config | MongoConfigurationDomain | migrated | 1 | -
 cluster_keys | config | MongoConfigurationDomain | migrated | 1 | -
