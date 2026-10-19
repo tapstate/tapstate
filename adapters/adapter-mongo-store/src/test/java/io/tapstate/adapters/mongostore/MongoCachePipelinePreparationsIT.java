@@ -839,7 +839,7 @@ class MongoCachePipelinePreparationsIT {
                 var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
                 domain.prepareAuth(new CacheAuthScope(business.clusterId(), business.bindingVersion(), StorageBinding.Mode.OP, business.cacheIncarnation(), 1), "auth-a", ACTIVE);
                 try (var session = cacheClient.startSession()) {
-                    for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_OPERATOR_CLEANUP, SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES)) {
+                    for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_OPERATOR_CLEANUP, SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES, SystemCollections.CACHE_SINK_PREPARATIONS)) {
                         table.prepareCollectionOn(cache, session); for (var index : table.indexes()) IndexEnsure.createInTransaction(session,table.on(cache),index);
                     }
                 }

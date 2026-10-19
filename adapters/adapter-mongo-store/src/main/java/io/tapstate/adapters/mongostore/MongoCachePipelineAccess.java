@@ -122,6 +122,8 @@ final class MongoCachePipelineAccess {
         return client.getDatabase(name);
     }
 
+    WorkloadClaimFence originalClaim() { return original; }
+
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
 
     Document state(ClientSession session) {

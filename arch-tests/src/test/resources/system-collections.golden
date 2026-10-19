@@ -86,3 +86,4 @@ join_indexes | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placeme
 join_writers | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
 nest_shapes | cache | MongoCacheNestShapeStore | migrated | 1 | -
 operator_cleanup | cache | MongoOperatorInventory | migrated | 1 | _id.clusterId+_id.bindingVersion+_id.cacheIncarnation+databases.database
+sink_preparations | cache | MongoSinkPreparationStore | migrated | 1 | _id.scope.clusterId+_id.scope.bindingVersion+_id.scope.cacheIncarnation+_id.scope.pipelineId+_id.scope.stateGeneration

@@ -109,9 +109,15 @@ final class PdkSinkWriter implements SinkWriter {
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo,
             io.tapstate.core.model.PipelineNode.Purpose purpose) {
+        this(connector,write,config,targets,stateStore,preparedAhead,letGo,purpose,null);
+    }
+
+    PdkSinkWriter(PdkConnector connector,WriteRecordFunction write,SinkConfig config,
+            Map<String,TargetTable> targets,KeyedStateStore stateStore,boolean preparedAhead,Runnable letGo,
+            io.tapstate.core.model.PipelineNode.Purpose purpose,PdkSinkPreparations receipts) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
-                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose, connector::requireActive), letGo);
+                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose, connector::requireActive,receipts), letGo);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
@@ -242,6 +248,7 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     static TapstateException writeFailed(String connectorId, Throwable cause) {
+        if(cause instanceof Error invariant)throw invariant;
         return new TapstateException(ConnectorError.WRITE_FAILED,
                 Map.of("connector", connectorId, "detail", detail(cause)), cause);
     }

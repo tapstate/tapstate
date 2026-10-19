@@ -231,6 +231,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCachePipelineRebuilds(client, database, expected, () -> { businessActive(); requireActive.run(); }, rateRetention);
     }
 
+    @Override public io.tapstate.spi.store.SinkPreparationStore sinkPreparations(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence original,Runnable requireActive) {
+        return new MongoSinkPreparationStore(pipelineAccess(scope,original,requireActive));
+    }
+
     /** Explicit schema preparation is separate from every ordinary operator facet open. */
     @Override public void prepareOperatorDatabase(io.tapstate.spi.store.PipelineIntentScope scope, String targetDatabase,
             io.tapstate.spi.store.WorkloadClaimFence original, String operationId, Runnable requireActive) {

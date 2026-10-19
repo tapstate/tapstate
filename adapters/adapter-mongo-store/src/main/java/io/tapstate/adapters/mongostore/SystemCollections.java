@@ -250,7 +250,11 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
     CACHE_NEST_SHAPES("nest_shapes", Database.CACHE, MongoCacheNestShapeStore.class, Strategy.MIGRATED, 1),
     CACHE_OPERATOR_CLEANUP("operator_cleanup", Database.CACHE, MongoOperatorInventory.class, Strategy.MIGRATED, 1,
-            new IndexSpec(List.of("_id.clusterId", "_id.bindingVersion", "_id.cacheIncarnation", "databases.database"), false, "operator_database_history"));
+            new IndexSpec(List.of("_id.clusterId", "_id.bindingVersion", "_id.cacheIncarnation", "databases.database"), false, "operator_database_history")),
+
+    /** Target preparation results remain distinct from operators and necessary connector notes. */
+    CACHE_SINK_PREPARATIONS("sink_preparations",Database.CACHE,MongoSinkPreparationStore.class,Strategy.MIGRATED,1,
+            new IndexSpec(List.of("_id.scope.clusterId","_id.scope.bindingVersion","_id.scope.cacheIncarnation","_id.scope.pipelineId","_id.scope.stateGeneration"),false,"sink_preparation_scope"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

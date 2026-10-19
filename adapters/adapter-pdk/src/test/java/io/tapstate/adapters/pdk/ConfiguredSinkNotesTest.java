@@ -225,6 +225,18 @@ class ConfiguredSinkNotesTest {
         assertThat(Files.readAllLines(f.trace)).as("the old open cannot init a plugin with a newer scope").isEmpty();
     }
 
+    @ParameterizedTest @ValueSource(strings={"open","prepare"})
+    void nativeHostReceiptErrorKeepsItsIdentityThroughTheActualPort(String mode,@TempDir Path directory)throws Exception {
+        Fixture f=new Fixture(directory);var failure=new AssertionError("host receipt invariant");
+        var store=(io.tapstate.spi.store.SinkPreparationStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{io.tapstate.spi.store.SinkPreparationStore.class},(proxy,method,args) -> {throw failure;});
+        var scope=new io.tapstate.spi.store.PipelineIntentScope("cluster-a",1,"cache-a","p1",1);
+        var receipts=new PdkSinkPreparations(store,scope,NODE,PipelineNode.Purpose.SYNC,CONFIG.onFullLoad(),CONFIG.fullLoad());
+        var port=PdkSinkPort.withScopedState(id -> f.ref,null,PipelineNode.Purpose.SYNC,f.scopes(new AtomicBoolean(true)),fence(1),receipts);
+        var targets=Map.of("orders",new io.tapstate.spi.sink.TargetTable("orders",List.of()));
+        assertThatThrownBy(() -> {if(mode.equals("open")){try(var ignored=port.open(CONFIG,targets)){} }else port.prepare(CONFIG,targets);}).isSameAs(failure);
+        assertThat(Files.readAllLines(f.trace)).containsExactly("init","stop");
+    }
+
     private static void drive(PdkSinkPort port, String mode) {
         if (mode.equals("prepare")) { port.prepare(CONFIG, Map.of()); return; }
         try (SinkWriter ignored = mode.equals("open") ? port.open(CONFIG) : port.openPrepared(CONFIG, Map.of())) { }

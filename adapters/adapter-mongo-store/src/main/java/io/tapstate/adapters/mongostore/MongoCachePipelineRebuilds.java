@@ -56,7 +56,7 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                         structure.verifyDirect(); structure.verifySrs();
                         for (var table : COLD) structure.verifyFacet(table);
                         for (var table : List.of(SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_OPERATOR_CLEANUP,
-                                SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY)) structure.verifyFacet(table);
+                                SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY, SystemCollections.CACHE_SINK_PREPARATIONS)) structure.verifyFacet(table);
                         var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
                         var filter = new Document("_id", MongoWorkloadClaimStore.id(request.originalClaim().key()));
                         Document row = claims.find(session, filter).first();
@@ -94,7 +94,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                                 .append("claimGeneration", nextClaim.claimGeneration()).append("leaseUntil", java.util.Date.from(now.toInstant().plusMillis(ttl.toMillis())))
                                 .append("pipelineScope", MongoPipelinePreparationFacts.scope(target))
                                 .append("pipelinePreparation", MongoCachePipelinePreparations.marker(original.preparationId(), PipelineCachePreparations.Phase.PREPARED))
-                                .append("pipelineSources", MongoPipelineSourcePreparations.encode(request.inputs())).append("pipelineRebuild", marker(receipt));
+                                .append("pipelineSources", MongoPipelineSourcePreparations.encode(request.inputs()))
+                                .append("sinkPreparations",MongoSinkPreparationStore.initial(original.preparationId())).append("pipelineRebuild", marker(receipt));
                         if (claims.updateOne(session, expected, new Document("$set", values)).getMatchedCount() != 1) throw fenced();
                         if (SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,
                                 new Document("_id", old.pipelineId()).append("scope", state.get("scope")).append("epoch", state.getLong("epoch"))
@@ -128,6 +129,7 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
             if (MongoCachePipelinePreparations.phase(row, target) != PipelineCachePreparations.Phase.PREPARED
                     || !original.preparationId().equals(row.get("pipelinePreparation", Document.class).getString("preparationId"))
                     || !original.request().inputs().equals(MongoPipelineSourcePreparations.retained(session, database, target))) throw rebuild(target);
+            MongoSinkPreparationStore.requireInitial(row,original.preparationId(),target);
             var state = new MongoCachePipelineAccess(client, database, target, null, () -> active(original), retention).state(session);
             if (state.getLong("epoch") != epoch || state.getLong("runtimeWriteFence") != writeFence
                     || !StateJson.of(PipelineState.STOPPED).equals(state.get("stateJson"))) throw rebuild(target);
@@ -151,7 +153,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
     private void requireEmptyPayloads(ClientSession session, PipelineIntentScope target) {
         var encoded = MongoPipelinePreparationFacts.scope(target); var structure = new MongoCacheMetadataStructure(database, retention);
         for (var table : COLD) { structure.verifyFacet(table); absent(session, table, new Document("_id.placement.scope", encoded), target); }
-        for (var table : List.of(SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY)) structure.verifyFacet(table);
+        for (var table : List.of(SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY, SystemCollections.CACHE_SINK_PREPARATIONS)) structure.verifyFacet(table);
+        MongoSinkPreparationStore.requireEmpty(session,database,target);
         absent(session, SystemCollections.CACHE_NEST_SHAPES, new Document("_id.scope", encoded), target);
         absent(session, SystemCollections.CACHE_DERIVED_SCHEMAS, new Document("scope", encoded), target);
         absent(session, SystemCollections.CACHE_PIPELINE_RATE_HISTORY, new Document("scope", encoded), target);

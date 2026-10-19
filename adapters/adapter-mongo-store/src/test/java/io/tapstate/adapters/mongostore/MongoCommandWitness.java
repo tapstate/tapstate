@@ -43,8 +43,10 @@ final class MongoCommandWitness implements CommandListener, AutoCloseable {
         if (changed) completed.incrementAndGet();
     }
     @Override public void commandFailed(CommandFailedEvent event) { pending.remove(event.getRequestId()); }
-    void refuseAfterCommand() {
-        if (completed.get() > 0) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED,Map.of(),null);
+    int confirmedCommands() { return completed.get(); }
+    void refuseAfterCommand() { refuseAfterCommand(0); }
+    void refuseAfterCommand(int baseline) {
+        if (completed.get() > baseline) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED,Map.of(),null);
     }
     void requireCommand() { assertThat(completed.get()).as("the target command reached the server before guard loss").isPositive(); }
     @Override public void close() { client.close(); }

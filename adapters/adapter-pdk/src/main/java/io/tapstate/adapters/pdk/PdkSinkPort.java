@@ -31,6 +31,7 @@ public final class PdkSinkPort implements SinkPort {
     private final PipelineNode.Purpose purpose;
     private final ConnectorNoteScopes noteScopes;
     private final WorkloadClaimFence execution;
+    private final PdkSinkPreparations preparations;
 
     /** Configured writes use already prepared CONFIG notes and the caller's fixed run authority. */
     public static PdkSinkPort withRequiredNotes(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
@@ -38,6 +39,14 @@ public final class PdkSinkPort implements SinkPort {
             WorkloadClaimFence execution) {
         return new PdkSinkPort(provisioner, stateStore, sharing, purpose,
                 Objects.requireNonNull(noteScopes, "noteScopes"), Objects.requireNonNull(execution, "execution"));
+    }
+
+    /** Native configured writes keep target receipts in CACHE and necessary connector notes in CONFIG. */
+    public static PdkSinkPort withScopedState(ConnectorProvisioner provisioner,SharedSinkConnectors sharing,
+            PipelineNode.Purpose purpose,ConnectorNoteScopes noteScopes,WorkloadClaimFence execution,
+            PdkSinkPreparations preparations) {
+        return new PdkSinkPort(provisioner,null,sharing,purpose,Objects.requireNonNull(noteScopes,"noteScopes"),
+                Objects.requireNonNull(execution,"execution"),Objects.requireNonNull(preparations,"preparations"));
     }
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
@@ -64,6 +73,13 @@ public final class PdkSinkPort implements SinkPort {
 
     private PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, SharedSinkConnectors sharing,
             PipelineNode.Purpose purpose, ConnectorNoteScopes noteScopes, WorkloadClaimFence execution) {
+        this(provisioner,stateStore,sharing,purpose,noteScopes,execution,null);
+    }
+
+    private PdkSinkPort(ConnectorProvisioner provisioner,KeyedStateStore stateStore,SharedSinkConnectors sharing,
+            PipelineNode.Purpose purpose,ConnectorNoteScopes noteScopes,WorkloadClaimFence execution,PdkSinkPreparations preparations) {
+        if(preparations!=null)preparations.requireClaim(execution);
+        this.preparations=preparations;
         if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
             throw new IllegalArgumentException("sink purpose must be view or sync");
         }
@@ -82,7 +98,7 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
-        requireActive();
+        requireInputs(config);requireActive();
         ConnectorRef ref = provisioner.resolve(config.connectorId());
         return open(config, ref, targets, false, configuredDrive(config, ref));
     }
@@ -96,11 +112,12 @@ public final class PdkSinkPort implements SinkPort {
      * sink on this member share one, started by the first of them and stopped by the last.
      */
     public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
-        requireActive();
+        requireInputs(config);requireActive();
+        if(preparations!=null)for(var target:targets.values())preparations.requireReady(target);
         ConnectorRef ref = provisioner.resolve(config.connectorId());
         ConfiguredDrive drive = configuredDrive(config, ref);
         SharedSinkConnectors.NoteIdentity identity = drive.identity();
-        PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values(), purpose);
+        if(preparations==null)PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values(), purpose);
         if (sharing == null || config.node() == null || !ref.shareSafe()) {
             return open(config, ref, targets, true, drive);
         }
@@ -121,7 +138,7 @@ public final class PdkSinkPort implements SinkPort {
             Runnable letGo) {
         WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
         try {
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
@@ -156,7 +173,7 @@ public final class PdkSinkPort implements SinkPort {
      * as it was when each writer prepared its own tables.
      */
     public void prepare(SinkConfig config, Map<String, TargetTable> targets) {
-        requireActive();
+        requireInputs(config);requireActive();
         ConnectorRef ref = provisioner.resolve(config.connectorId());
         ConfiguredDrive drive = configuredDrive(config, ref);
         PdkConnector connector = PdkConnector.open(
@@ -167,7 +184,7 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
                         connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
-                        config.node(), stateStore, false, purpose, connector::requireActive);
+                        config.node(), stateStore, false, purpose, connector::requireActive,preparations);
                 for (TargetTable target : targets.values()) {
                     TapTable table = TargetTapTable.build(target);
                     connector.resolveTargetTypes(table);
@@ -201,7 +218,7 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
@@ -213,6 +230,10 @@ public final class PdkSinkPort implements SinkPort {
             connector.close();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
+    }
+
+    private void requireInputs(SinkConfig config) {
+        if(preparations!=null)preparations.requireInputs(config.node(),purpose,config.onFullLoad(),config.fullLoad());
     }
 
     private void requireActive() {
