@@ -6,6 +6,7 @@ import io.tapstate.control.core.PipelinePreviewCommand;
 import io.tapstate.control.core.PipelinePreviewSession;
 import io.tapstate.control.core.PipelinePreviewService;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -48,13 +49,15 @@ class PipelinePreviewController {
 
     @Verb("pipeline.preview")
     @PostMapping(value = "/artifacts:preview", consumes = "application/json", produces = "application/x-ndjson")
-    ResponseEntity<StreamingResponseBody> preview(HttpServletRequest request) throws IOException {
+    ResponseEntity<StreamingResponseBody> preview(HttpServletRequest request, HttpServletResponse servletResponse)
+            throws IOException {
         if (request.getContentLengthLong() > MAX_REQUEST_BYTES) {
             throw MalformedRequest.rejecting("preview request exceeds the 4 MiB limit", null);
         }
         byte[] bytes = readBounded(request.getInputStream(), MAX_REQUEST_BYTES);
         PipelinePreviewCommand command = parse(decodeRequest(bytes, json));
-        PreviewResponse response = new PreviewResponse(json, previews.open(AuthenticatedCaller.subject(), command));
+        PreviewResponse response = new PreviewResponse(json, previews.open(AuthenticatedCaller.subject(), command),
+                servletResponse);
         try {
             WebAsyncUtils.getAsyncManager(request).registerCallableInterceptor(response, response);
             return ResponseEntity.ok()
@@ -77,18 +80,21 @@ class PipelinePreviewController {
             implements StreamingResponseBody, CallableProcessingInterceptor, AutoCloseable {
         private final ObjectMapper json;
         private final PipelinePreviewSession stream;
+        private final HttpServletResponse servletResponse;
         private final AtomicBoolean closed = new AtomicBoolean();
 
-        private PreviewResponse(ObjectMapper json, PipelinePreviewSession stream) {
+        private PreviewResponse(ObjectMapper json, PipelinePreviewSession stream, HttpServletResponse servletResponse) {
             this.json = json;
             this.stream = stream;
+            this.servletResponse = servletResponse;
         }
 
         @Override
         public void writeTo(OutputStream output) throws IOException {
             PreviewResponse owner = this;
             try (owner) {
-                writeEvents(json, output, stream);
+                // The framework can suppress output-stream flushes; commit each event through the servlet.
+                writeEvents(json, output, stream, servletResponse::flushBuffer);
             }
         }
 
@@ -203,13 +209,23 @@ class PipelinePreviewController {
     }
 
     static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream) throws IOException {
+        writeEvents(json, output, stream, output::flush);
+    }
+
+    @FunctionalInterface
+    private interface EventFlush {
+        void flush() throws IOException;
+    }
+
+    private static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream,
+                                    EventFlush eventFlush) throws IOException {
         SerializationOutputStream serializationOutput = new SerializationOutputStream(output);
         try {
             PipelinePreviewEvent event;
             while ((event = stream.next()) != null) {
                 json.writeValue(serializationOutput, event);
                 output.write('\n');
-                output.flush();
+                eventFlush.flush();
                 if ("run.completed".equals(event.kind()) || "run.failed".equals(event.kind())) {
                     break;
                 }

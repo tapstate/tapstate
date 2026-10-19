@@ -95,6 +95,45 @@ class ConnectorClassLoaderTest {
         }
     }
 
+    @Test
+    void sharesTheLog4jApiFromTheHost(@TempDir Path dir) throws Exception {
+        // A connector built for the Tapdata engine logs through the log4j API and leaves it out of its jar,
+        // because that engine provides it - the Db2 for i journal reader does. Unshared, its first change
+        // read dies on NoClassDefFoundError for LogManager.
+        Path jar = SyntheticJar.compileToJar(dir, "synthetic.JournalReader",
+                "package synthetic; public class JournalReader { public String logger() {"
+                        + " return org.apache.logging.log4j.LogManager.getLogger(\"synthetic.journal\").getName(); } }");
+        try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar))) {
+            assertThat(loader.load("org.apache.logging.log4j.LogManager"))
+                    .isSameAs(org.apache.logging.log4j.LogManager.class);
+            Class<?> reader = loader.load("synthetic.JournalReader");
+            Object logger = reader.getMethod("logger").invoke(reader.getDeclaredConstructor().newInstance());
+            assertThat(logger).isEqualTo("synthetic.journal");
+        }
+    }
+
+    @Test
+    void aBundledLog4jApiAndItsCallersStayInOneLoader(@TempDir Path dir) throws Exception {
+        // The nested caller needs package-private API access. Mixing its bundled API with the host
+        // facade fails at invocation, even when both classes could be looked up independently.
+        Path jar = SyntheticJar.compileToJar(dir, "org.apache.logging.log4j.LogManager", """
+                package org.apache.logging.log4j;
+                public class LogManager {
+                    static String contextName() { return "bundled-context"; }
+                    public static class BundledReader {
+                        public String read() { return LogManager.contextName(); }
+                    }
+                }
+                """);
+        try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar))) {
+            Class<?> reader = loader.load("org.apache.logging.log4j.LogManager$BundledReader");
+            assertThat(reader.getMethod("read").invoke(reader.getDeclaredConstructor().newInstance()))
+                    .isEqualTo("bundled-context");
+            assertThat(loader.load("org.apache.logging.log4j.LogManager").getClassLoader())
+                    .isSameAs(reader.getClassLoader()).isNotSameAs(getClass().getClassLoader());
+        }
+    }
+
     /**
      * Every caller over one artifact gets the one loader, and so the one copy of each class: a connector that
      * binds a JNI library to the loader it was loaded through finds that loader again on its next open.

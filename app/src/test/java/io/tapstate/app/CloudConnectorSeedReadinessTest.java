@@ -102,7 +102,7 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
-    void allLockedArtifactsMustBeRegisteredLoadableAndHaveReadableSpecsIncludingOnRestart() throws Exception {
+    void allLockedArtifactsMustBeRegisteredLoadableAndHaveReadableSpecsOnRepeatedChecks() throws Exception {
         var gate = gate();
         gate.verifyRegistrations(outcomes);
         gate.verifyRegistrations(outcomes.stream().map(outcome -> {
