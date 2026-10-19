@@ -311,6 +311,30 @@ class MongoCachePipelineRebuildsIT {
         });
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"pipelineRebuild","pipelineRebuild.issuerNode.resourceId","pipelineRebuild.unexpected","pipelineRebuild.checkpointEpoch","pipelineRebuild.runtimeWriteFence"})
+    void anotherFullRejectsDamagedPreviousTransitionFacts(String path) {
+        withFixture(f -> {
+            var first=f.pending(0);f.configuration.rebuilds().complete(f.rebuilds().prepare(first,f.node,TTL,AT));
+            var next=f.pending(1);
+            f.claims().updateOne(new Document("_id.resourceId","flow"),new Document("$set",new Document(path,path.endsWith("checkpointEpoch")||path.endsWith("runtimeWriteFence") ? 100L : "damaged")));
+            var before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(next,f.node,TTL,AT),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void anotherFullPreservesTheCurrentTopologyAfterALegalClaimAcquire() {
+        withFixture(f -> {
+            f.domain.workloadClaims(f.business).acquirePipeline(f.scope,OWNER,7,TTL);
+            var first=f.pending(0);f.configuration.rebuilds().complete(f.rebuilds().prepare(first,f.node,TTL,AT));
+            var acquired=f.domain.workloadClaims(f.business).acquirePipeline(first.request().targetScope(),OWNER,0,TTL);
+            assertThat(acquired.acquired()).isTrue();assertThat(acquired.claim().topologyRevision()).isZero();
+            var next=f.pending(1);var receipt=f.rebuilds().prepare(next,f.node,TTL,AT);
+            assertThat(receipt.claim().topologyRevision()).isZero();assertThat(receipt.claim().claimGeneration()).isEqualTo(acquired.claim().claimGeneration()+1);
+        });
+    }
+
     @Test void fabricatedPreparationIsRefusedBeforeAnyAccessorRuns() {
         withFixture(f -> {
             var calls=new AtomicInteger(); PipelineRebuildPreparation fake=new PipelineRebuildPreparation() {

@@ -71,8 +71,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                         if (!scope.equals(old) || !request.originalClaim().equals(WorkloadClaimFence.from(claim))) throw fenced();
                         if (MongoCachePipelinePreparations.phase(row, old) != PipelineCachePreparations.Phase.PREPARED
                                 || !original.previousPreparationId().equals(row.get("pipelinePreparation", Document.class).getString("preparationId"))) throw rebuild(old);
-                        requirePriorMarker(row, old, original.previousPreparationId());
                         var state = access.state(session);
+                        requirePriorMarker(row, old, original.previousPreparationId(), state);
                         if (state.getLong("epoch") != request.originalStateEpoch() || state.getLong("epoch") >= Long.MAX_VALUE - 1
                                 || state.getLong("runtimeWriteFence") >= Long.MAX_VALUE - 1 || claim.claimGeneration() >= Long.MAX_VALUE - 1
                                 || claim.executionGeneration() >= Long.MAX_VALUE - 1 || claim.topologyRevision() >= Long.MAX_VALUE - 1) throw rebuild(old);
@@ -171,11 +171,36 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
         try { return MongoPipelinePreparationFacts.scope(row.get("pipelineScope", Document.class)); }
         catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw rebuild(expected); }
     }
-    private static void requirePriorMarker(Document row, PipelineIntentScope scope, String preparationId) {
+    private static void requirePriorMarker(Document row, PipelineIntentScope scope, String preparationId, Document state) {
         if (!row.containsKey("pipelineRebuild")) return;
-        var marker = row.get("pipelineRebuild", Document.class);
-        if (marker == null || !MongoPipelinePreparationFacts.scope(scope).equals(marker.get("targetScope"))
-                || !preparationId.equals(marker.get("preparationId")) || !Integer.valueOf(1).equals(marker.get("formatVersion"))) throw rebuild(scope);
+        try {
+            var marker = row.get("pipelineRebuild", Document.class);
+            if (marker == null || !marker.keySet().equals(Set.of("formatVersion", "operationId", "confirmationHash", "originalScope", "targetScope",
+                    "preparationId", "previousPreparationId", "issuerNode", "claim", "checkpointEpoch", "runtimeWriteFence"))
+                    || !Integer.valueOf(1).equals(marker.get("formatVersion"))
+                    || !(marker.get("operationId") instanceof String operation) || operation.isBlank()
+                    || !(marker.get("confirmationHash") instanceof String hash) || !hash.matches("[0-9a-f]{64}")
+                    || !(marker.get("checkpointEpoch") instanceof Long epoch) || epoch < 1 || epoch > state.getLong("epoch")
+                    || !(marker.get("runtimeWriteFence") instanceof Long writeFence) || writeFence < 2 || writeFence > state.getLong("runtimeWriteFence")
+                    || !preparationId.equals(marker.get("preparationId"))) throw unreadable(scope);
+            for (String field : List.of("preparationId", "previousPreparationId")) {
+                String id = marker.getString(field);
+                if (!java.util.UUID.fromString(id).toString().equals(id)) throw unreadable(scope);
+            }
+            var prior = MongoPipelinePreparationFacts.scope(marker.get("originalScope", Document.class));
+            var target = MongoPipelinePreparationFacts.scope(marker.get("targetScope", Document.class));
+            if (!target.equals(scope) || !prior.pipelineId().equals(target.pipelineId()) || prior.stateGeneration() + 1 != target.stateGeneration()
+                    || !new CacheBusinessScope(prior.clusterId(), prior.bindingVersion(), prior.cacheIncarnation())
+                            .equals(new CacheBusinessScope(target.clusterId(), target.bindingVersion(), target.cacheIncarnation()))) throw unreadable(scope);
+            var issuer = WorkloadClaimDocuments.readNode(marker.get("issuerNode", Document.class));
+            var claim = WorkloadClaimDocuments.readPipeline(marker.get("claim", Document.class));
+            if (!issuer.key().clusterId().equals(scope.clusterId()) || !claim.key().clusterId().equals(scope.clusterId())
+                    || !claim.key().resourceId().equals(scope.pipelineId()) || !claim.owner().equals(issuer.owner()) || claim.claimGeneration() < 2
+                    || claim.claimGeneration() > row.getLong("claimGeneration") || claim.executionGeneration() > row.getLong("executionGeneration")) throw unreadable(scope);
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(scope); }
+    }
+    private static TapstateException unreadable(PipelineIntentScope scope) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, java.util.Map.of("id", scope.pipelineId(), "field", "pipeline-rebuild"), null);
     }
     private static Document marker(Receipt receipt) {
         var original = receipt.preparation();
