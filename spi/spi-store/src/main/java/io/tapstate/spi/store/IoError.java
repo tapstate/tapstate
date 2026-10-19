@@ -90,6 +90,9 @@ public enum IoError implements TapstateErrorCode {
     /** Issued first-state authority has incomplete or inconsistent CACHE history; no counters may be recreated. */
     PIPELINE_STATE_REBUILD_REQUIRED("io.pipeline-state-rebuild-required", Set.of("pipeline")),
 
+    /** Missing canonical capture history requires explicitly confirmed Cluster cache recovery. */
+    CAPTURE_STATE_REBUILD_REQUIRED("io.capture-state-rebuild-required", Set.of("capture")),
+
     /** The captured business incarnation is unavailable or no longer current. */
     CACHE_BUSINESS_FENCED("io.cache-business-fenced", Set.of()),
 

@@ -351,6 +351,7 @@ class MongoSrsChainStoreIT {
                 var claim = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).acquire(
                         new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-a"), new WorkloadOwner("node-a", "boot-a"),
                         1, Duration.ofSeconds(30)).claim();
+                CaptureHistoryFixture.shared(database,SCOPE,WorkloadClaimFence.from(claim),CHAIN,"retention");
                 var models = new MongoSrsModelStore(client, database, SCOPE);
                 var log = new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models);

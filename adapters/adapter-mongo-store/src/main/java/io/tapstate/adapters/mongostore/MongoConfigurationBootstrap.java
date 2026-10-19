@@ -22,8 +22,9 @@ import java.util.Objects;
  */
 public final class MongoConfigurationBootstrap {
     static final String PREPARED = "CONFIG_PREPARED";
+    // Controlled collection creation requires LOCAL; ordinary CONFIG commands retain SNAPSHOT.
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
-            .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+            .readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
 
     private MongoConfigurationBootstrap() {}
 
@@ -67,6 +68,7 @@ public final class MongoConfigurationBootstrap {
                                 return null;
                             }
                             if (!emptyTarget) throw refused();
+                            SystemCollections.CAPTURE_PREPARATIONS.prepareCollectionOn(database,session);
                             SystemCollections.STORAGE_SETUP.on(database).insertOne(session,
                                     new Document("_id", "cluster").append("clusterId", clusterId)
                                             .append("installationId", installationId).append("operationId", operationId)

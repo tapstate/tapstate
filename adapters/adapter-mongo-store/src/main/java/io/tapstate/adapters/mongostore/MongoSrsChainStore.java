@@ -68,22 +68,21 @@ public final class MongoSrsChainStore implements SrsChainStore {
         requireName(chain);
         return transaction(session -> {
             prove(session, fence);
-            Document existing = root(session, chain);
-            if (existing != null) { requireCapture(existing, fence); return state(session, existing); }
-            if (hasRetainedFacts(session, chain)) throw unproven(chain);
-            // The original capture history survives loss of every chain-owned row. Its first
-            // committed chain write is the only ordinary call that can establish a new root.
+            Document existing = requireRoot(session, chain);
             var capture = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
                     new Document("_id",MongoWorkloadClaimStore.id(fence.key()))).first();
-            if (capture == null || !Long.valueOf(1).equals(capture.get("fencedChainWrites"))) throw unproven(chain);
-            Document row = new Document("_id", chain).append("formatVersion", 1).append("cacheIncarnation", scope.cacheIncarnation())
-                    .append("captureId", fence.key().resourceId()).append("captureFence", WorkloadClaimDocuments.stored(fence))
-                    .append("retention", retention).append("epoch", 0L).append("requestedTables", List.of())
-                    .append("servingTables", List.of()).append("modelContextHeads", List.of()).append("modelWriteFence", 0L)
-                    .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L);
-            SystemCollections.SRS_CHAINS.on(database).insertOne(session, row);
-            return decode(row);
+            var preparation=MongoCaptureCachePreparations.requirePreparation(capture,fence.key(),scope);
+            if(preparation.mode()!=io.tapstate.spi.store.CapturePreparation.Mode.SHARED_SRS || !chain.equals(preparation.chainId())) throw fenced();
+            requireCapture(existing,fence);
+            return state(session,existing);
         });
+    }
+    static Document initialRow(CacheBusinessScope scope,String chain,String retention,WorkloadClaimFence fence) {
+        return new Document("_id", chain).append("formatVersion", 1).append("cacheIncarnation", scope.cacheIncarnation())
+                .append("captureId", fence.key().resourceId()).append("captureFence", WorkloadClaimDocuments.stored(fence))
+                .append("retention", retention).append("epoch", 0L).append("requestedTables", List.of())
+                .append("servingTables", List.of()).append("modelContextHeads", List.of()).append("modelWriteFence", 0L)
+                .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L);
     }
     @Override public Optional<SrsChainState> load(String chain) {
         requireName(chain);

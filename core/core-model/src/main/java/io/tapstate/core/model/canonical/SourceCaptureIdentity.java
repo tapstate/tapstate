@@ -13,6 +13,15 @@ public final class SourceCaptureIdentity {
     public static String resolve(String connector,Map<String,Object> settings,String key) {
         return key != null && !key.isBlank() ? "mck-"+key : physical(connector,settings);
     }
+    public static String sharedCapture(String chainId) {
+        named(chainId);return "capture-"+CanonicalHash.ofText(chainId+"|tail:ring");
+    }
+    public static String snapshotCapture(String chainId,Collection<String> streams) {
+        named(chainId);var input=new StringBuilder(chainId).append("|snapshot");
+        var sorted=new ArrayList<>(streams);sorted.sort(String::compareTo);input.append('|').append(sorted.size());
+        for(String stream:sorted)input.append('|').append(stream.length()).append(':').append(stream);
+        return "capture-"+CanonicalHash.ofText(input.toString());
+    }
     public static String directChannel(String connector,Map<String,Object> settings,String key,String pipeline,String source) {
         named(pipeline); named(source); var input = new StringBuilder();
         token(input,resolve(connector,settings,key)); token(input,pipeline); token(input,source);

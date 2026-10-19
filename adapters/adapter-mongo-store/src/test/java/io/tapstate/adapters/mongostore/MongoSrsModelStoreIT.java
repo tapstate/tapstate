@@ -1219,6 +1219,7 @@ class MongoSrsModelStoreIT {
     void aRetainedRealCheckpointPreventsClassifyingLostPublishedHistoryAsWaiting(String checkpointBody) {
         withBusiness(f -> {
             SystemCollections.SRS_CHAINS.on(f.database()).deleteMany(new Document());
+            CaptureHistoryFixture.shared(f.database(),SCOPE,f.fence(),CHAIN,null);
             var chains = new MongoSrsChainStore(f.client(), f.database(), SCOPE);
             chains.prepare(CHAIN, null, f.fence()); chains.requestTables(CHAIN, java.util.Set.of("orders"), f.fence());
             assertThat(chains.openEpoch(CHAIN, 0, f.fence())).hasValue(1);

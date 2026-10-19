@@ -54,6 +54,19 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void lostCaptureHistoryCannotBeReissuedAsTheSameOriginalFence() {
+        withBusiness(f -> {
+            var claims=f.domain().workloadClaims(SCOPE);
+            var capture=new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.CAPTURE,"original-tail");
+            CaptureHistoryFixture.expired(f.database(),SCOPE,capture.resourceId(),"fixture-chain",OWNER,1,TTL);
+            var original=claims.acquire(capture,OWNER,1,TTL).claim();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).deleteOne(new Document("_id",MongoWorkloadClaimStore.id(capture)));
+            assertThatThrownBy(() -> claims.acquire(capture,OWNER,1,TTL)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.CAPTURE_STATE_REBUILD_REQUIRED));
+            assertThat(claims.read(capture)).isEmpty();
+        });
+    }
+
     @Test void normalTransitionsKeepOneAdmissionAndIgnoreIndependentAuthenticationReset() {
         withBusiness(f -> {
             var claims = f.domain().workloadClaims(SCOPE);
@@ -77,12 +90,13 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
-    @Test void separateClientsRacingAnAbsentKeyCommitOneTenureWithoutPoisoningTheRefusal() {
+    @Test void separateClientsRacingAnExpiredPreparedKeyCommitOneTenureWithoutPoisoningTheRefusal() {
         withBusiness(f -> {
             try (var second = MongoCacheDomain.connect(f.binding(), Duration.ofSeconds(5), "claims-second");
                  var workers = Executors.newFixedThreadPool(2)) {
                 var one = f.domain().workloadClaims(SCOPE); var two = second.workloadClaims(SCOPE);
                 var absent = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "unclaimed-tail");
+                CaptureHistoryFixture.expired(f.database(),SCOPE,absent.resourceId(),"fixture-chain",OWNER,1,TTL);
                 var start = new CountDownLatch(1);
                 var a = workers.submit(() -> { start.await(); return one.acquire(absent, OWNER, 1, TTL); });
                 var b = workers.submit(() -> { start.await(); return two.acquire(absent, new WorkloadOwner("node-b", "boot-b"), 1, TTL); });
@@ -102,6 +116,7 @@ class MongoCacheWorkloadClaimStoreIT {
             var pipeline = claims.advanceExecution(claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim(), 1, Set.of("node-a")).orElseThrow();
             var nodeKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node-a");
             var captureKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "tail-a");
+            CaptureHistoryFixture.expired(f.database(),SCOPE,captureKey.resourceId(),"fixture-chain",OWNER,1,TTL);
             claims.acquire(nodeKey, OWNER, 0, TTL); claims.acquire(captureKey, OWNER, 1, TTL);
             var before = claimBodies(f.database());
             f.domain().retireBusiness(SCOPE, "retire-a", ACTIVE);

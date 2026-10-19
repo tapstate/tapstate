@@ -254,7 +254,8 @@ public enum SystemCollections {
 
     /** Target preparation results remain distinct from operators and necessary connector notes. */
     CACHE_SINK_PREPARATIONS("sink_preparations",Database.CACHE,MongoSinkPreparationStore.class,Strategy.MIGRATED,1,
-            new IndexSpec(List.of("_id.scope.clusterId","_id.scope.bindingVersion","_id.scope.cacheIncarnation","_id.scope.pipelineId","_id.scope.stateGeneration"),false,"sink_preparation_scope"));
+            new IndexSpec(List.of("_id.scope.clusterId","_id.scope.bindingVersion","_id.scope.cacheIncarnation","_id.scope.pipelineId","_id.scope.stateGeneration"),false,"sink_preparation_scope")),
+    CAPTURE_PREPARATIONS("capture_preparations", Database.CONFIG, MongoCaptureStatePreparations.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

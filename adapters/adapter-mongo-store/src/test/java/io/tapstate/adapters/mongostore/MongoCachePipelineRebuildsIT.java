@@ -284,6 +284,8 @@ class MongoCachePipelineRebuildsIT {
     @Test void rebuildingADetachesOnlyAAndAllowsBToKeepAdvancingItsSharedConsumer() {
         withFixture(f -> {
             f.initial("independent");var aFence=f.advance("flow");var bFence=f.advance("independent");
+            var initial=CaptureHistoryFixture.expired(f.cache,f.business,"capture","shared",OWNER,1,TTL);
+            CaptureHistoryFixture.shared(f.cache,f.business,initial,"shared","retention");
             var capture=WorkloadClaimFence.from(f.domain.workloadClaims(f.business).acquire(new WorkloadClaimKey(f.scope.clusterId(),WorkloadClaimType.CAPTURE,"capture"),OWNER,1,TTL).claim());
             var srs=f.domain.srs(f.business,ACTIVE);srs.chains().prepare("shared","retention",capture);
             var a=new SrsConsumerContext(new SrsConsumerKey("shared","flow","input"),1);var b=new SrsConsumerContext(new SrsConsumerKey("shared","independent","input"),1);

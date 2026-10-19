@@ -210,6 +210,8 @@ class MongoCacheSrsStoresIT {
                 domain.prepareFirstAuth(committed.firstCreation().orElseThrow()); var scope = domain.prepareInitialBusiness(committed.preparation(),ACTIVE);
                 var claims = domain.workloadClaims(scope); var owner = new WorkloadOwner("node","boot");
                 var node = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),owner,1,Duration.ofMinutes(2)).claim();
+                var initial=CaptureHistoryFixture.expired(database,scope,"capture",CHAIN,owner,1,Duration.ofMinutes(2));
+                CaptureHistoryFixture.shared(database,scope,initial,CHAIN,"retention");
                 var capture = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),owner,1,Duration.ofMinutes(2)).claim();
                 action.accept(new Fixture(configuration,domain,database,configDatabase,endpoint,scope,committed.preparation().authScope(),WorkloadClaimFence.from(capture),WorkloadClaimFence.from(node)));
             } finally { database.drop(); configDatabase.drop(); }

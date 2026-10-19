@@ -133,6 +133,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     /** Verifies a fixed business identity and its schema; individual facets verify their own structures. */
+    public io.tapstate.spi.store.CaptureCachePreparations capturePreparations(CacheBusinessScope scope,Runnable requireActive) {
+        Objects.requireNonNull(requireActive,"requireActive");return new MongoCaptureCachePreparations(client,database,scope,targetFingerprint,() -> {businessActive();requireActive.run();},rateRetention);
+    }
+
     public CacheBusinessScope loadBusinessScope(CacheBusinessScope expected) {
         businessActive();
         return StoreIo.call(() -> {

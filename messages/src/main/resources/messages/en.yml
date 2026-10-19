@@ -1160,3 +1160,7 @@ io.configuration-import-refused:
 io.configuration-import-limit:
   message: "Configuration import exceeded its {limit} budget."
   solution: "Use a smaller package or resolve the retained original operations. Do not delete unknown or committed receipts to bypass the limit."
+
+io.capture-state-rebuild-required:
+  message: "Capture {capture} has missing or unproven canonical claim history."
+  solution: "Keep the original state and explicitly confirm Cluster cache recovery, including affected pipelines and sessions. Do not recreate the claim or reset its generations."

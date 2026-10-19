@@ -44,22 +44,30 @@ class ScopedSrsSinkAckFactoryIT {
                 cache.prepareFirstAuth(committed.firstCreation().orElseThrow()); var business = cache.prepareInitialBusiness(committed.preparation(),() -> {});
                 var claims = cache.workloadClaims(business); var owner = new WorkloadOwner("node","boot");
                 var node = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),owner,1,Duration.ofMinutes(2)).claim();
-                var pipeline = new PipelineResource("pipeline",null,List.of(),null,null,null,null,null); configuration.artifacts().create(pipeline);
+                var source = new SourceResource("source",null,"fixture",Map.of(),io.tapstate.core.model.SourceMode.CDC,
+                        Set.of("orders").stream().sorted().<io.tapstate.core.model.TableRef>map(io.tapstate.core.model.TableRef::literal).toList(),new io.tapstate.core.model.Srs("chain","retention",null,null,true),null);
+                configuration.artifacts().create(source);
+                var pipeline = new PipelineResource("pipeline",null,List.of(io.tapstate.core.model.SourceRef.spec("source",true)),null,null,null,null,null);
+                configuration.artifacts().create(pipeline);
                 var physical = new PipelineIntentScope("cluster",business.bindingVersion(),business.cacheIncarnation(),"pipeline",1);
                 configuration.intents().compareAndSet(physical,0,new DesiredState("pipeline",PipelineState.RUNNING,CanonicalHash.of(pipeline),false));
-                var grant = ((FirstPipelineCreationResult.Issued)configuration.preparations().issueFirstCreate(physical,WorkloadClaimFence.from(node))).creation();
+                var inputs=PipelinePreparationInputs.of(physical,pipeline,Map.of("source",source),Map.of("source",Set.of("orders")));
+                var grant = ((FirstPipelineCreationResult.Issued)configuration.preparations().issueFirstCreate(physical,WorkloadClaimFence.from(node),inputs)).creation();
                 var preparations = cache.pipelinePreparations(business,() -> {});
                 var receipt = preparations.seed(preparations.reserveFirst(grant,Duration.ofMinutes(2)),configuration.preparations(),Instant.parse("2026-10-19T00:00:00Z"));
                 configuration.preparations().complete(receipt);
                 var prepared = claims.acquirePipeline(physical,owner,1,Duration.ofMinutes(2)).claim();
                 var running = claims.advanceExecution(prepared,1,Set.of(owner.nodeId())).orElseThrow(); var original = WorkloadClaimFence.from(running);
-                var capture = WorkloadClaimFence.from(claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),owner,1,Duration.ofMinutes(2)).claim());
-                var stores = cache.srs(business,() -> {}); stores.chains().prepare("chain","retention",capture);
-                assertThat(stores.chains().openEpoch("chain",0,capture)).hasValue(1);
-                var model = new SrsModel(new SrsModelKey("chain","orders",business.cacheIncarnation(),1,0),"ring",
+                var captureGrant=((CaptureCreationResult.Issued)configuration.capturePreparations().issueFirstCreate(
+                        new CapturePreparationRequest(physical,original,WorkloadClaimFence.from(node),"source",inputs))).creation();
+                var firstCapture=cache.capturePreparations(business,() -> {}).createFirst(captureGrant);
+                var capture=WorkloadClaimFence.from(claims.acquire(firstCapture.claim().key(),owner,1,Duration.ofMinutes(2)).claim());
+                var stores = cache.srs(business,() -> {}); stores.chains().prepare("mck-chain","retention",capture);
+                assertThat(stores.chains().openEpoch("mck-chain",0,capture)).hasValue(1);
+                var model = new SrsModel(new SrsModelKey("mck-chain","orders",business.cacheIncarnation(),1,0),"ring",
                         new SourceTable("orders",List.of(new SourceField("id","integer")),List.of("id"),List.of()),0);
                 stores.models().publish(model,capture);
-                var context = new SrsConsumerContext(new SrsConsumerKey("chain","pipeline","source"),1);
+                var context = new SrsConsumerContext(new SrsConsumerKey("mck-chain","pipeline","source"),1);
                 var membership = stores.consumers().attach(context,0,Set.of("orders"),original).orElseThrow();
                 assertThat(stores.consumers().pinSnapshot(context,membership.revision(),0,new SrsSnapshotPin(7,"owner-seam",Map.of("orders",model.key())),original)).isTrue();
                 assertThat(stores.consumers().startReadingAfter(context,membership.revision(),1,"orders",-1,original)).isTrue();
@@ -84,7 +92,7 @@ class ScopedSrsSinkAckFactoryIT {
                     assertThat(confirmed.cursor().sinkAcked()).isEqualTo(new ChainPosition(new SourceOrder(7,4),"slow-4"));
                     assertThat(readerFactory.recoverySequence(member)).hasValue(4);
                     assertThat(readerFactory.confirmedPosition(member)).contains(confirmed.cursor().sinkAcked());
-                    assertThat(stores.chains().load("chain").orElseThrow().checkpoint()).isNull();
+                    assertThat(stores.chains().load("mck-chain").orElseThrow().checkpoint()).isNull();
                     claims.advanceExecution(running,1,Set.of(owner.nodeId())).orElseThrow();
                     assertThatThrownBy(() -> slow.advance("source.orders",new ChainPosition(new SourceOrder(7,99),"late"),original)).isInstanceOf(TapstateException.class);
                     assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);

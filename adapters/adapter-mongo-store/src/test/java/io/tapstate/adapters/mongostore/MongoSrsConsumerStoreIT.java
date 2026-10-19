@@ -954,6 +954,7 @@ class MongoSrsConsumerStoreIT {
                         new WorkloadOwner("node-c", "boot-c"), 1, Duration.ofSeconds(30)).claim();
                 WorkloadClaim a = pipeline(claims,"pipeline-a"); WorkloadClaim b = pipeline(claims,"pipeline-b");
                 preparePipelineScope(database,"pipeline-a",1); preparePipelineScope(database,"pipeline-b",1);
+                CaptureHistoryFixture.shared(database,SCOPE,WorkloadClaimFence.from(capture),CHAIN,"retention");
                 var chains = new MongoSrsChainStore(client, database, SCOPE); chains.prepare(CHAIN, "retention", WorkloadClaimFence.from(capture));
                 scenario.run(new Fixture(client, database, chains, new MongoSrsConsumerStore(client, database, SCOPE), capture, a, b));
             } catch (Exception failure) { throw new AssertionError(failure); }
