@@ -122,6 +122,14 @@
       <artifactId>bson</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- The log4j API a connector built for the Tapdata engine logs through and does not bundle. The
+         application explicitly provides it at runtime; the loader cases need it on the
+         host test classpath to show a connector resolves it from the host. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
