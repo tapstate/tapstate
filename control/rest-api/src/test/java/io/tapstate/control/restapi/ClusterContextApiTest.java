@@ -2,6 +2,8 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudClusterEgressAddress;
+import io.tapstate.control.core.CloudClusterEgressAddressProvider;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
@@ -50,12 +52,14 @@ class ClusterContextApiTest {
     private static final CloudSessionContext DISPLAY = new CloudSessionContext(
             "context-org", "context-cluster", "Workspace organization", "Workspace cluster", "workspace-region",
             "198.51.100.1", "DYNAMIC");
+    private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
+            DISPLAY.organizationId(), DISPLAY.clusterId(), "203.0.113.42", "STABLE");
     private static final CloudSessionIdentity IDENTITY = new CloudSessionIdentity(
             "https://context.example.test", DISPLAY.organizationId(), DISPLAY.clusterId());
 
     @ParameterizedTest
     @CsvSource({"false,true", "true,true", "false,false", "true,false"})
-    void contextReturnsTheSessionAddressAndKeepsOptionalKeysExplicit(boolean omitNulls, boolean includeEgress) {
+    void contextReturnsTheCurrentAddressAndKeepsOptionalKeysExplicit(boolean omitNulls, boolean includeEgress) {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(TestApp.class).run(
                 "--server.address=127.0.0.1", "--server.port=0",
                 "--tapstate.test.include-egress=" + includeEgress,
@@ -77,8 +81,8 @@ class ClusterContextApiTest {
             assertThat(body.get("clusterName")).isEqualTo(DISPLAY.clusterName());
             assertThat(body.get("region")).isEqualTo(DISPLAY.region());
             if (includeEgress) {
-                assertThat(body).containsEntry("ec2PublicIp", DISPLAY.ec2PublicIp());
-                assertThat(body).containsEntry("egressAddressStatus", DISPLAY.egressAddressStatus());
+                assertThat(body).containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp());
+                assertThat(body).containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus());
             } else {
                 assertThat(body).containsEntry("ec2PublicIp", null);
                 assertThat(body).containsEntry("egressAddressStatus", null);
@@ -132,11 +136,14 @@ class ClusterContextApiTest {
                     DISPLAY.region());
             CloudSessionService sessions = new CloudSessionService(
                     new ContextStore(sessionContext), IDENTITY, secrets, Clock.fixed(NOW, ZoneOffset.UTC));
+            CloudClusterEgressAddressProvider addressProvider = includeEgress
+                    ? (organizationId, clusterId) -> Optional.of(CURRENT_ADDRESS)
+                    : (organizationId, clusterId) -> Optional.empty();
             return new CloudAuthenticationService((code, cluster) -> {
                 throw new IllegalStateException("context read must not call Cloud");
             }, (jwt, identity, audience) -> {
                 throw new IllegalStateException("context read must not verify a JWT");
-            }, sessions);
+            }, sessions, io.tapstate.control.core.CloudAuthenticationObserver.NONE, addressProvider);
         }
 
         @Bean

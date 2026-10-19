@@ -46,9 +46,9 @@ def check(workflows, contexts, inputs):
     namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
     reactor = ET.fromstring(inputs['pom.xml'])
     version = reactor.findtext('m:properties/m:cloud.sdk.version', namespaces=namespace)
-    # The Cloud SDK snapshot publisher emits major.minor-<8-char-commit>-SNAPSHOT.
-    assert version and re.fullmatch(r'[0-9]+\.[0-9]+-[0-9a-f]{8}-SNAPSHOT', version), \
-        'the reactor must declare the published major.minor Cloud SDK snapshot revision'
+    # The Cloud SDK snapshot publisher preserves either a major.minor or major.minor.patch tag.
+    assert version and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[0-9a-f]{8}-SNAPSHOT', version), \
+        'the reactor must declare a published Cloud SDK snapshot revision'
     app = ET.fromstring(inputs['app/pom.xml'])
     sdk = [dependency for dependency in app.findall('m:dependencies/m:dependency', namespace)
            if dependency.findtext('m:groupId', namespaces=namespace) == 'io.tapstate'
@@ -138,9 +138,12 @@ for original, replacement in [
     raise AssertionError(f'workflow mutation escaped: {replacement}')
 sdk_version = ET.fromstring(inputs['pom.xml']).findtext(
     './/{http://maven.apache.org/POM/4.0.0}cloud.sdk.version')
+patch_sdk_version = '0.1.1-' + sdk_version.split('-', 1)[1]
+accepted_patch_version = {**inputs, 'pom.xml': inputs['pom.xml'].replace(sdk_version, patch_sdk_version, 1)}
+check(workflows, contexts, accepted_patch_version)
 for name, original, replacement in [
     ('pom.xml', sdk_version, 'LATEST'),
-    ('pom.xml', sdk_version, sdk_version.replace('-', '.0-', 1)),
+    ('pom.xml', sdk_version, sdk_version.replace('-', '.1.2-', 1)),
     ('app/pom.xml', '<artifactId>cloud-control-plane-sdk</artifactId>',
      '<artifactId>missing-cloud-sdk</artifactId>'),
     ('app/pom.xml', '${cloud.sdk.version}', 'LATEST'),

@@ -109,7 +109,8 @@ class CloudRuntimeConfiguration {
             }
         };
         return new CloudAuthenticationService(
-                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock, observer), observer);
+                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock, observer), observer,
+                new CachedCloudClusterEgressAddressProvider(bridge, clock));
     }
 
     @Bean

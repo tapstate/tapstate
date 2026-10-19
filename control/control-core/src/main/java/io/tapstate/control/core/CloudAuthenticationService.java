@@ -15,18 +15,27 @@ public final class CloudAuthenticationService {
     private final CloudJwtValidator validator;
     private final CloudSessionService sessions;
     private final CloudAuthenticationObserver observer;
+    private final CloudClusterEgressAddressProvider egressAddresses;
 
     public CloudAuthenticationService(
             CloudCodeExchanger exchanger, CloudJwtValidator validator, CloudSessionService sessions) {
-        this(exchanger, validator, sessions, CloudAuthenticationObserver.NONE);
+        this(exchanger, validator, sessions, CloudAuthenticationObserver.NONE, (organizationId, clusterId) ->
+                Optional.empty());
     }
 
     public CloudAuthenticationService(CloudCodeExchanger exchanger, CloudJwtValidator validator,
             CloudSessionService sessions, CloudAuthenticationObserver observer) {
+        this(exchanger, validator, sessions, observer, (organizationId, clusterId) -> Optional.empty());
+    }
+
+    public CloudAuthenticationService(CloudCodeExchanger exchanger, CloudJwtValidator validator,
+            CloudSessionService sessions, CloudAuthenticationObserver observer,
+            CloudClusterEgressAddressProvider egressAddresses) {
         this.exchanger = Objects.requireNonNull(exchanger, "exchanger");
         this.validator = Objects.requireNonNull(validator, "validator");
         this.sessions = Objects.requireNonNull(sessions, "sessions");
         this.observer = Objects.requireNonNull(observer, "observer");
+        this.egressAddresses = Objects.requireNonNull(egressAddresses, "egressAddresses");
     }
 
     public CreatedCloudSession exchangeCode(String code, String expectedAudience) {
@@ -67,9 +76,17 @@ public final class CloudAuthenticationService {
 
     /** Projects authenticated display fields without exposing a persistence record to presentation adapters. */
     public Optional<CloudClusterContextView> clusterContextView(String cookie) {
-        return clusterContext(cookie).map(context -> new CloudClusterContextView(context.organizationId(),
-                context.clusterId(), context.organizationName(), context.clusterName(), context.region(),
-                context.ec2PublicIp(), context.egressAddressStatus()));
+        return clusterContext(cookie).map(context -> {
+            CloudClusterEgressAddress current = egressAddresses.currentAddress(
+                    context.organizationId(), context.clusterId())
+                    .filter(address -> Objects.equals(address.organizationId(), context.organizationId())
+                            && Objects.equals(address.clusterId(), context.clusterId()))
+                    .orElse(null);
+            return new CloudClusterContextView(context.organizationId(), context.clusterId(),
+                    context.organizationName(), context.clusterName(), context.region(),
+                    current == null ? null : current.ec2PublicIp(),
+                    current == null ? null : current.egressAddressStatus());
+        });
     }
 
     public boolean logout(String cookie) {

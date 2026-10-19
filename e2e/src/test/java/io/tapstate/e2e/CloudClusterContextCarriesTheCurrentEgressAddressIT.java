@@ -2,6 +2,8 @@ package io.tapstate.e2e;
 
 import io.tapstate.app.Bootstrap;
 import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudClusterEgressAddress;
+import io.tapstate.control.core.CloudClusterEgressAddressProvider;
 import io.tapstate.control.core.CloudCodeExchangeResult;
 import io.tapstate.control.core.CloudCodeExchanger;
 import io.tapstate.control.core.CloudJwtValidator;
@@ -32,6 +34,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -50,12 +53,15 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
             new CloudSessionIdentity(CLOUD_URL, ORGANIZATION, CLUSTER);
     private static final CloudSessionContext LOGIN_CONTEXT = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region",
-            "203.0.113.42", "STABLE");
+            "198.51.100.1", "DYNAMIC");
+    private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
+            ORGANIZATION, CLUSTER, "203.0.113.42", "STABLE");
     private static final CloudSessionContext LOGIN_CONTEXT_WITHOUT_ADDRESS = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region");
 
     @Test
-    void authenticatedClusterContextReturnsTheLoginSnapshotAndRepresentsMissingAddressExplicitly() throws Exception {
+    void authenticatedClusterContextReturnsTheCurrentAddressAndRepresentsUnavailableAddressExplicitly()
+            throws Exception {
         String database = "cloud_egress_context_" + Long.toUnsignedString(System.nanoTime(), 16);
         String storeUri = SharedMongo.replicaSetUrl(database);
         Path stagingDirectory = ServerHandle.privateStagingDirectory();
@@ -103,8 +109,8 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsEntry("organizationName", "Workspace organization")
                         .containsEntry("clusterName", "Workspace cluster")
                         .containsEntry("region", "workspace-region")
-                        .containsEntry("ec2PublicIp", LOGIN_CONTEXT.ec2PublicIp())
-                        .containsEntry("egressAddressStatus", LOGIN_CONTEXT.egressAddressStatus())
+                        .containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp())
+                        .containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus())
                         .containsKey("clusterState")
                         .containsEntry("clusterState", null);
                 assertThat(response.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
@@ -176,8 +182,12 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 }
                 return Optional.empty();
             };
+            AtomicInteger addressReads = new AtomicInteger();
+            CloudClusterEgressAddressProvider addressProvider = (organizationId, clusterId) ->
+                    addressReads.getAndIncrement() == 0 ? Optional.of(CURRENT_ADDRESS) : Optional.empty();
             return new CloudAuthenticationService(exchanger, validator,
-                    new CloudSessionService(sessions, DEPLOYMENT, secrets, clock));
+                    new CloudSessionService(sessions, DEPLOYMENT, secrets, clock),
+                    io.tapstate.control.core.CloudAuthenticationObserver.NONE, addressProvider);
         }
     }
 }

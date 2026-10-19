@@ -5,10 +5,13 @@ import io.tapstate.cloud.sdk.ApiException;
 import io.tapstate.cloud.sdk.api.C2StatusReportApi;
 import io.tapstate.cloud.sdk.client.CloudControlPlaneException;
 import io.tapstate.cloud.sdk.client.CloudControlPlaneSdk;
+import io.tapstate.cloud.sdk.client.ClusterEgressAddress;
 import io.tapstate.cloud.sdk.client.JwtExchangeResult;
 import io.tapstate.cloud.sdk.client.JwtVerificationException;
 import io.tapstate.cloud.sdk.model.StatusReportRequest;
 import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudClusterEgressAddress;
+import io.tapstate.control.core.CloudClusterEgressAddressProvider;
 import io.tapstate.control.core.CloudCodeExchanger;
 import io.tapstate.control.core.CloudCodeExchangeResult;
 import io.tapstate.control.core.CloudJwtValidator;
@@ -32,7 +35,7 @@ import java.util.Optional;
 
 /** Thin binding to the Cloud-owned SDK; session and status policy remain in Tapstate. */
 final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
-        CloudSessionCallbackVerifier, CloudStatusSender {
+        CloudSessionCallbackVerifier, CloudStatusSender, CloudClusterEgressAddressProvider {
 
     static final String DEPLOYMENT_ORGANIZATION = "sdk-verified-cluster";
     private static final Logger LOG = LoggerFactory.getLogger(CloudSdkBridge.class);
@@ -138,6 +141,23 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         }
     }
 
+    @Override
+    public Optional<CloudClusterEgressAddress> currentAddress(String organizationId, String clusterId) {
+        if (!settings.clusterId().equals(clusterId)) {
+            return Optional.empty();
+        }
+        try {
+            ClusterEgressAddress current = sdk.currentEgressAddress();
+            if (!organizationId.equals(current.organizationId()) || !clusterId.equals(current.clusterId())) {
+                return Optional.empty();
+            }
+            return Optional.of(new CloudClusterEgressAddress(current.organizationId(), current.clusterId(),
+                    optionalText(current.ec2PublicIp()), optionalText(current.egressAddressStatus())));
+        } catch (ProviderFailure unavailable) {
+            return Optional.empty();
+        }
+    }
+
     private boolean deploymentMatches(CloudSessionIdentity deployment) {
         return deployment != null
                 && settings.baseUrl().toString().equals(deployment.issuer())
@@ -168,6 +188,15 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         // Provider messages, response bodies and exception causes can contain authentication inputs.
         markFailure("code-exchange", diagnostic);
         LOG.warn("Cloud authentication rejected [request_id={}, stage=code-exchange, http={}, reason={}]",
+                requestId(), status, diagnostic);
+    }
+
+    private static void logAddressFailure(CloudControlPlaneException failure) {
+        String code = failure.getErrorCode();
+        String diagnostic = reportableFailureCode(code) ? code : "unclassified";
+        int status = failure.getHttpStatus();
+        if (status < 0 || status > 599) status = 0;
+        LOG.warn("Cloud Cluster address refresh failed [request_id={}, http={}, reason={}]",
                 requestId(), status, diagnostic);
     }
 
@@ -213,6 +242,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     interface SdkRuntime {
         ExchangeResult exchange(String code);
         VerifiedClaims verify(String jwt);
+        ClusterEgressAddress currentEgressAddress();
         boolean verifyCallback(String method, String timestamp, String nonce, String data, String signature);
         void report(String clusterId, String nonce, CloudRuntimeStatus status, String token);
     }
@@ -322,6 +352,16 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 throw new ProviderFailure();
             } catch (CloudControlPlaneException failure) {
                 logValidationFailure("jwt-verification", "jwks-provider-unavailable");
+                throw new ProviderFailure();
+            }
+        }
+
+        @Override
+        public ClusterEgressAddress currentEgressAddress() {
+            try {
+                return sdk.currentEgressAddress();
+            } catch (CloudControlPlaneException failure) {
+                logAddressFailure(failure);
                 throw new ProviderFailure();
             }
         }
