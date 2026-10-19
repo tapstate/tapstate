@@ -55,6 +55,44 @@ class SourceAcknowledgementsTest {
         acknowledgements.close();
     }
 
+    @Test void nativeAcknowledgementsUseOnlyTheOriginalEpochAndNeverLaterCaptureHistory() {
+        var current = new java.util.concurrent.atomic.AtomicReference<>(nativeState(3,"original"));
+        var chains = new NativeChains(() -> Optional.of(current.get()));
+        followed = acknowledgements.follow(chains,CHAIN,3,tail,health,() -> {});
+        assertThat(tail.told).containsExactly("original");
+        current.set(nativeState(4,"later")); handOver();
+        assertThat(tail.told).containsExactly("original");
+        assertThat(health.consecutiveAcknowledgeFailures()).isEqualTo(1);
+        assertThat(health.failure()).isEmpty();
+    }
+
+    @Test void revocationDuringNativeCheckpointReadCannotReachTheOriginalSource() {
+        var active = new AtomicBoolean(true);
+        var chains = new NativeChains(() -> { active.set(false); return Optional.of(nativeState(3,"late")); });
+        followed = acknowledgements.follow(chains,CHAIN,3,tail,health,() -> {
+            if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+        });
+        assertThat(tail.told).isEmpty(); assertThat(health.consecutiveAcknowledgeFailures()).isEqualTo(1);
+        followed.close(); handOver(); assertThat(tail.told).isEmpty();
+    }
+
+    private record NativeChains(java.util.function.Supplier<Optional<io.tapstate.spi.store.SrsChainState>> read) implements io.tapstate.spi.store.SrsChainStore {
+        @Override public Optional<io.tapstate.spi.store.SrsChainState> load(String chain) { assertThat(chain).isEqualTo(CHAIN); return read.get(); }
+        @Override public io.tapstate.spi.store.SrsChainStore guardedBy(Runnable guard) { throw new AssertionError(); }
+        @Override public io.tapstate.spi.store.SrsChainState prepare(String c,String r,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public io.tapstate.spi.store.SrsChainState requestTables(String c,java.util.Set<String> t,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public java.util.OptionalLong openEpoch(String c,long e,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public boolean publishServingTables(String c,long e,java.util.Set<String> t,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public Optional<io.tapstate.spi.store.SrsChainState> checkpoint(String c,long r,io.tapstate.spi.store.SrsCaptureCheckpoint p,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+    }
+
+    private static io.tapstate.spi.store.SrsChainState nativeState(long epoch,String token) {
+        var model = new io.tapstate.spi.store.SrsModelKey(CHAIN,"table","cache",epoch,0);
+        var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(epoch,1),token),
+                Map.of("table",new io.tapstate.spi.store.SrsTableCheckpoint(model,1)));
+        return new io.tapstate.spi.store.SrsChainState(CHAIN,"capture",null,epoch,java.util.Set.of("table"),java.util.Set.of("table"),1,checkpoint,java.time.Instant.EPOCH,0,0);
+    }
+
     /**
      * A tail is told the position it starts from as soon as it is followed, and after that every position the
      * chain comes to hold -- once each, whoever moved it there. A tail told nothing until its first change

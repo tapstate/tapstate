@@ -106,6 +106,56 @@ class SrsSnapshotPreparationTest {
         assertThat(f.closedSessions).isOne();
     }
 
+    @Test void nativeUnitDrainsPreparedPrivateSnapshotWithoutOpeningOrOwningACaptureTail() throws Exception {
+        var f = new Fixture(); f.nativeRings = true; var rows = new java.util.concurrent.CopyOnWriteArrayList<Envelope>();
+        var completed = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(),new SrsStores(f,f,f,f),unusedMember())) {
+            var run = unit.beginSnapshot(RUN,config(),7,owner -> new Port(f,owner),new CaptureHandoff() {
+                @Override public void accept(Envelope row) { rows.add(row); }
+                @Override public void loaded(String table) { completed.add(table); }
+            },() -> { if (!f.active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); });
+            assertThat(run.awaitLoaded(java.time.Duration.ofSeconds(3))).isTrue(); assertThat(run.failure()).isEmpty();
+            assertThat(rows).hasSize(2).allSatisfy(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(7)));
+            assertThat(completed).containsExactly("orders","quiet"); assertThat(run.cdcSubscription()).isEmpty();
+            assertThat(run.health().receivedRows()).containsEntry("orders",Map.of("r",1L)).containsEntry("quiet",Map.of("r",1L));
+            long bytes = rows.stream().mapToLong(io.tapstate.core.event.PayloadBytes::of).sum();
+            assertThat(run.health().receivedBytes().values().stream().mapToLong(Long::longValue).sum()).isEqualTo(bytes);
+            unit.stopSnapshot(run); unit.stopSnapshot(run); assertThat(f.closedSessions).isOne();
+            assertThat(f.pinCalls).isOne();
+        }
+    }
+
+    @Test void revocationAfterOneTableCannotOpenTheNextTableOrReadAnotherRow() {
+        var f = new Fixture(); var owner = f.owner();
+        try (var load = SnapshotPhase.openPrepared(new Port(f,owner),config(),owner)) {
+            assertThatThrownBy(() -> load.read(row -> {},table -> f.active.set(false))).isInstanceOf(TapstateException.class);
+        }
+        assertThat(f.sourceReads).isOne(); assertThat(f.closedSessions).isOne();
+    }
+
+    @Test void losingAuthorityAfterSnapshotRegistrationReleasesTheUnreturnedRun() throws Exception {
+        var f = new Fixture(); f.nativeRings = true; var unitRef = new java.util.concurrent.atomic.AtomicReference<NativeSrsCaptureRunUnit>();
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(),new SrsStores(f,f,f,f),unusedMember())) {
+            unitRef.set(unit);
+            assertThatThrownBy(() -> unit.beginSnapshot(RUN,config(),7,owner -> new Port(f,owner),CaptureHandoff.of(row -> {
+                throw new AssertionError("a refused start cannot deliver a row");
+            }),() -> {
+                try { if (!registered(unitRef.get()).isEmpty()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
+                catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+            })).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(registered(unit)).isEmpty(); assertThat(f.closedSessions).isOne();
+        }
+    }
+    private static java.util.Collection<?> registered(NativeSrsCaptureRunUnit unit) throws ReflectiveOperationException {
+        var field = NativeSrsCaptureRunUnit.class.getDeclaredField("snapshots"); field.setAccessible(true);
+        return (java.util.Collection<?>) field.get(unit);
+    }
+    private static com.hazelcast.core.HazelcastInstance unusedMember() {
+        return (com.hazelcast.core.HazelcastInstance) java.lang.reflect.Proxy.newProxyInstance(
+                com.hazelcast.core.HazelcastInstance.class.getClassLoader(),new Class<?>[]{com.hazelcast.core.HazelcastInstance.class},
+                (proxy,method,args) -> { throw new AssertionError("a private snapshot must not use the capture member"); });
+    }
+
     private static void unavailable(Throwable failure) { assertThat(failure).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_CONSUMER_UNAVAILABLE)); }
     private static class PlainPort implements CapturePort {
         @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError("unprepared snapshot must not open"); }
@@ -141,7 +191,7 @@ class SrsSnapshotPreparationTest {
     private static final class Fixture implements SrsConsumerStore,SrsModelStore,SrsChainStore,SrsLogStore {
         final Map<String,SourceTable> actual = new HashMap<>(Map.of("orders",table("orders"),"quiet",table("quiet")));
         final AtomicBoolean active = new AtomicBoolean(true); int pinCalls,progressReads,headReads,exactReads,sourceReads,closedSessions;
-        long currentRevision = 4; boolean published = true,forbidHeads; SrsSnapshotPin pinned; SrsConsumerProgress original = progress(null,List.of());
+        long currentRevision = 4; boolean published = true,forbidHeads,nativeRings; SrsSnapshotPin pinned; SrsConsumerProgress original = progress(null,List.of());
         SrsConsumerProgress progress(SrsSnapshotPin snapshot,List<String> complete) {
             var cursor = new ConsumerOffset(RUN.context().key().consumerId(),Map.of("orders",-1L,"quiet",-1L),null,complete,
                     snapshot == null ? null : snapshot.sourcePosition(),snapshot == null ? 0 : snapshot.snapshotEpoch(),Map.of(),ConsumerProgressKind.SRS);
@@ -159,7 +209,7 @@ class SrsSnapshotPreparationTest {
         }
         @Override public Optional<Map<String,SrsModel>> publishedForNewSnapshot(String chain,Map<String,String> rings) {
             if (forbidHeads) throw new AssertionError("a saved reference must not consult current heads"); headReads++;
-            if (!published) return Optional.empty(); var answer = new HashMap<String,SrsModel>(); rings.forEach((table,ring) -> answer.put(table,model(table,2))); return Optional.of(answer);
+            if (!published) return Optional.empty(); var answer = new HashMap<String,SrsModel>(); rings.forEach((table,ring) -> answer.put(table,nativeRings ? new SrsModel(model(table,2).key(),SrsRingbuffer.ringName("chain",table),table(table),0) : model(table,2))); return Optional.of(answer);
         }
         @Override public Optional<SrsModel> load(SrsModelKey key) { exactReads++; assertThat(key.modelVersion()).isEqualTo(2); return Optional.of(model(key.table(),2)); }
         @Override public SrsModel requireEvent(SrsModelKey key,String ring,long sequence,WorkloadClaimFence fence) { throw new AssertionError("snapshot pinning must not resolve an event range"); }

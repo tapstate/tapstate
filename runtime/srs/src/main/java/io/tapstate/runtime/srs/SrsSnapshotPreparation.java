@@ -67,6 +67,7 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
     }
     /** A successful callback receipt, never a later pin discovered by reading the current consumer again. */
     public SrsSnapshotPin accepted() { requireOpen(); var pin = accepted.get(); if (pin == null) throw unavailable(); return pin; }
+    void requireReading() { requireOpen(); }
     void beginRead() {
         requireUsable();
         if (!phase.compareAndSet(Phase.CREATED,Phase.OPEN)) throw unavailable();

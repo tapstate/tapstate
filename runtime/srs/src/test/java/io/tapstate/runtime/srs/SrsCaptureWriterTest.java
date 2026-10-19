@@ -154,6 +154,31 @@ class SrsCaptureWriterTest {
         assertThatThrownBy(() -> writer.prepare(f.actual)).satisfies(error -> code(error, IoError.CACHE_BUSINESS_FENCED));
         assertThat(f.saved).isEmpty();
     }
+    @Test void nativeRunUnitOpensPreparedModelsAndOnlyAcknowledgesItsDurableCaptureCheckpoint() {
+        var f = new Fixture(); f.actual.keySet().forEach(name -> SHARED_LOG.stores.put(f.ring(name),f.log));
+        var callback = new AtomicReference<CaptureListener>(); var told = new ArrayList<String>(); var stopped = new AtomicBoolean();
+        try (var unit = new NativeSrsCaptureRunUnit(SCOPE,new SrsStores(f.chains,f.models,SHARED_LOG,unusedConsumers),member)) {
+            var tail = unit.startTail(SCOPE,f.opened,FENCE,f.config(),CaptureStart.present(),writer -> new CapturePort() {
+                @Override public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener listener) {
+                    writer.prepare(f.actual); callback.set(listener); ((CaptureStartedListener)listener).onStart(new SourcePosition("seam"));
+                    return new Subscription() {
+                        @Override public void acknowledge(SourcePosition position) { told.add(position.token()); }
+                        @Override public void close() { stopped.set(true); }
+                    };
+                }
+                @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError(); }
+                @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError(); }
+                @Override public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError(); }
+            },() -> { if (!f.active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); });
+            assertThat(f.published).hasSize(2); assertThat(told).containsExactly("seam");
+            callback.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",1),null)),Optional.of(new SourcePosition("durable")));
+            assertThat(f.saved.getLast().position().token()).isEqualTo("durable");
+            tail.close(); tail.close(); assertThat(stopped).isTrue();
+            assertThatThrownBy(() -> callback.get().onBatch(List.of(),Optional.of(new SourcePosition("late"))))
+                    .satisfies(error -> code(error,IoError.CACHE_BUSINESS_FENCED));
+        }
+    }
+
     private static final class Fixture {
         final String chain = "chain-" + UUID.randomUUID(); final AtomicBoolean active = new AtomicBoolean(true);
         final Map<String, SourceTable> actual = Map.of("orders", table("orders"), "quiet", table("quiet"));
@@ -197,7 +222,7 @@ class SrsCaptureWriterTest {
                 assertThat(id).isEqualTo(chain); assertThat(fence).isEqualTo(FENCE); assertThat(expected).isEqualTo(opened.checkpointRevision() + saved.size());
                 if (conflict) return Optional.empty(); saved.add(value); return Optional.of(state(expected + 1, value));
             }
-            @Override public Optional<SrsChainState> load(String chain) { loadCalls++; throw new AssertionError("must not adopt a newer checkpoint"); }
+            @Override public Optional<SrsChainState> load(String chain) { loadCalls++; return Optional.of(saved.isEmpty() ? opened : state(opened.checkpointRevision()+saved.size(),saved.getLast())); }
             @Override public SrsChainState prepare(String c, String r, WorkloadClaimFence f) { throw new AssertionError(); }
             @Override public SrsChainState requestTables(String c, Set<String> t, WorkloadClaimFence f) { throw new AssertionError(); }
             @Override public OptionalLong openEpoch(String c, long e, WorkloadClaimFence f) { throw new AssertionError(); }
@@ -222,7 +247,7 @@ class SrsCaptureWriterTest {
         @Override public void trim(String r, long s) { throw new AssertionError(); }
     }
     private static final SrsConsumerStore unusedConsumers = new SrsConsumerStore() {
-        @Override public SrsConsumerStore guardedBy(Runnable g) { throw new AssertionError(); }
+        @Override public SrsConsumerStore guardedBy(Runnable g) { g.run(); return this; }
         @Override public Optional<SrsConsumerMembership> find(SrsConsumerKey k) { throw new AssertionError(); }
         @Override public SrsConsumerTopology attached(String c) { throw new AssertionError(); }
         @Override public Optional<ConsumerOffset> cursor(SrsConsumerContext c) { throw new AssertionError(); }

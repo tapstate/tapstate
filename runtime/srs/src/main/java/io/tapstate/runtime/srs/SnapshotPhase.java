@@ -170,7 +170,12 @@ public final class SnapshotPhase {
             var opened = SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
                     new TapstateException(io.tapstate.spi.store.IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",run.miningChainId()),null));
             session = new SnapshotSession() {
-                @Override public CaptureBatch read(String table) { return opened.read(table); }
+                @Override public CaptureBatch read(String table) {
+                    preparation.requireReading();
+                    var batch = opened.read(table);
+                    try { preparation.requireReading(); return guardedBatch(batch,preparation); }
+                    catch (RuntimeException | Error failure) { closing(failure,batch::close); throw failure; }
+                }
                 @Override public void close() { preparation.close(); opened.close(); }
             };
             first = session.read(owed.getFirst());
@@ -183,6 +188,16 @@ public final class SnapshotPhase {
             if (session != null) closing(failure,session::close);
             throw failure;
         }
+    }
+
+    private static CaptureBatch guardedBatch(CaptureBatch original,SrsSnapshotPreparation preparation) {
+        return new CaptureBatch() {
+            private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+            @Override public Optional<SourcePosition> seam() { preparation.requireReading(); return original.seam(); }
+            @Override public boolean hasNext() { preparation.requireReading(); return original.hasNext(); }
+            @Override public Envelope next() { preparation.requireReading(); return original.next(); }
+            @Override public void close() { if (closed.compareAndSet(false,true)) original.close(); }
+        };
     }
 
     private static Throwable closing(Throwable primary,Runnable close) {
@@ -416,6 +431,7 @@ public final class SnapshotPhase {
         public void close() {
             CaptureBatch batch;
             synchronized (this) {
+                if (closed) return;
                 closed = true;
                 batch = open;
                 open = null;

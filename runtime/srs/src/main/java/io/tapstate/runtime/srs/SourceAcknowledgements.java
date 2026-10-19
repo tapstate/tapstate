@@ -88,6 +88,27 @@ final class SourceAcknowledgements implements AutoCloseable {
         return one;
     }
 
+    /** Native capture acknowledgements remain bound to the original epoch and command guard. */
+    Subscription follow(io.tapstate.spi.store.SrsChainStore chains, String chainId, long epoch,
+            Subscription tail, CaptureHealth health, Runnable requireActive) {
+        Objects.requireNonNull(chains, "chains"); Objects.requireNonNull(requireActive, "requireActive");
+        Subscription guarded = new Subscription() {
+            @Override public void acknowledge(SourcePosition position) { requireActive.run(); tail.acknowledge(position); }
+            @Override public void close() { tail.close(); }
+        };
+        var one = new Followed(chainId, () -> {
+            requireActive.run();
+            var state = chains.load(chainId).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                    io.tapstate.spi.store.IoError.SRS_CHECKPOINT_UNPROVEN, java.util.Map.of("chain",chainId),null));
+            requireActive.run();
+            if (!chainId.equals(state.miningChainId()) || state.epoch() != epoch || state.checkpoint() == null
+                    || state.checkpoint().position().order().epoch() != epoch) throw new io.tapstate.core.common.TapstateException(
+                    io.tapstate.spi.store.IoError.SRS_CHECKPOINT_UNPROVEN,java.util.Map.of("chain",chainId),null);
+            return Optional.of(state.checkpoint().position());
+        }, guarded, health, followed);
+        followed.add(one); one.handOverQuietly(); return one;
+    }
+
     /**
      * Stops the thread that reads for every tail followed here. The tails themselves are left as they are: each
      * is closed by the run that holds it.

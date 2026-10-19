@@ -72,9 +72,9 @@ final class ExecutionAuthorization implements AutoCloseable {
     private record Entry(WorkloadClaimFence claim, long deadlineNanos) {
     }
 
-    private record ReadKey(String pipelineId, PipelineIntentScope scope) {
+    private record ReadKey(String pipelineId, PipelineIntentScope scope, WorkloadClaimType type) {
         static ReadKey of(ExecutionFence fence) {
-            return new ReadKey(fence.pipelineId(), fence.scope());
+            return new ReadKey(fence.pipelineId(), fence.scope(), WorkloadClaimType.PIPELINE_ACTUATION);
         }
     }
 
@@ -196,6 +196,29 @@ final class ExecutionAuthorization implements AutoCloseable {
         return authorized.claim();
     }
 
+    /** A physical source uses the same bounded proof cache, independently of all Pipeline executions. */
+    WorkloadClaimFence requireCapture(CacheBusinessScope originalScope,WorkloadClaimFence original) {
+        Objects.requireNonNull(originalScope,"originalScope"); Objects.requireNonNull(original,"original");
+        if (!fenced || businessScope == null || !businessScope.equals(originalScope)
+                || original.key().type() != WorkloadClaimType.CAPTURE || !clusterId.equals(original.key().clusterId())
+                || closed.get() || !nodeActive.getAsBoolean()) throw captureRefused();
+        var key = new ReadKey(original.key().resourceId(),null,WorkloadClaimType.CAPTURE);
+        Entry entry = entries.get(key); long now = nanoTime.getAsLong();
+        if (entry != null && (entry.claim().claimGeneration() < original.claimGeneration()
+                || entry.claim().claimGeneration() == original.claimGeneration()
+                        && (entry.claim().executionGeneration() < original.executionGeneration()
+                                || entry.claim().executionGeneration() == original.executionGeneration()
+                                        && entry.claim().topologyRevision() != original.topologyRevision()))) read(key,true);
+        else if (entry == null || now - entry.deadlineNanos() >= 0) read(key,false);
+        Entry published = entries.get(key);
+        if (closed.get() || !nodeActive.getAsBoolean() || published == null
+                || nanoTime.getAsLong() - published.deadlineNanos() >= 0 || !original.equals(published.claim())) throw captureRefused();
+        return published.claim();
+    }
+    private static TapstateException captureRefused() {
+        return new TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+    }
+
     /** Whether {@code fence}'s run is still the current one, as far as this member can prove locally. */
     boolean authorized(ExecutionFence fence) {
         if (!fenced) {
@@ -274,7 +297,7 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     private Optional<WorkloadClaimReading> readStore(ReadKey key) {
         return key.scope() == null
-                ? claims.read(new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, key.pipelineId()))
+                ? claims.read(new WorkloadClaimKey(clusterId, key.type(), key.pipelineId()))
                 : claims.readPipeline(key.scope());
     }
 
@@ -348,11 +371,11 @@ final class ExecutionAuthorization implements AutoCloseable {
         if (key.scope() != null && !entries.containsKey(key)) {
             // A proved replacement ends every older positive answer for this Pipeline immediately.
             // Reads are serialized, and the scoped store refuses a scope that is no longer current.
-            boolean newerKnown = entries.keySet().stream().anyMatch(other -> other.pipelineId().equals(key.pipelineId())
+            boolean newerKnown = entries.keySet().stream().anyMatch(other -> other.type() == key.type() && other.scope() != null && other.pipelineId().equals(key.pipelineId())
                     && other.scope().stateGeneration() > key.scope().stateGeneration());
             if (newerKnown) return null;
-            entries.keySet().removeIf(other -> other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
-            nextReadNanos.keySet().removeIf(other -> other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
+            entries.keySet().removeIf(other -> other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
+            nextReadNanos.keySet().removeIf(other -> other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
         }
         if (current.isEmpty()) {
             entries.remove(key);
