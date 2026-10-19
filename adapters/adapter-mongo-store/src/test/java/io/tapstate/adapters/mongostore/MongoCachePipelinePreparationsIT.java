@@ -509,6 +509,194 @@ class MongoCachePipelinePreparationsIT {
         client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1)).append("data", data));
     }
     private static void clearFailpoint(MongoClient client) { client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+    @Test void rebuildBeginFreezesOneSuccessorButLeavesCacheHistoryUntouched() {
+        withFixture(f -> {
+            var request = rebuildRequest(f); long revision = f.version(); var before = f.snapshot();
+            var previous = SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find(new Document("_id","flow")).first().get("cachePreparation");
+            var pending = f.configuration.rebuilds().begin(request);
+            assertThat(pending.request()).isEqualTo(request); assertThat(pending.confirmationHash()).matches("[0-9a-f]{64}");
+            assertThat(pending.request().targetScope().stateGeneration()).isEqualTo(2);
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find(new Document("_id","flow")).first();
+            assertThat(mapping).containsEntry("stateGeneration",1L).containsEntry("phase","REBUILDING").containsEntry("operationId","rebuild-operation")
+                    .containsEntry("cachePreparation",previous);
+            assertThat(mapping.toJson()).doesNotContain("leaseUntil","password","uri");
+            assertThat(f.version()).isEqualTo(revision+1); assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(f.configuration.intents().loadForActuation("flow")).isEmpty();
+            f.configuration.rebuilds().requirePending(pending);
+            assertCode(() -> f.configuration.preparations().issueFirstCreate(f.scope,f.node),IoError.PIPELINE_INTENT_FENCED);
+        });
+    }
+    @Test void rebuildBeginCanReopenTheOriginalOperationWithoutAllocatingAnotherPreparation() {
+        withFixture(f -> {
+            var request = rebuildRequest(f); var original = f.configuration.rebuilds().begin(request); long revision = f.version();
+            try (var reopened = MongoConfigurationDomain.open(f.settings(),"cluster-a")) {
+                var resumed = reopened.rebuilds().begin(request);
+                assertThat(resumed.preparationId()).isEqualTo(original.preparationId());
+                assertThat(resumed.previousPreparationId()).isEqualTo(original.previousPreparationId());
+                assertThat(resumed.confirmationHash()).isEqualTo(original.confirmationHash());
+                reopened.rebuilds().requirePending(resumed);
+                assertCode(() -> reopened.rebuilds().requirePending(original),IoError.PIPELINE_INTENT_FENCED);
+            }
+            assertThat(f.version()).isEqualTo(revision);
+        });
+    }
+    @Test void rebuildBeginConcurrencyPublishesOneOriginalAnnexAndOneRevision() {
+        withFixture(f -> {
+            var request = rebuildRequest(f); long revision = f.version(); var begin = new CountDownLatch(1);
+            try (var reopened = MongoConfigurationDomain.open(f.settings(),"cluster-a"); var executor = Executors.newFixedThreadPool(2)) {
+                var a = executor.submit(() -> { begin.await(); return f.configuration.rebuilds().begin(request); });
+                var b = executor.submit(() -> { begin.await(); return reopened.rebuilds().begin(request); });
+                begin.countDown(); var first = a.get(20,TimeUnit.SECONDS); var second = b.get(20,TimeUnit.SECONDS);
+                assertThat(first.preparationId()).isEqualTo(second.preparationId());
+                assertThat(first.confirmationHash()).isEqualTo(second.confirmationHash());
+            }
+            assertThat(f.version()).isEqualTo(revision+1);
+        });
+    }
+    @Test void rebuildPendingNeverAdoptsAnotherOperationEpochClaimOrInput() {
+        withFixture(f -> {
+            var original = rebuildRequest(f); var pending = f.configuration.rebuilds().begin(original); long revision = f.version();
+            var changedEpoch = new io.tapstate.spi.store.PipelineRebuildRequest(original.operationId(),original.intent(),original.originalClaim(),1,original.inputs());
+            var changedOperation = new io.tapstate.spi.store.PipelineRebuildRequest("different-operation",original.intent(),original.originalClaim(),0,original.inputs());
+            var claim = original.originalClaim();
+            var changedClaim = new io.tapstate.spi.store.PipelineRebuildRequest(original.operationId(),original.intent(),
+                    new WorkloadClaimFence(claim.key(),claim.owner(),claim.claimGeneration()+1,claim.executionGeneration(),claim.topologyRevision()),0,original.inputs());
+            for (var changed : List.of(changedEpoch,changedOperation,changedClaim))
+                assertCode(() -> f.configuration.rebuilds().begin(changed),IoError.PIPELINE_INTENT_FENCED);
+            f.configuration.rebuilds().requirePending(pending); assertThat(f.version()).isEqualTo(revision);
+        });
+    }
+    @Test void rebuildRefusesAnUnpreparedPipelineAndNeverChangesTheFirstCreationFacts() {
+        withFixture(f -> {
+            var request = rawRebuildRequest(f,new WorkloadClaimFence(new WorkloadClaimKey("cluster-a",WorkloadClaimType.PIPELINE_ACTUATION,"flow"),OWNER,1,0,1));
+            long revision = f.version(); var before = f.snapshot();
+            assertCode(() -> f.configuration.rebuilds().begin(request),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.version()).isEqualTo(revision); assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(f.configuration.preparations().read("flow").orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+        });
+    }
+    @Test void rebuildMissingAnnexAfterThePhaseCommitIsNeverRecreated() {
+        withFixture(f -> {
+            var request = rebuildRequest(f); f.configuration.rebuilds().begin(request); long revision = f.version();
+            SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).updateOne(new Document("_id","flow"),new Document("$unset",new Document("stateRebuild",1)));
+            assertCode(() -> f.configuration.rebuilds().begin(request),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.version()).isEqualTo(revision);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find(new Document("_id","flow")).first()).doesNotContainKey("stateRebuild");
+        });
+    }
+    @Test void rebuildRefusesAnIntentChangedSinceTheConfirmation() {
+        withFixture(f -> {
+            var request = rebuildRequest(f); var current = request.intent();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,current.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,current.desired().revision(),false))).isTrue();
+            long revision = f.version(); assertCode(() -> f.configuration.rebuilds().begin(request),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.version()).isEqualTo(revision);
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE);
+        });
+    }
+    @Test void rebuildChecksActualSourceDefinitionsAndPersistsNoConnectionSecrets() {
+        withFixture(f -> {
+            var request = sourceRebuildRequest(f); var pending = f.configuration.rebuilds().begin(request);
+            f.configuration.rebuilds().requirePending(pending);
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find(new Document("_id","flow")).first();
+            assertThat(mapping.toJson()).doesNotContain("source.invalid","source-secret-sentinel","mongodb://");
+            assertThat(request.inputs().sourceHashes()).containsOnlyKeys("input");
+        });
+    }
+    @Test void rebuildDoesNotRefreshSourceInputsAfterTheConfirmation() {
+        withFixture(f -> {
+            var request = sourceRebuildRequest(f);
+            var source = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            f.configuration.artifacts().save(new SourceResource("input",source.metadata(),source.connector(),Map.of("uri","mongodb://changed.invalid/source"),
+                    source.mode(),source.tables(),source.srs(),source.execution(),source.experimental()));
+            long revision = f.version(); assertCode(() -> f.configuration.rebuilds().begin(request),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.version()).isEqualTo(revision);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find(new Document("_id","flow")).first()).doesNotContainKey("stateRebuild");
+        });
+    }
+    @Test void rebuildGuardLossAfterTheActualMappingWriteRollsBackPhaseAnnexAndRevision() {
+        withFixture(f -> {
+            var request = rebuildRequest(f); long revision = f.version();
+            var before = SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find(new Document("_id","flow")).first();
+            try (var witness = new MongoCommandWitness(CONFIG.getReplicaSetUrl(),f.configDatabase.getName(),"update","operator_generations")) {
+                var material = SystemCollections.CLUSTER_KEYS.on(f.configDatabase).find().first().getString("material");
+                var cipher = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+                var bindings = new MongoStorageBindingStore(witness.client,witness.database,cipher);
+                var artifacts = new MongoConfigurationArtifactStore(witness.client,witness.database,cipher);
+                var store = new MongoPipelineStateRebuilds(witness.client,witness.database,"cluster-a",bindings,artifacts,witness::refuseAfterCommand);
+                assertCode(() -> store.begin(request),IoError.CACHE_BUSINESS_FENCED); witness.requireCommand();
+            }
+            assertThat(f.version()).isEqualTo(revision);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find(new Document("_id","flow")).first()).isEqualTo(before);
+        });
+    }
+    @Test void rebuildPendingRefusesForeignProofsWithoutCallingTheirAccessors() {
+        withFixture(f -> {
+            var request = rebuildRequest(f); var pending = f.configuration.rebuilds().begin(request); var calls = new AtomicInteger();
+            io.tapstate.spi.store.PipelineRebuildPreparation forged = new io.tapstate.spi.store.PipelineRebuildPreparation() {
+                @Override public io.tapstate.spi.store.PipelineRebuildRequest request() { calls.incrementAndGet(); return request; }
+                @Override public String preparationId() { calls.incrementAndGet(); return pending.preparationId(); }
+                @Override public String previousPreparationId() { calls.incrementAndGet(); return pending.previousPreparationId(); }
+                @Override public String confirmationHash() { calls.incrementAndGet(); return pending.confirmationHash(); }
+            };
+            assertCode(() -> f.configuration.rebuilds().requirePending(forged),IoError.PIPELINE_INTENT_FENCED);
+            assertCode(() -> MongoPipelineStateRebuilds.requireOriginalPending(forged),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(calls.get()).isZero();
+        });
+    }
+    @Test void rebuildPhaseFencesOrdinaryNotesButAllowsOnlyItsOriginalRetirementContext() {
+        withFixture(f -> {
+            var oldRequest = sourceRebuildRequest(f); var notes = f.configuration.requiredNotes();
+            var owner = new io.tapstate.spi.store.RequiredNoteOwner(f.scope.bindingVersion(),"pdk.state.flow.capture.input",
+                    io.tapstate.spi.store.RequiredNoteOwner.Kind.PIPELINE,"flow",1);
+            var old = notes.open(owner);
+            var origin = new io.tapstate.spi.store.RequiredNoteOrigin("mongodb","b".repeat(64),new byte[]{1,2,3});
+            notes.prepareOrigin(old,origin); notes.compareAndSet(old,"slot",0,new byte[]{4,5},false);
+            var source = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            var changed = new SourceResource("input",source.metadata(),source.connector(),Map.of("uri","mongodb://new.invalid/source"),
+                    source.mode(),source.tables(),source.srs(),source.execution(),source.experimental());
+            f.configuration.artifacts().save(changed);
+            var pipeline = (io.tapstate.core.model.PipelineResource) f.configuration.artifacts().get("flow").orElseThrow();
+            var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(oldRequest.targetScope(),pipeline,Map.of("input",changed),Map.of("input",java.util.Set.of("orders")));
+            var request = new io.tapstate.spi.store.PipelineRebuildRequest(oldRequest.operationId(),oldRequest.intent(),oldRequest.originalClaim(),oldRequest.originalStateEpoch(),inputs);
+            f.configuration.rebuilds().begin(request);
+            assertCode(() -> notes.read(old,"slot"),IoError.NOTE_SCOPE_UNAVAILABLE);
+            var retirement = notes.retirement(old,request.operationId());
+            assertThat(retirement.origin()).contains(origin);
+            assertThat(retirement.notes().read(old,"slot").bytes()).containsExactly(new byte[]{4,5});
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().stateGeneration()).isEqualTo(1);
+            assertCode(() -> notes.retirement(old,"foreign-operation"),IoError.NOTE_SCOPE_UNAVAILABLE);
+        });
+    }
+
+    private static io.tapstate.spi.store.PipelineRebuildRequest sourceRebuildRequest(Fixture f) {
+        var source = new SourceResource("input",null,"mongodb",Map.of("uri","mongodb://source.invalid/source","password","source-secret-sentinel"),io.tapstate.core.model.SourceMode.CDC,
+                List.of(io.tapstate.core.model.TableRef.literal("orders")),null,null);
+        var pipeline = new io.tapstate.core.model.PipelineResource("flow",null,List.of(io.tapstate.core.model.SourceRef.spec("input",false)),null,null,null,
+                new io.tapstate.core.model.Settings(null,null,null,null,io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY,null),null);
+        f.configuration.artifacts().saveAll(List.of(source,pipeline));
+        var intent = f.configuration.intents().load("flow").orElseThrow();
+        assertThat(f.configuration.intents().compareAndSet(f.scope,intent.intentRevision(),new DesiredState("flow",PipelineState.RUNNING,CanonicalHash.of(pipeline),false))).isTrue();
+        var initial = f.issue(); var reservation = f.preparations().reserveFirst(initial,TTL);
+        f.configuration.preparations().complete(f.preparations().seed(reservation,f.configuration.preparations(),AT));
+        var scope = new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"flow",2);
+        var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(scope,pipeline,Map.of("input",source),Map.of("input",java.util.Set.of("orders")));
+        return new io.tapstate.spi.store.PipelineRebuildRequest("rebuild-operation",f.configuration.intents().load("flow").orElseThrow(),reservation.claim(),0,inputs);
+    }
+
+    private static io.tapstate.spi.store.PipelineRebuildRequest rebuildRequest(Fixture f) {
+        var initial = f.issue(); var reservation = f.preparations().reserveFirst(initial,TTL);
+        f.configuration.preparations().complete(f.preparations().seed(reservation,f.configuration.preparations(),AT));
+        return rawRebuildRequest(f,reservation.claim());
+    }
+    private static io.tapstate.spi.store.PipelineRebuildRequest rawRebuildRequest(Fixture f,WorkloadClaimFence claim) {
+        var current = f.configuration.intents().load("flow").orElseThrow();
+        var scope = new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"flow",2);
+        var pipeline = (io.tapstate.core.model.PipelineResource) f.configuration.artifacts().get("flow").orElseThrow();
+        var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(scope,pipeline,Map.of(),Map.of());
+        return new io.tapstate.spi.store.PipelineRebuildRequest("rebuild-operation",current,claim,0,inputs);
+    }
+
     private static void withFixture(Scenario scenario) {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String configName = "first_cfg_" + suffix; String cacheName = "first_cache_" + suffix;

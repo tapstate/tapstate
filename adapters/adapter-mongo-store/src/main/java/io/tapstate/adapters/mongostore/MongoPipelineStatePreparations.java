@@ -106,7 +106,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         Objects.requireNonNull(inputs,"inputs");
         transaction(session -> { requireCurrent(session,scope); verifyInputs(session,scope,inputs); return null; });
     }
-    private PipelinePreparationInputs verifyInputs(ClientSession session,PipelineIntentScope scope,PipelinePreparationInputs requested) {
+    PipelinePreparationInputs verifyInputs(ClientSession session,PipelineIntentScope scope,PipelinePreparationInputs requested) {
         var resource = artifacts.getInTransaction(session,scope.pipelineId()).orElseThrow(MongoPipelineStatePreparations::fenced);
         if (!(resource instanceof PipelineResource pipeline)) throw fenced();
         var sources = new java.util.HashMap<String,SourceResource>();

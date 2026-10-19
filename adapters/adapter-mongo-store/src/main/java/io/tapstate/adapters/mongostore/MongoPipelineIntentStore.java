@@ -68,8 +68,10 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
     @Override public Optional<PipelineIntentSnapshot> load(String pipelineId) {
         requireId(pipelineId);
-        return transaction(session -> Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first())
-                .map(row -> decodeCurrent(session, row)));
+        return transaction(session -> loadInTransaction(session, pipelineId));
+    }
+    Optional<PipelineIntentSnapshot> loadInTransaction(ClientSession session, String pipelineId) {
+        return Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first()).map(row -> decodeCurrent(session, row));
     }
     @Override public Optional<PipelineIntentSnapshot> loadForActuation(String pipelineId) {
         requireId(pipelineId);
