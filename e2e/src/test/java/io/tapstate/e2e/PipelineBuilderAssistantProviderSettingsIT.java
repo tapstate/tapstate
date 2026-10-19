@@ -17,6 +17,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Cloud Builder provider settings stay authenticated and write-only over the shipped API. */
 @RequiresDocker
+@RequiresCloudReleaseInputs
 class PipelineBuilderAssistantProviderSettingsIT {
 
     private static final String TEST_KEY = "sk-e2e-provider-key-sentinel";
