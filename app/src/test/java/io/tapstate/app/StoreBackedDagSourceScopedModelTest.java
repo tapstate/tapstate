@@ -284,6 +284,37 @@ class StoreBackedDagSourceScopedModelTest {
         f.store.artifacts().save(pipeline); return new Fixture(f.store,pipeline,f.source,f.views);
     }
 
+    @Test void actualNativeDagFreezesAllTerminalModelsOnceUnderTheOriginalPass() {
+        var f=fixture(false);
+        var pipeline=(PipelineResource)new io.tapstate.core.dsl.DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src]
+                serve:
+                  from: src
+                  sync:
+                    - {id: first, source: dest, on_full_load: clear}
+                    - {id: second, source: dest, on_full_load: append}
+                """);
+        f.store.artifacts().save(pipeline);
+        var notes=org.mockito.Mockito.mock(RequiredNoteStore.class);
+        org.mockito.Mockito.when(notes.guardedBy(org.mockito.ArgumentMatchers.any())).thenReturn(notes);
+        org.mockito.Mockito.when(notes.open(org.mockito.ArgumentMatchers.any())).thenAnswer(call -> new RequiredNoteScope(call.getArgument(0),5));
+        org.mockito.Mockito.when(notes.prepareOrigin(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any())).thenAnswer(call -> call.getArgument(1));
+        var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"synthetic.NotLoaded","2.0.8",null,null,"a".repeat(64),false);
+        var source=new StoreBackedDagSource(f.store,new StoreBackedDagSource.PdkSinkWriterBinder(notes,id -> ref));
+        var pass=new PipelineConvergencePass(new PipelineIntentSnapshot(SCOPE,1,new DesiredState("p",PipelineState.RUNNING,CanonicalHash.of(pipeline))),ORIGINAL,f.views,() -> {});
+        var prepared=source.prepareStart(pass,"default");f.views.current.set(advance(1));pass.advanced(advance(1));bindCapturedSources(prepared,pass);
+        prepared.plan().build(new ExecutionFence(SCOPE,advance(1)));
+        assertThat(f.views.targetRosters).hasSize(1);var roster=f.views.targetRosters.getFirst();assertThat(roster).hasSize(2);
+        assertThat(roster).extracting(input -> input.key().nodeId()).containsExactlyInAnyOrder("first","second");
+        assertThat(roster).allSatisfy(input -> {assertThat(input.key().scope()).isEqualTo(SCOPE);assertThat(input.key().purpose()).isEqualTo(io.tapstate.core.model.PipelineNode.Purpose.SYNC);assertThat(input.key().target()).isEqualTo("orders");assertThat(input.modelHash()).matches("[a-f0-9]{64}");});
+        assertThat(roster).extracting(SinkPreparationStore.Input::policy).containsExactlyInAnyOrder(io.tapstate.core.model.OnFullLoad.CLEAR,io.tapstate.core.model.OnFullLoad.APPEND);
+        org.mockito.Mockito.verify(notes,org.mockito.Mockito.never()).initialize(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.verify(notes,org.mockito.Mockito.times(2)).prepareOrigin(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+    }
+
     private static Fixture fixture(boolean join) {
         var store = new InMemoryStorePort(); var parser = new io.tapstate.core.dsl.DslParser();
         store.artifacts().save(parser.parse("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nconfig: {host: h}\nmode: cdc\ntables: [orders]\n"));
@@ -329,6 +360,15 @@ class StoreBackedDagSourceScopedModelTest {
         }
     }
     private static final class Views implements PipelineStoreViews {
+        final List<List<SinkPreparationStore.Input>> targetRosters=new ArrayList<>();
+        @Override public SinkPreparationStore sinkPreparations(PipelineIntentScope scope,WorkloadClaimFence original,Runnable active) {
+            return new SinkPreparationStore() {
+                public void prepareTargets(List<Input> targets){active.run();scopes.add(scope);writes.add(original);if(!scope.equals(SCOPE)||!original.equals(current.get()))throw fenced();targetRosters.add(List.copyOf(targets));}
+                public Snapshot load(Input input){throw new AssertionError("model planning opens no target");}
+                public Attempt begin(Input input){throw new AssertionError("model planning opens no target");}
+                public Snapshot complete(Attempt attempt,Result result){throw new AssertionError("model planning opens no target");}
+            };
+        }
         final InMemoryDerivedSchemaStore models = new InMemoryDerivedSchemaStore();
         final Map<String,java.util.Set<String>> shapes = new java.util.LinkedHashMap<>();
         @Override public NestShapeStore nestShapes(PipelineIntentScope scope,String database) {

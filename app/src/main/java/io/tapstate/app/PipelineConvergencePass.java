@@ -166,6 +166,18 @@ final class PipelineConvergencePass {
         }
     }
 
+    Runnable guardOriginal(WorkloadClaimFence original) {
+        Objects.requireNonNull(original,"original");
+        return () -> {requirePipeline(scope().pipelineId());if(!original.equals(claim.get()))throw fenced();};
+    }
+
+    /** Freezes the complete compiled roster before the job can open a target on any member. */
+    void prepareSinkTargets(WorkloadClaimFence original,java.util.List<io.tapstate.spi.store.SinkPreparationStore.Input> inputs) {
+        var captured=java.util.List.copyOf(inputs);Objects.requireNonNull(original,"original");
+        Runnable fixed=guardOriginal(original);
+        fixed.run();views.sinkPreparations(scope(),original,fixed).prepareTargets(captured);fixed.run();
+    }
+
     /** Called before any later start step may throw; no other pass or asynchronous DAG retains this object. */
     void advanced(WorkloadClaimFence actual) {
         Objects.requireNonNull(actual, "actual");

@@ -76,6 +76,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     private final Map<String, TargetTable> targets;
     private final PipelineNode node;
     private final PipelineNode.Purpose purpose;
+    private final ConfiguredSinkRun configured;
 
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl, TargetTable target,
@@ -100,6 +101,13 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad,
             PipelineNode.Purpose purpose) {
+        this(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,null);
+    }
+
+    private PdkSinkWriterFactory(String connectorId,Map<String,Object> settings,WriteMode writeMode,DdlPolicy ddl,
+            Map<String,TargetTable> targets,PipelineNode node,OnFullLoad onFullLoad,boolean fullLoad,
+            PipelineNode.Purpose purpose,ConfiguredSinkRun configured) {
+        this.configured=configured;
         if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
             throw new IllegalArgumentException("sink purpose must be view or sync");
         }
@@ -112,6 +120,14 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
         this.ddl = ddl;
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
         this.node = node;
+    }
+
+    PdkSinkWriterFactory forRun(ConfiguredSinkRun run) {
+        if(!node.equals(run.node()) || purpose!=run.purpose())throw new IllegalArgumentException("configured sink run belongs to another node");
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,run);
+    }
+    java.util.List<io.tapstate.spi.store.SinkPreparationStore.Input> preparationInputs(io.tapstate.spi.store.PipelineIntentScope scope) {
+        return targets.values().stream().map(target -> io.tapstate.adapters.pdk.PdkSinkPreparations.input(scope,node,purpose,onFullLoad,fullLoad,target)).distinct().toList();
     }
 
     /** The write-side models this factory will hand the sink, keyed by the stream each answers for. */
@@ -133,6 +149,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     @Override
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
+        if(configured!=null)return ScopedSinkStateProvider.of(member).open(member,configured,config(),provisioner(member),sharing(member)).openPrepared(config(),targets);
         return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member), purpose)
                 .openPrepared(config(), targets);
     }
@@ -145,10 +162,11 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
 
     @Override
     public void prepareTargets(HazelcastInstance coordinator) {
+        if(configured!=null){ScopedSinkStateProvider.of(coordinator).open(coordinator,configured,config(),provisioner(coordinator),null).prepare(config(),targets);return;}
         new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), null, purpose).prepare(config(), targets);
     }
 
-    private SinkConfig config() {
+    SinkConfig config() {
         return new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad);
     }
 

@@ -733,15 +733,17 @@ final class StoreBackedDagSource implements DagSource {
             var original = operators == null ? null : operators.bind(fence);
             var capturedSources = original == null ? null : operators.pass().captureBindings(original.claim());
             var scopedSources = capturedSources == null ? null : scopedSources(sourceVertices,capturedSources);
+            var targetPreparations=new ArrayList<io.tapstate.spi.store.SinkPreparationStore.Input>();
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
                     bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                             serveLanding,viewLanding,stepIds,frontier,compiledJoins,
-                            capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources),
+                            capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources,targetPreparations),
                     FencedSinkAckFactory.heldTo(scopedSources == null ? sinkAckFactory(pipeline,pipelineId,fence) :
                             scopedSources.isEmpty() ? SinkAckFactory.NONE : new ScopedSrsSinkAckFactory(scopedSources,runIdOf(fence)),fence),frontier,
                     shape, drawn);
+            if(original!=null)operators.pass().prepareSinkTargets(original.claim(),targetPreparations);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
                     drawn.feedingByNode());
         });
@@ -1850,9 +1852,11 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, CompiledJoin> compiledJoins,
             boolean freshFullLoad,
             ExecutionFence fence,PreparedOperators operators,PipelineCaptureBindings captureBindings,
-            Map<String,ScopedSrsSinkAckFactory.Source> scopedSources) {
+            Map<String,ScopedSrsSinkAckFactory.Source> scopedSources,
+            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations) {
         var originalOperators = operators == null ? null : operators.bind(fence);
         var manifest = originalOperators == null ? null : originalOperators.manifest();
+        Runnable targetGuard=originalOperators==null?() -> {}:operators.pass().guardOriginal(originalOperators.claim());
         ChainAxes axes = frontier.axes();
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
         long snapshotEpoch = snapshotOnly && captureBindings == null
@@ -1866,11 +1870,11 @@ final class StoreBackedDagSource implements DagSource {
                         progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
-                        sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
+                        sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad,fence,targetPreparations,targetGuard), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
-                        viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices)), fence),
+                        viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices),fence,targetPreparations,targetGuard), fence),
                 operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
                         new NestBinding(operators.tables()::get,NestBinding.onMap(manifest),
                                 new LoggingNestDeadLetter(new DurableNestDeadLetter()),
@@ -2115,7 +2119,8 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> viewSink(
             PipelineResource pipeline, ViewBlock view, Map<String, TargetTable> targets,
-            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId) {
+            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId,ExecutionFence fence,
+            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations,Runnable targetGuard) {
         if (!(view instanceof ViewBlock.Inline inline)) {
             throw new IllegalArgumentException(
                     "view block is a use-reference; resolve it to an inline view first");
@@ -2174,6 +2179,7 @@ final class StoreBackedDagSource implements DagSource {
         SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bindView(
                 store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
                 new PipelineNode(pipeline.id(), inline.id()));
+        writer=sinkWriterBinder.scoped(writer,fence,targetPreparations,targetGuard);
         String viewId = inline.id();
         String viewKey = inline.primaryKey();
         // A unique current value says nothing about what the capture stream puts in an earlier image.
@@ -3252,14 +3258,16 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
             PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
-            Set<String> serveStreams, Map<String, String> sourceIdByTable, boolean freshFullLoad) {
+            Set<String> serveStreams, Map<String, String> sourceIdByTable, boolean freshFullLoad,ExecutionFence fence,
+            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations,Runnable targetGuard) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
-        return sinkWriterBinder.bind(
+        var writer=sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
                 TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
                 element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
                 freshFullLoad);
+        return sinkWriterBinder.scoped(writer,fence,targetPreparations,targetGuard);
     }
 
     /** A CDC-only read and any durable consumer state suppress target preparation. */
@@ -3422,6 +3430,12 @@ final class StoreBackedDagSource implements DagSource {
      */
     @FunctionalInterface
     interface SinkWriterBinder {
+        default SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
+                List<io.tapstate.spi.store.SinkPreparationStore.Input> roster,Runnable requireActive) {
+            if(original!=null && original.scope()!=null && factory instanceof PdkSinkWriterFactory)
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
+            return factory;
+        }
 
         SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
@@ -3447,6 +3461,19 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     static final class PdkSinkWriterBinder implements SinkWriterBinder {
+        private final io.tapstate.spi.store.RequiredNoteStore notes;
+        private final io.tapstate.adapters.pdk.ConnectorProvisioner provisioner;
+        PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;}
+        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this.notes=Objects.requireNonNull(notes,"notes");this.provisioner=Objects.requireNonNull(provisioner,"provisioner");}
+        @Override public SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
+                List<io.tapstate.spi.store.SinkPreparationStore.Input> roster,Runnable requireActive) {
+            if(original==null || original.scope()==null)return factory;
+            if(!(factory instanceof PdkSinkWriterFactory sink))throw new IllegalStateException("the configured binder requires a concrete target factory");
+            if(notes==null || provisioner==null)throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
+            var inputs=sink.preparationInputs(original.scope());
+            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive);
+            roster.addAll(inputs);return sink.forRun(run);
+        }
 
         @Override
         public SupplierEx<? extends SinkWriter> bindView(
