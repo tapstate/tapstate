@@ -1877,7 +1877,7 @@ final class StoreBackedDagSource implements DagSource {
                         viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices),fence,targetPreparations,targetGuard), fence),
                 operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
                         new NestBinding(operators.tables()::get,NestBinding.onMap(manifest),
-                                new LoggingNestDeadLetter(new DurableNestDeadLetter()),
+                                new LoggingNestDeadLetter(new io.tapstate.runtime.engine.nest.RequiredNestDeadLetter(manifest)),
                                 new ScopedSrsReplayFloorFactory(scopedSources),
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)

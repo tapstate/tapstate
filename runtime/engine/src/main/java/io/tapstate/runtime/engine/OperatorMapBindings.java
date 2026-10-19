@@ -217,6 +217,13 @@ public final class OperatorMapBindings implements AutoCloseable {
         @Override public long count(String namespace) { return delegate(namespace).count(namespace); }
     }
 
+    /** Captures one installed slot, so a late diagnostic callback cannot follow its replacement. */
+    public synchronized Runnable guard(OperatorMapBinding original) {
+        Bound held=require(original.mapName());
+        if(!held.binding.equals(original))throw fenced();
+        return held::requireActive;
+    }
+
     /** The caller drains and destroys the original hot map before releasing its exact binding. */
     public synchronized boolean release(OperatorMapBinding original) {
         requireOpen(); Bound held = slots.get(original.placement().mapName());
