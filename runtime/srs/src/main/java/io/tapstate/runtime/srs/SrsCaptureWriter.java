@@ -67,6 +67,15 @@ public final class SrsCaptureWriter implements AutoCloseable {
 
     /** Called with actual selected metadata from each source session, before that session may read rows. */
     public synchronized void prepare(Map<String, SourceTable> actualTables) {
+        prepareTables(actualTables, true);
+    }
+
+    /** Publishes only tables this snapshot session actually reads; it grants no CDC preparation receipt. */
+    public synchronized void prepareSnapshotTables(Map<String, SourceTable> actualTables) {
+        prepareTables(actualTables, false);
+    }
+
+    private void prepareTables(Map<String, SourceTable> actualTables, boolean completeSelection) {
         requireActive();
         Map<String, SourceTable> actual = new LinkedHashMap<>();
         for (var entry : Map.copyOf(actualTables).entrySet()) {
@@ -74,7 +83,8 @@ public final class SrsCaptureWriter implements AutoCloseable {
             if (!entry.getKey().equals(table.name())) throw unavailable(entry.getKey());
             actual.put(entry.getKey(), new SourceTable(table.name(), table.fields(), table.primaryKey(), table.indexes()));
         }
-        if (!actual.keySet().equals(opened.servingTables())) throw unproven();
+        if (actual.isEmpty() || !opened.servingTables().containsAll(actual.keySet())
+                || (completeSelection && !actual.keySet().equals(opened.servingTables()))) throw unproven();
         // Validate the entire retained baseline before publishing any new model. Current discovery cannot
         // describe a different schema's unread source history after a restart.
         for (var entry : actual.entrySet()) {
@@ -105,7 +115,7 @@ public final class SrsCaptureWriter implements AutoCloseable {
             frontiers.put(table, new SrsTableCheckpoint(key, sequence));
         }
         requireActive();
-        if (started.get()) streamPrepared = true;
+        if (completeSelection && started.get()) streamPrepared = true;
     }
 
     /** Starts only once; a snapshot preparation receipt cannot replace this CDC session's own callback. */

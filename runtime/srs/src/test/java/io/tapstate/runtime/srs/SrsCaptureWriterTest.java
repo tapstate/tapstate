@@ -56,8 +56,30 @@ class SrsCaptureWriterTest {
         }
         assertThat(f.loadCalls).isZero();
     }
+    @Test void aSnapshotPublishesOnlyItsOwedSubsetBeforeTheCdcSessionPublishesTheCompleteSelection() {
+        var f = new Fixture(); var writer = f.writer();
+        writer.prepareSnapshotTables(Map.of("orders", f.actual.get("orders")));
+        assertThat(f.published).hasSize(1).allSatisfy((key,model) -> assertThat(key.table()).isEqualTo("orders"));
+        var callback = new AtomicReference<CaptureListener>();
+        try (var source = writer.start(f.port(writer,callback,true),f.config(),CaptureStart.present(),new CaptureHealth())) {
+            assertThat(f.published).hasSize(2);
+            callback.get().onBatch(List.of(Envelope.insert(1,"quiet",Map.of("id",1),null)),Optional.of(new SourcePosition("next")));
+            assertThat(f.saved.getLast().tables().get("quiet").sequence()).isZero();
+        }
+    }
+    @Test void aSnapshotSubsetCannotPublishAnUnservedTableOrReplaceAnAlreadyHeldShape() {
+        var f = new Fixture(); var writer = f.writer();
+        assertThatThrownBy(() -> writer.prepareSnapshotTables(Map.of("other",table("other"))))
+                .satisfies(error -> code(error,IoError.SRS_CHECKPOINT_UNPROVEN));
+        assertThat(f.published).isEmpty();
+        writer.prepareSnapshotTables(Map.of("orders",f.actual.get("orders")));
+        var held = Map.copyOf(f.published);
+        assertThatThrownBy(() -> writer.prepareSnapshotTables(Map.of("orders",new SourceTable("orders",List.of(new SourceField("changed","string")),List.of(),List.of()))))
+                .satisfies(error -> code(error,IoError.SRS_MODEL_UNAVAILABLE));
+        assertThat(f.published).isEqualTo(held); writer.close();
+    }
     @Test void snapshotReceiptCannotReplaceTheCdcSessionsOwnMetadataPreparation() {
-        var f = new Fixture(); var writer = f.writer(); writer.prepare(f.actual);
+        var f = new Fixture(); var writer = f.writer(); writer.prepareSnapshotTables(f.actual);
         assertThatThrownBy(() -> writer.start(f.port(writer, new AtomicReference<>(), false), f.config(), CaptureStart.present(), new CaptureHealth()))
                 .satisfies(error -> code(error, IoError.SRS_CHECKPOINT_UNPROVEN));
         assertThat(f.saved).isEmpty(); assertThat(f.log.rows).isEmpty();

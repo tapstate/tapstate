@@ -98,6 +98,33 @@ class PreparedSrsSnapshotIT {
             } finally { member.shutdown(); }
         });
     }
+    @Test void nativeSnapshotPublishesAndPinsItsActualModelsBeforeCdcUsesItsOwnSessionReceipt() throws Exception {
+        withFixture(f -> {
+            var member = member(f.stores.log());
+            try {
+                var writer = writer(f,member,1);
+                var pin = new SrsSnapshotPreparation(f.domain,f.run,Map.of("t1",io.tapstate.runtime.srs.SrsRingbuffer.ringName("chain","t1"),
+                        "t2",io.tapstate.runtime.srs.SrsRingbuffer.ringName("chain","t2")),1,() -> {});
+                var port = f.port().withSnapshotPreparation((request,seam,actual) -> {
+                    writer.prepareSnapshotTables(actual); pin.prepare(request,seam,actual); f.flag("pinned").set(true);
+                }).withStreamPreparation(writer::prepare);
+                String seam;
+                try (var load = SnapshotPhase.openPrepared(port,f.config(),pin)) {
+                    seam = load.tailSeam();
+                    assertThat(f.stores.consumers().progress(f.run.context()).orElseThrow().snapshot().sourcePosition()).isEqualTo(seam);
+                    assertThat(load.read(row -> {throw new AssertionError("empty fixture");},table -> {})).isZero();
+                }
+                var health = new io.tapstate.runtime.srs.CaptureHealth();
+                try (var source = writer.start(port,f.config(),io.tapstate.spi.capture.CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(seam)),health)) {
+                    streamEnded(f,health);
+                    assertThat(((AtomicReference<?>)f.state.get("streamOffset")).get()).isEqualTo("actual-session-seam");
+                    assertThat(f.stores.chains().load("chain").orElseThrow().checkpoint().tables().get("t1").sequence()).isZero();
+                }
+                assertThat(f.count("reads")).isEqualTo(2); assertThat(f.count("earlyReads")).isZero();
+                assertThat(f.count("streams")).isOne(); assertThat(f.count("stops")).isEqualTo(2);
+            } finally { member.shutdown(); }
+        });
+    }
     @Test void nativeProducerReopensAtOriginalSourceTokenAndKeepsOldEventModelBindings() throws Exception {
         withFixture(f -> {
             var member = member(f.stores.log());
