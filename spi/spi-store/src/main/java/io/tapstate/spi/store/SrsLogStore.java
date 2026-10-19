@@ -89,6 +89,9 @@ public interface SrsLogStore {
     /**
      * Retires the caller's resolved confirmed prefix under the original CAPTURE claim. Implementations
      * without durable claim proof refuse; they must not silently use the unclaimed entry point.
+     * Split model-aware storage also limits the cut to every current table consumer's confirmed floor
+     * in the same CACHE transaction. A newly attached or lagging consumer can reduce the cut to no work;
+     * the durable bounds, rather than return from this method, state the prefix actually retired.
      */
     default void trim(String ring, long throughSeq, WorkloadClaimFence originalCaptureFence) {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);

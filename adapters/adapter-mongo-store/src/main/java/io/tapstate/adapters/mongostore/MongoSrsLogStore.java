@@ -294,10 +294,12 @@ public final class MongoSrsLogStore implements SrsLogStore {
         }
         if (split) {
             transaction(originalCaptureFence, session -> {
-                if (models != null) models.requireCaptureForTrim(session, ring, originalCaptureFence);
+                var identity = models == null ? null : models.requireCaptureForTrim(session, ring, originalCaptureFence);
                 SrsLogBounds observed = splitBounds(session, ring);
                 long cut = Math.min(throughSeq, observed.largestSequence());
-                if (cut < 0) return null;
+                if (cut < 0 || cut <= observed.trimmedThrough()) return null;
+                if (models != null) cut = models.confirmedTrimCut(session,identity,cut);
+                if (cut < 0 || cut <= observed.trimmedThrough()) return null;
                 boundsCollection.updateOne(session, new Document("_id", boundsId(ring)),
                         new Document("$max", new Document(TRIMMED_THROUGH, cut)));
                 collection.deleteMany(session, ringRange(ring, cut));

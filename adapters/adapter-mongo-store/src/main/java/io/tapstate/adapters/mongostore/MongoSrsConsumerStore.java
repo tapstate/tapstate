@@ -76,6 +76,20 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             return new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
         });
     }
+    /** Limits a fixed requested cut and serializes actual deletion with membership replacement. */
+    long limitTrimToConfirmed(ClientSession session,String chain,String table,long requested) {
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("consumer trim protection requires the original CACHE transaction");
+        requireActive.run(); requireStructure.run(); new MongoCacheBusinessIdentity(database,scope).requireReady(session);
+        var held = view(session,chain); long safe = requested;
+        for (var member : held.members().values()) {
+            if (member.detached() || !member.tables().contains(table)) continue;
+            var cursor = held.cursors().get(member.context().key().consumerId());
+            safe = Math.min(safe,cursor.ringDoneThrough().getOrDefault(table,-1L));
+        }
+        if (safe >= 0) chains.replace(session,held.root(),new Document(held.root()));
+        requireActive.run(); return safe;
+    }
+
     /**
      * Read-only closure check for a caller that fences the original claim and checkpoint in this same
      * CACHE transaction. It cannot detach, repair missing history or establish retirement by itself.

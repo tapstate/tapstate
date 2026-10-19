@@ -283,7 +283,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     /** Trimming historical rows belongs to the chain's current original capture tenure. */
-    void requireCaptureForTrim(ClientSession session, String ring, WorkloadClaimFence original) {
+    SrsModelKey requireCaptureForTrim(ClientSession session, String ring, WorkloadClaimFence original) {
         if (original.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(original.key().clusterId())) throw claimFenced();
         checkRing(session, ring);
         var control = contexts.firstOnRing(session, ring);
@@ -292,6 +292,13 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (!(chain.get("captureFence") instanceof Document bound)) throw unreadable();
         if (!original.key().resourceId().equals(chain.get("captureId"))
                 || !original.equals(WorkloadClaimDocuments.readCapture(bound))) throw claimFenced();
+        return control.key();
+    }
+
+    long confirmedTrimCut(ClientSession session,SrsModelKey identity,long requested) {
+        requireScope(identity);
+        return new MongoSrsConsumerStore(client,database,scope,requireActive,null)
+                .limitTrimToConfirmed(session,identity.miningChainId(),identity.table(),requested);
     }
 
     EventModelRange requireEvent(ClientSession session, String ring, SrsLogRecord event, boolean writing) {

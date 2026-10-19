@@ -805,6 +805,85 @@ class MongoSrsConsumerStoreIT {
     private static void code(Throwable failure, IoError expected) {
         assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> { assertThat(error.code()).isEqualTo(expected); assertThat(error.getCause()).isNull(); });
     }
+    @Test void trimmingAnEarlierConfirmedCutCannotDeleteANewConsumersUnconfirmedRows() {
+        withBusiness(f -> {
+            publishSnapshotModels(f,Set.of("orders"));var log=new MongoSrsLogStore(f.client(),SystemCollections.SRS_EVENTS.on(f.database()),
+                    SystemCollections.SRS_LOG_BOUNDS.on(f.database()),SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()),models(f));
+            var events=new java.util.ArrayList<io.tapstate.spi.store.SrsLogRecord>();
+            for(int i=0;i<5;i++)events.add(new io.tapstate.spi.store.SrsLogRecord("t"+i,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",i),0,f.captureFence(),1));
+            log.storeAll(ring("orders"),0,events);
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThat(f.consumers().startReadingAfter(A,1,0,"orders",4,f.fenceA())).isTrue();
+            long oldCut=f.consumers().progress(A).orElseThrow().ringDoneThrough().get("orders");
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            log.trim(ring("orders"),oldCut,f.captureFence());
+            assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(-1);
+            assertThat(log.readBatch(ring("orders"),0,5).records()).hasSize(5);
+            assertThat(f.consumers().startReadingAfter(B,1,0,"orders",1,f.fenceB())).isTrue();
+            log.trim(ring("orders"),oldCut,f.captureFence());
+            assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(1);
+            assertThat(log.readBatch(ring("orders"),2,3).records().keySet()).containsExactly(2L,3L,4L);
+            assertThat(f.consumers().advanceReadSequence(B,1,"orders",4,f.fenceB())).isTrue();
+            log.trim(ring("orders"),oldCut,f.captureFence());assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(1);
+            f.consumers().detach(B,1,f.fenceB()).orElseThrow();log.trim(ring("orders"),oldCut,f.captureFence());
+            assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(4);assertThat(log.readBatch(ring("orders"),0,5).records()).isEmpty();
+        });
+    }
+
+    @Test void attachAfterTheTrimSnapshotForcesTheOriginalTransactionToRecheckItsCut() {
+        withBusiness(f -> {
+            var original=preparedTrimLog(f);f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().startReadingAfter(A,1,0,"orders",4,f.fenceA());
+            var paused=new CountDownLatch(1);var proceed=new CountDownLatch(1);var once=new java.util.concurrent.atomic.AtomicBoolean();
+            var pending=java.util.concurrent.ConcurrentHashMap.<Integer>newKeySet();
+            var listener=new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if(event.getCommandName().equals("find")&&event.getCommand().getString("find").getValue().equals(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName()))pending.add(event.getRequestId());
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if(pending.remove(event.getRequestId())&&once.compareAndSet(false,true)) {
+                        paused.countDown();try{if(!proceed.await(15,TimeUnit.SECONDS))throw new AssertionError("trim race barrier did not open");}
+                        catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    }
+                }
+            };
+            try(var observed=MongoClients.create(com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build());
+                var workers=Executors.newSingleThreadExecutor()) {
+                var database=observed.getDatabase(f.database().getName());var models=new MongoSrsModelStore(observed,database,SCOPE);
+                var log=new MongoSrsLogStore(observed,SystemCollections.SRS_EVENTS.on(database),SystemCollections.SRS_LOG_BOUNDS.on(database),SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),models);
+                var result=workers.submit(() -> log.trim(ring("orders"),4,f.captureFence()));
+                try {
+                    assertThat(paused.await(10,TimeUnit.SECONDS)).as("the trim read its original consumer snapshot").isTrue();
+                    f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+                } finally {proceed.countDown();}
+                result.get(20,TimeUnit.SECONDS);
+            }
+            assertThat(original.bounds(ring("orders")).trimmedThrough()).isEqualTo(-1);
+            assertThat(original.readBatch(ring("orders"),0,5).records()).hasSize(5);
+            assertThat(f.consumers().attached(CHAIN).consumers()).hasSize(2);
+        });
+    }
+
+    @Test void trimCannotInterpretAMissingCursorAsAnUnreferencedLog() {
+        withBusiness(f -> {
+            var log=preparedTrimLog(f);f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().startReadingAfter(A,1,0,"orders",4,f.fenceA());
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(A));
+            var bounds=SystemCollections.SRS_LOG_BOUNDS.on(f.database()).find().first();var claim=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id",MongoWorkloadClaimStore.id(f.captureFence().key()))).first();
+            assertThatThrownBy(() -> log.trim(ring("orders"),4,f.captureFence())).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            assertThat(SystemCollections.SRS_LOG_BOUNDS.on(f.database()).find().first()).isEqualTo(bounds);
+            assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isEqualTo(5);
+            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id",MongoWorkloadClaimStore.id(f.captureFence().key()))).first()).isEqualTo(claim);
+        });
+    }
+    private static MongoSrsLogStore preparedTrimLog(Fixture f) {
+        publishSnapshotModels(f,Set.of("orders"));var log=new MongoSrsLogStore(f.client(),SystemCollections.SRS_EVENTS.on(f.database()),
+                SystemCollections.SRS_LOG_BOUNDS.on(f.database()),SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()),models(f));
+        var events=new java.util.ArrayList<io.tapstate.spi.store.SrsLogRecord>();
+        for(int i=0;i<5;i++)events.add(new io.tapstate.spi.store.SrsLogRecord("t"+i,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",i),0,f.captureFence(),1));
+        log.storeAll(ring("orders"),0,events);return log;
+    }
+
     @Test void rebuildPreflightRequiresOnlyAConsumerDetachedAndKeepsBUnchanged() {
         withBusiness(f -> {
             f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
