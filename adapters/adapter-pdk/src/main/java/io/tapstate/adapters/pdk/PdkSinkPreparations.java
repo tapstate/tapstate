@@ -38,6 +38,14 @@ public final class PdkSinkPreparations {
     void requireInputs(PipelineNode actualNode,PipelineNode.Purpose actualPurpose,OnFullLoad actualPolicy,boolean actualFullLoad) {
         if(!node.equals(actualNode) || purpose!=actualPurpose || policy!=actualPolicy || fullLoad!=actualFullLoad)throw fenced();
     }
+    /** Internal transport through connector catch boundaries; the public boundary restores the original host failure. */
+    static final class HostInvariant extends RuntimeException {
+        final RuntimeException original;
+        HostInvariant(RuntimeException original){super(null,null,false,false);this.original=original;}
+    }
+    static <T>T host(java.util.function.Supplier<T> action) {
+        try{return action.get();}catch(TapstateException coded){throw coded;}catch(RuntimeException invariant){throw new HostInvariant(invariant);}
+    }
     private static TapstateException fenced(){return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}
     SinkPreparationStore.Snapshot load(TargetTable target){if(target==null)throw new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",scope.pipelineId()),null);return store.load(input(target));}
     SinkPreparationStore.Attempt begin(TargetTable target){return store.begin(input(target));}

@@ -249,6 +249,7 @@ final class PdkSinkWriter implements SinkWriter {
 
     static TapstateException writeFailed(String connectorId, Throwable cause) {
         if(cause instanceof Error invariant)throw invariant;
+        if(cause instanceof PdkSinkPreparations.HostInvariant host)throw host.original;
         return new TapstateException(ConnectorError.WRITE_FAILED,
                 Map.of("connector", connectorId, "detail", detail(cause)), cause);
     }

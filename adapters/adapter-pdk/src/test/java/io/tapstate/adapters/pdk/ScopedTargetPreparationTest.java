@@ -79,8 +79,9 @@ class ScopedTargetPreparationTest {
                     .hasCauseInstanceOf(TapstateException.class);assertThat(writes).hasValue(0);
         }
     }
-    @Test void hostReceiptErrorKeepsItsIdentityThroughTheActualAsyncWriter(@org.junit.jupiter.api.io.TempDir java.nio.file.Path directory)throws Throwable {
-        var failure=new AssertionError("host invariant");
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
+    void hostReceiptErrorKeepsItsIdentityThroughTheActualAsyncWriter(boolean fatal,@org.junit.jupiter.api.io.TempDir java.nio.file.Path directory)throws Throwable {
+        Throwable failure=fatal?new AssertionError("host invariant"):new IllegalStateException("host invariant");
         SinkPreparationStore broken=(SinkPreparationStore)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{SinkPreparationStore.class},(proxy,method,args) -> {throw failure;});
         var receipts=new PdkSinkPreparations(broken,SCOPE,NODE,PipelineNode.Purpose.SYNC,OnFullLoad.CLEAR,true);
         var connector=PdkConnector.open("demo",new ConnectorRef(List.of(Synthetic.countingSink(directory)),"synthetic.CountingSink","2.0.8",null),Map.of());

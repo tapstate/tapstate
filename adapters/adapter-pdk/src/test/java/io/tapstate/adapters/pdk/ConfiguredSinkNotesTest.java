@@ -225,9 +225,9 @@ class ConfiguredSinkNotesTest {
         assertThat(Files.readAllLines(f.trace)).as("the old open cannot init a plugin with a newer scope").isEmpty();
     }
 
-    @ParameterizedTest @ValueSource(strings={"open","prepare"})
-    void nativeHostReceiptErrorKeepsItsIdentityThroughTheActualPort(String mode,@TempDir Path directory)throws Exception {
-        Fixture f=new Fixture(directory);var failure=new AssertionError("host receipt invariant");
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"open,error","prepare,error","open,runtime","prepare,runtime"})
+    void nativeHostReceiptErrorKeepsItsIdentityThroughTheActualPort(String mode,String kind,@TempDir Path directory)throws Exception {
+        Fixture f=new Fixture(directory);Throwable failure=kind.equals("error")?new AssertionError("host receipt invariant"):new IllegalStateException("host receipt invariant");
         var store=(io.tapstate.spi.store.SinkPreparationStore)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{io.tapstate.spi.store.SinkPreparationStore.class},(proxy,method,args) -> {throw failure;});
         var scope=new io.tapstate.spi.store.PipelineIntentScope("cluster-a",1,"cache-a","p1",1);
         var receipts=new PdkSinkPreparations(store,scope,NODE,PipelineNode.Purpose.SYNC,CONFIG.onFullLoad(),CONFIG.fullLoad());

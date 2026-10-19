@@ -101,7 +101,7 @@ final class PdkTargetPreparation {
     void prepare(TargetTable target, TapTable table) throws Throwable {
         requireActive.run();
         if (receipts!=null) {
-            if(target==null || preparedAhead || prepared.contains(target.name())){receipts.requireReady(target);return;}
+            if(target==null || preparedAhead || prepared.contains(target.name())){PdkSinkPreparations.host(() -> {receipts.requireReady(target);return null;});return;}
             prepareScoped(target,table);return;
         }
         if (target == null || prepared.contains(target.name())) {
@@ -171,15 +171,15 @@ final class PdkTargetPreparation {
     }
 
     private void prepareScoped(TargetTable target,TapTable table)throws Throwable {
-        var held=receipts.load(target);boolean created;
+        var held=PdkSinkPreparations.host(() -> receipts.load(target));boolean created;
         if(held.phase()==io.tapstate.spi.store.SinkPreparationStore.Phase.READY)created=held.result().created();
         else {
-            var original=receipts.begin(target);
+            var original=PdkSinkPreparations.host(() -> receipts.begin(target));
             requireActive.run();
             if(mongoTarget && fullLoad)prepareExisting(table);
             created=create(table);
             if(!mongoTarget && !created && fullLoad)prepareExisting(table);
-            requireActive.run();receipts.complete(original,created);
+            requireActive.run();boolean confirmedCreated=created;PdkSinkPreparations.host(() -> {receipts.complete(original,confirmedCreated);return null;});
         }
         if(functions.getCreateIndexFunction()!=null) {
             var event=TargetTapTable.createIndexEvent(target,created);
