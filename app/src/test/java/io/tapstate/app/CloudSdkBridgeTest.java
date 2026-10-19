@@ -36,6 +36,11 @@ class CloudSdkBridgeTest {
                 "org", "cluster", "Org", "Cluster", "us-east-1", "  ", ""));
         assertThat(blankMetadata.context().ec2PublicIp()).isNull();
         assertThat(blankMetadata.context().egressAddressStatus()).isNull();
+
+        var compatibleSdkResult = new CloudSdkBridge.ExchangeResult(
+                "jwt", "org", "cluster", "Org", "Cluster", "us-east-1");
+        assertThat(compatibleSdkResult.context().ec2PublicIp()).isNull();
+        assertThat(compatibleSdkResult.context().egressAddressStatus()).isNull();
     }
 
     @Test

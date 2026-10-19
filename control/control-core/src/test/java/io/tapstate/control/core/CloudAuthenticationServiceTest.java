@@ -80,6 +80,19 @@ class CloudAuthenticationServiceTest {
     }
 
     @Test
+    void legacyConstructorLeavesCurrentAddressUnavailableInsteadOfReusingTheLoginSnapshot() {
+        CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", "198.51.100.1", "DYNAMIC");
+        String cookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a", "cluster-a",
+                "legacy-constructor-jti", Scope.WRITE, NOW.plusSeconds(900)), snapshot).orElseThrow().token();
+        CloudAuthenticationService service = new CloudAuthenticationService((code, cluster) -> "unused",
+                (jwt, target, audience) -> Optional.empty(), sessions);
+
+        assertThat(service.clusterContextView(cookie).orElseThrow()).isEqualTo(new CloudClusterContextView(
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", null, null));
+    }
+
+    @Test
     void contextViewRejectsCurrentAddressMetadataForAnotherCluster() {
         CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
                 "us-east-1", "198.51.100.1", "DYNAMIC");

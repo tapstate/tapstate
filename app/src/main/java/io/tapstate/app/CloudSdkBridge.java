@@ -191,15 +191,6 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 requestId(), status, diagnostic);
     }
 
-    private static void logAddressFailure(CloudControlPlaneException failure) {
-        String code = failure.getErrorCode();
-        String diagnostic = reportableFailureCode(code) ? code : "unclassified";
-        int status = failure.getHttpStatus();
-        if (status < 0 || status > 599) status = 0;
-        LOG.warn("Cloud Cluster address refresh failed [request_id={}, http={}, reason={}]",
-                requestId(), status, diagnostic);
-    }
-
     static boolean reportableFailureCode(String code) {
         if (code == null || code.length() > 128) return false;
         int start;
@@ -363,6 +354,17 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             } catch (CloudControlPlaneException failure) {
                 logAddressFailure(failure);
                 throw new ProviderFailure();
+            }
+        }
+
+        private static void logAddressFailure(CloudControlPlaneException failure) {
+            String code = failure.getErrorCode();
+            String diagnostic = reportableFailureCode(code) ? code : "unclassified";
+            int status = failure.getHttpStatus();
+            if (status < 0 || status > 599) status = 0;
+            if (LOG.isWarnEnabled()) {
+                LOG.warn("Cloud Cluster address refresh failed [request_id={}, http={}, reason={}]",
+                        requestId(), status, diagnostic);
             }
         }
 

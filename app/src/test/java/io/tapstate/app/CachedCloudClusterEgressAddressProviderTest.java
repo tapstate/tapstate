@@ -15,12 +15,22 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CachedCloudClusterEgressAddressProviderTest {
 
     private static final String ORGANIZATION = "organization-one";
     private static final String CLUSTER = "cluster-one";
     private static final Instant NOW = Instant.parse("2026-10-19T08:00:00Z");
+
+    @Test
+    void refreshIntervalsMustBePositive() {
+        assertThatThrownBy(() -> new CachedCloudClusterEgressAddressProvider(
+                (organizationId, clusterId) -> Optional.empty(), Clock.fixed(NOW, ZoneOffset.UTC),
+                Duration.ZERO, Duration.ofSeconds(10), Duration.ofMinutes(5)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("refreshInterval must be positive");
+    }
 
     @Test
     void cachesRefreshesAndServesOnlyBoundedStaleAddressesDuringProviderFailures() {
