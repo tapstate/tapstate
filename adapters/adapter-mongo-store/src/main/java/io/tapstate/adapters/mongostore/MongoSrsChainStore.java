@@ -71,6 +71,11 @@ public final class MongoSrsChainStore implements SrsChainStore {
             Document existing = root(session, chain);
             if (existing != null) { requireCapture(existing, fence); return state(session, existing); }
             if (hasRetainedFacts(session, chain)) throw unproven(chain);
+            // The original capture history survives loss of every chain-owned row. Its first
+            // committed chain write is the only ordinary call that can establish a new root.
+            var capture = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                    new Document("_id",MongoWorkloadClaimStore.id(fence.key()))).first();
+            if (capture == null || !Long.valueOf(1).equals(capture.get("fencedChainWrites"))) throw unproven(chain);
             Document row = new Document("_id", chain).append("formatVersion", 1).append("cacheIncarnation", scope.cacheIncarnation())
                     .append("captureId", fence.key().resourceId()).append("captureFence", WorkloadClaimDocuments.stored(fence))
                     .append("retention", retention).append("epoch", 0L).append("requestedTables", List.of())

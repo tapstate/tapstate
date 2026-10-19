@@ -123,6 +123,30 @@ class MongoSrsChainStoreIT {
     }
 
     @ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"false,false","false,true","true,false","true,true"})
+    void totalChainFactLossCannotRecreateItsKnownBirthUnderTheOriginalOrNextClaim(boolean used,boolean takeover) {
+        withBusiness(f -> {
+            if(used) { prepare(f,Set.of(ORDERS)); f.log().store(ring(ORDERS),0,event(0,1,f.fence())); }
+            else f.chains().prepare(CHAIN,"retention",f.fence());
+            var identity = SystemCollections.CACHE_IDENTITY.on(f.database()).find().first();
+            for(var table : List.of(SystemCollections.SRS_CHAINS,SystemCollections.SRS_MODELS,SystemCollections.SRS_MODEL_CONTEXTS,
+                    SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS,SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS))
+                table.on(f.database()).deleteMany(new Document());
+            var original = f.fence();
+            if(takeover) {
+                var store = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+                assertThat(store.release(f.claim())).isTrue();
+                original = WorkloadClaimFence.from(store.acquire(f.claim().key(),new WorkloadOwner("node-b","boot-b"),2,Duration.ofSeconds(30)).claim());
+            }
+            var command = original; Document before = claim(f);
+            assertThat(before.getLong("fencedChainWrites")).isPositive();
+            assertThatThrownBy(() -> f.chains().prepare(CHAIN,"retention",command)).satisfies(MongoSrsChainStoreIT::unproven);
+            assertThat(root(f)).isNull(); assertThat(claim(f)).isEqualTo(before);
+            assertThat(SystemCollections.CACHE_IDENTITY.on(f.database()).find().first()).isEqualTo(identity);
+        });
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"future", "gap", "old-model", "other-context"})
     void aClaimCannotCertifyAnUnprovenPerTableFrontier(String damage) {
         withBusiness(f -> {
@@ -314,7 +338,7 @@ class MongoSrsChainStoreIT {
                 try (var session = client.startSession()) {
                     for (var table : List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS, SystemCollections.SRS_CHAINS,
                             SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS,
-                            SystemCollections.CACHE_WORKLOAD_CLAIMS)) {
+                            SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.CACHE_WORKLOAD_CLAIMS)) {
                         table.prepareCollectionOn(database, session);
                         for (var index : table.indexes()) IndexEnsure.createInTransaction(session, table.on(database), index);
                     }
