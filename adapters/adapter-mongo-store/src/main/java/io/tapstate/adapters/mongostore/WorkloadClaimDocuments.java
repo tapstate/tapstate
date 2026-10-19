@@ -31,6 +31,11 @@ final class WorkloadClaimDocuments {
                 .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
     }
 
+    static WorkloadClaimFence readNode(Document stored) {
+        var node = read(stored, WorkloadClaimType.NODE_SESSION);
+        if (!node.key().resourceId().equals(node.owner().nodeId())) throw unreadable();
+        return node;
+    }
     static WorkloadClaimFence readCapture(Document stored) { return read(stored, WorkloadClaimType.CAPTURE); }
     static WorkloadClaimFence readPipeline(Document stored) { return read(stored, WorkloadClaimType.PIPELINE_ACTUATION); }
     private static WorkloadClaimFence read(Document stored, WorkloadClaimType type) {

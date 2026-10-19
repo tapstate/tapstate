@@ -1,0 +1,389 @@
+package io.tapstate.adapters.mongostore;
+
+import com.mongodb.ReadConcern;
+import com.mongodb.TransactionOptions;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.*;
+import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.*;
+
+/** Real independent CONFIG and CACHE clients retain original history through one controlled replacement. */
+@RequiresDocker
+class MongoCachePipelineRebuildsIT {
+    @Container private static final MongoDBContainer CONFIG = mongo();
+    @Container private static final MongoDBContainer CACHE = mongo();
+    private static final Runnable ACTIVE = () -> {};
+    private static final Duration TTL = Duration.ofMinutes(2);
+    private static final Instant AT = Instant.parse("2026-10-19T03:00:00Z");
+    private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
+    private static MongoDBContainer mongo() { return new MongoDBContainer(DockerImageName.parse("mongo:7.0")); }
+
+    @Test void successorRetainsExecutionHistoryAndPipelineTopologyWithAZeroTopologyNode() {
+        withFixture(f -> {
+            var old = f.claim();
+            f.claims().updateOne(new Document("_id",old.get("_id")), new Document("$set", new Document("executionGeneration",4L)
+                    .append("topologyRevision",7L).append("contextExecutionGeneration",4L).append("executionClaimGeneration",1L)
+                    .append("executionNodeIds",List.of("node-a","node-b")).append("failureClaimGeneration",1L).append("failureAfterMemberLoss",true)));
+            f.states().updateOne(new Document("_id","flow"),new Document("$set",new Document("epoch",9L).append("runtimeWriteFence",11L).append("stateJson","RUNNING")));
+            var original = f.pending(9);
+            var placement = new OperatorPlacement(f.scope,f.cache.getName(),OperatorPlacement.Resource.JOIN_FACTS,"join","fact","facts");
+            var writer = f.domain.operatorState(placement,original.request().originalClaim(),ACTIVE);
+            writer.save(placement.mapName(),"original",new byte[]{1,2});
+            var before = f.claim(); var oldState = f.state();
+            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.cache).insertOne(new Document("_id","flow").append("scope",MongoPipelinePreparationFacts.scope(f.scope)).append("diagnostic","old"));
+            f.initial("independent"); var b = f.claims().find(new Document("_id.resourceId","independent")).first();
+            var receipt = f.rebuilds().prepare(original,f.node,TTL,AT);
+            assertThat(receipt.claim().claimGeneration()).isEqualTo(original.request().originalClaim().claimGeneration()+1);
+            assertThat(receipt.claim().executionGeneration()).isEqualTo(4);
+            assertThat(receipt.claim().topologyRevision()).isEqualTo(7);
+            assertThat(receipt.issuerNode().topologyRevision()).isZero();
+            for (String field : List.of("executionGeneration","contextExecutionGeneration","executionClaimGeneration","executionNodeIds","failureClaimGeneration","failureAfterMemberLoss","topologyRevision"))
+                assertThat(f.claim().get(field)).as(field).isEqualTo(before.get(field));
+            assertThat(f.state()).containsEntry("scope",MongoPipelinePreparationFacts.scope(original.request().targetScope()))
+                    .containsEntry("epoch",10L).containsEntry("runtimeWriteFence",oldState.getLong("runtimeWriteFence")+1).containsEntry("stateJson","STOPPED");
+            assertThat(f.claims().find(new Document("_id.resourceId","independent")).first()).isEqualTo(b);
+            assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.cache).find(new Document("_id","flow")).first()).isNull();
+            assertThat(f.configuration.intents().loadForActuation("flow")).isEmpty();
+            try (var session=f.cacheClient.startSession()) {
+                session.withTransaction(() -> { assertThat(MongoOperatorInventory.requireRetired(session,f.cache,original).getList("placements",Document.class)).hasSize(1); return null; });
+            }
+            assertThat(SystemCollections.CACHE_JOIN_FACTS.on(f.cache).countDocuments()).isEqualTo(1);
+            assertCode(() -> writer.save(placement.mapName(),"late",new byte[]{3}),IoError.CACHE_BUSINESS_FENCED);
+            var again=f.rebuilds().prepare(original,f.node,TTL,AT.plusSeconds(1));
+            assertThat(again.claim()).isEqualTo(receipt.claim()); assertThat(again.checkpointEpoch()).isEqualTo(receipt.checkpointEpoch());
+        });
+    }
+
+    @Test void concurrentIndependentCacheClientsPublishOneSuccessorAndReplayItsOriginalReceipt() {
+        withFixture(f -> {
+            var pending=f.pending(0); var start=new CountDownLatch(1);
+            try (var other=MongoCacheDomain.connect(f.connection,Duration.ofSeconds(5),"second-rebuild");var workers=Executors.newFixedThreadPool(2)) {
+                var a=workers.submit(() -> { start.await(); return f.rebuilds().prepare(pending,f.node,TTL,AT); });
+                var b=workers.submit(() -> { start.await(); return other.pipelineRebuilds(f.business,ACTIVE).prepare(pending,f.node,TTL,AT); });
+                start.countDown(); var first=a.get(30,TimeUnit.SECONDS); var second=b.get(30,TimeUnit.SECONDS);
+                assertThat(first.claim()).isEqualTo(second.claim()); assertThat(first.claim().claimGeneration()).isEqualTo(2);
+                assertThat(first.checkpointEpoch()).isEqualTo(1); assertThat(second.checkpointEpoch()).isEqualTo(1);
+                assertThat(SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.cache).countDocuments()).isEqualTo(2);
+            }
+        });
+    }
+
+    @Test void missingOriginalClaimOrCheckpointCannotBecomeFirstCreation() {
+        withFixture(f -> {
+            var pending=f.pending(0); var original=f.claim();
+            f.claims().deleteOne(new Document("_id",original.get("_id"))); var before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED); assertThat(f.snapshot()).isEqualTo(before);
+            f.claims().insertOne(original); f.states().deleteOne(new Document("_id","flow")); before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.DOCUMENT_UNREADABLE); assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void unknownSuccessorResourcesNeverGetAdoptedOrDeleted() {
+        withFixture(f -> {
+            var pending=f.pending(0); var scope=MongoPipelinePreparationFacts.scope(pending.request().targetScope());
+            var fixtures=List.of(
+                    Map.entry(SystemCollections.CACHE_NEST_STATE,new Document("placement",new Document("scope",scope))),
+                    Map.entry(SystemCollections.CACHE_JOIN_FACTS,new Document("placement",new Document("scope",scope))),
+                    Map.entry(SystemCollections.CACHE_JOIN_DIMENSIONS,new Document("placement",new Document("scope",scope))),
+                    Map.entry(SystemCollections.CACHE_JOIN_INDEXES,new Document("placement",new Document("scope",scope))),
+                    Map.entry(SystemCollections.CACHE_JOIN_WRITERS,new Document("placement",new Document("scope",scope))),
+                    Map.entry(SystemCollections.CACHE_NEST_SHAPES,new Document("scope",scope)),Map.entry(SystemCollections.CACHE_OPERATOR_CLEANUP,scope),
+                    Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,new Document("scope",scope)),Map.entry(SystemCollections.DIRECT_BATCHES,new Document("channel",new Document("scope",scope))));
+            for (var fixture:fixtures) {
+                var table=fixture.getKey().on(f.cache); table.insertOne(new Document("_id",fixture.getValue()).append("unknown",true));var before=f.snapshot();
+                assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED); assertThat(f.snapshot()).as(fixture.getKey().name()).isEqualTo(before);
+                table.deleteOne(new Document("_id",fixture.getValue()));
+            }
+            for (var table:List.of(SystemCollections.CACHE_DERIVED_SCHEMAS,SystemCollections.CACHE_PIPELINE_RATE_HISTORY)) {
+                table.on(f.cache).insertOne(new Document("_id","unknown").append("scope",scope));var before=f.snapshot();
+                assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED);assertThat(f.snapshot()).isEqualTo(before);
+                table.on(f.cache).deleteOne(new Document("_id","unknown"));
+            }
+        });
+    }
+
+    @Test void originalClaimChangesAndForeignObservationPreventTheEntireTransition() {
+        withFixture(f -> {
+            var pending=f.pending(0); var row=f.claim();
+            f.claims().updateOne(new Document("_id",row.get("_id")),new Document("$inc",new Document("claimGeneration",1L)));var before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.WORKLOAD_CLAIM_FENCED);assertThat(f.snapshot()).isEqualTo(before);
+            f.claims().replaceOne(new Document("_id",row.get("_id")),row);
+            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.cache).insertOne(new Document("_id","flow").append("scope",MongoPipelinePreparationFacts.scope(pending.request().targetScope())));
+            before=f.snapshot();assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED);assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void corruptOriginalInventoryAndDamagedReplayAreNeverRepaired() {
+        withFixture(f -> {
+            var pending=f.pending(0); var table=SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.cache);var old=table.find().first();
+            table.updateOne(new Document("_id",old.get("_id")),new Document("$set",new Document("revision",1L)));var before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.DOCUMENT_UNREADABLE);assertThat(f.snapshot()).isEqualTo(before);
+            table.replaceOne(new Document("_id",old.get("_id")),old); f.rebuilds().prepare(pending,f.node,TTL,AT);
+            table.updateOne(new Document("_id",old.get("_id")),new Document("$set",new Document("retirement.contentHash","0".repeat(64))));before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.DOCUMENT_UNREADABLE);assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void replayRejectsAnIssuerNodeWhoseCanonicalResourceDoesNotBelongToItsOwner() {
+        withFixture(f -> {
+            var pending=f.pending(0); f.rebuilds().prepare(pending,f.node,TTL,AT);
+            f.claims().updateOne(new Document("_id.resourceId","flow"),new Document("$set",new Document("pipelineRebuild.issuerNode.resourceId","another-node")));
+            var before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void completionPublishesOneSuccessorAndConsumesOnlyTheConfirmedOneShotFlags() {
+        withFixture(f -> {
+            for (Long stamp : java.util.Arrays.asList(null,0L)) {
+                var current=f.configuration.intents().load("flow").orElseThrow();
+                var desired=new DesiredState("flow",PipelineState.RUNNING,current.desired().revision(),true,"assembly",true,stamp);
+                assertThat(f.configuration.intents().compareAndSet(current.scope(),current.intentRevision(),desired)).isTrue();
+                var pending=f.pending(f.state().getLong("epoch")); var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);
+                long version=f.version();var completed=f.configuration.rebuilds().complete(receipt);
+                assertThat(completed.scope()).isEqualTo(pending.request().targetScope());assertThat(completed.phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+                var after=f.configuration.intents().loadForActuation("flow").orElseThrow();
+                assertThat(after.scope()).isEqualTo(completed.scope());assertThat(after.intentRevision()).isEqualTo(pending.request().intent().intentRevision()+1);
+                assertThat(after.desired()).isEqualTo(new DesiredState("flow",PipelineState.RUNNING,desired.revision(),false,"assembly",false,null));
+                assertThat(f.version()).isEqualTo(version+1);
+                assertThat(f.configuration.rebuilds().complete(receipt)).isEqualTo(completed);assertThat(f.version()).isEqualTo(version+1);
+            }
+        });
+    }
+
+    @Test void committedResultSurvivesLostResponseProcessReopenAndCacheProgressWithoutRepublishing() {
+        withFixture(f -> {
+            var pending=f.pending(0);var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);var complete=f.configuration.rebuilds().complete(receipt);long version=f.version();
+            f.states().updateOne(new Document("_id","flow"),new Document("$inc",new Document("epoch",1L).append("runtimeWriteFence",1L)));
+            try(var reopened=MongoConfigurationDomain.open(new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()),null,Duration.ofSeconds(5)),"cluster-a")) {
+                assertThat(reopened.rebuilds().completed(pending.request())).contains(complete);assertThat(f.version()).isEqualTo(version);
+            }
+            f.domain.close();assertThat(f.configuration.rebuilds().complete(receipt)).isEqualTo(complete);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @Test void staleCacheReceiptCannotPublishAndMissingDirectStructureIsNotRecreated() {
+        withFixture(f -> {
+            var pending=f.pending(0);var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);var before=f.mapping();long version=f.version();
+            f.states().updateOne(new Document("_id","flow"),new Document("$inc",new Document("runtimeWriteFence",1L)));
+            assertCode(() -> f.configuration.rebuilds().complete(receipt),IoError.PIPELINE_STATE_REBUILD_REQUIRED);assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+            f.states().updateOne(new Document("_id","flow"),new Document("$inc",new Document("runtimeWriteFence",-1L)));
+            SystemCollections.DIRECT_BATCHES.on(f.cache).drop();
+            assertCode(() -> f.configuration.rebuilds().complete(receipt),IoError.DOCUMENT_UNREADABLE);assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+            assertThat(f.cache.listCollectionNames().into(new ArrayList<>())).doesNotContain(SystemCollections.DIRECT_BATCHES.collectionName());
+        });
+    }
+
+    @Test void lossAfterTheActualConfigPublishWriteRollsBackMappingIntentAndVersion() {
+        withFixture(f -> {
+            var pending=f.pending(0);
+            try(var witness=new MongoCommandWitness(CONFIG.getReplicaSetUrl(),f.config.getName(),"update","operator_generations")) {
+                var material=SystemCollections.CLUSTER_KEYS.on(f.config).find().first().getString("material");
+                var cipher=SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+                var bindings=new MongoStorageBindingStore(witness.client,witness.database,cipher);
+                var artifacts=new MongoConfigurationArtifactStore(witness.client,witness.database,cipher);
+                var store=new MongoPipelineStateRebuilds(witness.client,witness.database,"cluster-a",bindings,artifacts,witness::refuseAfterCommand);
+                var resumed=store.begin(pending.request());var receipt=f.rebuilds().prepare(resumed,f.node,TTL,AT);
+                long version=f.version();var mapping=f.mapping();var intent=f.configuration.intents().load("flow");
+                assertCode(() -> store.complete(receipt),IoError.CACHE_BUSINESS_FENCED);witness.requireCommand();
+                assertThat(f.version()).isEqualTo(version);assertThat(f.mapping()).isEqualTo(mapping);assertThat(f.configuration.intents().load("flow")).isEqualTo(intent);
+            }
+        });
+    }
+
+    @Test void completionRejectsUnknownTargetBytesThatAppearedAfterPreparation() {
+        withFixture(f -> {
+            var pending=f.pending(0);var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);var before=f.mapping();long version=f.version();
+            SystemCollections.CACHE_JOIN_FACTS.on(f.cache).insertOne(new Document("_id",new Document("placement",new Document("scope",MongoPipelinePreparationFacts.scope(pending.request().targetScope())))).append("untracked",true));
+            assertCode(() -> f.configuration.rebuilds().complete(receipt),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @Test void saturationAtBeginReservesBothOriginalMappingWrites() {
+        withFixture(f -> {
+            SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id","flow"),new Document("$set",new Document("noteWriteFence",Long.MAX_VALUE-2)));
+            var before=f.mapping();long version=f.version();var request=f.request(0);
+            assertCode(() -> f.configuration.rebuilds().begin(request),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+    @Test void saturationAtBeginReservesTheCompletionIntentIncrement() {
+        withFixture(f -> {
+            SystemCollections.PIPELINE_INTENTS.on(f.config).updateOne(new Document("_id","flow"),new Document("$set",new Document("intentRevision",Long.MAX_VALUE-1)));
+            var before=f.mapping();long version=f.version();var request=f.request(0);
+            assertCode(() -> f.configuration.rebuilds().begin(request),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+    @Test void saturationAtBeginReservesTwoConfigurationVersionAdvances() {
+        withFixture(f -> {
+            SystemCollections.CONFIGURATION_VERSION.on(f.config).updateOne(new Document("_id","configuration"),new Document("$set",new Document("revision",Long.MAX_VALUE-2)));
+            var before=f.mapping();long version=f.version();var request=f.request(0);
+            assertCode(() -> f.configuration.rebuilds().begin(request),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+    @Test void saturationNeverPublishesAnUnreadableConfigurationVersion() {
+        withFixture(f -> {
+            SystemCollections.CONFIGURATION_VERSION.on(f.config).updateOne(new Document("_id","configuration"),new Document("$set",new Document("revision",Long.MAX_VALUE-1)));
+            var source=new SourceResource("unrelated",null,"mongodb",Map.of("uri","mongodb://other.invalid/db"),null,null,null,null);
+            assertCode(() -> f.configuration.artifacts().create(source),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.configuration.artifacts().get(source.id())).isEmpty();assertThat(f.version()).isEqualTo(Long.MAX_VALUE-1);
+        });
+    }
+
+    @Test void nonemptyDirectSourceInputsAreSeededOnlyInTheConfirmedSuccessor() {
+        withFixture(f -> {
+            var source=new SourceResource("input",null,"mongodb",Map.of("uri","mongodb://input.invalid/db","password","secret-sentinel"),io.tapstate.core.model.SourceMode.CDC,
+                    List.of(io.tapstate.core.model.TableRef.literal("orders")),null,null);
+            var pipeline=new io.tapstate.core.model.PipelineResource("flow",null,List.of(io.tapstate.core.model.SourceRef.spec(source.id(),false)),null,null,null,null,null);
+            f.configuration.artifacts().saveAll(List.of(source,pipeline));var held=f.configuration.intents().load("flow").orElseThrow();
+            f.configuration.intents().compareAndSet(f.scope,held.intentRevision(),new DesiredState("flow",PipelineState.RUNNING,CanonicalHash.of(pipeline),false));
+            var current=f.configuration.intents().load("flow").orElseThrow();
+            var target=new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"flow",2);
+            var inputs=PipelinePreparationInputs.of(target,pipeline,Map.of(source.id(),source),Map.of(source.id(),java.util.Set.of("orders")));
+            var claim=f.domain.workloadClaims(f.business).readPipeline(f.scope).orElseThrow().claim();
+            var request=new PipelineRebuildRequest("direct-rebuild",current,WorkloadClaimFence.from(claim),0,inputs);
+            var pending=f.configuration.rebuilds().begin(request);var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);
+            assertThat(inputs.directChannels()).hasSize(1);
+            assertThat(SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.cache).find().first())
+                    .containsEntry("_id",MongoDirectChannelRecords.id(inputs.directChannels().getFirst().context()));
+            assertThat(SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.cache).find().first().toJson()).doesNotContain("secret-sentinel","input.invalid");
+            assertThat(f.configuration.rebuilds().complete(receipt).scope()).isEqualTo(request.targetScope());
+            f.domain.pipelinePreparations(f.business,ACTIVE).verifySources(request.targetScope(),inputs);
+        });
+    }
+
+    @Test void rebuildingADetachesOnlyAAndAllowsBToKeepAdvancingItsSharedConsumer() {
+        withFixture(f -> {
+            f.initial("independent");var aFence=f.advance("flow");var bFence=f.advance("independent");
+            var capture=WorkloadClaimFence.from(f.domain.workloadClaims(f.business).acquire(new WorkloadClaimKey(f.scope.clusterId(),WorkloadClaimType.CAPTURE,"capture"),OWNER,1,TTL).claim());
+            var srs=f.domain.srs(f.business,ACTIVE);srs.chains().prepare("shared","retention",capture);
+            var a=new SrsConsumerContext(new SrsConsumerKey("shared","flow","input"),1);var b=new SrsConsumerContext(new SrsConsumerKey("shared","independent","input"),1);
+            srs.consumers().attach(a,0,java.util.Set.of("orders"),aFence).orElseThrow();srs.consumers().attach(b,0,java.util.Set.of("orders"),bFence).orElseThrow();
+            var pending=f.pending(0);var before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED);assertThat(f.snapshot()).isEqualTo(before);
+            srs.consumers().detach(a,1,aFence).orElseThrow();var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);
+            assertThat(srs.consumers().startReadingAfter(b,1,0,"orders",0,bFence)).isTrue();
+            assertThat(srs.consumers().advanceReadSequence(b,1,"orders",12,bFence)).isTrue();var bProgress=srs.consumers().progress(b);
+            var chain=SystemCollections.SRS_CHAINS.on(f.cache).find(new Document("_id","shared")).first();
+            f.configuration.rebuilds().complete(receipt);
+            assertThat(srs.consumers().progress(b)).isEqualTo(bProgress);assertThat(SystemCollections.SRS_CHAINS.on(f.cache).find(new Document("_id","shared")).first()).isEqualTo(chain);
+            assertThat(chain).containsEntry("consumerCount",1L);assertThat(srs.consumers().attached("shared").consumers()).hasSize(1);
+        });
+    }
+
+    @Test void lossAfterTheActualCacheCheckpointWriteRollsBackTheWholeReplacement() {
+        withFixture(f -> {
+            var pending=f.pending(0);var before=f.snapshot();
+            try(var witness=new MongoCommandWitness(CACHE.getReplicaSetUrl(),f.cache.getName(),"update","pipeline_state")) {
+                var store=new MongoCachePipelineRebuilds(witness.client,witness.database,f.business,witness::refuseAfterCommand,MongoRateHistoryStore.DEFAULT_RETENTION);
+                assertCode(() -> store.prepare(pending,f.node,TTL,AT),IoError.CACHE_BUSINESS_FENCED);witness.requireCommand();
+            }
+            assertThat(f.snapshot()).isEqualTo(before);f.configuration.rebuilds().requirePending(pending);
+        });
+    }
+
+    @Test void fabricatedPreparationIsRefusedBeforeAnyAccessorRuns() {
+        withFixture(f -> {
+            var calls=new AtomicInteger(); PipelineRebuildPreparation fake=new PipelineRebuildPreparation() {
+                public PipelineRebuildRequest request(){calls.incrementAndGet();return null;}
+                public String preparationId(){calls.incrementAndGet();return null;}
+                public String previousPreparationId(){calls.incrementAndGet();return null;}
+                public String confirmationHash(){calls.incrementAndGet();return null;}
+            };
+            var before=f.snapshot();assertCode(() -> f.rebuilds().prepare(fake,f.node,TTL,AT),IoError.PIPELINE_INTENT_FENCED);
+            assertThat(calls).hasValue(0);assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    private static void assertCode(Runnable action,io.tapstate.core.common.TapstateErrorCode expected) {
+        assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(expected));
+    }
+    private static void withFixture(Scenario scenario) {
+        String suffix=UUID.randomUUID().toString().replace("-","");String configName="rebuild_cfg_"+suffix,cacheName="rebuild_cache_"+suffix;
+        try(var configClient=MongoClients.create(CONFIG.getReplicaSetUrl());var cacheClient=MongoClients.create(CACHE.getReplicaSetUrl())) {
+            var cfg=configClient.getDatabase(configName);var cache=cacheClient.getDatabase(cacheName);
+            var settings=new MongoConnectionSettings(CONFIG.getReplicaSetUrl(configName),null,Duration.ofSeconds(5));
+            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,CACHE.getReplicaSetUrl(cacheName),cacheName,null);
+            try(var configuration=MongoConfigurationBootstrap.prepare(settings,"cluster-a","installation-a","setup-a",1);
+                var domain=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"rebuild-test")) {
+                var master=new SourceResource(StorageBinding.defaultSourceId(StorageBinding.Mode.OP),null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null);
+                configuration.bindings().commit(new StorageSetupScope("cluster-a","installation-a","setup-a",1),StorageBinding.Mode.OP,connection,master);
+                var business=configuration.bindings().cachePreparation().orElseThrow().businessScope();
+                domain.prepareAuth(new CacheAuthScope(business.clusterId(),business.bindingVersion(),StorageBinding.Mode.OP,business.cacheIncarnation(),1),"auth-a",ACTIVE);
+                try(var session=cacheClient.startSession()) {
+                    session.startTransaction(TransactionOptions.builder().readConcern(ReadConcern.LOCAL).build());
+                    new MongoCacheMetadataStructure(cache,MongoRateHistoryStore.DEFAULT_RETENTION).prepareBusinessInTransaction(session,ACTIVE);session.commitTransaction();
+                }
+                SystemCollections.CACHE_IDENTITY.on(cache).updateOne(new Document("_id","cluster"),new Document("$set",new Document("businessPhase","READY").append("businessPreparationId","business-a").append("claimAdmissionFence",0L)));
+                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cache).insertOne(new Document("_id","business").append("installedVersion",1).append("phase","READY").append("epoch",1L).append("operationId","business-a"));
+                var node=WorkloadClaimFence.from(domain.workloadClaims(business).acquire(new WorkloadClaimKey("cluster-a",WorkloadClaimType.NODE_SESSION,OWNER.nodeId()),OWNER,0,TTL).claim());
+                var scope=new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"flow",1);
+                var fixture=new Fixture(configuration,cfg,cacheClient,cache,domain,connection,business,scope,node);fixture.initial("flow");scenario.run(fixture);
+            } finally {cfg.drop();cache.drop();}
+        } catch(RuntimeException|Error failure){throw failure;}catch(Exception failure){throw new AssertionError(failure);}
+    }
+    private record Fixture(MongoConfigurationDomain configuration,MongoDatabase config,MongoClient cacheClient,MongoDatabase cache,MongoCacheDomain domain,
+            StorageBinding.Connection connection,CacheBusinessScope business,PipelineIntentScope scope,WorkloadClaimFence node) {
+        void initial(String id) {
+            var pipeline=new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: "+id+"\nsource: []\n");configuration.artifacts().create(pipeline);
+            var initialScope=new PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),id,1);
+            configuration.intents().compareAndSet(initialScope,0,new DesiredState(id,PipelineState.RUNNING,CanonicalHash.of(pipeline),false));
+            var creation=((FirstPipelineCreationResult.Issued)configuration.preparations().issueFirstCreate(initialScope,node)).creation();
+            var reservation=domain.pipelinePreparations(business,ACTIVE).reserveFirst(creation,TTL);
+            configuration.preparations().complete(domain.pipelinePreparations(business,ACTIVE).seed(reservation,configuration.preparations(),AT));
+        }
+        PipelineRebuildPreparation pending(long epoch) { return configuration.rebuilds().begin(request(epoch)); }
+        PipelineRebuildRequest request(long epoch) {
+            var pipeline=(io.tapstate.core.model.PipelineResource)configuration.artifacts().get("flow").orElseThrow();
+            var current=configuration.intents().load("flow").orElseThrow();
+            var target=new PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),scope.pipelineId(),current.scope().stateGeneration()+1);
+            var claim=domain.workloadClaims(business).read(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId())).orElseThrow().claim();
+            return new PipelineRebuildRequest("original-rebuild-"+current.scope().stateGeneration(),current,WorkloadClaimFence.from(claim),epoch,
+                    PipelinePreparationInputs.of(target,pipeline,Map.of(),Map.of()));
+        }
+        long version(){return SystemCollections.CONFIGURATION_VERSION.on(config).find().first().getLong("revision");}
+        Document mapping(){return SystemCollections.OPERATOR_GENERATIONS.on(config).find(new Document("_id","flow")).first();}
+        WorkloadClaimFence advance(String id){
+            var scope=new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),id,1);
+            var store=domain.workloadClaims(business);var original=store.acquirePipeline(scope,OWNER,1,TTL).claim();
+            return WorkloadClaimFence.from(store.advanceExecution(original,1,java.util.Set.of(OWNER.nodeId())).orElseThrow());
+        }
+        PipelineCacheRebuilds rebuilds(){return domain.pipelineRebuilds(business,ACTIVE);}
+        com.mongodb.client.MongoCollection<Document> claims(){return SystemCollections.CACHE_WORKLOAD_CLAIMS.on(cache);}
+        com.mongodb.client.MongoCollection<Document> states(){return SystemCollections.CACHE_PIPELINE_STATE.on(cache);}
+        Document claim(){return claims().find(new Document("_id.resourceId","flow")).first();}
+        Document state(){return states().find(new Document("_id","flow")).first();}
+        Map<String,List<Document>> snapshot(){var result=new java.util.TreeMap<String,List<Document>>();for(var table:SystemCollections.values())if(table.database()==SystemCollections.Database.CACHE&&table!=SystemCollections.CACHE_CONNECTOR_ARTIFACTS)
+            result.put(table.name(),table.on(cache).find().sort(new Document("_id",1)).into(new ArrayList<>()));return result;}
+    }
+    @FunctionalInterface private interface Scenario{void run(Fixture fixture)throws Exception;}
+}

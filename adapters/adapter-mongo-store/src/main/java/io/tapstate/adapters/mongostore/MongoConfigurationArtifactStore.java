@@ -112,6 +112,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 throw new Refused(id, ArtifactMutation.VERSION_CONFLICT);
             }
             requireUnmanaged(stored);
+            requireRebuildDependenciesUnchanged(session, Set.of(id));
             if ("pipeline".equals(stored.getString("kind"))) stateMappings.refuseRemoval(session, id);
             else stateMappings.requireNoRetainedIdentity(session, id);
             collection(stored.getString("kind")).deleteOne(session, new Document("_id", id));
@@ -142,6 +143,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 }
             }
         }
+        requireRebuildDependenciesUnchanged(session, requested.stream().map(write -> write.resource().id()).collect(java.util.stream.Collectors.toSet()));
         Map<String, Set<PipelineConnectorNodes.Identity>> before = privateNodes(session);
         for (ArtifactWrite write : requested) write(session, write);
         reservePrivateScopes(session, before, requested);
@@ -153,6 +155,36 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
 
     Optional<Resource> getInTransaction(ClientSession session, String id) {
         return Optional.ofNullable(find(session, id)).map(this::decode);
+    }
+
+    /** A pending rebuild keeps its exact authoring dependencies; unrelated configuration remains writable. */
+    private void requireRebuildDependenciesUnchanged(ClientSession session, Set<String> changed) {
+        if (changed.isEmpty()) return;
+        var known = new java.util.HashMap<String, Resource>();
+        try (var pending = mappings.find(session, new Document("phase", "REBUILDING")).iterator()) {
+            while (pending.hasNext()) {
+                Document mapping = pending.next();
+                if (!(mapping.get("_id") instanceof String pipelineId)) throw unreadable("pipeline", "stateMapping");
+                MongoPipelineStateMappings.decode(pipelineId, mapping);
+                var queue = new java.util.ArrayDeque<Resource>();
+                var root = getInTransaction(session, pipelineId).orElseThrow(() -> unreadable(pipelineId, "references"));
+                if (!(root instanceof PipelineResource)) throw unreadable(pipelineId, "references");
+                queue.add(root); known.put(root.id(), root); var visited = new HashSet<String>();
+                while (!queue.isEmpty()) {
+                    Resource resource = queue.remove(); if (!visited.add(resource.id())) continue;
+                    if (changed.contains(resource.id())) stateMappings.requireActive(session, pipelineId);
+                    for (var edge : io.tapstate.core.dsl.ReferenceGraph.declaredReferences(resource)) {
+                        if (changed.contains(edge.id())) stateMappings.requireActive(session, pipelineId);
+                        Resource target = known.get(edge.id());
+                        if (target == null) {
+                            target = getInTransaction(session, edge.id()).orElseThrow(() -> unreadable(pipelineId, "references"));
+                            known.put(target.id(), target); queue.add(target);
+                        } else if (!visited.contains(target.id())) queue.add(target);
+                        if (!edge.kind().equals(target.kind())) throw unreadable(pipelineId, "references");
+                    }
+                }
+            }
+        }
     }
 
     private Map<String, Set<PipelineConnectorNodes.Identity>> privateNodes(ClientSession session) {

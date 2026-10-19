@@ -40,17 +40,26 @@ final class MongoOperatorInventory {
     static Document require(ClientSession session, MongoDatabase database, PipelineIntentScope scope) {
         new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
         Document root = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first();
+        return decode(session, database, scope, root, true);
+    }
+
+    private static Document decode(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root, boolean current) {
         try {
-            if (root == null || !root.keySet().equals(FIELDS) || !MongoPipelinePreparationFacts.scope(scope).equals(root.get("_id"))
+            Set<String> expected = new HashSet<>(FIELDS);
+            if (!current) expected.add("retirement");
+            if (current && root != null && root.containsKey("retirement")) throw MongoCachePipelineAccess.claimFenced();
+            if (root == null || !root.keySet().equals(expected) || !MongoPipelinePreparationFacts.scope(scope).equals(root.get("_id"))
                     || !Integer.valueOf(1).equals(root.get("formatVersion")) || !(root.get("revision") instanceof Long revision)
                     || revision < 0 || revision == Long.MAX_VALUE || !(root.get("preparationId") instanceof String preparationId)
                     || !UUID.fromString(preparationId).toString().equals(preparationId)) throw unreadable(scope);
             var shapes = documents(root, "shapes", scope); var placements = documents(root, "placements", scope);
             if (revision != (long) shapes.size() + placements.size()) throw unreadable(scope);
-            var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
-            Document claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-            if (claim == null || !(claim.get("pipelinePreparation") instanceof Document preparation)
-                    || !preparationId.equals(preparation.get("preparationId"))) throw unreadable(scope);
+            if (current) {
+                var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+                Document claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+                if (claim == null || !(claim.get("pipelinePreparation") instanceof Document preparation)
+                        || !preparationId.equals(preparation.get("preparationId"))) throw unreadable(scope);
+            }
             Set<Document> unique = new HashSet<>();
             for (Document shape : shapes) {
                 if (!shape.keySet().equals(Set.of("database", "stepId")) || !(shape.get("database") instanceof String db) || db.isBlank()
@@ -64,6 +73,43 @@ final class MongoOperatorInventory {
             }
             return root;
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw unreadable(scope); }
+    }
+
+    /** Frozen old locations remain verifiable after the canonical claim points to its successor. */
+    static void retire(ClientSession session, MongoDatabase database, io.tapstate.spi.store.PipelineRebuildPreparation original) {
+        var scope = original.request().originalScope(); Document root = require(session, database, scope);
+        if (!original.previousPreparationId().equals(root.get("preparationId"))) throw unreadable(scope);
+        Document marker = retirement(original); marker.append("contentHash", frozenHash(root, marker));
+        if (SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).updateOne(session,
+                new Document("_id", root.get("_id")).append("preparationId", root.get("preparationId"))
+                        .append("revision", root.get("revision")).append("retirement", new Document("$exists", false)),
+                new Document("$set", new Document("retirement", marker))).getMatchedCount() != 1)
+            throw new IllegalStateException("operator inventory changed inside its retirement transaction");
+    }
+
+    static Document requireRetired(ClientSession session, MongoDatabase database, io.tapstate.spi.store.PipelineRebuildPreparation original) {
+        var scope = original.request().originalScope();
+        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
+        Document root = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session,
+                new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first();
+        decode(session, database, scope, root, false);
+        var expected = retirement(original); expected.append("contentHash", frozenHash(root, expected));
+        if (!original.previousPreparationId().equals(root.get("preparationId")) || !expected.equals(root.get("retirement"))) throw unreadable(scope);
+        return root;
+    }
+
+    private static Document retirement(io.tapstate.spi.store.PipelineRebuildPreparation original) {
+        return new Document("phase", "RETIRED").append("operationId", original.request().operationId())
+                .append("confirmationHash", original.confirmationHash())
+                .append("targetScope", MongoPipelinePreparationFacts.scope(original.request().targetScope()))
+                .append("targetPreparationId", original.preparationId());
+    }
+
+    private static String frozenHash(Document root, Document marker) {
+        return io.tapstate.core.model.canonical.CanonicalHash.ofText(io.tapstate.core.common.JsonWriter.write(
+                new Document("scope", root.get("_id")).append("preparationId", root.get("preparationId"))
+                        .append("revision", root.get("revision")).append("shapes", root.get("shapes"))
+                        .append("placements", root.get("placements")).append("retirement", marker)));
     }
 
     static boolean knowsShape(Document root, String database, String step) { return root.getList("shapes", Document.class).contains(shape(database, step)); }

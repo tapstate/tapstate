@@ -199,8 +199,14 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
 
     /** Strict original node proof and an actual write serialize preparation with node revocation. */
     private Date proveNode(ClientSession session, WorkloadClaimFence node) {
-        requireNode(node);
-        var reading = raw(session).read(node.key()).orElseThrow(MongoCachePipelinePreparations::claimFenced);
+        return proveNode(session, database, business, node);
+    }
+    static Date proveNode(ClientSession session, MongoDatabase database, CacheBusinessScope business, WorkloadClaimFence node) {
+        Objects.requireNonNull(node, "node");
+        if (node.key().type() != WorkloadClaimType.NODE_SESSION || !business.clusterId().equals(node.key().clusterId())
+                || !node.key().resourceId().equals(node.owner().nodeId())) throw claimFenced();
+        var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        var reading = new MongoWorkloadClaimStore(claims).inStrictSession(session).read(node.key()).orElseThrow(MongoCachePipelinePreparations::claimFenced);
         if (!node.equals(WorkloadClaimFence.from(reading.claim())) || !reading.leased()
                 || node.claimGeneration() >= Long.MAX_VALUE - 1 || node.executionGeneration() == Long.MAX_VALUE
                 || node.topologyRevision() == Long.MAX_VALUE) throw claimFenced();

@@ -141,6 +141,21 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             return true;
         });
     }
+    /** Only the original controlled rebuild transaction may re-scope and consume an already carried-out command. */
+    long completeRebuild(ClientSession session, PipelineIntentSnapshot original, PipelineIntentScope target) {
+        var current = loadInTransaction(session, original.scope().pipelineId()).orElseThrow(MongoPipelineIntentStore::fenced);
+        if (!current.equals(original) || original.deleted() || original.intentRevision() >= Long.MAX_VALUE - 1
+                || !target.pipelineId().equals(original.scope().pipelineId()) || target.stateGeneration() != original.scope().stateGeneration() + 1
+                || !matchesCurrentCache(session, target)) throw fenced();
+        var desired = original.desired(); long next = original.intentRevision() + 1;
+        var replacement = header(target, next, false).append("targetState", desired.targetState().name()).append("revision", desired.revision())
+                .append("purgeState", false).append("assemblyRevision", desired.assemblyRevision()).append("reassemble", false).append("rebuiltAtStateEpoch", null);
+        if (intents.replaceOne(session, new Document("_id", target.pipelineId()).append("intentRevision", original.intentRevision())
+                        .append("stateGeneration", original.scope().stateGeneration()), replacement).getMatchedCount() != 1)
+            throw new IllegalStateException("original rebuild intent changed within one CONFIG snapshot");
+        return next;
+    }
+
     private Document requireScope(ClientSession session, PipelineIntentScope scope) {
         Document stored = identity.find(session, new Document("_id", "cluster")).first();
         if (stored == null || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))

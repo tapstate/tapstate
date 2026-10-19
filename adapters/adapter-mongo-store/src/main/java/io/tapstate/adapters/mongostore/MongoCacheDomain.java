@@ -215,6 +215,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); });
     }
 
+    /** Controlled successor preparation retains the original history, client and caller lifecycle. */
+    public io.tapstate.spi.store.PipelineCacheRebuilds pipelineRebuilds(CacheBusinessScope expected, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        return new MongoCachePipelineRebuilds(client, database, expected, () -> { businessActive(); requireActive.run(); }, rateRetention);
+    }
+
     @Override public io.tapstate.spi.store.NestShapeStore nestShapes(io.tapstate.spi.store.PipelineIntentScope scope, String database) {
         return new MongoCacheNestShapeStore(pipelineAccess(scope, null, () -> {}), database);
     }

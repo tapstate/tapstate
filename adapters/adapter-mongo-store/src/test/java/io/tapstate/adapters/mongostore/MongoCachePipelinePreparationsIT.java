@@ -669,6 +669,134 @@ class MongoCachePipelinePreparationsIT {
         });
     }
 
+    @Test void missingAClaimCannotBeReissuedWhileAnIndependentBRemainsReadable() {
+        withFixture(f -> {
+            rebuildRequest(f);
+            var peer = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: peer\nsource: []\n");
+            f.configuration.artifacts().create(peer);
+            var scope = new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"peer",1);
+            f.configuration.intents().compareAndSet(scope,0,new DesiredState("peer",PipelineState.RUNNING,CanonicalHash.of(peer),false));
+            var grant = ((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(scope,f.node)).creation();
+            var reservation = f.preparations().reserveFirst(grant,TTL);
+            f.configuration.preparations().complete(f.preparations().seed(reservation,f.configuration.preparations(),AT));
+            var b = f.cacheDomain.pipelineStates(scope).read("peer").orElseThrow();
+            f.claims().deleteOne(pipelineFilter(f.scope));
+            assertCode(() -> f.cacheDomain.workloadClaims(f.business()).acquirePipeline(f.scope,OWNER,1,TTL),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> f.cacheDomain.pipelineStates(f.scope).read("flow"),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.configuration.preparations().issueFirstCreate(f.scope,f.node)).isInstanceOf(FirstPipelineCreationResult.AlreadyIssued.class);
+            assertThat(f.cacheDomain.pipelineStates(scope).read("peer")).contains(b);
+            assertThat(f.claims().find(pipelineFilter(f.scope)).first()).isNull();
+        });
+    }
+
+    @Test void rebuildRejectsAReferencedDefinitionChangedAfterConfirmation() {
+        withFixture(f -> {
+            var request = referencedRebuildRequest(f);
+            f.configuration.artifacts().save(new DslParser().parse("version: tapstate/v1\nkind: transform\nid: reusable_filter\ntype: filter\nexpr: \"false\"\n"));
+            assertCode(() -> f.configuration.rebuilds().begin(request),IoError.PIPELINE_INTENT_FENCED);
+        });
+    }
+    @Test void rebuildBlocksRelatedDefinitionMutationButAllowsUnrelatedConfiguration() {
+        withFixture(f -> {
+            var request = referencedRebuildRequest(f); var pending = f.configuration.rebuilds().begin(request);
+            var old = f.configuration.artifacts().get("reusable_filter"); long revision = f.version();
+            assertThatThrownBy(() -> f.configuration.artifacts().save(new DslParser().parse("version: tapstate/v1\nkind: transform\nid: reusable_filter\ntype: filter\nexpr: \"false\"\n")))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(StoreError.PIPELINE_RETIREMENT_REQUIRED));
+            assertThat(f.configuration.artifacts().get("reusable_filter")).isEqualTo(old); assertThat(f.version()).isEqualTo(revision);
+            f.configuration.artifacts().create(new SourceResource("unrelated",null,"mongodb",Map.of("uri","mongodb://unrelated.invalid/db"),null,null,null,null));
+            f.configuration.rebuilds().requirePending(pending);
+        });
+    }
+    @Test void rebuildBlocksDependencyDeletionWhileTheOriginalOperationIsPending() {
+        withFixture(f -> {
+            var request = referencedRebuildRequest(f); f.configuration.rebuilds().begin(request);
+            var definition = f.configuration.artifacts().get("reusable_filter").orElseThrow();
+            assertThatThrownBy(() -> f.configuration.artifacts().delete(definition.id(),CanonicalHash.of(definition)))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(StoreError.PIPELINE_RETIREMENT_REQUIRED));
+            assertThat(f.configuration.artifacts().get(definition.id())).contains(definition);
+        });
+    }
+    @Test void rebuildRefusesUnconfirmedReferenceClosure() {
+        withFixture(f -> {
+            var fixed = referencedRebuildRequest(f);
+            var missing = new io.tapstate.spi.store.PipelineRebuildRequest(fixed.operationId(),fixed.intent(),fixed.originalClaim(),fixed.originalStateEpoch(),fixed.inputs());
+            assertCode(() -> f.configuration.rebuilds().begin(missing),IoError.PIPELINE_INTENT_FENCED);
+        });
+    }
+    @Test void rebuildNestedServeSinkAndViewStayFrozenWhileBatchSiblingsRollBack() {
+        withFixture(f -> {
+            var request=nestedRebuildRequest(f);var pending=f.configuration.rebuilds().begin(request);long version=f.version();
+            var source=(SourceResource)f.configuration.artifacts().get("target").orElseThrow();
+            var changed=new SourceResource(source.id(),null,source.connector(),Map.of("uri","mongodb://changed.invalid/other"),null,null,null,null);
+            assertThatThrownBy(() -> f.configuration.artifacts().saveAll(List.of(new io.tapstate.core.model.TransformResource("unrelated_sibling",null,new io.tapstate.core.model.TransformBody.Filter("true"),null),changed)))
+                    .isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(StoreError.PIPELINE_RETIREMENT_REQUIRED));
+            assertThat(f.configuration.artifacts().get("unrelated_sibling")).isEmpty();assertThat(f.configuration.artifacts().get("target")).contains(source);assertThat(f.version()).isEqualTo(version);
+            for(String id:List.of("reusable_view","reusable_serve","target")) {
+                var resource=f.configuration.artifacts().get(id).orElseThrow();
+                assertThatThrownBy(() -> f.configuration.artifacts().delete(id,CanonicalHash.of(resource)))
+                        .isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(StoreError.PIPELINE_RETIREMENT_REQUIRED));
+            }
+            f.configuration.rebuilds().requirePending(pending);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @Test void rebuildRequiresEveryNestedSinkHashAndRejectsUnrelatedExtraHashes() {
+        withFixture(f -> {
+            var request=nestedRebuildRequest(f);var hashes=new java.util.HashMap<>(request.dependencyHashes());hashes.remove("target");
+            var missing=new io.tapstate.spi.store.PipelineRebuildRequest(request.operationId(),request.intent(),request.originalClaim(),0,request.inputs(),hashes);
+            assertCode(() -> f.configuration.rebuilds().begin(missing),IoError.PIPELINE_INTENT_FENCED);
+            hashes.put("target",request.dependencyHashes().get("target"));hashes.put("unrelated","0".repeat(64));
+            var extra=new io.tapstate.spi.store.PipelineRebuildRequest(request.operationId(),request.intent(),request.originalClaim(),0,request.inputs(),hashes);
+            assertCode(() -> f.configuration.rebuilds().begin(extra),IoError.PIPELINE_INTENT_FENCED);
+        });
+    }
+
+    @Test void rebuildAndIndependentConfigClientSourceEditCannotBothCommitFromTheOldConfirmation() {
+        withFixture(f -> {
+            var request=nestedRebuildRequest(f);var source=(SourceResource)f.configuration.artifacts().get("target").orElseThrow();
+            var changed=new SourceResource(source.id(),null,source.connector(),Map.of("uri","mongodb://changed.invalid/other"),null,null,null,null);
+            var start=new CountDownLatch(1);
+            try(var other=MongoConfigurationDomain.open(f.settings(),"cluster-a");var workers=Executors.newFixedThreadPool(2)) {
+                var a=workers.submit(() -> {start.await();try{f.configuration.rebuilds().begin(request);return true;}catch(TapstateException refused){assertThat(refused.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED);return false;}});
+                var b=workers.submit(() -> {start.await();try{other.artifacts().saveAll(List.of(changed));return true;}catch(TapstateException refused){assertThat(refused.code()).isEqualTo(StoreError.PIPELINE_RETIREMENT_REQUIRED);return false;}});
+                start.countDown();assertThat(List.of(a.get(30,TimeUnit.SECONDS),b.get(30,TimeUnit.SECONDS))).containsExactlyInAnyOrder(true,false);
+            }
+        });
+    }
+
+    private static io.tapstate.spi.store.PipelineRebuildRequest nestedRebuildRequest(Fixture f) {
+        var original=sourceRebuildRequest(f);var current=(io.tapstate.core.model.PipelineResource)f.configuration.artifacts().get("flow").orElseThrow();
+        var target=new SourceResource("target",null,"mongodb",Map.of("uri","mongodb://target.invalid/target"),null,null,null,null);
+        var view=new io.tapstate.core.model.ViewResource("reusable_view",null,"id",null,null);
+        var serve=new io.tapstate.core.model.ServeResource("reusable_serve",null,List.of(new io.tapstate.core.model.SyncElement("sink","target",null,null,null)),null,null,null);
+        var pipeline=new io.tapstate.core.model.PipelineResource(current.id(),current.metadata(),current.sources(),null,
+                new io.tapstate.core.model.ViewBlock.Use("materialized",view.id(),io.tapstate.core.model.FromRef.literal("orders")),
+                new io.tapstate.core.model.ServeBlock.Use(null,serve.id(),io.tapstate.core.model.FromRef.literal("materialized")),current.settings(),current.experimental());
+        f.configuration.artifacts().saveAll(List.of(target,view,serve,pipeline));var intent=f.configuration.intents().load("flow").orElseThrow();
+        assertThat(f.configuration.intents().compareAndSet(f.scope,intent.intentRevision(),new DesiredState("flow",PipelineState.RUNNING,CanonicalHash.of(pipeline),false))).isTrue();
+        var input=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+        var inputs=io.tapstate.spi.store.PipelinePreparationInputs.of(original.targetScope(),pipeline,Map.of(input.id(),input),Map.of(input.id(),java.util.Set.of("orders")));
+        return new io.tapstate.spi.store.PipelineRebuildRequest(original.operationId(),f.configuration.intents().load("flow").orElseThrow(),original.originalClaim(),0,inputs,
+                Map.of(target.id(),CanonicalHash.of(target),view.id(),CanonicalHash.of(view),serve.id(),CanonicalHash.of(serve)));
+    }
+
+    private static io.tapstate.spi.store.PipelineRebuildRequest referencedRebuildRequest(Fixture f) {
+        var original = sourceRebuildRequest(f);
+        var definition = new DslParser().parse("version: tapstate/v1\nkind: transform\nid: reusable_filter\ntype: filter\nexpr: \"true\"\n");
+        f.configuration.artifacts().create(definition);
+        var base = (io.tapstate.core.model.PipelineResource)f.configuration.artifacts().get("flow").orElseThrow();
+        var pipeline = new io.tapstate.core.model.PipelineResource(base.id(),base.metadata(),base.sources(),
+                List.of(io.tapstate.core.model.Step.use("filtered",definition.id(),io.tapstate.core.model.FromClause.list(io.tapstate.core.model.FromRef.literal("orders")))),
+                base.view(),base.serve(),base.settings(),base.experimental());
+        f.configuration.artifacts().save(pipeline);
+        var held = f.configuration.intents().load("flow").orElseThrow();
+        f.configuration.intents().compareAndSet(f.scope,held.intentRevision(),new DesiredState("flow",PipelineState.RUNNING,CanonicalHash.of(pipeline),false));
+        var source = (SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+        var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(original.targetScope(),pipeline,Map.of("input",source),Map.of("input",java.util.Set.of("orders")));
+        return new io.tapstate.spi.store.PipelineRebuildRequest(original.operationId(),f.configuration.intents().load("flow").orElseThrow(),
+                original.originalClaim(),0,inputs,Map.of(definition.id(),CanonicalHash.of(definition)));
+    }
+
     private static io.tapstate.spi.store.PipelineRebuildRequest sourceRebuildRequest(Fixture f) {
         var source = new SourceResource("input",null,"mongodb",Map.of("uri","mongodb://source.invalid/source","password","source-secret-sentinel"),io.tapstate.core.model.SourceMode.CDC,
                 List.of(io.tapstate.core.model.TableRef.literal("orders")),null,null);

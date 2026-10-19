@@ -10,6 +10,12 @@ public interface PipelineStateRebuilds {
      */
     PipelineRebuildPreparation begin(PipelineRebuildRequest original);
 
+    /** Publish the prepared successor and consume this operation's one-shot intent flags atomically. */
+    PipelinePreparation complete(PipelineRebuildReceipt original);
+
+    /** Read only this original committed result, including after process restart or response loss. */
+    java.util.Optional<PipelinePreparation> completed(PipelineRebuildRequest original);
+
     /** Verify the exact existing pending operation and original current definitions; never creates facts. */
     void requirePending(PipelineRebuildPreparation original);
 }
