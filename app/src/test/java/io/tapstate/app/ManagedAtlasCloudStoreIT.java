@@ -98,9 +98,12 @@ class ManagedAtlasCloudStoreIT {
                 "--tapstate.store.mongo.server-selection-timeout=20s",
                 "--tapstate.connectors.plugins-dir=" + plugins,
                 "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory()));
-        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
-                .initializers(CloudStartupDerivationWitness.initializer(), CloudSeedOutcomeWitness.initializer())
-                .run(arguments.toArray(String[]::new));
+        CloudStartupDerivationWitness witness = CloudStartupDerivationWitness.initializer();
+        try (var observation = witness.observeClientCreation()) {
+            return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                    .initializers(witness, CloudSeedOutcomeWitness.initializer())
+                    .run(arguments.toArray(String[]::new));
+        }
     }
 
     private static void assertEncryptedAndSeparated(
