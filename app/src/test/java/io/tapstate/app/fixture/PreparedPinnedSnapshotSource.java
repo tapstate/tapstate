@@ -24,6 +24,14 @@ public final class PreparedPinnedSnapshotSource implements TapConnector {
     private static AtomicInteger count(String key) { return (AtomicInteger)state().get(key); }
     @Override public void registerCapabilities(ConnectorFunctions functions,TapCodecsRegistry codecs) {
         functions.supportTimestampToStreamOffset((context,time) -> "actual-session-seam");
+        functions.supportStreamRead((context,tables,offset,size,consumer) -> {
+            count("streams").incrementAndGet();
+            ((java.util.concurrent.atomic.AtomicReference<Object>) state().get("streamOffset")).set(offset);
+            try {
+                consumer.accept(List.of(io.tapdata.entity.event.dml.TapInsertRecordEvent.create().table("t1").referenceTime(1L)
+                        .after(Map.of("session_id",1))), "stream-offset");
+            } finally { ((java.util.concurrent.CountDownLatch) state().get("streamEnded")).countDown(); }
+        });
         functions.supportBatchRead((context,table,offset,size,consumer) -> {
             count("reads").incrementAndGet();
             if (!((AtomicBoolean)state().get("pinned")).get()) count("earlyReads").incrementAndGet();
@@ -36,7 +44,9 @@ public final class PreparedPinnedSnapshotSource implements TapConnector {
         count("discoveries").incrementAndGet(); consumer.accept(List.of(table("t1"),table("t2")));
     }
     private static TapTable table(String name) {
-        var table = new TapTable(name); table.add(new TapField("session_id","int").isPrimaryKey(true).primaryKeyPos(1));
+        var table = new TapTable(name);
+        String field = ((AtomicBoolean) state().get("changedModel")).get() && name.equals("t1") ? "changed_id" : "session_id";
+        table.add(new TapField(field,"int").isPrimaryKey(true).primaryKeyPos(1));
         table.add(new TapIndex().name("idx_session").unique(true).indexField(new TapIndexField().name("session_id").fieldAsc(true))); return table;
     }
     @Override public ConnectionOptions connectionTest(TapConnectionContext context,Consumer<TestItem> consumer) { return ConnectionOptions.create(); }

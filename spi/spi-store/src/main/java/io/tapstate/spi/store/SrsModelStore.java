@@ -9,6 +9,16 @@ public interface SrsModelStore {
     /** Keeps the original operation authorization before and after every callback attempt. */
     SrsModelStore guardedBy(Runnable requireActive);
 
+    /**
+     * Explicitly publishes the initial actual model for one allocated capture context. An existing exact
+     * version zero retains its original introduction sequence; known missing control or body is never repaired.
+     * This is a fenced write command, not a relaxed historical existence query.
+     */
+    default SrsModel publishInitial(SrsModelKey key, String ring, SourceTable actual, WorkloadClaimFence originalCapture) {
+        throw new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,
+                Map.of("chain", key.miningChainId(), "table", key.table(), "version", String.valueOf(key.modelVersion())), null);
+    }
+
     /** Each table/capture starts at actual version zero and advances by one; identical captured retries are safe. */
     SrsModel publish(SrsModel model, WorkloadClaimFence captureFence);
 

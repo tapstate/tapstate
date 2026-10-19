@@ -59,6 +59,40 @@ class MongoSrsModelStoreIT {
     private static final String CHAIN = "chain-a";
     private static final String RING = "srs.chain-a.orders";
 
+    @Test void explicitInitialPublicationKeepsItsOriginalIntroductionAfterEvents() {
+        withBusiness(f -> {
+            var held = f.models().publishInitial(key(0),RING,table("id",99L),f.fence());
+            modelLog(f).store(RING,0,event(0,7,f.fence()));
+            assertThat(f.models().publishInitial(key(0),RING,table("id",500L),f.fence())).isEqualTo(held);
+            assertThat(held.ddlSequence()).isZero(); assertThat(held.table().approximateRowCount()).isNull();
+            var before = snapshotFacts(f.database());
+            assertThatThrownBy(() -> f.models().publishInitial(key(0),RING,table("changed",null),f.fence()))
+                    .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_MODEL_CONFLICT));
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+    @ParameterizedTest @ValueSource(strings={"body","control"})
+    void explicitInitialPublicationCannotRepairKnownMissingOriginalFacts(String missing) {
+        withBusiness(f -> {
+            f.models().publishInitial(key(0),RING,table("id",null),f.fence());
+            if (missing.equals("body")) models(f.database()).deleteMany(new Document());
+            else SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).deleteMany(new Document());
+            var before = snapshotFacts(f.database());
+            assertThatThrownBy(() -> f.models().publishInitial(key(0),RING,table("id",null),f.fence())).satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+    @Test void explicitInitialPublicationCanIntroduceANewAllocatedContextWhileHistoryReadsStayStrict() {
+        withBusiness(f -> {
+            f.models().publishInitial(key(0),RING,table("id",null),f.fence()); modelLog(f).store(RING,0,event(0,7,f.fence()));
+            assertThat(new MongoSrsChainStore(f.client(),f.database(),SCOPE).openEpoch(CHAIN,7,f.fence())).hasValue(8);
+            var next = new SrsModelKey(CHAIN,"orders",SCOPE.cacheIncarnation(),8,0);
+            assertThatThrownBy(() -> f.models().load(next)).satisfies(MongoSrsModelStoreIT::unavailable);
+            assertThat(f.models().publishInitial(next,RING,table("id",null),f.fence()).ddlSequence()).isEqualTo(1);
+            assertThat(f.models().requireEvent(key(0),RING,0,f.fence()).key()).isEqualTo(key(0));
+        });
+    }
+
     @Test
     void retirementBeforeOriginalClaimProofRejectsTheWholeDelayedModelPublication() {
         withBusiness(f -> {

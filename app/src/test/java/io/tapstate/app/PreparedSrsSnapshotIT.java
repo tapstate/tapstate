@@ -77,10 +77,101 @@ class PreparedSrsSnapshotIT {
             assertThat(f.stores.consumers().progress(f.run.context()).orElseThrow().snapshot()).isNull();
         });
     }
+    @Test void nativeProducerPublishesActualModelsBeforeWriteThroughAndKeepsQuietTableCheckpoint() throws Exception {
+        withFixture(f -> {
+            var member = member(f.stores.log());
+            try {
+                var writer = writer(f,member,1); var health = new io.tapstate.runtime.srs.CaptureHealth();
+                try (var source = writer.start(f.port().withStreamPreparation(writer::prepare),f.config(),io.tapstate.spi.capture.CaptureStart.present(),health)) {
+                    streamEnded(f,health);
+                    var checkpoint = f.stores.chains().load("chain").orElseThrow().checkpoint();
+                    assertThat(checkpoint.position().token()).isNotBlank();
+                    assertThat(checkpoint.tables().get("t1").sequence()).isZero();
+                    assertThat(checkpoint.tables().get("t2").sequence()).isEqualTo(-1);
+                    var recorded = f.stores.log().load(io.tapstate.runtime.srs.SrsRingbuffer.ringName("chain","t1"),0).orElseThrow();
+                    var key = checkpoint.tables().get("t1").model();
+                    var actual = f.stores.models().requireEvent(key,io.tapstate.runtime.srs.SrsRingbuffer.ringName("chain","t1"),0,recorded.captureFence());
+                    assertThat(actual.table().fields()).extracting(SourceField::name).containsExactly("session_id");
+                    assertThat(recorded.epoch()).isEqualTo(1); assertThat(recorded.schemaVer()).isZero();
+                }
+                assertThat(f.count("streams")).isOne(); assertThat(f.count("stops")).isOne();
+            } finally { member.shutdown(); }
+        });
+    }
+    @Test void nativeProducerReopensAtOriginalSourceTokenAndKeepsOldEventModelBindings() throws Exception {
+        withFixture(f -> {
+            var member = member(f.stores.log());
+            try {
+                var first = writer(f,member,1); var health = new io.tapstate.runtime.srs.CaptureHealth();
+                try (var source = first.start(f.port().withStreamPreparation(first::prepare),f.config(),io.tapstate.spi.capture.CaptureStart.present(),health)) { streamEnded(f,health); }
+                var before = f.stores.chains().load("chain").orElseThrow().checkpoint();
+                assertThat(f.stores.chains().openEpoch("chain",1,f.capture).orElseThrow()).isEqualTo(2);
+                f.state.put("streamEnded",new java.util.concurrent.CountDownLatch(1));
+                var second = writer(f,member,2); var nextHealth = new io.tapstate.runtime.srs.CaptureHealth();
+                try (var source = second.start(f.port().withStreamPreparation(second::prepare),f.config(),io.tapstate.spi.capture.CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(before.position().token())),nextHealth)) {
+                    streamEnded(f,nextHealth);
+                    assertThat(((AtomicReference<?>) f.state.get("streamOffset")).get()).isEqualTo("stream-offset");
+                    var after = f.stores.chains().load("chain").orElseThrow().checkpoint();
+                    assertThat(after.tables().get("t1").sequence()).isEqualTo(1);
+                    assertThat(after.tables().get("t2").sequence()).isEqualTo(-1);
+                    String ring = io.tapstate.runtime.srs.SrsRingbuffer.ringName("chain","t1");
+                    var oldEvent = f.stores.log().load(ring,0).orElseThrow(); var newEvent = f.stores.log().load(ring,1).orElseThrow();
+                    assertThat(oldEvent.epoch()).isEqualTo(1); assertThat(newEvent.epoch()).isEqualTo(2);
+                    assertThat(f.stores.models().requireEvent(before.tables().get("t1").model(),ring,0,oldEvent.captureFence()).key().captureEpoch()).isEqualTo(1);
+                    assertThat(f.stores.models().requireEvent(after.tables().get("t1").model(),ring,1,newEvent.captureFence()).ddlSequence()).isEqualTo(1);
+                }
+            } finally { member.shutdown(); }
+        });
+    }
+    @Test void nativeProducerRejectsChangedDiscoveryBeforeReopeningTheSourceStream() throws Exception {
+        withFixture(f -> {
+            var member = member(f.stores.log());
+            try {
+                var first = writer(f,member,1); var health = new io.tapstate.runtime.srs.CaptureHealth();
+                try (var source = first.start(f.port().withStreamPreparation(first::prepare),f.config(),io.tapstate.spi.capture.CaptureStart.present(),health)) { streamEnded(f,health); }
+                var before = f.stores.chains().load("chain").orElseThrow().checkpoint();
+                f.stores.chains().openEpoch("chain",1,f.capture).orElseThrow(); f.flag("changedModel").set(true);
+                var second = writer(f,member,2);
+                assertThatThrownBy(() -> second.start(f.port().withStreamPreparation(second::prepare),f.config(),
+                        io.tapstate.spi.capture.CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(before.position().token())),new io.tapstate.runtime.srs.CaptureHealth()))
+                        .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_MODEL_UNAVAILABLE));
+                assertThat(f.count("streams")).isOne();
+                assertThat(f.stores.chains().load("chain").orElseThrow().checkpoint()).isEqualTo(before);
+                var retained = f.stores.models().publishedForNewSnapshot("chain",Map.of("t1",io.tapstate.runtime.srs.SrsRingbuffer.ringName("chain","t1"),
+                        "t2",io.tapstate.runtime.srs.SrsRingbuffer.ringName("chain","t2"))).orElseThrow();
+                assertThat(retained).hasSize(2).allSatisfy((table,model) -> assertThat(model.key().captureEpoch()).isEqualTo(1));
+            } finally { member.shutdown(); }
+        });
+    }
+    private static io.tapstate.runtime.srs.SrsCaptureWriter writer(Fixture f,com.hazelcast.core.HazelcastInstance member,long epoch) {
+        f.stores.chains().requestTables("chain",Set.of("t1","t2"),f.capture);
+        assertThat(f.stores.chains().publishServingTables("chain",epoch,Set.of("t1","t2"),f.capture)).isTrue();
+        var scope = new CacheBusinessScope(f.run.scope().clusterId(),f.run.scope().bindingVersion(),f.run.scope().cacheIncarnation());
+        return new io.tapstate.runtime.srs.SrsCaptureWriter(scope,f.stores.chains().load("chain").orElseThrow(),f.capture,f.stores,member,() -> {});
+    }
+    private static void streamEnded(Fixture f,io.tapstate.runtime.srs.CaptureHealth health) throws InterruptedException {
+        boolean ended = ((java.util.concurrent.CountDownLatch) f.state.get("streamEnded")).await(10,java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(health.failure()).isEmpty(); assertThat(ended).as("the owned source callback completed").isTrue();
+    }
+    private static com.hazelcast.core.HazelcastInstance member(SrsLogStore log) {
+        var config = new com.hazelcast.config.Config().setClusterName("native-pdk-producer-"+UUID.randomUUID());
+        config.setProperty("hazelcast.phone.home.enabled","false"); config.setProperty("hazelcast.shutdownhook.enabled","false");
+        config.setProperty("hazelcast.operation.thread.count","2"); config.setProperty("hazelcast.operation.generic.thread.count","2");
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false); config.getJetConfig().setEnabled(false);
+        config.addRingBufferConfig(new com.hazelcast.config.RingbufferConfig("srs.*").setCapacity(8).setBackupCount(0)
+                .setInMemoryFormat(com.hazelcast.config.InMemoryFormat.OBJECT).setRingbufferStoreConfig(new com.hazelcast.config.RingbufferStoreConfig()
+                        .setEnabled(true).setFactoryImplementation(new io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory(log))));
+        config.getSerializationConfig().addSerializerConfig(new com.hazelcast.config.SerializerConfig()
+                .setTypeClass(io.tapstate.runtime.srs.SrsItem.class).setImplementation(new io.tapstate.runtime.srs.SrsItemSerializer()));
+        return com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+    }
     private static void withFixture(Scenario scenario) throws Exception {
         var state = new ConcurrentHashMap<String,Object>();
-        for (String key : List.of("reads","earlyReads","inits","discoveries","stops")) state.put(key,new AtomicInteger());
-        state.put("pinned",new AtomicBoolean()); System.getProperties().put(PreparedPinnedSnapshotSource.STATE,state);
+        for (String key : List.of("reads","earlyReads","inits","discoveries","stops","streams")) state.put(key,new AtomicInteger());
+        state.put("streamEnded",new java.util.concurrent.CountDownLatch(1)); state.put("streamOffset",new AtomicReference<>());
+        state.put("changedModel",new AtomicBoolean()); state.put("pinned",new AtomicBoolean()); System.getProperties().put(PreparedPinnedSnapshotSource.STATE,state);
         String suffix = UUID.randomUUID().toString().replace("-",""); String config = "prepared_config_"+suffix, cache = "prepared_cache_"+suffix;
         var endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,MONGO.getReplicaSetUrl(),cache,null);
         var settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(config),null,Duration.ofSeconds(5));
