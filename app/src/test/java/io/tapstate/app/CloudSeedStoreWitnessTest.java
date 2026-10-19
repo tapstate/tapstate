@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.MongoDriverInformation;
 import com.mongodb.MongoException;
+import com.mongodb.MongoCommandException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.event.CommandFailedEvent;
@@ -158,6 +159,92 @@ class CloudSeedStoreWitnessTest {
     }
 
     @Test
+    void theDefaultWitnessNeverReadsTheServerErrorField() throws IOException {
+        Fixture f = new Fixture(directory);
+        CommandListener listener = listener(f);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenThrow(new AssertionError("the default witness must not read"));
+        when(f.specs.has(anyString())).thenReturn(false);
+        doAnswer(call -> {
+            listener.commandFailed(driverFailure("update", driver));
+            throw f.failure;
+        }).when(f.specs).put(anyString(), any(byte[].class));
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        verify(driver, never()).getErrorMessage();
+        assertThat(f.events).allSatisfy(event -> assertThat(event).doesNotContainKey("refusal_category"));
+    }
+
+    @Test
+    void anEnabledExactWriteClassifiesOnceWithoutChangingTheOriginalFailure() throws IOException {
+        Fixture f = new Fixture(directory, true);
+        CommandListener listener = listener(f);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenReturn("you are over your space quota, using 513 MB of 512 MB");
+        when(f.specs.has(anyString())).thenReturn(false);
+        doAnswer(call -> {
+            listener.commandFailed(driverFailure("update", driver));
+            listener.commandFailed(driverFailure("update", driver));
+            throw f.failure;
+        }).when(f.specs).put(anyString(), any(byte[].class));
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        verify(f.specs).put(anyString(), any(byte[].class));
+        verify(driver).getErrorMessage();
+        verify(driver, never()).getMessage();
+        verify(driver, never()).getResponse();
+        verify(driver, never()).getCause();
+        assertThat(f.events).filteredOn(event -> event.containsKey("refusal_category")).singleElement()
+                .satisfies(event -> assertThat(event).containsEntry("refusal_category", "SPACE_QUOTA")
+                        .containsEntry("operation", "spec-put").containsEntry("command", "update"));
+        assertThat(JsonWriter.write(f.events.stream().map(event -> event.values().stream()
+                .filter(String.class::isInstance).toList()).toList()))
+                .doesNotContain("513", "512", "space quota", SENTINEL);
+    }
+
+    @Test
+    void otherOperationsAndCodesCannotConsumeTheSingleClassification() throws IOException {
+        Fixture f = new Fixture(directory, true);
+        CommandListener listener = listener(f);
+        MongoCommandException other = commandFailure(13);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenReturn(SENTINEL);
+        when(f.registry.findAll("mysql")).thenAnswer(call -> {
+            listener.commandFailed(driverFailure("find", driver));
+            return List.of();
+        });
+        when(f.specs.has(anyString())).thenReturn(false);
+        doAnswer(call -> {
+            listener.commandFailed(driverFailure("update", other));
+            listener.commandFailed(driverFailure("find", driver));
+            listener.commandFailed(driverFailure("update", driver));
+            throw f.failure;
+        }).when(f.specs).put(anyString(), any(byte[].class));
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        verify(other, never()).getErrorMessage();
+        verify(driver).getErrorMessage();
+        assertThat(f.events).filteredOn(event -> event.containsKey("refusal_category")).singleElement()
+                .satisfies(event -> assertThat(event).containsEntry("refusal_category", "UNCLASSIFIED")
+                        .containsEntry("operation", "spec-put").containsEntry("command", "update"));
+        assertThat(JsonWriter.write(f.events)).doesNotContain(SENTINEL);
+    }
+
+    @Test
+    void anUnavailableFieldStillPreservesTheMappedFailure() throws IOException {
+        Fixture f = new Fixture(directory, true);
+        CommandListener listener = listener(f);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenThrow(new IllegalArgumentException(SENTINEL));
+        when(f.specs.has(anyString())).thenReturn(false);
+        doAnswer(call -> {
+            listener.commandFailed(driverFailure("update", driver));
+            throw f.failure;
+        }).when(f.specs).put(anyString(), any(byte[].class));
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        assertThat(f.events).filteredOn(event -> event.containsKey("refusal_category")).singleElement()
+                .satisfies(event -> assertThat(event).containsEntry("refusal_category", "UNCLASSIFIED"));
+        assertThat(JsonWriter.write(f.events)).doesNotContain(SENTINEL);
+    }
+
+    @Test
     void unknownCommandsAndCallbacksOutsideTheSeedStayUnobserved() throws IOException {
         Fixture f = new Fixture(directory);
         CommandListener listener = listener(f);
@@ -276,10 +363,20 @@ class CloudSeedStoreWitnessTest {
     }
 
     private static CommandFailedEvent driverFailure(String command) {
+        return driverFailure(command, new UnreadableMessage());
+    }
+
+    private static CommandFailedEvent driverFailure(String command, Throwable failure) {
         CommandFailedEvent event = mock(CommandFailedEvent.class);
         when(event.getCommandName()).thenReturn(command);
-        when(event.getThrowable()).thenReturn(new UnreadableMessage());
+        when(event.getThrowable()).thenReturn(failure);
         return event;
+    }
+
+    private static MongoCommandException commandFailure(int code) {
+        MongoCommandException failure = mock(MongoCommandException.class);
+        when(failure.getCode()).thenReturn(code);
+        return failure;
     }
 
     private static final class UnreadableMessage extends MongoException {
@@ -305,8 +402,12 @@ class CloudSeedStoreWitnessTest {
         private final ConnectorArtifactRegistrar registrar;
 
         private Fixture(Path directory) throws IOException {
+            this(directory, false);
+        }
+
+        private Fixture(Path directory, boolean classify) throws IOException {
             artifact = Files.write(directory.resolve("mysql-connector.jar"), new byte[] {4, 7});
-            witness = new CloudStartupDerivationWitness(event -> {}, events::add, artifact);
+            witness = new CloudStartupDerivationWitness(event -> {}, events::add, artifact, classify);
             observedRegistry = witness.observe(registry);
             observedSpecs = witness.observe(specs);
             observedCatalog = witness.observe(catalog);

@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import com.mongodb.MongoException;
+import com.mongodb.MongoCommandException;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClients;
 import com.mongodb.event.CommandFailedEvent;
@@ -31,6 +32,7 @@ import java.util.Map;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -42,9 +44,12 @@ import static org.mockito.Mockito.spy;
 
 /** Test-only stage evidence before the startup boundary replaces a connector refusal. */
 final class CloudStartupDerivationWitness implements ApplicationContextInitializer<ConfigurableApplicationContext> {
+    static final String REFUSAL_CLASSIFICATION_PROPERTY = "tapstate.test.mysql-seed-refusal-classification";
     private final Consumer<Map<String, Object>> output;
     private final Consumer<Map<String, Object>> storeOutput;
     private final Path expectedSeed;
+    private final boolean refusalClassificationEnabled;
+    private final AtomicBoolean refusalClassified = new AtomicBoolean();
     private final AtomicInteger calls = new AtomicInteger();
     private final AtomicInteger seedCalls = new AtomicInteger();
     private final ThreadLocal<Attempt> active = new ThreadLocal<>();
@@ -61,9 +66,15 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
 
     CloudStartupDerivationWitness(Consumer<Map<String, Object>> output,
             Consumer<Map<String, Object>> storeOutput, Path expectedSeed) {
+        this(output, storeOutput, expectedSeed, false);
+    }
+
+    CloudStartupDerivationWitness(Consumer<Map<String, Object>> output,
+            Consumer<Map<String, Object>> storeOutput, Path expectedSeed, boolean refusalClassificationEnabled) {
         this.output = output;
         this.storeOutput = storeOutput;
         this.expectedSeed = expectedSeed == null ? null : expectedSeed.toAbsolutePath().normalize();
+        this.refusalClassificationEnabled = refusalClassificationEnabled;
     }
 
     static CloudStartupDerivationWitness initializer() {
@@ -73,7 +84,8 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
                             ? "CLOUD_STORE_OBSERVER_FACTORY " : "seed".equals(event.get("stage"))
                             ? "CLOUD_MYSQL_SEED_STORE " : "CLOUD_MYSQL_STORE_READ ";
                     System.out.println(prefix + JsonWriter.write(event));
-                }, CloudConnectorTestInputs.seedDirectory().resolve("mysql-connector.jar"));
+                }, CloudConnectorTestInputs.seedDirectory().resolve("mysql-connector.jar"),
+                Boolean.getBoolean(REFUSAL_CLASSIFICATION_PROPERTY));
     }
 
     @Override
@@ -292,6 +304,13 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
         event.put("command", command);
         event.put("exception_type", failure.getClass().getName());
         if (failure instanceof MongoException mongo) event.put("driver_code", mongo.getCode());
+        if (refusalClassificationEnabled && attempt.seed && "spec-put".equals(attempt.operation)
+                && "update".equals(command) && failure instanceof MongoCommandException mongo
+                && mongo.getCode() == 8000 && refusalClassified.compareAndSet(false, true)) {
+            // Read only this field once; arbitrary text never enters an event or a diagnostic exception.
+            event.put("refusal_category", CloudSpecPutRefusalClassifier.classify(
+                    true, true, attempt.operation, command, mongo.getCode(), mongo::getErrorMessage).name());
+        }
         emitStore(event);
     }
 
