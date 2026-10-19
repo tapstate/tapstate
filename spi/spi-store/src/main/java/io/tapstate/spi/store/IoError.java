@@ -78,7 +78,10 @@ public enum IoError implements TapstateErrorCode {
      * one code until a size failure was found reaching callers as "a store operation could not
      * complete", which sends whoever reads it to check a store that is healthy.
      */
-    DOCUMENT_TOO_LARGE("io.document-too-large", Set.of("id"));
+    DOCUMENT_TOO_LARGE("io.document-too-large", Set.of("id")),
+
+    /** Upload recovery could not establish publication or confirm removal of this attempt's chunks. */
+    CONNECTOR_UPLOAD_UNSETTLED("io.connector-upload-unsettled", Set.of("hash", "attempt"));
 
     private final String code;
     private final Set<String> placeholders;
