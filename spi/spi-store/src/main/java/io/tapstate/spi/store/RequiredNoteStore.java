@@ -40,6 +40,11 @@ public interface RequiredNoteStore {
      */
     RequiredNoteScope retireShared(RequiredNoteScope shared);
 
+    /** Loads original private tokens only under the already-persisted retirement operation, including its results. */
+    default List<RequiredNoteRetirement> retirements(PipelineIntentScope original, String operationId) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
+    }
+
     /** The fixed original private token may be used only by its persisted retirement operation. */
     default RequiredNoteRetirement retirement(RequiredNoteScope original, String operationId) {
         throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);

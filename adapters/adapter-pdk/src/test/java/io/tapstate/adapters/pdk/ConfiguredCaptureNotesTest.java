@@ -47,6 +47,17 @@ class ConfiguredCaptureNotesTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(PipelineNode.Purpose.class)
+    void releaseKeepsTheOriginalPurposeWithTheSameLogicalNode(PipelineNode.Purpose purpose,@TempDir Path dir) {
+        try(Fixture fixture=fixture(dir,false)) {
+            var port=PdkCapturePort.withRequiredNotes(id -> fixture.ref,null,fixture.scopes);
+            assertThat(port.release(config(),purpose)).isEmpty();
+            assertThat(fixture.opened).containsExactly("pdk.state.p1."+purpose.segment()+".src","pdk.global-state");
+            assertThat(fixture.released).containsExactly("recorded-slot");
+        }
+    }
+
     @Test
     void aReleaseStillRunsWithConfigurationNotesWhenThereIsNoGenericCacheStore(@TempDir Path dir) {
         try (Fixture fixture = fixture(dir, false)) {

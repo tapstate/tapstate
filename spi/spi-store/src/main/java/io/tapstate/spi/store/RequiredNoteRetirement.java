@@ -2,6 +2,9 @@ package io.tapstate.spi.store;
 
 /** Access to one retained private origin and notes under the original persisted retirement operation. */
 public interface RequiredNoteRetirement {
+    /** Whether this exact operation already published its retirement result. */
+    default boolean completed() { return false; }
+
     RequiredNoteScope scope();
     String operationId();
 

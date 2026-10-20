@@ -439,6 +439,39 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     @Override
+    public List<RequiredNoteRetirement> retirements(io.tapstate.spi.store.PipelineIntentScope original, String operationId) {
+        requireOrdinary(); Objects.requireNonNull(original, "original");
+        if (operationId == null || operationId.isBlank()) throw unavailable();
+        var tokens = withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
+            var row = operators.find(session, new Document("_id", original.pipelineId())).first();
+            var mapping = MongoPipelineStateMappings.decode(original.pipelineId(), row);
+            if (mapping.stateGeneration() != original.stateGeneration() || !operationId.equals(mapping.operationId())
+                    || (mapping.phase() != PipelineStateMapping.Phase.REBUILDING && mapping.phase() != PipelineStateMapping.Phase.RETIRING)
+                    || !original.equals(MongoPipelinePreparationFacts.decode(original.pipelineId(), row, original.clusterId()).scope())) throw unavailable();
+            var result = new ArrayList<RequiredNoteScope>();
+            try (var rows = scopes.find(session, new Document("_id.bindingVersion", original.bindingVersion())
+                    .append("ownerKind", "PIPELINE").append("ownerId", original.pipelineId())).iterator()) {
+                while (rows.hasNext()) {
+                    var metadata = rows.next();
+                    if (!(metadata.get("_id") instanceof Document id) || !(id.get("namespace") instanceof String namespace)) throw unavailable();
+                    RequiredNoteOwner owner;
+                    try { owner = new RequiredNoteOwner(original.bindingVersion(), namespace, RequiredNoteOwner.Kind.PIPELINE,
+                            original.pipelineId(), original.stateGeneration()); }
+                    catch (IllegalArgumentException invalid) { throw unavailable(); }
+                    var token = scopeOf(owner, metadata); checkBinding(session, owner);
+                    if (metadata.get("lastRetirement") instanceof Document retired && operationId.equals(retired.get("operationId"))) {
+                        if (!Long.valueOf(original.stateGeneration()).equals(retired.get("stateGeneration"))) throw unavailable();
+                        token = new RequiredNoteScope(owner, retired.getLong("fromGeneration"));
+                    }
+                    result.add(token);
+                }
+            }
+            return List.copyOf(result);
+        })));
+        return tokens.stream().map(token -> retirement(token, operationId)).toList();
+    }
+
+    @Override
     public RequiredNoteRetirement retirement(RequiredNoteScope original, String operationId) {
         requireOrdinary(); Objects.requireNonNull(original, "original");
         if (original.owner().kind() != RequiredNoteOwner.Kind.PIPELINE || operationId == null || operationId.isBlank()) throw unavailable();
@@ -451,6 +484,12 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             return null;
         })));
         return new RequiredNoteRetirement() {
+            @Override public boolean completed() {
+                return transaction(session -> {
+                    checkRetiringOwner(session, fixed, false);
+                    return retiredResult(fixed, scopes.find(session, byScope(original.owner())).first()) != null;
+                });
+            }
             @Override public RequiredNoteScope scope() { return original; }
             @Override public String operationId() { return operationId; }
             @Override public RequiredNoteStore notes() { return view; }

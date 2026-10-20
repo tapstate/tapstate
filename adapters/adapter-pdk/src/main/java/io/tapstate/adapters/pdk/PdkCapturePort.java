@@ -609,7 +609,16 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
      */
     @Override
     public Optional<TapstateException> release(CaptureConfig config) {
-        Objects.requireNonNull(config, "config");
+        return release(config, PipelineNode.Purpose.CAPTURE);
+    }
+
+    /** Release keeps the original connector purpose without changing its logical node identity. */
+    public Optional<TapstateException> release(CaptureConfig config, PipelineNode.Purpose purpose) {
+        Objects.requireNonNull(config, "config"); Objects.requireNonNull(purpose, "purpose");
+        if ((purpose != PipelineNode.Purpose.CAPTURE && stateStore != null)
+                || (purpose != PipelineNode.Purpose.CAPTURE && config.sharedNotes() != null)) {
+            throw new IllegalArgumentException("only capture notes may use a shared or legacy state store");
+        }
         if ((stateStore == null && noteScopes == null) || (config.node() == null && config.sharedNotes() == null)) {
             // Nothing was kept anywhere a later drive could read it, so nothing was set up through it either.
             return Optional.empty();
@@ -632,7 +641,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 if (releaseScopes == null) {
                     reference = provisioner.resolve(connectorId);
                 } else {
-                    String namespace = config.sharedNotes() == null ? ConnectorStateNamespace.of(config.node())
+                    String namespace = config.sharedNotes() == null ? ConnectorStateNamespace.of(config.node(), purpose)
                             : ConnectorStateNamespace.ofShared(config.sharedNotes().sharedBy());
                     var scope = releaseScopes.open(namespace);
                     var origin = releaseScopes.store().origin(scope);
@@ -643,7 +652,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                             requested.equals(namespace) ? scope : releaseScopes.open(requested), releaseScopes::requireActive);
                 }
                 PdkConnector connector = PdkConnector.open(connectorId, reference, settings, config.node(), notes,
-                        config.sharedNotes(), connectorScopes);
+                        config.sharedNotes(), connectorScopes, purpose);
                 try {
                     List<String> names = namedOnTheSource(connector);
                     named.set(names);

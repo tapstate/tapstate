@@ -43,6 +43,64 @@ class MongoCachePipelineRebuildsIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static MongoDBContainer mongo() { return new MongoDBContainer(DockerImageName.parse("mongo:7.0")); }
 
+    @Test void originalPrivateRetirementTokensSurviveReopenAndCompletedOnesDoNotReleaseTwice() {
+        withFixture(f -> {
+            var notes=f.configuration.requiredNotes();
+            var a=notes.initialize(RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","same"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1));
+            var b=notes.initialize(RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","same"),io.tapstate.core.model.PipelineNode.Purpose.SYNC,1));
+            var origin=new RequiredNoteOrigin("original","a".repeat(64),new byte[]{1});notes.prepareOrigin(a,origin);notes.prepareOrigin(b,origin);
+            notes.compareAndSet(a,"slot",0,new byte[]{1},false);notes.compareAndSet(b,"slot",0,new byte[]{2},false);
+            assertCode(() -> notes.retirements(f.scope,"operation"),IoError.NOTE_SCOPE_UNAVAILABLE);
+            var pending=f.pending(0);var operation=pending.request().operationId();
+            var tokens=notes.retirements(f.scope,operation);assertThat(tokens).hasSize(2).allSatisfy(token -> assertThat(token.completed()).isFalse());
+            var selected=tokens.stream().filter(token -> token.scope().equals(a)).findFirst().orElseThrow();selected.completeAfterVerifiedRelease();
+            try(var reopened=MongoConfigurationDomain.open(new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()),null,Duration.ofSeconds(5)),"cluster-a")) {
+                var retry=reopened.requiredNotes().retirements(f.scope,operation);assertThat(retry).hasSize(2);
+                assertThat(retry.stream().filter(RequiredNoteRetirement::completed)).singleElement().satisfies(token -> assertThat(token.scope()).isEqualTo(a));
+                var owed=retry.stream().filter(token -> !token.completed()).findFirst().orElseThrow();
+                assertThat(owed.scope()).isEqualTo(b);assertThat(owed.origin()).contains(origin);
+                assertThat(owed.notes().read(b,"slot").bytes()).containsExactly(2);owed.completeAfterVerifiedRelease();
+                assertThat(reopened.requiredNotes().retirements(f.scope,operation)).allSatisfy(token -> assertThat(token.completed()).isTrue());
+                assertCode(() -> reopened.requiredNotes().retirements(f.scope,"different-operation"),IoError.NOTE_SCOPE_UNAVAILABLE);
+            }
+        });
+    }
+    @Test void retirementRejectsCorruptPersistentNamespaceWithoutLeakingAnUncodedFailure() {
+        withFixture(f -> {
+            var pending=f.pending(0);var table=SystemCollections.PDK_NOTE_SCOPES.on(f.config);
+            table.insertOne(new Document("_id",new Document("bindingVersion",1L).append("namespace","foreign-persistent-namespace"))
+                    .append("ownerKind","PIPELINE").append("ownerId","flow").append("generation",1L).append("writeFence",0L)
+                    .append("originGeneration",0L).append("outgoingCarries",0L).append("incomingCarries",0L));
+            long before=table.countDocuments();assertCode(() -> f.configuration.requiredNotes().retirements(f.scope,pending.request().operationId()),IoError.NOTE_SCOPE_UNAVAILABLE);
+            assertThat(table.countDocuments()).isEqualTo(before);
+        });
+    }
+    @Test void retiredPayloadReclamationIsBoundedAndKeepsOtherScopesAndBirthHistory() {
+        withFixture(f -> {
+            var fence=f.advance("flow");
+            var location=new OperatorPlacement(f.scope,f.cache.getName(),OperatorPlacement.Resource.JOIN_FACTS,"join","fact","facts");
+            var writer=f.domain.operatorState(location,fence,ACTIVE);var values=new java.util.HashMap<String,byte[]>();
+            for(int i=0;i<300;i++)values.put("key-"+i,new byte[]{1});values.forEach((key,value) -> writer.save(location.mapName(),key,value));
+            f.initial("independent");var otherScope=new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"independent",1);
+            var other=f.advance("independent");
+            var neighbor=new OperatorPlacement(otherScope,f.cache.getName(),OperatorPlacement.Resource.JOIN_FACTS,"join","fact","facts");
+            f.domain.operatorState(neighbor,other,ACTIVE).save(neighbor.mapName(),"keep",new byte[]{9});
+            var pending=f.pending(0);var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);
+            long first=f.rebuilds().reclaim(receipt);assertThat(first).isEqualTo(256);
+            assertThat(SystemCollections.CACHE_JOIN_FACTS.on(f.cache).countDocuments()).isEqualTo(45);
+            assertThat(f.rebuilds().reclaim(receipt)).isGreaterThanOrEqualTo(44).isLessThanOrEqualTo(256);
+            assertThat(f.rebuilds().reclaim(receipt)).isZero();
+            assertThat(SystemCollections.CACHE_JOIN_FACTS.on(f.cache).countDocuments()).isOne();
+            assertThat(f.domain.operatorState(neighbor).load(neighbor.mapName(),"keep")).contains(new byte[]{9});
+            try(var session=f.cacheClient.startSession()){session.withTransaction(() -> {MongoOperatorInventory.requireRetired(session,f.cache,pending);return null;});}
+            assertCode(() -> writer.save(location.mapName(),"late",new byte[]{3}),IoError.CACHE_BUSINESS_FENCED);
+            f.configuration.rebuilds().complete(receipt);assertThat(f.rebuilds().reclaim(receipt)).isZero();
+            var claims=f.domain.workloadClaims(f.business);
+            claims.advanceExecution(claims.readPipeline(pending.request().targetScope()).orElseThrow().claim(),1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            assertThatThrownBy(() -> f.rebuilds().reclaim(receipt)).isInstanceOf(TapstateException.class);
+        });
+    }
+
     @Test void successorHasItsOwnPreparedSnapshotOrderBeforeAValidNewGenerationCanStart() {
         withFixture(f -> {
             var pending=f.pending(0); f.rebuilds().prepare(pending,f.node,TTL,AT);

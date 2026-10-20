@@ -190,6 +190,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             }
             var logged=new LinkedHashMap<String,PipelineCaptureBindings.LoggedSource>();
             for(var source:session.sources.values())if(source.shared) {
+                var before=source.srs.chains().load(source.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+                var retained=source.srs.consumers().progress(source.consumer.context()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+                if(!session.snapshot && readStart(pipeline) instanceof StartFrom.At at
+                        && at.instant().isBefore(execution.clock().instant())
+                        && !retained.ringDoneThrough().keySet().containsAll(source.selected.tables())
+                        && (before.epoch()==0 || !before.servingTables().containsAll(source.selected.tables()))) {
+                    throw new TapstateException(CaptureError.START_FROM_OUTSIDE_WINDOW,Map.of(
+                            "requested",at.instant().toString(),"earliest",execution.clock().instant().toString(),
+                            "retention",before.retention()==null?"unset":before.retention()),null);
+                }
                 if(source.owner!=null) {
                     if(source.owner.config==null){source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id))
                             .sharing(new SharedNotes(source.prepared.chainId(),List.of()));}

@@ -39,6 +39,66 @@ class PipelineDirectPreparationIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node","boot");
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-19T00:00:00Z"),ZoneOffset.UTC);
 
+    @Test void retainedSharedStartsResolveTheirOwnCursorAndRestartKeepsIt() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,"latest",null));
+            var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+            f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());var claims=f.cache.workloadClaims(f.business());
+            var fence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+            var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log());var ports=new CopyOnWriteArrayList<NativeSharedPort>();
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),stores,member);
+                var root=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {
+                            var port=new NativeSharedPort(config,guard,preparation,stream);ports.add(port);return port;
+                        })) {
+                var first=root.forRun(f.scope,fence,new ExecutionFence(f.scope,fence));first.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),models);
+                var physical=ports.getFirst();
+                physical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",1),null)),Optional.of(new SourcePosition("one")));
+                physical.listener.get().onBatch(List.of(Envelope.insert(3,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("two")));
+                for(String start:List.of("earliest",Instant.ofEpochMilli(2).toString(),"latest")) {
+                    String id="reader-"+(start.equals("earliest")?"earliest":start.equals("latest")?"latest":"time");
+                    var pipeline=new PipelineResource(id,null,List.of(SourceRef.spec("input",true)),null,null,null,new Settings(null,null,null,null,ReadMode.CDC_ONLY,start),null);
+                    f.configuration.artifacts().create(pipeline);var scope=new PipelineIntentScope("cluster",1,f.scope.cacheIncarnation(),id,1);
+                    var discovered=SourceModelSnapshot.capture(id,List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+                    var inputs=discovered.preparationInputs(scope,pipeline,pipeline,Map.of("input",f.source()));f.preparer(f.configuration,f.cache).prepare(scope,inputs);
+                    var original=claims.advanceExecution(claims.readPipeline(scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow();var claim=WorkloadClaimFence.from(original);
+                    var run=root.forRun(scope,claim,new ExecutionFence(scope,claim));run.startCapture(id,ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),discovered);
+                    var saved=run.captureBindings().logged().get("input");long expected=start.equals("earliest")?-1:start.equals("latest")?stores.log().bounds(SrsRingbuffer.ringName(saved.run().miningChainId(),"orders")).largestSequence():0;
+                    assertThat(saved.recoveryAfter()).containsEntry("orders",expected);run.stopCapture(id,false);
+                    physical.listener.get().onBatch(List.of(Envelope.insert(5,"orders",Map.of("id",3),null)),Optional.of(new SourcePosition("after-"+id)));
+                    var next=WorkloadClaimFence.from(claims.advanceExecution(original,1,Set.of(OWNER.nodeId())).orElseThrow());
+                    var restart=root.forRun(scope,next,new ExecutionFence(scope,next));restart.startCapture(id,ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),discovered);
+                    assertThat(restart.captureBindings().logged().get("input").recoveryAfter()).isEqualTo(saved.recoveryAfter());restart.stopCapture(id,false);
+                }
+                first.stopCapture("flow",false);
+            } finally {member.shutdown();}
+        });
+    }
+    @Test void freshSharedCaptureRefusesPastTimeBeforeAllocatingAnEpoch() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,CLOCK.instant().minusSeconds(1).toString(),null));
+            var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+            f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());var claims=f.cache.workloadClaims(f.business());
+            var fence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+            var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log());var ports=new CopyOnWriteArrayList<NativeSharedPort>();
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),stores,member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {
+                            var port=new NativeSharedPort(config,guard,preparation,stream);ports.add(port);return port;
+                        })) {
+                var run=coordinator.forRun(f.scope,fence,new ExecutionFence(f.scope,fence));
+                assertCode(() -> run.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),models),CaptureError.START_FROM_OUTSIDE_WINDOW);
+                assertThat(ports).isEmpty();
+                assertThat(f.cacheDatabase.getCollection("srs_chains").find().into(new ArrayList<>())).allSatisfy(chain -> assertThat(chain.getLong("epoch")).isZero());
+            } finally {member.shutdown();}
+        });
+    }
     @ParameterizedTest @ValueSource(booleans={false,true})
     void sharedMetadataPreflightDoesNotCancelTheOriginalTailBeforeItsStartCallback(boolean snapshot) {
         withFixture(f -> {
@@ -875,7 +935,7 @@ class PipelineDirectPreparationIT {
     private static PipelineResource pipeline(String source,boolean shared,ReadMode mode,String start,Metadata metadata) {
         return new PipelineResource("flow",metadata,List.of(SourceRef.spec(source,shared)),null,null,null,new Settings(null,null,null,null,mode,start),null);
     }
-    private static void assertCode(org.assertj.core.api.ThrowableAssert.ThrowingCallable action,IoError expected) {
+    private static void assertCode(org.assertj.core.api.ThrowableAssert.ThrowingCallable action,io.tapstate.core.common.TapstateErrorCode expected) {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class,failure -> { assertThat(failure.code()).isEqualTo(expected); assertThat(failure.getCause()).isNull(); });
     }
     private static void withFixture(Scenario scenario) {
