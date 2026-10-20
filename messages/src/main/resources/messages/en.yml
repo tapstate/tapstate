@@ -348,6 +348,9 @@ cli.auth-logout-unreachable:
 cli.auth-logout-cache-changed:
   message: "The session for context `{context}` changed while logout was in progress; the newer local session was kept."
   solution: "Run `tapstate auth status` to inspect the current session, then retry logout if needed."
+cli.storage-usage:
+  message: "Invalid storage command: {reason}."
+  solution: "Read storage or configuration help and provide request secrets only in a local JSON file."
 cli.auth-usage:
   message: "Invalid auth command: {reason}."
   solution: "Use `tapstate auth login [username]`, `tapstate auth status`, or `tapstate auth logout [--local-only]`."

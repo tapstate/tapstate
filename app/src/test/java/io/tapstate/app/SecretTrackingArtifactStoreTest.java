@@ -16,6 +16,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class SecretTrackingArtifactStoreTest {
 
+    @Test void managedTrustBundleLinesAreTrackedForPlainAndStructuredLogs() {
+        var redactor = new SecretRedactor(); var store = tracking(new RecordingStore(), redactor);
+        String ca = "-----BEGIN CERTIFICATE-----\nsentinel-certificate-body\n-----END CERTIFICATE-----";
+        store.save(new SourceResource("views", null, "mongodb", Map.of("uri", "mongodb://user:password@host/views", "tlsCaPem", ca), null, null, null, null));
+        assertThat(redactor.redact(ca)).doesNotContain("sentinel-certificate-body");
+        assertThat(redactor.redact(io.tapstate.core.common.JsonWriter.write(Map.of("tlsCaPem", ca)))).doesNotContain("sentinel-certificate-body");
+    }
+
     @Test
     void registersExistingAndSuccessfullyWrittenSourceSecrets() {
         RecordingStore delegate = new RecordingStore();

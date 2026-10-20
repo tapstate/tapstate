@@ -28,6 +28,15 @@ class SourceRepresentationTest {
     private final SourceRepresentation representation =
             new SourceRepresentation(TapstateCatalog.load());
 
+    @Test void aManagedMongoSourceNeverReturnsItsPersistedTrustBundle() {
+        for (String connector : List.of("mongodb", "mongodb-atlas")) {
+            var source = new SourceResource("views", null, connector, Map.of("uri", "mongodb://user:password@host/views", "tlsCaPem", "sentinel-trust-bundle"), null, null, null, null);
+            var view = representation.toView(source, CanonicalHash.of(source));
+            assertThat(view.config()).doesNotContainKey("tlsCaPem");
+            assertThat(source.config()).containsEntry("tlsCaPem", "sentinel-trust-bundle");
+        }
+    }
+
     @Test
     void refusesADraftCarryingOptions() {
         // Options are the engine's own configuration and its vocabulary is empty today, so the model

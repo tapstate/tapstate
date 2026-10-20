@@ -101,9 +101,11 @@ class ApiExceptionHandler {
     static HttpStatus statusFor(TapstateErrorCode code) {
         return switch (code.code()) {
             case "control.auth-failed", "control.unauthenticated" -> HttpStatus.UNAUTHORIZED;
-            case "control.cloud-auth-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
+            case "control.cloud-auth-unavailable", "control.storage-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
             case "control.auth-mode-unavailable" -> HttpStatus.FORBIDDEN;
             case "control.forbidden", "control.bootstrap-forbidden" -> HttpStatus.FORBIDDEN;
+            case "control.storage-test-required", "control.storage-scope-conflict", "io.configuration-import-refused", "store.initialization-refused" -> HttpStatus.CONFLICT;
+            case "control.storage-test-failed", "control.storage-databases-overlap", "store.storage-connection-unsupported", "store.invalid-uri", "store.tls-trust-invalid" -> HttpStatus.BAD_REQUEST;
             case "control.bootstrap-closed" -> HttpStatus.CONFLICT;
             case "source.id-mismatch" -> HttpStatus.BAD_REQUEST;
             case "source.not-found" -> HttpStatus.NOT_FOUND;

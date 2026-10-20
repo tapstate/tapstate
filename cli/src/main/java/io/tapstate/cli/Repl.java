@@ -177,7 +177,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "cluster", "token", "derived-schema", "explain");
+            "connectors", "cluster", "token", "derived-schema", "explain", "storage", "configuration");
 
     private final CommandLine commandLine;
 
@@ -804,6 +804,9 @@ final class Repl {
         // `test` and its read-back `test-result` return a structured report that is worth machine-reading, so
         // they accept an `-o` output flag and parse their own options — routed before the positional-only
         // guard the other verbs share.
+        if (words.get(0).equals("storage") || words.get(0).equals("configuration")) {
+            return storageOnline(words);
+        }
         if (words.get(0).equals("test")) {
             return testOnline(words);
         }
@@ -957,6 +960,37 @@ final class Repl {
     }
 
     /** Dispatches machine-token administration while keeping bearer creation a one-time output. */
+    private int storageOnline(List<String> words) {
+        int fileIndex = words.indexOf("--file");
+        int commandEnd = fileIndex < 0 ? words.size() : fileIndex;
+        String operation = String.join(".", words.subList(0, commandEnd));
+        if (!io.tapstate.control.client.StorageControlClient.OPERATIONS.contains(operation)
+                || (fileIndex >= 0 && words.size() != fileIndex + 2)
+                || (fileIndex < 0 && !operation.equals("storage.status"))) return storageUsage();
+        Map<String,Object> request = Map.of();
+        if (fileIndex >= 0) {
+            try (var input = Files.newInputStream(workdir.resolve(words.get(fileIndex+1)).normalize())) {
+                byte[] bytes = input.readNBytes(9 * 1024 * 1024 + 1);
+                if (bytes.length > 9 * 1024 * 1024) return storageUsage();
+                Object value = io.tapstate.core.common.JsonReader.parse(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+                if (!(value instanceof Map<?,?> map) || map.keySet().stream().anyMatch(key -> !(key instanceof String))) return storageUsage();
+                @SuppressWarnings("unchecked") var body = (Map<String,Object>) map; request = body;
+            } catch (IOException | IllegalArgumentException invalid) { return storageUsage(); }
+        }
+        var result = controlPlane.storageOperation(session.landingNode(), session.credential(), operation, request);
+        return switch (result) {
+            case io.tapstate.control.client.ControlResponse.Success success -> {
+                commandLine.getOut().println(io.tapstate.core.common.JsonWriter.write(success.body())); commandLine.getOut().flush(); yield Cli.EXIT_OK;
+            }
+            case io.tapstate.control.client.ControlResponse.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case io.tapstate.control.client.ControlResponse.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+    private int storageUsage() {
+        printDiagnostic(commandLine.getErr(), CliError.STORAGE_USAGE, Map.of("reason", "use storage <status|test|setup ACTION|recovery ACTION> or configuration import <preflight|commit|status>; supply one readable bounded JSON object with --file"));
+        return Cli.EXIT_USAGE;
+    }
+
     private int tokenOnline(List<String> words) {
         if (words.size() < 2) {
             return tokenUsage("missing action (usage: token <create|list|revoke> [ARGS...] [-o text|json|yaml])");

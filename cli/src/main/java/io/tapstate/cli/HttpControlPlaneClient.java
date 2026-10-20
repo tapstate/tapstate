@@ -42,6 +42,10 @@ import java.util.function.Supplier;
  * render outcomes without try/catch.
  */
 final class HttpControlPlaneClient implements ControlPlaneClient {
+    @Override public io.tapstate.control.client.ControlResponse storageOperation(URI baseUrl, String credential, String operation, Map<String,Object> input) {
+        return io.tapstate.control.client.StorageControlClient.execute(sharedClient, baseUrl, credential, operation, input);
+    }
+
 
     /**
      * The probe / connect budget: short enough that an unreachable seed does not stall the connect walk,

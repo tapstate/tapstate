@@ -18,7 +18,7 @@ final class StorageOperationSchemas {
         Map<String,Object> defs = new LinkedHashMap<>();
         var connection = object(List.of("kind", "uri", "database"), Map.of("kind", choice("MONGODB", "ATLAS"),
                 "uri", text(), "database", text(), "caPem", text()));
-        var candidate = object(List.of("configuration", "cache", "master"), Map.of(
+        var candidate = object(List.of("cache", "master"), Map.of(
                 "configuration", connection, "cache", connection, "master", connection));
         var stamps = object(List.of("CONFIG", "CACHE", "MASTER"), Map.of("CONFIG", text(), "CACHE", text(), "MASTER", text()));
         var transfer = Map.<String,Object>of("type", "string", "minLength", 1,
@@ -30,9 +30,9 @@ final class StorageOperationSchemas {
                 "operationId", text(), "generation", positive(), "candidate", candidate, "testStamps", stamps)));
         defs.put("StorageSetupStatusRequest", operation());
         defs.put("StorageRecoveryPlanRequest", object(List.of("scope", "pipelineIds"), Map.of(
-                "scope", choice("PIPELINE", "CLUSTER"), "pipelineIds", Map.of("type", "array", "items", text(), "maxItems", 64))));
-        defs.put("StorageRecoveryConfirmRequest", object(List.of("operationId", "planHash", "configurationRevision", "confirmed"), Map.of(
-                "operationId", text(), "planHash", text(), "configurationRevision", Map.of("type", "integer", "minimum", 0),
+                "scope", choice("PIPELINE", "CLUSTER"), "pipelineIds", Map.of("type", "array", "items", text(), "maxItems", 64), "operationId", text(), "previousOperationId", text())));
+        defs.put("StorageRecoveryConfirmRequest", object(List.of("operationId", "planHash", "controlRevision", "confirmed"), Map.of(
+                "operationId", text(), "planHash", text(), "controlRevision", positive(),
                 "confirmed", Map.of("type", "boolean", "const", true))));
         defs.put("StorageRecoveryStatusRequest", operation());
         defs.put("ConfigurationImportPreflightRequest", object(List.of("transfer", "transferKey", "defaultSourceMapping"), Map.of(
@@ -42,11 +42,31 @@ final class StorageOperationSchemas {
         defs.put("ConfigurationImportStatusRequest", object(List.of("importId"), Map.of("importId", text())));
         var setupStatus = object(List.of("mode", "clusterId", "operationId", "generation", "setupPhase", "bindingVersion"), Map.of(
                 "mode", choice("CLOUD", "OP"), "clusterId", text(), "operationId", text(), "generation", positive(),
-                "setupPhase", choice("CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"), "bindingVersion", Map.of("type", "integer", "minimum", 0)));
+                "setupPhase", choice("LOCAL_SETUP", "CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"), "bindingVersion", Map.of("type", "integer", "minimum", 0)));
         defs.put("StorageSetupCommitResult", setupStatus); defs.put("StorageSetupStatusResult", setupStatus);
         defs.put("StorageTestResult", object(List.of("layer", "testStamp", "expiresAt", "checks"), Map.of(
                 "layer", choice("CONFIG", "CACHE", "MASTER"), "testStamp", text(), "expiresAt", text(),
                 "checks", Map.of("type", "array", "items", text()))));
+        var health = object(List.of("CONFIG", "CACHE", "MASTER"), Map.of("CONFIG", choice("UNKNOWN", "AVAILABLE", "UNAVAILABLE", "AUTH_READY"),
+                "CACHE", choice("UNKNOWN", "AVAILABLE", "UNAVAILABLE", "AUTH_READY"), "MASTER", choice("UNKNOWN", "AVAILABLE", "UNAVAILABLE", "AUTH_READY")));
+        var snapshot = new LinkedHashMap<String,Object>();
+        snapshot.put("mode", choice("CLOUD", "OP")); snapshot.put("clusterId", text()); snapshot.put("operationId", text());
+        snapshot.put("setupGeneration", positive()); snapshot.put("bindingVersion", nonnegative()); snapshot.put("authGeneration", nonnegative()); snapshot.put("stateVersion", nonnegative());
+        snapshot.put("setupPhase", choice("LOCAL_SETUP", "CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"));
+        snapshot.put("businessPhase", choice("NOT_CONFIGURED", "PREPARING", "RESTART_REQUIRED", "FIRST_ADMIN_REQUIRED", "AUTH_READY", "READY", "UNAVAILABLE", "AWAITING_REBUILD_CONFIRMATION", "RECOVERING", "CLEANUP_REQUIRED"));
+        snapshot.put("health", health); snapshot.put("allowedActions", Map.of("type", "array", "items", text())); snapshot.put("restartRequired", Map.of("type", "boolean"));
+        defs.put("StorageStatusResult", object(List.copyOf(snapshot.keySet()), snapshot));
+        var recovery = new LinkedHashMap<String,Object>();
+        recovery.put("operationId", text()); recovery.put("previousOperationId", Map.of("anyOf", List.of(text(), Map.of("type", "null"))));
+        recovery.put("phase", choice("PLANNED", "CONFIRMED", "RUNNING", "COMPLETE")); recovery.put("scope", choice("PIPELINE", "CLUSTER"));
+        recovery.put("pipelineIds", Map.of("type", "array", "items", text())); recovery.put("affectedPipelineIds", Map.of("type", "array", "items", text()));
+        recovery.put("definitionHashes", stringMap()); recovery.put("dependencyHash", text()); recovery.put("configurationRevision", nonnegative());
+        recovery.put("controlRevision", positive()); recovery.put("planHash", text()); recovery.put("clusterId", text()); recovery.put("bindingVersion", positive());
+        recovery.put("mode", choice("CLOUD", "OP")); recovery.put("cacheIncarnation", text()); recovery.put("authGeneration", positive());
+        var recoveryResult = object(List.copyOf(recovery.keySet()), recovery);
+        defs.put("StorageRecoveryPlanResult", recoveryResult); defs.put("StorageRecoveryConfirmResult", recoveryResult);
+        defs.put("StorageRecoveryStatusResult", Map.of("anyOf", List.of(recoveryResult, object(List.of("operationId", "phase"),
+                Map.of("operationId", text(), "phase", choice("UNKNOWN"))))));
         var nullableText = Map.<String,Object>of("anyOf", List.of(text(), Map.of("type", "null")));
         var scope = object(List.of("clusterId", "bindingVersion", "mode", "organizationId"), Map.of(
                 "clusterId", text(), "bindingVersion", positive(), "mode", choice("CLOUD", "OP"), "organizationId", nullableText));

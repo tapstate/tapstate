@@ -146,14 +146,21 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     private Collection<String> secretValues(SourceResource source) {
+        List<String> secrets = new ArrayList<>();
+        if (("mongodb".equals(source.connector()) || "mongodb-atlas".equals(source.connector()))
+                && source.config().get(io.tapstate.control.core.StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca) {
+            secrets.add(ca);
+            // Structured and multiline logs can escape or indent the original bundle differently.
+            ca.lines().filter(line -> !line.isBlank()).forEach(secrets::add);
+        }
         ConnectorCatalogEntry connector;
         try {
             connector = catalog.get().byId(source.connector());
         } catch (IllegalArgumentException unavailable) {
-            return namedSecretValues(source.config());
+            secrets.addAll(namedSecretValues(source.config()));
+            return secrets;
         }
 
-        List<String> secrets = new ArrayList<>();
         connector.config().stream()
                 .filter(ConfigField::secret)
                 .map(field -> configValue(source.config(), field.name()))

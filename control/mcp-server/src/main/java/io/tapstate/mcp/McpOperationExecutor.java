@@ -3,6 +3,7 @@ package io.tapstate.mcp;
 import io.tapstate.control.client.ControlResponse;
 import io.tapstate.control.client.HttpControlClient;
 import io.tapstate.control.client.RequestBudget;
+import io.tapstate.control.client.StorageControlClient;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.ListBounds;
 import io.tapstate.control.core.Operation;
@@ -46,6 +47,8 @@ final class McpOperationExecutor {
         Objects.requireNonNull(operation, "operation");
         Map<String, Object> args = arguments == null ? Map.of() : arguments;
         try {
+            if (StorageControlClient.OPERATIONS.contains(operation.id()))
+                return McpResult.from(StorageControlClient.execute(client, server, token, operation.id(), args));
             return switch (operation.id()) {
                 case "system.version" -> get("/version");
                 case "connector.list" -> get("/api/connectors");

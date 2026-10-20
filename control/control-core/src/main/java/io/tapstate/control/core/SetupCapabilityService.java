@@ -34,6 +34,20 @@ public final class SetupCapabilityService {
     }
     private record Current(Issued issued, byte[] digest) {}
 
+    /** Created only after the opaque secret and real management channel were verified by this authority. */
+    public static final class Permission implements Runnable {
+        private final StorageSetupScope scope;
+        private final StorageSetupStateStore.Purpose purpose;
+        private final Runnable active;
+        private Permission(StorageSetupScope scope, StorageSetupStateStore.Purpose purpose, Runnable active) {
+            this.scope = scope; this.purpose = purpose; this.active = active;
+        }
+        public StorageSetupScope scope() { return scope; }
+        public StorageSetupStateStore.Purpose purpose() { return purpose; }
+        @Override public void run() { active.run(); }
+        @Override public String toString() { return "SetupPermission[redacted]"; }
+    }
+
     /** Channel checks must use the server listener identity, never forwarded headers or client booleans. */
     public SetupCapabilityService(StorageSetupStateStore states, Clock clock, Runnable requireDeploymentOwner,
             Runnable requireManagementChannel, Runnable requireFirstAdminReadiness) {
@@ -69,7 +83,7 @@ public final class SetupCapabilityService {
     }
 
     /** Captures the original authorization; repeat this guard inside every final store transaction. */
-    public Runnable authorize(String token, StorageSetupScope expected, StorageSetupStateStore.Purpose purpose) {
+    public Permission authorize(String token, StorageSetupScope expected, StorageSetupStateStore.Purpose purpose) {
         requireManagementChannel.run();
         Current captured = current;
         if (captured == null || token == null || token.length() != 43
@@ -82,7 +96,7 @@ public final class SetupCapabilityService {
             states.requireCurrent(expected, purpose);
         };
         active.run();
-        return active;
+        return new Permission(expected, purpose, active);
     }
 
     /** Phase completion is durable; clearing local material never reopens its authority. */

@@ -4,12 +4,12 @@ import java.util.Objects;
 
 /** The original installation phase and capability generation, kept in the configuration authority. */
 public interface StorageSetupStateStore {
-    enum Phase { CONFIG_PREPARED, STORAGE_BOUND, COMPLETE }
+    enum Phase { LOCAL_SETUP, CONFIG_PREPARED, STORAGE_BOUND, COMPLETE }
     enum Purpose { SETUP, FIRST_ADMIN }
     record Status(StorageSetupScope scope, Phase phase, long bindingVersion) {
         public Status {
             Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(phase, "phase");
-            if (bindingVersion != (phase == Phase.CONFIG_PREPARED ? 0 : 1))
+            if (bindingVersion != (phase == Phase.LOCAL_SETUP || phase == Phase.CONFIG_PREPARED ? 0 : 1))
                 throw new IllegalArgumentException("setup phase and binding version disagree");
         }
     }

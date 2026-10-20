@@ -14,7 +14,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ControlApiSchemaTest {
 
     private static final Set<String> MCP_OPERATIONS = Set.of(
-            "system.version",
+            "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+            "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
             "connector.list", "connector.get",
             "source.draft", "source.list",
             "connection.test", "connection.test-result", "connection.discover-schema", "connection.schema",

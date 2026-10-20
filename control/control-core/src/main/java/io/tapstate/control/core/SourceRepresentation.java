@@ -154,6 +154,9 @@ public final class SourceRepresentation {
         connector.config().stream()
                 .filter(ConfigField::secret)
                 .forEach(field -> result.put(field.name(), field));
+        if (isMongoConnector(connector.id())) result.put(StorageSetupService.CA_BUNDLE_FIELD,
+                new ConfigField(StorageSetupService.CA_BUNDLE_FIELD, io.tapstate.core.catalog.ConfigType.STRING,
+                        Map.of(), false, null, true, List.of(), null));
         return result;
     }
 

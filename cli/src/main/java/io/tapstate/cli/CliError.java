@@ -206,6 +206,8 @@ enum CliError implements TapstateErrorCode {
     AUTH_LOGOUT_CACHE_CHANGED("cli.auth-logout-cache-changed", Set.of("context")),
 
     /** The persistent auth namespace was invoked with an invalid action or operand shape. */
+    STORAGE_USAGE("cli.storage-usage", Set.of(Names.REASON)),
+
     AUTH_USAGE("cli.auth-usage", Set.of(Names.REASON)),
 
     /** The interactive context manager could not continue with the current input or terminal state. */

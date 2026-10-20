@@ -26,11 +26,12 @@ import java.util.function.Supplier;
 /** One installation's tests and original binding publication, independent from business assembly. */
 public final class StorageSetupService {
     public enum Layer { CONFIG, CACHE, MASTER }
+    public static final String CA_BUNDLE_FIELD = "tlsCaPem";
     public static final Duration TEST_LIFETIME = Duration.ofMinutes(10);
     public record Candidate(StorageBinding.Connection configuration, StorageBinding.Connection cache,
             StorageBinding.Connection master) {
         public Candidate {
-            Objects.requireNonNull(configuration, "configuration"); Objects.requireNonNull(cache, "cache");
+            Objects.requireNonNull(cache, "cache");
             Objects.requireNonNull(master, "master");
         }
         StorageBinding.Connection connection(Layer layer) {
@@ -63,7 +64,7 @@ public final class StorageSetupService {
     private final StorageSetupStateStore states;
     private final StorageConnectionProbe probe;
     private final DefaultTarget target;
-    private final Supplier<StorageBinding.Connection> configuration;
+    private final Supplier<Optional<StorageBinding.Connection>> configuration;
     private final AuditGate audit;
     private final Clock clock;
     private final Runnable operationActive;
@@ -72,7 +73,7 @@ public final class StorageSetupService {
     private StorageBindingCommit pending;
 
     public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
-            StorageConnectionProbe probe, DefaultTarget target, Supplier<StorageBinding.Connection> configuration,
+            StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
             AuditGate audit, Clock clock, Runnable operationActive) {
         this.mode = Objects.requireNonNull(mode, "mode"); this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.states = Objects.requireNonNull(states, "states"); this.probe = Objects.requireNonNull(probe, "probe");
@@ -108,6 +109,7 @@ public final class StorageSetupService {
             Candidate candidate, Map<Layer,String> stamps) {
         active.run();
         Prepared prepared = prepare(candidate);
+        requireInstalledConfiguration(prepared.candidate().configuration());
         var guarded = bindings.guardedBy(active);
         Optional<StorageBinding> previous = guarded.load();
         if (previous.isEmpty()) {
@@ -152,8 +154,18 @@ public final class StorageSetupService {
     }
 
     private Prepared prepare(Candidate input) {
-        Candidate normalized = new Candidate(probe.normalize(input.configuration()), probe.normalize(input.cache()), probe.normalize(input.master()));
-        if (!normalized.configuration().equals(probe.normalize(configuration.get()))) throw conflict();
+        Objects.requireNonNull(input, "input");
+        var installed = configuration.get().map(probe::normalize);
+        StorageBinding.Connection config;
+        if (mode == StorageBinding.Mode.CLOUD) {
+            if (input.configuration() != null) throw conflict();
+            config = installed.orElseThrow(StorageSetupService::unavailable);
+        } else {
+            if (input.configuration() == null) throw conflict();
+            config = probe.normalize(input.configuration());
+            if (installed.isPresent() && !config.equals(installed.get())) throw conflict();
+        }
+        Candidate normalized = new Candidate(config, probe.normalize(input.cache()), probe.normalize(input.master()));
         if (java.util.stream.Stream.of(normalized.configuration(), normalized.cache(), normalized.master())
                 .map(StorageBinding.Connection::database).distinct().count() != Layer.values().length)
             throw new TapstateException(ControlError.STORAGE_DATABASES_OVERLAP, Map.of(), null);
@@ -164,6 +176,7 @@ public final class StorageSetupService {
                 target.definition(normalized.master(), StorageBinding.defaultSourceId(mode))));
         if (!source.id().equals(StorageBinding.defaultSourceId(mode)) || source.mode() != null || source.tables() != null
                 || source.srs() != null || source.execution() != null || !normalized.master().uri().equals(source.config().get("uri"))
+                || !Objects.equals(normalized.master().caPem(), source.config().get(CA_BUNDLE_FIELD))
                 || !source.connector().equals(normalized.master().kind() == StorageBinding.Connection.Kind.ATLAS ? "mongodb-atlas" : "mongodb")) throw conflict();
         String hash = CanonicalHash.ofText(JsonWriter.write(List.of(mode.name(), connectionTree(normalized.configuration()),
                 connectionTree(normalized.cache()), connectionTree(normalized.master()), CanonicalHash.of(source),
@@ -171,6 +184,14 @@ public final class StorageSetupService {
         return new Prepared(normalized, source, connector, hash);
     }
 
+    private void requireInstalledConfiguration(StorageBinding.Connection expected) {
+        var installed = configuration.get().map(probe::normalize).orElseThrow(StorageSetupService::unavailable);
+        if (!expected.equals(installed)) throw conflict();
+        if (states.load().phase() == StorageSetupStateStore.Phase.LOCAL_SETUP) throw unavailable();
+    }
+    private static TapstateException unavailable() {
+        return new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+    }
     private void requireTests(StorageSetupScope expected, Prepared prepared, Map<Layer,String> stamps) {
         if (stamps == null || stamps.size() != Layer.values().length) throw testsRequired();
         for (Layer layer : Layer.values()) {

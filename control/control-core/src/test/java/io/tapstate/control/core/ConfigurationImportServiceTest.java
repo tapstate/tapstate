@@ -23,13 +23,13 @@ class ConfigurationImportServiceTest {
     private static ConfigurationImportStore.Payload payload(List<Resource> resources, List<User> users) {
         return new ConfigurationImportStore.Payload(resources, users, List.of(), Map.of(), Map.of());
     }
-    private static final class Definitions implements ArtifactStore {
+    static final class Definitions implements ArtifactStore {
         boolean unavailable;
         @Override public void saveAll(List<Resource> resources) { throw new AssertionError("ordinary authoring writes are not import commits"); }
         @Override public Optional<Resource> get(String id) { if (unavailable) throw new AssertionError("completed import must not reload mutable definitions"); return Optional.empty(); }
         @Override public List<Resource> list() { if (unavailable) throw new AssertionError("completed import must not reload mutable definitions"); return List.of(); }
     }
-    private static final class Imports implements ConfigurationImportStore {
+    static final class Imports implements ConfigurationImportStore {
         Status status; Payload prepared; int admissions; int commits;
         @Override public ConfigurationImportStore guardedBy(Runnable active) {
             return new ConfigurationImportStore() {
@@ -60,7 +60,7 @@ class ConfigurationImportServiceTest {
             status = new Status(ticket, Phase.COMMITTED, 1, receipt); return receipt;
         }
     }
-    private static final class Codec implements ConfigurationImportService.TransferCodec {
+    static final class Codec implements ConfigurationImportService.TransferCodec {
         final Map<String,ConfigurationImportStore.Payload> packages = new HashMap<>();
         @Override public ConfigurationImportStore.Payload open(String packet,String key,Map<String,String> mapping) {
             var payload = packages.get(packet); if (payload == null) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "invalid test packet"), null);
@@ -70,7 +70,7 @@ class ConfigurationImportServiceTest {
             String packet = "prepared-" + packages.size(); packages.put(packet, prepared); return packet;
         }
     }
-    private static final class Fixture {
+    static final class Fixture {
         final Definitions definitions = new Definitions(); final Imports imports = new Imports(); final Codec codec = new Codec();
         final List<AuditRecord> records = new ArrayList<>();
         boolean auditAvailable = true;

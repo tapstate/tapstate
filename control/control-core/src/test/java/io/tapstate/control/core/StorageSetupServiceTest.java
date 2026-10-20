@@ -9,20 +9,20 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 class StorageSetupServiceTest {
-    private static final StorageSetupScope SCOPE = new StorageSetupScope("cluster", "installation", "operation", 1);
+    static final StorageSetupScope SCOPE = new StorageSetupScope("cluster", "installation", "operation", 1);
     private static StorageBinding.Connection connection(String database) {
         return new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                 "mongodb://user:sentinel-secret@host/" + database, database, null);
     }
-    private static final StorageSetupService.Candidate CANDIDATE = new StorageSetupService.Candidate(
+    static final StorageSetupService.Candidate CANDIDATE = new StorageSetupService.Candidate(
             connection("config"), connection("cache"), connection("master"));
-    private static final class Time extends Clock {
+    static final class Time extends Clock {
         Instant now = Instant.parse("2026-10-20T00:00:00Z");
         @Override public ZoneId getZone() { return ZoneOffset.UTC; }
         @Override public Clock withZone(ZoneId ignored) { return this; }
         @Override public Instant instant() { return now; }
     }
-    private static final class States implements StorageSetupStateStore {
+    static final class States implements StorageSetupStateStore {
         Status state = new Status(SCOPE, Phase.CONFIG_PREPARED, 0);
         @Override public StorageSetupStateStore guardedBy(Runnable active) { active.run(); return this; }
         @Override public Status load() { return state; }
@@ -31,7 +31,7 @@ class StorageSetupServiceTest {
             if (!state.scope().equals(expected) || state.phase() == Phase.COMPLETE) throw new TapstateException(ControlError.BOOTSTRAP_FORBIDDEN, Map.of(), null);
         }
     }
-    private static final class Binding implements StorageBindingStore {
+    static final class Binding implements StorageBindingStore {
         final States states;
         final Binding root;
         final Runnable active;
@@ -68,26 +68,28 @@ class StorageSetupServiceTest {
         }
         @Override public StorageBinding complete(StorageSetupScope expected) { throw new UnsupportedOperationException(); }
     }
-    private static final class Target implements StorageSetupService.DefaultTarget {
+    static final class Target implements StorageSetupService.DefaultTarget {
         StorageSetupService.ConnectorIdentity identity = new StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64));
         int tests;
         @Override public StorageSetupService.ConnectorIdentity identity(StorageBinding.Connection master) { return identity; }
         @Override public SourceResource definition(StorageBinding.Connection master, String id) {
-            return new SourceResource(id, null, "mongodb", Map.of("isUri", true, "uri", master.uri()), null, null, null, null);
+            return new SourceResource(id, null, master.kind() == StorageBinding.Connection.Kind.ATLAS ? "mongodb-atlas" : "mongodb", Map.of("isUri", true, "uri", master.uri()), null, null, null, null);
         }
         @Override public void test(StorageBinding.Connection master, SourceResource source, StorageSetupService.ConnectorIdentity original) { tests++; }
     }
-    private static final class Fixture {
+    static final class Fixture {
         final Time time = new Time(); final States states = new States(); final Binding binding = new Binding(states); final Target target = new Target();
         final List<AuditRecord> audit = new ArrayList<>();
         Runnable onAudit = () -> {};
         boolean operationAlive = true;
+        StorageBinding.Mode mode = StorageBinding.Mode.OP;
+        StorageBinding.Connection installedConfiguration = CANDIDATE.configuration();
         StorageConnectionProbe probe = new StorageConnectionProbe() {
             @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
             @Override public void test(StorageBinding.Connection input) {}
         };
         StorageSetupService service() {
-            return new StorageSetupService(StorageBinding.Mode.OP, binding, states, probe, target, CANDIDATE::configuration,
+            return new StorageSetupService(mode, binding, states, probe, target, () -> Optional.ofNullable(installedConfiguration),
                     new AuditGate(record -> { onAudit.run(); audit.add(record); }, time), time, () -> {
                         if (!operationAlive) throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
                     });
@@ -97,6 +99,33 @@ class StorageSetupServiceTest {
             for (var layer : StorageSetupService.Layer.values()) stamps.put(layer, service.test(SCOPE, () -> {}, candidate, layer).testStamp());
             return stamps;
         }
+    }
+    @Test void cloudConfigurationIsServerOwnedAndNeverRequiredFromTheBrowser() {
+        var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
+        var service = f.service();
+        var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://user:secret@customer/cache?tls=true", "cache", null);
+        var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://user:secret@customer/master?tls=true", "master", null);
+        assertThatCode(() -> service.test(SCOPE, () -> {}, new StorageSetupService.Candidate(null, cache, master), StorageSetupService.Layer.CONFIG))
+                .doesNotThrowAnyException();
+    }
+    @Test void anOpCandidateCanBeTestedBeforeItsConfigurationUriIsInstalled() {
+        var f = new Fixture(); f.installedConfiguration = null;
+        var service = f.service();
+        assertThatCode(() -> service.test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CONFIG)).doesNotThrowAnyException();
+    }
+    @Test void cloudCannotReplaceItsPlatformConfiguration() {
+        var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CONFIG))
+                .isInstanceOf(TapstateException.class).hasMessage(ControlError.STORAGE_SCOPE_CONFLICT.code());
+    }
+    @Test void opCommitWaitsForTheOriginalConfigurationHandoff() {
+        var f = new Fixture(); f.installedConfiguration = null;
+        var service = f.service(); var stamps = f.tested(service, CANDIDATE);
+        assertThatThrownBy(() -> service.commit("owner", SCOPE, () -> {}, CANDIDATE, stamps))
+                .isInstanceOf(TapstateException.class).hasMessage(ControlError.STORAGE_UNAVAILABLE.code());
+        assertThat(f.binding.inserts).isZero(); assertThat(f.audit).isEmpty();
+        f.installedConfiguration = CANDIDATE.configuration();
+        assertThat(service.commit("owner", SCOPE, () -> {}, CANDIDATE, stamps).bindingVersion()).isEqualTo(1);
     }
     @Test void formalLayerTestsPublishOneBindingAndAnExpiredRetryOnlyReadsTheOriginalResult() {
         var f = new Fixture(); var service = f.service(); var stamps = f.tested(service, CANDIDATE);
