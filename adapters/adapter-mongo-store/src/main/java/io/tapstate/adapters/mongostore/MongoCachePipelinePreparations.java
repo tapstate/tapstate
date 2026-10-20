@@ -138,6 +138,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                     .append("epoch", 0L).append("touchMillis", touchTime.toEpochMilli()).append("runtimeWriteFence", 1L));
             MongoOperatorInventory.prepareInitial(session, database, original.scope(), original.preparationId());
             MongoPipelineSourcePreparations.seedInitial(session,database,original.scope(),inputs);
+            MongoSnapshotStateStore.seedInitial(session,database,original.scope());
             return null;
         });
         requireActive.run();
@@ -151,7 +152,8 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
             new MongoCacheMetadataStructure(database,MongoRateHistoryStore.DEFAULT_RETENTION).verifyDirect();
             var original = MongoPipelineSourcePreparations.retained(session,database,scope);
             if (!original.sameRecovery(expected)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
-            MongoPipelineSourcePreparations.verifyAll(session,client,database,scope,original,requireActive); return null;
+            MongoPipelineSourcePreparations.verifyAll(session,client,database,scope,original,requireActive);
+            MongoSnapshotStateStore.order(session,database,scope); return null;
         });
     }
 
@@ -193,6 +195,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         MongoSinkPreparationStore.requireEmpty(session,database,scope);
         var inputs = MongoPipelineSourcePreparations.retained(session,database,scope);
         MongoPipelineSourcePreparations.verifyInitial(session,database,scope,inputs);
+        MongoSnapshotStateStore.verifyInitial(session,database,scope);
         try { MongoOperatorInventory.requireInitial(session, database, scope,
                 claimRow(session, scope).get("pipelinePreparation", Document.class).getString("preparationId")); }
         catch (TapstateException invalid) { throw rebuild(scope); }

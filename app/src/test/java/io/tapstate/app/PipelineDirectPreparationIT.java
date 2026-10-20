@@ -39,6 +39,109 @@ class PipelineDirectPreparationIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node","boot");
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-19T00:00:00Z"),ZoneOffset.UTC);
 
+    @Test void snapshotOnlyOrderAndCountsUseSeparateNativeResourcesAndSurviveOriginalScopeReopen() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",false,ReadMode.SNAPSHOT_ONLY,"latest",null));
+            var inputs = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims = f.cache.workloadClaims(f.business()); var initial = claims.readPipeline(f.scope).orElseThrow().claim();
+            var running = claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow(); var original = WorkloadClaimFence.from(running);
+            var capture = f.capture(original,inputs); var preparation = f.configuration.capturePreparations().read(f.business(),capture.key().resourceId()).orElseThrow();
+            var captured = f.cache.capturePreparations(f.business(),ACTIVE).load(preparation); var captures = Map.of("input",captured);
+            assertThat(captured.preparation().mode()).isEqualTo(CapturePreparation.Mode.SNAPSHOT_ONLY);
+            var snapshots = f.cache.snapshotStates(f.scope,original,ACTIVE); assertThat(snapshots.order()).isZero();
+            assertThat(snapshots.advanceOrder(0,7,captures)).isEqualTo(8);
+            assertThat(snapshots.advanceOrder(0,7,captures)).isEqualTo(8);
+            snapshots.recordCount("input","orders",8,12); snapshots.recordCount("input","quiet",8,0);
+            assertThat(snapshots.count("input","orders",8)).hasValue(12);
+            assertThat(snapshots.count("input","quiet",8)).hasValue(0);
+            assertThat(snapshots.count("input","orders",7)).isEmpty();
+            var order = f.cacheDatabase.getCollection("snapshot_orders").find().first();
+            assertThat(order.keySet()).containsExactlyInAnyOrder("_id","formatVersion","order","previousOrder","retainedFloor","command","captures");
+            assertThat(f.cacheDatabase.getCollection("snapshot_counts").find().first().keySet()).containsExactlyInAnyOrder("_id","formatVersion","snapshotEpoch","rows");
+            try (var reopened = MongoCacheDomain.connect(f.cacheConnection,Duration.ofSeconds(5),"snapshot-reopen")) {
+                var same = reopened.snapshotStates(f.scope,original,ACTIVE); assertThat(same.order()).isEqualTo(8);
+                assertThat(same.count("input","orders",8)).hasValue(12);
+                var next = WorkloadClaimFence.from(claims.advanceExecution(running,1,Set.of(OWNER.nodeId())).orElseThrow());
+                assertThatThrownBy(snapshots::order).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> snapshots.recordCount("input","orders",8,99)).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> snapshots.count("input","orders",8)).isInstanceOf(TapstateException.class);
+                var current = reopened.snapshotStates(f.scope,next,ACTIVE);
+                assertThat(current.advanceOrder(8,7,captures)).isEqualTo(9);
+                assertThat(current.count("input","orders",8)).hasValue(12);
+                current.recordCount("input","orders",9,3);
+                assertThat(current.count("input","orders",8)).isEmpty(); assertThat(current.count("input","orders",9)).hasValue(3);
+                assertThatThrownBy(() -> current.recordCount("input","orders",8,100)).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> current.recordCount("input","foreign",9,100)).isInstanceOf(TapstateException.class);
+            }
+            assertThat(f.cacheDatabase.getCollection("srs_chains").countDocuments()).isZero();
+            assertThat(f.cacheDatabase.getCollection("direct_channel_offsets").countDocuments()).isZero();
+            assertThat(f.configDatabase.listCollectionNames()).doesNotContain("snapshot_orders","snapshot_counts");
+        });
+    }
+    @Test void concurrentSnapshotOrderRetriesShareOneOriginalExecutionAllocation() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",false,ReadMode.SNAPSHOT_ONLY,"latest",null));
+            var inputs = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims = f.cache.workloadClaims(f.business()); var initial = claims.readPipeline(f.scope).orElseThrow().claim();
+            var original = WorkloadClaimFence.from(claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow());
+            var capture = f.capture(original,inputs); var prepared = f.configuration.capturePreparations().read(f.business(),capture.key().resourceId()).orElseThrow();
+            var captures = Map.of("input",f.cache.capturePreparations(f.business(),ACTIVE).load(prepared));
+            var snapshots = f.cache.snapshotStates(f.scope,original,ACTIVE);
+            try (var executor = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+                var start = new java.util.concurrent.CountDownLatch(1);
+                var a = executor.submit(() -> { start.await(); return snapshots.advanceOrder(0,0,captures); });
+                var b = executor.submit(() -> { start.await(); return snapshots.advanceOrder(0,0,captures); }); start.countDown();
+                assertThat(a.get(10,java.util.concurrent.TimeUnit.SECONDS)).isOne();
+                assertThat(b.get(10,java.util.concurrent.TimeUnit.SECONDS)).isOne();
+            }
+            assertThat(snapshots.order()).isOne();
+            assertThat(f.cacheDatabase.getCollection("snapshot_orders").countDocuments()).isOne();
+        });
+    }
+    @Test void missingKnownSnapshotOrderCannotBeReseededByPreparationOrAnOrdinaryRun() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",false,ReadMode.SNAPSHOT_ONLY,"latest",null));
+            var inputs = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims = f.cache.workloadClaims(f.business()); var initial = claims.readPipeline(f.scope).orElseThrow().claim();
+            var original = WorkloadClaimFence.from(claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow());
+            var capture = f.capture(original,inputs); var prepared = f.configuration.capturePreparations().read(f.business(),capture.key().resourceId()).orElseThrow();
+            var captures = Map.of("input",f.cache.capturePreparations(f.business(),ACTIVE).load(prepared));
+            var snapshots = f.cache.snapshotStates(f.scope,original,ACTIVE); snapshots.advanceOrder(0,0,captures);
+            snapshots.recordCount("input","orders",1,12);
+            f.cacheDatabase.getCollection("snapshot_orders").deleteMany(new Document());
+            assertThatThrownBy(snapshots::order).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> snapshots.advanceOrder(0,0,captures)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.preparer(f.configuration,f.cache).prepare(f.scope,inputs)).isInstanceOf(TapstateException.class);
+            assertThat(f.cacheDatabase.getCollection("snapshot_orders").countDocuments()).isZero();
+            assertThat(f.cacheDatabase.getCollection("snapshot_counts").countDocuments()).isOne();
+        });
+    }
+    @Test void aDirectCaptureCannotAuthorizeSnapshotOnlyOrderAllocation() {
+        withFixture(f -> {
+            var inputs = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims = f.cache.workloadClaims(f.business()); var initial = claims.readPipeline(f.scope).orElseThrow().claim();
+            var original = WorkloadClaimFence.from(claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow());
+            var capture = f.capture(original,inputs); var prepared = f.configuration.capturePreparations().read(f.business(),capture.key().resourceId()).orElseThrow();
+            var captures = Map.of("input",f.cache.capturePreparations(f.business(),ACTIVE).load(prepared));
+            var snapshots = f.cache.snapshotStates(f.scope,original,ACTIVE);
+            assertThatThrownBy(() -> snapshots.advanceOrder(0,0,captures)).isInstanceOf(TapstateException.class);
+            assertThat(snapshots.order()).isZero();
+        });
+    }
+    @Test void aReleasedOriginalSnapshotCaptureCannotAllocateANewOrderOrChangeTheCheckpoint() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",false,ReadMode.SNAPSHOT_ONLY,"latest",null));
+            var inputs=f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims=f.cache.workloadClaims(f.business()); var initial=claims.readPipeline(f.scope).orElseThrow().claim();
+            var original=WorkloadClaimFence.from(claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow());
+            var capture=f.capture(original,inputs); var prepared=f.configuration.capturePreparations().read(f.business(),capture.key().resourceId()).orElseThrow();
+            var captures=Map.of("input",f.cache.capturePreparations(f.business(),ACTIVE).load(prepared));
+            assertThat(claims.release(claims.read(capture.key()).orElseThrow().claim())).isTrue();
+            var snapshots=f.cache.snapshotStates(f.scope,original,ACTIVE); var before=f.cacheSnapshot();
+            assertThatThrownBy(() -> snapshots.advanceOrder(0,0,captures)).isInstanceOf(TapstateException.class);
+            assertThat(snapshots.order()).isZero(); assertThat(f.cacheSnapshot()).isEqualTo(before);
+        });
+    }
     @Test void nativeProducerAndSerializedWriterCallbacksSettleOnlyTheCompletePrefixAndReopenAtItsActualToken() {
         withFixture(f -> {
             var inputs = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
@@ -311,7 +414,7 @@ class PipelineDirectPreparationIT {
         Document claim() { return cacheDatabase.getCollection("workload_claims").find(new Document("_id.resourceType","PIPELINE_ACTUATION")).first(); }
         Map<String,List<Document>> cacheSnapshot() {
             var out = new TreeMap<String,List<Document>>();
-            for (String table : List.of("workload_claims","pipeline_state","direct_channel_offsets","direct_batches","operator_cleanup"))
+            for (String table : List.of("workload_claims","pipeline_state","direct_channel_offsets","direct_batches","operator_cleanup","snapshot_orders","snapshot_counts"))
                 out.put(table,cacheDatabase.getCollection(table).find().sort(new Document("_id",1)).into(new ArrayList<>()));
             return out;
         }

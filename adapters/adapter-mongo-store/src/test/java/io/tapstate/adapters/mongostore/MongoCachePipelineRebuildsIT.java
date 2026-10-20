@@ -43,6 +43,40 @@ class MongoCachePipelineRebuildsIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static MongoDBContainer mongo() { return new MongoDBContainer(DockerImageName.parse("mongo:7.0")); }
 
+    @Test void successorHasItsOwnPreparedSnapshotOrderBeforeAValidNewGenerationCanStart() {
+        withFixture(f -> {
+            var pending=f.pending(0); f.rebuilds().prepare(pending,f.node,TTL,AT);
+            var scope=pending.request().targetScope(); var encoded=MongoPipelinePreparationFacts.scope(scope);
+            assertThat(SystemCollections.CACHE_SNAPSHOT_ORDERS.on(f.cache).find(new Document("_id",encoded)).first()).isNotNull();
+            f.domain.pipelinePreparations(f.business,ACTIVE).verifySources(scope,pending.request().inputs());
+            try(var session=f.cacheClient.startSession()) {
+                session.withTransaction(() -> { MongoSnapshotStateStore.verifyInitial(session,f.cache,scope);return null; });
+            }
+            var beforeOrders=SystemCollections.CACHE_SNAPSHOT_ORDERS.on(f.cache).find().sort(new Document("_id",1)).into(new ArrayList<>());
+            var beforeCounts=SystemCollections.CACHE_SNAPSHOT_COUNTS.on(f.cache).find().into(new ArrayList<>());
+            var beforeState=f.state(); var beforeClaim=f.claim(); var again=f.rebuilds().prepare(pending,f.node,TTL,AT);
+            assertThat(again.preparation().request().targetScope()).isEqualTo(scope);
+            assertThat(SystemCollections.CACHE_SNAPSHOT_ORDERS.on(f.cache).find().sort(new Document("_id",1)).into(new ArrayList<>())).isEqualTo(beforeOrders);
+            assertThat(SystemCollections.CACHE_SNAPSHOT_COUNTS.on(f.cache).find().into(new ArrayList<>())).isEqualTo(beforeCounts);
+            assertThat(f.state()).isEqualTo(beforeState); assertThat(f.claim()).isEqualTo(beforeClaim);
+        });
+    }
+
+    @Test void receiptReplayRefusesLostSnapshotOrderOrUnexpectedMeasurementsWithoutRepair() {
+        withFixture(f -> {
+            var pending=f.pending(0); f.rebuilds().prepare(pending,f.node,TTL,AT);
+            var encoded=MongoPipelinePreparationFacts.scope(pending.request().targetScope());
+            var orders=SystemCollections.CACHE_SNAPSHOT_ORDERS.on(f.cache); var initial=orders.find(new Document("_id",encoded)).first();
+            orders.deleteOne(new Document("_id",encoded)); var before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+            orders.insertOne(initial);
+            SystemCollections.CACHE_SNAPSHOT_COUNTS.on(f.cache).insertOne(new Document("_id",new Document("scope",encoded)).append("unknown",true)); before=f.snapshot();
+            assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void successorRetainsExecutionHistoryAndPipelineTopologyWithAZeroTopologyNode() {
         withFixture(f -> {
             var old = f.claim();
@@ -113,7 +147,8 @@ class MongoCachePipelineRebuildsIT {
                     Map.entry(SystemCollections.CACHE_JOIN_INDEXES,new Document("placement",new Document("scope",scope))),
                     Map.entry(SystemCollections.CACHE_JOIN_WRITERS,new Document("placement",new Document("scope",scope))),
                     Map.entry(SystemCollections.CACHE_NEST_SHAPES,new Document("scope",scope)),Map.entry(SystemCollections.CACHE_OPERATOR_CLEANUP,scope),
-                    Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,new Document("scope",scope)),Map.entry(SystemCollections.DIRECT_BATCHES,new Document("channel",new Document("scope",scope))));
+                    Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,new Document("scope",scope)),Map.entry(SystemCollections.DIRECT_BATCHES,new Document("channel",new Document("scope",scope))),
+                    Map.entry(SystemCollections.CACHE_SNAPSHOT_ORDERS,scope),Map.entry(SystemCollections.CACHE_SNAPSHOT_COUNTS,new Document("scope",scope)));
             for (var fixture:fixtures) {
                 var table=fixture.getKey().on(f.cache); table.insertOne(new Document("_id",fixture.getValue()).append("unknown",true));var before=f.snapshot();
                 assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED); assertThat(f.snapshot()).as(fixture.getKey().name()).isEqualTo(before);

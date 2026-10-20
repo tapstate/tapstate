@@ -191,6 +191,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs));
     }
 
+    @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence original,Runnable requireActive) {
+        if (Objects.requireNonNull(original,"original").executionGeneration()<1) throw MongoCachePipelineAccess.claimFenced();
+        return new MongoSnapshotStateStore(pipelineAccess(scope,original,requireActive));
+    }
+
     /** The private direct-channel view retains this exact CACHE identity, client and lifecycle. */
     @Override public io.tapstate.spi.store.DirectChannelStore directChannels(CacheBusinessScope expected,Runnable requireActive) {
         Objects.requireNonNull(requireActive,"requireActive");

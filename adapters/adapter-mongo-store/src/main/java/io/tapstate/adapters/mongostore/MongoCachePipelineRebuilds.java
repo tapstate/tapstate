@@ -56,7 +56,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                         structure.verifyDirect(); structure.verifySrs();
                         for (var table : COLD) structure.verifyFacet(table);
                         for (var table : List.of(SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_OPERATOR_CLEANUP,
-                                SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY, SystemCollections.CACHE_SINK_PREPARATIONS)) structure.verifyFacet(table);
+                                SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY, SystemCollections.CACHE_SINK_PREPARATIONS,
+                SystemCollections.CACHE_SNAPSHOT_ORDERS,SystemCollections.CACHE_SNAPSHOT_COUNTS)) structure.verifyFacet(table);
                         var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
                         var filter = new Document("_id", MongoWorkloadClaimStore.id(request.originalClaim().key()));
                         Document row = claims.find(session, filter).first();
@@ -105,6 +106,7 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                         discardObservation(session, old);
                         MongoOperatorInventory.prepareInitial(session, database, target, original.preparationId());
                         MongoPipelineSourcePreparations.seedInitial(session, database, target, request.inputs());
+                        MongoSnapshotStateStore.seedInitial(session,database,target);
                         active(original); return receipt;
                     }, TRANSACTION);
                 }
@@ -139,6 +141,7 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
             MongoOperatorInventory.requireInitial(session, database, target, original.preparationId());
             MongoOperatorInventory.requireRetired(session, database, original);
             MongoPipelineSourcePreparations.verifyInitial(session, database, target, original.request().inputs());
+            MongoSnapshotStateStore.verifyInitial(session,database,target);
             if (SystemCollections.CACHE_PIPELINE_OBSERVATION.on(database).find(session, new Document("_id", target.pipelineId())).first() != null) throw rebuild(target);
             return receipt;
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw rebuild(target); }
@@ -149,11 +152,14 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
         requireEmptyPayloads(session, target);
         absent(session, SystemCollections.CACHE_OPERATOR_CLEANUP, new Document("_id", encoded), target);
         MongoPipelineSourcePreparations.requireEmpty(session, database, target);
+        absent(session,SystemCollections.CACHE_SNAPSHOT_ORDERS,new Document("_id",encoded),target);
+        absent(session,SystemCollections.CACHE_SNAPSHOT_COUNTS,new Document("_id.scope",encoded),target);
     }
     private void requireEmptyPayloads(ClientSession session, PipelineIntentScope target) {
         var encoded = MongoPipelinePreparationFacts.scope(target); var structure = new MongoCacheMetadataStructure(database, retention);
         for (var table : COLD) { structure.verifyFacet(table); absent(session, table, new Document("_id.placement.scope", encoded), target); }
-        for (var table : List.of(SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY, SystemCollections.CACHE_SINK_PREPARATIONS)) structure.verifyFacet(table);
+        for (var table : List.of(SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY, SystemCollections.CACHE_SINK_PREPARATIONS,
+                SystemCollections.CACHE_SNAPSHOT_ORDERS,SystemCollections.CACHE_SNAPSHOT_COUNTS)) structure.verifyFacet(table);
         MongoSinkPreparationStore.requireEmpty(session,database,target);
         absent(session, SystemCollections.CACHE_NEST_SHAPES, new Document("_id.scope", encoded), target);
         absent(session, SystemCollections.CACHE_DERIVED_SCHEMAS, new Document("scope", encoded), target);

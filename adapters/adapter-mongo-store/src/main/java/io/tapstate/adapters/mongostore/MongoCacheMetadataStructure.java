@@ -28,7 +28,8 @@ final class MongoCacheMetadataStructure {
             SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES,
             SystemCollections.CACHE_CLUSTER_MEMBERSHIP, SystemCollections.CACHE_NEST_STATE, SystemCollections.CACHE_JOIN_FACTS,
             SystemCollections.CACHE_JOIN_DIMENSIONS, SystemCollections.CACHE_JOIN_INDEXES, SystemCollections.CACHE_JOIN_WRITERS,
-            SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_SINK_PREPARATIONS)).toList();
+            SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_SINK_PREPARATIONS,
+            SystemCollections.CACHE_SNAPSHOT_ORDERS,SystemCollections.CACHE_SNAPSHOT_COUNTS)).toList();
     private static final SystemCollections.IndexSpec FILE_NAMES = new SystemCollections.IndexSpec(
             List.of("filename", "uploadDate"), false, "filename_1_uploadDate_1");
     private static final SystemCollections.IndexSpec CHUNK_ORDER = new SystemCollections.IndexSpec(
