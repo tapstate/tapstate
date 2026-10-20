@@ -126,6 +126,8 @@ class HazelcastConfiguration {
             if (identity != null) {
                 identify(config, identity);
                 configureClusterProtection(config, membershipGate, clusterProperties.getProfile() != ClusterProperties.Profile.SINGLE);
+            } else {
+                identifyConfiguredSingleMember(config, clusterProperties, controlProperties, bootId);
             }
             member = startMember(() -> Hazelcast.newHazelcastInstance(config));
         } catch (RuntimeException | Error startupFailure) {
@@ -416,6 +418,23 @@ class HazelcastConfiguration {
         }
         member.getConfig().addMapConfig(protectIfCluster(
                 member, JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY)));
+    }
+
+    /** Publishes an explicitly configured single member without enabling distributed coordination. */
+    static void identifyConfiguredSingleMember(Config config, ClusterProperties cluster,
+            ControlEndpointProperties control, BootId bootId) {
+        if (!hasText(cluster.getNodeId())) {
+            return;
+        }
+        ClusterMemberPreflight.clusterId(cluster.getId());
+        config.getMemberAttributeConfig()
+                .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, cluster.getNodeId().trim())
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, bootId.value());
+        if (hasText(control.getAdvertiseUrl())) {
+            java.net.URI url = ClusterMemberPreflight.controlUrl(control.getAdvertiseUrl(), false);
+            config.getMemberAttributeConfig().setAttribute(
+                    ClusterMembershipGate.CONTROL_URL_ATTRIBUTE, url.toString());
+        }
     }
 
     /**

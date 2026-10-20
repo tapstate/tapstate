@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -42,6 +43,7 @@ final class NodeSessionLease implements AutoCloseable {
     private final Runnable lost;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean firstRenewal = new AtomicBoolean(true);
 
     /** When the lease the last accepted renewal bought runs out, on the monotonic clock. */
     private volatile long provenUntil;
@@ -90,26 +92,68 @@ final class NodeSessionLease implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
-        renewer.scheduleWithFixedDelay(
-                this::renew, renewInterval.toMillis(), renewInterval.toMillis(), TimeUnit.MILLISECONDS);
-        long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
-        renewer.scheduleWithFixedDelay(this::loseALapsedSession, lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        long adoptedAt = nanoTime.getAsLong();
+        LOG.info("Node session maintenance adopted [proof_age_ms={}, proof_remaining_ms={}, ttl_ms={}, renew_interval_ms={}].",
+                TimeUnit.NANOSECONDS.toMillis(adoptedAt - askedAt),
+                TimeUnit.NANOSECONDS.toMillis(provenUntil - adoptedAt), ttl.toMillis(), renewInterval.toMillis());
+        CountDownLatch registered = new CountDownLatch(1);
+        try {
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::renew),
+                    0, renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+            long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::loseALapsedSession),
+                    lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException | Error setupFailure) {
+            renewer.shutdownNow();
+            throw setupFailure;
+        } finally {
+            // A fast first refusal must not shut down the executor while its other task is being registered.
+            registered.countDown();
+        }
+    }
+
+    private static void afterRegistration(CountDownLatch registered, Runnable action) {
+        try {
+            registered.await();
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        action.run();
     }
 
     private void renew() {
-        if (!active()) return;
-        WorkloadClaim expected = current.get();
+        if (closed.get()) {
+            return;
+        }
+        long priorProofUntil = provenUntil;
         long askedAt = nanoTime.getAsLong();
+        if (!proofRemainsLive(priorProofUntil)) return;
+        WorkloadClaim expected = current.get();
+        boolean first = firstRenewal.compareAndSet(true, false);
+        if (first) {
+            LOG.info("Node session first renewal started [proof_remaining_ms={}].",
+                    TimeUnit.NANOSECONDS.toMillis(provenUntil - askedAt));
+        }
         try {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
+            long storeReturnedAt = nanoTime.getAsLong();
+            if (first) {
+                LOG.info("Node session first renewal store returned [elapsed_ms={}, matched={}].",
+                        TimeUnit.NANOSECONDS.toMillis(storeReturnedAt - askedAt), renewed.isPresent());
+            }
             if (renewed.isPresent()) {
-                if (closed.get()) return;
-                if (nanoTime.getAsLong() - provenUntil >= 0) {
-                    lose("the renewal arrived after the prior proof expired", null); return;
-                }
+                // A late store response cannot replace an already-lapsed local proof.
+                if (!proofRemainsLive(priorProofUntil)) return;
                 WorkloadClaim accepted = renewed.get();
                 current.set(accepted);
                 provenUntil = askedAt + ttl.toNanos();
+                if (first) {
+                    long completedAt = nanoTime.getAsLong();
+                    LOG.info("Node session first renewal accepted [elapsed_ms={}, proof_remaining_ms={}].",
+                            TimeUnit.NANOSECONDS.toMillis(completedAt - askedAt),
+                            TimeUnit.NANOSECONDS.toMillis(provenUntil - completedAt));
+                }
                 return;
             }
             lose("the stored owner or generation no longer matches", null);
@@ -135,6 +179,15 @@ final class NodeSessionLease implements AutoCloseable {
             return false;
         }
         return !closed.get();
+    }
+
+    private boolean proofRemainsLive(long deadline) {
+        if (closed.get()) return false;
+        if (nanoTime.getAsLong() - deadline >= 0) {
+            lose("no renewal was accepted within the lease the last one bought", null);
+            return false;
+        }
+        return true;
     }
 
     private void loseALapsedSession() {

@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
@@ -9,9 +11,12 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -151,14 +156,96 @@ class NodeSessionLeaseTest {
     @Test
     void aNodeFenceIsNotReturnedIfItsLocalDeadlineExpiresDuringCapture() throws Exception {
         var checks = new AtomicInteger(); var stopped = new CountDownLatch(1);
+        Thread caller = Thread.currentThread();
+        var capturing = new AtomicBoolean();
         var lease = new NodeSessionLease(new RecordingStore(true), CLAIM, 0, Duration.ofSeconds(30),
                 Duration.ofHours(1), stopped::countDown,
-                () -> checks.incrementAndGet() == 1 ? 0L : Duration.ofSeconds(30).toNanos());
+                () -> Thread.currentThread() == caller && capturing.get() && checks.incrementAndGet() > 1
+                        ? Duration.ofSeconds(30).toNanos() : 0L);
         try {
+            capturing.set(true);
             assertThat(lease.currentFence()).isEmpty();
             assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
         } finally { lease.close(); }
     }
+
+    @Test
+    void anExpiredLocalProofDoesNotAskTheStoreToCreateANewProof() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        CountDownLatch stopped = new CountDownLatch(1);
+        try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM,
+                System.nanoTime() - Duration.ofSeconds(1).toNanos(), Duration.ofMillis(200),
+                Duration.ofMillis(50), stopped::countDown)) {
+            assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
+            assertThat(store.renewed.getCount()).as("expired proof cannot be extended by a late store success").isEqualTo(1);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(FirstFailure.class)
+    void anImmediateFirstRefusalRunsOnlyAfterBothTasksAreRegistered(FirstFailure failure) throws Exception {
+        for (int race = 0; race < 20; race++) {
+            RecordingStore store = new RecordingStore(failure != FirstFailure.OWNER,
+                    failure == FirstFailure.STORE ? new TapstateException(IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "owned fixture store unavailable"), null) : null);
+            CountDownLatch stopped = new CountDownLatch(1);
+            AtomicInteger stops = new AtomicInteger();
+            try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM, System.nanoTime(),
+                    Duration.ofSeconds(2), Duration.ofSeconds(1), () -> {
+                        stops.incrementAndGet();
+                        stopped.countDown();
+                    })) {
+                assertThat(stopped.await(500, TimeUnit.MILLISECONDS))
+                        .as("the first refusal must not wait for the periodic renewal interval").isTrue();
+                assertThat(stops).hasValue(1);
+            }
+            assertThat(stops).hasValue(1);
+        }
+    }
+
+    @Test
+    void aLateSuccessfulResponseCannotExtendAnAlreadyLapsedProof() throws Exception {
+        Delay delay = new Delay();
+        RecordingStore store = new RecordingStore(true, null, delay);
+        CountDownLatch stopped = new CountDownLatch(1);
+        AtomicInteger stops = new AtomicInteger();
+        Duration ttl = Duration.ofSeconds(2);
+        long askedAt = System.nanoTime() - Duration.ofMillis(1500).toNanos();
+        long originalDeadline = askedAt + ttl.toNanos();
+        try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM, askedAt, ttl,
+                Duration.ofMillis(1800), () -> {
+                    stops.incrementAndGet();
+                    stopped.countDown();
+                })) {
+            assertThat(delay.entered.await(300, TimeUnit.MILLISECONDS)).as("the immediate renewal reached its held response").isTrue();
+            while (System.nanoTime() - originalDeadline < 0) Thread.sleep(5);
+            assertThat(stopped.getCount()).as("the coarse lapse checker has not run before the controlled return").isEqualTo(1);
+            delay.resume.countDown();
+            assertThat(stopped.await(300, TimeUnit.MILLISECONDS))
+                    .as("a response after the prior proof expired must fail closed before publishing a new proof").isTrue();
+            assertThat(stops).hasValue(1);
+            assertThat(lease.currentFence()).as("a late response cannot restore an expired fence").isEmpty();
+        } finally {
+            delay.resume.countDown();
+        }
+        assertThat(stops).hasValue(1);
+    }
+
+    private static final class Delay {
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch resume = new CountDownLatch(1);
+
+        private void block() {
+            entered.countDown();
+            try {
+                if (!resume.await(2, TimeUnit.SECONDS)) throw new AssertionError("owned successful response was not released");
+            } catch (InterruptedException stopped) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private enum FirstFailure { OWNER, STORE }
 
     /** A store whose renewals hang until {@link #answer} lets them go, as a frozen store's do. */
     private static final class SilentStore implements WorkloadClaimStore {
@@ -215,11 +302,23 @@ class NodeSessionLeaseTest {
         /** Nothing here reads the lease; it answers with a live one so a read is not a lapsed claim. */
         private static final Duration LIVE_LEASE = Duration.ofSeconds(30);
         private final boolean renews;
+        private final RuntimeException renewalFailure;
+        private final Delay delay;
         private final CountDownLatch renewed = new CountDownLatch(1);
         private final AtomicBoolean released = new AtomicBoolean();
 
         private RecordingStore(boolean renews) {
+            this(renews, null);
+        }
+
+        private RecordingStore(boolean renews, RuntimeException renewalFailure) {
+            this(renews, renewalFailure, null);
+        }
+
+        private RecordingStore(boolean renews, RuntimeException renewalFailure, Delay delay) {
             this.renews = renews;
+            this.renewalFailure = renewalFailure;
+            this.delay = delay;
         }
 
         @Override
@@ -231,6 +330,8 @@ class NodeSessionLeaseTest {
         @Override
         public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
             renewed.countDown();
+            if (delay != null) delay.block();
+            if (renewalFailure != null) throw renewalFailure;
             return renews ? Optional.of(expected) : Optional.empty();
         }
 
