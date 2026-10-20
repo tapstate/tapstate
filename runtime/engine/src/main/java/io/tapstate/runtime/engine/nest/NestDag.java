@@ -103,6 +103,13 @@ public final class NestDag {
             for (NestInbound edge : spec.inbound()) {
                 connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
             }
+            if (!spec.isAssembler()) {
+                String recoveryName = spec.name() + ".handoff-recovery";
+                Vertex recovery = dag.newVertex(recoveryName, ProcessorMetaSupplier.forceTotalParallelismOne(
+                        new HandoffSupplier(spec, binding.stores()), recoveryName));
+                dag.edge(width.into(Edge.from(recovery).to(vertex, spec.inbound().size()), spec.name(),
+                        (NestHandoffRecovery.Key key) -> key.value()).priority(-1));
+            }
             assembler = vertex;
         }
         // Drawn after the assembler and never mistaken for it: a lookup takes no part in assembly, and the
@@ -111,6 +118,20 @@ public final class NestDag {
             attachLookup(dag, lookup, built, upstream, binding, nextOutbound, frontier, width);
         }
         return assembler;
+    }
+
+    private static final class HandoffSupplier implements ProcessorSupplier {
+        private static final long serialVersionUID = 1L;
+        private final NestVertex vertex;
+        private final NestBinding.NestStores stores;
+        private transient NestHandoffRecovery.Pages pages;
+        HandoffSupplier(NestVertex vertex, NestBinding.NestStores stores) { this.vertex = vertex; this.stores = stores; }
+        @Override public void init(Context context) {
+            pages = stores.bind(context.hazelcastInstance()).handoffs(vertex);
+        }
+        @Override public Collection<? extends Processor> get(int count) {
+            return java.util.stream.IntStream.range(0, count).mapToObj(ignored -> new NestHandoffRecovery(pages)).toList();
+        }
     }
 
     /**

@@ -36,6 +36,75 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void pendingPagesStayWithinTheirOriginalPlacementAndRetireWithThePayload() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var writer = (NestStateStore) f.writer(at);
+            writer.saveNest(at.mapName(), "a", new byte[]{1}, new byte[]{10});
+            writer.saveNest(at.mapName(), "b", new byte[]{2}, new byte[]{20});
+            writer.save(at.mapName(), "ordinary", new byte[]{3});
+            var sibling = new OperatorPlacement(SCOPE, at.database(), at.resource(), at.stepId(), at.pathId(), "other");
+            ((NestStateStore) f.writer(sibling)).saveNest(sibling.mapName(), "c", new byte[]{4}, new byte[]{30});
+            var first = writer.pending(at.mapName(), null, 1);
+            assertThat(first).hasSize(1);
+            var second = writer.pending(at.mapName(), first.getFirst().cursor(), 1);
+            assertThat(second).hasSize(1);
+            assertThat(List.of(first.getFirst().key(), second.getFirst().key())).containsExactly(new byte[]{10}, new byte[]{20});
+            assertThat(writer.pending(at.mapName(), second.getFirst().cursor(), 1)).isEmpty();
+            writer.saveNest(at.mapName(), "a", new byte[]{5}, null);
+            assertThat(writer.load(at.mapName(), "a")).hasValue(new byte[]{5});
+            assertThat(writer.pending(at.mapName(), null, 64)).singleElement().satisfies(row -> assertThat(row.key()).containsExactly((byte)20));
+            assertThat(SystemCollections.CACHE_NEST_STATE.on(f.database).find(new Document("_id.key", OperatorStateText.encode("a"))).first())
+                    .containsEntry("formatVersion", 2).containsEntry("pending", false).doesNotContainKey("pendingKey");
+        });
+    }
+
+    @Test void pendingDiscoveryAndMutationRefuseAReleasedOriginalExecution() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var writer = (NestStateStore) f.writer(at);
+            writer.saveNest(at.mapName(), "a", new byte[]{1}, new byte[]{10});
+            assertThat(f.domain.workloadClaims(BUSINESS).release(f.claim)).isTrue();
+            var before = f.snapshot();
+            code(() -> writer.pending(at.mapName(), null, 64), IoError.WORKLOAD_CLAIM_FENCED);
+            code(() -> writer.saveNest(at.mapName(), "a", new byte[]{2}, null), IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void ordinaryPendingAccessCannotRepairAMissingDeclaredIndexOrReadOldRows() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var writer = (NestStateStore) f.writer(at);
+            writer.saveNest(at.mapName(), "a", new byte[]{1}, new byte[]{10});
+            var table = SystemCollections.CACHE_NEST_STATE.on(f.database);
+            table.updateOne(new Document(), new Document("$set", new Document("formatVersion", 1)));
+            code(() -> writer.pending(at.mapName(), null, 64), IoError.DOCUMENT_UNREADABLE);
+            code(() -> writer.load(at.mapName(), "a"), IoError.DOCUMENT_UNREADABLE);
+            table.updateOne(new Document(), new Document("$set", new Document("formatVersion", 2)));
+            table.dropIndex("pending_handoffs"); var before = f.snapshot();
+            code(() -> writer.pending(at.mapName(), null, 64), IoError.DOCUMENT_UNREADABLE);
+            code(() -> writer.saveNest(at.mapName(), "a", new byte[]{2}, null), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(table.listIndexes()).extracting(index -> index.getString("name")).doesNotContain("pending_handoffs");
+        });
+    }
+
+    @Test void aGuardLostAfterTheNestWriteRollsBackPayloadAndPendingMetadataTogether() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var before = f.snapshot(); var lost = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("nest_state")) lost.set(true);
+            }};
+            try (var observed = observed(listener)) {
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(observed, observed.getDatabase(f.database.getName()),
+                        SCOPE, WorkloadClaimFence.from(f.claim), () -> {
+                    if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                }), at);
+                code(() -> writer.saveNest(at.mapName(), "a", new byte[]{1}, new byte[]{10}), IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
+            }
+        });
+    }
+
     @Test void losingBothKnownShapeAndColdBytesStillCannotBecomeANewFirstShape() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});

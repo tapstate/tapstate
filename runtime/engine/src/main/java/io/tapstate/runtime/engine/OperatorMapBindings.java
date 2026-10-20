@@ -7,6 +7,7 @@ import com.hazelcast.map.IMap;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.NestStateStore;
 import io.tapstate.spi.store.OperatorPlacement;
 
 import java.util.ArrayList;
@@ -191,7 +192,7 @@ public final class OperatorMapBindings implements AutoCloseable {
     }
 
     /** A name selects this local placeholder, but never supplies a cold location or authorization. */
-    private final class PendingStore implements KeyedStateStore {
+    private final class PendingStore implements NestStateStore {
         final String name, database;
         final boolean nest;
         Bound bound;
@@ -215,6 +216,12 @@ public final class OperatorMapBindings implements AutoCloseable {
         @Override public void delete(String namespace, String key) { delegate(namespace).delete(namespace, key); }
         @Override public void dropNamespace(String namespace) { delegate(namespace).dropNamespace(namespace); }
         @Override public long count(String namespace) { return delegate(namespace).count(namespace); }
+        @Override public void saveNest(String namespace, String key, byte[] state, byte[] pendingKey) {
+            nestStore(delegate(namespace)).saveNest(namespace, key, state, pendingKey);
+        }
+        @Override public List<NestStateStore.Pending> pending(String namespace, String after, int limit) {
+            return nestStore(delegate(namespace)).pending(namespace, after, limit);
+        }
     }
 
     /** Captures one installed slot, so a late diagnostic callback cannot follow its replacement. */
@@ -233,7 +240,7 @@ public final class OperatorMapBindings implements AutoCloseable {
 
     private KeyedStateStore forMap(Bound original, KeyedStateStore cold) {
         String hotName = original.binding.mapName(); String coldName = original.binding.placement().mapName();
-        return new KeyedStateStore() {
+        return new NestStateStore() {
             private void check(String namespace) { if (!hotName.equals(namespace)) throw fenced(); original.requireActive(); }
             @Override public Optional<byte[]> load(String namespace, String key) { check(namespace); return cold.load(coldName, key); }
             @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { check(namespace); return cold.loadAll(coldName, keys); }
@@ -242,7 +249,22 @@ public final class OperatorMapBindings implements AutoCloseable {
             @Override public void delete(String namespace, String key) { check(namespace); cold.delete(coldName, key); }
             @Override public void dropNamespace(String namespace) { check(namespace); cold.dropNamespace(coldName); }
             @Override public long count(String namespace) { check(namespace); return cold.count(coldName); }
+            @Override public void saveNest(String namespace, String key, byte[] state, byte[] pendingKey) {
+                check(namespace);
+                if (cold instanceof NestStateStore nest) nest.saveNest(coldName, key, state, pendingKey);
+                else {
+                    if (pendingKey != null) throw fenced();
+                    cold.save(coldName, key, state);
+                }
+            }
+            @Override public List<NestStateStore.Pending> pending(String namespace, String after, int limit) {
+                check(namespace); return nestStore(cold).pending(coldName, after, limit);
+            }
         };
+    }
+    private static NestStateStore nestStore(KeyedStateStore store) {
+        if (!(store instanceof NestStateStore nest)) throw fenced();
+        return nest;
     }
     private Bound require(String name) { requireOpen(); Bound held = hotMaps.get(name); if (held == null) throw fenced(); held.requireActive(); return held; }
     private void requireNoMap(String name) {

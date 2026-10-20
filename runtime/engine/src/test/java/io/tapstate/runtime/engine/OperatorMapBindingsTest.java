@@ -51,6 +51,24 @@ class OperatorMapBindingsTest {
         fenced(() -> hot.save("foreign", "key",new byte[]{1}));
     }
 
+    @Test void pendingDiscoveryRetainsTheCapturedNamespaceAndRefusesReplacedHandles() {
+        var cold = new RecordingStore(); var original = binding(placement(OperatorPlacement.Resource.NEST_STATE, "root"), 1);
+        var registry = OperatorMapBindings.bindTo(member(), (binding, active) -> cold);
+        var waiting = (NestStateStore) registry.initializingNest(original.mapName(), "cache");
+        fenced(() -> waiting.pending(original.mapName(), null, 64));
+        registry.attachExisting(List.of(original));
+        waiting.saveNest(original.mapName(), "key", new byte[]{1}, new byte[]{2});
+        waiting.pending(original.mapName(), null, 64);
+        var captured = (NestStateStore) registry.nest(original.mapName(), "cache");
+        assertThat(cold.calls).containsExactly(new Call("saveNest", original.placement().mapName()), new Call("pending", original.placement().mapName()));
+        fenced(() -> captured.pending("foreign", null, 64));
+        registry.install(List.of(binding(original.placement(), 2)));
+        fenced(() -> captured.pending(original.mapName(), null, 64));
+        fenced(() -> waiting.pending(original.mapName(), null, 64));
+        fenced(() -> captured.saveNest(original.mapName(), "key", new byte[]{3}, null));
+        assertThat(cold.calls).hasSize(2);
+    }
+
     @Test void aFinalPreparationCallbackCannotReviveTheOriginalBindingItRetired() {
         var member = member(); var original = binding(placement(OperatorPlacement.Resource.JOIN_FACTS,"facts"),1);
         var registry = OperatorMapBindings.bindTo(member,(binding,active) -> new RecordingStore()); registry.install(List.of(original));
@@ -205,7 +223,7 @@ class OperatorMapBindingsTest {
     }
 
     private record Call(String operation,String namespace) {}
-    private static final class RecordingStore implements KeyedStateStore {
+    private static final class RecordingStore implements NestStateStore {
         final List<Call> calls = new ArrayList<>();
         @Override public Optional<byte[]> load(String ns,String key) { calls.add(new Call("load",ns)); return Optional.empty(); }
         @Override public Map<String,byte[]> loadAll(String ns,Collection<String> keys) { calls.add(new Call("loadAll",ns)); return Map.of(); }
@@ -214,6 +232,8 @@ class OperatorMapBindingsTest {
         @Override public void delete(String ns,String key) { calls.add(new Call("delete",ns)); }
         @Override public void dropNamespace(String ns) { calls.add(new Call("drop",ns)); }
         @Override public long count(String ns) { calls.add(new Call("count",ns)); return 0; }
+        @Override public void saveNest(String ns,String key,byte[] value,byte[] pending) { calls.add(new Call("saveNest",ns)); }
+        @Override public List<Pending> pending(String ns,String after,int limit) { calls.add(new Call("pending",ns)); return List.of(); }
     }
 
 }

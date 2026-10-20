@@ -68,3 +68,47 @@ Other exact-head failures:
   Authenticated exact-head Sonar evidence helper: status=unavailable, reason=analysis-missing,
     analysis_date=null, gate=null, issues=[]. A new head must run CI and refresh Sonar evidence before readiness.
   e2e-admission passed; both e2e test shards passed. No waiver is justified or requested.
+
+Issue 819: recovery discovery must follow the approved storage and input boundary.
+Baseline: c134884574522aba3956b73ce4784f32778666d8 on ws/issue-819.
+Case: ADeferredParkingHandoffStaysDurableTest#aColdRestartMustFindAnOutstandingHandoffWithoutAnotherEventForItsKey
+
+Golden current state and inputs:
+  runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/ResolverState.java
+    serialVersionUID = 1L
+    durable release = {order, covered, deliveries, children}
+  adapters/adapter-mongo-store/src/main/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStore.java
+    row = {_id: {placement: address, key: encodedKey}, formatVersion: 1, state: Binary}
+    ordinary decode accepts formatVersion 1 only.
+  runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/ADeferredParkingHandoffStaysDurableTest.java
+    ColdState implements NestStore<ResolverState> with serialized point load/save/remove/count.
+    The restarted ResolverProcessor is opened directly; no recovery source is constructed or fed.
+    Three idle turns follow, without another source event for the key.
+    Parking removal and durable pending == 2 pass before the final recovery assertion.
+    The restarted outbox is []; the assertion requires the retained K2 child.
+
+Required boundary, restated without a private provenance reference:
+  Pending discovery belongs to an indexed flag and original key encoding on the same nest_state row.
+  Payload and discovery facts commit together under the original full CACHE execution claim/fence.
+  A typed port pages only pending rows in the original scope/namespace with a bounded page size.
+  Its recovery source feeds the original partitioned edge before current business input and frontiers.
+  Ordinary KeyedStateStore enumeration remains absent and MapStore.loadAllKeys remains empty.
+  Controlled new-layout preparation creates the declared index; ordinary access refuses a missing index.
+  Row format 2 and Resolver UID 2 explicitly refuse old bytes; no implicit empty-field migration.
+
+Conflict captured before fixture adaptation was authorized:
+  The saved probe has neither that typed store capability nor recovery-source startup wiring.
+  An auxiliary bucket index can make the unchanged case pass but does not satisfy same-row atomicity
+  or the approved recovery edge. That prototype was removed; no repair was retained at that checkpoint.
+  Exercising the actual production mechanism requires adapting the cold fixture/startup wiring while
+  preserving the no-input scenario, assertions and saved command. The current instruction forbids
+  editing the case, so that adaptation was not silently applied.
+  The stored-shape golden was unchanged at that checkpoint.
+
+Authorized resolution:
+  Adapt only the fixture and startup wiring; preserve the no-input scenario, assertions and command.
+  NestStateStore now carries same-row pending metadata and a bounded pending-only page operation.
+  The Mongo path retains the original placement and full claim transaction for both pages and writes.
+  NestDag attaches the recovery source to the original keyed edge at higher priority than live input.
+  The new cold format and Resolver UID explicitly refuse old bytes; shape goldens record that boundary.
+  Disabling the recovery attachment makes the real cold-restart case fail with [], not a setup error.

@@ -2,7 +2,6 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.model.ReplaceOptions;
-import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.OperatorPlacement;
 import org.bson.Document;
 import org.bson.types.Binary;
@@ -15,7 +14,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /** Opaque operator bytes, split by resource type and fenced by the original Pipeline execution. */
-final class MongoCacheOperatorStateStore implements KeyedStateStore {
+final class MongoCacheOperatorStateStore implements io.tapstate.spi.store.NestStateStore {
     private static final int BATCH_KEYS = 256;
     private static final int BATCH_BYTES = 4 * 1024 * 1024;
     private final MongoCachePipelineAccess access;
@@ -79,9 +78,39 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
     }
 
     @Override public void save(String namespace, String key, byte[] state) {
+        saveNest(namespace, key, state, null);
+    }
+
+    @Override public void saveNest(String namespace, String key, byte[] state, byte[] pendingKey) {
         requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
+        byte[] pending = pendingKey == null ? null : pendingKey.clone();
+        if (pending != null && placement.resource() != OperatorPlacement.Resource.NEST_STATE) throw MongoCachePipelineAccess.fenced();
         transaction(true, session -> {
-            table.on(target).replaceOne(session, new Document("_id", id), row(id, captured), new ReplaceOptions().upsert(true)); return null;
+            table.on(target).replaceOne(session, new Document("_id", id), row(id, captured, pending), new ReplaceOptions().upsert(true)); return null;
+        });
+    }
+
+    @Override public List<Pending> pending(String namespace, String after, int limit) {
+        requireNamespace(namespace);
+        if (placement.resource() != OperatorPlacement.Resource.NEST_STATE) throw MongoCachePipelineAccess.fenced();
+        if (limit < 1 || limit > BATCH_KEYS) throw new IllegalArgumentException("invalid pending page limit");
+        // A page is authorized by the exact original claim inside the same transaction as the read.
+        return transaction(false, session -> {
+            access.proveClaim(session);
+            var filter = new Document("_id.placement", address).append("pending", true);
+            if (after != null) filter.append("_id.key", new Document("$gt", after));
+            var found = new java.util.ArrayList<Pending>();
+            for (Document value : table.on(target).find(session, filter)
+                    .projection(new Document("_id", 1).append("formatVersion", 1).append("pendingKey", 1))
+                    .hintString("pending_handoffs").sort(new Document("_id.key", 1)).limit(limit)) {
+                if (!(value.get("_id") instanceof Document stored) || !address.equals(stored.get("placement"))
+                        || !(stored.get("key") instanceof String cursor)
+                        || !Integer.valueOf(2).equals(value.get("formatVersion"))
+                        || !(value.get("pendingKey") instanceof Binary key) || key.getType() != 0)
+                    throw access.unreadable("nest-pending");
+                found.add(new Pending(cursor, key.getData()));
+            }
+            return List.copyOf(found);
         });
     }
 
@@ -90,7 +119,7 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
         return transaction(true, session -> {
             Document before = table.on(target).find(session, new Document("_id", id)).first();
             if (before != null) return Optional.of(decode(before, id));
-            table.on(target).insertOne(session, row(id, captured)); return Optional.empty();
+            table.on(target).insertOne(session, row(id, captured, null)); return Optional.empty();
         });
     }
 
@@ -124,10 +153,22 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     private void requireNamespace(String namespace) { if (!mapName.equals(namespace)) throw MongoCachePipelineAccess.fenced(); }
     private Document id(String key) { return new Document("placement", address).append("key", OperatorStateText.encode(Objects.requireNonNull(key, "key"))); }
-    private static Document row(Document id, byte[] value) { return new Document("_id", id).append("formatVersion", 1).append("state", new Binary(value)); }
+    private Document row(Document id, byte[] value, byte[] pendingKey) {
+        var row = new Document("_id", id).append("formatVersion", format()).append("state", new Binary(value));
+        if (placement.resource() == OperatorPlacement.Resource.NEST_STATE) {
+            row.append("pending", pendingKey != null);
+            if (pendingKey != null) row.append("pendingKey", new Binary(pendingKey));
+        }
+        return row;
+    }
+    private int format() { return placement.resource() == OperatorPlacement.Resource.NEST_STATE ? 2 : 1; }
     private byte[] decode(Document row, Document id) {
-        if (!id.equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))
+        if (!id.equals(row.get("_id")) || !Integer.valueOf(format()).equals(row.get("formatVersion"))
                 || !(row.get("state") instanceof Binary binary) || binary.getType() != 0) throw access.unreadable("operator-state");
+        if (placement.resource() == OperatorPlacement.Resource.NEST_STATE
+                && (!(row.get("pending") instanceof Boolean pending)
+                || (pending ? !(row.get("pendingKey") instanceof Binary key) || key.getType() != 0
+                            : row.containsKey("pendingKey")))) throw access.unreadable("nest-pending");
         return binary.getData().clone();
     }
 }

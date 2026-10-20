@@ -40,7 +40,7 @@ public final class ResolverState implements Serializable {
      * Explicit so a compatible payload's Java identity is not derived from incidental method changes.
      * The storage layout controls admission; this is not an old-layout migration mechanism.
      */
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private Object parentKey;
     private SourceOrder order;

@@ -105,10 +105,24 @@ class ADeferredParkingHandoffStaysDurableTest {
         var restarted = new ResolverProcessor(VERTEX,state,(from,child) -> {},axes,edges,
                 chain -> Optional.ofNullable(floors.get(chain)),NestClock.SYSTEM,NestSettings.defaults(),parking);
         restarted.init(restartedOut,new TestProcessorContext());
+        recoverHandoffs(state, restarted);
         // The old parent is below the confirmed floor, so no event is delivered to this key again.
         for (int i = 0; i < 3; i++) restarted.tryProcess();
         var recovered = new ArrayList<Object>(); restartedOut.drainQueueAndReset(0,recovered,false);
         assertThat(recovered).anySatisfy(item -> assertThat(((KeyedElement)item).element().fields()).containsEntry("claim_id","K2"));
+    }
+
+    private static void recoverHandoffs(ColdState state, ResolverProcessor receiver) throws Exception {
+        var out = new TestOutbox(16);
+        var source = new NestHandoffRecovery(state::pending);
+        source.init(out, new TestProcessorContext());
+        boolean complete;
+        do {
+            complete = source.complete();
+            var keys = new ArrayList<Object>();
+            out.drainQueueAndReset(0, keys, false);
+            for (Object key : keys) feed(receiver, VERTEX.inbound().size(), key);
+        } while (!complete);
     }
 
     private static ResolverProcessor receiver(ColdState state, NestStore<ParkedSubtree> parking,
@@ -132,10 +146,11 @@ class ADeferredParkingHandoffStaysDurableTest {
         var inbox = new TestInbox(); inbox.queue().add(event); processor.process(ordinal, inbox);
     }
     private static final class ColdState implements NestStore<ResolverState> {
-        private final Map<Object, byte[]> entries = new LinkedHashMap<>(); boolean fail;
+        private record Row(byte[] state, byte[] pendingKey) { }
+        private final Map<Object, Row> entries = new LinkedHashMap<>(); boolean fail;
         @Override public ResolverState load(Object key) {
-            var bytes = entries.get(key); if (bytes == null) return null;
-            try (var in = new ObjectInputStream(new ByteArrayInputStream(bytes))) { return (ResolverState) in.readObject(); }
+            var row = entries.get(key); if (row == null) return null;
+            try (var in = new ObjectInputStream(new ByteArrayInputStream(row.state()))) { return (ResolverState) in.readObject(); }
             catch (Exception failure) { throw new AssertionError(failure); }
         }
         @Override public void save(Object key, ResolverState state) {
@@ -143,7 +158,15 @@ class ADeferredParkingHandoffStaysDurableTest {
             var bytes = new ByteArrayOutputStream();
             try (var out = new ObjectOutputStream(bytes)) { out.writeObject(state); }
             catch (IOException failure) { throw new AssertionError(failure); }
-            entries.put(key, bytes.toByteArray());
+            entries.put(key, new Row(bytes.toByteArray(), state.releases().isEmpty() ? null : NestHandoffRecovery.encodeKey(key)));
+        }
+        List<io.tapstate.spi.store.NestStateStore.Pending> pending(String after, int limit) {
+            return entries.entrySet().stream().filter(entry -> entry.getValue().pendingKey() != null)
+                    .map(entry -> new io.tapstate.spi.store.NestStateStore.Pending(
+                            NestStateKeys.nameOf(entry.getKey()), entry.getValue().pendingKey()))
+                    .filter(row -> after == null || row.cursor().compareTo(after) > 0)
+                    .sorted(Comparator.comparing(io.tapstate.spi.store.NestStateStore.Pending::cursor))
+                    .limit(limit).toList();
         }
         @Override public void remove(Object key) { entries.remove(key); }
         @Override public long count() { return entries.size(); }

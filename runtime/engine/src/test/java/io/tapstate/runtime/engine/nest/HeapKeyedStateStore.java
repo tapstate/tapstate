@@ -1,7 +1,5 @@
 package io.tapstate.runtime.engine.nest;
 
-import io.tapstate.spi.store.KeyedStateStore;
-
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -18,31 +16,44 @@ import java.util.concurrent.ConcurrentHashMap;
  * four writers on keys of their own, three quarters of the writes read back absent in one run. The store
  * this stands in for cannot lose them, so every such loss is a red no deployment can produce.
  */
-public final class HeapKeyedStateStore implements KeyedStateStore {
+public final class HeapKeyedStateStore implements io.tapstate.spi.store.NestStateStore {
 
-    private final Map<String, Map<String, byte[]>> byNamespace = new ConcurrentHashMap<>();
+    private record Row(byte[] state, byte[] pendingKey) { }
+    private final Map<String, Map<String, Row>> byNamespace = new ConcurrentHashMap<>();
 
     @Override
     public Optional<byte[]> load(String namespace, String key) {
-        Map<String, byte[]> entries = byNamespace.get(namespace);
-        return entries == null ? Optional.empty() : Optional.ofNullable(entries.get(key));
+        Map<String, Row> entries = byNamespace.get(namespace);
+        return entries == null ? Optional.empty() : Optional.ofNullable(entries.get(key)).map(Row::state);
     }
 
     @Override
     public void save(String namespace, String key, byte[] state) {
-        byNamespace.computeIfAbsent(namespace, ignored -> new ConcurrentHashMap<>()).put(key, state);
+        saveNest(namespace, key, state, null);
+    }
+
+    @Override public void saveNest(String namespace, String key, byte[] state, byte[] pendingKey) {
+        byNamespace.computeIfAbsent(namespace, ignored -> new ConcurrentHashMap<>()).put(key, new Row(state, pendingKey));
+    }
+
+    @Override public java.util.List<Pending> pending(String namespace, String after, int limit) {
+        return byNamespace.getOrDefault(namespace, Map.of()).entrySet().stream()
+                .filter(entry -> entry.getValue().pendingKey() != null)
+                .filter(entry -> after == null || entry.getKey().compareTo(after) > 0)
+                .sorted(Map.Entry.comparingByKey()).limit(limit)
+                .map(entry -> new Pending(entry.getKey(), entry.getValue().pendingKey())).toList();
     }
 
     @Override
     public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
         return Optional.ofNullable(byNamespace
                 .computeIfAbsent(namespace, ignored -> new ConcurrentHashMap<>())
-                .putIfAbsent(key, state));
+                .putIfAbsent(key, new Row(state, null))).map(Row::state);
     }
 
     @Override
     public void delete(String namespace, String key) {
-        Map<String, byte[]> entries = byNamespace.get(namespace);
+        Map<String, Row> entries = byNamespace.get(namespace);
         if (entries != null) {
             entries.remove(key);
         }

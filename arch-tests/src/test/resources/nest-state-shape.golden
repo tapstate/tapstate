@@ -21,6 +21,10 @@ io.tapstate.runtime.engine.nest.ElementRef :: field :: identity :: java.lang.Obj
 io.tapstate.runtime.engine.nest.ElementRef :: field :: parentIdentity :: java.lang.Object
 io.tapstate.runtime.engine.nest.ElementRef :: field :: pathId :: java.util.List<java.lang.String>
 io.tapstate.runtime.engine.nest.ElementRef :: record :: uid=0
+io.tapstate.runtime.engine.nest.KeyedElement :: field :: element :: io.tapstate.runtime.engine.nest.NestElement
+io.tapstate.runtime.engine.nest.KeyedElement :: field :: key :: java.lang.Object
+io.tapstate.runtime.engine.nest.KeyedElement :: field :: ts :: long
+io.tapstate.runtime.engine.nest.KeyedElement :: record :: uid=0
 # departed reads back absent as false, which is what "nothing was sent to the key this came from" is
 # written as - and nothing stored before the field existed had anything sent, because no path sent one.
 # So the absent value is the right answer here too, and the identity stays where it is.
@@ -48,11 +52,19 @@ io.tapstate.runtime.engine.nest.ParkedSubtree$At :: field :: elementKey :: java.
 io.tapstate.runtime.engine.nest.ParkedSubtree$At :: field :: pathId :: java.util.List<java.lang.String>
 io.tapstate.runtime.engine.nest.ParkedSubtree$At :: field :: piece :: int
 io.tapstate.runtime.engine.nest.ParkedSubtree$At :: record :: uid=0
-io.tapstate.runtime.engine.nest.ResolverState :: class :: uid=1
+# Retained deliveries require the new cold layout; an old resolver payload is refused explicitly.
+io.tapstate.runtime.engine.nest.ResolverState :: class :: uid=2
+io.tapstate.runtime.engine.nest.ResolverState :: field :: declaredAt :: java.util.Map<java.lang.String, io.tapstate.core.event.ChainPosition>
 io.tapstate.runtime.engine.nest.ResolverState :: field :: deleted :: boolean
 io.tapstate.runtime.engine.nest.ResolverState :: field :: order :: io.tapstate.core.event.SourceOrder
 io.tapstate.runtime.engine.nest.ResolverState :: field :: parentKey :: java.lang.Object
+io.tapstate.runtime.engine.nest.ResolverState :: field :: releases :: java.util.List<io.tapstate.runtime.engine.nest.ResolverState$Release>
 io.tapstate.runtime.engine.nest.ResolverState :: field :: waiting :: java.util.List<io.tapstate.runtime.engine.nest.ResolverState$Waiting>
+io.tapstate.runtime.engine.nest.ResolverState$Release :: field :: children :: int
+io.tapstate.runtime.engine.nest.ResolverState$Release :: field :: covered :: java.util.Map<java.lang.String, io.tapstate.core.event.SourceOrder>
+io.tapstate.runtime.engine.nest.ResolverState$Release :: field :: deliveries :: java.util.List<io.tapstate.runtime.engine.nest.KeyedElement>
+io.tapstate.runtime.engine.nest.ResolverState$Release :: field :: order :: io.tapstate.core.event.SourceOrder
+io.tapstate.runtime.engine.nest.ResolverState$Release :: record :: uid=0
 io.tapstate.runtime.engine.nest.ResolverState$Waiting :: field :: arrivedAt :: long
 io.tapstate.runtime.engine.nest.ResolverState$Waiting :: field :: child :: io.tapstate.runtime.engine.nest.NestElement
 io.tapstate.runtime.engine.nest.ResolverState$Waiting :: record :: uid=0

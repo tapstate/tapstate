@@ -136,7 +136,15 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void store(Object key, Object value) {
-        store.save(namespace, NestStateKeys.nameOf(key), toBytes(value));
+        byte[] pendingKey = value instanceof ResolverState state && !state.releases().isEmpty()
+                ? NestHandoffRecovery.encodeKey(key) : null;
+        if (store instanceof io.tapstate.spi.store.NestStateStore nest) {
+            nest.saveNest(namespace, NestStateKeys.nameOf(key), toBytes(value), pendingKey);
+        } else {
+            if (pendingKey != null) throw new io.tapstate.core.common.TapstateException(
+                    io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            store.save(namespace, NestStateKeys.nameOf(key), toBytes(value));
+        }
     }
 
     @Override
@@ -178,7 +186,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
             return in.readObject();
         } catch (IOException | ClassNotFoundException cause) {
-            throw new IllegalStateException("could not read back nest state", cause);
+            throw NestHandoffRecovery.unreadable(cause);
         }
     }
 

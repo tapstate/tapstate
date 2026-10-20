@@ -164,6 +164,21 @@ class HowManyInstancesANestVertexRunsIsDecidedNotInheritedTest {
         return names;
     }
 
+    @Test
+    void retainedHandoffInputIsKeyedAndFinishesBeforeBusinessInput() {
+        var topology = NestTopology.compile("p", "doc", TREE, tables());
+        var dag = draw(topology, new NodeWidth("doc", 3, 1, null));
+        topology.vertices().stream().filter(vertex -> !vertex.isAssembler()).forEach(vertex -> {
+            var recovery = dag.getInboundEdges(vertex.name()).stream().filter(edge -> edge.getPriority() == -1).toList();
+            assertThat(recovery).hasSize(1);
+            assertThat(recovery.getFirst().getDestOrdinal()).isEqualTo(vertex.inbound().size());
+            assertThat(recovery.getFirst().isDistributed()).isTrue();
+            assertThat(recovery.getFirst().getPartitioner().getConstantPartitioningKey()).isNull();
+            assertThat(dag.getInboundEdges(vertex.name()).stream().filter(edge -> edge.getPriority() != -1))
+                    .allSatisfy(edge -> assertThat(edge.getPriority()).isZero());
+        });
+    }
+
     private static DAG draw(NestTopology topology, NodeWidth width) {
         DAG dag = new DAG();
         Map<String, List<Vertex>> sources = new LinkedHashMap<>();

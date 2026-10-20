@@ -75,7 +75,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
     private final NestStore<ResolverState> store;
     private final NestDeadLetter deadLetter;
     private final Deque<Object> outgoing = new ArrayDeque<>();
-    // Only visited keys are tracked; cold state is never enumerated at startup.
+    // The startup source names retained keys without enumerating ordinary cold state.
     private final Map<Object, Set<SourceOrder>> offeredReleases = new LinkedHashMap<>();
     private Long releasesWeighedAt;
     private final LevelBounds bounds;
@@ -427,6 +427,10 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (!flush()) {
             return;
         }
+        if (ordinal == vertex.inbound().size()) {
+            processHandoffs(inbox);
+            return;
+        }
         NestInbound edge = vertex.inbound().get(ordinal);
         Map<Object, ResolverState> touched = new LinkedHashMap<>();
         try {
@@ -444,6 +448,18 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         } finally {
             settle(touched);
             collectWhatWasTakenOver();
+        }
+    }
+
+    private void processHandoffs(Inbox inbox) {
+        while (!inbox.isEmpty()) {
+            Object key = ((NestHandoffRecovery.Key) inbox.peek()).value();
+            ResolverState state = store.load(key);
+            if (state == null || state.releases().isEmpty()) throw NestHandoffRecovery.unreadable(null);
+            refuseToLetOneKeyHoldMoreThanItMay(key, state.pending());
+            if (restoreReleases(key, state, false)) store.save(key, state);
+            inbox.remove();
+            if (!flush()) return;
         }
     }
 

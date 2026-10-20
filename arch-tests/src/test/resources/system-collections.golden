@@ -79,7 +79,7 @@ connector_artifacts (gridfs) | cache | MongoCacheConnectorRegistry | immutable |
 derived_schemas | cache | MongoCacheDerivedSchemaStore | migrated | 1 | -
 pipeline_rate_history | cache | MongoCacheRateHistoryStore | migrated | 1 | observedAt (ttl 1296000s), pipelineId+observedAt+_id
 cluster_membership | cache | MongoCacheClusterMembershipStore | owned-elsewhere | 1 | -
-nest_state | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
+nest_state | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement, _id.placement+pending+_id.key
 join_facts | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
 join_dimensions | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
 join_indexes | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement

@@ -148,6 +148,9 @@ public record NestBinding(
         /** The store for one resolver's mappings and the children waiting in it. */
         NestStore<ResolverState> forResolver(NestVertex vertex);
 
+        /** A startup-only page reader; heap-only bindings have no retained cold work. */
+        default NestHandoffRecovery.Pages handoffs(NestVertex vertex) { return (after, limit) -> java.util.List.of(); }
+
         /** The store for the assembler's documents. */
         NestStore<RootAssembly> forAssembler(NestVertex vertex);
 
@@ -263,6 +266,17 @@ public record NestBinding(
         @Override
         public NestStore<ResolverState> forResolver(NestVertex vertex) {
             return metered(mapOf(vertex));
+        }
+
+        @Override
+        public NestHandoffRecovery.Pages handoffs(NestVertex vertex) {
+            if (original == null) return NestStores.super.handoffs(vertex);
+            String namespace = name(vertex.pathId(), NestMap.STATE, null, vertex.mapName());
+            var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, true);
+            var state = bindings.nest(namespace, null);
+            if (!(state instanceof io.tapstate.spi.store.NestStateStore nest)) throw new TapstateException(
+                    io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            return (after, limit) -> nest.pending(namespace, after, limit);
         }
 
         @Override
