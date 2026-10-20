@@ -172,6 +172,14 @@
       <artifactId>tapdata-common</artifactId>
       <scope>runtime</scope>
     </dependency>
+    <!-- Thin connectors, including the Db2 for i journal decoder, link against the host Log4j API.
+         Compile-invisible and load-bearing: do not remove as unused or downgrade to test scope.
+         PdkRuntimeInBootJarIT checks the packaged dependency independently of the logging starter. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
+      <scope>runtime</scope>
+    </dependency>
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>adapter-mongo-store</artifactId>

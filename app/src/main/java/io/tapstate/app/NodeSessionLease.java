@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +45,7 @@ final class NodeSessionLease implements AutoCloseable {
     private final SourceConfigKeyringSession sourceConfigKeyring;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean firstRenewal = new AtomicBoolean(true);
 
     /** When the lease the last accepted renewal bought runs out, on the monotonic clock. */
     private volatile long provenUntil;
@@ -176,31 +178,75 @@ final class NodeSessionLease implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
-        // Register the lapse check before an immediate refusal can shut down this executor.
-        long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
-        renewer.scheduleWithFixedDelay(this::loseALapsedSession, lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
-        // Member formation may have consumed most of the original acquisition's remaining lease.
-        renewer.scheduleWithFixedDelay(
-                this::renew, 0L, renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+        long adoptedAt = System.nanoTime();
+        LOG.info("Node session maintenance adopted [proof_age_ms={}, proof_remaining_ms={}, ttl_ms={}, renew_interval_ms={}].",
+                TimeUnit.NANOSECONDS.toMillis(adoptedAt - askedAt),
+                TimeUnit.NANOSECONDS.toMillis(provenUntil - adoptedAt), ttl.toMillis(), renewInterval.toMillis());
+        CountDownLatch registered = new CountDownLatch(1);
+        try {
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::renew),
+                    0, renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+            long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::loseALapsedSession),
+                    lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException | Error setupFailure) {
+            renewer.shutdownNow();
+            throw setupFailure;
+        } finally {
+            // A fast first refusal must not shut down the executor while its other task is being registered.
+            registered.countDown();
+        }
+    }
+
+    private static void afterRegistration(CountDownLatch registered, Runnable action) {
+        try {
+            registered.await();
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        action.run();
     }
 
     private void renew() {
         if (closed.get()) {
             return;
         }
-        WorkloadClaim expected = current.get();
+        long priorProofUntil = provenUntil;
         long askedAt = System.nanoTime();
+        if (!proofRemainsLive(priorProofUntil)) return;
+        WorkloadClaim expected = current.get();
+        boolean first = firstRenewal.compareAndSet(true, false);
+        if (first) {
+            LOG.info("Node session first renewal started [proof_remaining_ms={}].",
+                    TimeUnit.NANOSECONDS.toMillis(provenUntil - askedAt));
+        }
         try {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
+            long storeReturnedAt = System.nanoTime();
+            if (first) {
+                LOG.info("Node session first renewal store returned [elapsed_ms={}, matched={}].",
+                        TimeUnit.NANOSECONDS.toMillis(storeReturnedAt - askedAt), renewed.isPresent());
+            }
             if (renewed.isPresent()) {
-                if (closed.get()) return;
+                // A late store response cannot authorize an ACK after the preceding local proof lapsed.
+                if (!proofRemainsLive(priorProofUntil)) return;
                 WorkloadClaim accepted = renewed.get();
                 refreshChangedJoin(expected, accepted);
-                if (closed.get()) return;
+                // Refreshing the joined identity can outlive the prior local proof as well.
+                if (!proofRemainsLive(priorProofUntil)) return;
                 if (sourceConfigKeyring != null) sourceConfigKeyring.acknowledge(accepted, ttl);
-                if (closed.get()) return;
+                // A late ACK or independent close cannot publish a replacement for an already-lapsed proof.
+                if (!proofRemainsLive(priorProofUntil)) return;
                 current.set(accepted);
                 provenUntil = askedAt + ttl.toNanos();
+                if (first) {
+                    long completedAt = System.nanoTime();
+                    LOG.info("Node session first renewal accepted [ack_ms={}, elapsed_ms={}, proof_remaining_ms={}].",
+                            TimeUnit.NANOSECONDS.toMillis(completedAt - storeReturnedAt),
+                            TimeUnit.NANOSECONDS.toMillis(completedAt - askedAt),
+                            TimeUnit.NANOSECONDS.toMillis(provenUntil - completedAt));
+                }
                 return;
             }
             lose("the stored owner or generation no longer matches", null);
@@ -225,6 +271,15 @@ final class NodeSessionLease implements AutoCloseable {
 
     private static io.tapstate.core.common.TapstateException joinLost() {
         return new io.tapstate.core.common.TapstateException(BootError.PROFILE_SESSION_LOST, java.util.Map.of(), null);
+    }
+
+    private boolean proofRemainsLive(long deadline) {
+        if (closed.get()) return false;
+        if (System.nanoTime() - deadline >= 0) {
+            lose("no renewal was accepted within the lease the last one bought", null);
+            return false;
+        }
+        return true;
     }
 
     private void loseALapsedSession() {

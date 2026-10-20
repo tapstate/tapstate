@@ -89,19 +89,27 @@ The approved image and its source revision still come from the selected release.
 
 ## Cloud cluster dev images
 
-`cloud-cluster-dev.yml` is manual-only and must be dispatched on `main`. Select
-`minor`, `patch`, or `major`; it uses the release version calculator against the
-current main history. Dev runs create no Git tags or releases, so new main commits
-can rebuild the same candidate version until that version is formally released.
+`cloud-cluster-dev.yml` is manual-only and accepts branch refs, not tags. Dispatch
+it on `main` to build Tapstate and Web `main`, or on an allowlisted development
+branch to build both repositories at the selected ref (the branch must exist in
+both repositories). Select `minor`, `patch`, or `major`; the version calculator
+uses the tagged `main` history so an unmerged feature branch does not need a
+release tag ancestor. The selected ref still supplies the Tapstate and Web source.
+Dev runs create no Git tags or releases. Main may replace the shared candidate
+version's `-dev` tag; each feature build publishes a tag with the Tapstate source
+SHA suffix for manual validation without changing main's image or the dev catalog.
 
 | Lane | Image | Version tag policy |
 | --- | --- | --- |
-| Cloud dev | `ghcr.io/tapstate/tapstate-cloud:<version>-dev` | Replaced by another dev build of that version |
+| Cloud dev from main | `ghcr.io/tapstate/tapstate-cloud:<version>-dev` | Replaced by another main dev build of that version |
+| Cloud dev from a branch | `ghcr.io/tapstate/tapstate-cloud:<version>-dev-<tapstate-sha>` | Source-specific tag; cannot replace main's candidate |
 | Cloud release | `ghcr.io/tapstate/tapstate-cloud:<version>` | Independently rebuilt by release; different bytes cannot overwrite an existing tag |
 
-Configure the `cloud-ghcr-dev` environment for the `main` branch with the dev
-`VITE_CLOUD_CONSOLE_URL`. The existing repository `RELEASE_SATELLITE_TOKEN` reads
-Web main. Publishing uses the workflow token with package write permission, or
+Configure the `cloud-ghcr-dev` environment with the dev `VITE_CLOUD_CONSOLE_URL`
+and allow only the refs approved for image builds. Its branch policy must include
+a selected feature branch before that run. The existing repository
+`RELEASE_SATELLITE_TOKEN` reads the matching Web ref. Publishing uses the workflow
+token with package write permission, or
 the environment's `CLOUD_GHCR_USERNAME` / `CLOUD_GHCR_TOKEN` when explicitly set.
 Reuse the existing Public `tapstate-cloud` package and its workflow write access;
 the publisher refuses missing or non-public packages. Package access follows the

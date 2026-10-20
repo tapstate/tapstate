@@ -17,6 +17,8 @@ from posixpath import normpath
 from typing import Any
 
 
+sys.dont_write_bytecode = True
+
 PROFILE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "web-assets-profile.py"
 PROFILE_SPEC = spec_from_file_location("web_assets_profile", PROFILE_SCRIPT)
 assert PROFILE_SPEC is not None and PROFILE_SPEC.loader is not None
@@ -52,6 +54,10 @@ def declared_profile(web_profile: str, cloud_console_url: str | None) -> tuple[s
 
 
 def validate_profile_metadata(props: dict[str, str], description: str) -> tuple[str, str | None]:
+    if props.get("purpose") == "local-development":
+        raise ProvenanceError(f"{description} local-development artifacts cannot enter a release")
+    if props.get("purpose") not in {None, "release"}:
+        raise ProvenanceError(f"{description} purpose is not release-compatible")
     profile = props.get("web.profile")
     if profile not in {"cloud", "onprem"}:
         raise ProvenanceError(f"{description} is missing a known Web profile")
@@ -162,7 +168,16 @@ def properties_from_jar(jar_bytes: bytes, platform: str) -> dict[str, str]:
             raise ProvenanceError(f"{platform} packaged Web file does not match its manifest: {name}")
     if hashlib.sha256(files_manifest).hexdigest() != props.get("files.sha256"):
         raise ProvenanceError(f"{platform} Web manifest content disagrees with files.sha256 metadata")
-    validate_profile_metadata(props, f"{platform} Boot JAR")
+    profile, console_url = validate_profile_metadata(props, f"{platform} Boot JAR")
+    producer = static_files.get("tapstate-web-build.json")
+    if producer is not None:
+        try:
+            if len(producer) > 64 * 1024:
+                raise ProvenanceError("Web producer metadata exceeds its size limit")
+            metadata = json.loads(producer.decode("utf-8"), object_pairs_hook=unique_json_object)
+            PROFILE.validate_release_producer_metadata(metadata, profile, console_url)
+        except (UnicodeError, json.JSONDecodeError, PROFILE.WebAssetsError) as exc:
+            raise ProvenanceError("Web producer metadata is not release-compatible: " + str(exc)) from exc
     props["image.boot-jar.sha256"] = hashlib.sha256(jar_bytes).hexdigest()
     return props
 

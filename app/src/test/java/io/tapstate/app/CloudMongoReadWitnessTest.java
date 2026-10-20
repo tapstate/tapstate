@@ -1,6 +1,9 @@
 package io.tapstate.app;
 
 import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoNamespace;
+import com.mongodb.client.ListIndexesIterable;
+import com.mongodb.client.MongoCursor;
 import com.mongodb.MongoCredential;
 import com.mongodb.MongoDriverInformation;
 import com.mongodb.MongoException;
@@ -216,9 +219,9 @@ class CloudMongoReadWitnessTest {
     void aRealDriverMetadataCallStackIsIdentifiedWithoutADatabase() {
         CommandListener listener = listener();
         DriverReadFixture fixture = driverReadFixture();
-        when(fixture.find().first()).thenAnswer(call -> {
+        when(fixture.find().into(any())).thenAnswer(call -> {
             listener.commandFailed(driverFailure("find"));
-            return null;
+            return call.getArgument(0);
         });
         ConnectorRegistry observed = witness.observe(fixture.registry());
         mysql(() -> {
@@ -227,7 +230,8 @@ class CloudMongoReadWitnessTest {
         });
         verify(fixture.files()).find();
         verify(fixture.find()).filter(any(Bson.class));
-        verify(fixture.find()).first();
+        verify(fixture.find()).into(any());
+        verify(fixture.find(), never()).first();
         assertThat(reads).filteredOn(event -> "command-failed".equals(event.get("kind")))
                 .singleElement().satisfies(event -> assertThat(event)
                         .containsEntry("artifact_step", "metadata-find"));
@@ -241,9 +245,12 @@ class CloudMongoReadWitnessTest {
         GridFSFile file = new GridFSFile(new BsonObjectId(new ObjectId()), "synthetic-file", 0, 255,
                 new Date(0), new Document());
         RuntimeException stop = new IllegalStateException(SENTINEL);
-        AtomicInteger calls = new AtomicInteger();
+        when(fixture.find().into(any())).thenAnswer(call -> {
+            java.util.Collection<GridFSFile> target = call.getArgument(0);
+            target.add(file);
+            return target;
+        });
         when(fixture.find().first()).thenAnswer(call -> {
-            if (calls.incrementAndGet() == 1) return file;
             listener.commandFailed(driverFailure("find"));
             throw stop;
         });
@@ -251,7 +258,8 @@ class CloudMongoReadWitnessTest {
         assertThatThrownBy(() -> mysql(() -> observed.artifact("opaque-hash"))).isSameAs(stop);
         verify(fixture.files(), times(2)).find();
         verify(fixture.find(), times(2)).filter(any(Bson.class));
-        verify(fixture.find(), times(2)).first();
+        verify(fixture.find()).into(any());
+        verify(fixture.find()).first();
         assertThat(reads).filteredOn(event -> "command-failed".equals(event.get("kind")))
                 .singleElement().satisfies(event -> assertThat(event)
                         .containsEntry("artifact_step", "download"));
@@ -413,20 +421,32 @@ class CloudMongoReadWitnessTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static DriverReadFixture driverReadFixture() {
+    static DriverReadFixture driverReadFixture() {
         MongoDatabase database = mock(MongoDatabase.class);
         MongoCollection<GridFSFile> files = mock(MongoCollection.class, RETURNS_SELF);
         MongoCollection<BsonDocument> chunks = mock(MongoCollection.class, RETURNS_SELF);
         FindIterable<GridFSFile> find = mock(FindIterable.class, RETURNS_SELF);
         when(database.getCodecRegistry()).thenReturn(MongoClientSettings.getDefaultCodecRegistry());
-        when(database.getCollection("synthetic.files", GridFSFile.class)).thenReturn(files);
-        when(database.getCollection("synthetic.chunks", BsonDocument.class)).thenReturn(chunks);
+        when(database.getCollection("connector_artifacts.files", GridFSFile.class)).thenReturn(files);
+        when(database.getCollection("connector_artifacts.chunks", BsonDocument.class)).thenReturn(chunks);
         when(files.find()).thenReturn(find);
-        return new DriverReadFixture(new MongoConnectorRegistry(GridFSBuckets.create(database, "synthetic")),
-                files, find);
+        MongoCollection<Document> metadata = mock(MongoCollection.class, RETURNS_SELF);
+        when(database.getCollection("connector_artifacts.files")).thenReturn(metadata);
+        when(database.getCollection("connector_artifacts.chunks")).thenReturn(mock(MongoCollection.class));
+        when(metadata.getNamespace()).thenReturn(new MongoNamespace("synthetic", "connector_artifacts.files"));
+        ListIndexesIterable<Document> indexes = mock(ListIndexesIterable.class);
+        when(metadata.listIndexes()).thenReturn(indexes);
+        when(indexes.iterator()).thenAnswer(call -> {
+            MongoCursor<Document> cursor = mock(MongoCursor.class);
+            when(cursor.hasNext()).thenReturn(true, false);
+            when(cursor.next()).thenReturn(new Document("name", "filename_idx")
+                    .append("key", new Document("filename", 1)).append("unique", true));
+            return cursor;
+        });
+        return new DriverReadFixture(new MongoConnectorRegistry(mock(MongoClient.class), database), files, find);
     }
 
-    private record DriverReadFixture(MongoConnectorRegistry registry, MongoCollection<GridFSFile> files,
+    record DriverReadFixture(MongoConnectorRegistry registry, MongoCollection<GridFSFile> files,
                                      FindIterable<GridFSFile> find) {}
 
     private static final class UnreadableMessage extends MongoException {

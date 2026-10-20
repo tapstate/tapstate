@@ -143,21 +143,19 @@ final class CloudArtifactReadFailureWitnessTest {
         when(failed.getCommandName()).thenReturn("find");
         when(failed.getThrowable()).thenReturn(failure);
 
-        MongoDatabase database = mock(MongoDatabase.class);
-        MongoCollection<GridFSFile> files = mock(MongoCollection.class, RETURNS_SELF);
-        MongoCollection<BsonDocument> chunks = mock(MongoCollection.class, RETURNS_SELF);
-        FindIterable<GridFSFile> find = mock(FindIterable.class, RETURNS_SELF);
-        when(database.getCodecRegistry()).thenReturn(MongoClientSettings.getDefaultCodecRegistry());
-        when(database.getCollection("synthetic.files", GridFSFile.class)).thenReturn(files);
-        when(database.getCollection("synthetic.chunks", BsonDocument.class)).thenReturn(chunks);
-        when(files.find()).thenReturn(find);
-        MongoConnectorRegistry realRegistry = new MongoConnectorRegistry(GridFSBuckets.create(database, "synthetic"));
+        CloudMongoReadWitnessTest.DriverReadFixture fixture = CloudMongoReadWitnessTest.driverReadFixture();
+        MongoConnectorRegistry realRegistry = fixture.registry();
+        MongoCollection<GridFSFile> files = fixture.files();
+        FindIterable<GridFSFile> find = fixture.find();
         GridFSFile empty = new GridFSFile(new BsonObjectId(new ObjectId()), "synthetic-file", 0, 255,
                 new Date(0), new Document());
-        AtomicInteger findCalls = new AtomicInteger();
         RuntimeException stop = new IllegalStateException(SENTINEL);
+        when(find.into(any())).thenAnswer(call -> {
+            java.util.Collection<GridFSFile> target = call.getArgument(0);
+            target.add(empty);
+            return target;
+        });
         when(find.first()).thenAnswer(call -> {
-            if (findCalls.incrementAndGet() == 1) return empty;
             listener.get().commandFailed(failed);
             listener.get().commandFailed(failed);
             if (mode == Mode.RETURNED) return empty;
@@ -191,7 +189,8 @@ final class CloudArtifactReadFailureWitnessTest {
         verify(delegate, times(1)).artifact("synthetic-hash");
         verify(files, times(2)).find();
         verify(find, times(2)).filter(any(Bson.class));
-        verify(find, times(2)).first();
+        verify(find).into(any());
+        verify(find).first();
         boolean enabled = !(mode == Mode.OLD_CONSTRUCTOR || mode == Mode.EXPLICIT_OFF
                 || mode == Mode.PROPERTY_DEFAULT || mode == Mode.PROPERTY_OFF);
         assertThat(causeReads).hasValue(enabled ? 1 : 0);

@@ -7,6 +7,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import textwrap
 import subprocess
 import sys
 import tarfile
@@ -283,6 +285,39 @@ class StageConnectorsTest(unittest.TestCase):
         self.write_lock()
         with self.assertRaisesRegex(MODULE.StageError, "mysql: invalid shaded JAR length"):
             MODULE.read_lock(self.lock)
+
+    def test_cloud_workflows_download_only_locked_assets_from_a_larger_release(self) -> None:
+        repository = SCRIPT.parents[2]
+        # The release may contain optional connectors that are not Cloud startup seeds.
+        (self.jars / "db2i-connector.jar").write_bytes(b"optional preview")
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+            import fnmatch, os, pathlib, shutil, sys
+            args = sys.argv[1:]
+            assert args[:3] == ["release", "download", "connectors-preview"]
+            patterns = [args[i + 1] for i, arg in enumerate(args) if arg == "--pattern"]
+            destination = pathlib.Path(args[args.index("--dir") + 1])
+            for asset in pathlib.Path(os.environ["TEST_RELEASE_ASSETS"]).iterdir():
+                if not patterns or any(fnmatch.fnmatchcase(asset.name, pattern) for pattern in patterns):
+                    shutil.copyfile(asset, destination / asset.name)
+            """), encoding="utf-8")
+        gh.chmod(0o755)
+        for name in ("release.yml", "cloud-cluster-dev.yml"):
+            with self.subTest(workflow=name):
+                runtime = self.root / name
+                runtime.mkdir()
+                text = (repository / ".github/workflows" / name).read_text(encoding="utf-8")
+                start = text.index('          mkdir -p "$RUNNER_TEMP/cloud-jars"')
+                end = text.index("          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py", start)
+                download = textwrap.dedent(text[start:end])
+                env = dict(os.environ, RUNNER_TEMP=str(runtime), TEST_RELEASE_ASSETS=str(self.jars),
+                           PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+                subprocess.run(["bash", "-euo", "pipefail", "-c", download], cwd=repository, env=env, check=True)
+                MODULE.stage(self.lock, runtime / "cloud-jars", runtime / "staged")
+                self.assertEqual({path.name for path in (runtime / "staged/connectors").iterdir()},
+                                 {f"{entry['id']}-connector.jar" for entry in self.entries})
 
     def test_missing_or_extra_jar_refuses_without_staging(self) -> None:
         (self.jars / "mysql-connector.jar").unlink()

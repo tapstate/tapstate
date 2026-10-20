@@ -6,9 +6,10 @@ import io.tapstate.spi.transform.TransformPort;
 import java.util.List;
 
 /**
- * The {@code filter} port: a CEL predicate over the event envelope keeps or drops each row. Only row
- * events are judged; a {@code ddl} event carries no row and bypasses the predicate untouched, since
- * dropping a schema change would silently break the downstream schema-evolution chain.
+ * The {@code filter} port: a CEL predicate keeps matching rows and retracts rows that stop matching.
+ * The earlier row is evaluated as {@code after} for a rejected update; the original
+ * operation and other envelope bindings still apply, so explicit operation filters are respected.
+ * A {@code ddl} event bypasses the predicate because it carries no row.
  */
 final class FilterPort implements TransformPort {
 
@@ -23,6 +24,14 @@ final class FilterPort implements TransformPort {
         if (event.op() == Op.DDL) {
             return List.of(event);
         }
-        return Boolean.TRUE.equals(predicate.eval(event)) ? List.of(event) : List.of();
+        if (Boolean.TRUE.equals(predicate.eval(event))) {
+            return List.of(event);
+        }
+        if (event.op() == Op.UPDATE && event.before() != null
+                && Boolean.TRUE.equals(predicate.eval(event, event.before()))) {
+            return List.of(new Envelope(Op.DELETE, event.ts(), event.src(), event.before(), null,
+                    event.schema(), event.positions(), event.removed()));
+        }
+        return List.of();
     }
 }

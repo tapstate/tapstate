@@ -36,7 +36,7 @@ enum BootError implements TapstateErrorCode {
     /** The packaged Web profile does not match the mode selected by the external Cloud settings. */
     WEB_PROFILE_MODE_MISMATCH("boot.web-profile-mode-mismatch", Set.of("profile", "mode")),
 
-    /** Cloud Web metadata requires a safe HTTPS Console URL; on-prem must carry no Console URL. */
+    /** Cloud Web metadata requires a safe Console URL for its artifact purpose; on-prem carries none. */
     WEB_CONSOLE_URL_INVALID("boot.web-console-url-invalid", Set.of()),
 
     /** The optional on-prem store switch cannot disable managed Cloud metadata persistence. */
@@ -105,7 +105,13 @@ enum BootError implements TapstateErrorCode {
     EXECUTION_PROFILE_INVALID("boot.execution-profile-invalid", Set.of("detail")),
     PROFILE_AUTHORIZATION_PENDING("boot.profile-authorization-pending", Set.of()),
     PROFILE_SESSION_LOST("boot.profile-session-lost", Set.of()),
-    LEGACY_CLUSTER_ACTIVE("boot.legacy-cluster-active", Set.of());
+    LEGACY_CLUSTER_ACTIVE("boot.legacy-cluster-active", Set.of()),
+
+    /** A development-only embedded Web artifact needs explicit runtime confirmation. */
+    WEB_DEVELOPMENT_CONFIRMATION_REQUIRED("boot.web-development-confirmation-required", Set.of()),
+
+    /** A development Web marker is malformed or unsupported by this runtime. */
+    WEB_DEVELOPMENT_ARTIFACT_INVALID("boot.web-development-artifact-invalid", Set.of("reason"));
 
     private final String code;
     private final Set<String> placeholders;

@@ -36,7 +36,7 @@ set -eu
 # nothing and install.sh refuses, which would strand the quickstart at the CLI step on a clean machine.
 # Pin it here instead, the same way the demo connector jars are pinned to a published tag. This must
 # match the version in pom.xml; quickstart-smoke.sh fails the build when the two drift apart.
-CLI_VERSION="0.6.0"
+CLI_VERSION="0.7.0"
 
 die() {
     printf 'quickstart: %s\n' "$1" >&2
@@ -238,6 +238,123 @@ YAML
 # failure; when it does run out it says what was actually observed, which is what separates "nothing is
 # arriving" from "this machine is slow": a count still at its starting value is the first, a count that
 # moved and did not finish is the second.
+# Wire an AI agent to this stack: a write-scoped machine token, and an MCP client configuration in
+# tapstate-mcp.json that starts the sidecar with it. The agent then creates sources and pipelines itself.
+#
+# Optional by design. The demo has already succeeded when this runs, so nothing here fails the run: a
+# step that cannot complete leaves agent_note saying why, and the browser and CLI paths stand on their
+# own. The file name is the demo's own rather than .mcp.json, because a saved script run in place sits in
+# the user's directory, and that name may already hold their configuration for something else.
+#
+# The sidecar ships as a jar unless a native one sits beside the CLI. A local Java 21 (or the native
+# sidecar) runs it through `tapstate mcp`, and JAVA_HOME is written into the configuration because an
+# agent launched from a desktop app does not inherit this shell's PATH. Without either, it runs on the
+# server image's own Java, inside the server container's network namespace: the sidecar refuses plain
+# HTTP to anything but loopback, and that namespace is where the server is loopback.
+write_agent_config() {
+    agent_config=tapstate-mcp.json
+    agent_note=""
+    server_url=http://127.0.0.1:8080
+    # A token from an earlier run is kept while the server still accepts it. One it no longer accepts --
+    # the store was wiped with down -v -- is replaced, rather than left to fail inside the agent.
+    if [ -f "$agent_config" ]; then
+        agent_token="$(sed -n 's/.*"TAPSTATE_TOKEN": *"\([^"]*\)".*/\1/p' "$agent_config" | head -n 1)"
+        if [ -n "$agent_token" ] \
+           && TAPSTATE_TOKEN="$agent_token" ./tapstate -c "$server_url" ls >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # The password travels in the environment, as everywhere else here, never as an argument.
+    token_json="$(TAPSTATE_PASSWORD="$admin_pw" ./tapstate -c "$server_url" -u admin \
+        token create --scope write -o json 2>/dev/null)" || token_json=""
+    agent_token="$(printf '%s' "$token_json" | tr -d '\n' \
+        | sed -n 's/.*"token" *: *"\([A-Za-z0-9._~+\/=-]*\)".*/\1/p')"
+    if [ -z "$agent_token" ]; then
+        agent_note="no agent token could be created; make one yourself with: TAPSTATE_PASSWORD=<.env password> ./tapstate -c $server_url -u admin token create --scope write"
+        return 0
+    fi
+
+    # Every path below is written into JSON unescaped, so one that would need escaping is refused here.
+    case "$PWD" in *\"*|*\\*)
+        agent_note="this directory's path contains a quote or a backslash, so no agent configuration was written"
+        return 0 ;;
+    esac
+    cli_link="$(readlink ./tapstate 2>/dev/null || true)"
+    case "$cli_link" in
+        "") cli_bin_dir="$PWD" ;;
+        /*) cli_bin_dir="$(dirname "$cli_link")" ;;
+        *)  cli_bin_dir="$PWD/$(dirname "$cli_link")" ;;
+    esac
+    libexec_dir=""
+    if [ -d "$cli_bin_dir/../libexec" ]; then libexec_dir="$(cd "$cli_bin_dir/../libexec" && pwd -P)"; fi
+
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+        java_bin="$JAVA_HOME/bin/java"
+    else
+        java_bin="$(command -v java 2>/dev/null || true)"
+    fi
+    java_major=""; java_home=""
+    if [ -n "$java_bin" ]; then
+        java_props="$("$java_bin" -XshowSettings:properties -version 2>&1 || true)"
+        java_major="$(printf '%s\n' "$java_props" | sed -n 's/^ *java\.specification\.version = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+        java_home="$(printf '%s\n' "$java_props" | sed -n 's/^ *java\.home = //p' | head -n 1)"
+    fi
+    case "$java_home" in *\"*|*\\*) java_home="" ;; esac
+
+    if [ -n "$libexec_dir" ] && [ -x "$libexec_dir/tapstate-mcp" ]; then
+        agent_env=""
+    elif [ -n "$java_major" ] && [ "$java_major" -ge 21 ] && [ -x "$java_home/bin/java" ]; then
+        agent_env=",
+        \"JAVA_HOME\": \"$java_home\""
+    else
+        agent_env=docker
+    fi
+
+    if [ "$agent_env" != docker ]; then
+        agent_command="$PWD/tapstate"
+        agent_args="\"mcp\", \"--server\", \"$server_url\", \"--allow-write\""
+    else
+        docker_bin="$(command -v docker)"
+        server_container="$(docker compose ps --format '{{.Name}}' server 2>/dev/null | head -n 1)"
+        case "$server_container" in
+            ""|*[!A-Za-z0-9_.-]*)
+                agent_note="the server container could not be named, so no agent configuration was written"
+                return 0 ;;
+        esac
+        case "$libexec_dir" in *\"*|*\\*) libexec_dir="" ;; esac
+        if [ -z "$libexec_dir" ] || [ ! -f "$libexec_dir/tapstate-mcp.jar" ]; then
+            agent_note="the MCP sidecar was not found beside the CLI, so no agent configuration was written"
+            return 0
+        fi
+        agent_command="$docker_bin"
+        agent_args="\"run\", \"-i\", \"--rm\", \"--network\", \"container:$server_container\",
+        \"-e\", \"TAPSTATE_TOKEN\", \"-v\", \"$libexec_dir:/opt/tapstate-mcp:ro\",
+        \"--entrypoint\", \"java\", \"ghcr.io/tapstate/tapstate:${CLI_VERSION}\",
+        \"-jar\", \"/opt/tapstate-mcp/tapstate-mcp.jar\", \"--server\", \"$server_url\", \"--allow-write\""
+        agent_env=""
+    fi
+
+    # The token is a credential, so the file is created readable by this user alone, like .env.
+    (
+        umask 077
+        cat > "$agent_config.tmp" <<EOF
+{
+  "mcpServers": {
+    "tapstate": {
+      "command": "$agent_command",
+      "args": [$agent_args],
+      "env": {
+        "TAPSTATE_TOKEN": "$agent_token"$agent_env
+      }
+    }
+  }
+}
+EOF
+    ) && mv "$agent_config.tmp" "$agent_config" \
+        || agent_note="the agent configuration could not be written to $agent_config"
+}
+
 print_next_steps() {
     demo_dir="$(basename "$PWD")"
     # Whole-directory removal is only ever offered for a directory this script made. Run in place --
@@ -245,10 +362,25 @@ print_next_steps() {
     # printing `rm -rf` on it puts a command that destroys unrelated work in front of someone who has
     # been told, correctly, that everything above was safe to copy.
     if [ "${demo_dir_is_ours:-no}" = yes ]; then
-        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, .env)"
+        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, .env, agent configuration)"
     else
         removal_line="  this directory is yours, so nothing here removes it. What the quickstart added:
-    tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ .env docker-compose.yml"
+    tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ .env docker-compose.yml tapstate-mcp.json"
+    fi
+    # The agent block names the file only when there is one; otherwise it says why there is not, so the
+    # option is never advertised over a configuration that was never written.
+    if [ -z "${agent_note:-}" ]; then
+        agent_lines="    1. Give your agent the Tapstate authoring skills. Without them it can write a pipeline that
+       validates and runs but does not mean what you asked:
+         npx --yes skills add tapstate/tapstate-skills
+    2. Connect it: $agent_config in this directory starts Tapstate's MCP server with a write token.
+         Claude Code:   claude --mcp-config $agent_config
+         other agents:  copy its \"tapstate\" entry into the agent's MCP settings
+    3. Ask it, for example:
+         \"Create a pipeline that keeps a live copy of the shipments in fulfillment_db with only
+          their id, carrier and status, start it, and tell me its status.\""
+    else
+        agent_lines="    Not set up: $agent_note"
     fi
     uri="mongodb://mongo:27017/views?directConnection=true"
     # How long a pasted wait keeps trying. Taken for the slowest healthy machine, not the fastest: a
@@ -263,13 +395,23 @@ What you have: one object per order, assembled out of two different databases. T
 MySQL, their shipments are in PostgreSQL, and neither engine can see the other's table -- so this is
 not a view and not a join. Tapstate keeps it fresh from both sides at once.
 
-Look at it (from this directory):
-  ./tapstate -w work        then: connect http://127.0.0.1:8080 ; login admin
-  then, at the prompt:
-    show collections                      three: the two sources, and views.order_state
-    views.order_state.find({id:1})         one order, with its shipments inside it
-    watch views.order_state {id:1}         the same object, redrawn as it changes
-    status order_pipeline --watch          the pipeline behind it
+Three ways to use it:
+
+  In the browser
+    Open http://127.0.0.1:8080 on this machine and sign in as admin, with the password in .env.
+    From another computer, keep  ssh -N -L 127.0.0.1:18080:127.0.0.1:8080 <you>@<this host>  open
+    and visit http://127.0.0.1:18080 instead.
+
+  With your AI agent -- it creates and runs sources and pipelines for you
+$agent_lines
+
+  From the CLI -- for scripts, CI, and machines without a browser or an AI assistant
+    ./tapstate -w work        then: connect http://127.0.0.1:8080 ; login admin
+    then, at the prompt:
+      show collections                      three: the two sources, and views.order_state
+      views.order_state.find({id:1})         one order, with its shipments inside it
+      watch views.order_state {id:1}         the same object, redrawn as it changes
+      status order_pipeline --watch          the pipeline behind it
 
 See change-data-capture: change either database, watch the same object follow. Each wait below gives
 up after ${cdc_wait_seconds}s, says what it saw, and answers non-zero -- so pasted into a script it
@@ -560,20 +702,9 @@ main() {
                     die "the CLI could not log in, so no verb after it ran; inspect it with: docker compose logs bootstrap" ;;
             esac ;;
     esac
-    # Anything else the CLI failed on. Two guards, because what one can see the other cannot.
-    #
-    # A CLI that died -- a crash, a kill -- is what the exit status is for, and the failure it names is
-    # the process, not the verb: the session ended, so nothing after it ran at all.
-    if [ "$repl_status" -ne 0 ]; then
-        die "the CLI exited $repl_status before the pipeline was started; its output is above"
-    fi
-    # A verb that failed is what the exit status cannot see, and it is the case a session produces: a
-    # rejected line is printed and the read loop takes the next one, so a session in which nothing worked
-    # ends exactly the way a healthy one does -- 0. That is how a refused connector registration reached
-    # the row-count wait, which then reported an empty target and sent the reader to the server log, half
-    # a minute later, for a failure that was neither there nor the server's.
-    #
-    # The verbs' own output carries what the status cannot, in one of two shapes. A failure the CLI can
+    # Check both the session status and its diagnostics: a refusal now leaves the
+    # REPL running but makes it exit 1, while older CLIs can still exit zero.
+    # The verbs' own output carries the refusal's identity in one of two shapes. A failure the CLI can
     # name is a coded diagnostic and opens with `error: <code>`, the header every face of the CLI renders
     # failures with. A refusal whose response body carried no code has none to open with, and arrives as
     # the client's own sentence for it -- `The server refused ...` -- under the same indent a message
@@ -603,6 +734,13 @@ main() {
         { print }
         END { if (pending != "") print pending }
     ')"
+    # Only the normal refusal status can be explained by the removed START/RUNNING
+    # diagnostic. An unexplained exit or a crash must still stop the run; any other
+    # refusal left alongside the tolerated one is rejected by the text guard below.
+    if [ "$repl_status" -ne 0 ] \
+        && { [ "$repl_status" -ne 1 ] || [ "$verb_failures" = "$repl_out" ]; }; then
+        die "the CLI exited $repl_status before the pipeline was started; its output is above"
+    fi
     if printf '%s\n' "$verb_failures" | grep -q -e 'error: ' -e 'The server refused ' -e 'request failed: '; then
         die "a verb failed during pipeline setup; the CLI's output is above"
     fi
@@ -635,6 +773,7 @@ main() {
     printf 'quickstart: %s orders from MySQL, each carrying its shipments from PostgreSQL -- %s of them, in one object per order\n' \
         "$orders" "$shipments"
 
+    write_agent_config
     print_next_steps
 }
 

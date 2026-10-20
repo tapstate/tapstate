@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.ClusterProfileStore;
 import io.tapstate.spi.store.IoError;
@@ -12,9 +13,12 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Map;
 import java.util.List;
@@ -232,6 +236,40 @@ class NodeSessionLeaseTest {
             session.close();
         }
         verify(keyring).release(same(accepted));
+    }
+
+    @Test
+    void aJoinResponseAfterThePriorProofExpiresCannotPublishAKeyringAcknowledgement() throws Exception {
+        WorkloadClaim accepted = acceptedProfileClaim(1);
+        WorkloadClaimStore store = mock(WorkloadClaimStore.class);
+        when(store.renew(any(), any())).thenReturn(Optional.of(accepted));
+        ClusterProfileStore profiles = mock(ClusterProfileStore.class);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(profiles.markJoined(any(), anyString(), anyString())).thenAnswer(call -> {
+            entered.countDown();
+            release.await();
+            return true;
+        });
+        SourceConfigKeyringSession keyring = mock(SourceConfigKeyringSession.class);
+        CountDownLatch stopped = new CountDownLatch(1);
+        Duration ttl = Duration.ofSeconds(2);
+        long askedAt = System.nanoTime() - Duration.ofMillis(1500).toNanos();
+        long originalDeadline = askedAt + ttl.toNanos();
+        try (NodeSessionLease session = new NodeSessionLease(store, PROFILE_CLAIM, askedAt, ttl,
+                Duration.ofMillis(1800), keyring, stopped::countDown,
+                profiles, () -> MERGED_JOIN, ORIGINAL_JOIN)) {
+            assertThat(entered.await(300, TimeUnit.MILLISECONDS)).isTrue();
+            while (System.nanoTime() - originalDeadline < 0) Thread.sleep(5);
+            assertThat(stopped.getCount()).as("the coarse lapse check has not run before the held join returns").isEqualTo(1);
+            release.countDown();
+            assertThat(stopped.await(300, TimeUnit.MILLISECONDS)).isTrue();
+            assertThat(session.proof().live()).isFalse();
+            verify(keyring, never()).acknowledge(any(), any());
+            assertThat(session.proof().claim()).isSameAs(PROFILE_CLAIM);
+        } finally {
+            release.countDown();
+        }
     }
 
     private static final WorkloadClaim PROFILE_CLAIM = new WorkloadClaim(
@@ -533,6 +571,93 @@ class NodeSessionLeaseTest {
                 stopped, profiles, actual::get, ORIGINAL_JOIN);
     }
 
+    @Test
+    void anExpiredLocalProofDoesNotAskTheStoreToCreateANewProof() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        RecordingKeyring keyring = new RecordingKeyring(false);
+        CountDownLatch stopped = new CountDownLatch(1);
+        try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM,
+                System.nanoTime() - Duration.ofSeconds(1).toNanos(), Duration.ofMillis(200),
+                Duration.ofMillis(50), keyring, stopped::countDown)) {
+            assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
+            assertThat(store.renewed.getCount()).as("expired proof cannot be extended by a late store success").isEqualTo(1);
+            assertThat(keyring.acknowledgements).hasValue(0);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(FirstFailure.class)
+    void anImmediateFirstRefusalRunsOnlyAfterBothTasksAreRegistered(FirstFailure failure) throws Exception {
+        for (int race = 0; race < 20; race++) {
+            RecordingStore store = new RecordingStore(failure != FirstFailure.OWNER,
+                    failure == FirstFailure.STORE ? new TapstateException(IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "owned fixture store unavailable"), null) : null);
+            RecordingKeyring keyring = new RecordingKeyring(failure == FirstFailure.ACK);
+            CountDownLatch stopped = new CountDownLatch(1);
+            AtomicInteger stops = new AtomicInteger();
+            try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM, System.nanoTime(),
+                    Duration.ofSeconds(2), Duration.ofSeconds(1), keyring, () -> {
+                        stops.incrementAndGet();
+                        stopped.countDown();
+                    })) {
+                assertThat(stopped.await(500, TimeUnit.MILLISECONDS))
+                        .as("the first refusal must not wait for the periodic renewal interval").isTrue();
+                assertThat(stops).hasValue(1);
+            }
+            assertThat(stops).hasValue(1);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(HeldSuccess.class)
+    void aLateSuccessfulResponseCannotExtendAnAlreadyLapsedProof(HeldSuccess stage) throws Exception {
+        Delay delay = new Delay();
+        RecordingStore store = new RecordingStore(true, null, stage == HeldSuccess.STORE ? delay : null);
+        RecordingKeyring keyring = new RecordingKeyring(false, stage == HeldSuccess.ACK ? delay : null);
+        CountDownLatch stopped = new CountDownLatch(1);
+        AtomicInteger stops = new AtomicInteger();
+        Duration ttl = Duration.ofSeconds(2);
+        long askedAt = System.nanoTime() - Duration.ofMillis(1500).toNanos();
+        long originalDeadline = askedAt + ttl.toNanos();
+        try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM, askedAt, ttl,
+                Duration.ofMillis(1800), keyring, () -> {
+                    stops.incrementAndGet();
+                    stopped.countDown();
+                })) {
+            assertThat(delay.entered.await(300, TimeUnit.MILLISECONDS)).as("the immediate renewal reached its held response").isTrue();
+            while (System.nanoTime() - originalDeadline < 0) Thread.sleep(5);
+            assertThat(stopped.getCount()).as("the coarse lapse checker has not run before the controlled return").isEqualTo(1);
+            delay.resume.countDown();
+            assertThat(stopped.await(300, TimeUnit.MILLISECONDS))
+                    .as("a response after the prior proof expired must fail closed before publishing a new proof").isTrue();
+            assertThat(stops).hasValue(1);
+            if (stage == HeldSuccess.STORE) {
+                assertThat(keyring.acknowledgements).as("an already-lapsed proof cannot publish an ACK").hasValue(0);
+            }
+        } finally {
+            delay.resume.countDown();
+        }
+        assertThat(stops).hasValue(1);
+    }
+
+    private enum HeldSuccess { STORE, ACK }
+
+    private static final class Delay {
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch resume = new CountDownLatch(1);
+
+        private void block() {
+            entered.countDown();
+            try {
+                if (!resume.await(2, TimeUnit.SECONDS)) throw new AssertionError("owned successful response was not released");
+            } catch (InterruptedException stopped) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private enum FirstFailure { OWNER, ACK, STORE }
+
     /** A store whose renewals hang until {@link #answer} lets them go, as a frozen store's do. */
     private static final class SilentStore implements WorkloadClaimStore {
 
@@ -588,12 +713,24 @@ class NodeSessionLeaseTest {
         /** Nothing here reads the lease; it answers with a live one so a read is not a lapsed claim. */
         private static final Duration LIVE_LEASE = Duration.ofSeconds(30);
         private final boolean renews;
+        private final RuntimeException renewalFailure;
+        private final Delay delay;
         private final CountDownLatch renewed = new CountDownLatch(1);
         private final AtomicLong firstRenewalAskedAt = new AtomicLong();
         private final AtomicBoolean released = new AtomicBoolean();
 
         private RecordingStore(boolean renews) {
+            this(renews, null);
+        }
+
+        private RecordingStore(boolean renews, RuntimeException renewalFailure) {
+            this(renews, renewalFailure, null);
+        }
+
+        private RecordingStore(boolean renews, RuntimeException renewalFailure, Delay delay) {
             this.renews = renews;
+            this.renewalFailure = renewalFailure;
+            this.delay = delay;
         }
 
         @Override
@@ -606,6 +743,8 @@ class NodeSessionLeaseTest {
         public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
             firstRenewalAskedAt.compareAndSet(0L, System.nanoTime());
             renewed.countDown();
+            if (delay != null) delay.block();
+            if (renewalFailure != null) throw renewalFailure;
             return renews ? Optional.of(expected) : Optional.empty();
         }
 
@@ -635,17 +774,24 @@ class NodeSessionLeaseTest {
 
     private static final class RecordingKeyring implements SourceConfigKeyringSession {
         private final boolean refuse;
+        private final Delay delay;
         private final CountDownLatch acknowledged = new CountDownLatch(1);
         private final AtomicInteger acknowledgements = new AtomicInteger();
         private final AtomicBoolean released = new AtomicBoolean();
 
         private RecordingKeyring(boolean refuse) {
+            this(refuse, null);
+        }
+
+        private RecordingKeyring(boolean refuse, Delay delay) {
             this.refuse = refuse;
+            this.delay = delay;
         }
 
         @Override
         public void acknowledge(WorkloadClaim session, Duration ttl) {
             acknowledgements.incrementAndGet();
+            if (delay != null) delay.block();
             acknowledged.countDown();
             if (refuse) {
                 throw new TapstateException(

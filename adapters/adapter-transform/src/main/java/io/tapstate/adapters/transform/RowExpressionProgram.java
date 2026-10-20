@@ -66,12 +66,17 @@ final class RowExpressionProgram {
 
     /** Evaluates the expression against one event, returning the raw CEL result. */
     Object eval(Envelope event) {
+        return eval(event, event.after());
+    }
+
+    /** Evaluates a row image as {@code after}, keeping the original event's other bindings. */
+    Object eval(Envelope event, Map<String, Object> after) {
         Map<String, Object> vars = new HashMap<>(8);
         vars.put("op", event.op().symbol());
         vars.put("ts", event.ts());
         vars.put("src", event.src());
         vars.put("before", bind(event.before()));
-        vars.put("after", bind(event.after()));
+        vars.put("after", bind(after));
         vars.put("schema", bind(event.schema()));
         try {
             return unbound(program.eval(vars));

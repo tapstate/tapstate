@@ -31,7 +31,8 @@ final class CloudArtifactReadStep {
             }
             originalArtifact |= REGISTRY.equals(frame.className()) && "artifact".equals(frame.methodName());
             download |= BUCKET.equals(frame.className()) && "downloadToStream".equals(frame.methodName());
-            metadataFind |= FIND.equals(frame.className()) && "first".equals(frame.methodName());
+            metadataFind |= FIND.equals(frame.className())
+                    && ("first".equals(frame.methodName()) || "into".equals(frame.methodName()));
         }
         if (!originalArtifact) return Step.UNCLASSIFIED;
         // A download can perform its own file lookup before reading chunks.
