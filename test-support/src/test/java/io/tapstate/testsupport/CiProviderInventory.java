@@ -31,6 +31,7 @@ public final class CiProviderInventory {
             Map.entry("io.tapstate.core.dsl.TargetConnectorRulesTest", List.of("sinkConnectors")),
             Map.entry("io.tapstate.adapters.pdk.PdkTypeMappingTest", List.of("declaredColumnShapes", "driverNativeColumnShapes")),
             Map.entry("io.tapstate.control.restapi.WrittenFilterTest", List.of("theVocabularyDownBothRoads")),
+            Map.entry("io.tapstate.cli.PublishedConnectorArtifactsTest", List.of("publishedIds")),
             Map.entry("io.tapstate.e2e.JoinConformanceIT", List.of("carriers")),
             Map.entry("io.tapstate.core.event.HowManyBytesARowIsTest", List.of("eachRuleChargesWhatTheDefinitionSays")));
 

@@ -15,6 +15,17 @@
       "source": "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/PdkTypeMappingTest.java",
       "source_sha256": "c77042856e3be8ba50a67f44a8067aa3d3a4c08287b706b679ca9908b8c0da5a"
     },
+    "io.tapstate.cli.PublishedConnectorArtifactsTest": {
+      "module": "cli",
+      "providers": {
+        "publishedIds": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "cli/src/test/java/io/tapstate/cli/PublishedConnectorArtifactsTest.java",
+      "source_sha256": "b9844afa4a4efcbc98d1fc0c43135a911336454fc1805925d490225e4bfdcfa5"
+    },
     "io.tapstate.control.restapi.WrittenFilterTest": {
       "module": "control/rest-api",
       "providers": {
@@ -87,7 +98,7 @@
         }
       },
       "source": "core/core-dsl/src/test/java/io/tapstate/core/dsl/TargetConnectorRulesTest.java",
-      "source_sha256": "21dbbff5204e987ff6aa5d0e5b54848b1ffdd57e73df104ea1163c1669a3cafe"
+      "source_sha256": "f7f4f9a38a3da5ef8acc929e93fa4936ca948677c8ecf30591526bf7fd5c5ff6"
     },
     "io.tapstate.core.event.HowManyBytesARowIsTest": {
       "module": "core/core-event",
