@@ -1,8 +1,11 @@
 package io.tapstate.app;
 
 import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudClusterEgressAddress;
 import io.tapstate.control.core.CloudRuntimeStatus;
 import io.tapstate.control.core.Scope;
+import io.tapstate.cloud.sdk.client.ClusterEgressAddress;
+import io.tapstate.cloud.sdk.client.JwtExchangeResult;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,6 +20,35 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CloudSdkBridgeTest {
+
+    @Test
+    void exchangeResultCarriesTypedOptionalEgressMetadataAndAllowsOlderCloudResponses() {
+        var mapped = CloudSdkBridge.exchangeResult(new JwtExchangeResult("jwt", EXPIRY, "jti", null,
+                "org", "cluster", "Org", "Cluster", "us-east-1", "203.0.113.42", "STABLE"));
+        var context = mapped.context();
+        assertThat(context.ec2PublicIp()).isEqualTo("203.0.113.42");
+        assertThat(context.egressAddressStatus()).isEqualTo("STABLE");
+        var oldCloudResponse = CloudSdkBridge.exchangeResult(new JwtExchangeResult("jwt", EXPIRY, "jti", null,
+                "org", "cluster", "Org", "Cluster", "us-east-1", null, null));
+        assertThat(oldCloudResponse.context().ec2PublicIp()).isNull();
+        assertThat(oldCloudResponse.context().egressAddressStatus()).isNull();
+        var blankMetadata = CloudSdkBridge.exchangeResult(new JwtExchangeResult("jwt", EXPIRY, "jti", null,
+                "org", "cluster", "Org", "Cluster", "us-east-1", "  ", ""));
+        assertThat(blankMetadata.context().ec2PublicIp()).isNull();
+        assertThat(blankMetadata.context().egressAddressStatus()).isNull();
+
+        var compatibleSdkResult = new CloudSdkBridge.ExchangeResult(
+                "jwt", "org", "cluster", "Org", "Cluster", "us-east-1");
+        assertThat(compatibleSdkResult.context().ec2PublicIp()).isNull();
+        assertThat(compatibleSdkResult.context().egressAddressStatus()).isNull();
+    }
+
+    @Test
+    void missingRequiredExchangeFieldsRejectBeforeCreatingDisplayContext() {
+        assertThatThrownBy(() -> CloudSdkBridge.exchangeResult(new JwtExchangeResult("jwt", EXPIRY, "jti", null,
+                "org", "cluster", "Org", "Cluster", "", "203.0.113.42", "STABLE")))
+                .isInstanceOf(CloudSdkBridge.ProviderFailure.class);
+    }
 
     @Test
     void reportableFailureCodesKeepTheBoundedAsciiGrammarWithoutRecursiveMatching() {
@@ -169,6 +201,16 @@ class CloudSdkBridgeTest {
     }
 
     @Test
+    void readsOnlyTheCurrentAddressForTheRequestedOrganizationAndCluster() {
+        sdk.address = new ClusterEgressAddress("org-one", "cluster-one", "203.0.113.42", "STABLE");
+
+        assertThat(bridge.currentAddress("org-one", "cluster-one")).contains(
+                new CloudClusterEgressAddress("org-one", "cluster-one", "203.0.113.42", "STABLE"));
+        assertThat(bridge.currentAddress("other-org", "cluster-one")).isEmpty();
+        assertThat(bridge.currentAddress("org-one", "other-cluster")).isEmpty();
+    }
+
+    @Test
     void providerFailuresStayCodedAndCarryNoProviderCause() {
         sdk.failure = true;
         assertThatThrownBy(() -> bridge.exchange("one-time-code", "cluster-one"))
@@ -178,6 +220,7 @@ class CloudSdkBridgeTest {
         assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
         assertThat(bridge.verify("https://cloud.example", CloudSdkBridge.DEPLOYMENT_ORGANIZATION,
                 "cluster-one", "POST", "ts", "nonce", "jti", "signature")).isFalse();
+        assertThat(bridge.currentAddress("org-one", "cluster-one")).isEmpty();
         assertThatThrownBy(() -> bridge.send(
                 "cluster-one", "nonce", new CloudRuntimeStatus("0.5.0", 1, 0, null)))
                 .isInstanceOf(TapstateException.class)
@@ -202,6 +245,8 @@ class CloudSdkBridgeTest {
         private String reportNonce;
         private CloudRuntimeStatus reportStatus;
         private String reportToken;
+        private ClusterEgressAddress address = new ClusterEgressAddress(
+                "org-one", "cluster-one", null, "PROVISIONING");
         private boolean failure;
 
         @Override
@@ -216,6 +261,12 @@ class CloudSdkBridgeTest {
             failIfRequested();
             verifiedJwt = jwt;
             return claims;
+        }
+
+        @Override
+        public ClusterEgressAddress currentEgressAddress() {
+            failIfRequested();
+            return address;
         }
 
         @Override

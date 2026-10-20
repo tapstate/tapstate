@@ -134,6 +134,7 @@ class OracleFixtureChangeCaptureIT {
     @Test
     @Timeout(value = 6, unit = TimeUnit.MINUTES)
     void anInflightTransactionDoesNotAbortChangeCaptureSetup() throws Exception {
+        System.err.printf("oracle-fixture-probe method-start epoch-ms=%d%n", System.currentTimeMillis());
         DockerGate.require();
         ImageNameSubstitutor originalSubstitutor = ImageNameSubstitutor.instance();
         String delayedImage = new ImageFromDockerfile()
@@ -166,12 +167,18 @@ class OracleFixtureChangeCaptureIT {
                         "$ORACLE_HOME/bin/sqlplus-probe-real" -s / as sysdba \
                           > /tmp/tapstate-transaction.log 2>&1 <<'SQL' &
                         WHENEVER SQLERROR EXIT FAILURE ROLLBACK
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-before-create epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         CREATE TABLE SYSTEM.TAPSTATE_LOGGING_HOLD (ID NUMBER);
                         INSERT INTO SYSTEM.TAPSTATE_LOGGING_HOLD VALUES (1);
                         HOST touch /tmp/tapstate-transaction-ready
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-ready epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-sleep-start epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         BEGIN DBMS_SESSION.SLEEP(130); END;
                         /
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-sleep-end epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         ROLLBACK;
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-rollback-end epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-exit epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         EXIT;
                         SQL
                         holder=$!

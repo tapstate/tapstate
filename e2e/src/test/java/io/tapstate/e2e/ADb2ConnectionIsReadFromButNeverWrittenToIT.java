@@ -7,7 +7,8 @@ import io.tapstate.testsupport.DockerGate;
 
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -17,20 +18,9 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Db2 is supported as a source only: a running server installs a pipeline that reads a db2 connection,
- * and refuses, with a code naming the connector, a pipeline that would write into one - and an edit that
- * would move the connection an installed pipeline writes to onto db2.
- *
- * <p>The refusal is the part worth an end-to-end case. Db2's own connector implements writes, and an
- * on-prem deployment otherwise accepts a sync onto any connector the catalog marks sink-capable, so
- * the only thing standing between an author and a db2 target is that the catalog row the server
- * judges against says it is not one. That row is what this release ships, and the server is where an
- * author meets the answer.
- *
- * <p>The read half is asserted first, against the same server, so the refusal cannot be a server that
- * turns away every db2 document: the connection it refuses to write into is the same kind it has just
- * installed a pipeline reading from. Neither half needs a Db2 database or the connector jar - apply
- * judges a batch against the catalog, before anything connects.
+ * Both Db2 previews can be read but cannot be sync targets, including after editing a stored target
+ * or loading a legacy writable catalog row. The server applies the source-only policy before it
+ * connects, so these cases need neither a live Db2 system nor a connector JAR.
  */
 class ADb2ConnectionIsReadFromButNeverWrittenToIT {
 
@@ -40,8 +30,8 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
             version: tapstate/v1
             kind: source
             id: src_db2
-            connector: db2
-            config: { host: 10.10.0.7, port: 50000, database: SAMPLE, schema: APP, rawLogServerHost: 10.10.0.8 }
+            connector: %s
+            config: %s
             mode: cdc
             tables: [ ORDERS ]
             """;
@@ -78,8 +68,8 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
             version: tapstate/v1
             kind: source
             id: tgt_db2
-            connector: db2
-            config: { host: 10.30.0.9, port: 50000, database: SAMPLE, schema: APP }
+            connector: %s
+            config: %s
             """;
 
     /** The connection the installed pipeline writes to, re-applied on its own with Db2 underneath. */
@@ -87,8 +77,8 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
             version: tapstate/v1
             kind: source
             id: tgt_mongo
-            connector: db2
-            config: { host: 10.30.0.9, port: 50000, database: SAMPLE, schema: APP }
+            connector: %s
+            config: %s
             """;
 
     private static final String WRITE_INTO_DB2 = """
@@ -101,20 +91,33 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
               sync: [ { id: out, source: tgt_db2, write_mode: upsert } ]
             """;
 
+    private static String sourceConfig(String connector) {
+        return "db2i".equals(connector)
+                ? "{ host: 10.10.0.7, database: ORDERSLIB, journalLibraryName: ORDERSLIB, journalName: QSQJRN }"
+                : "{ host: 10.10.0.7, port: 50000, database: SAMPLE, schema: APP, rawLogServerHost: 10.10.0.8 }";
+    }
+
+    private static String targetConfig(String connector) {
+        return "db2i".equals(connector)
+                ? "{ host: 10.30.0.9, database: ODSLIB }"
+                : "{ host: 10.30.0.9, port: 50000, database: SAMPLE, schema: APP }";
+    }
+
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
     }
 
-    @Test
-    void aStoredWritableDb2RowFromAnEarlierReleaseCannotEnableASyncTarget() throws Exception {
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"db2", "db2i"})
+    void aStoredWritableDb2RowFromAnEarlierReleaseCannotEnableASyncTarget(String connector) throws Exception {
         String database = "e2e_db2_catalog_upgrade_" + UUID.randomUUID().toString().replace("-", "");
         String storeUri = SharedMongo.replicaSetUrl(database);
         // Seed the persisted shape directly: the running release must not derive the legacy fixture.
-        try (var resource = TapstateCatalog.class.getResourceAsStream("/catalog/db2.json");
+        try (var resource = TapstateCatalog.class.getResourceAsStream("/catalog/" + connector + ".json");
                 var client = MongoClients.create(storeUri)) {
             Document legacy = Document.parse(new String(resource.readAllBytes(), StandardCharsets.UTF_8));
-            legacy.put("_id", "db2");
+            legacy.put("_id", connector);
             legacy.put("sink", new Document("capable", true)
                     .append("writeSemantics", List.of("upsert", "append")));
             client.getDatabase(database).getCollection(MongoStorePort.CONNECTOR_CATALOG).insertOne(legacy);
@@ -124,37 +127,38 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
             control.apply(Map.of(
-                    "src_db2.tap.yml", DB2_SOURCE,
+                    "src_db2.tap.yml", DB2_SOURCE.formatted(connector, sourceConfig(connector)),
                     "tgt_mongo.tap.yml", MONGO_TARGET,
                     "orders_from_db2.tap.yml", READ_FROM_DB2));
             assertThat(control.artifactIds()).contains("orders_from_db2", "src_db2", "tgt_mongo");
 
             ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
                     "src_orders.tap.yml", MYSQL_SOURCE,
-                    "tgt_db2.tap.yml", DB2_TARGET,
+                    "tgt_db2.tap.yml", DB2_TARGET.formatted(connector, targetConfig(connector)),
                     "orders_into_db2.tap.yml", WRITE_INTO_DB2));
 
             assertThat(refusal.code()).isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
-            assertThat(refusal.params()).containsEntry("connector", "db2").containsEntry("source", "tgt_db2");
+            assertThat(refusal.params()).containsEntry("connector", connector).containsEntry("source", "tgt_db2");
             assertThat(control.artifactIds()).doesNotContain("orders_into_db2", "tgt_db2", "src_orders");
             // Reading current support policy must not rewrite the stored document or require re-registration.
             try (var client = MongoClients.create(storeUri)) {
                 Document persisted = client.getDatabase(database).getCollection(MongoStorePort.CONNECTOR_CATALOG)
-                        .find(new Document("_id", "db2")).first();
+                        .find(new Document("_id", connector)).first();
                 assertThat(persisted.get("sink", Document.class).getBoolean("capable")).isTrue();
             }
         }
     }
 
-    @Test
-    void aPipelineReadingDb2IsInstalledAndOneWritingIntoDb2IsRefused() {
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"db2", "db2i"})
+    void aPipelineReadingDb2IsInstalledAndOneWritingIntoDb2IsRefused(String connector) {
         String database = "e2e_db2_source_only_" + UUID.randomUUID().toString().replace("-", "");
         try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl(database))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
 
             control.apply(Map.of(
-                    "src_db2.tap.yml", DB2_SOURCE,
+                    "src_db2.tap.yml", DB2_SOURCE.formatted(connector, sourceConfig(connector)),
                     "tgt_mongo.tap.yml", MONGO_TARGET,
                     "orders_from_db2.tap.yml", READ_FROM_DB2));
 
@@ -164,7 +168,7 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
 
             ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
                     "src_orders.tap.yml", MYSQL_SOURCE,
-                    "tgt_db2.tap.yml", DB2_TARGET,
+                    "tgt_db2.tap.yml", DB2_TARGET.formatted(connector, targetConfig(connector)),
                     "orders_into_db2.tap.yml", WRITE_INTO_DB2));
 
             assertThat(refusal.code())
@@ -172,7 +176,7 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
                     .isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
             assertThat(refusal.params())
                     .as("the connector and the connection naming it are what send the author to the fix")
-                    .containsEntry("connector", "db2")
+                    .containsEntry("connector", connector)
                     .containsEntry("source", "tgt_db2");
             assertThat(control.artifactIds())
                     .as("what the server holds after refusing the batch")
@@ -180,14 +184,14 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
 
             String installedTarget = control.contentHash("tgt_mongo");
             ControlPlane.Refusal moved = control.applyExpectingRefusal(Map.of(
-                    "tgt_mongo.tap.yml", MONGO_TARGET_MOVED_TO_DB2));
+                    "tgt_mongo.tap.yml", MONGO_TARGET_MOVED_TO_DB2.formatted(connector, targetConfig(connector))));
 
             assertThat(moved.code())
                     .as("the code refusing an edit that would leave an installed sync writing into db2")
                     .isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
             assertThat(moved.params())
                     .as("the pipeline that would write into it is named, not only the connection")
-                    .containsEntry("connector", "db2")
+                    .containsEntry("connector", connector)
                     .containsEntry("source", "tgt_mongo")
                     .containsEntry("resource", "orders_from_db2");
             assertThat(control.contentHash("tgt_mongo"))

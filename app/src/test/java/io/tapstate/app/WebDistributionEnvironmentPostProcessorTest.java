@@ -80,6 +80,32 @@ class WebDistributionEnvironmentPostProcessorTest {
                 .isEqualTo(ConfigDataEnvironmentPostProcessor.ORDER + 1);
     }
 
+    @Test
+    void localWebConfirmationUsesTheAuthoritativeReaderBeforeAnyContextOrClientExists() throws Exception {
+        for (String profile : List.of("onprem", "cloud")) {
+            URL source = origin(profile);
+            Path metadata = Path.of(source.toURI()).resolve("META-INF/tapstate-web.properties");
+            Files.writeString(metadata, "purpose=local-development\nprofile="
+                    + (profile.equals("onprem") ? "op" : "cloud") + "\nweb.profile=" + profile + "\n"
+                    + (profile.equals("cloud") ? "cloud.console.url=http://localhost:39175/\n" : ""));
+            for (String confirmation : List.of("false", "true")) {
+                Counters counters = new Counters();
+                Map<String, String> settings = new LinkedHashMap<>(profile.equals("cloud") ? values(15) : Map.of());
+                settings.put("tapstate.local-development.enabled", confirmation);
+                Prepared prepared = prepare(Carrier.JVM, settings, source, counters);
+                if (confirmation.equals("false")) {
+                    assertEarlyFailure(prepared, counters, BootError.WEB_DEVELOPMENT_CONFIRMATION_REQUIRED);
+                } else {
+                    try (var context = prepared.application().run(prepared.arguments())) {
+                        assertThat(context.isActive()).isTrue();
+                        assertThat(counters.contexts()).hasValue(1);
+                        assertThat(counters.networkClients()).hasValue(1);
+                    }
+                }
+            }
+        }
+    }
+
     @ParameterizedTest(name = "{0} {1} configuration mask {2}")
     @MethodSource("configurationMatrix")
     void everyCarrierUsesTheSameStrictSixteenCombinationMatrix(
@@ -237,7 +263,11 @@ class WebDistributionEnvironmentPostProcessorTest {
 
     private Prepared prepare(Carrier carrier, Map<String, String> values, String profile,
             Counters counters) throws Exception {
-        URL origin = origin(profile);
+        return prepare(carrier, values, origin(profile), counters);
+    }
+
+    private Prepared prepare(Carrier carrier, Map<String, String> values, URL origin,
+            Counters counters) throws Exception {
         var environment = CloudFixtureEnvironment.isolated();
         List<String> arguments = new ArrayList<>();
         if (carrier == Carrier.PROPERTIES) {
