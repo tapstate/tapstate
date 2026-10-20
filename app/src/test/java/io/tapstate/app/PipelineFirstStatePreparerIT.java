@@ -345,6 +345,15 @@ class PipelineFirstStatePreparerIT {
                     () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE));
             assertThatThrownBy(() -> coordinator.delete(request,Optional.empty())).isInstanceOf(TapstateException.class);
             assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
+            var beforeLateRelease=f.claim();
+            assertThat(claims.release(run)).isFalse();
+            assertThat(f.claim()).isEqualTo(beforeLateRelease);
+            var malformedScope=new Document(beforeLateRelease).append("pipelineScope","broken");
+            f.cacheDatabase.getCollection("workload_claims").replaceOne(f.pipelineFilter(),malformedScope);
+            assertThatThrownBy(() -> claims.release(run)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.claim()).isEqualTo(malformedScope);
+            f.cacheDatabase.getCollection("workload_claims").replaceOne(f.pipelineFilter(),beforeLateRelease);
             assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);assertThat(releases).hasValue(1);assertThat(store.retirement(token,request.operationId()).origin()).contains(origin);
             assertThat(f.configuration.artifacts().create(pipeline)).isEqualTo(io.tapstate.spi.store.ArtifactMutation.ALREADY_EXISTS);
             var retiredClaim=f.claim();failed.set(false);var result=coordinator.resume(f.scope,request.operationId(),Optional.empty()).orElseThrow();

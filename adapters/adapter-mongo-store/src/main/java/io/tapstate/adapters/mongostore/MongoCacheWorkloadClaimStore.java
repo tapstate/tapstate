@@ -85,9 +85,26 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     @Override public boolean release(WorkloadClaim expected) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
         return transaction(false, (store, session) -> {
+            if (knownRetiredPipeline(session, expected.key())) return false;
             storedScope(session, expected.key());
             return store.release(expected);
         });
+    }
+    private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {
+        if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION) return false;
+        var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+        if (row == null || !(row.get("pipelinePreparation") instanceof Document preparation)
+                || !"RETIRED".equals(preparation.get("phase"))) return false;
+        if (!(row.get("pipelineRetirement") instanceof Document saved)) throw claimFenced();
+        if (!(row.get("pipelineScope") instanceof Document physical)) throw unreadableScope();
+        var retired = MongoPipelineRetirementFacts.cache(saved);
+        if (!key.equals(retired.claim().key())
+                || !scope.equals(new CacheBusinessScope(retired.scope().clusterId(), retired.scope().bindingVersion(), retired.scope().cacheIncarnation()))
+                || !retired.scope().equals(MongoPipelinePreparationFacts.scope(physical))) throw claimFenced();
+        new MongoCachePipelineRetirements(client, database, scope, requireActive).verifyRetired(session, retired);
+        // Retirement has already expired and replaced the live fence. A late release cannot rewrite that result.
+        return true;
     }
     @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
