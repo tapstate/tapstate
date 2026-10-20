@@ -234,6 +234,126 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    /** Real production-root routing and Mongo persistence; the SDK boundary remains a local fixture. */
+    @Test
+    void wholeCacheLossUsesOriginalCloudExchangeAndDurableRevocationWithoutBusinessState() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "cloud_config_" + suffix, cacheDb = "cloud_cache_" + suffix, masterDb = "cloud_master_" + suffix;
+        String user = "cloud_" + suffix;
+        var original = new io.tapstate.spi.store.StorageSetupScope("cloud-" + suffix, "installation", "setup", 1);
+        var sdk = new RecoverySdk(original.clusterId());
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(configDb, cacheDb, masterDb));
+            var cache = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                    uri(user, cacheDb), cacheDb, null);
+            try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                    new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(user, configDb), null, Duration.ofSeconds(5)),
+                    original.clusterId(), original.installationId(), original.operationId(), 1)) {
+                var target = new SourceResource("atlas-store", null, "mongodb", Map.of("uri", uri(user, masterDb)), null, null, null, null);
+                var initial = configuration.bindings().commitWithFirstCache(original, io.tapstate.spi.store.StorageBinding.Mode.CLOUD, cache, target);
+                try (var cached = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(cache, Duration.ofSeconds(5), "cloud-fixture")) {
+                    cached.prepareFirstAuth(initial.firstCreation().orElseThrow());
+                }
+                configuration.bindings().complete(original);
+            }
+            var configuration = admin.getDatabase(configDb);
+            Document binding = configuration.getCollection("storage_binding").find().first();
+            Document keys = configuration.getCollection("cluster_keys").find().first();
+            String old;
+            try (var first = cloudRecoveryRoot(uri(user, configDb), sdk)) { old = exchangeCookie(first, "old"); }
+            admin.getDatabase(cacheDb).drop();
+            try (var restarted = cloudRecoveryRoot(uri(user, configDb), sdk)) {
+                var root = restarted.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(2);
+                assertCloudStatus(restarted, old, 401);
+                assertThatThrownBy(() -> exchangeCookie(restarted, "old"))
+                        .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                String timestamp = Long.toString(Instant.now().getEpochSecond());
+                rootClient(restarted).post().uri("/auth/invalidate-session?jti=blocked&ts=" + timestamp + "&nonce=fixture-nonce&sign=fixture-signature")
+                        .retrieve().toBodilessEntity();
+                assertThat(admin.getDatabase(cacheDb).getCollection("cloud_revocations").countDocuments()).isOne();
+            }
+            // The blocked code has never been consumed. Only the durable callback survives this restart.
+            try (var restarted = cloudRecoveryRoot(uri(user, configDb), sdk)) {
+                var root = restarted.getBean(StorageRoot.class);
+                assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(2);
+                assertThatThrownBy(() -> exchangeCookie(restarted, "blocked"))
+                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                failure -> assertThat(failure.getStatusCode().value()).isEqualTo(401));
+                String fresh = exchangeCookie(restarted, "fresh");
+                assertCloudStatus(restarted, fresh, 200);
+                assertThat(root.runtime().business()).isEmpty();
+                assertThat(restarted.getBeansOfType(com.hazelcast.core.HazelcastInstance.class)).isEmpty();
+                assertThat(restarted.getBeansOfType(io.tapstate.spi.store.UserStore.class)).isEmpty();
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>()))
+                        .containsExactlyInAnyOrder("cache_identity", "schema_migrations", "cloud_sessions", "cloud_revocations");
+                assertThat(binding.equals(configuration.getCollection("storage_binding").find().first())).isTrue();
+                var currentKey = configuration.getCollection("cluster_keys").find().first();
+                var materialBefore = new Document(keys); materialBefore.remove("sourceWriteFence");
+                var materialAfter = new Document(currentKey); materialAfter.remove("sourceWriteFence");
+                assertThat(materialBefore.equals(materialAfter)).isTrue();
+                assertThat(configuration.getCollection("users").countDocuments()).isZero();
+            }
+        }
+    }
+
+    private ConfigurableApplicationContext cloudRecoveryRoot(String configurationUri, RecoverySdk sdk) {
+        return new SpringApplicationBuilder(Bootstrap.class, RecoverySdkConfiguration.class)
+                .environment(CloudFixtureEnvironment.isolated())
+                .initializers(context -> context.getBeanFactory().registerSingleton("fixtureRecoverySdk", sdk)).run(
+                        "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR", "--SDK_STATUS_SENDER_ENABLED=false",
+                        "--tapstate.cloud.base-url=https://cloud.example", "--tapstate.cloud.token=fixture-runtime-token",
+                        "--tapstate.cloud.cluster-id=" + sdk.cluster, "--tapstate.cloud.atlas-uri=" + configurationUri,
+                        "--tapstate.control.auth.jwt-secret=cloud-loss-stable-test-key",
+                        "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"));
+    }
+    private static String exchangeCookie(ConfigurableApplicationContext application, String code) {
+        int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
+        var client = org.springframework.web.client.RestClient.builder().baseUrl("http://127.0.0.1:" + port)
+                .requestFactory(new org.springframework.http.client.JdkClientHttpRequestFactory(java.net.http.HttpClient.newBuilder()
+                        .followRedirects(java.net.http.HttpClient.Redirect.NEVER).build())).build();
+        var response = client.get().uri("/auth/exchange?code=" + code).retrieve().toBodilessEntity();
+        assertThat(response.getStatusCode().value()).isEqualTo(302);
+        String cookie = response.getHeaders().getFirst("Set-Cookie");
+        assertThat(cookie).contains("Secure", "HttpOnly");
+        return cookie.split(";", 2)[0];
+    }
+    private static void assertCloudStatus(ConfigurableApplicationContext application, String cookie, int expected) {
+        int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
+        rootClient(application).post().uri("/api/storage/status").header("Cookie", cookie)
+                .header("Origin", "http://127.0.0.1:" + port).body(Map.of()).exchange((request, response) -> {
+                    assertThat(response.getStatusCode().value()).isEqualTo(expected);
+                    if (expected == 200) assertThat(response.bodyTo(Map.class).get("businessPhase")).isEqualTo("AWAITING_REBUILD_CONFIRMATION");
+                    return null;
+                });
+    }
+    @org.springframework.boot.test.context.TestConfiguration(proxyBeanMethods = false)
+    static class RecoverySdkConfiguration {
+        @org.springframework.context.annotation.Bean
+        @org.springframework.context.annotation.Primary
+        CloudSdkBridge recoveryBridge(CloudRuntimeSettings settings, RecoverySdk sdk) { return new CloudSdkBridge(settings, sdk); }
+    }
+    static final class RecoverySdk implements CloudSdkBridge.SdkRuntime {
+        final String cluster;
+        final java.util.Set<String> consumed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        RecoverySdk(String cluster) { this.cluster = cluster; }
+        @Override public CloudSdkBridge.ExchangeResult exchange(String code) {
+            if (!List.of("old", "blocked", "fresh").contains(code) || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
+            return new CloudSdkBridge.ExchangeResult(code, "organization", cluster, "Fixture", "Cluster", "local");
+        }
+        @Override public CloudSdkBridge.VerifiedClaims verify(String jwt) {
+            return new CloudSdkBridge.VerifiedClaims("cloud-user", "organization", cluster, jwt, Instant.now().plusSeconds(600),
+                    "https://cloud.example", "127.0.0.1", List.of("workload:write"));
+        }
+        @Override public boolean verifyCallback(String method, String timestamp, String nonce, String data, String signature) {
+            return method.equals("POST") && nonce.equals("fixture-nonce") && signature.equals("fixture-signature") && data.equals("blocked");
+        }
+        @Override public void report(String cluster, String nonce, io.tapstate.control.core.CloudRuntimeStatus status, String token) {
+            throw new AssertionError("the fixture disables status reporting");
+        }
+    }
+
     private ConfigurableApplicationContext nativeRoot(String configurationUri) {
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                 "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0", "--logging.level.root=ERROR",
