@@ -23,9 +23,9 @@ public final class StorageControlCallers {
                 throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
             var original = selected.original();
             original.requireActive().run();
-            if (original.storageScope().isEmpty())
+            if (original.storageScope().isEmpty() && (mode != StorageBinding.Mode.CLOUD || original.organizationId().isEmpty()))
                 throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
-            return StorageControlAccess.ordinary(mode, setups.get(), original.storageScope().orElseThrow(),
+            return StorageControlAccess.ordinary(mode, setups.get(), original.storageScope().orElse(null),
                     selected.getPrincipal(), original.organizationId().orElse(null), original.requireActive());
         };
     }

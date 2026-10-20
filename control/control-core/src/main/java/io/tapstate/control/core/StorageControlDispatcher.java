@@ -37,15 +37,31 @@ public final class StorageControlDispatcher {
         }
     }
     private final OperationRegistry operations;
-    private final StorageSetupService setup;
-    private final StorageRecoveryService recovery;
-    private final ConfigurationImportService imports;
+    private final java.util.function.Supplier<StorageSetupService> setups;
+    private final java.util.function.Supplier<StorageRecoveryService> recoveries;
+    private final java.util.function.Supplier<ConfigurationImportService> importers;
     private final Snapshots snapshots;
     public StorageControlDispatcher(OperationRegistry operations, StorageSetupService setup, StorageRecoveryService recovery,
             ConfigurationImportService imports, Snapshots snapshots) {
-        this.operations = Objects.requireNonNull(operations, "operations"); this.setup = Objects.requireNonNull(setup, "setup");
-        this.recovery = Objects.requireNonNull(recovery, "recovery"); this.imports = Objects.requireNonNull(imports, "imports");
+        this(operations, constant(setup), constant(recovery), constant(imports), snapshots);
+    }
+    public static StorageControlDispatcher staged(OperationRegistry operations, java.util.function.Supplier<StorageSetupService> setups,
+            java.util.function.Supplier<StorageRecoveryService> recoveries,
+            java.util.function.Supplier<ConfigurationImportService> importers, Snapshots snapshots) {
+        return new StorageControlDispatcher(operations, setups, recoveries, importers, snapshots);
+    }
+    private StorageControlDispatcher(OperationRegistry operations, java.util.function.Supplier<StorageSetupService> setups,
+            java.util.function.Supplier<StorageRecoveryService> recoveries,
+            java.util.function.Supplier<ConfigurationImportService> importers, Snapshots snapshots) {
+        this.operations = Objects.requireNonNull(operations, "operations"); this.setups = Objects.requireNonNull(setups, "setups");
+        this.recoveries = Objects.requireNonNull(recoveries, "recoveries"); this.importers = Objects.requireNonNull(importers, "importers");
         this.snapshots = Objects.requireNonNull(snapshots, "snapshots");
+    }
+    private static <T> java.util.function.Supplier<T> constant(T value) { Objects.requireNonNull(value); return () -> value; }
+    private static <T> T available(java.util.function.Supplier<T> provider) {
+        T value = provider.get();
+        if (value == null) throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        return value;
     }
     public Map<String,Object> dispatch(String operationId, StorageControlAccess caller, Map<String,Object> body) {
         try { return execute(operationId, caller, body); }
@@ -68,7 +84,7 @@ public final class StorageControlDispatcher {
             }
             case "storage.test" -> {
                 input.only("operationId", "generation", "candidate", "layer"); setupScope(input, caller);
-                var tested = setup.test(caller.setup(), active, candidate(input.child("candidate")), input.enumeration("layer", StorageSetupService.Layer.class));
+                var tested = available(setups).test(caller.setup(), active, candidate(input.child("candidate")), input.enumeration("layer", StorageSetupService.Layer.class));
                 yield Map.of("layer", tested.layer().name(), "testStamp", tested.testStamp(), "expiresAt", tested.expiresAt().toString(), "checks", tested.checks());
             }
             case "storage.setup.commit" -> {
@@ -76,39 +92,39 @@ public final class StorageControlDispatcher {
                 var stamps = input.child("testStamps"); stamps.only("CONFIG", "CACHE", "MASTER");
                 Map<StorageSetupService.Layer,String> proofs = new EnumMap<>(StorageSetupService.Layer.class);
                 for (var layer : StorageSetupService.Layer.values()) proofs.put(layer, stamps.text(layer.name()));
-                yield setup(setup.commit(caller.subject(), caller.setup(), active, candidate(input.child("candidate")), proofs));
+                yield setup(available(setups).commit(caller.subject(), caller.setup(), active, candidate(input.child("candidate")), proofs));
             }
             case "storage.setup.status" -> {
-                input.only("operationId"); originalSetup(input, caller); yield setup(setup.status(caller.setup(), active));
+                input.only("operationId"); originalSetup(input, caller); yield setup(available(setups).status(caller.setup(), active));
             }
             case "storage.recovery.plan" -> {
                 input.only("scope", "pipelineIds", "operationId", "previousOperationId");
                 var extent = input.enumeration("scope", StorageRecoveryCommands.Extent.class); var ids = input.ids("pipelineIds");
                 if ((extent == StorageRecoveryCommands.Extent.PIPELINE && ids.isEmpty()) || (extent == StorageRecoveryCommands.Extent.CLUSTER && !ids.isEmpty())) throw malformed();
-                yield recovery(recovery.plan(caller.subject(), caller.cache(), active, new StorageRecoveryCommands.Selection(extent, ids),
+                yield recovery(available(recoveries).plan(caller.subject(), caller.cache(), active, new StorageRecoveryCommands.Selection(extent, ids),
                         input.optionalUuid("operationId"), input.optionalUuid("previousOperationId")));
             }
             case "storage.recovery.confirm" -> {
                 input.only("operationId", "planHash", "controlRevision", "confirmed");
                 if (!Boolean.TRUE.equals(input.values.get("confirmed"))) throw malformed();
-                yield recovery(recovery.confirm(caller.subject(), caller.cache(), active, input.uuid("operationId"), input.hash("planHash"), input.number("controlRevision", 1), true));
+                yield recovery(available(recoveries).confirm(caller.subject(), caller.cache(), active, input.uuid("operationId"), input.hash("planHash"), input.number("controlRevision", 1), true));
             }
             case "storage.recovery.status" -> {
                 input.only("operationId"); String id = input.uuid("operationId");
-                yield recovery.status(caller.cache(), active, id).map(StorageControlDispatcher::recovery)
+                yield available(recoveries).status(caller.cache(), active, id).map(StorageControlDispatcher::recovery)
                         .orElseGet(() -> Map.of("operationId", id, "phase", "UNKNOWN"));
             }
             case "configuration.import.preflight" -> {
                 input.only("transfer", "transferKey", "defaultSourceMapping");
-                var resultView = imports.preflight(caller.subject(), caller.importScope(), active, submission(input));
+                var resultView = available(importers).preflight(caller.subject(), caller.importScope(), active, submission(input));
                 yield Map.of("operation", importOperation(resultView.operation()), "preparedTransfer", resultView.preparedTransfer());
             }
             case "configuration.import.commit" -> {
                 input.only("importId", "transfer", "transferKey", "defaultSourceMapping");
-                yield receipt(imports.commit(caller.subject(), caller.importScope(), active, input.uuid("importId"), submission(input)));
+                yield receipt(available(importers).commit(caller.subject(), caller.importScope(), active, input.uuid("importId"), submission(input)));
             }
             case "configuration.import.status" -> {
-                input.only("importId"); var found = imports.status(caller.importScope(), active, input.uuid("importId"));
+                input.only("importId"); var found = available(importers).status(caller.importScope(), active, input.uuid("importId"));
                 var out = new LinkedHashMap<String,Object>(); out.put("importId", found.importId()); out.put("phase", found.phase());
                 out.put("ticket", found.ticket() == null ? null : ticket(found.ticket())); out.put("attempts", found.attempts());
                 out.put("receipt", found.receipt() == null ? null : receipt(found.receipt())); yield out;

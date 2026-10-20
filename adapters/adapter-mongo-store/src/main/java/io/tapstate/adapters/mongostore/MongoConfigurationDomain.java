@@ -124,6 +124,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     public String clusterId() { requireOpen(); return clusterId; }
+    public String databaseName() { requireOpen(); return connection.database().getName(); }
 
     public ArtifactStore artifacts() {
         return artifacts;

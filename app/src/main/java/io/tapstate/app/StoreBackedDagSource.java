@@ -409,6 +409,13 @@ final class StoreBackedDagSource implements DagSource {
                 ParallelismBudget.DEFAULTS);
     }
 
+    static StoreBackedDagSource scopedRoot(StorePort store, NestSettings nests, StoreReachability reachability,
+            SourcePlacement placement, boolean marked, Supplier<List<String>> members, ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes, io.tapstate.adapters.pdk.ConnectorProvisioner connectors) {
+        return new StoreBackedDagSource(store, new PdkSinkWriterBinder(notes, connectors), nests, reachability,
+                placement, store.artifacts(), marked, members, budget);
+    }
+
     /** Resolves the candidate's selected source tables without opening a connector or changing a store. */
     List<PreviewSourceTable> previewSourceTables(PipelineResource pipeline) {
         List<PreviewSourceTable> selected = new ArrayList<>();

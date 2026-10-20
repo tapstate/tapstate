@@ -164,6 +164,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         if (!over || engine.isLost()) return;
         if (capture != null) capture.stopCapture(id(),false);
         if (manifest != null) ports.releaseHot().accept(manifest);
+        if (original != null) ports.plans().apply(original, command).forget(id());
     }
 
     private void stopOriginal() {
@@ -176,6 +177,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         }
         if (capture != null) { capture.stopCapture(id(),false); require(); }
         if (manifest != null && !engine.isLost()) { ports.releaseHot().accept(manifest); require(); }
+        if (original != null) { ports.plans().apply(original, command).forget(id()); require(); }
     }
 
     @Override public synchronized void stop(String pipeline,boolean purge) {

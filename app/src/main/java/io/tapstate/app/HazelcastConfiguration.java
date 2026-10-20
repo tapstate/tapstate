@@ -74,6 +74,10 @@ import java.util.regex.Pattern;
 @EnableConfigurationProperties({HazelcastProperties.class, ControlEndpointProperties.class})
 @Import(ClusterMembershipConfiguration.class)
 class HazelcastConfiguration {
+    private ObjectProvider<MemberStorage> nativeStorage;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    void memberStorage(ObjectProvider<MemberStorage> providers) { nativeStorage = providers; }
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
 
@@ -121,14 +125,28 @@ class HazelcastConfiguration {
             if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) membershipGate.bindSingle(identity.nodeSession());
         }
         HazelcastInstance member;
+        var candidate = new java.util.concurrent.atomic.AtomicReference<HazelcastInstance>();
         try {
             Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
             if (identity != null) {
                 identify(config, identity);
                 configureClusterProtection(config, membershipGate, clusterProperties.getProfile() != ClusterProperties.Profile.SINGLE);
             }
+            MemberStorage storage = nativeStorage == null ? null : nativeStorage.getIfAvailable();
+            if (storage != null) {
+                if (identity == null) throw ThreeLayerStorePort.refused();
+                storage.prepare(config, identity.nodeSession(), sessionAskedAt);
+            }
             member = startMember(() -> Hazelcast.newHazelcastInstance(config));
+            candidate.set(member);
+            if (storage != null) storage.joined(member);
         } catch (RuntimeException | Error startupFailure) {
+            if (candidate.get() != null) {
+                try { candidate.get().shutdown(); }
+                catch (RuntimeException | Error cleanupFailure) {
+                    if (cleanupFailure != startupFailure) startupFailure.addSuppressed(cleanupFailure);
+                }
+            }
             if (identity != null && claimStore != null) {
                 try { claimStore.release(identity.nodeSession()); }
                 catch (RuntimeException | Error cleanupFailure) {

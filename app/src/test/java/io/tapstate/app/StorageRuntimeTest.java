@@ -51,6 +51,7 @@ class StorageRuntimeTest {
     @Test void completedSetupAndVerifiedOriginalCacheStartOnlyOneOwnedRuntimeAndCloseInDependencyOrder() {
         var config = configuration(); var cache = mock(MongoCacheDomain.class); var business = mock(StorageRuntime.Business.class);
         var root = new StorageRuntime(config, binding -> cache);
+        when(business.available()).thenReturn(true);
         var bound = root.loadBound().orElseThrow(); bound.verifyAuthentication();
         root.startBusiness(bound, ignored -> business);
         root.startBusiness(bound, ignored -> { throw new AssertionError("duplicate runtime"); });

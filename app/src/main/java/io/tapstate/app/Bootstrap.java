@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.pdk.PdkAdapter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.Severity;
@@ -19,19 +20,20 @@ import java.util.List;
  * diagnostic — then starts the application context. At L1 the only supported role is {@code all};
  * conditional per-role wiring of the service rings lands later.
  *
- * <p>This is the only non-adapter module permitted to depend on the adapters ring (rule R7): the
- * assembly root is where the adapter bridges are bound into the runtime. The store bridge is engaged
- * here — {@link StoreConfiguration} wires a {@code StorePort} from {@link MongoStorePort}; the PDK
- * bridge is engaged through the control plane, which wires the connector operations (connection test,
- * schema discovery, registration) onto the PDK adapter. {@link #adapterBridges()} records both, so the
- * wiring surface is referenced only from the assembly root.
- *
- * <p>The Mongo driver is on the classpath (through the store adapter), but the framework must not
- * stand up its own, unmanaged store client — the only store client is the controlled
- * {@link StoreConfiguration} connection. The base starter pulls no Mongo auto-configuration, so no
- * exclusion is needed; a test guards that no auto-configured Mongo client bean appears.
+ * <p>This is the only non-adapter module permitted to bind adapter bridges (rule R7).
+ * The minimum root owns CONFIG and authentication. A separately owned business context is created
+ * only after the retained CACHE identity, schema and completed setup are verified. Neither Spring
+ * nor a status read creates an unmanaged Mongo client or starts a member.
  */
 @SpringBootApplication
+@org.springframework.context.annotation.ComponentScan(basePackageClasses = Bootstrap.class, excludeFilters = {
+        @org.springframework.context.annotation.ComponentScan.Filter(type = org.springframework.context.annotation.FilterType.CUSTOM,
+                classes = org.springframework.boot.context.TypeExcludeFilter.class),
+        @org.springframework.context.annotation.ComponentScan.Filter(type = org.springframework.context.annotation.FilterType.CUSTOM,
+                classes = org.springframework.boot.autoconfigure.AutoConfigurationExcludeFilter.class),
+        @org.springframework.context.annotation.ComponentScan.Filter(type = org.springframework.context.annotation.FilterType.ASSIGNABLE_TYPE,
+                classes = {StoreConfiguration.class, ControlPlaneConfiguration.class, HazelcastConfiguration.class,
+                        DataPlaneActuationConfiguration.class, RuntimeConvergenceConfiguration.class, CloudRuntimeConfiguration.class})})
 public class Bootstrap {
 
     private static final Logger LOG = LoggerFactory.getLogger(Bootstrap.class);
@@ -69,14 +71,8 @@ public class Bootstrap {
         new GracefulShutdown(context::close, Runtime.getRuntime()::halt).install();
     }
 
-    /**
-     * The adapter bridges the assembly root binds into the runtime under {@code --role=all}. The app
-     * is the only non-adapter module allowed to depend on the adapters ring (rule R7). The store
-     * bridge ({@link MongoStorePort}) is engaged through {@link StoreConfiguration}; the PDK bridge
-     * ({@link PdkAdapter}) is engaged through the control plane, which wires the connector operations onto
-     * the PDK adapter module.
-     */
+    /** The explicitly owned storage domains and connector bridge used by the production assembly. */
     static List<Class<?>> adapterBridges() {
-        return List.of(PdkAdapter.class, MongoStorePort.class);
+        return List.of(PdkAdapter.class, MongoConfigurationDomain.class, MongoCacheDomain.class);
     }
 }

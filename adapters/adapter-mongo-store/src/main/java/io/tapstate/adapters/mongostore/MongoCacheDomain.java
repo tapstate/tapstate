@@ -363,6 +363,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
     }
 
+    public Duration rateRetention() { businessActive(); return rateRetention; }
+
     private void businessActive() { if (closed.get()) throw MongoCacheBusinessIdentity.businessFenced(); }
     private static com.mongodb.TransactionOptions businessTransaction() {
         return com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)

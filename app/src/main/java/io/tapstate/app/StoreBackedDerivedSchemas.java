@@ -55,11 +55,21 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     private final StorePort storePort;
     private final StoreBackedDagSource joins;
     private final AuditGate auditGate;
+    @FunctionalInterface interface Commands { Command bind(String pipeline); }
+    record Command(StorePort ports, Runnable release) implements AutoCloseable {
+        Command { Objects.requireNonNull(ports); Objects.requireNonNull(release); }
+        @Override public void close() { release.run(); }
+    }
+    private final Commands commands;
 
     StoreBackedDerivedSchemas(StorePort storePort, AuditGate auditGate) {
+        this(storePort, auditGate, null);
+    }
+    StoreBackedDerivedSchemas(StorePort storePort, AuditGate auditGate, Commands commands) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.joins = new StoreBackedDagSource(storePort);
+        this.commands = commands;
     }
 
     @Override
@@ -108,6 +118,10 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
 
     @Override
     public void accept(String principal, String pipelineId) {
+        if (commands != null) {
+            try (var command = commands.bind(pipelineId)) { new StoreBackedDerivedSchemas(command.ports(), auditGate).accept(principal, pipelineId); }
+            return;
+        }
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
         refuseUnlessAtRest(pipelineId);
@@ -131,6 +145,10 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
 
     @Override
     public void derive(String pipelineId) {
+        if (commands != null) {
+            try (var command = commands.bind(pipelineId)) { new StoreBackedDerivedSchemas(command.ports(), auditGate).derive(pipelineId); }
+            return;
+        }
         Objects.requireNonNull(pipelineId, "pipelineId");
         // Apply converts this coded refusal into a warning after committing its artifacts. The held
         // run keeps its models; pipelines that are at rest can still refresh in the same batch.

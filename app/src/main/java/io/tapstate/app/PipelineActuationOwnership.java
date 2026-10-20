@@ -76,6 +76,33 @@ final class PipelineActuationOwnership {
     private final LongSupplier nanoTime;
     private final boolean fenced;
     private final Map<String, Held> held = new HashMap<>();
+    private final Map<String, Control> controls = new HashMap<>();
+
+    /** A synchronous control command pins the existing holder; it creates no second durable lease. */
+    final class Control implements AutoCloseable {
+        private final PipelineIntentScope scope;
+        private final WorkloadClaimFence claim;
+        private Control(PipelineIntentScope scope, WorkloadClaimFence claim) { this.scope = scope; this.claim = claim; }
+        WorkloadClaimFence claim() { return claim; }
+        void requireActive() {
+            synchronized (PipelineActuationOwnership.this) {
+                if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
+            }
+            if (!proveClaim(scope, claim)) throw ThreeLayerStorePort.refused();
+            synchronized (PipelineActuationOwnership.this) {
+                if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
+            }
+        }
+        @Override public void close() {
+            synchronized (PipelineActuationOwnership.this) { controls.remove(scope.pipelineId(), this); }
+        }
+    }
+    synchronized Control control(PipelineIntentScope scope) {
+        var admitted = permit(scope);
+        if (!admitted.granted() || admitted.claim() == null) throw ThreeLayerStorePort.refused();
+        var command = new Control(scope, WorkloadClaimFence.from(admitted.claim()));
+        controls.put(scope.pipelineId(), command); return command;
+    }
     private volatile boolean closing;
 
     /** One pipeline's local view: the claim this member proved, and when the next round trip is due. */
@@ -208,7 +235,7 @@ final class PipelineActuationOwnership {
     /** A new physical scope must be admitted by the store before it can replace the local holder. */
     synchronized Permit permit(PipelineIntentScope scope) {
         Objects.requireNonNull(scope, "scope");
-        if (closing || !accepts(scope)) return Permit.denied();
+        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId())) return Permit.denied();
         String pipelineId = scope.pipelineId();
         Held state = held.get(pipelineId);
         if (state == null) {
@@ -351,7 +378,7 @@ final class PipelineActuationOwnership {
     }
 
     private Execution beginExecution(String pipelineId, PipelineIntentScope scope, WorkloadClaimFence expected) {
-        if (closing || !fenced) return Execution.refused();
+        if (closing || !fenced || controls.containsKey(pipelineId)) return Execution.refused();
         Held state = held.get(pipelineId);
         if (state == null || !Objects.equals(scope, state.scope) || state.claim == null
                 || !expected.equals(WorkloadClaimFence.from(state.claim))) return Execution.refused();
@@ -785,7 +812,7 @@ final class PipelineActuationOwnership {
         Iterator<Map.Entry<String, Held>> entries = held.entrySet().iterator();
         while (entries.hasNext()) {
             Map.Entry<String, Held> entry = entries.next();
-            if (pipelineIds.contains(entry.getKey())) {
+            if (pipelineIds.contains(entry.getKey()) || controls.containsKey(entry.getKey())) {
                 continue;
             }
             WorkloadClaim claim = entry.getValue().claim;

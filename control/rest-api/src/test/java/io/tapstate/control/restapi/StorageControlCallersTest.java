@@ -47,4 +47,34 @@ class StorageControlCallersTest {
                 .isInstanceOf(TapstateException.class)
                 .extracting(error -> ((TapstateException)error).code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE);
     }
+
+    @Test void unavailableAuthenticationDependencyUsesTheSecurityFailureChannelWithoutItsDriverCause() throws Exception {
+        var credentials = new CredentialAuthenticator(raw -> {
+            throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), new IllegalStateException("secret-driver-detail"));
+        });
+        var failure = catchThrowable(() -> new TapstateCredentialAuthenticationProvider(credentials)
+                .authenticate(new TapstateCredentialAuthenticationToken("credential")));
+        assertThat(failure).isInstanceOf(org.springframework.security.authentication.AuthenticationServiceException.class);
+        assertThat(failure.getCause()).isNull();
+        assertThat(failure.toString()).doesNotContain("secret-driver-detail");
+        var response = new org.springframework.mock.web.MockHttpServletResponse();
+        new CodedAuthenticationEntryPoint(new ApiSecurityErrorWriter(io.tapstate.messages.MessageCatalog.bundled(),
+                tools.jackson.databind.json.JsonMapper.builder().build())).commence(
+                new org.springframework.mock.web.MockHttpServletRequest(), response,
+                (org.springframework.security.core.AuthenticationException)failure);
+        assertThat(response.getStatus()).isEqualTo(503);
+        assertThat(response.getContentAsString()).contains("control.storage-unavailable").doesNotContain("secret-driver-detail");
+        assertThat(response.getHeader("Cache-Control")).isEqualTo("no-store");
+    }
+
+    @Test void verifiedCloudSetupIdentityCanReadSetupButCannotBorrowAFormalCacheScope() {
+        var verified = new CredentialAuthentication(new VerifiedToken("cloud-user", Scope.WRITE), Optional.empty(),
+                Optional.of("organization"), () -> {});
+        var credentials = CredentialAuthenticator.scoped(raw -> Optional.of(verified));
+        SecurityContextHolder.getContext().setAuthentication(new TapstateCredentialAuthenticationProvider(credentials)
+                .authenticate(new TapstateCredentialAuthenticationToken("tcs_setup-cookie")));
+        var caller = StorageControlCallers.ordinary(StorageBinding.Mode.CLOUD, () -> SETUP).current();
+        caller.require(ControlOperations.STORAGE_STATUS);
+        assertThatThrownBy(caller::cache).isInstanceOf(TapstateException.class);
+    }
 }

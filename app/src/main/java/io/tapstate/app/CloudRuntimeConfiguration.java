@@ -81,7 +81,13 @@ class CloudRuntimeConfiguration {
         }
         CloudSessionIdentity identity = new CloudSessionIdentity(
                 settings.baseUrl().toString(), CloudSdkBridge.DEPLOYMENT_ORGANIZATION, settings.clusterId());
-        CloudAuthenticationObserver observer = new CloudAuthenticationObserver() {
+        var observer = authenticationObserver();
+        return new CloudAuthenticationService(
+                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock, observer), observer);
+    }
+
+    static CloudAuthenticationObserver authenticationObserver() {
+        return new CloudAuthenticationObserver() {
             @Override
             public void entering(Stage stage) {
                 String label = stage.name().toLowerCase(Locale.ROOT).replace('_', '-');
@@ -108,8 +114,6 @@ class CloudRuntimeConfiguration {
                 return id == null ? "none" : id;
             }
         };
-        return new CloudAuthenticationService(
-                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock, observer), observer);
     }
 
     @Bean

@@ -62,6 +62,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final DagSource dagSource;
     private final PipelineCaptureCoordinator captureCoordinator;
     private final NestStateTeardown stateTeardown;
+    private final String defaultDatabase;
     private final PipelineActuationOwnership actuation;
     private final ExecutionPlanRecorder plans;
     private final Clock clock;
@@ -98,6 +99,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
         this.stateTeardown = Objects.requireNonNull(stateTeardown, "stateTeardown");
+        this.defaultDatabase = stateTeardown.defaultDatabase();
         this.actuation = Objects.requireNonNull(actuation, "actuation");
         this.plans = Objects.requireNonNull(plans, "plans");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -105,10 +107,21 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         captureCoordinator.runOnlyWhileDriving(actuation::isDriving);
     }
 
+    /** A native assembly exposes only fixed convergence passes and never opens the legacy teardown ledger. */
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captures,
+            String defaultDatabase, PipelineActuationOwnership ownership, ExecutionPlanRecorder plans, Clock clock,
+            ConnectorReadiness connectors) {
+        this.engine = Objects.requireNonNull(engine); this.dagSource = Objects.requireNonNull(dagSource);
+        this.captureCoordinator = Objects.requireNonNull(captures); this.stateTeardown = null;
+        this.defaultDatabase = Objects.requireNonNull(defaultDatabase); this.actuation = Objects.requireNonNull(ownership);
+        this.plans = Objects.requireNonNull(plans); this.clock = Objects.requireNonNull(clock);
+        this.connectors = Objects.requireNonNull(connectors);
+    }
+
     /** Reuses this assembly without registering a second global capture ownership predicate. */
     LifecycleActuator forPass(PipelineConvergencePass pass, ScopedEngineLifecycleActuator.Ports ports) {
         return new ScopedEngineLifecycleActuator(pass, engine, dagSource, captureCoordinator, actuation,
-                stateTeardown.defaultDatabase(), connectors, clock, ports, scopedSubmissions);
+                defaultDatabase, connectors, clock, ports, scopedSubmissions);
     }
 
     @Override
@@ -123,6 +136,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     private void startOriginal(String pipelineId, WorkloadClaimFence expected, Consumer<WorkloadClaimFence> onAdvanced) {
+        requireLegacy();
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
         // An engine whose member was shut down for want of memory is the first such refusal. Everything
@@ -232,6 +246,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void pause(String pipelineId) {
+        requireLegacy();
         engine.suspend(pipelineId);
     }
 
@@ -253,6 +268,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
      */
     @Override
     public void resume(String pipelineId) {
+        requireLegacy();
         if (!captureCoordinator.loadDelivered(pipelineId)) {
             stop(pipelineId, false);
             start(pipelineId);
@@ -263,6 +279,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void stop(String pipelineId, boolean purgeState) {
+        requireLegacy();
         waitingForCapture.remove(pipelineId);
         engine.cancel(pipelineId);
         if (!engine.isLost()) {
@@ -297,6 +314,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public Optional<Throwable> failure(String pipelineId) {
+        requireLegacy();
         // A deferred start submitted no job of its own. Ignore the previous terminal job only while the
         // claim still carries that start's execution: another holder's replacement run can fail normally.
         // Capture failures and a lost engine still surface.
@@ -316,6 +334,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public Optional<Throwable> lost(String pipelineId) {
+        requireLegacy();
         // The engine alone: a member shut down for want of memory took every job it held with it. The capture is
         // not asked. It keeps running behind a paused pipeline, and whether it has died is failure()'s to say.
         return engine.lost(pipelineId).map(Throwable.class::cast);
@@ -323,6 +342,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public boolean isCarryingAJob(String pipelineId) {
+        requireLegacy();
         // The job side alone. A capture that died while the job runs is a failure, reported above; what
         // is asked here is whether anything is running this pipeline at all, and a process that has just
         // come up to a checkpoint an earlier one wrote answers no.
@@ -366,4 +386,5 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 fence == null ? null : fence.executionGeneration(), execution.topologyRevision(), planned.members(),
                 nodes, plannedAt);
     }
+    private void requireLegacy() { if (stateTeardown == null) throw ThreeLayerStorePort.refused(); }
 }

@@ -1,0 +1,168 @@
+package io.tapstate.app;
+
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.control.core.*;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.*;
+import java.time.Clock;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
+
+/** Publishes a formal authentication owner independently from Hazelcast, claims and business readiness. */
+final class StorageAuthentication implements AutoCloseable {
+    private final MongoConfigurationDomain configuration;
+    private final CloudRuntimeSettings cloud;
+    private final CloudSdkBridge bridge;
+    private final TokenSecrets secrets;
+    private final Clock clock;
+    private final byte[] signingKey;
+    private final AtomicReference<Epoch> current = new AtomicReference<>();
+    private final Bootstrap bootstrap;
+    private volatile boolean closed;
+
+    StorageAuthentication(MongoConfigurationDomain configuration, CloudRuntimeSettings cloud, CloudSdkBridge bridge,
+            TokenSecrets secrets, Clock clock, byte[] signingKey) {
+        this.configuration = configuration; this.cloud = Objects.requireNonNull(cloud);
+        this.bridge = bridge; this.secrets = Objects.requireNonNull(secrets); this.clock = Objects.requireNonNull(clock);
+        this.signingKey = signingKey.clone();
+        bootstrap = configuration != null && cloud.cloud() && bridge != null
+                && configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE ? new Bootstrap() : null;
+    }
+
+    synchronized void install(StorageRuntime.Bound original) {
+        if (closed || configuration == null) throw StorageRuntime.unavailable();
+        var existing = current.get();
+        if (existing != null) {
+            if (existing.bound != original) throw StorageRuntime.unavailable();
+            existing.requireActive(); return;
+        }
+        original.verifyAuthentication();
+        Epoch candidate = new Epoch(original);
+        original.requireAuthentication();
+        if (bootstrap != null) bootstrap.sessions.close();
+        current.set(candidate);
+    }
+
+    LocalAuthenticationContext local() {
+        Epoch original = selected();
+        if (cloud.cloud()) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "cloud"), null);
+        original.requireActive(); return original.local;
+    }
+    ManagedAuthenticationContext managed() {
+        if (!cloud.cloud()) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "on_prem"), null);
+        if (current.get() == null && bootstrap != null) {
+            bootstrap.requireActive(); return new ManagedAuthenticationContext(bootstrap.managed, bootstrap::requireActive);
+        }
+        Epoch original = selected();
+        original.requireActive(); return new ManagedAuthenticationContext(original.managed, original::requireActive);
+    }
+    CredentialAuthenticator credentials() { return CredentialAuthenticator.scoped(this::authenticate); }
+
+    private Optional<CredentialAuthentication> authenticate(String presented) {
+        if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
+        Epoch original = selected(); original.requireActive();
+        Optional<VerifiedToken> verified = original.authenticate(presented);
+        if (verified.isEmpty()) return Optional.empty();
+        Optional<String> organization = cloud.cloud()
+                ? original.managed.clusterContext(presented).map(CloudSessionContext::organizationId) : Optional.empty();
+        if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
+        original.requireActive();
+        VerifiedToken identity = verified.orElseThrow();
+        return Optional.of(new CredentialAuthentication(identity, Optional.of(original.bound.preparation().authScope()),
+                organization, () -> {
+                    original.requireActive();
+                    if (original.authenticate(presented).filter(identity::equals).isEmpty()) throw unauthenticated();
+                    original.requireActive();
+                }));
+    }
+
+    private final class Bootstrap {
+        final StorageSetupScope setup = configuration.setupStates().load().scope();
+        final BootstrapCloudSessions sessions;
+        final CloudAuthenticationService managed;
+        Bootstrap() {
+            var identity = new CloudSessionIdentity(cloud.baseUrl().toString(), CloudSdkBridge.DEPLOYMENT_ORGANIZATION, cloud.clusterId());
+            sessions = new BootstrapCloudSessions(identity, this::requireActive);
+            var observer = CloudRuntimeConfiguration.authenticationObserver();
+            managed = new CloudAuthenticationService(bridge, bridge,
+                    new CloudSessionService(sessions, identity, secrets, clock, observer), observer);
+        }
+        void requireActive() {
+            if (closed || current.get() != null) throw unauthenticated();
+            var actual = configuration.setupStates().load();
+            if (!actual.scope().equals(setup) || !cloud.clusterId().equals(setup.clusterId())
+                    || actual.phase() == StorageSetupStateStore.Phase.COMPLETE) throw unauthenticated();
+        }
+        Optional<CredentialAuthentication> authenticate(String credential) {
+            requireActive();
+            var verified = managed.authenticate(credential);
+            if (verified.isEmpty()) return Optional.empty();
+            var organization = managed.clusterContext(credential).map(CloudSessionContext::organizationId);
+            if (organization.isEmpty()) return Optional.empty();
+            var identity = verified.orElseThrow(); requireActive();
+            return Optional.of(new CredentialAuthentication(identity, Optional.empty(), organization, () -> {
+                requireActive();
+                if (managed.authenticate(credential).filter(identity::equals).isEmpty()) throw unauthenticated();
+                requireActive();
+            }));
+        }
+    }
+
+    private Epoch selected() {
+        if (closed) throw StorageRuntime.unavailable();
+        Epoch selected = current.get(); if (selected == null) throw StorageRuntime.unavailable(); return selected;
+    }
+
+    private final class Epoch {
+        final StorageRuntime.Bound bound;
+        final LocalAuthenticationContext local;
+        final CloudAuthenticationService managed;
+        final TokenService tokens;
+        final TokenSigner signer;
+        Epoch(StorageRuntime.Bound bound) {
+            this.bound = bound;
+            var scope = bound.preparation().authScope();
+            if (cloud.cloud() != (scope.mode() == StorageBinding.Mode.CLOUD)) throw StorageRuntime.unavailable();
+            if (cloud.cloud()) {
+                if (bridge == null || !cloud.clusterId().equals(scope.clusterId())) throw StorageRuntime.unavailable();
+                local = null; tokens = null; signer = null;
+                var identity = new CloudSessionIdentity(cloud.baseUrl().toString(), CloudSdkBridge.DEPLOYMENT_ORGANIZATION, cloud.clusterId());
+                var observer = CloudRuntimeConfiguration.authenticationObserver();
+                managed = new CloudAuthenticationService(bridge, bridge,
+                        new CloudSessionService(bound.cache().cloudSessions(scope), identity, secrets, clock, observer), observer);
+            } else {
+                managed = null;
+                signer = new HmacTokenSigner(signingKey, HmacTokenSigner.DEFAULT_TTL, clock, scope);
+                tokens = new TokenService(configuration.tokens(), secrets, clock);
+                var access = new AccessTokenService(signer, clock);
+                local = new LocalAuthenticationContext(new LoginService(configuration.users(), new BCryptPasswordHasher(), access),
+                        new SessionService(bound.cache().sessions(scope), secrets, access, clock),
+                        new ClusterIdentityService(configuration.clusterIdentity()), this::requireActive);
+            }
+        }
+        Optional<VerifiedToken> authenticate(String presented) {
+            requireActive();
+            Optional<VerifiedToken> result = cloud.cloud() ? managed.authenticate(presented)
+                    : TokenService.isMachineToken(presented) ? tokens.authenticate(presented) : signer.verify(presented);
+            if (result.isPresent()) bound.cache().loadAuthScope(bound.preparation().authScope());
+            requireActive(); return result;
+        }
+        void requireActive() {
+            bound.requireAuthentication();
+            if (closed || current.get() != this) throw unauthenticated();
+            try { bound.cache().loadAuthScope(bound.preparation().authScope()); }
+            catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
+            bound.requireAuthentication();
+            if (closed || current.get() != this) throw unauthenticated();
+        }
+    }
+
+    @Override public synchronized void close() {
+        closed = true; current.set(null);
+        if (bootstrap != null) bootstrap.sessions.close();
+        java.util.Arrays.fill(signingKey, (byte)0);
+    }
+    private static TapstateException unauthenticated() { return new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null); }
+}

@@ -42,6 +42,7 @@ class ScopedEngineLifecycleActuatorTest {
     private final List<OperatorRunManifest> released = new ArrayList<>();
     private final List<OperatorRunManifest> prepared = new ArrayList<>();
     private final List<PipelineConvergencePass> rebuilds = new ArrayList<>();
+    private final List<ExecutionFence> forgottenPlans = new ArrayList<>();
     private final PipelineStoreViews views = mock(PipelineStoreViews.class);
     private final PipelineConvergencePass pass;
     private DagSource.StartPreparation preparation;
@@ -85,7 +86,10 @@ class ScopedEngineLifecycleActuatorTest {
         return new ScopedEngineLifecycleActuator.Ports((original,capacities,members,guard) -> {
             events.add("operators"); prepared.add(original); assertThat(members).containsExactly("node");
             onPrepare.run(); guard.run();
-        },released::add,(original,manifest) -> rebuilds.add(original),(original,command) -> ExecutionPlanRecorder.NONE);
+        },released::add,(original,manifest) -> rebuilds.add(original),(original,command) -> new ExecutionPlanRecorder() {
+            @Override public void record(io.tapstate.core.lifecycle.ExecutionPlan plan) {}
+            @Override public void forget(String pipeline) { assertThat(pipeline).isEqualTo(original.pipelineId()); forgottenPlans.add(original); }
+        });
     }
     private ScopedEngineLifecycleActuator actuator() {
         return new ScopedEngineLifecycleActuator(pass,engine,dags,captures,ownership,"cache",ConnectorReadiness.NONE,Clock.systemUTC(),ports(),submissions);
@@ -108,6 +112,7 @@ class ScopedEngineLifecycleActuatorTest {
         verify(replacement,never()).cancel(); verify(engine,times(1)).captureRun("p");
         verify(engine,never()).cancel(anyString()); verify(engine,never()).awaitTerminal(anyString(),any());
         verify(fixedCapture).stopCapture("p",false); assertThat(released).containsExactly(manifest(1)); assertThat(rebuilds).isEmpty();
+        assertThat(forgottenPlans).containsExactly(new ExecutionFence(SCOPE, claim(1)));
     }
     @Test void revokedAndForeignCommandsCannotEvenBindAJob() {
         active.set(false); assertThatThrownBy(this::actuator).isInstanceOf(TapstateException.class);

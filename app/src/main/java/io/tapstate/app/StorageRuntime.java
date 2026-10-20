@@ -17,6 +17,7 @@ final class StorageRuntime implements AutoCloseable {
     interface Business extends AutoCloseable {
         /** Resources are registered with this owner before startup creates members or background work. */
         void start();
+        default boolean available() { return true; }
         @Override void close();
     }
     private final MongoConfigurationDomain configuration;
@@ -90,7 +91,10 @@ final class StorageRuntime implements AutoCloseable {
         }
     }
 
-    synchronized boolean businessStarted() { return !closed && business != null; }
+    synchronized boolean businessStarted() { return !closed && business instanceof Business actual && actual.available(); }
+    synchronized Optional<Business> business() {
+        requireOpen(); return business instanceof Business actual ? Optional.of(actual) : Optional.empty();
+    }
 
     private void verifyCompletedSetup(Bound original) {
         if (loadBound().orElseThrow(StorageRuntime::unavailable) != original) throw unavailable();

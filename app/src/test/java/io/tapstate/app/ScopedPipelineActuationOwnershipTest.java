@@ -76,6 +76,18 @@ class ScopedPipelineActuationOwnershipTest {
         assertThat(owner.proveClaim(FIRST, new WorkloadClaimFence(KEY, new WorkloadOwner("node-a", "other-boot"),
                 expected.claimGeneration(), expected.executionGeneration(), expected.topologyRevision()))).isFalse();
     }
+    @Test void aControlCommandSurvivesIntentRetentionAndCannotOverlapAStartOrAnotherControl() {
+        var owner = ownership();
+        WorkloadClaimFence original;
+        try (var control = owner.control(FIRST)) {
+            original = control.claim(); owner.retain(Set.of()); control.requireActive();
+            assertThat(owner.permit(FIRST).granted()).isFalse();
+            assertThat(owner.beginExecution(FIRST, original).allowed()).isFalse();
+            assertThatThrownBy(() -> owner.control(FIRST)).isInstanceOf(TapstateException.class);
+        }
+        assertThat(owner.permit(FIRST).granted()).isTrue();
+        assertThat(owner.beginExecution(FIRST, original).allowed()).isTrue();
+    }
 
     @Test void aScopedPermitAdvancesOnlyItsOriginalClaimAndReturnsItsExactRunIdentity() {
         var owner = ownership();

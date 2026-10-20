@@ -145,6 +145,134 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    @Test
+    void unboundCloudRootNeedsOnlyConfigAndDoesNotBuildRuntimeOrConnectorTestsForStatus() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "unbound_config_" + suffix, configUser = "unbound_" + suffix;
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, configUser, List.of(configDb));
+            var settings = new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(configUser, configDb), null, Duration.ofSeconds(5));
+            String cluster = "unbound-" + suffix;
+            try (var ignored = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(settings, cluster, "installation", "setup", 1)) { }
+            try (var application = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                    "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR", "--SDK_STATUS_SENDER_ENABLED=false",
+                    "--tapstate.cloud.base-url=https://cloud.example", "--tapstate.cloud.token=fixture-runtime-token",
+                    "--tapstate.cloud.cluster-id=" + cluster, "--tapstate.cloud.atlas-uri=" + uri(configUser, configDb),
+                    "--tapstate.control.auth.jwt-secret=unbound-test-key", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"))) {
+                var root = application.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.SETUP_REQUIRED);
+                assertThat(root.runtime().current()).isEmpty(); assertThat(root.runtime().business()).isEmpty();
+                assertThat(root.authentication().managed().service().identity().clusterId()).isEqualTo(cluster);
+                assertThat(application.getBeansOfType(com.hazelcast.core.HazelcastInstance.class)).isEmpty();
+                assertThat(application.getBeansOfType(io.tapstate.spi.store.UserStore.class)).isEmpty();
+                assertThat(application.getBean(io.tapstate.control.core.CloudRuntimeStatusProvider.class).snapshot().activePipelines()).isZero();
+                var original = root.runtime().requireConfiguration().setupStates().load().scope();
+                assertThat(application.getBean(io.tapstate.control.core.StorageSetupService.class).status(original, () -> {}).bindingVersion()).isZero();
+                assertThat(application.getBeanFactory().containsSingleton("installedConnectorTests")).isFalse();
+                try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
+                    assertDenied(limited, configDb + "_operator"); assertDenied(limited, configDb + "_views");
+                }
+                assertThat(admin.getDatabase(configDb).listCollectionNames().into(new ArrayList<>()))
+                        .doesNotContain("cloud_sessions", "workload_claims", "system_meta");
+            }
+        }
+    }
+
+    /** Low-level fixture preparation isolates production-root loading; it does not certify the installer or a registered target JAR. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void nativeProductionRootLoadsConfigAndAuthBeforeAdmittingItsCacheRuntime(boolean businessPrepared) {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "root_config_" + suffix, cacheDb = "root_cache_" + suffix, masterDb = "root_master_" + suffix;
+        String configUser = "config_" + suffix, cacheUser = "cache_" + suffix, masterUser = "master_" + suffix;
+        var original = new io.tapstate.spi.store.StorageSetupScope("root-" + suffix, "installation", "setup-" + suffix, 1);
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, configUser, List.of(configDb)); createUser(admin, cacheUser, List.of(cacheDb)); createUser(admin, masterUser, List.of(masterDb));
+            var settings = new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(configUser, configDb), null, Duration.ofSeconds(5));
+            var cache = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                    uri(cacheUser, cacheDb), cacheDb, null);
+            try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(settings,
+                    original.clusterId(), original.installationId(), original.operationId(), 1)) {
+                var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", uri(masterUser, masterDb)), null, null, null, null);
+                var published = configuration.bindings().commitWithFirstCache(original, io.tapstate.spi.store.StorageBinding.Mode.OP, cache, target);
+                var preparation = configuration.bindings().cachePreparation().orElseThrow();
+                try (var cached = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(cache, Duration.ofSeconds(5), "fixture")) {
+                    cached.prepareFirstAuth(published.firstCreation().orElseThrow());
+                    if (businessPrepared) cached.prepareInitialBusiness(preparation, () -> {});
+                }
+                configuration.bindings().complete(original);
+                configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
+                        new io.tapstate.spi.store.User("admin", new BCryptPasswordHasher().hash("sentinel-login-password"), "admin"));
+            }
+            try (var application = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                    "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
+                    "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=ERROR", "--SDK_STATUS_SENDER_ENABLED=false",
+                    "--tapstate.store.mongo.uri=" + uri(configUser, configDb), "--tapstate.control.auth.jwt-secret=native-root-test-key",
+                    "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"), "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"))) {
+                var root = application.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(businessPrepared ? StorageRoot.Phase.BUSINESS_READY : StorageRoot.Phase.AUTH_READY);
+                if (businessPrepared) org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+                else assertThat(root.runtime().business()).isEmpty();
+                int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
+                var client = org.springframework.web.client.RestClient.create("http://127.0.0.1:" + port);
+                var login = client.post().uri("/auth/login").body(Map.of("username", "admin", "password", "sentinel-login-password"))
+                        .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
+                assertThat(login).isNotNull();
+                String snapshot = client.post().uri("/api/storage/status").header("Authorization", "Bearer " + login.token())
+                        .body(Map.of()).retrieve().body(String.class);
+                assertThat(((Map<?,?>)io.tapstate.core.common.JsonReader.parse(snapshot)).get("businessPhase"))
+                        .isEqualTo(businessPrepared ? "READY" : "AUTH_READY");
+                assertThat(snapshot).contains("COMPLETE").doesNotContain(PASSWORD, "sentinel-login-password", "mongodb://");
+                if (!businessPrepared) {
+                    assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>()))
+                            .doesNotContain("workload_claims", "pipeline_state", "srs_chain_state");
+                    assertThatThrownBy(() -> client.get().uri("/api/sources").header("Authorization", "Bearer " + login.token()).retrieve().body(String.class))
+                            .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                    failure -> assertThat(failure.getStatusCode().value()).isEqualTo(503));
+                    return;
+                }
+                String sources = client.get().uri("/api/sources").header("Authorization", "Bearer " + login.token()).retrieve().body(String.class);
+                assertThat(sources).contains("views").doesNotContain(PASSWORD, "sentinel-login-password");
+                try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
+                    assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
+                }
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
+                assertThat(admin.getDatabase(configDb).listCollectionNames().into(new ArrayList<>())).doesNotContain(
+                        "workload_claims", "system_meta", "operator_state", "op_sessions", "srs_meta");
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).doesNotContain("users", "cluster_keys", "system_meta", "operator_state", "srs_meta");
+                var current = root.runtime().current().orElseThrow();
+                var modelSource = new SourceResource("model_source", null, "mongodb", Map.of("uri", uri(masterUser, masterDb)),
+                        io.tapstate.core.model.SourceMode.SNAPSHOT, List.of(io.tapstate.core.model.TableRef.literal("orders")), null, null);
+                root.runtime().requireConfiguration().artifacts().create(modelSource);
+                root.runtime().requireConfiguration().artifacts().create(new io.tapstate.core.model.PipelineResource("model_flow", null,
+                        List.of(io.tapstate.core.model.SourceRef.spec("model_source", false)), null, null, null, null, null));
+                current.cache().schemas(current.preparation().businessScope(), () -> {}).save(new io.tapstate.spi.store.DiscoveredSourceModel(
+                        "model_source", "mongodb", 1L, new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of())))));
+                ((ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(
+                        root.runtime().business().orElseThrow(), "context")).getBean(StoreBackedDerivedSchemas.class).accept("admin", "model_flow");
+                client.post().uri("/api/pipelines/model_flow:accept-derived-schema").header("Authorization", "Bearer " + login.token())
+                        .retrieve().toBodilessEntity();
+                var modelScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                        current.preparation().authScope().cacheIncarnation(), "model_flow", 1);
+                assertThat(current.cache().pipelineDerivedSchemas(modelScope).latest("model_flow", "model_source.orders").orElseThrow().schema())
+                        .containsEntry("id", "INT64 NULL");
+                ((NativeBusinessContext)root.runtime().business().orElseThrow()).close();
+                assertThat(root.runtime().businessStarted()).isFalse();
+                String degraded = client.post().uri("/api/storage/status").header("Authorization", "Bearer " + login.token())
+                        .body(Map.of()).retrieve().body(String.class);
+                assertThat(((Map<?,?>)io.tapstate.core.common.JsonReader.parse(degraded)).get("businessPhase"))
+                        .isEqualTo("AUTH_READY");
+                admin.getDatabase(cacheDb).getCollection("op_sessions").drop();
+                assertThatThrownBy(() -> client.post().uri("/auth/login")
+                        .body(Map.of("username", "admin", "password", "sentinel-login-password", "createSession", false))
+                        .retrieve().body(String.class))
+                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                failure -> assertThat(failure.getStatusCode().value()).isEqualTo(503));
+            }
+        }
+    }
+
     /** Native control-service composition; the target fixture does not certify a registered connector or TLS. */
     @Test
     void setupAndFirstAdministratorServicesKeepNativeAuthorityAcrossAuditFailureAndReopen() {

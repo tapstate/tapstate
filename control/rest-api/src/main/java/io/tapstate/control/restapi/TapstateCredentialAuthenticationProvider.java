@@ -5,6 +5,8 @@ import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.VerifiedToken;
+import io.tapstate.control.core.ControlError;
+import io.tapstate.core.common.TapstateException;
 import org.springframework.security.authentication.AuthenticationProvider;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.Authentication;
@@ -22,6 +24,16 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
 
     @Override
     public Authentication authenticate(Authentication authentication) {
+        try { return verify(authentication); }
+        catch (TapstateException failure) {
+            if (failure.code() == ControlError.UNAUTHENTICATED || failure.code() == ControlError.AUTH_FAILED)
+                throw new BadCredentialsException("invalid bearer credential");
+            throw new CodedAuthenticationFailure(failure.code() == ControlError.CLOUD_AUTH_UNAVAILABLE
+                    ? ControlError.CLOUD_AUTH_UNAVAILABLE : ControlError.STORAGE_UNAVAILABLE);
+        }
+    }
+
+    private Authentication verify(Authentication authentication) {
         TapstateCredentialAuthenticationToken credential = (TapstateCredentialAuthenticationToken) authentication;
         var original = credentials.authenticateContext(credential.credential())
                 .orElseThrow(() -> new BadCredentialsException("invalid bearer credential"));
