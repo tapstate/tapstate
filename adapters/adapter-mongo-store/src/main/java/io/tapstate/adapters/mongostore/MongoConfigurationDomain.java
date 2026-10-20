@@ -142,6 +142,23 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new MongoPipelineStatePreparations(connection.client(), connection.database(), clusterId, bindings, artifacts, this::requireOpen);
     }
 
+    public long configurationRevision() {
+        requireOpen();
+        return StoreIo.call(() -> {
+            try (var session = connection.client().startSession()) {
+                return session.withTransaction(() -> {
+                    requireOpen();
+                    return ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()));
+                });
+            }
+        });
+    }
+
+    public io.tapstate.spi.store.StorageRecoveryCommands recoveryCommands() {
+        requireOpen();
+        return new MongoStorageRecoveryCommands(connection.client(), connection.database(), bindings, artifacts, this::requireOpen);
+    }
+
     public io.tapstate.spi.store.StorageSetupStateStore setupStates() {
         requireOpen();
         return new MongoStorageSetupStateStore(connection.client(), connection.database(), bindings, this::requireOpen);

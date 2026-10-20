@@ -21,8 +21,8 @@ final class StorageOperationSchemas {
         var candidate = object(List.of("configuration", "cache", "master"), Map.of(
                 "configuration", connection, "cache", connection, "master", connection));
         var stamps = object(List.of("CONFIG", "CACHE", "MASTER"), Map.of("CONFIG", text(), "CACHE", text(), "MASTER", text()));
-        var transfer = object(List.of("version", "nonce", "ciphertext"), Map.of(
-                "version", Map.of("type", "integer", "const", 1), "nonce", text(), "ciphertext", text()));
+        var transfer = Map.<String,Object>of("type", "string", "minLength", 1,
+                "description", "Opaque versioned encrypted transfer package; plaintext definitions are not accepted.");
         defs.put("StorageStatusRequest", object(List.of(), Map.of()));
         defs.put("StorageTestRequest", object(List.of("operationId", "generation", "candidate", "layer"), Map.of(
                 "operationId", text(), "generation", positive(), "candidate", candidate, "layer", choice("CONFIG", "CACHE", "MASTER"))));
@@ -47,10 +47,31 @@ final class StorageOperationSchemas {
         defs.put("StorageTestResult", object(List.of("layer", "testStamp", "expiresAt", "checks"), Map.of(
                 "layer", choice("CONFIG", "CACHE", "MASTER"), "testStamp", text(), "expiresAt", text(),
                 "checks", Map.of("type", "array", "items", text()))));
+        var nullableText = Map.<String,Object>of("anyOf", List.of(text(), Map.of("type", "null")));
+        var scope = object(List.of("clusterId", "bindingVersion", "mode", "organizationId"), Map.of(
+                "clusterId", text(), "bindingVersion", positive(), "mode", choice("CLOUD", "OP"), "organizationId", nullableText));
+        var ticket = object(List.of("id", "scope", "inputHash", "mappingHash", "destinationRevision", "createdAt", "expiresAt"), Map.of(
+                "id", text(), "scope", scope, "inputHash", text(), "mappingHash", text(), "destinationRevision", nonnegative(),
+                "createdAt", text(), "expiresAt", text()));
+        var receipt = object(List.of("id", "inputHash", "configurationRevision", "resourceHashes", "usernames", "layoutIds"), Map.of(
+                "id", text(), "inputHash", text(), "configurationRevision", positive(), "resourceHashes", stringMap(),
+                "usernames", Map.of("type", "array", "items", text()), "layoutIds", Map.of("type", "array", "items", text())));
+        var nullableReceipt = Map.<String,Object>of("anyOf", List.of(receipt, Map.of("type", "null")));
+        var importOperation = object(List.of("ticket", "phase", "attempts", "receipt"), Map.of(
+                "ticket", ticket, "phase", choice("PENDING", "EXPIRED", "COMMITTING", "COMMITTED", "ABORTED"),
+                "attempts", nonnegative(), "receipt", nullableReceipt));
+        defs.put("ConfigurationImportPreflightResult", object(List.of("operation", "preparedTransfer"), Map.of(
+                "operation", importOperation, "preparedTransfer", transfer)));
+        defs.put("ConfigurationImportCommitResult", receipt);
+        defs.put("ConfigurationImportStatusResult", object(List.of("importId", "phase", "ticket", "attempts", "receipt"), Map.of(
+                "importId", text(), "phase", choice("PENDING", "EXPIRED", "COMMITTING", "COMMITTED", "ABORTED", "UNKNOWN"),
+                "ticket", Map.of("anyOf", List.of(ticket, Map.of("type", "null"))),
+                "attempts", nonnegative(), "receipt", nullableReceipt)));
         return defs;
     }
     private static Map<String,Object> operation() { return object(List.of("operationId"), Map.of("operationId", text())); }
     private static Map<String,Object> text() { return Map.of("type", "string", "minLength", 1); }
+    private static Map<String,Object> nonnegative() { return Map.of("type", "integer", "minimum", 0); }
     private static Map<String,Object> positive() { return Map.of("type", "integer", "minimum", 1); }
     private static Map<String,Object> stringMap() { return Map.of("type", "object", "additionalProperties", text()); }
     private static Map<String,Object> choice(String... values) { return Map.of("type", "string", "enum", List.of(values)); }

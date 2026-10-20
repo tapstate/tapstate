@@ -111,7 +111,7 @@ public final class ControlOperations {
     public static final Operation STORAGE_TEST = storage("storage.test", Scope.WRITE, false);
     public static final Operation STORAGE_SETUP_COMMIT = storage("storage.setup.commit", Scope.WRITE, true);
     public static final Operation STORAGE_SETUP_STATUS = storage("storage.setup.status", Scope.READ, false);
-    public static final Operation STORAGE_RECOVERY_PLAN = storage("storage.recovery.plan", Scope.WRITE, false);
+    public static final Operation STORAGE_RECOVERY_PLAN = storage("storage.recovery.plan", Scope.WRITE, true);
     public static final Operation STORAGE_RECOVERY_CONFIRM = storage("storage.recovery.confirm", Scope.WRITE, true);
     public static final Operation STORAGE_RECOVERY_STATUS = storage("storage.recovery.status", Scope.READ, false);
     public static final Operation CONFIGURATION_IMPORT_PREFLIGHT = storage("configuration.import.preflight", Scope.WRITE, true);

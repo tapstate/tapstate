@@ -34,6 +34,12 @@ final class MongoStorageRecoveryStore {
         var rows = SystemCollections.STORAGE_RECOVERY.on(database).find(session).limit(2).into(new java.util.ArrayList<>());
         if (rows.size() != 1) throw unreadable();
         Document row = rows.getFirst();
+        var pending = MongoStorageRecoveryCommands.pending(row);
+        if (pending.isPresent()) {
+            var scope = pending.orElseThrow().originalScope();
+            if (scope.mode() != binding.mode() || !scope.cacheIncarnation().equals(row.get("cacheIncarnation"))
+                    || !Long.valueOf(scope.authGeneration()).equals(row.get("authGeneration"))) throw unreadable();
+        }
         if (!"cluster".equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))
                 || !MongoConfigurationDomain.LAYOUT.equals(row.get("layoutId"))
                 || !binding.setup().clusterId().equals(row.get("clusterId"))
