@@ -304,6 +304,9 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
         event.put("command", command);
         event.put("exception_type", failure.getClass().getName());
         if (failure instanceof MongoException mongo) event.put("driver_code", mongo.getCode());
+        if (!attempt.seed && "artifact".equals(attempt.operation)) {
+            event.put("artifact_step", CloudArtifactReadStep.current().wireValue());
+        }
         if (refusalClassificationEnabled && attempt.seed && "spec-put".equals(attempt.operation)
                 && "update".equals(command) && failure instanceof MongoCommandException mongo
                 && mongo.getCode() == 8000 && refusalClassified.compareAndSet(false, true)) {
