@@ -61,7 +61,7 @@ final class PipelinePrivateNoteRetirement {
             // A no-longer-drawn node still retains its necessary identity until an authorized deletion.
             if(source==null || context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))continue;
             operations.requirePending(original);
-            releaseOne(original,notes.guardedBy(requireRetiredExecution).retirement(context.scope(),request.operationId()),requireRetiredExecution);
+            releaseOne(original.request().originalScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),request.operationId()),requireRetiredExecution);
         }
         operations.requirePending(original);requireRetiredExecution.run();
     }
@@ -71,18 +71,28 @@ final class PipelinePrivateNoteRetirement {
         Objects.requireNonNull(original);Objects.requireNonNull(requireRetiredExecution);
         Runnable guard=requireRetiredExecution;guard.run();operations.requirePending(original);var request=original.request();
         for(var retirement:notes.guardedBy(guard).retirements(request.originalScope(),request.operationId())) {
-            operations.requirePending(original);releaseOne(original,retirement,guard);
+            operations.requirePending(original);releaseOne(original.request().originalScope().clusterId(),retirement,guard);
         }
         operations.requirePending(original);guard.run();
     }
-    private void releaseOne(PipelineRebuildPreparation original,RequiredNoteRetirement retirement,Runnable guard) {
+    /** Deletion has its own original lifecycle authority; a cache-only full never enters this path. */
+    void delete(PipelineRetirementPreparation original,PipelineRetirements lifecycle,Runnable guard) {
+        Objects.requireNonNull(original);Objects.requireNonNull(lifecycle);Objects.requireNonNull(guard);
+        guard.run();lifecycle.requirePending(original);var request=original.request();
+        for(var retirement:notes.guardedBy(guard).retirements(request.scope(),request.operationId())) {
+            lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard);
+        }
+        lifecycle.requirePending(original);guard.run();
+    }
+
+    private void releaseOne(String clusterId,RequiredNoteRetirement retirement,Runnable guard) {
         guard.run();if(retirement.completed())return;var origin=retirement.origin();
         if(origin.isPresent()) {
             var owner=retirement.scope().owner();
             var purpose=java.util.Arrays.stream(PipelineNode.Purpose.values()).filter(owner::hasPurpose).findFirst().orElseThrow(PipelinePrivateNoteRetirement::unavailable);
             String prefix="pdk.state."+owner.ownerId()+"."+purpose.segment()+".";
             var config=new CaptureConfig(origin.orElseThrow().connectorId(),Map.of(),List.of(),new PipelineNode(owner.ownerId(),owner.namespace().substring(prefix.length())));
-            release.run(retirement,config,purpose,original.request().originalScope().clusterId(),guard).ifPresent(failure -> {throw failure;});guard.run();
+            release.run(retirement,config,purpose,clusterId,guard).ifPresent(failure -> {throw failure;});guard.run();
         }
         retirement.completeAfterVerifiedRelease();guard.run();
     }

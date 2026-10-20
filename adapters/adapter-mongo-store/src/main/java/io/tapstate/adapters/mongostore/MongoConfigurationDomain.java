@@ -128,6 +128,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return pipelineStates;
     }
 
+    public io.tapstate.spi.store.PipelineRetirements retirements() {
+        requireOpen();return new MongoPipelineRetirements(connection.client(),connection.database(),clusterId,bindings,artifacts,
+                (MongoRequiredNoteStore)requiredNotes,this::requireOpen);
+    }
+
     public io.tapstate.spi.store.CaptureStatePreparations capturePreparations() {
         requireOpen();return new MongoCaptureStatePreparations(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen);
     }

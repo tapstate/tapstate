@@ -112,6 +112,57 @@ final class MongoOperatorInventory {
         return root;
     }
 
+    static String retireDeletion(ClientSession session,MongoDatabase database,io.tapstate.spi.store.PipelineRetirementPreparation original,
+            io.tapstate.spi.store.WorkloadClaimFence retired,long epoch,long writeFence) {
+        var scope=original.request().scope();var root=require(session,database,scope);
+        if(!original.previousPreparation().preparationId().equals(root.get("preparationId")))throw unreadable(scope);
+        var marker=new Document("phase","RETIRED").append("purpose","DELETE").append("operationId",original.request().operationId())
+                .append("definitionHash",original.request().definitionHash()).append("privateScopesHash",original.privateScopesHash())
+                .append("privateScopesCount",original.privateScopesCount()).append("claim",WorkloadClaimDocuments.stored(retired))
+                .append("checkpointEpoch",epoch).append("runtimeWriteFence",writeFence);
+        String hash=frozenHash(root,marker);marker.append("contentHash",hash);
+        if(SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).updateOne(session,new Document("_id",root.get("_id"))
+                        .append("preparationId",root.get("preparationId")).append("revision",root.get("revision")).append("retirement",new Document("$exists",false)),
+                new Document("$set",new Document("retirement",marker))).getMatchedCount()!=1)throw unreadable(scope);
+        return hash;
+    }
+    static Document requireDeleted(ClientSession session,MongoDatabase database,io.tapstate.spi.store.PipelineRetiredState original) {
+        var root=SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session,new Document("_id",MongoPipelinePreparationFacts.scope(original.scope()))).first();
+        decode(session,database,original.scope(),root,false);
+        if(!original.preparationId().equals(root.get("preparationId")) || !(root.get("retirement") instanceof Document marker)
+                || !marker.keySet().equals(Set.of("phase","purpose","operationId","definitionHash","privateScopesHash","privateScopesCount","claim","checkpointEpoch","runtimeWriteFence","contentHash")))throw unreadable(original.scope());
+        var payload=new Document(marker);payload.remove("contentHash");
+        if(!"RETIRED".equals(marker.get("phase")) || !"DELETE".equals(marker.get("purpose")) || !original.operationId().equals(marker.get("operationId"))
+                || !WorkloadClaimDocuments.stored(original.claim()).equals(marker.get("claim")) || !Long.valueOf(original.epoch()).equals(marker.get("checkpointEpoch"))
+                || !Long.valueOf(original.writeFence()).equals(marker.get("runtimeWriteFence")) || !original.inventoryHash().equals(marker.get("contentHash"))
+                || !original.inventoryHash().equals(frozenHash(root,payload)))throw unreadable(original.scope());
+        return root;
+    }
+
+    static io.tapstate.spi.store.RetiredPipelinePayloads.Original frozen(ClientSession session,MongoDatabase database,PipelineIntentScope scope,Document root) {
+        decode(session,database,scope,root,false);
+        try {
+            var marker=root.get("retirement",Document.class);var payload=new Document(marker);payload.remove("contentHash");
+            if(!"RETIRED".equals(marker.get("phase")) || !(marker.get("operationId") instanceof String operation) || operation.isBlank()
+                    || !(marker.get("contentHash") instanceof String hash) || !hash.equals(frozenHash(root,payload)))throw unreadable(scope);
+            if(marker.containsKey("purpose")) {
+                var retired=new io.tapstate.spi.store.PipelineRetiredState(scope,operation,WorkloadClaimDocuments.readPipeline(marker.get("claim",Document.class)),
+                        marker.getLong("checkpointEpoch"),marker.getLong("runtimeWriteFence"),root.getString("preparationId"),hash);
+                requireDeleted(session,database,retired);
+                if(!(marker.get("definitionHash") instanceof String definition) || !definition.matches("[a-f0-9]{64}")
+                        || !(marker.get("privateScopesHash") instanceof String notes) || !notes.matches("[a-f0-9]{64}")
+                        || !(marker.get("privateScopesCount") instanceof Integer count) || count<0)throw unreadable(scope);
+            } else {
+                if(!marker.keySet().equals(Set.of("phase","operationId","confirmationHash","targetScope","targetPreparationId","contentHash"))
+                        || !(marker.get("confirmationHash") instanceof String confirmation) || !confirmation.matches("[a-f0-9]{64}"))throw unreadable(scope);
+                var target=MongoPipelinePreparationFacts.scope(marker.get("targetScope",Document.class));
+                if(!MongoPipelineRetirementFacts.sameBusiness(scope,target) || !scope.pipelineId().equals(target.pipelineId()) || scope.stateGeneration()>=Long.MAX_VALUE-1
+                        || target.stateGeneration()!=scope.stateGeneration()+1 || !UUID.fromString(marker.getString("targetPreparationId")).toString().equals(marker.get("targetPreparationId")))throw unreadable(scope);
+            }
+            return new io.tapstate.spi.store.RetiredPipelinePayloads.Original(scope,operation,root.getString("preparationId"),hash);
+        } catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unreadable(scope);}
+    }
+
     private static Document retirement(io.tapstate.spi.store.PipelineRebuildPreparation original) {
         return new Document("phase", "RETIRED").append("operationId", original.request().operationId())
                 .append("confirmationHash", original.confirmationHash())

@@ -141,6 +141,21 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             return true;
         });
     }
+    static void recreate(ClientSession session,MongoDatabase database,PipelineIntentScope old,PipelineIntentScope next) {
+        var table=SystemCollections.PIPELINE_INTENTS.on(database);var row=table.find(session,new Document("_id",old.pipelineId())).first();if(row==null)return;
+        if(!(row.get("intentRevision") instanceof Long revision) || revision<1 || revision>=Long.MAX_VALUE-1
+                || !row.equals(header(old,revision,true)))throw unreadable();
+        if(table.replaceOne(session,new Document("_id",old.pipelineId()).append("intentRevision",revision),header(next,revision+1,true)).getMatchedCount()!=1)throw fenced();
+    }
+
+    void retire(ClientSession session,PipelineIntentScope original) {
+        var held=loadInTransaction(session,original.pipelineId());if(held.isEmpty())return;
+        var prior=held.orElseThrow();if(!prior.scope().equals(original) || prior.intentRevision()>=Long.MAX_VALUE-1)throw fenced();
+        if(prior.deleted())return;
+        if(intents.replaceOne(session,new Document("_id",original.pipelineId()).append("intentRevision",prior.intentRevision()),
+                header(original,prior.intentRevision()+1,true)).getMatchedCount()!=1)throw fenced();
+    }
+
     /** Only the original controlled rebuild transaction may re-scope and consume an already carried-out command. */
     long completeRebuild(ClientSession session, PipelineIntentSnapshot original, PipelineIntentScope target) {
         var current = loadInTransaction(session, original.scope().pipelineId()).orElseThrow(MongoPipelineIntentStore::fenced);
@@ -179,7 +194,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (!matchesCurrentCache(session, snapshot.scope())) throw unreadable();
         return snapshot;
     }
-    private Document header(PipelineIntentScope scope, long revision, boolean deleted) {
+    private static Document header(PipelineIntentScope scope, long revision, boolean deleted) {
         return new Document("_id", scope.pipelineId()).append("formatVersion", 1).append("clusterId", scope.clusterId())
                 .append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())
                 .append("stateGeneration", scope.stateGeneration()).append("intentRevision", revision).append("deleted", deleted);

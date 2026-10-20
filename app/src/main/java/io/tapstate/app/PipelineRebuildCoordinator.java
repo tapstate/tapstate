@@ -68,7 +68,6 @@ final class PipelineRebuildCoordinator {
         // View identity is retained here; its deployment-owned target is reconciled by the binding operation.
         notes.reconcile(original,Map.copyOf(desired),guard);guard.run();stores.configuration().requirePending(original);
         var receipt=stores.cache().prepare(original,currentNode,ttl,clock.instant());guard.run();
-        while(stores.cache().reclaim(receipt,currentNode)>0)guard.run();
         guard.run();return stores.configuration().complete(receipt);
     }
     private record Closure(PipelinePreparationInputs inputs,Map<String,String> dependencies) {}

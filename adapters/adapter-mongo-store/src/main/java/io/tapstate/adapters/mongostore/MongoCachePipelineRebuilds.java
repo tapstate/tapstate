@@ -49,72 +49,14 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
         requireVerifiedReceipt(candidate);Objects.requireNonNull(currentNode,"currentNode"); var receipt=(Receipt)candidate;
         if (receipt.owner.client!=client || !receipt.owner.database.getName().equals(database.getName())
                 || !receipt.owner.business.equals(business)) throw fenced();
-        requireCurrentReceipt(receipt);
-        return StoreIo.call(() -> {
-            active(receipt.preparation());
-            try(var session=client.startSession()) {
-                return session.withTransaction(() -> {
-                    active(receipt.preparation());
-                    var original=receipt.preparation();var old=original.request().originalScope();var scope=MongoPipelinePreparationFacts.scope(old);
-                    new MongoCacheBusinessIdentity(database,business).requireAdmissionState(session);
-                    var claims=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-                    var row=claims.find(session,new Document("_id",MongoWorkloadClaimStore.id(receipt.claim().key()))).first();
-                    if(row==null)throw rebuild(old);
-                    var current=new MongoWorkloadClaimStore(claims).inStrictSession(session).decodeStored(row);
-                    if(!marker(receipt).equals(marker(retained(session,original,row,current))))throw fenced();
-                    MongoCachePipelinePreparations.proveNode(session,database,business,currentNode);
-                    // Only frozen retired payloads use this exact, possibly expired receipt. No business write is admitted.
-                    var sameReceipt=WorkloadClaimDocuments.live(receipt.claim());sameReceipt.remove("$expr");
-                    sameReceipt.append("pipelineScope",MongoPipelinePreparationFacts.scope(original.request().targetScope()))
-                            .append("pipelinePreparation.phase","PREPARED");
-                    if(claims.updateOne(session,sameReceipt,new Document("$inc",new Document("fencedPipelineWrites",1L))).getMatchedCount()!=1)throw fenced();
-                    var inventory=MongoOperatorInventory.requireRetired(session,database,original);long deleted=0;
-                    // A shared extra database keeps its identity and every other Pipeline's rows.
-                    for(var location:inventory.getList("placements",Document.class)) {
-                        var target=client.getDatabase(location.getString("database"));
-                        if(!target.getName().equals(database.getName())) {
-                            String held=MongoCacheOperatorDatabases.require(session,target,operatorDatabases);
-                            MongoOperatorInventory.requireDatabase(inventory,target.getName(),held,old);
-                        }
-                        var table=MongoCacheOperatorStateStore.table(OperatorPlacement.Resource.valueOf(location.getString("resource")));
-                        var address=new Document("scope",scope).append("database",target.getName()).append("resource",location.getString("resource"))
-                                .append("stepId",location.getString("stepId")).append("pathId",location.getString("pathId")).append("namespace",location.getString("namespace"));
-                        deleted+=reclaimRows(session,table.on(target),new Document("_id.placement",address),256-(int)deleted);
-                        if(deleted>=256)break;
-                    }
-                    if(deleted<256)for(var shape:inventory.getList("shapes",Document.class)) {
-                        var target=client.getDatabase(shape.getString("database"));
-                        if(!target.getName().equals(database.getName())) {
-                            String held=MongoCacheOperatorDatabases.require(session,target,operatorDatabases);
-                            MongoOperatorInventory.requireDatabase(inventory,target.getName(),held,old);
-                        }
-                        deleted+=reclaimRows(session,SystemCollections.CACHE_NEST_SHAPES.on(target),
-                                new Document("_id.scope",scope).append("_id.stepId",shape.getString("stepId")),256-(int)deleted);
-                        if(deleted>=256)break;
-                    }
-                    var payloads=List.of(
-                            java.util.Map.entry(SystemCollections.DIRECT_BATCHES,new Document("_id.channel.scope",scope)),
-                            java.util.Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,new Document("_id.scope",scope)),
-                            java.util.Map.entry(SystemCollections.CACHE_SINK_PREPARATIONS,MongoSinkPreparationStore.scopeFilter(old)),
-                            java.util.Map.entry(SystemCollections.CACHE_DERIVED_SCHEMAS,new Document("scope",scope)),
-                            java.util.Map.entry(SystemCollections.CACHE_PIPELINE_RATE_HISTORY,new Document("scope",scope)),
-                            java.util.Map.entry(SystemCollections.CACHE_SNAPSHOT_COUNTS,new Document("_id.scope",scope)),
-                            java.util.Map.entry(SystemCollections.CACHE_SNAPSHOT_ORDERS,new Document("_id",scope)));
-                    if(deleted<256)for(var payload:payloads) {
-                        deleted+=reclaimRows(session,payload.getKey().on(database),payload.getValue(),256-(int)deleted);
-                        if(deleted>=256)break;
-                    }
-                    active(original);return deleted;
-                },TRANSACTION);
-            }
+        var original=receipt.preparation();
+        var handle=StoreIo.call(() -> {
+            active(original);try(var session=client.startSession()) {return session.withTransaction(() -> {
+                active(original);var inventory=MongoOperatorInventory.requireRetired(session,database,original);
+                return MongoOperatorInventory.frozen(session,database,original.request().originalScope(),inventory);
+            },TRANSACTION);}
         });
-    }
-    private static long reclaimRows(ClientSession session,com.mongodb.client.MongoCollection<Document> table,Document filter,int remaining) {
-        if(remaining<=0)return 0;
-        var ids=new java.util.ArrayList<Object>();
-        for(var row:table.find(session,filter).projection(new Document("_id",1)).limit(remaining))ids.add(row.get("_id"));
-        if(ids.isEmpty())return 0;
-        return table.deleteMany(session,new Document("$and",List.of(filter,new Document("_id",new Document("$in",ids))))).getDeletedCount();
+        return new MongoRetiredPipelinePayloads(client,database,business,() -> active(original),operatorDatabases).reclaim(handle,currentNode);
     }
 
     @Override public PipelineRebuildReceipt prepare(PipelineRebuildPreparation original, WorkloadClaimFence currentNode, Duration ttl, Instant touchTime) {

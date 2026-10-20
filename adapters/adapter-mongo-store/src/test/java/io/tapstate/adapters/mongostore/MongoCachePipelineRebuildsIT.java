@@ -43,6 +43,175 @@ class MongoCachePipelineRebuildsIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static MongoDBContainer mongo() { return new MongoDBContainer(DockerImageName.parse("mongo:7.0")); }
 
+    @Test void completedDeletionReusesTheSameIdWithoutResettingClaimOrCheckpointHistory() {
+        withFixture(f -> {
+            var running=f.advance("flow");var sourceScope=RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1);
+            var token=f.configuration.requiredNotes().initialize(sourceScope);
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new PipelineRetirementRequest("delete-original",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(running,0)));
+            var pending=f.configuration.retirements().begin(request);assertThat(pending.privateScopesCount()).isOne();
+            assertThat(f.configuration.artifacts().create(pipeline)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            var receipt=f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node);
+            assertCode(() -> f.configuration.retirements().complete(receipt),IoError.NOTE_SCOPE_UNAVAILABLE);
+            var notes=f.configuration.requiredNotes().retirements(f.scope,request.operationId());assertThat(notes).hasSize(1);
+            assertThat(notes.getFirst().origin()).isEmpty();notes.getFirst().completeAfterVerifiedRelease();
+            var result=f.configuration.retirements().complete(receipt);assertThat(result.cache()).isPresent();
+            assertThat(f.configuration.artifacts().get("flow")).isEmpty();assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase()).isEqualTo(PipelineStateMapping.Phase.RETIRED);
+            long retiredGeneration=f.claim().getLong("claimGeneration"),retiredEpoch=f.state().getLong("epoch");
+            assertThat(retiredGeneration).isEqualTo(running.claimGeneration()+1);assertThat(retiredEpoch).isOne();
+            f.configuration.artifacts().create(pipeline);var scope=new PipelineIntentScope(f.scope.clusterId(),1,f.scope.cacheIncarnation(),"flow",2);
+            var tombstone=f.configuration.intents().load("flow").orElseThrow();assertThat(tombstone.scope()).isEqualTo(scope);assertThat(tombstone.deleted()).isTrue();
+            var authority=((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(scope,f.node)).creation();
+            var reservation=f.domain.pipelinePreparations(f.business,ACTIVE).reserveFirst(authority,TTL);
+            assertThat(reservation.claim().claimGeneration()).isEqualTo(retiredGeneration+1);assertThat(reservation.claim().executionGeneration()).isEqualTo(running.executionGeneration());
+            var prepared=f.domain.pipelinePreparations(f.business,ACTIVE).seed(reservation,f.configuration.preparations(),AT);f.configuration.preparations().complete(prepared);
+            assertThat(f.state().getLong("epoch")).isEqualTo(retiredEpoch+1);assertThat(f.state().get("scope")).isEqualTo(MongoPipelinePreparationFacts.scope(scope));
+            assertThat(f.configuration.retirements().complete(receipt)).isEqualTo(result);assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);
+            assertCode(() -> f.configuration.requiredNotes().read(token,"late"),IoError.NOTE_SCOPE_UNAVAILABLE);
+        });
+    }
+    @Test void aNeverPreparedDefinitionHasAnExplicitEmptyHistoryRetirement() {
+        withFixture(f -> {
+            var pipeline=new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: unused\nsource: []\n");f.configuration.artifacts().create(pipeline);
+            var scope=new PipelineIntentScope(f.business.clusterId(),1,f.business.cacheIncarnation(),"unused",1);
+            var request=new PipelineRetirementRequest("delete-unused",scope,CanonicalHash.of(pipeline),java.util.Optional.empty());
+            var pending=f.configuration.retirements().begin(request);var receipt=f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node);
+            assertThat(receipt.retiredState()).isEmpty();f.configuration.retirements().complete(receipt);
+            f.configuration.artifacts().create(pipeline);var next=new PipelineIntentScope(f.business.clusterId(),1,f.business.cacheIncarnation(),"unused",2);
+            var authority=((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(next,f.node)).creation();
+            var reserved=f.domain.pipelinePreparations(f.business,ACTIVE).reserveFirst(authority,TTL);
+            f.configuration.preparations().complete(f.domain.pipelinePreparations(f.business,ACTIVE).seed(reserved,f.configuration.preparations(),AT));
+            assertThat(reserved.claim().claimGeneration()).isOne();assertThat(reserved.claim().executionGeneration()).isZero();
+        });
+    }
+
+    @Test void aCompletedRetirementCannotDropItsKnownCacheResultBeforeRecreation() {
+        withFixture(f -> {
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new PipelineRetirementRequest("delete-damaged-result",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"),0)));
+            var pending=f.configuration.retirements().begin(request);f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node));
+            SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id","flow"),new Document("$set",new Document("retirement.cacheResult",null)));
+            var before=f.mapping();long version=f.version();
+            assertCode(() -> f.configuration.artifacts().create(pipeline),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);assertThat(f.configuration.artifacts().get("flow")).isEmpty();
+        });
+    }
+
+    @Test void retirementResumesAcrossIndependentClientsWithoutReissuingOrAdvancingItsResult() {
+        withFixture(f -> {
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new PipelineRetirementRequest("delete-reopen",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"),0)));
+            var pending=f.configuration.retirements().begin(request);
+            var receipt=f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node);var beforeClaim=f.claim();var beforeState=f.state();
+            try(var reopened=MongoConfigurationDomain.open(new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()),null,Duration.ofSeconds(5)),"cluster-a");
+                var other=MongoCacheDomain.connect(f.connection,Duration.ofSeconds(5),"deletion-resume")) {
+                var retained=reopened.retirements().pending(f.scope,request.operationId()).orElseThrow();
+                var again=other.pipelineRetirements(f.business,ACTIVE).retire(retained,f.node);
+                assertThat(again.retiredState()).isEqualTo(receipt.retiredState());assertThat(f.claim()).isEqualTo(beforeClaim);assertThat(f.state()).isEqualTo(beforeState);
+                var result=reopened.retirements().complete(again);long version=f.version();
+                assertThat(f.configuration.retirements().complete(receipt)).isEqualTo(result);
+                assertThat(reopened.retirements().completed("flow",request.operationId())).contains(result);assertThat(f.version()).isEqualTo(version);
+            }
+        });
+    }
+    @Test void aLostPrivateScopeCannotBeReinterpretedAsTheRemainingCompleteSet() {
+        withFixture(f -> {
+            var notes=f.configuration.requiredNotes();
+            notes.initialize(RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","one"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1));
+            notes.initialize(RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","two"),io.tapstate.core.model.PipelineNode.Purpose.SYNC,1));
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new PipelineRetirementRequest("delete-missing-note",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"),0)));
+            var pending=f.configuration.retirements().begin(request);assertThat(pending.privateScopesCount()).isEqualTo(2);
+            var receipt=f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node);
+            notes.retirements(f.scope,request.operationId()).getFirst().completeAfterVerifiedRelease();
+            var table=SystemCollections.PDK_NOTE_SCOPES.on(f.config);table.deleteOne(new Document("_id",table.find().first().get("_id")));
+            assertCode(() -> f.configuration.retirements().pending(f.scope,request.operationId()),IoError.DOCUMENT_UNREADABLE);
+            assertCode(() -> f.configuration.retirements().complete(receipt),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);
+        });
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void missingKnownRetiredHistoryNeverBecomesANewClaim(boolean loseCheckpoint) {
+        withFixture(f -> {
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new PipelineRetirementRequest("delete-known",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"),0)));
+            var pending=f.configuration.retirements().begin(request);f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node));
+            f.configuration.artifacts().create(pipeline);var scope=new PipelineIntentScope(f.scope.clusterId(),1,f.scope.cacheIncarnation(),"flow",2);
+            var creation=((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(scope,f.node)).creation();
+            if(loseCheckpoint)f.states().deleteOne(new Document("_id","flow"));else f.claims().deleteOne(new Document("_id.resourceId","flow"));
+            var before=f.snapshot();assertThatThrownBy(() -> f.domain.pipelinePreparations(f.business,ACTIVE).reserveFirst(creation,TTL)).isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+    @Test void concurrentRecreationPublishesOneGenerationAndPreservesUnusedPredecessorHistory() {
+        withFixture(f -> {
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new PipelineRetirementRequest("delete-first",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"),0)));
+            var pending=f.configuration.retirements().begin(request);var first=f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node));
+            try(var reopened=MongoConfigurationDomain.open(new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()),null,Duration.ofSeconds(5)),"cluster-a");var workers=Executors.newFixedThreadPool(2)) {
+                var start=new CountDownLatch(1);
+                var a=workers.submit(() -> {start.await();return f.configuration.artifacts().create(pipeline);});
+                var b=workers.submit(() -> {start.await();return reopened.artifacts().create(pipeline);});start.countDown();
+                assertThat(List.of(a.get(30,TimeUnit.SECONDS),b.get(30,TimeUnit.SECONDS))).containsExactlyInAnyOrder(ArtifactMutation.CREATED,ArtifactMutation.ALREADY_EXISTS);
+            }
+            var secondScope=new PipelineIntentScope(f.scope.clusterId(),1,f.scope.cacheIncarnation(),"flow",2);
+            var secondRequest=new PipelineRetirementRequest("delete-unused-recreation",secondScope,CanonicalHash.of(pipeline),java.util.Optional.empty());
+            var second=f.configuration.retirements().begin(secondRequest);var result=f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business,ACTIVE).retire(second,f.node));
+            assertThat(result.cache()).isEqualTo(first.cache());
+            f.configuration.artifacts().create(pipeline);var thirdScope=new PipelineIntentScope(f.scope.clusterId(),1,f.scope.cacheIncarnation(),"flow",3);
+            var authority=((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(thirdScope,f.node)).creation();
+            var reserved=f.domain.pipelinePreparations(f.business,ACTIVE).reserveFirst(authority,TTL);
+            assertThat(reserved.claim().claimGeneration()).isEqualTo(first.cache().orElseThrow().claim().claimGeneration()+1);
+            f.configuration.preparations().complete(f.domain.pipelinePreparations(f.business,ACTIVE).seed(reserved,f.configuration.preparations(),AT));
+            assertThat(f.state().getLong("epoch")).isEqualTo(first.cache().orElseThrow().epoch()+1);
+        });
+    }
+    @Test void sameScopeExecutionChangeRequiresAFreshFixedIsolationCandidate() {
+        withFixture(f -> {
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();var original=f.advance("flow");
+            var request=new PipelineRetirementRequest("delete-inflight-start",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(original,0)));
+            var pending=f.configuration.retirements().begin(request);
+            var store=f.domain.workloadClaims(f.business);assertThat(store.release(store.readPipeline(f.scope).orElseThrow().claim())).isTrue();
+            var candidate=WorkloadClaimFence.from(store.acquirePipeline(f.scope,OWNER,0,TTL).claim());
+            assertThat(candidate.topologyRevision()).isZero();
+            assertThat(candidate.claimGeneration()).isGreaterThan(original.claimGeneration());
+            assertThatThrownBy(() -> f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node)).isInstanceOf(TapstateException.class);
+            var isolated=java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(candidate,0));
+            var receipt=f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node,isolated);
+            assertThat(receipt.retiredState().orElseThrow().claim().claimGeneration()).isEqualTo(candidate.claimGeneration()+1);
+            f.configuration.retirements().complete(receipt);
+        });
+    }
+
+    @Test void reopenedCleanupUsesOnlyTheFrozenDeletedScopeAfterItsReplacementIsRunning() {
+        withFixture(f -> {
+            var running=f.advance("flow");var old=new OperatorPlacement(f.scope,f.cache.getName(),OperatorPlacement.Resource.JOIN_FACTS,"join","fact","facts");
+            var writer=f.domain.operatorState(old,running,ACTIVE);writer.save(old.mapName(),"old",new byte[]{1});
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new PipelineRetirementRequest("delete-and-clean-later",f.scope,CanonicalHash.of(pipeline),java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(running,0)));
+            var pending=f.configuration.retirements().begin(request);f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node));
+            f.configuration.artifacts().create(pipeline);var scope=new PipelineIntentScope(f.scope.clusterId(),1,f.scope.cacheIncarnation(),"flow",2);
+            var creation=((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(scope,f.node)).creation();
+            var reservation=f.domain.pipelinePreparations(f.business,ACTIVE).reserveFirst(creation,TTL);
+            f.configuration.preparations().complete(f.domain.pipelinePreparations(f.business,ACTIVE).seed(reservation,f.configuration.preparations(),AT));
+            var store=f.domain.workloadClaims(f.business);var current=store.advanceExecution(store.acquirePipeline(scope,OWNER,1,TTL).claim(),1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var replacement=new OperatorPlacement(scope,f.cache.getName(),OperatorPlacement.Resource.JOIN_FACTS,"join","fact","facts");
+            f.domain.operatorState(replacement,WorkloadClaimFence.from(current),ACTIVE).save(replacement.mapName(),"keep",new byte[]{2});
+            try(var reopened=MongoCacheDomain.connect(f.connection,Duration.ofSeconds(5),"old-payload-retry")) {
+                var cleanup=reopened.retiredPipelinePayloads(f.business,ACTIVE);var original=cleanup.find(f.scope).orElseThrow();
+                assertThat(cleanup.list("flow",0,128)).containsExactly(original);
+                var fake=new RetiredPipelinePayloads.Original(original.scope(),original.operationId(),original.preparationId(),"0".repeat(64));
+                assertThatThrownBy(() -> cleanup.reclaim(fake,f.node)).isInstanceOf(TapstateException.class);
+                assertThat(cleanup.reclaim(original,f.node)).isGreaterThan(0);assertThat(cleanup.reclaim(original,f.node)).isZero();
+                assertThat(cleanup.find(f.scope)).contains(original);assertThat(cleanup.list("flow",1,128)).isEmpty();
+            }
+            assertThat(f.domain.operatorState(replacement).load(replacement.mapName(),"keep")).contains(new byte[]{2});
+            assertCode(() -> writer.save(old.mapName(),"late",new byte[]{3}),IoError.CACHE_BUSINESS_FENCED);
+            assertThat(f.claim().getLong("executionGeneration")).isEqualTo(2);
+        });
+    }
+
     @Test void originalPrivateRetirementTokensSurviveReopenAndCompletedOnesDoNotReleaseTwice() {
         withFixture(f -> {
             var notes=f.configuration.requiredNotes();
@@ -141,7 +310,7 @@ class MongoCachePipelineRebuildsIT {
             f.configuration.rebuilds().complete(receipt);assertThat(f.rebuilds().reclaim(receipt)).isZero();
             var claims=f.domain.workloadClaims(f.business);
             claims.advanceExecution(claims.readPipeline(pending.request().targetScope()).orElseThrow().claim(),1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
-            assertThatThrownBy(() -> f.rebuilds().reclaim(receipt)).isInstanceOf(TapstateException.class);
+            assertThat(f.rebuilds().reclaim(receipt)).isZero();
         });
     }
 

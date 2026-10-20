@@ -56,6 +56,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     private final MongoCollection<Document> versions;
     private final EncryptedArtifactCodec codec;
     private final MongoPipelineStateMappings stateMappings;
+    private final MongoStorageBindingStore bindings;
     private final MongoRequiredNoteStore notes;
     private final MongoCollection<Document> identity;
     private final MongoCollection<Document> mappings;
@@ -77,6 +78,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         this.versions = durable(SystemCollections.CONFIGURATION_VERSION.on(database));
         this.codec = new EncryptedArtifactCodec(Objects.requireNonNull(ciphers, "ciphers"));
         this.stateMappings = new MongoPipelineStateMappings(client, database);
+        this.bindings=new MongoStorageBindingStore(client,database,ciphers);
         this.notes = new MongoRequiredNoteStore(client, database, ciphers);
         this.identity = durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database));
         this.mappings = durable(SystemCollections.OPERATOR_GENERATIONS.on(database));
@@ -118,6 +120,14 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             collection(stored.getString("kind")).deleteOne(session, new Document("_id", id));
             return ArtifactMutation.DELETED;
         }, refused -> refused.outcome);
+    }
+
+    /** Only the validated original lifecycle transaction may remove a Pipeline whose notes are retired. */
+    void deleteRetiredPipeline(ClientSession session,String id,String expectedHash) {
+        var stored=find(session,id);
+        if(stored==null || !"pipeline".equals(stored.get("kind")) || !expectedHash.equals(stored.get("contentHash")))throw MongoPipelineRetirementFacts.fenced();
+        requireUnmanaged(stored);
+        if(collection("pipeline").deleteOne(session,new Document("_id",id).append("contentHash",expectedHash)).getDeletedCount()!=1)throw MongoPipelineRetirementFacts.fenced();
     }
 
     @Override
@@ -265,7 +275,8 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             }
         }
         if ("pipeline".equals(resource.kind()) && (observed == null || !"pipeline".equals(observed.getString("kind")))) {
-            stateMappings.create(session, resource.id());
+            stateMappings.create(session,resource.id(),() -> bindings.cachePreparationForTransaction(session)
+                    .orElseThrow(MongoPipelineRetirementFacts::fenced).businessScope());
         }
         // Unconditional apply may replace a kind, but must never leave the same id in both tables.
         if (observed != null && !resource.kind().equals(observed.getString("kind"))) {

@@ -56,6 +56,12 @@ public interface SrsConsumerStore {
         return detach(membership.context(),membership.revision(),original.request().originalClaim());
     }
 
+    /** A fixed verified deletion step retires only this original physical generation's relation. */
+    default Optional<SrsConsumerMembership> detachForRetirement(PipelineRetirementPreparation original,SrsConsumerMembership membership,
+            WorkloadClaimFence currentNode,Optional<PipelineRetirementRequest.CacheOriginal> isolated) {
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+    }
+
     /** Removes only this cursor and leaves a revision marker so a late original attach cannot revive it. */
     Optional<SrsConsumerMembership> detach(SrsConsumerContext context, long expectedRevision,
                                           WorkloadClaimFence originalPipelineFence);

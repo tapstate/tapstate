@@ -34,6 +34,6 @@ class PipelineRebuildCoordinatorTest {
         var coordinator=new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(artifacts,mock(SchemaStore.class),views,consumers,configuration,cache),
                 privateNotes,() -> node,() -> {},(original,manifest) -> {},Duration.ofSeconds(30),Clock.systemUTC());
         coordinator.rebuild(pass,Optional.empty());
-        assertThat(releases).hasValue(0);verify(retirement,never()).completeAfterVerifiedRelease();
+        assertThat(releases).hasValue(0);verify(retirement,never()).completeAfterVerifiedRelease();verify(cache,never()).reclaim(any(),any());
     }
 }

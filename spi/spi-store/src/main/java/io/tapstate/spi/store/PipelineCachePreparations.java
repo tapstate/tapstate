@@ -30,5 +30,5 @@ public interface PipelineCachePreparations {
             }
         }
     }
-    enum Phase { RESERVED, PREPARED }
+    enum Phase { RESERVED, PREPARED, RETIRED }
 }

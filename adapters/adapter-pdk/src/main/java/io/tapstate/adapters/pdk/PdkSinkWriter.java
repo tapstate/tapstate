@@ -59,14 +59,18 @@ final class PdkSinkWriter implements SinkWriter {
     private final Runnable letGo;
     private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
     // Blocking connector calls must leave the shared async pool available for engine lifecycle callbacks.
+    private volatile Thread writeThread;
+    private boolean delivering;
     private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {
         Thread thread = new Thread(task, "tapstate-sink-write");
         thread.setDaemon(true);
+        writeThread = thread;
         return thread;
     });
     private final Object lifecycle = new Object();
     private final Set<CompletableFuture<WriteResult>> pending = new HashSet<>();
     private boolean closed;
+    private final java.util.concurrent.CountDownLatch closeFinished = new java.util.concurrent.CountDownLatch(1);
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl, TargetTable target) {
         this(connector, write, mode, ddl, target == null ? Map.of() : Map.of(target.name(), target));
@@ -170,7 +174,14 @@ final class PdkSinkWriter implements SinkWriter {
             }
             // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
             List<Envelope> batch = List.copyOf(records);
-            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> deliver(batch), writes);
+            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> {
+                synchronized (lifecycle) {
+                    if (closed) throw new java.util.concurrent.CancellationException("the sink writer was closed");
+                    delivering = true;
+                }
+                try { return deliver(batch); }
+                finally { delivering = false; }
+            }, writes);
             pending.add(result);
             result.whenComplete((accepted, failure) -> {
                 synchronized (lifecycle) {
@@ -260,22 +271,60 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public void close() {
-        List<CompletableFuture<WriteResult>> abandoned;
-        synchronized (lifecycle) {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            abandoned = List.copyOf(pending);
+        if (Thread.currentThread() == writeThread && delivering) {
+            throw new IllegalStateException("a target callback cannot close its active writer");
         }
-        // Completion handlers may wait for the active callback to exit, so interrupt it first.
+        List<CompletableFuture<WriteResult>> abandoned;
+        boolean first;
+        synchronized (lifecycle) {
+            first = !closed;
+            closed = true;
+            abandoned = first ? List.copyOf(pending) : List.of();
+        }
+        if (!first) {
+            // A completion callback has left deliver already; waiting here could cycle with another close.
+            if (Thread.currentThread() == writeThread) return;
+            awaitClosed();
+            return;
+        }
         writes.shutdownNow();
         try {
+            // A blocked target call can need its connector stopped before it can exit.
             letGo.run();
         } finally {
-            // Release the connector before notifying handlers; a blocked call may need that release to exit.
-            // Tasks removed from the executor's queue still owe a result even when connector cleanup fails.
-            abandoned.forEach(result -> result.cancel(false));
+            try {
+                // Jet may swallow close failures. Never leave it while an original callback can still write.
+                // Completion callbacks on our worker run after deliver; queued target calls are refused.
+                if (Thread.currentThread() != writeThread) awaitWrites();
+                abandoned.forEach(result -> result.cancel(false));
+            } finally {
+                closeFinished.countDown();
+            }
         }
     }
+
+    private void awaitWrites() {
+        boolean interrupted = false;
+        try {
+            while (!writes.isTerminated()) {
+                try { writes.awaitTermination(1, java.util.concurrent.TimeUnit.DAYS); }
+                catch (InterruptedException stopping) { interrupted = true; }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
+
+    private void awaitClosed() {
+        boolean interrupted = false;
+        try {
+            for (;;) {
+                try { closeFinished.await(); return; }
+                catch (InterruptedException stopping) { interrupted = true; }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
+
 }

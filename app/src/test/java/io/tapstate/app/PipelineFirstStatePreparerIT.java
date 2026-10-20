@@ -249,6 +249,43 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void deletionKeepsOriginalIdentityAndBlocksReuseUntilReleaseIsConfirmed() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);var claims=f.cache.workloadClaims(f.business());
+            var run=claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var store=f.configuration.requiredNotes();
+            var token=store.initialize(io.tapstate.spi.store.RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","original-source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1));
+            var origin=io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture("original-connector","c".repeat(64),Map.of("uri","original-database"));
+            store.prepareOrigin(token,origin);store.compareAndSet(token,"slot",0,new byte[]{7},false);
+            var global=store.initialize(new io.tapstate.spi.store.RequiredNoteOwner(1,"pdk.global-state",io.tapstate.spi.store.RequiredNoteOwner.Kind.GLOBAL,"cluster-a",0));
+            store.compareAndSet(global,"keep",0,new byte[]{8},false);
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new io.tapstate.spi.store.PipelineRetirementRequest("app-delete",f.scope,CanonicalHash.of(pipeline),Optional.of(new io.tapstate.spi.store.PipelineRetirementRequest.CacheOriginal(WorkloadClaimFence.from(run),0)));
+            var failed=new java.util.concurrent.atomic.AtomicBoolean(true);var releases=new java.util.concurrent.atomic.AtomicInteger();
+            var notes=new PipelinePrivateNoteRetirement(store,f.configuration.rebuilds(),(retirement,config,purpose,cluster,guard) -> {
+                releases.incrementAndGet();guard.run();assertThat(retirement.origin()).contains(origin);
+                assertThat(config.connectorId()).isEqualTo("original-connector");assertThat(purpose).isEqualTo(io.tapstate.core.model.PipelineNode.Purpose.CAPTURE);
+                assertThat(retirement.notes().read(token,"slot").bytes()).containsExactly(7);
+                return failed.get()?Optional.of(new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null)):Optional.empty();
+            });
+            var coordinator=new PipelineDeletionCoordinator(f.configuration.retirements(),f.cache.pipelineRetirements(f.business(),ACTIVE),f.cache.srs(f.business(),ACTIVE).consumers(),notes,
+                    () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE));
+            assertThatThrownBy(() -> coordinator.delete(request,Optional.empty())).isInstanceOf(TapstateException.class);
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
+            assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);assertThat(releases).hasValue(1);assertThat(store.retirement(token,request.operationId()).origin()).contains(origin);
+            assertThat(f.configuration.artifacts().create(pipeline)).isEqualTo(io.tapstate.spi.store.ArtifactMutation.ALREADY_EXISTS);
+            var retiredClaim=f.claim();failed.set(false);var result=coordinator.resume(f.scope,request.operationId(),Optional.empty()).orElseThrow();
+            assertThat(releases).hasValue(2);assertThat(f.configuration.artifacts().get("flow")).isEmpty();
+            assertThat(coordinator.delete(request,Optional.empty())).isEqualTo(result);assertThat(releases).hasValue(2);
+            assertThat(f.claim().get("claimGeneration")).isEqualTo(retiredClaim.get("claimGeneration"));
+            assertThat(store.read(global,"keep").bytes()).containsExactly(8);
+            f.configuration.artifacts().create(pipeline);var next=new PipelineIntentScope(f.scope.clusterId(),1,f.scope.cacheIncarnation(),"flow",2);
+            f.preparer(f.configuration,f.cache).prepare(next);
+            assertThat(f.claim().getLong("claimGeneration")).isGreaterThan(retiredClaim.getLong("claimGeneration"));
+            assertThat(coordinator.delete(request,Optional.empty())).isEqualTo(result);assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);
+        });
+    }
+
     @Test void actualStopPortResumesTheSameRebuildAfterTheCacheCommitResponseIsLost() {
         withFixture(f -> {
             f.preparer(f.configuration,f.cache).prepare(f.scope);var claims=f.cache.workloadClaims(f.business());

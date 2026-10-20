@@ -22,11 +22,12 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
+    private final MongoDatabase database;
     private final MongoCollection<Document> mappings;
     private final MongoCollection<Document> pipelines;
 
     MongoPipelineStateMappings(MongoClient client, MongoDatabase database) {
-        this.client = Objects.requireNonNull(client, "client");
+        this.client = Objects.requireNonNull(client, "client");this.database=Objects.requireNonNull(database,"database");
         this.mappings = SystemCollections.OPERATOR_GENERATIONS.on(database)
                 .withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
         this.pipelines = SystemCollections.PIPELINES.on(database)
@@ -49,11 +50,25 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         });
     }
 
-    void create(ClientSession session, String pipelineId) {
-        requireNoRetainedIdentity(session, pipelineId);
-        mappings.insertOne(session, new Document("_id", pipelineId).append("stateGeneration", 1L)
-                .append("phase", PipelineStateMapping.Phase.ACTIVE.name()).append("operationId", null)
-                .append("noteWriteFence", 0L).append("cachePreparation", new Document("phase", "UNASSIGNED")));
+    void create(ClientSession session,String pipelineId) { create(session,pipelineId,() -> null); }
+    void create(ClientSession session,String pipelineId,java.util.function.Supplier<io.tapstate.spi.store.CacheBusinessScope> currentBusiness) {
+        var prior=mappings.find(session,new Document("_id",pipelineId)).first();
+        if(prior==null) {
+            mappings.insertOne(session,new Document("_id",pipelineId).append("stateGeneration",1L).append("phase","ACTIVE").append("operationId",null)
+                    .append("noteWriteFence",0L).append("cachePreparation",new Document("phase","UNASSIGNED")));return;
+        }
+        var state=decode(pipelineId,prior);if(state.phase()!=PipelineStateMapping.Phase.RETIRED)throw retirementRequired(pipelineId);
+        var result=MongoPipelineRetirementFacts.read(prior).completed();
+        if(result.scope().stateGeneration()!=state.stateGeneration() || state.stateGeneration()>=Long.MAX_VALUE-2
+                || prior.getLong("noteWriteFence")>=Long.MAX_VALUE-1)throw retirementRequired(pipelineId);
+        var business=currentBusiness.get();if(business==null || !business.clusterId().equals(result.scope().clusterId()))throw retirementRequired(pipelineId);
+        var next=new io.tapstate.spi.store.PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),pipelineId,state.stateGeneration()+1);
+        MongoPipelineIntentStore.recreate(session,database,result.scope(),next);
+        var replacement=new Document(prior).append("stateGeneration",next.stateGeneration()).append("phase","ACTIVE")
+                .append("noteWriteFence",prior.getLong("noteWriteFence")+1).append("cachePreparation",new Document("phase","UNASSIGNED"));
+        replacement.remove("stateRebuild");
+        if(mappings.replaceOne(session,new Document("_id",pipelineId).append("stateGeneration",state.stateGeneration()).append("phase","RETIRED")
+                .append("noteWriteFence",prior.get("noteWriteFence")).append("retirement",prior.get("retirement")),replacement).getMatchedCount()!=1)throw retirementRequired(pipelineId);
     }
 
     void requireNoRetainedIdentity(ClientSession session, String resourceId) {

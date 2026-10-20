@@ -88,17 +88,22 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
             PipelinePreparation previous = MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId);
             if (previous.phase() != PipelinePreparation.Phase.UNASSIGNED) {
                 if (!scope.equals(previous.scope())) throw fenced();
-                return new Issuance(previous, false, null);
+                return new Issuance(previous, false, null,Optional.empty());
             }
             var fixed = verifyInputs(session,scope,requested);
             var issued = new PipelinePreparation(scope.pipelineId(), scope.stateGeneration(), PipelinePreparation.Phase.ISSUED,
                     scope, preparationId, originalNode);
+            Optional<io.tapstate.spi.store.PipelineRetirementResult> retired=Optional.empty();
+            if(row.containsKey("retirement")) {
+                var completedRetirement=MongoPipelineRetirementFacts.read(row).completed();
+                if(completedRetirement.scope().stateGeneration()+1!=scope.stateGeneration())throw fenced();retired=Optional.of(completedRetirement);
+            } else if(scope.stateGeneration()!=1)throw fenced();
             replaceAnnex(session, scope, row, issued);
-            return new Issuance(issued, true, fixed);
+            return new Issuance(issued, true, fixed,retired);
         });
         // The grant is constructed only after withTransaction has confirmed its commit.
         requireActive.run();
-        return result.won() ? new FirstPipelineCreationResult.Issued(new Creation(result.preparation(), result.inputs(), requireActive))
+        return result.won() ? new FirstPipelineCreationResult.Issued(new Creation(result.preparation(), result.inputs(), result.retirement(),requireActive))
                 : new FirstPipelineCreationResult.AlreadyIssued(result.preparation());
     }
 
@@ -207,15 +212,21 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         return invocation;
     }
 
-    private record Issuance(PipelinePreparation preparation, boolean won, PipelinePreparationInputs inputs) {}
+    static Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement(FirstPipelineCreation original) {
+        if(!(original instanceof Creation creation))throw fenced();return creation.retirement;
+    }
+
+    private record Issuance(PipelinePreparation preparation,boolean won,PipelinePreparationInputs inputs,Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement) {}
 
     /** The implementation is neither a persistent DTO nor serializable. */
     private static final class Creation implements FirstPipelineCreation {
         private final PipelinePreparation preparation;
         private final Runnable originalActive;
         private final PipelinePreparationInputs inputs;
+        private final Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement;
         private final AtomicBoolean consumed = new AtomicBoolean();
-        private Creation(PipelinePreparation preparation, PipelinePreparationInputs inputs, Runnable originalActive) {
+        private Creation(PipelinePreparation preparation,PipelinePreparationInputs inputs,Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement,Runnable originalActive) {
+            this.retirement=retirement;
             this.preparation = preparation; this.inputs = Objects.requireNonNull(inputs,"inputs"); this.originalActive = originalActive;
         }
         @Override public PipelinePreparation preparation() { return preparation; }

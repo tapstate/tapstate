@@ -139,6 +139,19 @@ class EngineTest {
                 .isTrue();
     }
 
+    @Test void originalRunDoesNotBecomeTerminalUntilProcessorCloseActuallyReturns() throws Exception {
+        CloseHeldProcessor.entered=new CountDownLatch(1);CloseHeldProcessor.release=new CountDownLatch(1);
+        var dag=new DAG();dag.newVertex("held-close",ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of((SupplierEx<Processor>) CloseHeldProcessor::new)));
+        var engine=new Engine(member);var identity=new TestRunIdentity("cache-a",1,"boot-a",1,1);
+        var original=engine.submitRun("held-close",dag,Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),identity);
+        try {
+            awaitStatus(member.getJet().getJob("held-close"),JobStatus.RUNNING);original.cancel();
+            assertThat(CloseHeldProcessor.entered.await(10,TimeUnit.SECONDS)).isTrue();
+            assertThat(original.awaitTerminal(Duration.ofMillis(200))).isFalse();
+        } finally {CloseHeldProcessor.release.countDown();}
+        assertThat(original.awaitTerminal(Duration.ofSeconds(10))).isTrue();
+    }
+
     @Test
     void awaitTerminal_says_yes_for_a_pipeline_that_has_no_job_at_all() {
         // Nothing was ever submitted, so there is nothing still writing: a caller waiting to clear up after
@@ -961,6 +974,18 @@ class EngineTest {
             Thread.sleep(500);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private static final class CloseHeldProcessor extends AbstractProcessor {
+        static volatile CountDownLatch entered,release;
+        @Override public boolean complete(){return false;}
+        @Override public void close() throws Exception {
+            entered.countDown();boolean interrupted=false;
+            try {
+                for(;;)try {if(!release.await(15,TimeUnit.SECONDS))throw new AssertionError("close was not released");return;}
+                    catch(InterruptedException stopping){interrupted=true;}
+            } finally {if(interrupted)Thread.currentThread().interrupt();}
         }
     }
 

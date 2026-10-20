@@ -91,6 +91,8 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         };
     }
 
+    boolean belongsTo(MongoClient expected,String name){return client==expected && scopes.getNamespace().getDatabaseName().equals(name);}
+
     @Override
     public RequiredNoteStore guardedBy(Runnable additionalGuard) {
         return new MongoRequiredNoteStore(this, Objects.requireNonNull(additionalGuard, "additionalGuard"));
@@ -467,7 +469,20 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             var mapping = MongoPipelineStateMappings.decode(original.pipelineId(), row);
             if (mapping.stateGeneration() != original.stateGeneration() || !operationId.equals(mapping.operationId())
                     || (mapping.phase() != PipelineStateMapping.Phase.REBUILDING && mapping.phase() != PipelineStateMapping.Phase.RETIRING)
-                    || !original.equals(MongoPipelinePreparationFacts.decode(original.pipelineId(), row, original.clusterId()).scope())) throw unavailable();
+                    || !retirementScopeMatches(original,row)) throw unavailable();
+            return retirementScopes(session,original,operationId);
+        })));
+    }
+
+    private boolean retirementScopeMatches(io.tapstate.spi.store.PipelineIntentScope original,Document row) {
+        var prepared=MongoPipelinePreparationFacts.decode(original.pipelineId(),row,original.clusterId());
+        if(prepared.phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED)return original.equals(prepared.scope());
+        return row.containsKey("retirement") && original.equals(MongoPipelineRetirementFacts.read(row).request().scope());
+    }
+
+    /** Called only from the original CONFIG lifecycle transaction, before or during its phase transition. */
+    List<RequiredNoteScope> retirementScopes(ClientSession session,io.tapstate.spi.store.PipelineIntentScope original,String operationId) {
+        requireOrdinary();requireActive.run();
             var result = new ArrayList<RequiredNoteScope>();
             try (var rows = scopes.find(session, new Document("_id.bindingVersion", original.bindingVersion())
                     .append("ownerKind", "PIPELINE").append("ownerId", original.pipelineId())).iterator()) {
@@ -487,7 +502,17 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                 }
             }
             return List.copyOf(result);
-        })));
+    }
+    void requireRetiredScopes(ClientSession session,io.tapstate.spi.store.PipelineRetirementPreparation original) {
+        var request=original.request();var tokens=retirementScopes(session,request.scope(),request.operationId());
+        if(tokens.size()!=original.privateScopesCount() || !MongoPipelineRetirementFacts.notesHash(tokens).equals(original.privateScopesHash()))throw unavailable();
+        for(var token:tokens) {
+            var fixed=new Retirement(token,request.operationId());checkRetiringOwner(session,fixed,false);
+            var metadata=scopes.find(session,byScope(token.owner())).first();
+            if(retiredResult(fixed,metadata)==null || !Long.valueOf(0).equals(metadata.get("originGeneration"))
+                    || !incoming(session,token.owner(),metadata).isEmpty() || origins.find(session,byScope(token.owner())).first()!=null
+                    || notes.find(session,new Document("_id.bindingVersion",token.owner().bindingVersion()).append("_id.namespace",token.owner().namespace())).first()!=null)throw unavailable();
+        }
     }
 
     @Override
