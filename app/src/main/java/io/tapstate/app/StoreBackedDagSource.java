@@ -3092,14 +3092,19 @@ final class StoreBackedDagSource implements DagSource {
         String chain = vertex.stream();
         byte axis = axes.axisOf(chain);
         if (captureBindings != null) {
-            if (snapshotOnly) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+            if (snapshotOnly) {
+                var source=captureBindings.requireSnapshot(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+                return SrsSourceProcessor.snapshotOnlyMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.epoch(),
+                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
+            }
+            if (!captureBindings.snapshots().isEmpty()) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
             if (direct) {
                 var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
-                return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.epoch(),
+                return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.epoch(),
                         order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
             }
             var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
-            return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
+            return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
                     source.recoveryAfter().get(vertex.table()),source.snapshotEpoch(),new ScopedSrsReadCursorPublisherFactory(source.run(),vertex.table()),
                     order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
                     readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.sourceId())));
@@ -3136,7 +3141,7 @@ final class StoreBackedDagSource implements DagSource {
     private static Map<String,ScopedSrsSinkAckFactory.Source> scopedSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
         var sources = new LinkedHashMap<String,ScopedSrsSinkAckFactory.Source>(); var selected = new HashSet<String>();
         for (var vertex : vertices.values()) {
-            if (bindings.direct().containsKey(vertex.sourceId())) continue;
+            if (bindings.direct().containsKey(vertex.sourceId()) || bindings.snapshots().containsKey(vertex.sourceId())) continue;
             var source = bindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); selected.add(vertex.sourceId());
             sources.put(vertex.stream(),new ScopedSrsSinkAckFactory.Source(source.run(),vertex.table()));
         }
@@ -3152,6 +3157,11 @@ final class StoreBackedDagSource implements DagSource {
             sources.put(vertex.stream(),new ScopedDirectSinkAckFactory.Source(run,vertex.table()));
         }
         if (!selected.equals(bindings.direct().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        var bounded=new HashSet<String>();
+        for (var vertex:vertices.values()) if (bindings.snapshots().containsKey(vertex.sourceId())) {
+            bindings.requireSnapshot(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); bounded.add(vertex.sourceId());
+        }
+        if (!bounded.equals(bindings.snapshots().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
         return Map.copyOf(sources);
     }
 

@@ -234,6 +234,26 @@ class StoreBackedDagSourceScopedModelTest {
         org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).derivedSchemas();
     }
 
+    @Test void aScopedBoundedSourceUsesItsAssignedOrderWithoutLegacyStateOrSrsProgress() {
+        var f=fixture(false); var old=f.pipeline;
+        var bounded=new PipelineResource(old.id(),old.metadata(),old.sources(),old.transforms(),old.view(),old.serve(),
+                new io.tapstate.core.model.Settings(null,null,null,null,io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY,null),old.experimental());
+        f.store.artifacts().save(bounded); var guarded=org.mockito.Mockito.spy(f.store);
+        org.mockito.Mockito.doThrow(new AssertionError("bounded capture cannot use legacy progress")).when(guarded).meta();
+        org.mockito.Mockito.doThrow(new AssertionError("bounded capture cannot allocate legacy order")).when(guarded).keyedState();
+        var source=new StoreBackedDagSource(guarded,f.source.sinkWriterBinder());
+        var pass=new PipelineConvergencePass(new PipelineIntentSnapshot(SCOPE,1,new DesiredState("p",PipelineState.RUNNING,CanonicalHash.of(bounded))),ORIGINAL,f.views,() -> {});
+        var prepared=source.prepareStart(pass,"cache"); f.views.current.set(advance(1)); pass.advanced(advance(1));
+        var artifact=(SourceResource)prepared.artifactSnapshot().orElseThrow().get("src").orElseThrow();
+        var resolution=SourceCaptureResolution.forPipeline(bounded,artifact,prepared.sourceModels().orElseThrow().model(artifact)).orElseThrow();
+        var original=new ExecutionFence(SCOPE,advance(1));
+        var fixed=new PipelineCaptureBindings.SnapshotOnlySource(resolution.chainId().value(),java.util.Set.copyOf(resolution.tables()),11);
+        pass.bindCapture(advance(1),new PipelineCaptureBindings(original,Map.of(),Map.of(),Map.of("src",fixed),true));
+        assertThat(prepared.plan().build(original).dag()).isNotNull();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).meta();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).keyedState();
+    }
+
     @Test void aScopedPrivateSourceBuildsFromItsFixedDirectBindingWithoutReadingLegacyProgress() {
         var f = fixture(false); var old = f.pipeline;
         var direct = new PipelineResource(old.id(),old.metadata(),List.of(io.tapstate.core.model.SourceRef.spec("src",false)),

@@ -113,7 +113,8 @@ final class BackgroundLoad {
         }
         // The batch being read is closed under the reader and a wait for room is interrupted: those are the
         // two places the thread can be parked for a long time, and neither ends by itself.
-        load.close();
+        Throwable failure = null;
+        try { load.close(); } catch (RuntimeException | Error closeFailure) { failure = closeFailure; }
         if (Thread.currentThread() != thread) {
             // Closed from outside. Closed from the reading thread itself -- by something it calls on the way
             // -- there is nothing to wake and nobody else to wait for: it sees the abandonment as it returns.
@@ -130,8 +131,14 @@ final class BackgroundLoad {
             opened = null;
         }
         if (subscription != null) {
-            subscription.close();
+            try { subscription.close(); }
+            catch (RuntimeException | Error closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else if (closeFailure != failure) failure.addSuppressed(closeFailure);
+            }
         }
+        if (failure instanceof RuntimeException runtime) throw runtime;
+        if (failure instanceof Error error) throw error;
     }
 
     /**
@@ -186,8 +193,9 @@ final class BackgroundLoad {
                 health.fail(failure);
             }
         } finally {
-            load.close();
-            finished.countDown();
+            try { load.close(); }
+            catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
+            finally { finished.countDown(); }
         }
     }
 

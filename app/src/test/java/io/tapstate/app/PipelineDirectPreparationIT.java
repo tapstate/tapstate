@@ -39,6 +39,125 @@ class PipelineDirectPreparationIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node","boot");
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-19T00:00:00Z"),ZoneOffset.UTC);
 
+    @Test void actualScopedCoordinatorUsesNativePreparationNotesAndCountsAcrossAKeepStateRestart() {
+        withFixture(f -> {
+            var definition=(PipelineResource)new io.tapstate.core.dsl.DslParser().parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: [{id: input, srs: false}]
+                    settings: {read_mode: snapshot_only}
+                    serve:
+                      from: input
+                      sync: [{id: copy, source: %s, on_full_load: clear}]
+                    """.formatted(StorageBinding.defaultSourceId(StorageBinding.Mode.OP)));
+            f.configuration.artifacts().save(definition);
+            f.cache.schemas(f.business(),ACTIVE).save(new DiscoveredSourceModel("input","mongodb",0,new SourceModel(List.of(
+                    new SourceTable("orders",List.of(new SourceField("id","INT")),List.of("id"),List.of()),
+                    new SourceTable("quiet",List.of(new SourceField("id","INT")),List.of("id"),List.of())))));
+            var inputs=f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims=f.cache.workloadClaims(f.business()); var initial=claims.readPipeline(f.scope).orElseThrow().claim();
+            var running=claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow(); var original=WorkloadClaimFence.from(running);
+            var ownership=mock(CaptureOwnership.class);
+            when(ownership.acquire(any())).thenAnswer(call -> {
+                var id=call.getArgument(0,CaptureId.class);
+                var attempt=claims.acquire(new WorkloadClaimKey(f.scope.clusterId(),WorkloadClaimType.CAPTURE,id.value()),OWNER,1,TTL);
+                return new CaptureOwnership.Permit(attempt.acquired(),attempt.claim());
+            });
+            when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));
+            when(ownership.ttl()).thenReturn(TTL);
+            doAnswer(call -> { claims.release(call.getArgument(0)); return null; }).when(ownership).release(any());
+            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
+            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var member=mock(HazelcastInstance.class); var buffer=new SnapshotBuffer(8); var opened=new CopyOnWriteArrayList<CaptureConfig>();
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),f.cache.srs(f.business(),ACTIVE),member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,buffer,provisioner,(fixed,config,guard) -> { guard.run();opened.add(config);return new NativeBoundedPort(guard); })) {
+                var artifacts=ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts());
+                var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+                var first=coordinator.forRun(f.scope,original,new ExecutionFence(f.scope,original)); first.startCapture("flow",artifacts,models);
+                awaitLoadedCounts(first); var firstBindings=first.captureBindings();
+                assertThat(firstBindings.snapshots().get("input").epoch()).isOne();
+                assertThat(first.snapshotProgress("flow").byTable().get("orders").rowsDone()).isOne();
+                assertThat(first.snapshotProgress("flow").byTable().get("quiet").rowsDone()).isZero();
+                String ring=SourceCaptureResolution.forPipeline(f.pipeline(),f.source(),models.model(f.source())).orElseThrow().ringName("orders");
+                assertThat(buffer.drain(firstBindings.bufferKey("input"),ring)).singleElement().satisfies(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(1)));
+                var targetInputs=buildBoundedDag(f,provisioner,firstBindings);
+                assertThat(targetInputs).hasSize(2).allSatisfy(input -> assertThat(input.fullLoad()).isTrue());
+                var originalTargets=f.cache.sinkPreparations(f.scope,original,ACTIVE);
+                for(var input:targetInputs)originalTargets.complete(originalTargets.begin(input),new SinkPreparationStore.Result(false));
+                var readyTargets=f.cacheDatabase.getCollection("sink_preparations").find().into(new ArrayList<>());
+                var oldView=f.cache.snapshotStates(f.scope,original,ACTIVE); assertThat(oldView.order()).isOne();
+                first.stopCapture("flow",false); assertThat(oldView.count("input","orders",1)).hasValue(1);
+                var next=WorkloadClaimFence.from(claims.advanceExecution(running,1,Set.of(OWNER.nodeId())).orElseThrow());
+                var second=coordinator.forRun(f.scope,next,new ExecutionFence(f.scope,next)); second.startCapture("flow",artifacts,models); awaitLoadedCounts(second);
+                assertThat(second.captureBindings().snapshots().get("input").epoch()).isEqualTo(2);
+                assertThat(buildBoundedDag(f,provisioner,second.captureBindings())).containsExactlyElementsOf(targetInputs);
+                assertThat(f.cacheDatabase.getCollection("sink_preparations").find().into(new ArrayList<>())).containsExactlyElementsOf(readyTargets);
+                assertThat(f.cache.snapshotStates(f.scope,next,ACTIVE).count("input","quiet",2)).hasValue(0);
+                assertThatThrownBy(oldView::order).isInstanceOf(TapstateException.class);
+                second.stopCapture("flow",false);
+                assertThat(opened).hasSize(2).allSatisfy(config -> {
+                    assertThat(config.node()).isEqualTo(new PipelineNode("flow","input")); assertThat(config.sharedNotes()).isNull();
+                    assertThat(config.settings()).containsEntry("password","test-secret");
+                });
+            }
+            assertThat(f.cacheDatabase.getCollection("srs_chains").countDocuments()).isZero();
+            assertThat(f.cacheDatabase.getCollection("direct_channel_offsets").countDocuments()).isZero();
+            assertThat(f.cacheDatabase.getCollection("snapshot_orders").countDocuments()).isOne();
+            assertThat(f.configDatabase.getCollection("pdk_note_origins").find().first().toJson()).doesNotContain("test-secret","x.invalid");
+        });
+    }
+    private static List<SinkPreparationStore.Input> buildBoundedDag(Fixture f,
+            io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,PipelineCaptureBindings bindings) {
+        var mixed=mock(StorePort.class);when(mixed.artifacts()).thenReturn(f.configuration.artifacts());
+        when(mixed.schemas()).thenReturn(f.cache.schemas(f.business(),ACTIVE));
+        var views=mock(PipelineStoreViews.class,org.mockito.AdditionalAnswers.delegatesTo(f.cache));
+        var inputs=new AtomicReference<List<SinkPreparationStore.Input>>();
+        doAnswer(call -> {
+            var actual=f.cache.sinkPreparations(call.getArgument(0),call.getArgument(1),call.getArgument(2));
+            var observed=spy(actual);
+            doAnswer(prepare -> { var targets=List.copyOf(prepare.<List<SinkPreparationStore.Input>>getArgument(0));
+                inputs.set(targets);actual.prepareTargets(targets);return null;
+            }).when(observed).prepareTargets(anyList());
+            return observed;
+        }).when(views).sinkPreparations(any(),any(),any());
+        var pass=new PipelineConvergencePass(new PipelineIntentSnapshot(f.scope,1,new io.tapstate.core.lifecycle.DesiredState(
+                "flow",io.tapstate.core.lifecycle.PipelineState.RUNNING,io.tapstate.core.model.canonical.CanonicalHash.of(f.pipeline()))),
+                new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"flow"),OWNER,
+                        bindings.original().claimGeneration(),bindings.original().executionGeneration(),bindings.original().topologyRevision()),views,ACTIVE);
+        var source=new StoreBackedDagSource(mixed,new StoreBackedDagSource.PdkSinkWriterBinder(f.configuration.requiredNotes(),provisioner));
+        var prepared=source.prepareStart(pass,"cache");pass.bindCapture(pass.claim(),bindings);
+        prepared.plan().build(bindings.original());return inputs.get();
+    }
+    private static void awaitLoadedCounts(PipelineCaptureCoordinator run) throws InterruptedException {
+        long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();
+        while(run.snapshotProgress("flow").byTable().size()!=2 && System.nanoTime()<deadline) {
+            if(run.captureFailure("flow").isPresent())throw new AssertionError("native capture failed",run.captureFailure("flow").orElseThrow());
+            Thread.sleep(25);
+        }
+        assertThat(run.snapshotProgress("flow").byTable()).containsOnlyKeys("orders","quiet");
+    }
+    private static final class NativeBoundedPort implements CapturePort,SnapshotOnlyCapture {
+        final Runnable guard;
+        NativeBoundedPort(Runnable guard) { this.guard=guard; }
+        public CaptureBatch snapshotOnly(CaptureConfig config) {
+            guard.run();var rows=List.of(Envelope.read(1,"orders",Map.of("id",1),null)).iterator();
+            return new CaptureBatch() {
+                public boolean hasNext() { guard.run();return rows.hasNext(); }
+                public Envelope next() { guard.run();return rows.next(); }
+                public Optional<SourcePosition> seam() { throw new AssertionError("bounded-only sources have no CDC seam"); }
+                public void close() {}
+            };
+        }
+        public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError(); }
+        public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener listener) { throw new AssertionError(); }
+        public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError(); }
+        public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError(); }
+    }
     @Test void snapshotOnlyOrderAndCountsUseSeparateNativeResourcesAndSurviveOriginalScopeReopen() {
         withFixture(f -> {
             f.configuration.artifacts().save(pipeline("input",false,ReadMode.SNAPSHOT_ONLY,"latest",null));

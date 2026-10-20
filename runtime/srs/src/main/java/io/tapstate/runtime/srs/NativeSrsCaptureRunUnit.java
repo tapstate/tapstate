@@ -75,6 +75,27 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         }
     }
 
+    /** A bounded-only source opens no change chain or CDC seam and uses the already allocated row order. */
+    public synchronized CaptureRun beginSnapshotOnly(CaptureConfig config,long snapshotEpoch,CapturePort port,
+            CaptureHandoff handoff,Runnable requireActive) {
+        Objects.requireNonNull(config,"config"); Objects.requireNonNull(port,"port"); Objects.requireNonNull(handoff,"handoff");
+        Runnable fixed=guard(requireActive); fixed.run(); SnapshotPhase.Load load=null; CaptureRun provisional=null;
+        try {
+            load=SnapshotPhase.openChainless(port,config,snapshotEpoch); fixed.run(); var health=new CaptureHealth();
+            CaptureHandoff guarded=new CaptureHandoff() {
+                @Override public void accept(io.tapstate.core.event.Envelope row) { fixed.run(); handoff.accept(row); }
+                @Override public void loaded(String table) { fixed.run(); handoff.loaded(table); }
+            };
+            var background=new BackgroundLoad(load,guarded,Optional::empty,health,"tapstate-native-bounded-"+config.connectorId());
+            var result=new CaptureRun(Optional.empty(),false,Optional.empty(),health,background);
+            provisional=result; snapshots.add(result); fixed.run(); background.start(); return result;
+        } catch (RuntimeException|Error failure) {
+            if (provisional!=null) { var abandoned=provisional; snapshots.remove(abandoned); closeAfter(failure,abandoned::close); }
+            else if (load!=null) closeAfter(failure,load::close);
+            throw failure;
+        }
+    }
+
     public final class Tail implements AutoCloseable {
         private final SrsCaptureWriter writer;
         private final Subscription subscription;
@@ -100,14 +121,21 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             if (closed.get()) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED,Map.of(),null);
         };
     }
-    private static void closeAfter(Throwable primary,Runnable close) {
-        try { close.run(); } catch (RuntimeException | Error failure) { if (failure != primary) primary.addSuppressed(failure); }
+    private static Throwable closeAfter(Throwable primary,Runnable close) {
+        try { close.run(); }
+        catch (RuntimeException | Error failure) {
+            if (primary == null) return failure;
+            if (failure != primary) primary.addSuppressed(failure);
+        }
+        return primary;
     }
     @Override public synchronized void close() {
         if (!closed.compareAndSet(false,true)) return;
-        RuntimeException first = null;
-        for (var run : List.copyOf(snapshots)) try { stopSnapshot(run); } catch (RuntimeException failure) { if (first == null) first=failure; else if (failure != first) first.addSuppressed(failure); }
-        for (var tail : List.copyOf(tails)) try { tail.close(); } catch (RuntimeException failure) { if (first == null) first=failure; else if (failure != first) first.addSuppressed(failure); }
-        acknowledgements.close(); if (first != null) throw first;
+        Throwable first = null;
+        for (var run : List.copyOf(snapshots)) first = closeAfter(first,() -> stopSnapshot(run));
+        for (var tail : List.copyOf(tails)) first = closeAfter(first,tail::close);
+        first = closeAfter(first,acknowledgements::close);
+        if (first instanceof RuntimeException runtime) throw runtime;
+        if (first instanceof Error error) throw error;
     }
 }
