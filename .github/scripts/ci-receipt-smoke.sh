@@ -460,13 +460,21 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
                    run_id=os.getenv('GITHUB_RUN_ID', 'local'), run_attempt=os.getenv('GITHUB_RUN_ATTEMPT', '1'))
     aggregate_path = root / 'current-aggregate.json'; aggregate_path.write_text(json.dumps(current))
     command_workers = root / 'command-worker-inputs'; command_workers.mkdir()
+    command_results = root / 'command-results'; command_results.mkdir()
     for shard in plan['shards']:
         directory = command_workers / ('ci-inputs-' + shard['id']); directory.mkdir()
-        (directory / 'build-inputs.json').write_text(json.dumps(current))
+        snapshot = directory / 'build-inputs.json'; snapshot.write_text(json.dumps(current))
+        result = command_results / shard['id']; result.mkdir()
+        producer = dict(schema=1, status='success', source_sha=plan['source_sha'],
+                        cohort_hash=plan['cohort_hash'], shard_id=shard['id'], run_id=current['run_id'],
+                        run_attempt=int(current['run_attempt']),
+                        case_observer=dict(enabled=True, build_inputs_sha256=m.digest(snapshot)))
+        (result / 'manifest.json').write_text(json.dumps(dict(provenance=producer)))
     directory = command_workers / 'ci-inputs-build'; directory.mkdir()
     (directory / 'build-inputs.json').write_text('old aggregate is not current')
     arguments = argparse.Namespace(root=str(fixture), plan=str(plan_path), inputs_root=str(command_workers),
-                                   aggregate_inputs=str(aggregate_path), output=str(root / 'comparison.json'))
+                                   aggregate_inputs=str(aggregate_path), artifacts=str(command_results),
+                                   output=str(root / 'comparison.json'))
     m.compare_inputs(arguments)
     check(json.loads(Path(arguments.output).read_text())['declared_input_hashes_equal'], 'real Git/plan/file/current-run comparison accepts fresh workers with old aggregate artifact')
     current['run_attempt'] = str(int(current['run_attempt']) + 1)
