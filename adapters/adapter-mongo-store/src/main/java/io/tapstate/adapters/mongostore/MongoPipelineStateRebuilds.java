@@ -71,6 +71,28 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             return pending;
         });
     }
+    @Override public java.util.Optional<PipelineRebuildPreparation> pending(String pipelineId,PipelinePreparationInputs inputs,Map<String,String> dependencyHashes) {
+        Objects.requireNonNull(pipelineId,"pipelineId");Objects.requireNonNull(inputs,"inputs");var captured=Map.copyOf(dependencyHashes);
+        return transaction(session -> {
+            var mapping=SystemCollections.OPERATOR_GENERATIONS.on(database).find(session,new Document("_id",pipelineId)).first();
+            if(mapping==null)return java.util.Optional.empty();var state=MongoPipelineStateMappings.decode(pipelineId,mapping);
+            if(state.phase()!=PipelineStateMapping.Phase.REBUILDING)return java.util.Optional.empty();
+            try {
+                var annex=mapping.get("stateRebuild",Document.class);if(annex==null || !annex.keySet().equals(ANNEX))throw unreadable();
+                var original=intents.loadInTransaction(session,pipelineId).orElseThrow(MongoPipelineStateRebuilds::fenced);
+                var claim=annex.get("originalClaim",Document.class);
+                if(claim==null || !claim.keySet().equals(Set.of("clusterId","pipelineId","nodeId","bootId","claimGeneration","executionGeneration","topologyRevision"))
+                        || !(claim.get("claimGeneration") instanceof Long generation) || !(claim.get("executionGeneration") instanceof Long execution)
+                        || !(claim.get("topologyRevision") instanceof Long topology) || !(annex.get("originalStateEpoch") instanceof Long epoch))throw unreadable();
+                var fence=new WorkloadClaimFence(new WorkloadClaimKey(claim.getString("clusterId"),WorkloadClaimType.PIPELINE_ACTUATION,claim.getString("pipelineId")),
+                        new WorkloadOwner(claim.getString("nodeId"),claim.getString("bootId")),generation,execution,topology);
+                var request=new PipelineRebuildRequest(annex.getString("operationId"),original,fence,epoch,inputs,captured);
+                var retained=retained(request,confirmationHash(request),requireOriginal(session,request));
+                return java.util.Optional.of(retained);
+            }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unreadable();}
+        });
+    }
+
     @Override public void requirePending(PipelineRebuildPreparation original) {
         if (!(original instanceof Pending pending) || pending.owner.client != client
                 || !pending.owner.database.getName().equals(database.getName()) || !pending.owner.clusterId.equals(clusterId)) throw fenced();

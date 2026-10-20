@@ -63,6 +63,21 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(additional, "requireActive");
         return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
     }
+    @Override public List<SrsConsumerMembership> forPipeline(io.tapstate.spi.store.PipelineIntentScope original) {
+        Objects.requireNonNull(original,"original");
+        if(!scope.equals(new CacheBusinessScope(original.clusterId(),original.bindingVersion(),original.cacheIncarnation())))throw MongoCacheBusinessIdentity.businessFenced();
+        return transaction(session -> {
+            var result=new ArrayList<SrsConsumerMembership>();var names=new java.util.TreeSet<String>();
+            for(var row:SystemCollections.SRS_CONSUMERS.on(database).find(session,new Document("pipelineId",original.pipelineId())
+                    .append("_id.cacheIncarnation",scope.cacheIncarnation())))names.add(records.membership(row).context().key().miningChainId());
+            for(String name:names)for(var member:view(session,name).members().values())if(member.context().key().pipelineId().equals(original.pipelineId())) {
+                if(member.context().stateGeneration()>original.stateGeneration())throw MongoCachePipelinePreparations.rebuild(original);
+                if(member.context().stateGeneration()==original.stateGeneration())result.add(member);
+            }
+            return List.copyOf(result);
+        });
+    }
+
     @Override public Optional<SrsConsumerMembership> find(SrsConsumerKey key) {
         Objects.requireNonNull(key, "key");
         return transaction(session -> Optional.ofNullable(view(session, key.miningChainId()).members().get(key.consumerId())));
@@ -311,9 +326,33 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         });
     }
     @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext context, long expectedRevision, WorkloadClaimFence fence) {
-        Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); String chain = context.key().miningChainId();
+        Objects.requireNonNull(context, "context"); requireRevision(expectedRevision);
+        return transaction(session -> { prove(session,context,fence);return detachInTransaction(session,context,expectedRevision,fence); });
+    }
+    @Override public Optional<SrsConsumerMembership> detachForRebuild(io.tapstate.spi.store.PipelineRebuildPreparation original,
+            SrsConsumerMembership membership,WorkloadClaimFence currentNode) {
+        MongoPipelineStateRebuilds.requireOriginalPending(original);Objects.requireNonNull(membership,"membership");Objects.requireNonNull(currentNode,"currentNode");
+        var request=original.request();var physical=request.originalScope();var context=membership.context();
+        if(!scope.equals(new CacheBusinessScope(physical.clusterId(),physical.bindingVersion(),physical.cacheIncarnation()))
+                || !physical.pipelineId().equals(context.key().pipelineId()) || physical.stateGeneration()!=context.stateGeneration())throw fenced();
         return transaction(session -> {
-            prove(session,context,fence); var view = view(session, chain); var held = view.members().get(context.key().consumerId());
+            MongoPipelineStateRebuilds.requireOriginalActive(original);
+            MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
+            var held=view(session,context.key().miningChainId()).members().get(context.key().consumerId());
+            if(replayed(held,context,membership.revision(),true,Set.of(),request.originalClaim()))return Optional.of(held);
+            var access=new MongoCachePipelineAccess(client,database,physical,null,requireActive);access.verifyStateStructure();var state=access.state(session);
+            if(state.getLong("epoch")!=request.originalStateEpoch())throw MongoCachePipelinePreparations.rebuild(physical);
+            var fixed=WorkloadClaimDocuments.live(request.originalClaim());fixed.remove("$expr");
+            fixed.append("pipelineScope",MongoPipelinePreparationFacts.scope(physical)).append("pipelinePreparation.phase","PREPARED");
+            if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,fixed,
+                    new Document("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount()!=1)throw fenced();
+            access.updateState(session,state,new Document(),false);
+            return detachInTransaction(session,context,membership.revision(),request.originalClaim());
+        });
+    }
+    private Optional<SrsConsumerMembership> detachInTransaction(ClientSession session,SrsConsumerContext context,long expectedRevision,WorkloadClaimFence fence) {
+        String chain=context.key().miningChainId();
+        var view = view(session, chain); var held = view.members().get(context.key().consumerId());
             if (replayed(held, context, expectedRevision, true, Set.of(), fence)) return Optional.of(held);
             long revision = held == null ? 0 : held.revision();
             if (revision != expectedRevision) return Optional.empty();
@@ -325,7 +364,6 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     new Document("_id", records.id(context.key())).append("membershipRevision", held.revision())).getDeletedCount() != 1) throw unavailable(chain);
             changeRoot(session, view, held == null || held.detached() ? 0 : -1);
             return Optional.of(next);
-        });
     }
 
     private static boolean replayed(SrsConsumerMembership held, SrsConsumerContext context, long expected, boolean detached,

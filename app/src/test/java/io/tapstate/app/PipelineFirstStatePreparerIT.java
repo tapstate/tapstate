@@ -249,6 +249,62 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void actualStopPortResumesTheSameRebuildAfterTheCacheCommitResponseIsLost() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);var claims=f.cache.workloadClaims(f.business());
+            var original=claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var originalNotes=f.configuration.requiredNotes();
+            var originalNoteOwner=io.tapstate.spi.store.RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","original-source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1);
+            var originalNoteToken=originalNotes.initialize(originalNoteOwner);
+            var originalOrigin=io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture("mongodb","c".repeat(64),Map.of("uri","original-database"));
+            originalNotes.prepareOrigin(originalNoteToken,originalOrigin);originalNotes.compareAndSet(originalNoteToken,"slot",0,new byte[]{1,2},false);
+            var fence=WorkloadClaimFence.from(original);var current=f.configuration.intents().load("flow").orElseThrow();
+            f.configuration.intents().compareAndSet(f.scope,current.intentRevision(),new DesiredState("flow",PipelineState.STOPPED,current.desired().revision(),true));
+            var intent=f.configuration.intents().load("flow").orElseThrow();var pass=new PipelineConvergencePass(intent,fence,f.cache,ACTIVE);
+            var manifest=new io.tapstate.runtime.engine.OperatorRunManifest("flow",new ExecutionFence(f.scope,fence),List.of());
+            var engine=org.mockito.Mockito.mock(io.tapstate.runtime.engine.Engine.class);var run=org.mockito.Mockito.mock(io.tapstate.runtime.engine.Engine.Run.class);
+            var captures=org.mockito.Mockito.mock(PipelineCaptureCoordinator.class);var fixedCapture=org.mockito.Mockito.mock(PipelineCaptureCoordinator.class);
+            var ownership=org.mockito.Mockito.mock(PipelineActuationOwnership.class);
+            var cancelled=new java.util.concurrent.atomic.AtomicBoolean();var captureStopped=new java.util.concurrent.atomic.AtomicBoolean();var hotRetired=new java.util.concurrent.atomic.AtomicBoolean();
+            org.mockito.Mockito.when(engine.captureRun("flow")).thenReturn(Optional.of(run));org.mockito.Mockito.when(run.operatorManifest()).thenReturn(manifest);
+            org.mockito.Mockito.doAnswer(call -> {cancelled.set(true);return null;}).when(run).cancel();
+            org.mockito.Mockito.when(run.awaitTerminal(org.mockito.ArgumentMatchers.any())).thenAnswer(call -> cancelled.get());
+            org.mockito.Mockito.when(captures.forRun(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any())).thenReturn(fixedCapture);
+            org.mockito.Mockito.doAnswer(call -> {captureStopped.set(true);return null;}).when(fixedCapture).stopCapture("flow",false);
+            org.mockito.Mockito.when(ownership.proveClaim(f.scope,fence)).thenReturn(true);
+            PipelineRebuildCoordinator.RetiredExecution retired=(request,held) -> {
+                assertThat(held).contains(manifest);assertThat(cancelled).isTrue();assertThat(captureStopped).isTrue();assertThat(hotRetired).isTrue();
+            };
+            var actual=f.cache.pipelineRebuilds(f.business(),ACTIVE);var lost=new IllegalStateException("simulated lost cache response");
+            var fault=new io.tapstate.spi.store.PipelineCacheRebuilds() {
+                public io.tapstate.spi.store.PipelineRebuildReceipt prepare(io.tapstate.spi.store.PipelineRebuildPreparation prepared,WorkloadClaimFence node,Duration ttl,Instant time) {
+                    actual.prepare(prepared,node,ttl,time);throw lost;
+                }
+            };
+            var noteRetirement=new PipelinePrivateNoteRetirement(f.configuration.requiredNotes(),f.configuration.rebuilds(),
+                    (notes,config,purpose,cluster,guard) -> {throw new AssertionError("no connector was opened");});
+            var consumerStore=f.cache.srs(f.business(),ACTIVE).consumers();
+            var faulty=new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(f.configuration.artifacts(),f.cache.schemas(f.business(),ACTIVE),f.cache,consumerStore,f.configuration.rebuilds(),fault),
+                    noteRetirement,() -> f.node,ACTIVE,retired,TTL,CLOCK);
+            var ports=new ScopedEngineLifecycleActuator.Ports((m,c,n,g) -> {},m -> {assertThat(m).isEqualTo(manifest);hotRetired.set(true);},faulty::rebuild,(r,c) -> ExecutionPlanRecorder.NONE);
+            var actor=new ScopedEngineLifecycleActuator(pass,engine,org.mockito.Mockito.mock(DagSource.class),captures,ownership,f.cacheDatabase.getName(),ConnectorReadiness.NONE,CLOCK,ports,new ScopedEngineLifecycleActuator.Submissions());
+            assertThatThrownBy(() -> actor.stop("flow",true)).isSameAs(lost);
+            var pending=f.configuration.pipelineStates().read("flow").orElseThrow();assertThat(pending.phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.REBUILDING);assertThat(pending.stateGeneration()).isOne();
+            var committed=f.cacheDatabase.getCollection("workload_claims").find(new Document("_id.resourceId","flow")).first();
+            var resumed=new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(f.configuration.artifacts(),f.cache.schemas(f.business(),ACTIVE),f.cache,consumerStore,f.configuration.rebuilds(),actual),
+                    noteRetirement,() -> f.node,ACTIVE,retired,TTL,CLOCK);
+            var result=resumed.resume(f.scope,Optional.of(manifest)).orElseThrow();assertThat(result.stateGeneration()).isEqualTo(2);
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().operationId()).isEqualTo(pending.operationId());
+            var after=f.cacheDatabase.getCollection("workload_claims").find(new Document("_id.resourceId","flow")).first();
+            for(String field:List.of("claimGeneration","executionGeneration","topologyRevision","pipelinePreparation"))assertThat(after.get(field)).isEqualTo(committed.get(field));
+            var nextNoteOwner=io.tapstate.spi.store.RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","original-source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,2);
+            var nextToken=originalNotes.open(nextNoteOwner);assertThat(nextToken.generation()).isEqualTo(originalNoteToken.generation());
+            assertThat(originalNotes.origin(nextToken)).isEqualTo(originalOrigin);assertThat(originalNotes.read(nextToken,"slot").bytes()).containsExactly(1,2);
+            assertThat(resumed.resume(f.scope,Optional.of(manifest))).isEmpty();
+            assertThatThrownBy(() -> actor.stop("flow",true)).isInstanceOf(TapstateException.class);
+        });
+    }
+
     @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
     void theActualGraphFindsColdHandoffsWithoutAnyNewSourceRows(boolean killedWorkerJvm) {
         withFixture(f -> {

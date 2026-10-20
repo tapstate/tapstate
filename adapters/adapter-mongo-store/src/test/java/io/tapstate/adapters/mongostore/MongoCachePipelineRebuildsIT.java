@@ -52,9 +52,11 @@ class MongoCachePipelineRebuildsIT {
             notes.compareAndSet(a,"slot",0,new byte[]{1},false);notes.compareAndSet(b,"slot",0,new byte[]{2},false);
             assertCode(() -> notes.retirements(f.scope,"operation"),IoError.NOTE_SCOPE_UNAVAILABLE);
             var pending=f.pending(0);var operation=pending.request().operationId();
+            assertThat(notes.privateContexts(f.scope,operation)).hasSize(2).allSatisfy(context -> {assertThat(context.origin()).contains(origin);assertThat(context.completed()).isFalse();});
             var tokens=notes.retirements(f.scope,operation);assertThat(tokens).hasSize(2).allSatisfy(token -> assertThat(token.completed()).isFalse());
             var selected=tokens.stream().filter(token -> token.scope().equals(a)).findFirst().orElseThrow();selected.completeAfterVerifiedRelease();
             try(var reopened=MongoConfigurationDomain.open(new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()),null,Duration.ofSeconds(5)),"cluster-a")) {
+                assertThat(reopened.requiredNotes().privateContexts(f.scope,operation).stream().filter(RequiredNoteContext::completed)).hasSize(1);
                 var retry=reopened.requiredNotes().retirements(f.scope,operation);assertThat(retry).hasSize(2);
                 assertThat(retry.stream().filter(RequiredNoteRetirement::completed)).singleElement().satisfies(token -> assertThat(token.scope()).isEqualTo(a));
                 var owed=retry.stream().filter(token -> !token.completed()).findFirst().orElseThrow();
@@ -73,6 +75,48 @@ class MongoCachePipelineRebuildsIT {
                     .append("originGeneration",0L).append("outgoingCarries",0L).append("incomingCarries",0L));
             long before=table.countDocuments();assertCode(() -> f.configuration.requiredNotes().retirements(f.scope,pending.request().operationId()),IoError.NOTE_SCOPE_UNAVAILABLE);
             assertThat(table.countDocuments()).isEqualTo(before);
+        });
+    }
+    @Test void anOriginalPendingRebuildDetachesOnlyItsConsumerAfterItsBusinessLeaseExpires() {
+        withFixture(f -> {
+            var original=f.advance("flow");f.initial("independent");var other=f.advance("independent");
+            var raw=new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache));
+            var capture=WorkloadClaimFence.from(raw.acquire(new WorkloadClaimKey("cluster-a",WorkloadClaimType.CAPTURE,"shared"),OWNER,1,TTL).claim());
+            CaptureHistoryFixture.shared(f.cache,f.business,capture,"shared-chain",null);var stores=f.domain.srs(f.business,ACTIVE);stores.chains().prepare("shared-chain",null,capture);
+            var a=stores.consumers().attach(new SrsConsumerContext(new SrsConsumerKey("shared-chain","flow","source"),1),0,java.util.Set.of("orders"),original).orElseThrow();
+            var b=stores.consumers().attach(new SrsConsumerContext(new SrsConsumerKey("shared-chain","independent","source"),1),0,java.util.Set.of("orders"),other).orElseThrow();
+            var progress=stores.consumers().progress(b.context()).orElseThrow();var pending=f.pending(0);
+            f.claims().updateOne(new Document("_id.resourceId","flow"),new Document("$set",new Document("leaseUntil",new java.util.Date(0))));
+            assertThat(stores.consumers().detachForRebuild(pending,a,f.node)).hasValueSatisfying(value -> assertThat(value.detached()).isTrue());
+            assertThat(stores.consumers().progress(b.context())).contains(progress);assertThat(stores.consumers().attached("shared-chain").consumers()).containsExactly(b);
+            f.configuration.rebuilds().complete(f.rebuilds().prepare(pending,f.node,TTL,AT));
+        });
+    }
+    @Test void aReopenedControllerLoadsOnlyTheOriginalPendingOperationAndCleansWithItsOwnNode() {
+        withFixture(f -> {
+            var pending=f.pending(0);var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);
+            f.claims().updateMany(new Document(),new Document("$set",new Document("leaseUntil",new java.util.Date(0))));
+            var replacement=new WorkloadOwner("replacement","replacement-boot");
+            var current=WorkloadClaimFence.from(f.domain.workloadClaims(f.business).acquire(new WorkloadClaimKey("cluster-a",WorkloadClaimType.NODE_SESSION,replacement.nodeId()),replacement,0,TTL).claim());
+            try(var reopened=MongoConfigurationDomain.open(new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()),null,Duration.ofSeconds(5)),"cluster-a")) {
+                var retained=reopened.rebuilds().pending("flow",pending.request().inputs(),Map.of()).orElseThrow();
+                assertThat(retained.request()).isEqualTo(pending.request());assertThat(retained.preparationId()).isEqualTo(pending.preparationId());
+                var resumed=f.rebuilds().prepare(retained,current,TTL,AT);assertThat(resumed.claim()).isEqualTo(receipt.claim());
+                while(f.rebuilds().reclaim(resumed,current)>0){}
+                assertThat(reopened.rebuilds().complete(resumed).scope()).isEqualTo(pending.request().targetScope());
+                assertThat(reopened.rebuilds().pending("flow",pending.request().inputs(),Map.of())).isEmpty();
+            }
+        });
+    }
+    @Test void retiredPayloadCleanupDoesNotRequireAStillRunningSuccessorBusinessLease() {
+        withFixture(f -> {
+            var fence=f.advance("flow");var location=new OperatorPlacement(f.scope,f.cache.getName(),OperatorPlacement.Resource.JOIN_FACTS,"join","fact","facts");
+            f.domain.operatorState(location,fence,ACTIVE).save(location.mapName(),"old",new byte[]{1});
+            var pending=f.pending(0);var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);
+            f.claims().updateOne(new Document("_id.resourceId","flow"),new Document("$set",new Document("leaseUntil",new java.util.Date(0))));
+            assertThat(f.rebuilds().reclaim(receipt)).isGreaterThan(0);
+            assertThat(SystemCollections.CACHE_JOIN_FACTS.on(f.cache).countDocuments()).isZero();
+            assertThat(f.configuration.rebuilds().complete(receipt).scope()).isEqualTo(pending.request().targetScope());
         });
     }
     @Test void retiredPayloadReclamationIsBoundedAndKeepsOtherScopesAndBirthHistory() {

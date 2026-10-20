@@ -10,6 +10,11 @@ public interface PipelineCacheRebuilds {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, java.util.Map.of(), null);
     }
 
+    /** A replacement controller proves its own existing node session, without reviving successor business authority. */
+    default long reclaim(PipelineRebuildReceipt original, WorkloadClaimFence currentNode) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, java.util.Map.of(), null);
+    }
+
     /** The original external writers and hot state are already retired; shared consumers detached first. */
     PipelineRebuildReceipt prepare(PipelineRebuildPreparation original, WorkloadClaimFence currentNode, Duration ttl, Instant touchTime);
 }

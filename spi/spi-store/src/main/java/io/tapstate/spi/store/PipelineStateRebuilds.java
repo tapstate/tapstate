@@ -10,6 +10,12 @@ public interface PipelineStateRebuilds {
      */
     PipelineRebuildPreparation begin(PipelineRebuildRequest original);
 
+    /** Reconstructs only an existing pending operation against the same still-locked authoring closure. */
+    default java.util.Optional<PipelineRebuildPreparation> pending(String pipelineId,PipelinePreparationInputs inputs,
+            java.util.Map<String,String> dependencyHashes) {
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /** Publish the prepared successor and consume this operation's one-shot intent flags atomically. */
     PipelinePreparation complete(PipelineRebuildReceipt original);
 

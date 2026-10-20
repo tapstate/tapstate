@@ -8,6 +8,11 @@ import java.util.Set;
 /** Logged-capture membership is independent from each consumer's cursor and the source checkpoint. */
 public interface SrsConsumerStore {
     SrsConsumerStore guardedBy(Runnable requireActive);
+    /** Loads coherent original-generation relations, including detach markers, for lifecycle retirement only. */
+    default List<SrsConsumerMembership> forPipeline(PipelineIntentScope original) {
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+    }
+
     Optional<SrsConsumerMembership> find(SrsConsumerKey key);
     SrsConsumerTopology attached(String miningChainId);
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
@@ -44,6 +49,12 @@ public interface SrsConsumerStore {
     /** Uses the original expected relation revision and Pipeline claim; existing progress is preserved. */
     Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables,
                                           WorkloadClaimFence originalPipelineFence);
+
+    /** A confirmed original rebuild may detach its retired consumer under the current node session. */
+    default Optional<SrsConsumerMembership> detachForRebuild(PipelineRebuildPreparation original,SrsConsumerMembership membership,
+            WorkloadClaimFence currentNode) {
+        return detach(membership.context(),membership.revision(),original.request().originalClaim());
+    }
 
     /** Removes only this cursor and leaves a revision marker so a late original attach cannot revive it. */
     Optional<SrsConsumerMembership> detach(SrsConsumerContext context, long expectedRevision,

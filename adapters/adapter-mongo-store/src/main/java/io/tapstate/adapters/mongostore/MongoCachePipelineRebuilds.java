@@ -43,7 +43,10 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
     }
 
     @Override public long reclaim(PipelineRebuildReceipt candidate) {
-        requireVerifiedReceipt(candidate); var receipt=(Receipt)candidate;
+        requireVerifiedReceipt(candidate);return reclaim(candidate,candidate.issuerNode());
+    }
+    @Override public long reclaim(PipelineRebuildReceipt candidate,WorkloadClaimFence currentNode) {
+        requireVerifiedReceipt(candidate);Objects.requireNonNull(currentNode,"currentNode"); var receipt=(Receipt)candidate;
         if (receipt.owner.client!=client || !receipt.owner.database.getName().equals(database.getName())
                 || !receipt.owner.business.equals(business)) throw fenced();
         requireCurrentReceipt(receipt);
@@ -59,8 +62,12 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                     if(row==null)throw rebuild(old);
                     var current=new MongoWorkloadClaimStore(claims).inStrictSession(session).decodeStored(row);
                     if(!marker(receipt).equals(marker(retained(session,original,row,current))))throw fenced();
-                    new MongoCachePipelineAccess(client,database,original.request().targetScope(),receipt.claim(),
-                            () -> active(original),retention).proveClaim(session);
+                    MongoCachePipelinePreparations.proveNode(session,database,business,currentNode);
+                    // Only frozen retired payloads use this exact, possibly expired receipt. No business write is admitted.
+                    var sameReceipt=WorkloadClaimDocuments.live(receipt.claim());sameReceipt.remove("$expr");
+                    sameReceipt.append("pipelineScope",MongoPipelinePreparationFacts.scope(original.request().targetScope()))
+                            .append("pipelinePreparation.phase","PREPARED");
+                    if(claims.updateOne(session,sameReceipt,new Document("$inc",new Document("fencedPipelineWrites",1L))).getMatchedCount()!=1)throw fenced();
                     var inventory=MongoOperatorInventory.requireRetired(session,database,original);long deleted=0;
                     // A shared extra database keeps its identity and every other Pipeline's rows.
                     for(var location:inventory.getList("placements",Document.class)) {

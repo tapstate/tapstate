@@ -442,7 +442,27 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     public List<RequiredNoteRetirement> retirements(io.tapstate.spi.store.PipelineIntentScope original, String operationId) {
         requireOrdinary(); Objects.requireNonNull(original, "original");
         if (operationId == null || operationId.isBlank()) throw unavailable();
-        var tokens = withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
+        return privateTokens(original,operationId).stream().map(token -> retirement(token, operationId)).toList();
+    }
+    @Override public List<io.tapstate.spi.store.RequiredNoteContext> privateContexts(io.tapstate.spi.store.PipelineIntentScope original,String operationId) {
+        var tokens=privateTokens(original,operationId);
+        return withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
+            var result=new ArrayList<io.tapstate.spi.store.RequiredNoteContext>();
+            for(var token:tokens) {
+                var fixed=new Retirement(token,operationId);checkRetiringOwner(session,fixed,false);
+                var metadata=scopes.find(session,byScope(token.owner())).first();
+                if(retiredResult(fixed,metadata)!=null){result.add(new io.tapstate.spi.store.RequiredNoteContext(token,java.util.Optional.empty(),true));continue;}
+                metadata=verifyPhysicalScope(session,token,false);var origin=retainedOrigin(session,token,metadata);
+                if(origin==null && notes.find(session,new Document("_id.bindingVersion",token.owner().bindingVersion())
+                        .append("_id.namespace",token.owner().namespace())).first()!=null)throw unavailable();
+                result.add(new io.tapstate.spi.store.RequiredNoteContext(token,java.util.Optional.ofNullable(origin),false));
+            }
+            return List.copyOf(result);
+        })));
+    }
+    private List<RequiredNoteScope> privateTokens(io.tapstate.spi.store.PipelineIntentScope original,String operationId) {
+        requireOrdinary();Objects.requireNonNull(original,"original");if(operationId==null || operationId.isBlank())throw unavailable();
+        return withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
             var row = operators.find(session, new Document("_id", original.pipelineId())).first();
             var mapping = MongoPipelineStateMappings.decode(original.pipelineId(), row);
             if (mapping.stateGeneration() != original.stateGeneration() || !operationId.equals(mapping.operationId())
@@ -468,7 +488,6 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             }
             return List.copyOf(result);
         })));
-        return tokens.stream().map(token -> retirement(token, operationId)).toList();
     }
 
     @Override
