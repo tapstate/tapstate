@@ -253,6 +253,45 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
     result = compare_current()
     check(result['declared_input_hashes_equal'] and not result['whole_build_provenance_complete']
           and not result['ability_proven'] and not result['raw_bytes_uploaded'], 'current declared hashes agree without inventing complete provenance')
+    # Hosted Linux kernels may differ while compiler and dependency identities agree.
+    def linux_toolchain(release):
+        return dict(java='openjdk version "21.0.12.1"\nOpenJDK Runtime Environment Temurin-21.0.12.1+1\n',
+                    maven=('Apache Maven 3.10.0 (c43a36b8d67be7e0805a411bc0898af1a51f5472)\n'
+                           'Maven home: /usr/share/apache-maven-3.10.0\n'
+                           'Java version: 21.0.12.1, vendor: Eclipse Adoptium, runtime: /usr/lib/jvm/temurin-21-jdk-amd64\n'
+                           'Default locale: en, platform encoding: UTF-8, time zone: Etc/UTC\n'
+                           'OS name: "linux", version: "'+release+'", arch: "amd64", family: "unix"\n'),
+                    os='Linux-'+release+'-x86_64-with-glibc2.39', architecture='x86_64', cpu_count=4)
+    linux_prepared=copy.deepcopy(prepared)
+    linux_prepared['toolchain']=linux_toolchain('6.17.0-1022-azure')
+    linux_workers={shard['id']:copy.deepcopy(linux_prepared) for shard in input_plan['shards']}
+    for peer in linux_workers.values():peer['toolchain']=linux_toolchain('7.0.0-1017-azure')
+    saved_linux=(copy.deepcopy(linux_prepared),copy.deepcopy(linux_workers))
+    def compare_linux():return m.compare_input_snapshots(input_plan,linux_prepared,linux_workers)
+    check(compare_linux()['declared_input_hashes_equal'], 'same JDK and Maven on different hosted Linux kernels must compare')
+    check((linux_prepared,linux_workers)==saved_linux,'toolchain comparison must retain raw observations unchanged')
+    for key,value in [
+            ('java',linux_toolchain('7.0.0-1017-azure')['java'].replace('21.0.12.1','21.0.13')),
+            ('java',linux_toolchain('7.0.0-1017-azure')['java'].replace('Temurin','OtherVM')),
+            ('maven',linux_toolchain('7.0.0-1017-azure')['maven'].replace('Apache Maven 3.10.0','Apache Maven 3.10.1')),
+            ('maven',linux_toolchain('7.0.0-1017-azure')['maven'].replace('c43a36b8','d43a36b8')),
+            ('maven',linux_toolchain('7.0.0-1017-azure')['maven'].replace('/usr/share/apache-maven','/other/apache-maven')),
+            ('maven',linux_toolchain('7.0.0-1017-azure')['maven'].replace('version: "7.0.0-1017-azure"','version: "8.0.0-1017-azure"')),
+            ('maven',linux_toolchain('7.0.0-1017-azure')['maven'].replace('Eclipse Adoptium','Other Vendor')),
+            ('maven',linux_toolchain('7.0.0-1017-azure')['maven'].replace('OS name:','Host name:')),
+            ('maven',linux_toolchain('7.0.0-1017-azure')['maven']+'OS name: "linux", version: "7.0.0-1017-azure", arch: "amd64", family: "unix"\n'),
+            ('os','Linux-unknown-x86_64-with-glibc2.39'),
+            ('os','Linux-7.0.0-1017-azure-x86_64-with-glibc2.40'),
+            ('os','FreeBSD-7.0.0-x86_64-with-glibc2.39'),
+            ('architecture','aarch64'),('cpu_count',2)]:
+        linux_workers['engine']['toolchain'][key]=value
+        rejected(compare_linux,'material toolchain differences still reject: '+key)
+        linux_workers=copy.deepcopy(saved_linux[1])
+    extra_os='OS name: "linux", version: "5.15.0", arch: "amd64", family: "unix"\n'
+    linux_prepared['toolchain']['maven']+=extra_os
+    for peer in linux_workers.values():peer['toolchain']['maven']+=extra_os
+    rejected(compare_linux,'conflicting Maven OS declarations must retain exact comparison')
+    linux_prepared,linux_workers=copy.deepcopy(saved_linux)
     for field in m.BUILD_INPUT_FIELDS:
         worker_inputs['engine'][field] = {} if isinstance(prepared[field], dict) else 'wrong'
         rejected(compare_current, 'missing or different projection rejects: ' + field)

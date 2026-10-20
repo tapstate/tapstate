@@ -18,6 +18,15 @@ and performance acceptance flags remain false.
 replays source case subsets against original worker members. Its computed provider
 and remaining whole-input gaps stay explicit; see `ci-archive-cases.md`.
 
+Independent build comparison retains each raw toolchain observation. Hosted
+Linux kernel releases are compared as environment observations: only when the
+Python platform and a unique Maven OS line identify the same release is that release
+excluded from tool identity equality. Java and Maven versions/builds/vendors,
+Maven runtime metadata, OS family, libc, architecture, CPU count and every
+captured byte hash remain compared. Unknown or inconsistent formats keep their
+original exact comparison. This does not waive toolchain changes during verify
+or certify compiler consumption.
+
 ## Request and command
 
 The request has exactly `schema: 1`, `type: archive-inputs-request` and `source`,

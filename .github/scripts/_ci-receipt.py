@@ -693,6 +693,30 @@ def test_resource_snapshot(value):
     return files
 
 
+def build_toolchain_identity(value):
+    # Hosted Linux workers can use different kernels with identical build tools.
+    # Keep raw observations untouched and preserve all other tool and ABI fields.
+    if not isinstance(value, dict):
+        return value
+    architecture, system, maven = (value.get(key) for key in ('architecture', 'os', 'maven'))
+    if not all(isinstance(field, str) and field for field in (architecture, system, maven)):
+        return value
+    linux = re.fullmatch(r'Linux-([0-9][A-Za-z0-9._+-]*)-' + re.escape(architecture)
+                        + r'(-with-.+)?', system)
+    if linux is None or maven.count('OS name:') != 1:
+        return value
+    # Both independent observations must identify the same unique kernel declaration.
+    pattern = (r'^(OS name: "linux", version: ")' + re.escape(linux[1])
+               + r'(", arch: "[^"\n]+", family: "[^"\n]+")$')
+    normalized, count = re.subn(pattern, r'\1<host-kernel-release>\2', maven, flags=re.M)
+    if count != 1:
+        return value
+    identity = dict(value)
+    identity['os'] = 'Linux-' + architecture + (linux[2] or '')
+    identity['maven'] = normalized
+    return identity
+
+
 def compare_input_snapshots(plan, aggregate, workers):
     require(isinstance(plan, dict) and isinstance(aggregate, dict) and isinstance(workers, dict),
             'invalid independent input snapshot objects')
@@ -715,7 +739,10 @@ def compare_input_snapshots(plan, aggregate, workers):
         require(value.get('source_sha') == source and value.get('run_id') == run
                 and str(value.get('run_attempt')) == attempt, 'input source/run/attempt differs: ' + name)
         for field in BUILD_INPUT_FIELDS:
-            require(value.get(field) == aggregate[field], 'independent build input differs: ' + name + '/' + field)
+            observed, expected = value.get(field), aggregate[field]
+            if field == 'toolchain':
+                observed, expected = build_toolchain_identity(observed), build_toolchain_identity(expected)
+            require(observed == expected, 'independent build input differs: ' + name + '/' + field)
         available = value.get('dependency_repository_files')
         require(isinstance(available, dict), 'dependency hash map missing: ' + name)
         # Incoming caches may contain unused extras. Their shared bytes may not change;
