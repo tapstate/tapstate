@@ -384,7 +384,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private synchronized void maintain() {
         if(closed.get())return;
         for(var owner:List.copyOf(owners.values()))if(owner.prepared.mode()==CapturePreparation.Mode.SHARED_SRS && !owner.ended.get()) {
-            try {owner.require();if(owner.physical!=null)owner.physical.tail.health().failure().ifPresent(failure -> {throwFailure(failure);});ensureTail(owner);}
+            try {owner.require();if(owner.physical!=null)owner.physical.tail.health().failure().ifPresent(failure -> {throwFailure(failure);});ensureTail(owner);runtime.retain(stores.scope(),owner.prepared.chainId(),owner.fence,owner::require);}
             catch(RuntimeException|Error failure) {
                 for(var session:sessions.values())if(session.sources.values().stream().anyMatch(source -> source.owner==owner))session.failure.compareAndSet(null,failure);
                 owner.ended.set(true);owners.remove(owner.prepared.captureId(),owner);cleanup(failure,owner::release);

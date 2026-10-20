@@ -249,7 +249,8 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
-    @Test void theActualGraphFindsColdHandoffsWithoutAnyNewSourceRows() {
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void theActualGraphFindsColdHandoffsWithoutAnyNewSourceRows(boolean killedWorkerJvm) {
         withFixture(f -> {
             f.preparer(f.configuration, f.cache).prepare(f.scope);
             var claims = f.cache.workloadClaims(f.business());
@@ -282,6 +283,42 @@ class PipelineFirstStatePreparerIT {
                 var resolverName = names.nest(List.of("$root"),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName();
                 var roots = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName);
                 var states = member.<Object,io.tapstate.runtime.engine.nest.ResolverState>getMap(resolverName);
+                if(killedWorkerJvm) seedInKilledWorker(f,manifest);
+                else seedHandoffs(member,manifest);
+                assertThat(f.cacheDatabase.getCollection("nest_state").countDocuments(new Document("pendingRelease",true))).isEqualTo(2);
+                roots.destroy(); states.destroy();
+                var stores = io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).forStep("flow","step");
+                var binding = new io.tapstate.runtime.engine.nest.NestBinding(alias -> null,stores,(from,child) -> {},
+                        ignored -> chain -> Optional.of(new io.tapstate.core.event.SourceOrder(1,50)));
+                var dag = new com.hazelcast.jet.core.DAG();
+                var inputs = new java.util.HashMap<String,com.hazelcast.jet.core.Vertex>();
+                for (String alias : List.of("customer","policy","claim")) inputs.put(alias,dag.newVertex(alias+"-empty",
+                        com.hazelcast.jet.core.ProcessorMetaSupplier.of(com.hazelcast.jet.core.ProcessorSupplier.of(EmptyNestInput::new))).localParallelism(1));
+                var ordinal = new java.util.HashMap<com.hazelcast.jet.core.Vertex,Integer>();
+                var assembled = io.tapstate.runtime.engine.nest.NestDag.attach(dag,topology,"step","customer","out",
+                        alias -> List.of(inputs.get(alias)),binding,vertex -> ordinal.merge(vertex,1,Integer::sum)-1,null,
+                        new io.tapstate.runtime.engine.NodeWidth("step",2,1,null));
+                var sink = dag.newVertex("collected",com.hazelcast.jet.core.processor.SinkProcessors.writeListP("recovered-documents"));
+                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink));
+                member.getJet().newJob(dag).getFuture().toCompletableFuture().get(20,java.util.concurrent.TimeUnit.SECONDS);
+                for (int key = 1; key <= 2; key++) {
+                    var restored = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName).get(List.of("C"+key));
+                    var document = restored.render(topology.slots()).orElseThrow();
+                    var parents = (List<?>) document.get("$root");
+                    assertThat(parents).hasSize(1);
+                    var children = (List<?>) ((Map<?,?>)parents.getFirst()).get("child");
+                    assertThat(children).hasSize(1);
+                    assertThat(((Map<?,?>)children.getFirst()).get("value")).isEqualTo(1);
+                }
+                assertThat(member.getList("recovered-documents")).hasSize(2);
+            } finally { member.shutdown(); }
+        });
+    }
+
+    private static void seedHandoffs(com.hazelcast.core.HazelcastInstance member,io.tapstate.runtime.engine.OperatorRunManifest manifest) throws Exception {
+        var topology=literalRootTopology();var names=manifest.forStep("flow","step");
+        var roots=member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(names.nest(List.of(),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName());
+        var states=member.<Object,io.tapstate.runtime.engine.nest.ResolverState>getMap(names.nest(List.of("$root"),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName());
                 var spec = topology.vertexAt(List.of("$root"));
                 var axes = io.tapstate.runtime.engine.ChainAxes.assign(List.of("policy","claim"));
                 for (int key = 1; key <= 2; key++) {
@@ -319,34 +356,51 @@ class PipelineFirstStatePreparerIT {
                     feedNest(receiver,0,io.tapstate.core.event.Envelope.insert(2,"policy",parent,null).withOrder(new io.tapstate.core.event.SourceOrder(1,2)));
                     assertThat(states.get(List.of(parentId)).pending()).isEqualTo(1);
                 }
-                assertThat(f.cacheDatabase.getCollection("nest_state").countDocuments(new Document("pendingRelease",true))).isEqualTo(2);
-                roots.destroy(); states.destroy();
-                var stores = io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).forStep("flow","step");
-                var binding = new io.tapstate.runtime.engine.nest.NestBinding(alias -> null,stores,(from,child) -> {},
-                        ignored -> chain -> Optional.of(new io.tapstate.core.event.SourceOrder(1,50)));
-                var dag = new com.hazelcast.jet.core.DAG();
-                var inputs = new java.util.HashMap<String,com.hazelcast.jet.core.Vertex>();
-                for (String alias : List.of("customer","policy","claim")) inputs.put(alias,dag.newVertex(alias+"-empty",
-                        com.hazelcast.jet.core.ProcessorMetaSupplier.of(com.hazelcast.jet.core.ProcessorSupplier.of(EmptyNestInput::new))).localParallelism(1));
-                var ordinal = new java.util.HashMap<com.hazelcast.jet.core.Vertex,Integer>();
-                var assembled = io.tapstate.runtime.engine.nest.NestDag.attach(dag,topology,"step","customer","out",
-                        alias -> List.of(inputs.get(alias)),binding,vertex -> ordinal.merge(vertex,1,Integer::sum)-1,null,
-                        new io.tapstate.runtime.engine.NodeWidth("step",2,1,null));
-                var sink = dag.newVertex("collected",com.hazelcast.jet.core.processor.SinkProcessors.writeListP("recovered-documents"));
-                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink));
-                member.getJet().newJob(dag).getFuture().toCompletableFuture().get(20,java.util.concurrent.TimeUnit.SECONDS);
-                for (int key = 1; key <= 2; key++) {
-                    var restored = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName).get(List.of("C"+key));
-                    var document = restored.render(topology.slots()).orElseThrow();
-                    var parents = (List<?>) document.get("$root");
-                    assertThat(parents).hasSize(1);
-                    var children = (List<?>) ((Map<?,?>)parents.getFirst()).get("child");
-                    assertThat(children).hasSize(1);
-                    assertThat(((Map<?,?>)children.getFirst()).get("value")).isEqualTo(1);
+    }
+    /** Only the owned worker JVM is killed; the original controller claim and CACHE remain intact. */
+    private static void seedInKilledWorker(Fixture f,io.tapstate.runtime.engine.OperatorRunManifest manifest) throws Exception {
+        var directory=java.nio.file.Files.createTempDirectory("tapstate-held-worker-");
+        var descriptor=directory.resolve("manifest.bin");var ready=directory.resolve("ready");var log=directory.resolve("worker.log");
+        try(var out=new java.io.ObjectOutputStream(java.nio.file.Files.newOutputStream(descriptor))){out.writeObject(manifest);}
+        Process child=null;
+        try {
+            String classpath=System.getProperty("surefire.test.class.path",System.getProperty("java.class.path"));
+            child=new ProcessBuilder(System.getProperty("java.home")+"/bin/java","-Xmx384m","-cp",classpath,HeldWorker.class.getName(),
+                    f.cacheConnection.uri(),f.cacheDatabase.getName(),descriptor.toString(),ready.toString()).redirectErrorStream(true).redirectOutput(log.toFile()).start();
+            long deadline=System.nanoTime()+Duration.ofSeconds(30).toNanos();
+            while(!java.nio.file.Files.exists(ready) && child.isAlive() && System.nanoTime()<deadline)Thread.sleep(20);
+            assertThat(java.nio.file.Files.exists(ready)).withFailMessage("worker did not durably hold its output: %s",java.nio.file.Files.readString(log)).isTrue();
+            assertThat(child.isAlive()).isTrue();child.destroyForcibly();assertThat(child.waitFor(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(child.exitValue()).isNotZero();
+        } finally {
+            if(child!=null && child.isAlive()){child.destroyForcibly();child.waitFor(10,java.util.concurrent.TimeUnit.SECONDS);}
+            java.nio.file.Files.deleteIfExists(ready);java.nio.file.Files.deleteIfExists(descriptor);java.nio.file.Files.deleteIfExists(log);java.nio.file.Files.deleteIfExists(directory);
+        }
+    }
+    public static final class HeldWorker {
+        public static void main(String[] arguments) throws Exception {
+            io.tapstate.runtime.engine.OperatorRunManifest manifest;
+            try(var input=new java.io.ObjectInputStream(java.nio.file.Files.newInputStream(java.nio.file.Path.of(arguments[2])))){
+                manifest=(io.tapstate.runtime.engine.OperatorRunManifest)input.readObject();
+            }
+            var original=(ExecutionFence)manifest.executionIdentity();var scope=original.scope();
+            var business=new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation());
+            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,arguments[0],arguments[1],null);
+            try(var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"held-worker")) {
+                var claims=cache.workloadClaims(business);var config=isolatedNestMember();
+                for(var binding:manifest.bindings()){
+                    var map=io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(binding.mapName());
+                    map.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY,"true");config.addMapConfig(map);
                 }
-                assertThat(member.getList("recovered-documents")).hasSize(2);
-            } finally { member.shutdown(); }
-        });
+                var member=com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+                try(var authorization=ExecutionAuthorization.scoped(business,claims,Duration.ofSeconds(10),System::nanoTime,() -> true);
+                    var registry=io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,new ScopedOperatorStateProvider(cache,authorization))) {
+                    registry.install(manifest.bindings());seedHandoffs(member,manifest);
+                    java.nio.file.Files.writeString(java.nio.file.Path.of(arguments[3]),"durable-held");
+                    new java.util.concurrent.CountDownLatch(1).await();
+                } finally {member.shutdown();}
+            }
+        }
     }
 
     private static com.hazelcast.config.Config isolatedNestMember() {

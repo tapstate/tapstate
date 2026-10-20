@@ -1109,6 +1109,9 @@ io.srs-checkpoint-unproven:
 io.srs-model-unavailable:
   message: "Actual model {version} for table {table} on chain {chain} is unavailable in its captured context."
   solution: "Stop continuation and restore the exact retained model or complete the authorized full rebuild. Do not use the latest discovery model as a substitute."
+io.srs-model-capacity:
+  message: "Required retained models for chain {chain} exceed the {bytes}-byte history budget."
+  solution: "Keep required history intact. Allow confirmed consumers to advance or complete an authorized rebuild before retrying; do not delete referenced models."
 io.srs-model-conflict:
   message: "Model {version} for table {table} on chain {chain} already names different content."
   solution: "Keep the original version unchanged and verify the capture context before publishing a new model version."

@@ -51,6 +51,21 @@ class MongoSrsConsumerStoreIT {
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
 
+    @Test void anAttachedSnapshotKeepsItsClosedModelContextUntilItsOwnDetach() {
+        withBusiness(f -> {
+            var refs=publishSnapshotModels(f,Set.of("orders"));var first=refs.get("orders");
+            var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().pinSnapshot(A,member.revision(),0,new SrsSnapshotPin(1,"seam",refs),f.fenceA());
+            f.chains().openEpoch(CHAIN,1,f.captureFence()).orElseThrow();
+            var next=new SrsModelKey(CHAIN,"orders",SCOPE.cacheIncarnation(),2,0);
+            models(f).publishInitial(next,ring("orders"),new SourceTable("orders",List.of(new SourceField("id","int")),List.of(),List.of()),f.captureFence());
+            assertThat(models(f).reclaim(CHAIN,f.captureFence())).isZero();assertThat(models(f).require(first).key()).isEqualTo(first);
+            f.consumers().detach(A,member.revision(),f.fenceA()).orElseThrow();
+            assertThat(models(f).reclaim(CHAIN,f.captureFence())).isOne();assertThat(models(f).require(next).key()).isEqualTo(next);
+            assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isEqualTo(2);
+        });
+    }
+
     @Test
     void independentConsumersKeepSeparateRelationsAndCursorsAcrossReopenAndDetach() {
         withBusiness(f -> {

@@ -54,6 +54,55 @@ public final class MongoSrsModelStore implements SrsModelStore {
         Objects.requireNonNull(additional, "requireActive");
         return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
     }
+    @Override public long reclaim(String chainId,WorkloadClaimFence fence) {
+        if(chainId==null || chainId.isBlank())throw new IllegalArgumentException("blank mining chain");
+        Objects.requireNonNull(fence,"originalCapture");
+        if(fence.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId()))throw claimFenced();
+        return transaction(session -> {
+            requireBusiness(session);
+            var consumers=new MongoSrsConsumerStore(client,database,scope,requireActive,requireStructure);
+            var pinned=consumers.retainedModels(session,chainId);
+            var chain=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chainId)).first();
+            if(chain==null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation")) || !fence.key().resourceId().equals(chain.get("captureId")))throw claimFenced();
+            var checkpoint=MongoSrsChainStore.decode(chain,scope,contexts).checkpoint();
+            if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
+            var protectedKeys=new java.util.HashSet<>(pinned);
+            if(checkpoint!=null)checkpoint.tables().values().forEach(value -> protectedKeys.add(value.model()));
+            long deleted=0;
+            try(var rows=SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session,new Document("_id.chain",chainId)
+                    .append("cacheIncarnation",scope.cacheIncarnation()).append("nextContext",new Document("$ne",null))).batchSize(64).iterator()) {
+                while(rows.hasNext() && deleted<256) {
+                    var stored=rows.next();var context=contexts.require(session,stored.get("_id",Document.class));contexts.requireAnchor(session,chain,context);
+                    if(context.nextId()==null || protectedKeys.stream().anyMatch(key -> key.miningChainId().equals(chainId)
+                            && key.table().equals(context.key().table()) && key.captureEpoch()==context.key().captureEpoch()))continue;
+                    var next=contexts.require(session,context.nextId());
+                    if(!next.ring().equals(context.ring()) || !Long.valueOf(next.firstSequence()).equals(context.nextSequence()))throw unreadable();
+                    var bounds=SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,new Document("_id",MongoSrsLogStore.boundsId(context.ring()))).first();
+                    if(bounds==null)throw unavailable(context.key());
+                    if(requireBounds(bounds).trimmedThrough()<context.nextSequence()-1)continue;
+                    var filter=new Document("_id.chain",chainId).append("_id.table",context.key().table())
+                            .append("_id.captureContext",new Document("cacheIncarnation",scope.cacheIncarnation()).append("epoch",context.key().captureEpoch()));
+                    var ids=new java.util.ArrayList<Document>();
+                    for(var body:SystemCollections.SRS_MODELS.on(database).find(session,filter).limit(256-(int)deleted)) {
+                        var actual=decode(body);requirePublished(context,actual);ids.add(body.get("_id",Document.class));
+                    }
+                    if(!ids.isEmpty())deleted+=SystemCollections.SRS_MODELS.on(database).deleteMany(session,new Document("_id",new Document("$in",ids))).getDeletedCount();
+                }
+            }
+            return deleted;
+        });
+    }
+    private void requireBudget(ClientSession session,SrsModel proposed,Document captured) {
+        long bytes=captured.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        for(var row:SystemCollections.SRS_MODELS.on(database).find(session,new Document("_id.chain",proposed.key().miningChainId())
+                .append("cacheIncarnation",scope.cacheIncarnation())).batchSize(64)) {
+            bytes+=row.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            if(bytes>RETAINED_MODEL_BUDGET_BYTES)break;
+        }
+        if(bytes>RETAINED_MODEL_BUDGET_BYTES)throw new TapstateException(IoError.SRS_MODEL_CAPACITY,
+                Map.of("chain",proposed.key().miningChainId(),"bytes",RETAINED_MODEL_BUDGET_BYTES),null);
+    }
+
     @Override public SrsModel publishInitial(SrsModelKey key, String ring, SourceTable actual, WorkloadClaimFence fence) {
         Objects.requireNonNull(key, "key"); Objects.requireNonNull(actual, "actual"); Objects.requireNonNull(fence, "originalCapture");
         requireScope(key);
@@ -127,6 +176,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 contexts.insert(session, initial);
                 contexts.setHead(session, chain, initial);
             }
+            requireBudget(session,model,captured);
             models.insertOne(session, captured);
             return model;
         });

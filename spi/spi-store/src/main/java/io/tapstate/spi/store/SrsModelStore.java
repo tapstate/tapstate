@@ -6,6 +6,14 @@ import java.util.Optional;
 
 /** Actual models are durable before events may refer to them; publication never overwrites a version. */
 public interface SrsModelStore {
+    /** Retained canonical model bodies for one chain remain within the existing one-mebibyte limit. */
+    long RETAINED_MODEL_BUDGET_BYTES = 1024L * 1024L;
+
+    /** Reclaims a bounded batch of entire closed contexts only after every durable reference is gone. */
+    default long reclaim(String miningChainId, WorkloadClaimFence originalCapture) {
+        throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     /** Keeps the original operation authorization before and after every callback attempt. */
     SrsModelStore guardedBy(Runnable requireActive);
 

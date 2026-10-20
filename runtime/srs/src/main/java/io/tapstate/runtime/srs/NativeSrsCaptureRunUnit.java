@@ -49,6 +49,27 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         }
     }
 
+    /** A tail proposes only its subscribers' confirmed prefix; CACHE rechecks all references atomically. */
+    public void retain(CacheBusinessScope scope,String chainId,WorkloadClaimFence originalCapture,Runnable requireActive) {
+        Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);
+        var chain=stores.chains().load(chainId).orElseThrow(() -> new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",chainId),null));
+        var members=stores.consumers().attached(chainId);
+        for(String table:chain.servingTables()) {
+            long floor=Long.MAX_VALUE;boolean subscribed=false;
+            for(var member:members.consumers())if(member.tables().contains(table)) {
+                subscribed=true;var held=stores.consumers().progress(member.context());
+                // A coherent detach may remove this cursor after the topology snapshot. Abandon this cut.
+                // The adapter still rejects missing progress for an attached or corrupt relation.
+                if(held.isEmpty())return;
+                var progress=held.orElseThrow();if(progress.membershipRevision()!=member.revision())return;
+                floor=Math.min(floor,progress.ringDoneThrough().getOrDefault(table,-1L));
+            }
+            String ring=SrsRingbuffer.ringName(chainId,table);
+            if(subscribed && floor>=0 && floor!=Long.MAX_VALUE && floor>stores.log().bounds(ring).trimmedThrough())stores.log().trim(ring,floor,originalCapture);
+        }
+        stores.models().reclaim(chainId,originalCapture);fixed.run();
+    }
+
     /** Resolves the existing durable read rule without publishing a cursor or treating read-ahead as confirmation. */
     public long initialReadAfter(CacheBusinessScope scope,String chain,String table,StartFrom start,String retention,Runnable requireActive) {
         Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);String ring=SrsRingbuffer.ringName(chain,table);

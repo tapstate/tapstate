@@ -108,6 +108,9 @@ public enum IoError implements TapstateErrorCode {
     /** An exact actual model is absent or cannot be used for the captured stream context. */
     SRS_MODEL_UNAVAILABLE("io.srs-model-unavailable", Set.of("chain", "table", "version")),
 
+    /** Required retained models cannot safely fit in the existing chain history budget. */
+    SRS_MODEL_CAPACITY("io.srs-model-capacity", Set.of("chain", "bytes")),
+
     /** An immutable model identity already names different structural content. */
     SRS_MODEL_CONFLICT("io.srs-model-conflict", Set.of("chain", "table", "version")),
 

@@ -90,6 +90,18 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         requireActive.run(); return safe;
     }
 
+    /** Serializes model reclamation with attach, detach and exact snapshot-pin publication. */
+    Set<io.tapstate.spi.store.SrsModelKey> retainedModels(ClientSession session,String chain) {
+        var held=view(session,chain);var result=new java.util.HashSet<io.tapstate.spi.store.SrsModelKey>();
+        for(var member:held.members().values()) {
+            if(member.detached())continue;
+            var snapshot=held.cursors().get(member.context().key().consumerId()).snapshot();
+            validateSnapshot(session,member.context(),snapshot);
+            if(snapshot!=null)result.addAll(snapshot.models().values());
+        }
+        chains.replace(session,held.root(),new Document(held.root()));return Set.copyOf(result);
+    }
+
     /**
      * Read-only closure check for a caller that fences the original claim and checkpoint in this same
      * CACHE transaction. It cannot detach, repair missing history or establish retirement by itself.

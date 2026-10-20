@@ -59,6 +59,37 @@ class MongoSrsModelStoreIT {
     private static final String CHAIN = "chain-a";
     private static final String RING = "srs.chain-a.orders";
 
+    @Test void closedModelBodiesWaitForRetainedEventsAndTheOriginalCheckpoint() {
+        withBusiness(f -> {
+            var first=f.models().publishInitial(key(0),RING,table("id",null),f.fence());var log=modelLog(f);
+            var chains=new MongoSrsChainStore(f.client(),f.database(),SCOPE);chains.requestTables(CHAIN,java.util.Set.of("orders"),f.fence());
+            chains.publishServingTables(CHAIN,7,java.util.Set.of("orders"),f.fence());log.store(RING,0,event(0,7,f.fence()));
+            var checkpoint=new io.tapstate.spi.store.SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(7,0),"first"),
+                    Map.of("orders",new io.tapstate.spi.store.SrsTableCheckpoint(first.key(),0)));
+            chains.checkpoint(CHAIN,0,checkpoint,f.fence()).orElseThrow();chains.openEpoch(CHAIN,7,f.fence()).orElseThrow();
+            chains.publishServingTables(CHAIN,8,java.util.Set.of("orders"),f.fence());
+            var next=f.models().publishInitial(new SrsModelKey(CHAIN,"orders",SCOPE.cacheIncarnation(),8,0),RING,table("id",null),f.fence());
+            assertThat(f.models().reclaim(CHAIN,f.fence())).isZero();log.trim(RING,0,f.fence());
+            assertThat(f.models().reclaim(CHAIN,f.fence())).isZero();assertThat(f.models().load(first.key())).contains(first);
+            var successor=new io.tapstate.spi.store.SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(io.tapstate.core.event.SourceOrder.snapshotRow(8),"next"),
+                    Map.of("orders",new io.tapstate.spi.store.SrsTableCheckpoint(next.key(),0)));
+            chains.checkpoint(CHAIN,1,successor,f.fence()).orElseThrow();assertThat(f.models().reclaim(CHAIN,f.fence())).isOne();
+            assertThat(f.models().reclaim(CHAIN,f.fence())).isZero();assertThat(f.models().load(next.key())).contains(next);
+            assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).countDocuments()).isEqualTo(2);
+            assertThatThrownBy(() -> f.models().load(first.key())).satisfies(MongoSrsModelStoreIT::unavailable);
+        });
+    }
+    @Test void modelCapacityRefusalRollsBackTheProposedBodyAndOrderingControl() {
+        withBusiness(f -> {
+            var oversized=new SourceTable("orders",List.of(new SourceField("id","x".repeat(1_048_576))),List.of("id"),List.of());
+            var before=snapshotFacts(f.database());
+            assertThatThrownBy(() -> f.models().publishInitial(key(0),RING,oversized,f.fence()))
+                    .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_MODEL_CAPACITY));
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+            assertThat(f.models().publishInitial(key(0),RING,table("id",null),f.fence()).key()).isEqualTo(key(0));
+        });
+    }
+
     @Test void explicitInitialPublicationKeepsItsOriginalIntroductionAfterEvents() {
         withBusiness(f -> {
             var held = f.models().publishInitial(key(0),RING,table("id",99L),f.fence());
