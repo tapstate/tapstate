@@ -98,6 +98,12 @@ final class PipelineActuationOwnership {
                 if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
             }
         }
+        void released() {
+            synchronized (PipelineActuationOwnership.this) {
+                requireHeld(); var old = held.get(scope.pipelineId());
+                if (old != null && old.scope.equals(scope) && (old.claim == null || WorkloadClaimFence.from(old.claim).equals(claim))) held.remove(scope.pipelineId());
+            }
+        }
         @Override public void close() {
             synchronized (PipelineActuationOwnership.this) { controls.remove(scope.pipelineId(), this); }
         }

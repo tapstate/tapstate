@@ -179,6 +179,22 @@ class SrsCaptureWriterTest {
         }
     }
 
+    @Test void explicitResumeUsesTheRequestedTokenAndPublishesOnlyTheNewActualCheckpoint() {
+        var f = new Fixture(); var previous = new LinkedHashMap<String,SrsTableCheckpoint>();
+        for (String table : f.actual.keySet()) {
+            var key = new SrsModelKey(f.chain,table,SCOPE.cacheIncarnation(),1,0);
+            previous.put(table, new SrsTableCheckpoint(key,-1)); f.published.put(key,new SrsModel(key,f.ring(table),f.actual.get(table),0));
+        }
+        var checkpoint = new SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1),"old-confirmed"),previous);
+        f.opened = new SrsChainState(f.chain,"capture",null,2,f.actual.keySet(),f.actual.keySet(),1,checkpoint,Instant.EPOCH,0,0,
+                new SourceResumeOverride("requested",1,Instant.EPOCH));
+        var writer = f.writer(); assertThat(f.saved).isEmpty();
+        try (var source = writer.start(f.port(writer,new AtomicReference<>(),true),f.config(),CaptureStart.resume(new SourcePosition("requested")),new CaptureHealth())) {
+            assertThat(f.saved).hasSize(1); assertThat(f.saved.getFirst().position()).isEqualTo(new ChainPosition(SourceOrder.snapshotRow(2),"requested"));
+            assertThat(f.opened.checkpoint()).isEqualTo(checkpoint);
+        }
+    }
+
     private static final class Fixture {
         final String chain = "chain-" + UUID.randomUUID(); final AtomicBoolean active = new AtomicBoolean(true);
         final Map<String, SourceTable> actual = Map.of("orders", table("orders"), "quiet", table("quiet"));

@@ -1335,7 +1335,7 @@ class MongoSrsModelStoreIT {
                         .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("captureId", "capture-a")
                         .append("captureFence", WorkloadClaimDocuments.stored(WorkloadClaimFence.from(claim))).append("retention", null)
                         .append("requestedTables", List.of()).append("servingTables", List.of()).append("modelContextHeads", List.of()).append("modelWriteFence", 0L)
-                        .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L));
+                        .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L).append("resumeOverride", null));
                 scenario.run(new Fixture(client, database, new MongoSrsModelStore(client, database, SCOPE), claim));
             } catch (Exception failure) { throw new AssertionError(failure); }
             finally { database.drop(); }

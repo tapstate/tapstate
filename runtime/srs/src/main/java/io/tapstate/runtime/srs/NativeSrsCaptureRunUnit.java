@@ -144,14 +144,14 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                 var window=current.current();var original=opened.current();
                 if(window==null || window.epoch()!=opened.epoch() || !window.captureFence().equals(original.captureFence())
                         || !window.pipelineFence().equals(original.pipelineFence()))throw new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",opened.context().channelId()),null);
-                var saved=current.cursor().sinkAcked();if(saved==null)throw new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",opened.context().channelId()),null);
+                var saved=current.resumeToken();if(saved==null || current.cursor().sinkAcked()==null)throw new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",opened.context().channelId()),null);
                 var writer=new DirectCaptureWriter(current,window.captureFence(),window.pipelineFence(),channels,row -> {
                     fixed.run();handoff.accept(row);fixed.run();
                 },capacity,fixed);
                 Runnable ending=() -> {writer.close();writer.stopSources();};pendingCloses.put(ending,requireActive);
                 Subscription source=null;
                 try {
-                    source=writer.start(port,config,CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(saved.token())),health);fixed.run();
+                    source=writer.start(port,config,CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(saved)),health);fixed.run();
                     var followed=acknowledgements.follow(channels,current,source,health,fixed);pendingCloses.remove(ending);return Optional.of(followed);
                 } catch(RuntimeException|Error failure) {
                     writer.close();if(source!=null)closeAfter(failure,source::close);closeAfter(failure,() -> closePending(ending));throw failure;

@@ -8,6 +8,9 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.SourcePositionEdits;
+import io.tapstate.spi.store.SourceResumeOverride;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsChainState;
@@ -62,6 +65,72 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public MongoSrsConsumerStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
         return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
+    }
+
+    SourcePositionEdits positions(WorkloadClaimFence node, java.time.Duration retention) {
+        Objects.requireNonNull(node, "originalNode");
+        return (moves, readers, editedAt) -> {
+            var fixed = List.copyOf(moves); var originals = Map.copyOf(readers);
+            var at = Objects.requireNonNull(editedAt).truncatedTo(java.time.temporal.ChronoUnit.MILLIS);
+            if (fixed.isEmpty()) throw new IllegalArgumentException("a position edit requires selected sources");
+            transaction(session -> {
+                new MongoCacheBusinessIdentity(database, scope).admitMetadataWrite(session);
+                MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+                for (var reader : originals.entrySet()) {
+                    var physical = reader.getKey();
+                    if (!scope.equals(new CacheBusinessScope(physical.clusterId(), physical.bindingVersion(), physical.cacheIncarnation()))) throw fenced();
+                    var access = new MongoCachePipelineAccess(client, database, physical, reader.getValue(), requireActive);
+                    access.verifyStateStructure(); var state = access.state(session);
+                    access.proveConsumerClaim(session); access.updateState(session, state, new Document(), false);
+                }
+                var selected = new java.util.HashSet<String>();
+                for (var move : fixed) {
+                    requireActive.run();
+                    if (move instanceof SourcePositionEdits.Logged logged) {
+                        String chain = logged.original().miningChainId();
+                        if (!selected.add(chain)) throw unavailable(chain);
+                        var held = view(session, chain);
+                        if (!held.state().equals(logged.original()) || held.state().checkpoint() == null) throw unavailable(chain);
+                        chains.prove(session, logged.capture()); chains.requireCapture(held.root(), logged.capture());
+                        var attached = new java.util.HashSet<SrsConsumerContext>();
+                        for (var member : held.members().values()) {
+                            if (member.detached()) continue;
+                            var context = member.context(); var cursor = held.cursors().get(context.key().consumerId());
+                            var before = new SrsConsumerProgress(context, member.revision(), cursor.revision(), cursor.value(),
+                                    cursor.snapshot(), cursor.writerRun(), cursor.ringDoneThrough());
+                            var physical = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), context.key().pipelineId(), context.stateGeneration());
+                            var claim = originals.get(physical);
+                            if (!before.equals(logged.consumers().get(context)) || claim == null || !MongoPositionFences.retained(member.commandFence(), claim)) throw unavailable(chain);
+                            attached.add(context); prove(session, context, claim); validateSnapshot(session, context, cursor.snapshot());
+                            var old = cursor.value();
+                            var cleared = new ConsumerOffset(old.pipelineId(), old.perTableSeq(), null, old.snapshotCompletedTables(),
+                                    old.cdcStartPosition(), old.snapshotEpoch(), Map.of(), old.progressKind());
+                            replaceProgress(session, new Own(member, cursor), cleared, null, cursor.ringDoneThrough());
+                        }
+                        if (!attached.equals(logged.consumers().keySet())) throw unavailable(chain);
+                        var next = new Document(held.root()).append("resumeOverride", MongoResumeOverrides.stored(new SourceResumeOverride(logged.token(), held.state().epoch(), at)));
+                        chains.replace(session, held.root(), next);
+                    } else if (move instanceof SourcePositionEdits.Direct direct) {
+                        String channel = direct.original().context().channelId();
+                        if (!selected.add(channel)) throw fenced();
+                        new MongoCacheMetadataStructure(database, retention).verifyDirect();
+                        var pipeline = originals.get(direct.original().context().scope());
+                        if (pipeline == null) throw fenced();
+                        new MongoDirectChannelStore(client, database, scope, requireActive, retention)
+                                .editPosition(session, direct.original(), direct.token(), at, direct.capture(), pipeline);
+                    }
+                }
+                requireActive.run(); MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+                // End the original tenures in this same transaction: a delayed writer cannot recreate its old run roster.
+                for (var reader : originals.entrySet()) {
+                    var filter = WorkloadClaimDocuments.live(reader.getValue()).append("pipelineScope", MongoPipelinePreparationFacts.scope(reader.getKey()))
+                            .append("pipelinePreparation.phase", "PREPARED");
+                    if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, filter,
+                            List.of(new Document("$set", new Document("leaseUntil", "$$NOW")))).getMatchedCount() != 1) throw fenced();
+                }
+                return null;
+            });
+        };
     }
     @Override public List<SrsConsumerMembership> forPipeline(io.tapstate.spi.store.PipelineIntentScope original) {
         Objects.requireNonNull(original,"original");

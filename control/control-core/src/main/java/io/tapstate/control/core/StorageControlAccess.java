@@ -36,6 +36,16 @@ public final class StorageControlAccess {
             throw new IllegalArgumentException("storage caller does not match the deployment authentication mode");
         return new StorageControlAccess(mode, setup, cache, principal, organizationId, reauthenticate, null);
     }
+    /** Resolves persistent scope only after the original selected credential has been rechecked. */
+    public static StorageControlAccess ordinary(StorageBinding.Mode mode, java.util.function.Supplier<StorageSetupScope> setups,
+            TapstatePrincipal principal, CredentialAuthentication original) {
+        Objects.requireNonNull(mode, "mode"); Objects.requireNonNull(setups, "setups"); Objects.requireNonNull(original, "original");
+        original.requireActive().run();
+        if (original.storageScope().isEmpty() && (mode != StorageBinding.Mode.CLOUD || original.organizationId().isEmpty()))
+            throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        return ordinary(mode, setups.get(), original.storageScope().orElse(null), principal,
+                original.organizationId().orElse(null), original.requireActive());
+    }
     public static StorageControlAccess management(SetupCapabilityService.Permission verified) {
         Objects.requireNonNull(verified, "verified"); verified.run();
         return new StorageControlAccess(StorageBinding.Mode.OP, verified.scope(), null, null, null, verified, verified);

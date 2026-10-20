@@ -46,6 +46,8 @@ public final class DirectSnapshotPreparation implements AutoCloseable {
         confirmBaseline(request.replayAnchor());requireReading();accepted.set(request.replayAnchor());
     }
     private void confirmBaseline(SourcePosition first) {
+        // A requested CDC restart is not an observed source anchor; the original snapshot keeps its own pin.
+        if(original.resumeOverride()!=null)return;
         var saved=original.cursor().sinkAcked();String token=saved==null?first.token():saved.token();
         if(!channels.confirmAnchor(original.context(),original.epoch(),token,original.current().captureFence(),original.current().pipelineFence()))throw unavailable();
     }

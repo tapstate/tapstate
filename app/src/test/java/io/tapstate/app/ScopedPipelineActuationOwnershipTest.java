@@ -89,6 +89,16 @@ class ScopedPipelineActuationOwnershipTest {
         assertThat(owner.beginExecution(FIRST, original).allowed()).isTrue();
     }
 
+    @Test void completedPositionReleaseToleratesTheRenewerAlreadyDroppingItsClaim() {
+        var owner = ownership();
+        try (var control = owner.control(FIRST)) {
+            raw.release(raw.read(KEY).orElseThrow().claim());
+            nanos.addAndGet(RENEW.toNanos()); owner.renewDue();
+            control.released(); control.requireHeld();
+        }
+        assertThat(owner.permit(FIRST).claim().claimGeneration()).isEqualTo(2);
+    }
+
     @Test void aScopedPermitAdvancesOnlyItsOriginalClaimAndReturnsItsExactRunIdentity() {
         var owner = ownership();
         var permit = owner.permit(FIRST);

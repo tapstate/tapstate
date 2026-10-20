@@ -281,6 +281,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     ownership,() -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),owner.memberStorage::requireNode,
                     engine,actuator,new HazelcastOperatorReadiness(member,Duration.ofSeconds(30)),plans,connectors);
         }
+        @Bean PipelinePositionService.WriteBack nativeSourcePositions(NativeBusinessContext owner,
+                PipelineChains chains, LivePipelines live, AuditGate audit, PipelineActuationOwnership ownership,
+                CaptureOwnership captures, NodeSessionLease node, Engine engine, EngineLifecycleActuator actuator,
+                HazelcastInstance member, HazelcastExecutionPlans plans, Clock clock,
+                ArtifactMutationService.PipelineDeletion retirement) {
+            var reading = new PipelinePositionService(chains, owner.port.meta(), owner.port.artifacts(), live, audit);
+            return new NativeSourcePositionEdits(owner.configuration, owner.original.cache(), owner.original.preparation().businessScope(),
+                    owner.port, reading, ownership, captures, () -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),
+                    owner.memberStorage::requireNode, engine, actuator, new HazelcastOperatorReadiness(member, Duration.ofSeconds(30)), plans, clock);
+        }
         @Bean RebuildAdmission rebuildAdmission(ClusterProperties cluster, HazelcastProperties hazelcast,
                 PipelineActuationOwnership ownership, Engine engine) {
             return new DataPlaneActuationConfiguration().rebuildAdmission(cluster, hazelcast, ownership, engine);

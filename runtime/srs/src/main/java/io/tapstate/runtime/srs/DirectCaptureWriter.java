@@ -48,8 +48,7 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
         if (config.node()==null || !context.scope().pipelineId().equals(config.node().pipelineId())
                 || !context.sourceId().equals(config.node().nodeId()) || !opened.tables().equals(new HashSet<>(config.streams()))
                 || config.streams().size()!=opened.tables().size() || config.sharedNotes()!=null) throw unavailable();
-        String known=opened.cursor().sinkAcked()!=null?opened.cursor().sinkAcked().token():opened.cursor().cdcStartPosition();
-        if (known==null) known=anchor;
+        String known=opened.resumeToken();
         if (known!=null && (!(start instanceof CaptureStart.Resume resume) || !known.equals(resume.position().token()))
                 || known==null && start instanceof CaptureStart.Resume) throw unavailable();
         expectedResume=known;

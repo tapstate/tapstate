@@ -51,7 +51,8 @@ class StorageRootConfiguration {
         });
     }
     @Bean StorageControlCaller storageControlCaller(StorageRoot root) {
-        return StorageControlCallers.ordinary(root.mode(), () -> root.runtime().requireConfiguration().setupStates().load().scope());
+        return StorageControlCallers.ordinary((principal, original) -> StorageControlAccess.ordinary(root.mode(),
+                () -> root.runtime().requireConfiguration().setupStates().load().scope(), principal, original));
     }
     @Bean StorageControlDispatcher.Snapshots storageSnapshots(StorageRoot root) { return root::snapshot; }
     @Bean @org.springframework.context.annotation.Lazy

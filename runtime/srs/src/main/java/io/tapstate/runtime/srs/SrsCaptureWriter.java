@@ -125,8 +125,8 @@ public final class SrsCaptureWriter implements AutoCloseable {
         Objects.requireNonNull(start, "start"); Objects.requireNonNull(health, "health");
         requireActive();
         if (!java.util.Set.copyOf(config.streams()).equals(opened.servingTables())) throw unproven();
-        if (opened.checkpoint() != null && (!(start instanceof CaptureStart.Resume resume)
-                || !opened.checkpoint().position().token().equals(resume.position().token()))) throw unproven();
+        if (opened.resumeToken() != null && (!(start instanceof CaptureStart.Resume resume)
+                || !opened.resumeToken().equals(resume.position().token()))) throw unproven();
         if (!started.compareAndSet(false, true)) throw unproven();
         try {
             Subscription source = port.cdc(config, start, health.recording(new CaptureStartedListener() {

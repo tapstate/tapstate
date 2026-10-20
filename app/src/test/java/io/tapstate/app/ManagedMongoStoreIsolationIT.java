@@ -18,6 +18,8 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.*;
+import io.tapstate.core.model.*;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsMeta;
@@ -351,6 +353,165 @@ class ManagedMongoStoreIsolationIT {
         }
         @Override public void report(String cluster, String nonce, io.tapstate.control.core.CloudRuntimeStatus status, String token) {
             throw new AssertionError("the fixture disables status reporting");
+        }
+    }
+
+    /** Native ports seed exact historical receipts; HTTP/production DI perform the actual mixed-source edit. */
+    @Test void originalPositionApiCommitsSharedAndDirectEditsTogetherAndAllowsASecondEdit() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "position_cfg_" + suffix, cacheDb = "position_cache_" + suffix, masterDb = "position_master_" + suffix;
+        String user = "position_" + suffix;
+        var setup = new StorageSetupScope("position-" + suffix, "installation", "setup", 1);
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(configDb, cacheDb, masterDb));
+            var cacheConnection = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, uri(user, cacheDb), cacheDb, null);
+            try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                    new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(user, configDb), null, Duration.ofSeconds(5)),
+                    setup.clusterId(), setup.installationId(), setup.operationId(), 1)) {
+                var target = new SourceResource("views", null, "mongodb", Map.of("uri", uri(user, masterDb)), null, null, null, null);
+                var committed = configuration.bindings().commitWithFirstCache(setup, StorageBinding.Mode.OP, cacheConnection, target);
+                try (var cached = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(cacheConnection, Duration.ofSeconds(5), "position-fixture")) {
+                    cached.prepareFirstAuth(committed.firstCreation().orElseThrow()); cached.prepareInitialBusiness(committed.preparation(), () -> {});
+                }
+                configuration.bindings().complete(setup);
+                configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
+                        new User("admin", new BCryptPasswordHasher().hash("sentinel-login-password"), "admin"));
+            }
+            try (var application = nativeRoot(uri(user, configDb))) {
+                var root = application.getBean(StorageRoot.class); assertThat(root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+                var bound = root.runtime().current().orElseThrow(); var cache = bound.cache(); var business = bound.preparation().businessScope();
+                var configuration = root.runtime().requireConfiguration();
+                var child = (ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(root.runtime().business().orElseThrow(), "context");
+                var sources = new java.util.LinkedHashMap<String,SourceResource>();
+                var table = new SourceTable("orders", List.of(new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of());
+                for (String id : List.of("shared_source", "direct_source")) {
+                    var source = new SourceResource(id, null, "mongodb", Map.of("uri", uri(user, masterDb)), SourceMode.SNAPSHOT,
+                            List.of(TableRef.literal("orders")), null, null);
+                    configuration.artifacts().create(source); sources.put(id, source);
+                    cache.schemas(business, () -> {}).save(new DiscoveredSourceModel(id, "mongodb", 1, new SourceModel(List.of(table))));
+                }
+                var pipeline = new PipelineResource("position_flow", null, List.of(SourceRef.spec("shared_source", true), SourceRef.spec("direct_source", false)), null, null, null, null, null);
+                configuration.artifacts().create(pipeline);
+                var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(), pipeline.id(), 1);
+                var inputs = SourceModelSnapshot.capture(pipeline.id(), List.copyOf(sources.values()), cache.schemas(business, () -> {}))
+                        .preparationInputs(scope, pipeline, pipeline, sources);
+                child.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
+                var ownership = child.getBean(PipelineActuationOwnership.class);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> ownership.permit(scope).granted());
+                var permit = ownership.permit(scope); assertThat(permit.granted()).isTrue();
+                var execution = ownership.beginExecution(scope, WorkloadClaimFence.from(permit.claim()));
+                assertThat(execution.allowed()).isTrue(); var pipelineFence = execution.claimFence();
+                var node = child.getBean(NodeSessionLease.class).currentFence().orElseThrow();
+                var captures = child.getBean(CaptureOwnership.class);
+                var srs = cache.srs(business, () -> {});
+                String sharedId = null; DirectChannelContext directContext = null; DirectBatch pending = null;
+                for (String source : sources.keySet()) {
+                    var issued = (CaptureCreationResult.Issued)configuration.capturePreparations().issueFirstCreate(new CapturePreparationRequest(scope, pipelineFence, node, source, inputs));
+                    var prepared = cache.capturePreparations(business, () -> {}).createFirst(issued.creation()).preparation();
+                    var capture = captures.acquire(new io.tapstate.runtime.srs.CaptureId(prepared.captureId()));
+                    assertThat(capture.acquired()).isTrue();
+                    try {
+                        if (prepared.mode() == CapturePreparation.Mode.SHARED_SRS) {
+                            sharedId = prepared.chainId();
+                            srs.chains().requestTables(sharedId, java.util.Set.of("orders"), capture.fence());
+                            srs.chains().openEpoch(sharedId, 0, capture.fence()).orElseThrow();
+                            srs.chains().publishServingTables(sharedId, 1, java.util.Set.of("orders"), capture.fence());
+                            var key = new SrsModelKey(sharedId, "orders", business.cacheIncarnation(), 1, 0);
+                            srs.models().publishInitial(key, io.tapstate.runtime.srs.SrsRingbuffer.ringName(sharedId, "orders"), table, capture.fence());
+                            srs.chains().checkpoint(sharedId, 0, new SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "old-shared"),
+                                    Map.of("orders", new SrsTableCheckpoint(key, -1))), capture.fence()).orElseThrow();
+                            var consumer = new SrsConsumerContext(new SrsConsumerKey(sharedId, pipeline.id(), source), 1);
+                            srs.consumers().attach(consumer, 0, java.util.Set.of("orders"), pipelineFence).orElseThrow();
+                            srs.consumers().beginWriterRun(consumer, 1, "old-writer", Map.of("orders", List.of("writer")), pipelineFence);
+                        } else {
+                            directContext = inputs.directChannels().getFirst().context();
+                            var direct = cache.directChannels(business, () -> {}); var before = direct.load(directContext);
+                            long epoch = direct.beginCapture(directContext, before.revision(), 0, capture.fence(), pipelineFence).orElseThrow();
+                            direct.confirmAnchor(directContext, epoch, "old-direct", capture.fence(), pipelineFence);
+                            assertThat(direct.pinSnapshot(directContext, direct.load(directContext).revision(), epoch, "old-direct", pipelineFence)).isTrue();
+                            direct.beginWriterRun(directContext, epoch, "old-writer", Map.of("orders", List.of("writer")), pipelineFence);
+                            pending = new DirectBatch(directContext, epoch, 1, new ChainPosition(new SourceOrder(epoch, 0), "pending"), Map.of("orders", 0L));
+                            direct.recordBatch(pending, 0, capture.fence(), pipelineFence);
+                        }
+                    } finally { captures.release(capture.claim()); }
+                }
+                var login = ordinaryLogin(application, false); var client = rootClient(application);
+                var reading = client.get().uri("/api/pipelines/position_flow/position").header("Authorization", "Bearer " + login.token())
+                        .retrieve().body(io.tapstate.control.core.PipelinePosition.class);
+                assertThat(reading.chains()).extracting(value -> value.resumeFrom().token()).containsExactly("old-shared", "old-direct");
+                for (String token : List.of("first", "second")) {
+                    var request = Map.of("chains", List.of(Map.of("chainId", sharedId, "resumeFrom", Map.of("token", token + "-shared")),
+                            Map.of("chainId", directContext.channelId(), "resumeFrom", Map.of("token", token + "-direct"))));
+                    var result = client.put().uri("/api/pipelines/position_flow/position").header("Authorization", "Bearer " + login.token())
+                            .body(request).retrieve().body(io.tapstate.control.core.PipelinePosition.class);
+                    assertThat(result.chains()).extracting(value -> value.resumeFrom().token()).containsExactly(token + "-shared", token + "-direct");
+                    var projected = child.getBean(StorePort.class).meta();
+                    assertThat(projected.durableSourceRead(sharedId)).isEmpty();
+                    assertThat(projected.durableSourceRead(directContext.channelId())).isEmpty();
+                    assertThat(List.of(projected.read(sharedId).orElseThrow(), projected.read(directContext.channelId()).orElseThrow()))
+                            .extracting(SrsMeta::sourceReadDurable).containsExactly(false, false);
+                }
+                assertThat(srs.chains().load(sharedId).orElseThrow().checkpoint().position().token()).isEqualTo("old-shared");
+                var direct = cache.directChannels(business, () -> {}); var changed = direct.load(directContext);
+                assertThat(changed.cursor().sinkAcked().token()).isEqualTo("old-direct"); assertThat(changed.writerRun()).isNull();
+                assertThat(direct.pending(directContext, 1)).containsExactly(pending);
+                var oldConsumer = new SrsConsumerContext(new SrsConsumerKey(sharedId, pipeline.id(), "shared_source"), 1);
+                assertThatThrownBy(() -> srs.consumers().beginWriterRun(oldConsumer, 1, "old-writer", Map.of("orders", List.of("writer")), pipelineFence))
+                        .isInstanceOf(TapstateException.class);
+                var nextPermit = ownership.permit(scope);
+                var nextExecution = ownership.beginExecution(scope, WorkloadClaimFence.from(nextPermit.claim()));
+                var nextCapture = captures.acquire(new io.tapstate.runtime.srs.CaptureId(directContext.captureId()));
+                assertThat(nextCapture.acquired()).isTrue();
+                try {
+                    long epoch = direct.beginCapture(directContext, changed.revision(), 1, nextCapture.fence(), nextExecution.claimFence()).orElseThrow();
+                    var opened = cache.directChannels(business, () -> {}).load(directContext);
+                    assertThat(opened.resumeToken()).isEqualTo("second-direct");
+                    assertThat(opened.cursor().sinkAcked().token()).isEqualTo("old-direct");
+                    assertThat(opened.retained().pendingCount()).isOne();
+                    assertThat(direct.beginWriterRun(directContext, epoch, "next-writer", Map.of("orders", List.of("writer")), nextExecution.claimFence())).isTrue();
+                    assertThat(direct.advanceWriter(directContext, epoch, "next-writer", "orders", "writer",
+                            new WriterProgress(SourceOrder.snapshotRow(1),new ChainPosition(SourceOrder.snapshotRow(1),"old-direct")),nextExecution.claimFence())).isTrue();
+                    var loaded = direct.load(directContext);
+                    assertThat(loaded.cursor().snapshotCompletedTables()).containsExactly("orders");
+                    assertThat(loaded.cursor().sinkAcked().token()).isEqualTo("old-direct");
+                    assertThat(loaded.resumeOverride().token()).isEqualTo("second-direct");
+                    var fixedDirect = directContext;
+                    assertThatThrownBy(() -> direct.advanceWriter(fixedDirect,epoch,"next-writer","orders","writer",
+                            new WriterProgress(new SourceOrder(epoch,0),new ChainPosition(new SourceOrder(epoch,0),"unstarted-cdc")),nextExecution.claimFence()))
+                            .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.DIRECT_CHANNEL_UNAVAILABLE));
+                    assertThat(direct.load(directContext)).isEqualTo(loaded);
+                    assertThat(direct.confirmAnchor(directContext, epoch, "second-direct", nextCapture.fence(), nextExecution.claimFence())).isTrue();
+                    assertThat(direct.load(directContext).resumeOverride()).isNull();
+                    assertThat(direct.load(directContext).cursor().sinkAcked().order()).isEqualTo(SourceOrder.snapshotRow(epoch));
+                    assertThat(admin.getDatabase(cacheDb).getCollection("direct_batches").countDocuments()).isZero();
+                } finally { captures.release(nextCapture.claim()); }
+                // A required second-source fact disappears after preflight/audit. The first source must stay unchanged.
+                var sharedCollection = admin.getDatabase(cacheDb).getCollection("srs_chains");
+                var cursorCollection = admin.getDatabase(cacheDb).getCollection("srs_consumer_offsets");
+                var channelCollection = admin.getDatabase(cacheDb).getCollection("direct_channel_offsets");
+                var sharedBefore = sharedCollection.find(new Document("_id", sharedId)).first();
+                var cursorBefore = cursorCollection.find().first(); var channelBefore = channelCollection.find().first();
+                var service = child.getBean(io.tapstate.control.core.PipelinePositionService.class);
+                var writer = child.getBean(io.tapstate.control.core.PipelinePositionService.WriteBack.class);
+                org.springframework.test.util.ReflectionTestUtils.setField(service, "nativeWriteBack",
+                        (io.tapstate.control.core.PipelinePositionService.WriteBack)(id, before, moves) -> {
+                            var command = writer.prepare(id, before, moves);
+                            return () -> { channelCollection.deleteOne(new Document("_id", channelBefore.get("_id"))); command.run(); };
+                        });
+                try {
+                    var refused = Map.of("chains", List.of(Map.of("chainId", sharedId, "resumeFrom", Map.of("token", "never-shared")),
+                            Map.of("chainId", directContext.channelId(), "resumeFrom", Map.of("token", "never-direct"))));
+                    assertThatThrownBy(() -> client.put().uri("/api/pipelines/position_flow/position").header("Authorization", "Bearer " + login.token())
+                            .body(refused).retrieve().toBodilessEntity()).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("io.direct-channel-unavailable"));
+                    assertThat(sharedCollection.find(new Document("_id", sharedId)).first()).isEqualTo(sharedBefore);
+                    assertThat(cursorCollection.find().first()).isEqualTo(cursorBefore);
+                    assertThat(channelCollection.countDocuments()).isZero();
+                } finally {
+                    channelCollection.insertOne(channelBefore);
+                    org.springframework.test.util.ReflectionTestUtils.setField(service, "nativeWriteBack", writer);
+                }
+            }
         }
     }
 

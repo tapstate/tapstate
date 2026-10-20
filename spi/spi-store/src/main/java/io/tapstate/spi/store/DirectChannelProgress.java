@@ -7,7 +7,11 @@ import java.util.Set;
 
 /** Private channel progress and its small ordering control; pending batches are a separate resource. */
 public record DirectChannelProgress(DirectChannelContext context,Set<String> tables,long revision,
-        DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun writerRun) {
+        DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun writerRun,SourceResumeOverride resumeOverride) {
+    public DirectChannelProgress(DirectChannelContext context,Set<String> tables,long revision,
+            DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun writerRun) {
+        this(context,tables,revision,current,retained,cursor,writerRun,null);
+    }
     public DirectChannelProgress {
         Objects.requireNonNull(context,"context"); Objects.requireNonNull(cursor,"cursor"); tables = Set.copyOf(tables);
         if (tables.isEmpty() || tables.stream().anyMatch(String::isBlank) || revision < 0 || revision == Long.MAX_VALUE
@@ -17,6 +21,8 @@ public record DirectChannelProgress(DirectChannelContext context,Set<String> tab
                 || cursor.snapshotEpoch() == Long.MAX_VALUE || (cursor.snapshotEpoch() == 0) != (cursor.cdcStartPosition() == null)
                 || cursor.cdcStartPosition() != null && cursor.cdcStartPosition().isBlank()
                 || cursor.snapshotEpoch() == 0 && !cursor.snapshotCompletedTables().isEmpty()) throw new IllegalArgumentException("invalid private channel progress");
+        if (resumeOverride != null && (current == null || cursor.sinkAcked() == null || resumeOverride.fromEpoch() > current.epoch()
+                || cursor.sinkAcked().order().epoch() > resumeOverride.fromEpoch())) throw new IllegalArgumentException("resume request has no original checkpoint");
         if (current == null && (retained != null || writerRun != null || cursor.sinkAcked() != null || cursor.snapshotEpoch() != 0 || !cursor.sinkAckedByTable().isEmpty()))
             throw new IllegalArgumentException("an unopened channel cannot have capture progress");
         if (current != null) {
@@ -55,6 +61,12 @@ public record DirectChannelProgress(DirectChannelContext context,Set<String> tab
                 || point.order().seq() < 0 && point.order().seq() != SourceOrder.SNAPSHOT_SEQ
                 || point.token() != null && point.token().isBlank()) return false;
         return point.order().seq() != Long.MAX_VALUE || durable && point.token() == null;
+    }
+    public String resumeToken() {
+        if (resumeOverride != null) return resumeOverride.token();
+        if (cursor.sinkAcked() != null) return cursor.sinkAcked().token();
+        if (cursor.cdcStartPosition() != null) return cursor.cdcStartPosition();
+        return current == null ? null : current.anchor();
     }
     public long epoch() { return current == null ? 0 : current.epoch(); }
 }

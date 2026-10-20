@@ -207,6 +207,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 () -> { businessActive(); requireActive.run(); });
     }
 
+    /** Explicit position writes keep all selected native resources in the same CACHE transaction. */
+    public io.tapstate.spi.store.SourcePositionEdits sourcePositions(CacheBusinessScope expected,
+            io.tapstate.spi.store.WorkloadClaimFence node, Runnable requireActive) {
+        Objects.requireNonNull(requireActive); Runnable active = () -> { businessActive(); requireActive.run(); };
+        active.run(); loadBusinessScope(expected);
+        var structure = new MongoCacheMetadataStructure(database, rateRetention); structure.verifySrs();
+        return new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs).positions(node, rateRetention);
+    }
+
     /** SRS facets retain one CACHE client, complete business scope and original caller lifecycle. */
     @Override public io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");

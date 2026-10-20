@@ -763,9 +763,9 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelinePositionService pipelinePositionService(PipelineChains pipelineChains, StorePort storePort,
-            LivePipelines livePipelines, AuditGate auditGate) {
+            LivePipelines livePipelines, AuditGate auditGate, ObjectProvider<PipelinePositionService.WriteBack> nativeWrites) {
         return new PipelinePositionService(
-                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate);
+                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate, nativeWrites.getIfAvailable());
     }
 
     // ---- the node-local log tail: the sink, the appender that feeds it, and the read face over it ----

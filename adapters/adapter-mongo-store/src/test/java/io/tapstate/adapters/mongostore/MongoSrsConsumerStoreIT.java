@@ -948,6 +948,66 @@ class MongoSrsConsumerStoreIT {
         }
     }
 
+    @Test void positionEditsPreserveTruthFenceOldWritersAndAllowANewEditAfterReacquisition() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
+            f.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.captureFence());
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "original"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)));
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            f.consumers().pinSnapshot(A, 1, 0, new SrsSnapshotPin(1, "original", refs), f.fenceA());
+            f.consumers().beginWriterRun(A, 1, "old-run", Map.of("orders", List.of("writer")), f.fenceA());
+            f.consumers().advanceWriter(A, 1, "old-run", "orders", "writer", point(1, 3, "t3"), f.fenceA());
+            var before = f.consumers().progress(A).orElseThrow();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var node = claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node-edit"),
+                    new WorkloadOwner("node-edit", "boot-edit"), 1, Duration.ofSeconds(30)).claim();
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document(), new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var readers = Map.of(positionScope(A), f.fenceA(), positionScope(B), f.fenceB());
+            var edit = f.consumers().positions(WorkloadClaimFence.from(node), java.time.Duration.ofDays(7));
+            edit.rewrite(List.of(positionMove(f, "requested", f.captureFence())), readers, java.time.Instant.now());
+            var changed = f.chains().load(CHAIN).orElseThrow();
+            assertThat(changed.checkpoint()).isEqualTo(checkpoint); assertThat(changed.checkpointRevision()).isOne();
+            assertThat(changed.resumeOverride().token()).isEqualTo("requested");
+            var after = f.consumers().progress(A).orElseThrow();
+            assertThat(after.cursor().sinkAcked()).isNull(); assertThat(after.cursor().sinkAckedByTable()).isEmpty(); assertThat(after.writerRun()).isNull();
+            assertThat(after.snapshot()).isEqualTo(before.snapshot()); assertThat(after.ringDoneThrough()).isEqualTo(before.ringDoneThrough());
+            assertThat(after.cursor().perTableSeq()).isEqualTo(before.cursor().perTableSeq());
+            assertThat(claims.read(f.pipelineA().key()).orElseThrow().leased()).isFalse();
+            assertThatThrownBy(() -> f.consumers().beginWriterRun(A, 1, "old-run", Map.of("orders", List.of("writer")), f.fenceA())).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A, 1, "old-run", "orders", "writer", point(1, 4, "late"), f.fenceA())).isInstanceOf(TapstateException.class);
+            var a = claims.acquire(f.pipelineA().key(), f.pipelineA().owner(), 1, Duration.ofSeconds(30)).claim();
+            var b = claims.acquire(f.pipelineB().key(), f.pipelineB().owner(), 1, Duration.ofSeconds(30)).claim();
+            assertThat(a.claimGeneration()).isEqualTo(f.pipelineA().claimGeneration()+1);
+            edit.rewrite(List.of(positionMove(f, "second", f.captureFence())),
+                    Map.of(positionScope(A), WorkloadClaimFence.from(a), positionScope(B), WorkloadClaimFence.from(b)), java.time.Instant.now());
+            assertThat(f.chains().load(CHAIN).orElseThrow().resumeOverride().token()).isEqualTo("second");
+            f.chains().openEpoch(CHAIN, 1, f.captureFence()).orElseThrow();
+            assertThat(f.chains().load(CHAIN).orElseThrow().resumeOverride().token()).isEqualTo("second");
+            assertThat(f.chains().load(CHAIN).orElseThrow().checkpoint()).isEqualTo(checkpoint);
+            try (var reopened = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                assertThat(new MongoSrsChainStore(reopened, reopened.getDatabase(f.database().getName()), SCOPE).load(CHAIN).orElseThrow().resumeToken()).isEqualTo("second");
+            }
+            f.chains().publishServingTables(CHAIN, 2, Set.of("orders"), f.captureFence());
+            var nextKey = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 2, 0);
+            models(f).publishInitial(nextKey, ring("orders"), new SourceTable("orders", List.of(new SourceField("id", "int")), List.of(), List.of()), f.captureFence());
+            var actual = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(2), "second"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(nextKey, -1)));
+            var confirmed = f.chains().checkpoint(CHAIN, 1, actual, f.captureFence()).orElseThrow();
+            assertThat(confirmed.resumeOverride()).isNull(); assertThat(confirmed.checkpoint()).isEqualTo(actual);
+        });
+    }
+    private static io.tapstate.spi.store.PipelineIntentScope positionScope(SrsConsumerContext context) {
+        return new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(), SCOPE.cacheIncarnation(), context.key().pipelineId(), context.stateGeneration());
+    }
+    private static io.tapstate.spi.store.SourcePositionEdits.Logged positionMove(Fixture f, String token, WorkloadClaimFence capture) {
+        return new io.tapstate.spi.store.SourcePositionEdits.Logged(f.chains().load(CHAIN).orElseThrow(),
+                Map.of(A, f.consumers().progress(A).orElseThrow(), B, f.consumers().progress(B).orElseThrow()), token, capture);
+    }
+
     private static void withBusiness(Scenario scenario) {
         try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var database = client.getDatabase("srs_consumer_" + UUID.randomUUID().toString().replace("-", ""));

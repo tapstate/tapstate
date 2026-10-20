@@ -211,8 +211,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 if(source.direct.epoch()!=allocated)throw refused();
                 var binding=DirectSourceRun.of(run.original,source.direct);direct.put(source.id,binding);
                 var cursor=source.direct.cursor();
-                String token=cursor.sinkAcked()!=null?cursor.sinkAcked().token():cursor.cdcStartPosition();
-                if(token==null)token=source.direct.current().anchor();
+                String token=source.direct.resumeToken();
                 source.start=token==null?sourceStart(pipeline):CaptureStart.resume(new SourcePosition(token));
             }
             var logged=new LinkedHashMap<String,PipelineCaptureBindings.LoggedSource>();
@@ -399,7 +398,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(!current.chains().publishServingTables(owner.prepared.chainId(),epoch,before.requestedTables(),owner.fence))throw refused();
         var opened=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes());
-        var start=opened.checkpoint()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.checkpoint().position().token()));
+        var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;owner.configured=configured;var notes=configured;
         try {physical.tail=runtime.startTail(stores.scope(),opened,owner.fence,config,start,writer -> ports.open(notes,config,physical.guard,null,writer::prepare),physical.guard);}
         catch(RuntimeException|Error failure){cleanup(failure,physical::close);throw failure;}

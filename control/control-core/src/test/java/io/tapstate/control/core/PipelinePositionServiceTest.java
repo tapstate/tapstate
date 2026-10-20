@@ -54,6 +54,20 @@ class PipelinePositionServiceTest {
             chains::get, meta, artifacts, new LivePipelines(desired, state),
             new AuditGate(audit, Clock.fixed(WRITTEN_AT, ZoneOffset.UTC)));
 
+    @Test void nativePreflightPrecedesAuditButAFailedAuditNeverInvokesItsCommand() {
+        onOneChain("orders_sync");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(1, 1), "old"), List.of(), List.of(), null, 1, WRITTEN_AT));
+        var events = new ArrayList<String>(); var actions = new java.util.concurrent.atomic.AtomicInteger();
+        var guarded = new PipelinePositionService(chains::get, meta, artifacts, new LivePipelines(desired, state),
+                new AuditGate(record -> { events.add("audit"); throw new IllegalStateException("fixture audit unavailable"); }, Clock.fixed(WRITTEN_AT, ZoneOffset.UTC)),
+                (pipeline, before, moves) -> { events.add("prepare"); return actions::incrementAndGet; });
+        var request = new PipelinePosition("orders_sync", List.of(new PipelinePosition.Chain(CHAIN, null, List.of(),
+                new PipelinePosition.Point("requested", null, null), null, null, List.of())));
+        var refused = catchThrowableOfType(TapstateException.class, () -> guarded.writeBack("admin", "orders_sync", request));
+        assertThat(refused.code()).isEqualTo(ControlError.AUDIT_BLOCKED);
+        assertThat(events).containsExactly("prepare", "audit"); assertThat(actions).hasValue(0); assertThat(meta.rewinds).isEmpty();
+    }
+
     // ------------------------------------------------------------------ reading
 
     @Test

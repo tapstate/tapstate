@@ -59,15 +59,15 @@ final class MongoDirectChannelRecords {
         if (currentHash == null || retainedHash == null || !currentHash.matches("[0-9a-f]{64}") || !retainedHash.matches("[0-9a-f]{64}")) throw unreadable();
         return hash(new Document("_id",id(value.context())).append("formatVersion",1).append("tables",sorted(value.tables())).append("revision",value.revision())
                 .append("current",window(value.current())).append("retained",window(value.retained())).append("cursor",cursor(value.cursor()))
-                .append("writerRun",writers(value.writerRun())).append("currentPendingHash",currentHash).append("retainedPendingHash",retainedHash));
+                .append("writerRun",writers(value.writerRun())).append("resumeOverride",MongoResumeOverrides.stored(value.resumeOverride())).append("currentPendingHash",currentHash).append("retainedPendingHash",retainedHash));
     }
     static DirectChannelProgress progress(Document row) {
         try {
-            if (row == null || !row.keySet().equals(Set.of("_id","formatVersion","tables","revision","current","retained","cursor","writerRun","currentPendingHash","retainedPendingHash","contentHash"))
+            if (row == null || !row.keySet().equals(Set.of("_id","formatVersion","tables","revision","current","retained","cursor","writerRun","resumeOverride","currentPendingHash","retainedPendingHash","contentHash"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion"))) throw unreadable();
             var context = context(row.get("_id",Document.class));
             var result = new DirectChannelProgress(context,strings(row.get("tables")),number(row,"revision"),window(row.get("current",Document.class)),
-                    window(row.get("retained",Document.class)),cursor(context,row.get("cursor",Document.class)),writers(row.get("writerRun",Document.class)));
+                    window(row.get("retained",Document.class)),cursor(context,row.get("cursor",Document.class)),writers(row.get("writerRun",Document.class)),MongoResumeOverrides.read(row.get("resumeOverride")));
             if (!progress(result,row.getString("currentPendingHash"),row.getString("retainedPendingHash")).equals(row)) throw unreadable(); return result;
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }

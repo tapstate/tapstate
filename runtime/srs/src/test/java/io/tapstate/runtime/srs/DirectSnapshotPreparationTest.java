@@ -51,15 +51,56 @@ class DirectSnapshotPreparationTest {
                 .isInstanceOf(TapstateException.class);
         assertThat(f.actions).isEmpty();
     }
+    @Test void aRequestedResumeDoesNotPublishAnOldBaselineWhileFinishingTheRetainedSnapshot() {
+        var f = new Fixture(true,Set.of("a","b"),true);
+        try (var load = SnapshotPhase.openDirectPrepared(f.port,CONFIG,f.preparation)) {
+            assertThat(load.read(row -> { throw new AssertionError("no snapshot owed"); },table -> {})).isZero();
+        }
+        assertThat(f.actions).isEmpty(); assertThat(f.current.get().resumeOverride().token()).isEqualTo("requested");
+        assertThat(f.current.get().cursor().sinkAcked().token()).isEqualTo("settled");
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void aNativeRetainedSnapshotStartsAndAcknowledgesOnlyTheRequestedNewTail(boolean partial) throws Exception {
+        var f = new Fixture(true,partial?Set.of("a"):Set.of("a","b"),true); f.allowTail = true;
+        var delivered = new java.util.concurrent.CopyOnWriteArrayList<Envelope>();
+        var stores = new SrsStores(unused(SrsChainStore.class),unused(SrsModelStore.class),unused(SrsLogStore.class),unused(SrsConsumerStore.class));
+        try (var runtime = new NativeSrsCaptureRunUnit(new CacheBusinessScope("cluster",1,"cache"),stores,unused(com.hazelcast.core.HazelcastInstance.class))) {
+            var run = runtime.beginDirectSnapshot(CONFIG,f.original,f,preparation -> { f.activePreparation=preparation; return f.port; },
+                    CaptureHandoff.of(delivered::add),2,() -> {});
+            long deadline = System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+            while (f.tailOpened.getCount()!=0 && run.health().failure().isEmpty() && System.nanoTime()<deadline)
+                java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10));
+            assertThat(run.health().failure()).isEmpty(); assertThat(f.tailOpened.getCount()).isZero();
+            assertThat(f.actualStart).isEqualTo(CaptureStart.resume(new SourcePosition("requested")));
+            assertThat(f.acknowledged.await(2,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(f.acks).containsExactly("requested");
+            if(partial) {
+                assertThat(f.actions).containsExactly("pin:original-seam","anchor:requested");
+                assertThat(f.reads).containsExactly("b"); assertThat(delivered).singleElement().satisfies(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(1)));
+            } else { assertThat(f.actions).containsExactly("anchor:requested"); assertThat(f.reads).isEmpty(); assertThat(delivered).isEmpty(); }
+            assertThat(f.current.get().resumeOverride()).isNull();
+        }
+    }
+    @SuppressWarnings("unchecked") private static <T> T unused(Class<T> type) {
+        return (T)java.lang.reflect.Proxy.newProxyInstance(type.getClassLoader(),new Class<?>[]{type},
+                (proxy,method,args) -> { throw new AssertionError("a direct snapshot cannot use "+type.getSimpleName()); });
+    }
     private static SourceTable table(String name){return new SourceTable(name,List.of(new SourceField("id","INT")),List.of("id"),List.of());}
     private static final class Fixture implements DirectChannelStore {
         final List<String> actions=new ArrayList<>(),reads=new ArrayList<>();final AtomicInteger closed=new AtomicInteger(),next=new AtomicInteger();
-        final DirectChannelProgress original;final DirectSnapshotPreparation preparation;final CapturePort port;boolean allowPin=true;
-        Fixture(boolean retained,Set<String> complete) {
+        final DirectChannelProgress original;final DirectSnapshotPreparation preparation;DirectSnapshotPreparation activePreparation;final CapturePort port;boolean allowPin=true,allowTail;
+        final java.util.concurrent.atomic.AtomicReference<DirectChannelProgress> current;
+        final java.util.concurrent.CountDownLatch tailOpened=new java.util.concurrent.CountDownLatch(1),acknowledged=new java.util.concurrent.CountDownLatch(1);
+        final List<String> acks=new java.util.concurrent.CopyOnWriteArrayList<>(); volatile CaptureStart actualStart;
+        Fixture(boolean retained,Set<String> complete) { this(retained,complete,false); }
+        Fixture(boolean retained,Set<String> complete,boolean override) {
             long epoch=retained?2:1;var point=retained?new ChainPosition(new SourceOrder(1,4),"settled"):null;
             var cursor=new ConsumerOffset(CONTEXT.consumerId(),Map.of(),point,List.copyOf(complete),retained?"original-seam":null,retained?1:0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
-            original=new DirectChannelProgress(CONTEXT,Set.of("a","b"),3,new DirectCaptureWindow(epoch,CAPTURE,PIPELINE,null,0,0,null,null),null,cursor,null);
-            preparation=new DirectSnapshotPreparation(original,this,() -> {});port=new Port();
+            original=new DirectChannelProgress(CONTEXT,Set.of("a","b"),3,new DirectCaptureWindow(epoch,CAPTURE,PIPELINE,null,0,0,null,null),null,cursor,null,
+                    override?new SourceResumeOverride("requested",1,java.time.Instant.EPOCH):null);
+            current=new java.util.concurrent.atomic.AtomicReference<>(original);
+            preparation=new DirectSnapshotPreparation(original,this,() -> {});activePreparation=preparation;port=new Port();
         }
         final class Port implements CapturePort,SnapshotSession.PreparedProvider {
             public SnapshotSession snapshotSession(CaptureConfig config){throw new AssertionError("unprepared snapshot");}
@@ -69,11 +110,11 @@ class DirectSnapshotPreparationTest {
                     public CaptureBatch read(String name) {
                         reads.add(name);
                         if(!prepared) {var tables=new HashMap<String,SourceTable>();config.streams().forEach(table -> tables.put(table,table(table)));
-                            preparation.prepare(request,new SourcePosition("sampled"),tables);prepared=true;}
+                            activePreparation.prepare(request,new SourcePosition("sampled"),tables);prepared=true;}
                         var rows=List.of(Envelope.read(1,name,Map.of("id",1),null)).iterator();
                         return new CaptureBatch() {
                             public boolean hasNext(){return rows.hasNext();}
-                            public Envelope next(){assertThat(actions).hasSize(2);next.incrementAndGet();return rows.next();}
+                            public Envelope next(){assertThat(actions).hasSize(original.resumeOverride()==null?2:1);next.incrementAndGet();return rows.next();}
                             public Optional<SourcePosition> seam(){return Optional.of(new SourcePosition("sampled"));}
                             public void close(){}
                         };
@@ -82,14 +123,28 @@ class DirectSnapshotPreparationTest {
                 };
             }
             public CaptureBatch snapshot(CaptureConfig config){throw new AssertionError("unprepared read");}
-            public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener listener){throw new AssertionError("no tail here");}
+            public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener listener){
+                if(!allowTail)throw new AssertionError("no tail here"); actualStart=start;
+                ((CaptureStartedListener)listener).onStart(((CaptureStart.Resume)start).position()); tailOpened.countDown();
+                return new Subscription(){public void acknowledge(SourcePosition point){acks.add(point.token());acknowledged.countDown();}public void close(){}};
+            }
             public ConnectionReport testConnection(CaptureConfig config){throw new AssertionError();}
             public DiscoveredSchema discoverSchema(CaptureConfig config){throw new AssertionError();}
         }
         public DirectChannelStore guardedBy(Runnable guard){return this;}
         public boolean pinSnapshot(DirectChannelContext context,long revision,long epoch,String token,WorkloadClaimFence pipeline){assertThat(context).isEqualTo(CONTEXT);assertThat(revision).isEqualTo(3);assertThat(epoch).isEqualTo(1);assertThat(pipeline).isEqualTo(PIPELINE);actions.add("pin:"+token);return allowPin;}
-        public boolean confirmAnchor(DirectChannelContext context,long epoch,String token,WorkloadClaimFence capture,WorkloadClaimFence pipeline){assertThat(context).isEqualTo(CONTEXT);assertThat(epoch).isEqualTo(original.epoch());assertThat(capture).isEqualTo(CAPTURE);assertThat(pipeline).isEqualTo(PIPELINE);actions.add("anchor:"+token);return true;}
-        public DirectChannelProgress load(DirectChannelContext context){throw new AssertionError();}
+        public boolean confirmAnchor(DirectChannelContext context,long epoch,String token,WorkloadClaimFence capture,WorkloadClaimFence pipeline){
+            assertThat(context).isEqualTo(CONTEXT);assertThat(epoch).isEqualTo(original.epoch());assertThat(capture).isEqualTo(CAPTURE);assertThat(pipeline).isEqualTo(PIPELINE);
+            actions.add("anchor:"+token); var held=current.get();
+            if(held.resumeOverride()!=null) {
+                if(!held.resumeOverride().token().equals(token))throw new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",CONTEXT.channelId()),null);
+                var before=held.cursor(); var cursor=new ConsumerOffset(before.pipelineId(),Map.of(),new ChainPosition(SourceOrder.snapshotRow(epoch),token),
+                        before.snapshotCompletedTables(),before.cdcStartPosition(),before.snapshotEpoch(),Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
+                current.set(new DirectChannelProgress(CONTEXT,held.tables(),held.revision()+1,new DirectCaptureWindow(epoch,CAPTURE,PIPELINE,token,0,0,null,null),null,cursor,null));
+            }
+            return true;
+        }
+        public DirectChannelProgress load(DirectChannelContext context){assertThat(context).isEqualTo(CONTEXT);return current.get();}
         public List<DirectBatch> pending(DirectChannelContext context,long epoch){throw new AssertionError();}
         public OptionalLong beginCapture(DirectChannelContext context,long revision,long epoch,WorkloadClaimFence capture,WorkloadClaimFence pipeline){throw new AssertionError();}
         public boolean beginWriterRun(DirectChannelContext context,long epoch,String run,Map<String,List<String>> expected,WorkloadClaimFence pipeline){throw new AssertionError();}

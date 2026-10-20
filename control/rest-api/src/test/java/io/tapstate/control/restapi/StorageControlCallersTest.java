@@ -17,6 +17,9 @@ class StorageControlCallersTest {
     private static final StorageSetupScope SETUP = new StorageSetupScope("cluster", "installation",
             "c3a8a189-2177-49e1-bbf4-6d8a9e1cf65e", 1);
 
+    private static StorageControlCaller ordinary(StorageBinding.Mode mode, java.util.function.Supplier<StorageSetupScope> setups) {
+        return StorageControlCallers.ordinary((principal, original) -> StorageControlAccess.ordinary(mode, setups, principal, original));
+    }
     @AfterEach void clear() { SecurityContextHolder.clearContext(); }
 
     @Test void selectedRequestKeepsItsOriginalScopeAndRechecksItsOriginalCredential() {
@@ -29,7 +32,7 @@ class StorageControlCallersTest {
         var selected = new TapstateCredentialAuthenticationProvider(credentials)
                 .authenticate(new TapstateCredentialAuthenticationToken("credential"));
         SecurityContextHolder.getContext().setAuthentication(selected);
-        var caller = StorageControlCallers.ordinary(StorageBinding.Mode.OP, () -> SETUP).current();
+        var caller = ordinary(StorageBinding.Mode.OP, () -> SETUP).current();
         assertThat(caller.cache()).isEqualTo(ORIGINAL);
         assertThat(selected.getCredentials()).isEqualTo("");
         active.set(false);
@@ -43,7 +46,7 @@ class StorageControlCallersTest {
         var credentials = new CredentialAuthenticator(raw -> Optional.of(verified));
         SecurityContextHolder.getContext().setAuthentication(new TapstateCredentialAuthenticationProvider(credentials)
                 .authenticate(new TapstateCredentialAuthenticationToken("old-jwt")));
-        assertThatThrownBy(() -> StorageControlCallers.ordinary(StorageBinding.Mode.OP, () -> SETUP).current())
+        assertThatThrownBy(() -> ordinary(StorageBinding.Mode.OP, () -> SETUP).current())
                 .isInstanceOf(TapstateException.class)
                 .extracting(error -> ((TapstateException)error).code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE);
     }
@@ -73,8 +76,22 @@ class StorageControlCallersTest {
         var credentials = CredentialAuthenticator.scoped(raw -> Optional.of(verified));
         SecurityContextHolder.getContext().setAuthentication(new TapstateCredentialAuthenticationProvider(credentials)
                 .authenticate(new TapstateCredentialAuthenticationToken("tcs_setup-cookie")));
-        var caller = StorageControlCallers.ordinary(StorageBinding.Mode.CLOUD, () -> SETUP).current();
+        var caller = ordinary(StorageBinding.Mode.CLOUD, () -> SETUP).current();
         caller.require(ControlOperations.STORAGE_STATUS);
         assertThatThrownBy(caller::cache).isInstanceOf(TapstateException.class);
     }
+    @Test void anInvalidatedOriginalCredentialCannotReadConfigurationBeforeReauthentication() {
+        var active = new AtomicBoolean(true); var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var verified = new CredentialAuthentication(new VerifiedToken("alice", Scope.ADMIN), Optional.of(ORIGINAL), Optional.empty(), () -> {
+            if (!active.get()) throw new TapstateException(ControlError.UNAUTHENTICATED,Map.of(),null);
+        });
+        var credentials = CredentialAuthenticator.scoped(raw -> Optional.of(verified));
+        SecurityContextHolder.getContext().setAuthentication(new TapstateCredentialAuthenticationProvider(credentials)
+                .authenticate(new TapstateCredentialAuthenticationToken("credential")));
+        active.set(false);
+        assertThatThrownBy(() -> ordinary(StorageBinding.Mode.OP, () -> { reads.incrementAndGet(); return SETUP; }).current())
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+        assertThat(reads).hasValue(0);
+    }
+
 }

@@ -40,14 +40,26 @@ public final class PipelinePositionService {
     private final ArtifactStore artifacts;
     private final LivePipelines live;
     private final AuditGate auditGate;
+    private final WriteBack nativeWriteBack;
+
+    @FunctionalInterface
+    public interface WriteBack {
+        /** Reads and fixes the original command before audit; the returned action performs the write. */
+        Runnable prepare(String pipelineId, PipelinePosition current, Map<String, String> moves);
+    }
 
     public PipelinePositionService(PipelineChains chains, SrsMetaStore meta, ArtifactStore artifacts,
             LivePipelines live, AuditGate auditGate) {
+        this(chains, meta, artifacts, live, auditGate, null);
+    }
+    public PipelinePositionService(PipelineChains chains, SrsMetaStore meta, ArtifactStore artifacts,
+            LivePipelines live, AuditGate auditGate, WriteBack nativeWriteBack) {
         this.chains = Objects.requireNonNull(chains, "chains");
         this.meta = Objects.requireNonNull(meta, "meta");
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.live = Objects.requireNonNull(live, "live");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
+        this.nativeWriteBack = nativeWriteBack;
     }
 
     /**
@@ -97,9 +109,11 @@ public final class PipelinePositionService {
         for (String chainId : moves.keySet()) {
             refuseWhileAnyReaderIsUp(chainId, current);
         }
+        Runnable nativeAction = nativeWriteBack == null ? null : nativeWriteBack.prepare(pipelineId, current, Map.copyOf(moves));
         return auditGate.dispatch(
                 ControlOperations.PIPELINE_SET_POSITION, new AuditContext(caller, pipelineId), () -> {
-                    moves.forEach((chainId, token) -> {
+                    if (nativeAction != null) nativeAction.run();
+                    else moves.forEach((chainId, token) -> {
                         releaseTheAcksThatWouldOutrankIt(chainId);
                         meta.rewindSourceReadOffset(chainId, token);
                     });

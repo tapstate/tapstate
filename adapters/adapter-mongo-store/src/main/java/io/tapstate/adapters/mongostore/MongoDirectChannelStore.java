@@ -58,11 +58,15 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
             proveCapture(session,capture); var old = held.value(); var current = original(old,epoch,capture,pipeline);
             if (current == null) return false;
             if (current.anchor() != null) return current.anchor().equals(sourcePosition);
-            if (old.cursor().sinkAcked() != null && !old.cursor().sinkAcked().token().equals(sourcePosition)) throw unavailable(context);
+            boolean overriding = old.resumeOverride() != null && epoch > old.resumeOverride().fromEpoch();
+            if (overriding ? !old.resumeOverride().token().equals(sourcePosition)
+                    : old.cursor().sinkAcked() != null && !old.cursor().sinkAcked().token().equals(sourcePosition)) throw unavailable(context);
             if (old.retained() != null) remove(session,held.retained());
             var cursor = cursor(old.cursor(),new ChainPosition(SourceOrder.snapshotRow(epoch),sourcePosition));
             var anchored = new DirectCaptureWindow(epoch,capture,pipeline,sourcePosition,0,0,null,null);
-            replace(session,old,next(old,anchored,null,cursor,old.writerRun()),List.of(),List.of()); return true;
+            if (old.revision() >= Long.MAX_VALUE - 1) throw unavailable(context);
+            var next = new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,anchored,null,cursor,old.writerRun(),overriding?null:old.resumeOverride());
+            replace(session,old,next,List.of(),List.of()); return true;
         });
     }
     @Override public boolean pinSnapshot(DirectChannelContext context,long expectedRevision,long snapshotEpoch,String sourcePosition,WorkloadClaimFence pipeline) {
@@ -116,15 +120,41 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
             var old = held.value(); var current = old.current(); var run = old.writerRun();
             if (current == null || current.epoch() != epoch || run == null || !run.accounting().runId().equals(runId)) return false;
             if (!current.pipelineFence().equals(pipeline) || !run.commandFence().equals(pipeline)) throw fenced();
-            if (current.anchor() == null || !run.accounting().expectedFor(table).contains(writer)) throw unavailable(context);
+            if (!run.accounting().expectedFor(table).contains(writer)) throw unavailable(context);
+            if (current.anchor() == null && !snapshotBeforeRequestedAnchor(old, report)) throw unavailable(context);
             var next = DirectChannelAccounting.report(old,table,writer,report);
-            if (!next.cursor().equals(old.cursor()) || !next.writers().equals(run))
-                settleAndReplace(session,old,current,next.cursor(),next.writers(),held.current());
+            if (!next.cursor().equals(old.cursor()) || !next.writers().equals(run)) {
+                if (current.anchor() == null) replace(session,old,next(old,current,old.retained(),next.cursor(),next.writers()),held.current(),held.retained());
+                else settleAndReplace(session,old,current,next.cursor(),next.writers(),held.current());
+            }
             return true;
         });
     }
+    private static boolean snapshotBeforeRequestedAnchor(DirectChannelProgress old, WriterProgress report) {
+        var pending = old.resumeOverride(); var cursor = old.cursor();
+        if (pending == null || old.epoch() <= pending.fromEpoch() || cursor.snapshotEpoch() < 1) return false;
+        if (report.durableThrough().epoch() == 0) return report.lastTokened() == null;
+        var row = SourceOrder.snapshotRow(cursor.snapshotEpoch());
+        if (!report.durableThrough().equals(row) && !report.durableThrough().equals(new SourceOrder(cursor.snapshotEpoch(), Long.MAX_VALUE))) return false;
+        return report.lastTokened() == null || row.equals(report.lastTokened().order()) && cursor.cdcStartPosition().equals(report.lastTokened().token());
+    }
+    void editPosition(ClientSession session, DirectChannelProgress expected, String token, java.time.Instant at,
+                      WorkloadClaimFence capture, WorkloadClaimFence pipeline) {
+        var context = expected.context();
+        requireCapture(context, capture); proveCapture(session, capture);
+        var held = held(session, context); var old = held.value();
+        if (!old.equals(expected) || old.cursor().sinkAcked() == null || token.isBlank()
+                || old.current() == null || !MongoPositionFences.retained(old.current().pipelineFence(), pipeline)) throw unavailable(context);
+        var before = old.cursor();
+        var cursor = new ConsumerOffset(before.pipelineId(), Map.of(), before.sinkAcked(), before.snapshotCompletedTables(),
+                before.cdcStartPosition(), before.snapshotEpoch(), Map.of(), ConsumerProgressKind.DIRECT_SOURCE);
+        if (old.revision() >= Long.MAX_VALUE - 1) throw unavailable(context);
+        var next = new DirectChannelProgress(context, old.tables(), old.revision()+1, old.current(), old.retained(), cursor, null,
+                new SourceResumeOverride(token, old.epoch(), at));
+        replace(session, old, next, held.current(), held.retained());
+    }
     private void settleAndReplace(ClientSession session,DirectChannelProgress before,DirectCaptureWindow window,ConsumerOffset cursor,DirectWriterRun run,List<DirectBatch> pending) {
-        var prospective = new DirectChannelProgress(before.context(),before.tables(),before.revision(),window,null,cursor,run);
+        var prospective = new DirectChannelProgress(before.context(),before.tables(),before.revision(),window,null,cursor,run,before.resumeOverride());
         var settled = DirectChannelAccounting.settle(prospective,pending);
         remove(session,pending.stream().filter(batch -> batch.ordinal() <= settled.through()).toList());
         var nextWindow = new DirectCaptureWindow(window.epoch(),window.captureFence(),window.pipelineFence(),window.anchor(),window.recordedThrough(),settled.through(),window.lastBoundary(),window.lastBatchHash());
@@ -141,7 +171,7 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
     }
     private static DirectChannelProgress next(DirectChannelProgress old,DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun run) {
         if (old.revision() >= Long.MAX_VALUE - 1) throw unavailable(old.context());
-        return new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,current,retained,cursor,run);
+        return new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,current,retained,cursor,run,old.resumeOverride());
     }
     private record Held(DirectChannelProgress value,List<DirectBatch> current,List<DirectBatch> retained) {}
     void requireChannel(ClientSession session,DirectChannelContext context) { held(session,context); }

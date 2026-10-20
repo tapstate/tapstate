@@ -82,7 +82,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
                 .append("captureId", fence.key().resourceId()).append("captureFence", WorkloadClaimDocuments.stored(fence))
                 .append("retention", retention).append("epoch", 0L).append("requestedTables", List.of())
                 .append("servingTables", List.of()).append("modelContextHeads", List.of()).append("modelWriteFence", 0L)
-                .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L);
+                .append("checkpointRevision", 0L).append("checkpoint", null).append("checkpointAt", null).append("consumerCount", 0L).append("consumerRevision", 0L)
+                .append("resumeOverride", null);
     }
     @Override public Optional<SrsChainState> load(String chain) {
         requireName(chain);
@@ -152,6 +153,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
             validateCheckpoint(session, chain, checkpoint, fence, true);
             var replacement = new Document(row).append("checkpointRevision", expectedRevision + 1)
                     .append("checkpoint", checkpointDocument(checkpoint)).append("checkpointAt", Date.from(Instant.now()));
+            if (held.resumeOverride() != null && checkpoint.position().order().epoch() > held.resumeOverride().fromEpoch()) replacement.put("resumeOverride", null);
             replace(session, row, replacement); return Optional.of(decode(replacement));
         });
     }
@@ -191,13 +193,13 @@ public final class MongoSrsChainStore implements SrsChainStore {
         }
         return false;
     }
-    private void prove(ClientSession session, WorkloadClaimFence fence) {
+    void prove(ClientSession session, WorkloadClaimFence fence) {
         Objects.requireNonNull(fence, "originalCaptureFence");
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())
                 || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(fence),
                 new Document("$inc", new Document("fencedChainWrites", 1L))).getMatchedCount() != 1) throw fenced();
     }
-    private void requireCapture(Document row, WorkloadClaimFence fence) {
+    void requireCapture(Document row, WorkloadClaimFence fence) {
         decode(row);
         if (!fence.key().resourceId().equals(row.get("captureId"))) throw fenced();
     }
@@ -216,7 +218,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     static SrsChainState decode(Document row, CacheBusinessScope scope, MongoSrsModelContexts contexts) {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "captureId", "captureFence", "retention", "epoch",
-                    "requestedTables", "servingTables", "modelContextHeads", "modelWriteFence", "checkpointRevision", "checkpoint", "checkpointAt", "consumerCount", "consumerRevision"))
+                    "requestedTables", "servingTables", "modelContextHeads", "modelWriteFence", "checkpointRevision", "checkpoint", "checkpointAt", "consumerCount", "consumerRevision", "resumeOverride"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion")) || !scope.cacheIncarnation().equals(row.get("cacheIncarnation"))
                     || !(row.get("epoch") instanceof Long epoch) || !(row.get("checkpointRevision") instanceof Long revision)
                     || !(row.get("consumerCount") instanceof Long consumerCount) || !(row.get("consumerRevision") instanceof Long consumerRevision)
@@ -230,7 +232,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
             if (row.get("checkpointAt") != null && !(row.get("checkpointAt") instanceof Date)) throw unreadable();
             return new SrsChainState(row.getString("_id"), row.getString("captureId"), row.getString("retention"), epoch,
                     tableSet(row.get("requestedTables")), tableSet(row.get("servingTables")), revision, checkpoint,
-                    row.getDate("checkpointAt") == null ? null : row.getDate("checkpointAt").toInstant(), consumerCount, consumerRevision);
+                    row.getDate("checkpointAt") == null ? null : row.getDate("checkpointAt").toInstant(), consumerCount, consumerRevision,
+                    MongoResumeOverrides.read(row.get("resumeOverride")));
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
     private static Document checkpointDocument(SrsCaptureCheckpoint checkpoint) {

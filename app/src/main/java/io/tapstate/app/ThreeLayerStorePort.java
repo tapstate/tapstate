@@ -161,16 +161,63 @@ final class ThreeLayerStorePort implements StorePort {
             @Override public Duration retention() { active(); return bound.cache().rateRetention(); }
         };
     }
+    private Optional<DirectChannelProgress> directProgress(String chain) {
+        active();
+        for (var resource : configuration.artifacts().list()) {
+            if (!(resource instanceof io.tapstate.core.model.PipelineResource pipeline)) continue;
+            var mode = pipeline.settings() == null || pipeline.settings().readMode() == null
+                    ? io.tapstate.core.model.ReadMode.SNAPSHOT_AND_CDC : pipeline.settings().readMode();
+            if (mode == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY) continue;
+            for (var reference : pipeline.sources()) {
+                if (!(reference instanceof io.tapstate.core.model.SourceRef.Spec spec) || spec.srs()) continue;
+                var source = StoredArtifacts.requireSource(configuration.artifacts(), reference.id());
+                var key = source.srs() == null ? null : source.srs().key();
+                if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(source.connector(), source.config(), key, pipeline.id(), source.id()))) continue;
+                if (unprepared(pipeline.id())) return Optional.empty();
+                var tables = PipelineTableSelection.resolve(pipeline, source, SourceDiscovery.model(this, source));
+                var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, mode,
+                        pipeline.settings() == null ? null : pipeline.settings().startFrom(), tables);
+                var original = bound.cache().directChannels(business(), this::active).load(channel.context());
+                return Optional.of(original);
+            }
+        }
+        return Optional.empty();
+    }
+    private Optional<SrsMeta> directPosition(String chain) {
+        return directProgress(chain).map(original -> {
+            var pending = original.resumeOverride();
+            var position = pending == null ? original.cursor().sinkAcked() : new ChainPosition(null, pending.token());
+            return new SrsMeta(chain, position, List.of(original.cursor()), List.of(), null, original.epoch(),
+                    pending == null ? null : pending.editedAt(), false);
+        });
+    }
     @Override public SrsMetaStore meta() {
         return new SrsMetaStore() {
             private SrsStores stores() { active(); return bound.cache().srs(business(), ThreeLayerStorePort.this::active); }
             @Override public Optional<SrsMeta> read(String chain) {
                 var stores = stores();
-                return stores.chains().load(chain).map(original -> {
+                var shared = stores.chains().load(chain);
+                if (shared.isEmpty()) return directPosition(chain);
+                return shared.map(original -> {
                     var topology = stores.consumers().attached(chain);
                     var cursors = topology.consumers().stream().map(member -> stores.consumers().cursor(member.context()).orElseThrow(ThreeLayerStorePort::refused)).toList();
-                    return new SrsMeta(chain, original.checkpoint() == null ? null : original.checkpoint().position(), cursors,
-                            List.of(), original.retention(), original.epoch(), original.checkpointAt(), original.checkpoint() != null);
+                    return new SrsMeta(chain, original.resumeOverride() != null ? new ChainPosition(null, original.resumeOverride().token())
+                            : original.checkpoint() == null ? null : original.checkpoint().position(), cursors,
+                            List.of(), original.retention(), original.epoch(), original.resumeOverride() != null ? original.resumeOverride().editedAt() : original.checkpointAt(), original.resumeOverride() == null && original.checkpoint() != null);
+                });
+            }
+            @Override public Optional<DurableSourceRead> durableSourceRead(String chain) {
+                var shared = stores().chains().load(chain);
+                if (shared.isPresent()) {
+                    var original = shared.orElseThrow();
+                    if (original.resumeOverride() != null || original.checkpoint() == null
+                            || original.checkpoint().position().order().epoch() != original.epoch()) return Optional.empty();
+                    return Optional.of(new DurableSourceRead(original.checkpoint().position(), true));
+                }
+                return directProgress(chain).flatMap(original -> {
+                    var point = original.cursor().sinkAcked();
+                    return original.resumeOverride() != null || original.current() == null || original.current().anchor() == null
+                            || point == null || point.order().epoch() != original.epoch() ? Optional.empty() : Optional.of(new DurableSourceRead(point, false));
                 });
             }
             @Override public List<String> miningChainIdsWithConsumer(String pipeline) {

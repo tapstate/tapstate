@@ -125,6 +125,15 @@ class DirectCaptureWriterTest {
         assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.DIRECT_CHANNEL_UNAVAILABLE));
     }
     /** Explicit confirmed control values isolate producer sequencing; native adapter transactions are tested separately. */
+    @Test void aRequestedResumeOverridesTheRetainedConfirmedTokenUntilTheActualNewAnchor() {
+        var f = new Fixture(2,true);
+        assertThat(f.progress.get().cursor().sinkAcked().token()).isEqualTo("old-confirmed");
+        try (var source = f.writer.start(f.port,CONFIG,CaptureStart.resume(new SourcePosition("requested")),new CaptureHealth())) {
+            assertThat(f.progress.get().current().anchor()).isEqualTo("requested");
+            assertThat(f.progress.get().cursor().sinkAcked().order()).isEqualTo(SourceOrder.snapshotRow(2));
+            assertThat(f.progress.get().resumeOverride()).isNull();
+        }
+    }
     private static final class Fixture {
         final Store store=new Store(); final Port port=new Port(); final Source source=new Source();
         final AtomicBoolean active=new AtomicBoolean(true),refuseBatch=new AtomicBoolean();
@@ -132,11 +141,17 @@ class DirectCaptureWriterTest {
         final CountDownLatch blocked=new CountDownLatch(1); final AtomicReference<DirectChannelProgress> progress;
         final DirectCaptureWriter writer; final int capacity; CaptureStartedListener listener; Subscription subscription;
         volatile Runnable afterReceipt=() -> {}; volatile boolean acknowledgeEveryRow,acknowledgeOnlyA; volatile int expectedBlockedAfter;
-        Fixture(int capacity) {
+        Fixture(int capacity) { this(capacity,false); }
+        Fixture(int capacity,boolean override) {
             this.capacity=capacity; expectedBlockedAfter=capacity;
             var cursor=new ConsumerOffset(CONTEXT.consumerId(),Map.of(),null,List.of(),null,0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
             var window=new DirectCaptureWindow(1,CAPTURE,PIPELINE,null,0,0,null,null);
-            progress=new AtomicReference<>(new DirectChannelProgress(CONTEXT,Set.of("a","b"),0,window,null,cursor,null));
+            if (override) {
+                cursor = new ConsumerOffset(CONTEXT.consumerId(),Map.of(),new ChainPosition(SourceOrder.snapshotRow(1),"old-confirmed"),List.of(),null,0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
+                window = new DirectCaptureWindow(2,CAPTURE,PIPELINE,null,0,0,null,null);
+            }
+            progress=new AtomicReference<>(new DirectChannelProgress(CONTEXT,Set.of("a","b"),0,window,null,cursor,null,
+                    override?new SourceResumeOverride("requested",1,java.time.Instant.EPOCH):null));
             writer=new DirectCaptureWriter(progress.get(),CAPTURE,PIPELINE,store,event -> {
                 if(event.position().token()!=null)assertThat(batches).isNotEmpty();
                 delivered.add(event);if(acknowledgeEveryRow || acknowledgeOnlyA && event.src().equals("a"))acknowledge(event);
@@ -156,9 +171,9 @@ class DirectCaptureWriterTest {
                 assertThat(context).isEqualTo(CONTEXT);if(delivered.size()>=expectedBlockedAfter)blocked.countDown();return progress.get();
             }
             public boolean confirmAnchor(DirectChannelContext context,long epoch,String token,WorkloadClaimFence capture,WorkloadClaimFence pipeline) {
-                assertThat(context).isEqualTo(CONTEXT);assertThat(epoch).isEqualTo(1);assertThat(capture).isEqualTo(CAPTURE);assertThat(pipeline).isEqualTo(PIPELINE);
-                var old=progress.get();var anchored=new DirectCaptureWindow(1,CAPTURE,PIPELINE,token,0,0,null,null);
-                var next=new ConsumerOffset(CONTEXT.consumerId(),Map.of(),new ChainPosition(SourceOrder.snapshotRow(1),token),List.of(),null,0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
+                assertThat(context).isEqualTo(CONTEXT);assertThat(epoch).isEqualTo(progress.get().epoch());assertThat(capture).isEqualTo(CAPTURE);assertThat(pipeline).isEqualTo(PIPELINE);
+                var old=progress.get();var anchored=new DirectCaptureWindow(epoch,CAPTURE,PIPELINE,token,0,0,null,null);
+                var next=new ConsumerOffset(CONTEXT.consumerId(),Map.of(),new ChainPosition(SourceOrder.snapshotRow(epoch),token),List.of(),null,0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
                 progress.set(new DirectChannelProgress(CONTEXT,old.tables(),old.revision()+1,anchored,null,next,null));return true;
             }
             public boolean recordBatch(DirectBatch batch,long expected,WorkloadClaimFence capture,WorkloadClaimFence pipeline) {
@@ -176,7 +191,7 @@ class DirectCaptureWriterTest {
         private final class Port implements CapturePort {
             final AtomicInteger opens=new AtomicInteger();
             public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener target) {
-                opens.incrementAndGet();listener=(CaptureStartedListener)target;listener.onStart(new SourcePosition("start"));return source;
+                opens.incrementAndGet();listener=(CaptureStartedListener)target;listener.onStart(start instanceof CaptureStart.Resume resume?resume.position():new SourcePosition("start"));return source;
             }
             public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError("tail cannot read a new snapshot"); }
             public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError("tail cannot probe another context"); }
