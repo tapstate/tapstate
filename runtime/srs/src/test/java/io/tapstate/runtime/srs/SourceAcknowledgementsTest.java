@@ -55,6 +55,16 @@ class SourceAcknowledgementsTest {
         acknowledgements.close();
     }
 
+    @Test void closingAFollowedTailTwiceClosesTheUnderlyingSourceOnlyOnce() {
+        var closes = new AtomicInteger();
+        followed = acknowledgements.follow(meta, CHAIN, new Subscription() {
+            @Override public void close() { closes.incrementAndGet(); }
+        }, health, false);
+        followed.close();
+        followed.close();
+        assertThat(closes).hasValue(1);
+    }
+
     @Test void nativeAcknowledgementsUseOnlyTheOriginalEpochAndNeverLaterCaptureHistory() {
         var current = new java.util.concurrent.atomic.AtomicReference<>(nativeState(3,"original"));
         var chains = new NativeChains(() -> Optional.of(current.get()));

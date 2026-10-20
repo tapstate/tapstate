@@ -192,7 +192,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     /** The private direct-channel view retains this exact CACHE identity, client and lifecycle. */
-    public io.tapstate.spi.store.DirectChannelStore directChannels(CacheBusinessScope expected,Runnable requireActive) {
+    @Override public io.tapstate.spi.store.DirectChannelStore directChannels(CacheBusinessScope expected,Runnable requireActive) {
         Objects.requireNonNull(requireActive,"requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected); new MongoCacheMetadataStructure(database,rateRetention).verifyDirect();

@@ -733,15 +733,16 @@ final class StoreBackedDagSource implements DagSource {
             var original = operators == null ? null : operators.bind(fence);
             var capturedSources = original == null ? null : operators.pass().captureBindings(original.claim());
             var scopedSources = capturedSources == null ? null : scopedSources(sourceVertices,capturedSources);
+            var scopedDirect = capturedSources == null ? null : scopedDirectSources(sourceVertices,capturedSources);
             var targetPreparations=new ArrayList<io.tapstate.spi.store.SinkPreparationStore.Input>();
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
                     bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                             serveLanding,viewLanding,stepIds,frontier,compiledJoins,
-                            capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources,targetPreparations),
+                            capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources,scopedDirect,targetPreparations),
                     FencedSinkAckFactory.heldTo(scopedSources == null ? sinkAckFactory(pipeline,pipelineId,fence) :
-                            scopedSources.isEmpty() ? SinkAckFactory.NONE : new ScopedSrsSinkAckFactory(scopedSources,runIdOf(fence)),fence),frontier,
+                            scopedSources.isEmpty() && scopedDirect.isEmpty() ? SinkAckFactory.NONE : new ScopedSrsSinkAckFactory(scopedSources,scopedDirect,runIdOf(fence)),fence),frontier,
                     shape, drawn);
             if(original!=null)operators.pass().prepareSinkTargets(original.claim(),targetPreparations);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
@@ -1853,6 +1854,7 @@ final class StoreBackedDagSource implements DagSource {
             boolean freshFullLoad,
             ExecutionFence fence,PreparedOperators operators,PipelineCaptureBindings captureBindings,
             Map<String,ScopedSrsSinkAckFactory.Source> scopedSources,
+            Map<String,ScopedDirectSinkAckFactory.Source> scopedDirect,
             List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations) {
         var originalOperators = operators == null ? null : operators.bind(fence);
         var manifest = originalOperators == null ? null : originalOperators.manifest();
@@ -1878,7 +1880,7 @@ final class StoreBackedDagSource implements DagSource {
                 operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
                         new NestBinding(operators.tables()::get,NestBinding.onMap(manifest),
                                 new LoggingNestDeadLetter(new io.tapstate.runtime.engine.nest.RequiredNestDeadLetter(manifest)),
-                                new ScopedSrsReplayFloorFactory(scopedSources),
+                                new ScopedSrsReplayFloorFactory(scopedSources,scopedDirect),
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests()),
@@ -3090,7 +3092,12 @@ final class StoreBackedDagSource implements DagSource {
         String chain = vertex.stream();
         byte axis = axes.axisOf(chain);
         if (captureBindings != null) {
-            if (snapshotOnly || direct) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+            if (snapshotOnly) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+            if (direct) {
+                var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+                return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.epoch(),
+                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
+            }
             var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
             return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
                     source.recoveryAfter().get(vertex.table()),source.snapshotEpoch(),new ScopedSrsReadCursorPublisherFactory(source.run(),vertex.table()),
@@ -3129,10 +3136,22 @@ final class StoreBackedDagSource implements DagSource {
     private static Map<String,ScopedSrsSinkAckFactory.Source> scopedSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
         var sources = new LinkedHashMap<String,ScopedSrsSinkAckFactory.Source>(); var selected = new HashSet<String>();
         for (var vertex : vertices.values()) {
+            if (bindings.direct().containsKey(vertex.sourceId())) continue;
             var source = bindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); selected.add(vertex.sourceId());
             sources.put(vertex.stream(),new ScopedSrsSinkAckFactory.Source(source.run(),vertex.table()));
         }
         if (!selected.equals(bindings.logged().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        return Map.copyOf(sources);
+    }
+
+    private static Map<String,ScopedDirectSinkAckFactory.Source> scopedDirectSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var sources = new LinkedHashMap<String,ScopedDirectSinkAckFactory.Source>(); var selected = new HashSet<String>();
+        for (var vertex : vertices.values()) {
+            if (!bindings.direct().containsKey(vertex.sourceId())) continue;
+            var run = bindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); selected.add(vertex.sourceId());
+            sources.put(vertex.stream(),new ScopedDirectSinkAckFactory.Source(run,vertex.table()));
+        }
+        if (!selected.equals(bindings.direct().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
         return Map.copyOf(sources);
     }
 

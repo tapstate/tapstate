@@ -234,6 +234,31 @@ class StoreBackedDagSourceScopedModelTest {
         org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).derivedSchemas();
     }
 
+    @Test void aScopedPrivateSourceBuildsFromItsFixedDirectBindingWithoutReadingLegacyProgress() {
+        var f = fixture(false); var old = f.pipeline;
+        var direct = new PipelineResource(old.id(),old.metadata(),List.of(io.tapstate.core.model.SourceRef.spec("src",false)),
+                old.transforms(),old.view(),old.serve(),old.settings(),old.experimental());
+        f.store.artifacts().save(direct);
+        var guarded = org.mockito.Mockito.spy(f.store);
+        org.mockito.Mockito.doThrow(new AssertionError("private capture cannot read legacy SRS progress")).when(guarded).meta();
+        org.mockito.Mockito.doThrow(new AssertionError("private capture cannot read legacy state")).when(guarded).keyedState();
+        var source = new StoreBackedDagSource(guarded,f.source.sinkWriterBinder());
+        var pass = new PipelineConvergencePass(new PipelineIntentSnapshot(SCOPE,1,new DesiredState("p",PipelineState.RUNNING,CanonicalHash.of(direct))),ORIGINAL,f.views,() -> {});
+        var prepared = source.prepareStart(pass,"cache"); f.views.current.set(advance(1)); pass.advanced(advance(1));
+        var artifact = (SourceResource)prepared.artifactSnapshot().orElseThrow().get("src").orElseThrow();
+        var resolution = SourceCaptureResolution.forPipeline(direct,artifact,prepared.sourceModels().orElseThrow().model(artifact)).orElseThrow();
+        var context = DirectChannelPreparation.of(SCOPE,artifact,io.tapstate.core.model.ReadMode.CDC_ONLY,"latest",resolution.tables()).context();
+        var capture = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.CAPTURE,context.captureId()),ORIGINAL.owner(),1,0,1);
+        var opened = new DirectChannelProgress(context,java.util.Set.copyOf(resolution.tables()),1,
+                new DirectCaptureWindow(1,capture,advance(1),null,0,0,null,null),null,
+                new ConsumerOffset(context.consumerId(),Map.of(),null,List.of(),null,0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE),null);
+        var original = new ExecutionFence(SCOPE,advance(1));
+        pass.bindCapture(advance(1),new PipelineCaptureBindings(original,Map.of(),Map.of("src",DirectSourceRun.of(original,opened)),false));
+        assertThat(prepared.plan().build(original).dag()).isNotNull();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).meta();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).keyedState();
+    }
+
     @Test void aScopedSourceMissingItsOriginalCaptureResultCannotBuildFromLegacyProgress() {
         var f = fixture(false); var pass = f.pass(() -> {}); var prepared = f.source.prepareStart(pass,"cache");
         f.views.current.set(advance(1)); pass.advanced(advance(1));

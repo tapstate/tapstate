@@ -27,6 +27,43 @@ class ScopedSrsSinkAckFactoryTest {
             new SrsConsumerContext(new SrsConsumerKey("chain","pipeline","source"),7),4,false,Set.of("orders"),FENCE));
     private static ScopedSrsSinkAckFactory factory() { return new ScopedSrsSinkAckFactory(Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(RUN,"orders")),"original-run"); }
 
+    @Test void sharedAndPrivateStreamsKeepSeparateWriterStoresAfterFactorySerialization() throws Exception {
+        var f = new Fixture(); var privateStore = mock(DirectChannelStore.class);
+        var context = new DirectChannelContext(SCOPE,"private-channel","private-source","private-capture");
+        var capture = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.CAPTURE,context.captureId()),FENCE.owner(),1,0,1);
+        var window = new DirectCaptureWindow(9,capture,FENCE,"anchor",0,0,null,null);
+        var cursor = new ConsumerOffset(context.consumerId(),Map.of(),new ChainPosition(SourceOrder.snapshotRow(9),"anchor"),List.of(),null,0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
+        var opened = new DirectChannelProgress(context,Set.of("other"),1,window,null,cursor,null);
+        var original = new ExecutionFence(SCOPE,FENCE); var privateRun = DirectSourceRun.of(original,opened);
+        var sharedViews = (SrsStoreViews)f.context.get(SrsStoreViews.USER_CONTEXT_KEY);
+        f.context.put(SrsStoreViews.USER_CONTEXT_KEY,new SrsStoreViews() {
+            @Override public SrsStores srs(CacheBusinessScope scope,Runnable guard) { return sharedViews.srs(scope,guard); }
+            @Override public DirectChannelStore directChannels(CacheBusinessScope scope,Runnable guard) {
+                assertThat(scope).isEqualTo(RUN.cacheScope()); guard.run(); return privateStore;
+            }
+        });
+        when(privateStore.load(context)).thenReturn(opened);
+        when(privateStore.beginWriterRun(any(),anyLong(),anyString(),anyMap(),any())).thenReturn(true);
+        when(privateStore.advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any())).thenReturn(true);
+        var factory = new ScopedSrsSinkAckFactory(Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(RUN,"orders")),
+                Map.of("private.other",new ScopedDirectSinkAckFactory.Source(privateRun,"other")),"mixed-run");
+        var bytes = new ByteArrayOutputStream(); try (var out = new ObjectOutputStream(bytes)) { out.writeObject(factory); }
+        SinkAckFactory copy; try (var in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) { copy = (SinkAckFactory)in.readObject(); }
+        copy.beginRun(f.member,Map.of("source.orders",List.of("writer"),"private.other",List.of("writer")),FENCE);
+        verify(f.store).beginWriterRun(RUN.context(),RUN.membershipRevision(),"mixed-run",Map.of("orders",List.of("writer")),FENCE);
+        verify(privateStore).beginWriterRun(context,9,"mixed-run",Map.of("other",List.of("writer")),FENCE);
+        clearInvocations(f.store,privateStore);
+        var ack = copy.resolve(f.member).forWriter("writer"); var point = new ChainPosition(new SourceOrder(9,12),"actual");
+        ack.advance("source.orders",point,FENCE);
+        verify(f.store).advanceWriter(RUN.context(),RUN.membershipRevision(),"mixed-run","orders","writer",new WriterProgress(point.order(),point),FENCE);
+        verify(privateStore,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+        clearInvocations(f.store,privateStore);
+        ack.advance("private.other",point,FENCE); ack.bounded("private.other",new SourceOrder(9,20),FENCE);
+        verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",new WriterProgress(point.order(),point),FENCE);
+        verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",new WriterProgress(new SourceOrder(9,20),null),FENCE);
+        verify(f.store,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+    }
+
     @Test void deserializedFactoryBindsOnlyTheOriginalMembershipAndFullClaimOnItsActualMember() throws Exception {
         var f = new Fixture(); var original = factory(); var bytes = new ByteArrayOutputStream();
         try (var out = new ObjectOutputStream(bytes)) { out.writeObject(original); }
