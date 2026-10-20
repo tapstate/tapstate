@@ -224,7 +224,7 @@ with tempfile.TemporaryDirectory() as tmp:
     recorder.chmod(0o755)
     for ref_type, ref_name in [('tag','v1.2.3'),('branch','main')]:
         args=Path(tmp)/'args'
-        env=dict(os.environ,PATH=tmp+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',SONAR_HOST_URL='https://example.invalid',RUNNER_TEMP=tmp,GITHUB_REF_TYPE=ref_type,GITHUB_REF_NAME=ref_name,RECORDED_ARGS=str(args))
+        env=dict(os.environ,PATH=tmp+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',SONAR_HOST_URL='https://example.invalid',RUNNER_TEMP=tmp,GITHUB_REF_TYPE=ref_type,GITHUB_REF_NAME=ref_name,GITHUB_EVENT_NAME='pull_request' if ref_type=='branch' else 'push',GITHUB_REF='refs/pull/1/merge' if ref_type=='branch' else 'refs/tags/'+ref_name,RECORDED_ARGS=str(args))
         run=subprocess.run(['bash','-e','-c',script(analyze)],env=env,capture_output=True,text=True)
         assert run.returncode==0,run.stderr
         values=args.read_text().splitlines()
@@ -236,5 +236,64 @@ with tempfile.TemporaryDirectory() as tmp:
     recorder.write_text('#!/usr/bin/env bash\nexit 23\n')
     run=subprocess.run(['bash','-e','-c',script(analyze)],env=env,capture_output=True,text=True)
     assert run.returncode!=0, 'scanner failure was suppressed before the required check could see it'
-print(f'sonar-workflow smoke: 7 event/ref cases, 20 runtime cases and {lock_mutations} lock mutations passed, including 102 paginated issues')
+revision_controls=0
+with tempfile.TemporaryDirectory(prefix='sonar-revision-') as temporary:
+    directory=Path(temporary); repo=directory/'repo'; repo.mkdir(); commands=directory/'bin'; commands.mkdir()
+    git_env={key:value for key,value in os.environ.items() if key not in (
+        'GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_PREFIX','GIT_QUARANTINE_PATH','GIT_COMMON_DIR')}
+    def git(*args):
+        return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false',
+                                        '-C',str(repo),*args],env=git_env,text=True,stderr=subprocess.DEVNULL).strip()
+    git('init','-b','main')
+    assert Path(git('rev-parse','--show-toplevel')).resolve()==repo.resolve(), 'not the owned Git fixture'
+    git('config','user.email','fixture@example.invalid');git('config','user.name','Fixture')
+    (repo/'source').write_text('old');git('add','source');git('commit','-m','Old revision');old=git('rev-parse','HEAD')
+    (repo/'source').write_text('new');git('commit','-am','New revision');new=git('rev-parse','HEAD')
+    gh=commands/'gh'
+    gh.write_text('''#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['API_LOG'],'a') as out:out.write(json.dumps(sys.argv[1:])+'\\n')
+assert sys.argv[1:]==['api','--method','GET','repos/tapstate/tapstate/git/ref/heads/main','--jq','.object.sha']
+if os.environ.get('LIVE_MAIN_MODE')=='failed':raise SystemExit(1)
+print(os.environ['LIVE_MAIN_HEAD'])
+''');gh.chmod(0o755)
+    recorder=commands/'mvn'
+    recorder.write_text('''#!/usr/bin/env bash
+printf '%s\\n' "$GITHUB_SHA" > "$SONAR_STATE"
+printf '%s' "${GH_TOKEN+present}${GITHUB_TOKEN+present}" > "$SCANNER_AUTH"
+''');recorder.chmod(0o755)
+    state=directory/'sonar-state';auth=directory/'scanner-auth';api_log=directory/'api-log'
+    environment=dict(git_env,PATH=str(commands)+os.pathsep+os.environ['PATH'],SONAR_TOKEN='fixture-token',
+        SONAR_HOST_URL='https://example.invalid',RUNNER_TEMP=str(directory),GITHUB_REPOSITORY='tapstate/tapstate',
+        GITHUB_REF_TYPE='branch',GITHUB_REF_NAME='main',GITHUB_REF='refs/heads/main',GITHUB_EVENT_NAME='push',
+        GH_TOKEN='fixture-read-token',GITHUB_TOKEN='fixture-other-token',LIVE_MAIN_HEAD=new,
+        SONAR_STATE=str(state),SCANNER_AUTH=str(auth),API_LOG=str(api_log))
+    def run_revision(checkout, extra=None):
+        git('checkout','--detach',checkout)
+        return subprocess.run(['bash','-e','-c',script(analyze)],cwd=repo,
+                              env={**environment,'GITHUB_SHA':checkout,**(extra or {})},capture_output=True,text=True)
+    # A newer fast run reaches the shared analysis lock before the older slow run.
+    run=run_revision(new);assert run.returncode==0,run.stdout+run.stderr
+    assert state.read_text().strip()==new;revision_controls+=1
+    run=run_revision(old)
+    assert run.returncode!=0 and state.read_text().strip()==new, 'a late old main run overwrote newer Sonar state'
+    revision_controls+=1
+    assert auth.read_text()=='', 'scanner inherited GitHub API credentials'
+    for extra in ({'LIVE_MAIN_MODE':'failed'},{'LIVE_MAIN_HEAD':'null'},
+                  {'LIVE_MAIN_HEAD':''},{'GITHUB_SHA':old}):
+        state.unlink(missing_ok=True)
+        run=run_revision(new,extra)
+        assert run.returncode!=0 and not state.exists(), 'unknown or inconsistent main identity reached upload'
+        revision_controls+=1
+    for event,ref in [('pull_request','refs/pull/1/merge'),('push','refs/tags/v1.2.3'),
+                      ('workflow_dispatch','refs/heads/ws/feature')]:
+        run=run_revision(old,{'GITHUB_EVENT_NAME':event,'GITHUB_REF':ref,'LIVE_MAIN_MODE':'failed'})
+        assert run.returncode==0 and state.read_text().strip()==old, 'non-main analysis behavior changed'
+        revision_controls+=1
+    run=run_revision(old,{'GITHUB_EVENT_NAME':'workflow_dispatch'})
+    assert run.returncode!=0 and state.read_text().strip()==old, 'stale manual main upload was allowed'
+    revision_controls+=1
+    calls=[json.loads(line) for line in api_log.read_text().splitlines()]
+    assert calls and all(row==['api','--method','GET','repos/tapstate/tapstate/git/ref/heads/main','--jq','.object.sha'] for row in calls)
+print(f'sonar-workflow smoke: 7 event/ref cases, 20 runtime cases, {revision_controls} revision-order controls and {lock_mutations} lock mutations passed, including 102 paginated issues')
 PY

@@ -329,8 +329,24 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # The analysis lock orders arrivals, not revisions. A slower old main
+          # run must not upload after a newer revision has reached the server.
+          if [ "${GITHUB_REF:-}" = refs/heads/main ] && [ "${GITHUB_EVENT_NAME:-}" != pull_request ]; then
+            checkout_head="$(git rev-parse HEAD)"
+            if ! [[ "${GITHUB_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || [ "$checkout_head" != "$GITHUB_SHA" ]; then
+              echo '::error::Main analysis checkout identity is inconsistent; analysis not uploaded.'
+              exit 1
+            fi
+            current_head="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha 2>/dev/null)" || current_head=""
+            if ! [[ "$current_head" =~ ^[0-9a-f]{40}$ ]] || [ "$current_head" != "$checkout_head" ]; then
+              echo '::error::Current main differs or could not be confirmed; analysis not uploaded.'
+              exit 1
+            fi
+          fi
+          unset GH_TOKEN GITHUB_TOKEN
           args=(
             -Dsonar.projectKey=tapstate
             -Dsonar.host.url="$SONAR_HOST_URL"
