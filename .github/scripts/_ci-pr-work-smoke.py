@@ -262,6 +262,31 @@ time.sleep(30)
             check(w.supervise(['owned-fixture'], repo, expected, out, 'verify', interval=0) == w.OBSOLETE,
                   'obsolete observation dominates concurrent exit zero')
             check(json.loads(out.read_text())['status'] == 'obsolete-during-work', 'obsolete exit zero never publishes success')
+            class InterruptedAfterObsolete(FinishedAtBoundary):
+                def close(self):
+                    signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            w.OwnedCommand = InterruptedAfterObsolete
+            calls = 0
+            out = root / 'obsolete-and-interrupted.json'
+            check(w.supervise(['owned-fixture'], repo, expected, out, 'verify', interval=0) == w.OBSOLETE,
+                  'a cancellation during obsolete cleanup preserves the obsolete result')
+            check(json.loads(out.read_text())['status'] == 'obsolete-during-work',
+                  'late cancellation does not replace the obsolete diagnosis')
+            class FailedAfterInterrupt(FinishedAtBoundary):
+                def wait(self, timeout=None):
+                    signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                    raise OSError('original supervisor failure')
+            w.OwnedCommand = FailedAfterInterrupt
+            w.probe = lambda _: {'state': 'current'}
+            out = root / 'failure-and-interrupted.json'
+            try:
+                w.supervise(['owned-fixture'], repo, expected, out, 'verify', interval=1)
+            except OSError as error:
+                check(str(error) == 'original supervisor failure', 'the original failure remains actionable')
+            else:
+                raise AssertionError('interruption swallowed the supervisor failure')
+            check(json.loads(out.read_text())['status'] == 'supervisor-failed',
+                  'supervisor failure is recorded even when an interruption was received')
         finally:
             w.OwnedCommand, w.receipt.git, w.stop_owned = saved_owned, saved_git, saved_stop
         saved_owned = w.OwnedCommand

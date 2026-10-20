@@ -217,7 +217,8 @@ def supervise(command, root, expected, output, phase, interval=15.0):
     def interrupted_by(number, _frame):
         interrupted.append(number)
 
-    try:
+    def execute():
+        nonlocal process
         if observe()['state'] == 'obsolete':
             value['status'] = 'obsolete-before-start'
             return OBSOLETE
@@ -250,6 +251,14 @@ def supervise(command, root, expected, output, phase, interval=15.0):
             return 128 + interrupted[0]
         value['status'] = 'success' if process.returncode == 0 else 'command-failed'
         return process.returncode if process.returncode >= 0 else 128 - process.returncode
+
+    failure = None
+    try:
+        result = execute()
+    except BaseException as error:
+        failure = error
+        value['status'] = 'supervisor-failed'
+        raise
     finally:
         cleanup_error = None
         try:
@@ -260,9 +269,11 @@ def supervise(command, root, expected, output, phase, interval=15.0):
         except (ValueError, OSError, subprocess.TimeoutExpired) as error:
             cleanup_error = error
             value['status'] = 'supervisor-failed'
-        if interrupted and cleanup_error is None:
-            value['status'] = 'interrupted'
+        if interrupted:
             value['interruption_signal'] = interrupted[0]
+            if cleanup_error is None and value.get('status') not in (
+                    'obsolete-before-start', 'obsolete-during-work', 'supervisor-failed'):
+                value['status'] = 'interrupted'
         for number, handler in prior.items():
             signal.signal(number, handler)
         value['elapsed_ns'] = time.monotonic_ns() - started
@@ -271,9 +282,10 @@ def supervise(command, root, expected, output, phase, interval=15.0):
         output.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
         print('CI_PR_WORK_JSON ' + json.dumps({k: v for k, v in value.items() if k != 'observations'}, sort_keys=True), flush=True)
         if cleanup_error is not None:
-            raise cleanup_error
-        if interrupted:
-            return 128 + interrupted[0]
+            if failure is None:
+                raise cleanup_error
+            failure.add_note('owned process cleanup also failed: ' + str(cleanup_error))
+    return 128 + interrupted[0] if value['status'] == 'interrupted' else result
 
 
 def main():

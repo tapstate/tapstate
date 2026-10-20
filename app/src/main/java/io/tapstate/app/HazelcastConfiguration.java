@@ -133,6 +133,7 @@ class HazelcastConfiguration {
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
         SourceConfigKeyringSession sourceConfigKeyring = sourceConfigKeyrings.getIfAvailable();
         long sessionAskedAt = System.nanoTime();
+        NodeSessionStartup startup;
         if (identity != null) {
             try {
                 identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
@@ -141,17 +142,29 @@ class HazelcastConfiguration {
                     throw new IllegalStateException("cluster member started without its Source config keyring");
                 }
                 sourceConfigKeyring.acknowledge(identity.nodeSession(), clusterProperties.getNodeSessionTtl());
+                startup = new NodeSessionStartup(claimStore, identity.nodeSession(), sessionAskedAt,
+                        clusterProperties.getNodeSessionTtl(), clusterProperties.getNodeSessionRenewInterval(),
+                        sourceConfigKeyring);
             } catch (RuntimeException startupFailure) {
                 if (identity.nodeSession() != null && claimStore != null) {
-                    claimStore.release(identity.nodeSession());
-                    if (sourceConfigKeyring != null) sourceConfigKeyring.release(identity.nodeSession());
+                    try {
+                        claimStore.release(identity.nodeSession());
+                    } catch (RuntimeException cleanupFailure) {
+                        if (cleanupFailure != startupFailure) startupFailure.addSuppressed(cleanupFailure);
+                    }
+                    if (sourceConfigKeyring != null) {
+                        try {
+                            sourceConfigKeyring.release(identity.nodeSession());
+                        } catch (RuntimeException cleanupFailure) {
+                            if (cleanupFailure != startupFailure) startupFailure.addSuppressed(cleanupFailure);
+                        }
+                    }
                 }
                 throw startupFailure;
             }
+        } else {
+            startup = null;
         }
-        NodeSessionStartup startup = identity == null ? null : new NodeSessionStartup(
-                claimStore, identity.nodeSession(), sessionAskedAt, clusterProperties.getNodeSessionTtl(),
-                clusterProperties.getNodeSessionRenewInterval(), sourceConfigKeyring);
         HazelcastInstance member;
         try {
             Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);

@@ -1,6 +1,7 @@
 package io.tapstate.testsupport;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.ReflectiveInvocationContext;
@@ -258,6 +259,21 @@ class CiCaseEvidenceTest {
     }
 
     @Test
+    void injectedTestInfoUsesItsDeclaredTypeWithoutCallingMetadataAccessors() throws Exception {
+        Method method = method("infoFixture", String.class, TestInfo.class);
+        TestInfo info = (TestInfo) Proxy.newProxyInstance(TestInfo.class.getClassLoader(),
+                new Class<?>[]{TestInfo.class}, (proxy, called, arguments) -> {
+                    throw new AssertionError("injected metadata accessors must not run");
+                });
+        Captured captured = capture(true, () -> observer.interceptTestTemplateMethod(() -> null,
+                invocation(method, List.of("case", info)), context(method, "case", "[test-template-invocation:#1]")));
+        String expected = CiCaseEvidence.hash("[\"arguments\",[[\"java.lang.String\",\"case\"],"
+                + "[\"injected\",\"org.junit.jupiter.api.TestInfo\"]]]");
+        assertThat(captured.failure()).isNull();
+        assertThat(captured.output()).contains("\"argument_digest\":\"" + expected + "\"", "\"injected\":true", "\"stable\":true");
+    }
+
+    @Test
     void dynamicNamesAreHashedAndBoundToTheOriginalFactoryMethod() throws Exception {
         Method method = method("dynamicFixture");
         Captured first = capture(true, () -> observer.interceptDynamicTest(() -> null, null,
@@ -460,6 +476,9 @@ class CiCaseEvidenceTest {
     }
 
     private void temporaryFixture(String label, @TempDir Path directory) {
+    }
+
+    private void infoFixture(String label, TestInfo info) {
     }
 
     private void dynamicFixture() {

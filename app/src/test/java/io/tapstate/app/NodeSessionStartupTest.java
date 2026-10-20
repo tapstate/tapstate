@@ -39,6 +39,49 @@ import static org.awaitility.Awaitility.await;
 class NodeSessionStartupTest {
 
     @Test
+    void aLeaseConstructionFailureReleasesTheReservedSessionAndKeyring() {
+        assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void anOverflowingLeaseDurationDoesNotStrandItsReservation() {
+        assertThat(failLeaseConstruction(Duration.ofDays(106_752), Duration.ofMillis(10), null))
+                .isInstanceOf(ArithmeticException.class);
+    }
+
+    @Test
+    void cleanupStillReleasesTheKeyringAndPreservesTheConstructionFailure() {
+        IllegalStateException releaseFailure = new IllegalStateException("owned release failure");
+        assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), releaseFailure))
+                .isInstanceOf(IllegalArgumentException.class).hasSuppressedException(releaseFailure);
+    }
+
+    private static Throwable failLeaseConstruction(Duration ttl, Duration interval, RuntimeException releaseFailure) {
+        ClusterProperties cluster = cluster();
+        cluster.setNodeSessionTtl(ttl);
+        cluster.setNodeSessionRenewInterval(interval);
+        ControlEndpointProperties control = new ControlEndpointProperties();
+        control.setAdvertiseUrl("https://node-a.internal:8080");
+        RecordingClaims claims = new RecordingClaims();
+        claims.releaseFailure = releaseFailure;
+        RecordingKeyring keyring = new RecordingKeyring(claims);
+        Throwable failure = org.assertj.core.api.Assertions.catchThrowable(() ->
+                new HazelcastConfiguration().hazelcastMember(clusteredProperties(), cluster, control,
+                        null, null, null, null, NestSettings.defaults(), null, null, null,
+                        provider(ClusterIdentityStore.class, new MemoryIdentity()),
+                        provider(WorkloadClaimStore.class, claims), provider(SourceConfigKeyringSession.class, keyring),
+                        new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null),
+                        config -> { throw new AssertionError("member factory must not run after lease setup fails"); }));
+        assertThat(failure).isNotNull();
+        assertThat(claims.acquisitions).hasValue(1);
+        assertThat(keyring.acknowledgements).hasValue(1);
+        assertThat(claims.releases).hasValue(1);
+        assertThat(keyring.releases).hasValue(1);
+        return failure;
+    }
+
+    @Test
     void theReservedNodeSessionRenewsWhileTheMemberFactoryIsStillRunning() {
         ClusterProperties cluster = new ClusterProperties();
         cluster.setId("startup-cluster");
@@ -330,6 +373,7 @@ class NodeSessionStartupTest {
         private final AtomicBoolean factoryRunning = new AtomicBoolean();
         private final AtomicBoolean refuseRenewals = new AtomicBoolean();
         private final AtomicBoolean holdRelease = new AtomicBoolean();
+        private RuntimeException releaseFailure;
         private final CountDownLatch renewedDuringFactory = new CountDownLatch(1);
         private final CountDownLatch releaseStarted = new CountDownLatch(1);
         private final CountDownLatch allowRelease = new CountDownLatch(1);
@@ -349,6 +393,7 @@ class NodeSessionStartupTest {
         @Override
         public boolean release(WorkloadClaim expected) {
             releases.incrementAndGet();
+            if (releaseFailure != null) throw releaseFailure;
             releaseStarted.countDown();
             if (holdRelease.get()) {
                 try {

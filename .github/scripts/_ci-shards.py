@@ -844,11 +844,14 @@ def run_shard(args, root, plan):
     if examples:
         command += ['-Dtapstate.e2e.published-examples=' + ','.join(examples),
                     '-DforkCount=1', '-DreuseForks=true', '-Djunit.jupiter.execution.parallel.enabled=false']
+    observed = None
     try:
         with phase_timing('selected-verify', 'run', plan, shard['id']) as observed:
             subprocess.run(command, cwd=root, check=True)
     finally:
-        receipt.update(status=observed['status'], verify=observed)
+        receipt['status'] = observed['status'] if observed is not None else 'failure'
+        if observed is not None:
+            receipt['verify'] = observed
         if runtime_directory:
             write(runtime_directory / 'capture-origin.json', receipt)
             receipt['runtime_class_capture'].update(capture_origin_sha256=file_digest(runtime_directory / 'capture-origin.json'),

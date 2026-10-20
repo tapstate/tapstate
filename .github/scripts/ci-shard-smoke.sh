@@ -277,6 +277,31 @@ with tempfile.TemporaryDirectory() as tmp:
     spec=importlib.util.spec_from_file_location('extension_pack_controls',str(pathlib.Path(os.environ['SHARD_GATE']).with_name('_ci-shards.py')))
     pack_reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(pack_reader)
     from unittest.mock import patch
+    # A phase may fail before its context manager yields any timing record.
+    # Preserve that error and leave a failed receipt rather than masking it.
+    from contextlib import contextmanager
+    actual_timing = pack_reader.phase_timing
+    @contextmanager
+    def invalid_verify_identity(phase, *args, **kwargs):
+        if phase == 'selected-verify':
+            with patch.dict(os.environ, {'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': 'invalid'}):
+                with actual_timing(phase, *args, **kwargs) as observation:
+                    yield observation
+        else:
+            with actual_timing(phase, *args, **kwargs) as observation:
+                yield observation
+    with patch.object(pack_reader, 'phase_timing', invalid_verify_identity):
+        try:
+            pack_reader.run_shard(SimpleNamespace(shard='rest', repo_local=str(root/'m2'),
+                case_evidence=False, build_inputs=None, runtime_class_dir=None, class_gate_dir=None),
+                root.resolve(), json.loads((root/'plan.json').read_text()))
+        except ValueError as error:
+            assert str(error) == 'invalid Actions execution identity', str(error)
+        else:
+            raise AssertionError('invalid verify identity was accepted')
+    failed_origin = json.loads((root/'target/ci-shards/run-rest.json').read_text())
+    assert failed_origin['status'] == 'failure' and 'verify' not in failed_origin
+    subprocess.run(opted, check=True, env=environment, capture_output=True)
     hash_target=(root/fixture_sources[0]).resolve();original_hash_source=hash_target.read_bytes()
     real_digest=pack_reader.file_digest;first_hash=True
     def mutate_after_validated_hash(path):

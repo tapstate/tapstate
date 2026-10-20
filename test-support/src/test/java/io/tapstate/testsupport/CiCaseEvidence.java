@@ -2,6 +2,7 @@ package io.tapstate.testsupport;
 
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.RepetitionInfo;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.extension.DynamicTestInvocationContext;
 import org.junit.jupiter.api.extension.ExtensionContext;
@@ -227,10 +228,15 @@ public final class CiCaseEvidence implements InvocationInterceptor {
         String firstString = null;
         for (int i = 0; i < arguments.size(); i++) {
             Object argument = arguments.get(i);
-            boolean injected = method != null && i < method.getParameterCount()
+            boolean temporary = method != null && i < method.getParameterCount()
                     && method.getParameters()[i].isAnnotationPresent(TempDir.class);
-            Canonical value = injected ? known("[\"injected\",\"org.junit.jupiter.api.io.TempDir\","
-                    + quote(method.getParameterTypes()[i].getName()) + "]") : canonical(argument);
+            boolean testInfo = method != null && i < method.getParameterCount()
+                    && method.getParameterTypes()[i] == TestInfo.class;
+            boolean injected = temporary || testInfo || method != null && i < method.getParameterCount()
+                    && method.getParameterTypes()[i] == RepetitionInfo.class;
+            Canonical value = temporary ? known("[\"injected\",\"org.junit.jupiter.api.io.TempDir\","
+                    + quote(method.getParameterTypes()[i].getName()) + "]")
+                    : testInfo ? known("[\"injected\",\"org.junit.jupiter.api.TestInfo\"]") : canonical(argument);
             values.add(value.json());
             stable &= value.stable();
             descriptors.add("{\"position\":" + i + ",\"type\":" + quote(type(argument))

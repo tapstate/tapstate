@@ -3,6 +3,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export EVIDENCE_TOOL="$here/ci-evidence.sh" EVIDENCE_MODULE="$here/_ci-evidence.py"
+python3 "$here/_ci-evidence-regression-smoke.py"
 python3 - <<'PY'
 import copy, hashlib, importlib.util, json, os, pathlib, shutil, struct, subprocess, sys, tempfile, tarfile, zipfile
 import xml.etree.ElementTree as ET

@@ -254,9 +254,12 @@ def declarations(text, outer, package):
             parameter_end = close_at(clean, consumed - 1)
             parameter_types, parameter_injected = [], []
             for parameter in split_values(text[consumed:parameter_end], generic=True):
-                parameter_injected.append(bool(re.search(r'@(?:[\w.]+\.)?TempDir\b', parameter)))
+                temporary = bool(re.search(r'@(?:[\w.]+\.)?TempDir\b', parameter))
                 parameter = re.sub(r'@[\w.]+(?:\([^)]*\))?\s*', '', parameter).strip()
-                parameter_types.append(re.sub(r'\s+\w+\s*$', '', parameter).replace('final ', '').strip())
+                typename = re.sub(r'\s+\w+\s*$', '', parameter).replace('final ', '').strip()
+                parameter_types.append(typename)
+                parameter_injected.append(temporary or typename in ('TestInfo', 'org.junit.jupiter.api.TestInfo',
+                    'RepetitionInfo', 'org.junit.jupiter.api.RepetitionInfo'))
         elif 'ArchTest' in annotations:
             field = re.match(r'\s*(?:[\w<>\[\].?,]+\s+)+?(\w+)\s*=', clean[position:])
             if not field:
@@ -274,10 +277,15 @@ def declarations(text, outer, package):
         if owner is None or not (owner['name'] == package + outer or owner['name'].startswith(package + outer + '$')):
             continue
         # Include preceding Disabled annotations in the declaration's contract.
-        prefix = text[max(text.rfind('}', 0, found.start()), text.rfind(';', 0, found.start())) + 1:found.start()]
-        disabled = re.search(r'@Disabled(?:\s*\((.*?)\))?', prefix, re.S)
+        prefix_start = max(owner['start'], clean.rfind('}', 0, found.start()),
+                           clean.rfind(';', 0, found.start())) + 1
+        prefix = clean[prefix_start:found.start()]
+        disabled = re.search(r'@(?:org\.junit\.jupiter\.api\.)?Disabled\b(?:\s*\((.*?)\))?', prefix, re.S)
+        reason = (text[prefix_start + disabled.start(1):prefix_start + disabled.end(1)]
+                  if disabled and disabled.group(1) is not None else '')
+        disabled_source = annotations.get('Disabled', reason if disabled else None)
         result.append(dict(**{'class': owner['name']}, method=name, annotations=annotations,
-                           disabled_source=disabled.group(1) if disabled else None,
+                           disabled_source=disabled_source,
                            parameter_types=parameter_types, parameter_injected=parameter_injected, declaration_sha256=digest(text[found.start():consumed].encode())))
     return result
 
@@ -345,10 +353,18 @@ def canonical_expression(expression, root, source, sources, body):
         return ['null']
     if expression.startswith('"""') and expression.endswith('"""'):
         value = expression[3:-3]
-        require(not re.search(r'\\[^"\\nrtbf]', value), 'unsupported Java text block escape')
         value = textwrap.dedent(value.removeprefix('\n'))
-        value = value.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\"', '"').replace('\\\\', '\\')
-        return ['java.lang.String', value]
+        escapes = {'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f', '"': '"', '\\': '\\'}
+        decoded, position = [], 0
+        while position < len(value):
+            char = value[position]
+            if char == '\\':
+                position += 1
+                require(position < len(value) and value[position] in escapes, 'unsupported Java text block escape')
+                char = escapes[value[position]]
+            decoded.append(char)
+            position += 1
+        return ['java.lang.String', ''.join(decoded)]
     if re.fullmatch(r'"(?:\\.|[^"\\])*"', expression):
         return ['java.lang.String', json.loads(expression)]
     if expression in ('true', 'false'):
@@ -483,12 +499,18 @@ def static_provider_arguments(root, source, declaration, sources):
     raise ValueError('computed parameter provider requires an independent parameter contract: ' + annotation)
 
 
-def with_injected(arguments, declaration):
+def with_injected(arguments, declaration, repetition=None):
     result, position = [], 0
     for typename, injected in zip(declaration['parameter_types'], declaration['parameter_injected']):
         if injected:
-            require(typename == 'Path', 'unsupported injected TempDir type: ' + typename)
-            result.append(['injected', 'org.junit.jupiter.api.io.TempDir', 'java.nio.file.Path'])
+            if typename in ('TestInfo', 'org.junit.jupiter.api.TestInfo'):
+                result.append(['injected', 'org.junit.jupiter.api.TestInfo'])
+            elif typename in ('RepetitionInfo', 'org.junit.jupiter.api.RepetitionInfo'):
+                require(repetition is not None, 'RepetitionInfo injection requires RepeatedTest')
+                result.append(['repetition', *repetition])
+            else:
+                require(typename in ('Path', 'java.nio.file.Path'), 'unsupported injected TempDir type: ' + typename)
+                result.append(['injected', 'org.junit.jupiter.api.io.TempDir', 'java.nio.file.Path'])
         else:
             require(position < len(arguments), 'source and argument arity differs')
             result.append(arguments[position])
@@ -713,6 +735,9 @@ def csv_text_block(value):
 
 def source_parameters(root, source, declaration, sources):
     annotations, text = declaration['annotations'], source.read_text()
+    # Disabled templates are reported once without invoking their providers or interceptor.
+    if declaration.get('disabled_source') is not None:
+        return [''], 'disabled-method'
     if source.stem == 'PublishedExamplesIT' and declaration['method'] == 'thePublishedExampleRuns':
         examples = sorted((root / 'e2e/examples').rglob('*.e2e.yml'))
         declaration['published_policy'] = published_policy(root, source, examples, sources, declaration.get('published_connectors', 'unknown'))
@@ -721,7 +746,9 @@ def source_parameters(root, source, declaration, sources):
     if 'RepeatedTest' in annotations:
         count = re.match(r'(?:value\s*=\s*)?(\d+)', annotations['RepeatedTest'])
         require(count is not None and int(count.group(1)) > 0, 'unresolved RepeatedTest count')
-        declaration['argument_digests'] = [argument_digest([])] * int(count.group(1))
+        total = int(count.group(1))
+        declaration['argument_digests'] = [argument_digest(with_injected([], declaration, (n, total)))
+                                           for n in range(1, total + 1)]
         return ['repetition=' + str(n) for n in range(1, int(count.group(1)) + 1)], 'ordinal-to-source'
     if 'TestFactory' in annotations or 'TestTemplate' in annotations:
         raise ValueError('runtime dynamic identities require an independent parameter contract')
@@ -790,7 +817,8 @@ def source_parameters(root, source, declaration, sources):
         values.append(['null'])
         declaration['argument_digests'].append(argument_digest(with_injected([['null']], declaration)))
     if 'EmptySource' in annotations or 'NullAndEmptySource' in annotations:
-        require(declaration['parameter_types'] == ['String'], 'non-string EmptySource requires an independent parameter contract')
+        supplied_types = [typename for typename, injected in zip(declaration['parameter_types'], declaration['parameter_injected']) if not injected]
+        require(supplied_types in (['String'], ['java.lang.String']), 'non-string EmptySource requires an independent parameter contract')
         values.append(['empty'])
         declaration['argument_digests'].append(argument_digest(with_injected([['java.lang.String', '']], declaration)))
     require(values, 'empty parameter source')
@@ -1168,6 +1196,14 @@ def reports(args):
                 unknown.append(dict(**base, reported=reported, reason='report has no independently discovered source method'))
             elif declaration['parameters'] is None:
                 unknown.append(dict(**base, reported=reported, reason='source parameter identities are unresolved'))
+            elif declaration['mapping'] == 'disabled-method':
+                types = [re.sub(r'<.*>', '', typename).rsplit('.', 1)[-1].replace('...', '[]') for typename in declaration['parameter_types']]
+                signatures = {method + '(' + ', '.join(types) + ')'} | ({method} if not types else set())
+                if (declaration.get('disabled_source') is not None and case.find('skipped') is not None
+                        and not stable_markers and not markers and reported in signatures):
+                    parameter = ''
+                else:
+                    unknown.append(dict(**base, reported=reported, reason='disabled source method requires one markerless skipped method report'))
             elif declaration['mapping'] in ('marker', 'argument-marker'):
                 marker = runtime_pair(stable_markers, classname, method, case.find('skipped') is not None)
                 digests = declaration['parameters'] if declaration['mapping'] == 'marker' else declaration.get('argument_digests') or []
@@ -1451,10 +1487,10 @@ CRC_TABLE = crc_table()
 
 
 def crc64(content):
-    # JaCoCo uses the reflected ISO 3309 polynomial. Java 9's legacy version
-    # workaround is irrelevant to the current JDK 21 bytecode, and is rejected.
+    # Match capture and JaCoCo's early Java 9 compatibility adjustment exactly.
     require(content[:4] == b'\xca\xfe\xba\xbe' and len(content) >= 8, 'invalid production class file')
-    require(content[6:8] != b'\x00\x35', 'Java 9 class ID requires the original JaCoCo reader')
+    if content[6:8] == b'\x00\x35':
+        content = content[:7] + b'\x34' + content[8:]
     result = 0
     for byte in content:
         result = (result >> 8) ^ CRC_TABLE[(result ^ byte) & 0xff]
