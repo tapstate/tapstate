@@ -1171,3 +1171,12 @@ io.capture-state-rebuild-required:
 capture.still-ending:
   message: "Capture `{captureId}` has not finished stopping."
   solution: "Retry the original stop after the source call exits; retain its original resource identity."
+
+control.storage-test-required:
+  message: "Test every storage layer again using the current settings before saving."
+control.storage-test-failed:
+  message: "The {layer} storage test failed ({causeCode}). Check the connection and permissions."
+control.storage-scope-conflict:
+  message: "The storage operation or installation phase has changed. Read its current status."
+control.storage-unavailable:
+  message: "The storage operation is temporarily unavailable. Query the original operation before retrying."

@@ -51,6 +51,7 @@ public final class ControlApiSchema {
     private static Map<String, SchemaRef> refs() {
         Map<String, SchemaRef> refs = new LinkedHashMap<>();
         bind(refs, "system.version", "SystemVersion");
+        StorageOperationSchemas.STEMS.forEach((id, stem) -> bind(refs, id, stem));
         bind(refs, "connector.list", "ConnectorList");
         bind(refs, "connector.get", "ConnectorGet");
         bind(refs, "source.list", "SourceList");
@@ -277,6 +278,7 @@ public final class ControlApiSchema {
         pair(defs, "DataBrowserFind",
                 object(List.of("sourceId", "collection"), findProperties, false),
                 opaque);
+        defs.putAll(StorageOperationSchemas.definitions());
         return immutableMap(defs);
     }
 

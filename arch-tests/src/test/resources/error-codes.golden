@@ -182,6 +182,10 @@ control.preview-overloaded
 control.schema-derivation-incomplete
 control.source-config-reveal-unavailable
 control.state-database-unavailable
+control.storage-scope-conflict
+control.storage-test-failed
+control.storage-test-required
+control.storage-unavailable
 control.unauthenticated
 control.unreachable
 data-browser.connector-not-browsable

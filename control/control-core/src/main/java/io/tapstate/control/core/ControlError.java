@@ -91,7 +91,12 @@ public enum ControlError implements TapstateErrorCode {
      * {@code auth-failed}, which is pre-authentication: here the caller is known, they simply lack the
      * grade, so echoing the operation and the grade it needs is a help, not an information leak.
      */
-    FORBIDDEN("control.forbidden", Set.of("op", "required"));
+    FORBIDDEN("control.forbidden", Set.of("op", "required")),
+
+    STORAGE_TEST_REQUIRED("control.storage-test-required", Set.of()),
+    STORAGE_TEST_FAILED("control.storage-test-failed", Set.of("layer", "causeCode")),
+    STORAGE_SCOPE_CONFLICT("control.storage-scope-conflict", Set.of()),
+    STORAGE_UNAVAILABLE("control.storage-unavailable", Set.of());
 
     private final String code;
     private final Set<String> placeholders;

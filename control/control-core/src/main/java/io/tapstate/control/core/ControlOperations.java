@@ -107,6 +107,17 @@ public final class ControlOperations {
             "state-store.connect", Scope.WRITE, true, null,
             "Configure the one Cloud MongoDB Atlas destination for materialized views.", CLI_AND_REST);
 
+    public static final Operation STORAGE_STATUS = storage("storage.status", Scope.READ, false);
+    public static final Operation STORAGE_TEST = storage("storage.test", Scope.WRITE, false);
+    public static final Operation STORAGE_SETUP_COMMIT = storage("storage.setup.commit", Scope.WRITE, true);
+    public static final Operation STORAGE_SETUP_STATUS = storage("storage.setup.status", Scope.READ, false);
+    public static final Operation STORAGE_RECOVERY_PLAN = storage("storage.recovery.plan", Scope.WRITE, false);
+    public static final Operation STORAGE_RECOVERY_CONFIRM = storage("storage.recovery.confirm", Scope.WRITE, true);
+    public static final Operation STORAGE_RECOVERY_STATUS = storage("storage.recovery.status", Scope.READ, false);
+    public static final Operation CONFIGURATION_IMPORT_PREFLIGHT = storage("configuration.import.preflight", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_COMMIT = storage("configuration.import.commit", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_STATUS = storage("configuration.import.status", Scope.READ, false);
+
     // connection domain: each probing verb runs an external probe and persists its result for later query
     // and display, so it mutates persisted state (a write) and is audited; its read-back peer returns the
     // latest persisted result (or a 404 when the connection was never probed), mutates nothing, and is
@@ -362,6 +373,9 @@ public final class ControlOperations {
             SAMPLE_SOURCE_LIST,
             SAMPLE_SOURCE_INSTALL,
             STATE_STORE_CONNECT,
+            STORAGE_STATUS, STORAGE_TEST, STORAGE_SETUP_COMMIT, STORAGE_SETUP_STATUS,
+            STORAGE_RECOVERY_PLAN, STORAGE_RECOVERY_CONFIRM, STORAGE_RECOVERY_STATUS,
+            CONFIGURATION_IMPORT_PREFLIGHT, CONFIGURATION_IMPORT_COMMIT, CONFIGURATION_IMPORT_STATUS,
             CONNECTION_TEST,
             CONNECTION_TEST_RESULT,
             CONNECTION_DISCOVER_SCHEMA,
@@ -415,6 +429,12 @@ public final class ControlOperations {
             TOKEN_LIST);
 
     private ControlOperations() {
+    }
+
+    private static Operation storage(String id, Scope scope, boolean audited) {
+        return new Operation(id, scope, audited, ControlApiSchema.ref(id),
+                "Manage storage using the original authorized operation and current installation phase; query an uncertain result before retrying.",
+                Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT));
     }
 
     private static Operation mcp(String id, Scope scope, boolean audited, String description) {

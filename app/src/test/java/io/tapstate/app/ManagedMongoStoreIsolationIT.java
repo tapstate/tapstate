@@ -132,8 +132,10 @@ class ManagedMongoStoreIsolationIT {
                         io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, database), database, null);
                 try (var connection = io.tapstate.adapters.mongostore.MongoConnection.forCache(candidate, Duration.ofSeconds(5), null)) {
                     connection.verifyConnectivity();
-                    if (user.equals(writer)) connection.verifyStoragePermissions();
-                    else assertThatThrownBy(connection::verifyStoragePermissions)
+                    var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+                    var normalized = probe.normalize(candidate);
+                    if (user.equals(writer)) assertThat(probe.test(normalized)).isPresent();
+                    else assertThatThrownBy(() -> probe.test(normalized))
                             .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                                     failure -> assertThat(failure.code()).isEqualTo(
                                             io.tapstate.adapters.mongostore.StoreError.DATABASE_ACCESS_FAILED));
