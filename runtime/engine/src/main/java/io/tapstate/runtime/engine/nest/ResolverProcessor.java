@@ -18,6 +18,7 @@ import io.tapstate.runtime.engine.SettledPositions;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -36,9 +37,8 @@ import java.util.Set;
  * <p>Two kinds of thing arrive on the same key and are meant to. A row of the embed itself declares
  * "my key hangs from that parent" and is also an element of the document in its own right, so it both
  * writes the mapping and travels on. A row from beneath asks the same key that question: answered, it
- * travels on; unanswered, it waits here until the row that answers it arrives; and answered with "that
- * parent is gone" it can never reach a document and goes to the dead-letter rather than being dropped
- * or held forever.
+ * travels on; unanswered, it waits here until the row that answers it arrives. A deletion leaves that
+ * question open: a later higher-order parent can still resolve the original child.
  *
  * <p>Which of the two an item is, is decided by the ordinal it came in on and nothing else - the edges
  * were laid out while compiling, so no inspection of the item is needed or allowed.
@@ -75,6 +75,9 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
     private final NestStore<ResolverState> store;
     private final NestDeadLetter deadLetter;
     private final Deque<Object> outgoing = new ArrayDeque<>();
+    // Only visited keys are tracked; cold state is never enumerated at startup.
+    private final Map<Object, Set<SourceOrder>> offeredReleases = new LinkedHashMap<>();
+    private Long releasesWeighedAt;
     private final LevelBounds bounds;
     private final ReplayFloor floor;
 
@@ -94,9 +97,8 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
 
     /**
      * What time it is, which is stamped on a change as it starts waiting and read again when it is handed
-     * over unassemblable. Nothing is decided by it — the wait ends on the parent arriving or on the parent
-     * being known gone — it only says how long the wait was, which is what tells a dangling reference from
-     * a deletion that just happened.
+     * over unassemblable by an explicit relocation decision. Missing-parent waiting has no timeout;
+     * ordinary parent deletion does not end it.
      */
     private final NestClock clock;
 
@@ -273,6 +275,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
             return false;
         }
         collectWhatWasTakenOver();
+        weighReleases();
         weighTombstones();
         if (!flush()) {
             return false;
@@ -280,6 +283,60 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         // Only once what the second look sent has actually left: a bound offered ahead of the changes queued
         // behind it would say they had gone, and they are right here.
         return sayWhatIsNoLongerHeld();
+    }
+
+    private Map<String, SourceOrder> releaseBarrier(Map<String, ChainPosition> positions) {
+        var barrier = new LinkedHashMap<String, SourceOrder>();
+        for (var entry : positions.entrySet()) {
+            if (entry.getValue().order() == null) return Map.of();
+            SourceOrder after = entry.getValue().order();
+            var durable = floor.of(entry.getKey());
+            if (durable.isPresent() && durable.get().compareTo(after) > 0) after = durable.get();
+            var offered = bounds == null ? Optional.<SourceOrder>empty() : bounds.lastOfferedOn(entry.getKey());
+            if (offered.isPresent() && offered.get().compareTo(after) > 0) after = offered.get();
+            barrier.put(entry.getKey(), after);
+        }
+        return Map.copyOf(barrier);
+    }
+
+    private boolean covered(Map<String, SourceOrder> positions) {
+        if (positions.isEmpty()) return false;
+        for (var entry : positions.entrySet()) {
+            var resumed = floor.of(entry.getKey());
+            if (entry.getValue() == null || resumed.isEmpty()
+                    || entry.getValue().compareTo(resumed.get()) >= 0) return false;
+        }
+        return true;
+    }
+
+    private boolean restoreReleases(Object key, ResolverState state, boolean sweeping) {
+        boolean changed = false;
+        for (var release : state.releases()) {
+            var already = offeredReleases.get(key);
+            if (!sweeping && already != null && already.contains(release.order())) continue;
+            if (outgoing.isEmpty() && covered(release.covered())) {
+                state.forgetRelease(release);
+                changed = true;
+                var offered = offeredReleases.get(key);
+                if (offered != null) offered.remove(release.order());
+            } else if (offeredReleases.computeIfAbsent(key, ignored -> new LinkedHashSet<>()).add(release.order())) {
+                release.deliveries().forEach(this::emit);
+            }
+        }
+        if (state.releases().isEmpty()) offeredReleases.remove(key);
+        return changed;
+    }
+
+    private void weighReleases() {
+        if (offeredReleases.isEmpty()) return;
+        long now = clock.millis();
+        if (releasesWeighedAt != null && now - releasesWeighedAt < SWEEP_INTERVAL_MILLIS) return;
+        releasesWeighedAt = now;
+        for (Object key : List.copyOf(offeredReleases.keySet())) {
+            var state = store.load(key);
+            if (state == null) { offeredReleases.remove(key); continue; }
+            if (restoreReleases(key, state, true)) store.save(key, state);
+        }
     }
 
     /**
@@ -310,16 +367,14 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
 
     /**
      * Whether a tombstone can be dropped: nothing is waiting on the key, and every position its deletion
-     * covered sits below where a restart would resume. A chain whose floor is not known holds it back -
-     * dropping it early lets a child that arrives afterwards find no answer where there was one, and wait
-     * for a parent that has been deleted rather than being told so.
+     * covered sits below where a restart would resume. A chain whose floor is not known holds it back;
+     * dropping it early could allow an obsolete parent declaration to become current again.
      *
-     * <p>Nothing waits on a deleted key today: a deletion drains what was waiting, and a child arriving
-     * afterwards is told the parent is absent rather than held. The check is still made, because that is
-     * what the rule says and because a later bucket landing in the same place inherits it for free.
+     * <p>A tombstone may retain waiting children. Their presence prevents reclamation even if a
+     * child's original position is unknown; an empty position map is never evidence of an empty bucket.
      */
     private boolean forgettable(ResolverState state, Map<String, ChainPosition> covered) {
-        if (!state.lowestHeldByChain().isEmpty()) {
+        if (state.holdsChildren()) {
             return false;
         }
         for (Map.Entry<String, ChainPosition> position : covered.entrySet()) {
@@ -498,22 +553,6 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         }
     }
 
-    /**
-     * Says on the key the element used to hang from that it has gone, whenever a row's join key now names
-     * a different one. It travels the old key rather than the new one on purpose: only that key leads to
-     * the document holding the element today, and whether that is the same document the element is going to
-     * is not something this level can answer - the two keys resolve independently and may lead anywhere.
-     *
-     * <p>Nothing is sent where the key did not move. The element is where it always was, and a departure
-     * from an address it never left would take it out of the only document it is in.
-     */
-    private void sendDeparture(List<Object> parentBefore, List<Object> parent, NestElement arriving, long ts) {
-        if (parentBefore == null || parentBefore.equals(parent)) {
-            return;
-        }
-        emit(new KeyedElement(parentBefore, departureOf(arriving), ts));
-    }
-
     /** The half of a move that stays behind: the same change with no row, so it places nothing. */
     private static NestElement departureOf(NestElement arriving) {
         return new NestElement(arriving.ref(), null, arriving.order(), arriving.positions(),
@@ -551,7 +590,9 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         // The entry rejects a row it has already moved past - a replay resuming below a reparent is the
         // ordinary way to meet one - and sending it on regardless puts the element back into the document
         // that reparent took it out of, with the entry here still right and nothing counting the document.
-        if (!state.accepts(order)) {
+        boolean accepted = state.accepts(order);
+        if (!accepted && !state.repeats(parent, order, NestKeys.isDeletion(event))) {
+            collectVacated(key, state, event.ts());
             return;
         }
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
@@ -564,24 +605,34 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         // that arrives looks for it. Only an ordering, not a guarantee: the two are routed by different keys
         // and may be worked by different members, so what makes the hand-over land is the arriving side
         // looking again rather than the two being sent in this order.
-        sendDeparture(parentBefore, parent, arriving, event.ts());
-        emit(new KeyedElement(parent, arriving, event.ts()));
+        var delivery = new ArrayList<KeyedElement>();
+        if (parentBefore != null && !parentBefore.equals(parent)) {
+            delivery.add(new KeyedElement(parentBefore, departureOf(arriving), event.ts()));
+        }
+        delivery.add(new KeyedElement(parent, arriving, event.ts()));
+        // Repeated delivery does not mutate the mapping. It closes the crash window between applying
+        // a declaration here and its output becoming durable at a later level.
+        if (!accepted) {
+            delivery.forEach(this::emit);
+            collectVacated(key, state, event.ts());
+            return;
+        }
         if (NestKeys.isDeletion(event)) {
             deleted.put(key, event.positions());
-            // Written out before the entry gives them up: the drain stores what it touched however it
-            // ended, so an entry emptied for children that were never written is stored with them gone
-            // from the one place they were, and the replay that would rebuild it is rejected as a change
-            // already seen. A failure here costs a retry that writes some of them twice instead.
-            long releasedAt = clock.millis();
-            for (ReleasedChild child : state.wouldRelease(order, releasedAt)) {
-                deadLetter.unassemblable(vertex, child);
-            }
-            state.deleteMapping(order, releasedAt);
+            // A source deletion cannot prove that a later same-key declaration will never arrive.
+            state.deleteMapping(order);
+            delivery.forEach(this::emit);
         } else {
             deleted.remove(key);
-            for (NestElement child : state.declare(parent, order)) {
-                emit(new KeyedElement(parent, child, event.ts()));
+            // Finish fallible preparation before taking the only durable waiting copy out of its bucket.
+            var barrier = state.waiting().isEmpty() ? Map.<String, SourceOrder>of() : releaseBarrier(event.positions());
+            var children = state.declare(parent, order, event.positions());
+            for (NestElement child : children) delivery.add(new KeyedElement(parent, child, event.ts()));
+            if (!children.isEmpty()) {
+                state.retainRelease(order, barrier, delivery, children.size());
+                offeredReleases.computeIfAbsent(key, ignored -> new LinkedHashSet<>()).add(order);
             }
+            delivery.forEach(this::emit);
             if (!collectVacated(key, state, event.ts()) && tookOverFrom(edge, event, row)) {
                 tookOver.put(key, new Awaited(event.ts(), clock.millis()));
             }
@@ -774,14 +825,22 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (waiting == null) {
             return false;
         }
+        var deliveries = new ArrayList<KeyedElement>();
         for (NestElement child : waiting.changes()) {
             switch (state.resolve(child, clock.millis())) {
-                case RESOLVED -> emit(new KeyedElement(state.parentKey(), child, ts));
+                case RESOLVED -> deliveries.add(new KeyedElement(state.parentKey(), child, ts));
                 case HELD -> { }
-                case PARENT_ABSENT ->
-                        deadLetter.unassemblable(vertex, new ReleasedChild(child, Duration.ZERO));
             }
         }
+        if (!deliveries.isEmpty()) {
+            state.retainRelease(state.mappingOrder(), releaseBarrier(state.declaredAt()), deliveries, deliveries.size());
+            offeredReleases.computeIfAbsent(key, ignored -> new LinkedHashSet<>()).add(state.mappingOrder());
+            deliveries.forEach(this::emit);
+        }
+        // Transfer responsibility durably before deleting the last parked copy. A retry may see both;
+        // replay identities make that harmless, whereas deleting first can leave neither.
+        store.save(key, state);
+        refuseToLetOneKeyHoldMoreThanItMay(key, state.pending());
         parking.remove(at);
         tookOver.remove(key);
         return true;
@@ -820,9 +879,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
             // The time of the change that took the identity over, kept since it was recorded. What lands
             // here was parked before this level ever saw it, so its own time is no longer anywhere - and
             // this is the change that puts it in a document, which is the time a document is stamped by.
-            if (collectVacated(waited.getKey(), state, waited.getValue().ts())) {
-                store.save(waited.getKey(), state);
-            }
+            collectVacated(waited.getKey(), state, waited.getValue().ts());
         }
     }
 
@@ -858,8 +915,6 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
             // Held: it is in the state now, and the drain writes that through before this level promises
             // anything, so there is nothing further to do here and nothing to record about it.
             case HELD -> { }
-            // Zero: this change arrived after the parent was already gone, so it waited no time at all.
-            case PARENT_ABSENT -> deadLetter.unassemblable(vertex, new ReleasedChild(element, Duration.ZERO));
         }
     }
 
@@ -899,6 +954,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
                 heldNothing.add(k);
                 return new ResolverState();
             }
+            restoreReleases(k, kept, false);
             return kept;
         });
     }

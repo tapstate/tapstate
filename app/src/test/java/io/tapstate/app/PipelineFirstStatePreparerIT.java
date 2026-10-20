@@ -180,6 +180,66 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void aDeletedParentAndItsOriginalChildReloadThroughTheScopedMongoMapStore() {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var owned = claims.acquirePipeline(f.scope, OWNER, 1, TTL).claim();
+            var run = claims.advanceExecution(owned, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var topology = literalRootTopology();
+            f.cache.nestShapes(f.scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(run), ACTIVE)
+                    .recordIfAbsent("step", topology.stateIdentityPaths());
+            var placement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope, f.cacheDatabase.getName(), "step",
+                    List.of("$root"), io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE, null);
+            var fence = new ExecutionFence(f.scope, WorkloadClaimFence.from(run));
+            var binding = new io.tapstate.runtime.engine.OperatorMapBinding(placement, fence, fence.operatorExecutionKey());
+            var config = new com.hazelcast.config.Config();
+            config.setProperty("hazelcast.phone.home.enabled", "false");
+            config.setProperty("hazelcast.shutdownhook.enabled", "false");
+            config.setProperty("hazelcast.operation.thread.count", "2");
+            config.setProperty("hazelcast.operation.generic.thread.count", "2");
+            var join = config.getNetworkConfig().getJoin();
+            join.getMulticastConfig().setEnabled(false); join.getTcpIpConfig().setEnabled(false);
+            join.getAutoDetectionConfig().setEnabled(false);
+            config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+            config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
+            var mapConfig = io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(binding.mapName());
+            mapConfig.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY, "true");
+            config.addMapConfig(mapConfig);
+            var member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+            try (var authorization = ExecutionAuthorization.scoped(f.business(), claims, Duration.ofSeconds(10), System::nanoTime, () -> true);
+                 var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member, new ScopedOperatorStateProvider(f.cache, authorization))) {
+                registry.install(List.of(binding));
+                var map = member.<Object, io.tapstate.runtime.engine.nest.ResolverState>getMap(binding.mapName());
+                var state = new io.tapstate.runtime.engine.nest.ResolverState();
+                state.deleteMapping(new io.tapstate.core.event.SourceOrder(1, 1));
+                var child = new io.tapstate.runtime.engine.nest.NestElement(
+                        new io.tapstate.runtime.engine.nest.ElementRef(List.of("$root", "child"), List.of("P1"), List.of("K1"), null),
+                        Map.of("claim_id", "K1", "value", 1, "payload", new byte[]{1, 2}), new io.tapstate.core.event.SourceOrder(1, 3),
+                        Map.of("claims", new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(1, 3), "original-opaque-token")));
+                state.resolve(child, 1); map.set(List.of("P1"), state);
+                assertThat(f.cacheDatabase.getCollection("nest_state").countDocuments()).isEqualTo(1);
+                assertThat(f.configDatabase.listCollectionNames().into(new ArrayList<>())).doesNotContain("nest_state");
+                assertThat(map.evict(List.of("P1"))).isTrue();
+                assertThat(map.getLocalMapStats().getOwnedEntryCount()).isZero();
+                var cold = map.get(List.of("P1"));
+                assertThat(cold.deleted()).isTrue(); assertThat(cold.pending()).isEqualTo(1);
+                map.destroy();
+                var reopened = member.<Object, io.tapstate.runtime.engine.nest.ResolverState>getMap(binding.mapName());
+                var restored = reopened.get(List.of("P1"));
+                restored.resolve(child, 2);
+                assertThat(restored.pending()).isEqualTo(1);
+                var released = restored.declare(List.of("C1"), new io.tapstate.core.event.SourceOrder(1, 2));
+                assertThat(released).singleElement().satisfies(value -> {
+                    assertThat(value.fields()).containsEntry("value", 1);
+                    assertThat((byte[]) value.fields().get("payload")).containsExactly((byte) 1, (byte) 2);
+                    assertThat(value.positions().get("claims").token()).isEqualTo("original-opaque-token");
+                    assertThat(value.order()).isEqualTo(new io.tapstate.core.event.SourceOrder(1, 3));
+                });
+            } finally { member.shutdown(); }
+        });
+    }
+
     private static io.tapstate.runtime.engine.nest.NestTopology literalRootTopology() {
         var child = new io.tapstate.core.model.Embed("claim",Map.of("policy_id","policy_id"),io.tapstate.core.model.EmbedAs.ARRAY,"child",List.of("claim_id"),null,null,null);
         var parent = new io.tapstate.core.model.Embed("policy",Map.of("customer_id","customer_id"),io.tapstate.core.model.EmbedAs.ARRAY,"$root",List.of("policy_no"),null,null,List.of(child));

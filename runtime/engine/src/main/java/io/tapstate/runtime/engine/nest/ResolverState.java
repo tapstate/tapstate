@@ -4,10 +4,11 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 
 import java.io.Serializable;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.Map;
 import java.util.Objects;
 
@@ -19,25 +20,15 @@ import java.util.Objects;
  * <p><b>The higher order wins</b>, as everywhere else: a declaration at or beneath the one already held
  * is refused. <b>A deletion leaves a versioned tombstone rather than removing the entry.</b> The row's
  * children may still be on their way — a change not yet delivered, or one a replay will deliver again —
- * and an entry removed outright would leave them unable to resolve, so they would pile up waiting for a
- * parent that no longer exists and hold the frontier still. A tombstone answers them instead: a child
- * replayed from beneath it is told the parent is absent, and a genuine rebuild above it revives the
- * mapping.
+ * and a genuine newer declaration revives the mapping. A deletion does not prove that its key
+ * will never be declared again: independent input streams can deliver that declaration later.
  *
- * <p><b>A deletion empties the waiting bucket at once, and does not wait for a timeout.</b> Those
- * children were waiting for a row that is now known to be gone, so they can never resolve and would
- * otherwise pin the frontier for nothing. They are handed back to the caller to route — where they go
- * is the caller's business, but they must go somewhere: dropping them silently loses data that a
- * document-level assertion can never see, because those rows were never going to appear in a document.
+ * <p>Children wait while the mapping is missing, including under a deleted tombstone. Parent deletion
+ * preserves the bucket rather than turning a temporarily missing parent into a permanent orphan.
+ * The existing per-key capacity limit bounds this wait; it has no time-based release.
  *
- * <p>The bucket is therefore non-empty only while there is no entry at all — a live mapping resolves on
- * the spot, a tombstone answers absent — which keeps the pending set small and makes "what is waiting
- * here" a question with one answer.
- *
- * <p><b>A held child keeps the position it arrived with.</b> It has been consumed and not emitted, so
- * the durable frontier must stay below it; {@link #lowestHeldByChain()} is what a vertex reports so
- * that can be enforced. Both halves of a position are kept: the order to compare on, the token to
- * persist and hand back to the connector.
+ * <p>A held child retains its original order and source positions. The owner writes the state through
+ * before advertising durable coverage. An exact replay does not consume another pending slot.
  *
  * <p>{@link Serializable} because this state outlives a single run. An order is never null — a null
  * order is an engine invariant violation and crashes bare rather than being reported as a diagnosable
@@ -46,19 +37,82 @@ import java.util.Objects;
 public final class ResolverState implements Serializable {
 
     /**
-     * Said rather than derived, so this state's identity does not move when its fields do. Derived, it
-     * changes with every field added or dropped, and every mapping already written becomes unreadable on
-     * the first key that has to come back from the cold layer - an upgrade that looked clean until the
-     * first miss. Held still, bytes written before a field existed still load, and that field reads back
-     * at its zero. Bump this deliberately when that is the wrong answer and the old bytes should be
-     * refused outright instead.
+     * Explicit so a compatible payload's Java identity is not derived from incidental method changes.
+     * The storage layout controls admission; this is not an old-layout migration mechanism.
      */
     private static final long serialVersionUID = 1L;
 
     private Object parentKey;
     private SourceOrder order;
+    private Map<String, ChainPosition> declaredAt = Map.of();
     private boolean deleted;
     private final List<Waiting> waiting = new ArrayList<>();
+    private final List<Release> releases = new ArrayList<>();
+
+    /** The original handoff stays durable until its parent's source position is covered downstream. */
+    record Release(SourceOrder order, Map<String, SourceOrder> covered, List<KeyedElement> deliveries,
+            int children) implements Serializable {
+        Release {
+            covered = Map.copyOf(covered);
+            deliveries = List.copyOf(deliveries);
+        }
+    }
+
+    List<Release> releases() { return List.copyOf(releases); }
+
+    void retainRelease(SourceOrder parentOrder, Map<String, SourceOrder> covered,
+            List<KeyedElement> deliveries, int children) {
+        if (children == 0) return;
+        var next = new Release(parentOrder, covered, deliveries, children);
+        for (int index = 0; index < releases.size(); index++) {
+            var previous = releases.get(index);
+            if (!previous.order().equals(parentOrder)) continue;
+            var declarations = new LinkedHashMap<RoutedReplay, KeyedElement>();
+            var received = new LinkedHashMap<RoutedReplay, KeyedElement>();
+            for (var part : List.of(previous, next)) {
+                int prefix = part.deliveries().size() - part.children();
+                for (int item = 0; item < part.deliveries().size(); item++) {
+                    var delivery = part.deliveries().get(item);
+                    (item < prefix ? declarations : received).putIfAbsent(RoutedReplay.of(delivery), delivery);
+                }
+            }
+            var combined = new ArrayList<>(declarations.values()); combined.addAll(received.values());
+            var barriers = new LinkedHashMap<>(covered);
+            previous.covered().forEach((chain, value) -> barriers.merge(chain, value,
+                    (first, second) -> first.compareTo(second) >= 0 ? first : second));
+            releases.set(index, new Release(parentOrder,
+                    covered.isEmpty() || previous.covered().isEmpty() ? Map.of() : barriers,
+                    combined, received.size()));
+            return;
+        }
+        releases.add(next);
+    }
+
+    private record RoutedReplay(Object key, ReplayKey element) {
+        static RoutedReplay of(KeyedElement value) { return new RoutedReplay(value.key(), ReplayKey.of(value.element())); }
+    }
+
+    SourceOrder mappingOrder() { return order; }
+    Map<String, ChainPosition> declaredAt() { return declaredAt; }
+
+    void forgetRelease(Release release) { releases.remove(release); }
+
+    boolean repeats(Object parent, SourceOrder candidate, boolean deletion) {
+        return candidate.equals(order) && deleted == deletion
+                && (deletion || Objects.equals(parentKey, parent));
+    }
+    // Derived only in memory; the serialized wait list remains the sole durable representation.
+    private transient Set<ReplayKey> waitingValues;
+
+    // Source order and address identify the original change; payload arrays need not share identity
+    // with the deserialized copy. Keep the first full payload rather than normalizing its row values.
+    private record ReplayKey(ElementRef ref, SourceOrder order, Map<String, ChainPosition> positions,
+            ElementRef movedFrom, boolean deletion, boolean departed) {
+        static ReplayKey of(NestElement child) {
+            return new ReplayKey(child.ref(), child.order(), child.positions(), child.movedFrom(),
+                    child.deletion(), child.departed());
+        }
+    }
 
     /**
      * One change held here, and when it was first held. The time is a property of the holding rather than
@@ -85,12 +139,12 @@ public final class ResolverState implements Serializable {
 
     /** Whether anything is waiting here at all - asked far more often than what, and without building it. */
     public boolean holdsChildren() {
-        return !waiting.isEmpty();
+        return !waiting.isEmpty() || !releases.isEmpty();
     }
 
     /** How many changes are held here for a parent that has not arrived. */
     public int pending() {
-        return waiting.size();
+        return waiting.size() + releases.stream().mapToInt(Release::children).sum();
     }
 
     /**
@@ -98,7 +152,7 @@ public final class ResolverState implements Serializable {
      * indistinguishable from one that was never written, so keeping it costs a key and answers nothing.
      */
     public boolean vacant() {
-        return order == null && !deleted && waiting.isEmpty();
+        return order == null && !deleted && waiting.isEmpty() && releases.isEmpty();
     }
 
     /**
@@ -107,12 +161,16 @@ public final class ResolverState implements Serializable {
      * superseded, or when nothing was waiting.
      */
     public List<NestElement> declare(Object parentKey, SourceOrder order) {
+        return declare(parentKey, order, Map.of());
+    }
+
+    List<NestElement> declare(Object parentKey, SourceOrder order, Map<String, ChainPosition> positions) {
         Objects.requireNonNull(order, "order");
-        if (!wins(order)) {
-            return List.of();
-        }
+        var fixed = Map.copyOf(positions);
+        if (!wins(order)) return List.of();
         this.parentKey = parentKey;
         this.order = order;
+        this.declaredAt = fixed;
         this.deleted = false;
         return drain();
     }
@@ -122,9 +180,7 @@ public final class ResolverState implements Serializable {
      * vacated leaves behind: the row that answered to it now answers to another, so nothing carries this
      * value any more - but a row may yet declare it, and children naming it are waiting for exactly that.
      *
-     * <p>Held rather than released, which is the difference from a deletion. A deletion says the parent
-     * will not come back and its children are unassemblable; this says only that the value is unclaimed
-     * right now. Left answering instead, the mapping the row abandoned goes on placing children under a
+     * <p>The value is unclaimed right now. Left answering instead, the mapping the row abandoned goes on placing children under a
      * parent that is not there - in a document they do not belong to, with nothing counting it.
      */
     public void stopAnswering(SourceOrder order) {
@@ -136,66 +192,32 @@ public final class ResolverState implements Serializable {
         this.order = order;
     }
 
-    /**
-     * Marks the declaring row deleted at {@code order}, keeping a tombstone in place of the mapping.
-     * Returns the children that were waiting: they can never resolve now, and the caller must route
-     * them rather than drop them.
-     */
-    public List<ReleasedChild> deleteMapping(SourceOrder order, long now) {
+    /** Marks the mapping deleted without discarding children that a later declaration can resolve. */
+    public void deleteMapping(SourceOrder order) {
         Objects.requireNonNull(order, "order");
-        if (!wins(order)) {
-            return List.of();
-        }
+        if (!wins(order)) return;
         this.parentKey = null;
         this.order = order;
         this.deleted = true;
-        List<ReleasedChild> released = heldFor(now);
-        waiting.clear();
-        return released;
     }
 
-    /**
-     * What deleting this mapping at {@code order} would release, without releasing it - empty where the
-     * deletion does not win, exactly as applying it would be.
-     *
-     * <p>Separate from applying it for the same reason {@link #forgetWaiting()} is separate from
-     * {@link #waiting()}: a released child is released by being written somewhere, and until that write is
-     * done this entry is the only place it is. Emptied first and the write then failing leaves it nowhere,
-     * with the replay that would rebuild it rejected as a change already seen.
-     */
-    public List<ReleasedChild> wouldRelease(SourceOrder order, long now) {
-        Objects.requireNonNull(order, "order");
-        return wins(order) ? heldFor(now) : List.of();
-    }
-
-    private List<ReleasedChild> heldFor(long now) {
-        return waiting.stream()
-                .map(held -> new ReleasedChild(held.child(), Duration.ofMillis(now - held.arrivedAt())))
-                .toList();
-    }
-
-    /**
-     * Offers one child event to this key: resolved when the parent row is known, absent when it is known
-     * deleted, held otherwise — and a held child is kept until a declaration or a deletion releases it.
-     */
+    /** Resolves through a live mapping; otherwise retains the exact original child until a parent appears. */
     public Resolution resolve(NestElement child, long arrivedAt) {
         Objects.requireNonNull(child, "child");
-        if (deleted) {
-            return Resolution.PARENT_ABSENT;
-        }
-        // No declaration yet, or one that has been given up: a value nothing carries right now is not the
-        // same as one whose row is gone, and the difference is what these children are waiting on. The
-        // second case is only reachable through stopAnswering - a deletion leaves the tombstone above.
-        if (order == null || parentKey == null) {
-            waiting.add(new Waiting(child, arrivedAt));
+        if (deleted || order == null || parentKey == null) {
+            if (waitingValues == null) {
+                waitingValues = new HashSet<>();
+                for (Waiting held : waiting) waitingValues.add(ReplayKey.of(held.child()));
+            }
+            if (waitingValues.add(ReplayKey.of(child))) waiting.add(new Waiting(child, arrivedAt));
             return Resolution.HELD;
         }
         return Resolution.RESOLVED;
     }
 
     /**
-     * The lowest position held per chain — the bound below which the durable frontier must stay for the
-     * events waiting here. Chains with nothing waiting do not appear.
+     * The lowest original position held per chain. Durably held waiting does not pin the frontier;
+     * these positions remain part of the original change throughout recovery and handoff.
      */
     public Map<String, ChainPosition> lowestHeldByChain() {
         Map<String, ChainPosition> lowest = new LinkedHashMap<>();
@@ -243,6 +265,7 @@ public final class ResolverState implements Serializable {
         }
         List<NestElement> released = waiting();
         waiting.clear();
+        waitingValues = null;
         return released;
     }
 }
