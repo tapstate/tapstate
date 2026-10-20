@@ -128,17 +128,25 @@ final class BackgroundLoad {
         Subscription subscription;
         synchronized (this) {
             subscription = opened;
-            opened = null;
         }
         if (subscription != null) {
-            try { subscription.close(); }
+            try { closeTail(subscription); }
             catch (RuntimeException | Error closeFailure) {
                 if (failure == null) failure = closeFailure;
                 else if (closeFailure != failure) failure.addSuppressed(closeFailure);
             }
         }
+        if (Thread.currentThread() != thread && thread.isAlive()) {
+            var ending = new io.tapstate.core.common.TapstateException(CaptureError.STILL_ENDING, Map.of("captureId", thread.getName()), null);
+            if (failure == null) failure = ending; else failure.addSuppressed(ending);
+        }
         if (failure instanceof RuntimeException runtime) throw runtime;
         if (failure instanceof Error error) throw error;
+    }
+
+    private void closeTail(Subscription original) {
+        original.close();
+        synchronized (this) { if (opened == original) opened = null; }
     }
 
     /**
@@ -177,13 +185,11 @@ final class BackgroundLoad {
             boolean keep;
             synchronized (this) {
                 keep = !cancelled;
-                if (keep) {
-                    opened = subscription.orElse(null);
-                }
+                opened = subscription.orElse(null);
             }
             if (!keep) {
                 // Abandoned while the tail was opening: nobody is left to close it but this thread.
-                subscription.ifPresent(Subscription::close);
+                subscription.ifPresent(this::closeTail);
             }
         } catch (RuntimeException | Error failure) {
             // A run closed while it ran was cut short by the stop somebody asked for. Anything else that cuts it

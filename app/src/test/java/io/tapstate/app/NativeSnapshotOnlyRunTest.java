@@ -56,6 +56,21 @@ class NativeSnapshotOnlyRunTest {
             assertThat(loaded).isEmpty(); assertThat(port.closed).hasValue(1);
         }
     }
+    @Test void anUnreturnedBoundedOpeningIsRetriedOnlyUnderItsOriginalGuardIdentity() {
+        var active=new AtomicBoolean(true);var allowClose=new AtomicBoolean();var closes=new AtomicInteger();var pending=new IllegalStateException("original batch close pending");
+        var port=mock(CapturePort.class,withSettings().extraInterfaces(SnapshotOnlyCapture.class));
+        var batch=mock(CaptureBatch.class);
+        doAnswer(call -> {closes.incrementAndGet();if(!allowClose.get())throw pending;return null;}).when(batch).close();
+        when(((SnapshotOnlyCapture)port).snapshotOnly(any())).thenAnswer(call -> {active.set(false);return batch;});
+        Runnable original=() -> {if(!active.get())throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);};
+        try(var runtime=unit()) {
+            assertThatThrownBy(() -> runtime.beginSnapshotOnly(CONFIG,3,port,handoff(new ArrayList<>(),new ArrayList<>()),original)).isInstanceOf(TapstateException.class);
+            int before=closes.get();runtime.stopOpenings(() -> {});assertThat(closes).hasValue(before);
+            assertThatThrownBy(() -> runtime.stopOpenings(original)).isSameAs(pending);
+            allowClose.set(true);runtime.stopOpenings(original);int done=closes.get();runtime.stopOpenings(original);assertThat(closes).hasValue(done);
+        } finally {allowClose.set(true);}
+    }
+
     private static NativeSrsCaptureRunUnit unit() {
         return new NativeSrsCaptureRunUnit(SCOPE,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),mock(SrsConsumerStore.class)),mock(HazelcastInstance.class));
     }

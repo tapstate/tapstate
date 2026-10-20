@@ -33,6 +33,12 @@ public final class PreparedSnapshotSource implements TapConnector {
         });
         functions.supportBatchRead((context, table, offset, size, consumer) -> {
             counter("reads").incrementAndGet();
+            var entered=(java.util.concurrent.CountDownLatch)state().get("readEntered");
+            if(entered!=null) {
+                ((java.util.concurrent.atomic.AtomicReference<Thread>)state().get("readWorker")).set(Thread.currentThread());
+                entered.countDown();var release=(java.util.concurrent.CountDownLatch)state().get("readRelease");
+                while(release.getCount()!=0)try {release.await();}catch(InterruptedException stopping) { }
+            }
             if (!((AtomicBoolean) state().get("pinned")).get()) counter("earlyReads").incrementAndGet();
             consumer.accept(List.of(), null);
         });

@@ -99,7 +99,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
     @ParameterizedTest @ValueSource(booleans={false,true})
-    void aSourceCloseFailureStillReleasesTheOriginalBufferAndLease(boolean error) throws Exception {
+    void aSourceCloseFailureRetainsTheOriginalSessionAndLeaseForRetry(boolean error) throws Exception {
         try(var f=new Fixture(List.of("input"),1)) {
             Throwable failure=error?new AssertionError("close invariant"):new IllegalStateException("close invariant");
             f.closeFailure.set(failure);f.rowCount.set(3);
@@ -110,11 +110,22 @@ class ScopedPipelineCaptureCoordinatorTest {
             try {
                 assertThat(f.readRows).hasValue(2);
                 assertThatThrownBy(() -> run.stopCapture("flow",false)).isSameAs(failure);
-                verify(f.ownership).release(f.capture);
+                verify(f.ownership,never()).release(f.capture);assertThat(run.isCapturing("flow")).isTrue();
+                run.stopCapture("flow",false);verify(f.ownership).release(f.capture);assertThat(run.isCapturing("flow")).isFalse();
                 assertThat(f.buffer.snapshotState(key,ring).declared()).isFalse();
             } finally { f.buffer.release(key); }
         }
     }
+    @Test void wholeCoordinatorCloseRetainsUnclosedOriginalSessionsForRetry() throws Exception {
+        try(var f=new Fixture(List.of("input"),1)) {
+            f.rowCount.set(3);var failure=new IllegalStateException("original reader close pending");f.closeFailure.set(failure);
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            long deadline=System.nanoTime()+Duration.ofSeconds(3).toNanos();while(f.readRows.get()<2 && System.nanoTime()<deadline)Thread.sleep(5);
+            assertThatThrownBy(f.coordinator::close).isSameAs(failure);verify(f.ownership,never()).release(f.capture);
+            f.coordinator.close();verify(f.ownership).release(f.capture);
+        }
+    }
+
     private static final class Port implements CapturePort,SnapshotOnlyCapture {
         final String source; final Runnable guard; final AtomicInteger closed,read; final int count; final AtomicReference<Throwable> closeFailure;
         Port(String source,Runnable guard,AtomicInteger closed,AtomicInteger read,int count,AtomicReference<Throwable> closeFailure) {

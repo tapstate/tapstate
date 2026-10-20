@@ -55,6 +55,34 @@ class BackgroundLoadTest {
         } finally { worker.get().interrupt();assertThat(background.awaitFinished(Duration.ofSeconds(3))).isTrue(); }
     }
 
+    @Test void aStillRunningOriginalLoadKeepsItsClosePendingUntilTheWorkerExits() throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        CapturePort source=new CapturePort() {
+            public CaptureBatch snapshot(CaptureConfig config) {
+                return new CaptureBatch() {
+                    public boolean hasNext() {
+                        entered.countDown();while(release.getCount()!=0)try {release.await();}catch(InterruptedException stopping) { }
+                        return false;
+                    }
+                    public Envelope next(){throw new AssertionError();}
+                    public Optional<SourcePosition> seam(){return Optional.empty();}
+                    public void close(){ }
+                };
+            }
+            public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener listener){throw new AssertionError();}
+            public ConnectionReport testConnection(CaptureConfig config){throw new AssertionError();}
+            public DiscoveredSchema discoverSchema(CaptureConfig config){throw new AssertionError();}
+        };
+        var load=SnapshotPhase.openChainless(source,new CaptureConfig("fixture",Map.of(),List.of("orders")),1);
+        var original=new BackgroundLoad(load,CaptureHandoff.of(row -> {}),Optional::empty,new CaptureHealth(),"held-original-load");
+        original.start();assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        try {
+            assertThatThrownBy(original::cancel).isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(CaptureError.STILL_ENDING));
+            assertThat(original.finished()).isFalse();
+        } finally {release.countDown();assertThat(original.awaitFinished(Duration.ofSeconds(3))).isTrue();original.cancel();}
+    }
+
     /**
      * A run closed as its load ends never opens its tail. Opened anyway, the tail would set up on the source
      * what nothing is left to read through or let go of -- a replication slot, after the clearing that closed

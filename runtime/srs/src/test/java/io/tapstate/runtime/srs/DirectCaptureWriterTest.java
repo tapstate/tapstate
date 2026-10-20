@@ -115,6 +115,12 @@ class DirectCaptureWriterTest {
         }
     }
     private static Envelope row(String table,int value) { return Envelope.insert(1,table,Map.of("id",value),null); }
+    @Test void aFailedDirectCloseCannotMakeTheSecondStopLookComplete() {
+        var f=new Fixture(8);f.start();var pending=new IllegalStateException("original direct source is still ending");f.source.closeFailure=pending;
+        assertThatThrownBy(f.subscription::close).isSameAs(pending);assertThatThrownBy(f.subscription::close).isSameAs(pending);
+        assertThat(f.source.closed).hasValue(2);f.source.closeFailure=null;f.subscription.close();f.subscription.close();assertThat(f.source.closed).hasValue(3);
+    }
+
     private static void assertUnavailable(Runnable action) {
         assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.DIRECT_CHANNEL_UNAVAILABLE));
     }
@@ -177,9 +183,9 @@ class DirectCaptureWriterTest {
             public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError("actual host preparation owns discovery"); }
         }
         private static final class Source implements Subscription {
-            final AtomicInteger closed=new AtomicInteger();
+            final AtomicInteger closed=new AtomicInteger();volatile RuntimeException closeFailure;
             public void acknowledge(SourcePosition position) { throw new AssertionError("producer does not acknowledge its own delivery"); }
-            public void close() { closed.incrementAndGet(); }
+            public void close() { closed.incrementAndGet();if(closeFailure!=null)throw closeFailure; }
         }
     }
 }

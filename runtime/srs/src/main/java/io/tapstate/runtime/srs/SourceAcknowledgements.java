@@ -171,6 +171,7 @@ public final class SourceAcknowledgements implements AutoCloseable {
         private final Set<Followed> registry;
         private ChainPosition handed;
         private volatile boolean closed;
+        private boolean ended;
         private long lastWarnedNanos;
         private boolean warned;
 
@@ -228,10 +229,11 @@ public final class SourceAcknowledgements implements AutoCloseable {
 
         @Override
         public synchronized void close() {
-            if (closed) return;
+            if (ended) return;
             closed = true;
             registry.remove(this);
             tail.close();
+            ended = true;
         }
     }
 }

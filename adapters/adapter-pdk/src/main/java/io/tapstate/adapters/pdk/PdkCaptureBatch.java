@@ -74,6 +74,8 @@ final class PdkCaptureBatch implements CaptureBatch {
     private Iterator<Envelope> current = Collections.emptyIterator();
     private boolean over;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean cleanupStarted = new AtomicBoolean();
+    private final CompletableFuture<Void> cleanup = new CompletableFuture<>();
 
     private PdkCaptureBatch(PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
         this.connector = connector;
@@ -110,15 +112,15 @@ final class PdkCaptureBatch implements CaptureBatch {
         try {
             seam.get();
         } catch (InterruptedException interrupted) {
-            close();
+            if (ownsConnector) close(); else requestClose();
             Thread.currentThread().interrupt();
             throw new CancellationException("the snapshot read was interrupted before its seam was taken");
         } catch (ExecutionException failed) {
-            close();
+            if (ownsConnector) close(); else requestClose();
             throw unchecked(failed.getCause());
         } catch (CancellationException abandoned) {
             // A read abandoned before its seam ends the wait with that as itself, not wrapped as a failure is.
-            close();
+            if (ownsConnector) close(); else requestClose();
             throw abandoned;
         }
         return this;
@@ -194,21 +196,36 @@ final class PdkCaptureBatch implements CaptureBatch {
 
     @Override
     public void close() {
-        boolean first = requestClose();
-        // A session-owned batch releases only its worker. The session stops and closes the connector
-        // after the table read, or on abandonment before this worker is joined.
-        if (first && ownsConnector) {
-            connector.stopQuietly();
+        requestClose();
+        if (ownsConnector) {
+            if (cleanupStarted.compareAndSet(false,true)) {
+                var owner = new Thread(() -> {
+                    try {connector.stopQuietly(); awaitReader(); ahead.clear(); connector.close(); cleanup.complete(null);}
+                    catch(RuntimeException|Error failure){cleanup.completeExceptionally(failure);}
+                }, "tapstate-snapshot-ending-" + connector.connectorId());
+                owner.setDaemon(true); owner.start();
+            }
+            try { cleanup.get(JOIN_MILLIS,TimeUnit.MILLISECONDS); }
+            catch (InterruptedException stopping) {Thread.currentThread().interrupt();throw stillEnding(stopping);}
+            catch (ExecutionException failed) {throw unchecked(failed.getCause());}
+            catch (java.util.concurrent.TimeoutException stopping) {throw stillEnding(stopping);}
+            return;
         }
-        try {
-            reader.join(JOIN_MILLIS);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-        }
+        try { reader.join(JOIN_MILLIS); }
+        catch (InterruptedException stopping) {Thread.currentThread().interrupt();}
+        if (reader.isAlive()) throw stillEnding(null);
         ahead.clear();
-        if (first && ownsConnector) {
-            connector.close();
-        }
+    }
+
+    /** Only the original cleanup owner waits without a caller budget, retaining its own reader reference. */
+    void awaitReader() {
+        boolean interrupted=false;
+        while(reader.isAlive())try {reader.join();}catch(InterruptedException stopping){interrupted=true;}
+        if(interrupted)Thread.currentThread().interrupt();
+    }
+    private io.tapstate.core.common.TapstateException stillEnding(Throwable cause) {
+        return new io.tapstate.core.common.TapstateException(ConnectorError.CAPTURE_FAILED,
+                java.util.Map.of("connector",connector.connectorId(),"detail","the original snapshot reader is still ending; retry its close"),cause);
     }
 
     private void readAll(Read read) {

@@ -43,6 +43,33 @@ class PdkSnapshotPreparationTest {
     }
     private static void drain(CaptureBatch batch) { try (batch) { assertThat(batch.hasNext()).isFalse(); } }
 
+    @Test void closingAPreparedSessionRetainsItsActualReaderUntilItExits() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var worker=new AtomicReference<Thread>();
+        state.put("readEntered",entered);state.put("readRelease",release);state.put("readWorker",worker);
+        var port=port().withSnapshotPreparation((request,seam,tables) -> flag("pinned").set(true));
+        var session=SnapshotSession.openPrepared(port,config("t1"),new SnapshotPreparation(1,null)).orElseThrow();
+        try {
+            session.read("t1");assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(session::close).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+            assertThat(worker.get().isAlive()).isTrue();release.countDown();session.close();assertThat(worker.get().isAlive()).isFalse();
+        } finally {release.countDown();if(worker.get()!=null)worker.get().join(3000);session.close();}
+    }
+
+    @Test void aPreparedSessionStopThatBlocksCannotBlockItsCallerWithoutABudget() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var exited=new CountDownLatch(1);
+        state.put("stopEntered",entered);state.put("stopRelease",release);state.put("stopExited",exited);
+        var session=SnapshotSession.openPrepared(port().withSnapshotPreparation((request,seam,tables) -> flag("pinned").set(true)),config("t1"),new SnapshotPreparation(1,null)).orElseThrow();
+        drain(session.read("t1"));
+        try(var executor=Executors.newSingleThreadExecutor()) {
+            var close=executor.submit(session::close);
+            try {
+                assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> close.get(3,TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.ExecutionException.class).hasCauseInstanceOf(TapstateException.class);
+            } finally {release.countDown();assertThat(exited.await(3,TimeUnit.SECONDS)).isTrue();}
+        }
+        session.close();assertThat(counter("stops")).hasValue(1);
+    }
+
     @Test void cdcPublishesActualSelectedSessionMetadataBeforeItCanStream() throws Exception {
         var calls=new AtomicInteger();var delivered=new CountDownLatch(1);var host=Thread.currentThread().getContextClassLoader();
         var port=port().withStreamPreparation(tables -> {
@@ -303,7 +330,8 @@ class PdkSnapshotPreparationTest {
         try (var executor = Executors.newSingleThreadExecutor(); var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
             var opened = executor.submit(() -> session.read("t1"));
             try {
-                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue(); session.close();
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(session::close).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
                 assertThat(exited.getCount()).as("the callback is deliberately still pending").isOne();
                 assertThatThrownBy(() -> opened.get(1, TimeUnit.SECONDS)).hasCauseInstanceOf(CancellationException.class);
             } finally {

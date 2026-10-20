@@ -34,6 +34,7 @@ public final class SrsCaptureWriter implements AutoCloseable {
     private final HazelcastInstance member;
     private final Runnable guard;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final java.util.Set<Subscription> sourceHandles = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final AtomicBoolean started = new AtomicBoolean();
     private final Map<String, SrsModel> published = new LinkedHashMap<>();
     private final Map<String, SrsTableCheckpoint> frontiers = new LinkedHashMap<>();
@@ -136,16 +137,34 @@ public final class SrsCaptureWriter implements AutoCloseable {
                     try { append(events, position); } catch (RuntimeException | Error failure) { close(); throw failure; }
                 }
             }));
+            sourceHandles.add(source);
             try { requireActive(); }
             catch (RuntimeException | Error failure) {
-                try { source.close(); } catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+                try { stopSource(source); } catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
                 throw failure;
             }
             return new Subscription() {
                 @Override public void acknowledge(SourcePosition durable) { requireActive(); source.acknowledge(durable); }
-                @Override public void close() { SrsCaptureWriter.this.close(); source.close(); }
+                @Override public void close() { SrsCaptureWriter.this.close(); stopSource(source); }
             };
         } catch (RuntimeException | Error failure) { close(); throw failure; }
+    }
+
+    /** Cleanup never needs business activation; a failed start retains the original source until it closes. */
+    public void stopSources() {
+        Throwable first = null;
+        for (var source : List.copyOf(sourceHandles)) {
+            try { stopSource(source); }
+            catch (RuntimeException | Error failure) {
+                if (first == null) first = failure; else if (first != failure) first.addSuppressed(failure);
+            }
+        }
+        if (first instanceof RuntimeException runtime) throw runtime;
+        if (first instanceof Error error) throw error;
+    }
+    private void stopSource(Subscription source) {
+        if (!sourceHandles.contains(source)) return;
+        source.close(); sourceHandles.remove(source);
     }
 
     private synchronized void began(SourcePosition position) {

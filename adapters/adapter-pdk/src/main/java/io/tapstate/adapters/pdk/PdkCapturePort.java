@@ -283,6 +283,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         private final AtomicReference<PreparedSnapshot> prepared = new AtomicReference<>();
         private PdkCaptureBatch active;
         private volatile boolean closed;
+        private final CompletableFuture<Void> ending = new CompletableFuture<>();
 
         private SharedSnapshotSession(PdkConnector connector, CaptureConfig config, BatchReadFunction batch, SnapshotPreparation preparation) {
             this.connector = connector;
@@ -336,33 +337,40 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 if (closed) throw new CancellationException("the snapshot session was closed during preparation");
                 return opened;
             } catch (RuntimeException | Error failure) {
-                try { close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+                if (!closed) try { close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
                 throw failure;
             }
         }
 
         @Override
         public void close() {
-            PdkCaptureBatch reading;
             synchronized (this) {
-                if (closed) {
-                    return;
+                if (!closed) {
+                    closed = true; var reading = active;
+                    if (reading != null) reading.requestClose();
+                    var owner = new Thread(() -> {
+                        try {
+                            connector.stopQuietly();
+                            if (reading != null) { reading.awaitReader(); reading.close(); }
+                            connector.close(); ending.complete(null);
+                        } catch (RuntimeException | Error failure) { ending.completeExceptionally(failure); }
+                    }, "tapstate-snapshot-session-ending-" + connector.connectorId());
+                    owner.setDaemon(true); owner.start();
                 }
-                closed = true;
-                reading = active;
             }
-            if (reading != null) {
-                reading.requestClose();
-            }
-            connector.stopQuietly();
-            try {
-                if (reading != null) {
-                    reading.close();
-                }
-            } finally {
-                connector.close();
+            try { ending.get(SHUTDOWN_JOIN_MILLIS,TimeUnit.MILLISECONDS); }
+            catch (InterruptedException stopping) {
+                Thread.currentThread().interrupt();
+                throw new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector",connector.connectorId(),"detail","waiting for the original snapshot session to stop was interrupted"),stopping);
+            } catch (ExecutionException failed) {
+                if(failed.getCause() instanceof RuntimeException runtime)throw runtime;
+                if(failed.getCause() instanceof Error error)throw error;
+                throw new IllegalStateException("unexpected snapshot cleanup failure",failed.getCause());
+            } catch (TimeoutException stopping) {
+                throw new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector",connector.connectorId(),"detail","the original snapshot session is still ending; retry its close"),stopping);
             }
         }
+
     }
 
     /**
@@ -431,6 +439,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         thread.start();
         awaitPreflight(preflight, connector, thread, delivery);
         return new Subscription() {
+            private final CompletableFuture<Void> ended = new CompletableFuture<>();
             @Override
             public void acknowledge(SourcePosition durable) {
                 acknowledgements.offer(durable);
@@ -438,13 +447,27 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
             @Override
             public void close() {
-                // Before anything else: a source may still deliver on its way down, and a delivery made
-                // after close must hand it nothing.
                 acknowledgements.close();
-                if (!delivery.cancel()) {
-                    return;
+                if (delivery.cancel()) {
+                    Thread cleanup = new Thread(() -> finishCdc(connector, thread, delivery, ended),
+                            "tapstate-cdc-ending-" + connector.connectorId());
+                    cleanup.setDaemon(true);
+                    cleanup.start();
                 }
-                shutDown(connector, thread, CDC_SHUTDOWN_GRACE_MILLIS);
+                try {
+                    ended.get(CDC_SHUTDOWN_GRACE_MILLIS + SHUTDOWN_JOIN_MILLIS, TimeUnit.MILLISECONDS);
+                } catch (TimeoutException waiting) {
+                    throw new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of("connector", connector.connectorId(),
+                            "detail", "the original capture is still ending; retry its stop"), waiting);
+                } catch (InterruptedException stopping) {
+                    Thread.currentThread().interrupt();
+                    throw new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of("connector", connector.connectorId(),
+                            "detail", "waiting for the original capture to stop was interrupted"), stopping);
+                } catch (ExecutionException failed) {
+                    if(failed.getCause() instanceof RuntimeException runtime)throw runtime;
+                    if(failed.getCause() instanceof Error error)throw error;
+                    throw new IllegalStateException("unexpected capture cleanup failure",failed.getCause());
+                }
             }
         };
     }
@@ -508,17 +531,27 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         joinQuietly(cleanup, SHUTDOWN_JOIN_MILLIS);
     }
 
-    /** Lets a cancelled read release its cursor before stopping the client; aborts remain bounded. */
-    private static void shutDown(PdkConnector connector, Thread thread, long graceMillis) {
-        if (graceMillis > 0) {
-            joinQuietly(thread, graceMillis);
+    /** The caller waits within its old budget; this original owner retains every still-running callback. */
+    private static void finishCdc(PdkConnector connector, Thread worker, CdcDelivery delivery, CompletableFuture<Void> ended) {
+        Throwable failure = null;
+        try {
+            joinQuietly(worker, CDC_SHUTDOWN_GRACE_MILLIS);
+            if (worker.isAlive()) worker.interrupt();
+            connector.stopQuietly();
+        } catch (RuntimeException | Error stopping) { failure = stopping; }
+        boolean interrupted = false;
+        while (worker.isAlive()) {
+            try { worker.join(); }
+            catch (InterruptedException stopping) { interrupted = true; }
         }
-        if (thread.isAlive()) {
-            thread.interrupt();
+        delivery.awaitDrained();
+        try { connector.close(); }
+        catch (RuntimeException | Error closing) {
+            if (failure == null) failure = closing;
+            else if (failure != closing) failure.addSuppressed(closing);
         }
-        connector.stopQuietly();
-        joinQuietly(thread, SHUTDOWN_JOIN_MILLIS);
-        connector.close();
+        if (failure == null) ended.complete(null); else ended.completeExceptionally(failure);
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     /** Cancels at the consumer boundary without interrupting the source cursor's cleanup. */
@@ -534,6 +567,16 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             // Wake a listener blocked on downstream capacity, including connector-owned delivery threads.
             active.forEach(Thread::interrupt);
             return true;
+        }
+
+        void awaitDrained() {
+            boolean interrupted = false;
+            synchronized (this) {
+                while (!active.isEmpty()) {
+                    try { wait(); } catch (InterruptedException stopping) { interrupted = true; }
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
         }
 
         void accept(Runnable batch) {
@@ -552,6 +595,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             } finally {
                 synchronized (this) {
                     active.remove(current);
+                    notifyAll();
                     if (closed) {
                         // Our listener wake-up must not prevent a connector's finally block doing I/O.
                         Thread.interrupted();

@@ -58,6 +58,7 @@ class PipelineDirectPreparationIT {
                 var physical=ports.getFirst();
                 physical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",1),null)),Optional.of(new SourcePosition("one")));
                 physical.listener.get().onBatch(List.of(Envelope.insert(3,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("two")));
+                assertThat(first.capturedRows("flow").rowsByTableAndOp()).containsEntry("orders",Map.of("i",2L));
                 for(String start:List.of("earliest",Instant.ofEpochMilli(2).toString(),"latest")) {
                     String id="reader-"+(start.equals("earliest")?"earliest":start.equals("latest")?"latest":"time");
                     var pipeline=new PipelineResource(id,null,List.of(SourceRef.spec("input",true)),null,null,null,new Settings(null,null,null,null,ReadMode.CDC_ONLY,start),null);

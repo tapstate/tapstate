@@ -1167,3 +1167,7 @@ io.configuration-import-limit:
 io.capture-state-rebuild-required:
   message: "Capture {capture} has missing or unproven canonical claim history."
   solution: "Keep the original state and explicitly confirm Cluster cache recovery, including affected pipelines and sessions. Do not recreate the claim or reset its generations."
+
+capture.still-ending:
+  message: "Capture `{captureId}` has not finished stopping."
+  solution: "Retry the original stop after the source call exits; retain its original resource identity."

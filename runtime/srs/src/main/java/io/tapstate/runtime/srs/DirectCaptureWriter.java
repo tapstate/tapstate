@@ -13,6 +13,7 @@ import java.util.function.Consumer;
 /** One private producer records original batch boundaries before delivery and bounds unconfirmed rows. */
 public final class DirectCaptureWriter implements CaptureStartedListener, AutoCloseable {
     private record Pending(String table,long sequence) {}
+    private final java.util.Set<Subscription> sourceHandles=java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final DirectChannelProgress opened;
     private final DirectChannelContext context;
     private final DirectChannelStore channels;
@@ -56,16 +57,27 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
         this.health=health;
         Subscription source=null;
         try {
-            source=Objects.requireNonNull(port.cdc(config,start,health.recording(this)),"source subscription"); requireUsable();
+            source=Objects.requireNonNull(port.cdc(config,start,health.recording(this)),"source subscription"); sourceHandles.add(source); requireUsable();
             var original=source; var ended=new AtomicBoolean();
             return new Subscription() {
                 @Override public void acknowledge(SourcePosition position) { requireUsable(); original.acknowledge(position); }
-                @Override public void close() { if(ended.compareAndSet(false,true)) { DirectCaptureWriter.this.close(); original.close(); } }
+                @Override public synchronized void close() { if(!ended.get()) { DirectCaptureWriter.this.close(); stopSource(original); ended.set(true); } }
             };
         } catch (RuntimeException|Error failed) {
-            fail(failed); if (source!=null) try { source.close(); } catch(RuntimeException|Error cleanup) { if(cleanup!=failed)failed.addSuppressed(cleanup); }
+            fail(failed); if (source!=null) try { stopSource(source); } catch(RuntimeException|Error cleanup) { if(cleanup!=failed)failed.addSuppressed(cleanup); }
             throw failed;
         }
+    }
+
+    /** The original owner retains incomplete source shutdown independently of business activation. */
+    public void stopSources() {
+        Throwable first=null;
+        for(var source:List.copyOf(sourceHandles))try {stopSource(source);}
+        catch(RuntimeException|Error failure){if(first==null)first=failure;else if(first!=failure)first.addSuppressed(failure);}
+        if(first instanceof RuntimeException runtime)throw runtime;if(first instanceof Error error)throw error;
+    }
+    private void stopSource(Subscription source) {
+        if(!sourceHandles.contains(source))return;source.close();sourceHandles.remove(source);
     }
 
     @Override public synchronized void onStart(SourcePosition position) {

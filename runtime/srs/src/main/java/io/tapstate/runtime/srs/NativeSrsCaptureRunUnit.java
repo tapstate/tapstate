@@ -16,6 +16,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private final SourceAcknowledgements acknowledgements;
     private final Set<Tail> tails = ConcurrentHashMap.newKeySet();
     private final Set<CaptureRun> snapshots = ConcurrentHashMap.newKeySet();
+    private final Map<Runnable,Runnable> pendingCloses = new ConcurrentHashMap<>();
+    private final Map<CaptureRun,Runnable> runOwners = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
 
     /** The same canonical log instance must also back the member's durable ring configuration. */
@@ -37,15 +39,14 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         Runnable fixed = guard(requireActive); fixed.run();
         var stores = views.srs(scope,fixed);
         var writer = new SrsCaptureWriter(scope,opened,originalCapture,stores,member,fixed);
-        var health = new CaptureHealth(); Subscription source = null; Tail owned = null;
+        var health = new CaptureHealth(); var owned = new Tail(writer,null,health,requireActive); tails.add(owned);
         try {
-            source = writer.start(Objects.requireNonNull(ports.apply(writer),"prepared capture port"),config,start,health);
-            fixed.run();
-            source = acknowledgements.follow(stores.chains().guardedBy(fixed),opened.miningChainId(),opened.epoch(),source,health,fixed);
-            owned = new Tail(writer,source,health); tails.add(owned); fixed.run(); return owned;
+            var source = writer.start(Objects.requireNonNull(ports.apply(writer),"prepared capture port"),config,start,health);
+            owned.subscription = source; fixed.run();
+            owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed),opened.miningChainId(),opened.epoch(),source,health,fixed);
+            fixed.run(); return owned;
         } catch (RuntimeException | Error failure) {
-            writer.close(); if (owned != null) closeAfter(failure,owned::close);
-            else if (source != null) closeAfter(failure,source::close); throw failure;
+            writer.close(); closeAfter(failure,owned::close); throw failure;
         }
     }
 
@@ -86,7 +87,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         var preparation = new SrsSnapshotPreparation(views,run,rings,firstSnapshotEpoch,fixed);
         SnapshotPhase.Load load = null; CaptureRun provisional = null;
         try {
-            load = SnapshotPhase.openPrepared(Objects.requireNonNull(ports.apply(preparation),"prepared snapshot port"),config,preparation);
+            load = SnapshotPhase.openPrepared(Objects.requireNonNull(ports.apply(preparation),"prepared snapshot port"),config,preparation,session -> retainSession(session,requireActive));
             fixed.run(); var health = new CaptureHealth();
             CaptureHandoff guarded = new CaptureHandoff() {
                 @Override public void accept(io.tapstate.core.event.Envelope row) { fixed.run(); handoff.accept(row); }
@@ -94,10 +95,10 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             };
             var background = new BackgroundLoad(load,guarded,Optional::empty,health,"tapstate-native-load-"+run.sourceId());
             var result = new CaptureRun(Optional.of(new MiningChainId(run.miningChainId())),false,Optional.empty(),health,background);
-            provisional = result; snapshots.add(result); fixed.run(); background.start(); return result;
+            provisional = result; register(result,requireActive); fixed.run(); background.start(); return result;
         } catch (RuntimeException | Error failure) {
             preparation.close();
-            if (provisional != null) { var abandoned = provisional; snapshots.remove(abandoned); closeAfter(failure,abandoned::close); }
+            if (provisional != null) { var abandoned = provisional; closeAfter(failure,() -> stopSnapshot(abandoned)); }
             else if (load != null) closeAfter(failure,load::close);
             throw failure;
         }
@@ -111,17 +112,18 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         var writer=new DirectCaptureWriter(opened,window.captureFence(),window.pipelineFence(),channels,row -> {
             fixed.run();handoff.accept(row);fixed.run();
         },capacity,fixed);
+        Runnable ending=() -> {writer.close();writer.stopSources();};pendingCloses.put(ending,requireActive);
         var health=new CaptureHealth();Subscription source=null;CaptureRun provisional=null;
         try {
             source=writer.start(port,config,start,health);fixed.run();
             source=acknowledgements.follow(channels,opened,source,health,fixed);
             provisional=new CaptureRun(Optional.empty(),false,0L,Optional.empty(),Optional.of(source),health);
-            snapshots.add(provisional);fixed.run();return provisional;
+            register(provisional,requireActive);fixed.run();pendingCloses.remove(ending);return provisional;
         } catch(RuntimeException|Error failure) {
             writer.close();
-            if(provisional!=null) { var abandoned=provisional;snapshots.remove(abandoned);closeAfter(failure,abandoned::close); }
+            if(provisional!=null) { var abandoned=provisional;closeAfter(failure,() -> stopSnapshot(abandoned)); }
             else if(source!=null)closeAfter(failure,source::close);
-            throw failure;
+            closeAfter(failure,() -> closePending(ending));throw failure;
         }
     }
 
@@ -132,7 +134,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         SnapshotPhase.Load load=null;CaptureRun provisional=null;
         try {
             var port=Objects.requireNonNull(ports.apply(preparation),"prepared direct snapshot port");
-            load=SnapshotPhase.openDirectPrepared(port,config,preparation);fixed.run();var health=new CaptureHealth();
+            load=SnapshotPhase.openDirectPrepared(port,config,preparation,session -> retainSession(session,requireActive));fixed.run();var health=new CaptureHealth();
             CaptureHandoff guarded=new CaptureHandoff() {
                 @Override public void accept(io.tapstate.core.event.Envelope row){fixed.run();handoff.accept(row);}
                 @Override public void loaded(String table){fixed.run();handoff.loaded(table);}
@@ -146,19 +148,20 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                 var writer=new DirectCaptureWriter(current,window.captureFence(),window.pipelineFence(),channels,row -> {
                     fixed.run();handoff.accept(row);fixed.run();
                 },capacity,fixed);
+                Runnable ending=() -> {writer.close();writer.stopSources();};pendingCloses.put(ending,requireActive);
                 Subscription source=null;
                 try {
                     source=writer.start(port,config,CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(saved.token())),health);fixed.run();
-                    return Optional.of(acknowledgements.follow(channels,current,source,health,fixed));
+                    var followed=acknowledgements.follow(channels,current,source,health,fixed);pendingCloses.remove(ending);return Optional.of(followed);
                 } catch(RuntimeException|Error failure) {
-                    writer.close();if(source!=null)closeAfter(failure,source::close);throw failure;
+                    writer.close();if(source!=null)closeAfter(failure,source::close);closeAfter(failure,() -> closePending(ending));throw failure;
                 }
             },health,"tapstate-native-direct-load-"+opened.context().sourceId());
             var result=new CaptureRun(Optional.empty(),false,Optional.empty(),health,background);
-            provisional=result;snapshots.add(result);fixed.run();background.start();return result;
+            provisional=result;register(result,requireActive);fixed.run();background.start();return result;
         } catch(RuntimeException|Error failure) {
             preparation.close();
-            if(provisional!=null){var abandoned=provisional;snapshots.remove(abandoned);closeAfter(failure,abandoned::close);}
+            if(provisional!=null){var abandoned=provisional;closeAfter(failure,() -> stopSnapshot(abandoned));}
             else if(load!=null)closeAfter(failure,load::close);
             throw failure;
         }
@@ -170,16 +173,16 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         Objects.requireNonNull(config,"config"); Objects.requireNonNull(port,"port"); Objects.requireNonNull(handoff,"handoff");
         Runnable fixed=guard(requireActive); fixed.run(); SnapshotPhase.Load load=null; CaptureRun provisional=null;
         try {
-            load=SnapshotPhase.openChainless(port,config,snapshotEpoch); fixed.run(); var health=new CaptureHealth();
+            load=SnapshotPhase.openChainless(port,config,snapshotEpoch,batch -> retainBatch(batch,requireActive)); fixed.run(); var health=new CaptureHealth();
             CaptureHandoff guarded=new CaptureHandoff() {
                 @Override public void accept(io.tapstate.core.event.Envelope row) { fixed.run(); handoff.accept(row); }
                 @Override public void loaded(String table) { fixed.run(); handoff.loaded(table); }
             };
             var background=new BackgroundLoad(load,guarded,Optional::empty,health,"tapstate-native-bounded-"+config.connectorId());
             var result=new CaptureRun(Optional.empty(),false,Optional.empty(),health,background);
-            provisional=result; snapshots.add(result); fixed.run(); background.start(); return result;
+            provisional=result; register(result,requireActive); fixed.run(); background.start(); return result;
         } catch (RuntimeException|Error failure) {
-            if (provisional!=null) { var abandoned=provisional; snapshots.remove(abandoned); closeAfter(failure,abandoned::close); }
+            if (provisional!=null) { var abandoned=provisional; closeAfter(failure,() -> stopSnapshot(abandoned)); }
             else if (load!=null) closeAfter(failure,load::close);
             throw failure;
         }
@@ -187,21 +190,48 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
 
     public final class Tail implements AutoCloseable {
         private final SrsCaptureWriter writer;
-        private final Subscription subscription;
+        private volatile Subscription subscription;
         private final CaptureHealth health;
+        private final Runnable owner;
         private final AtomicBoolean ended = new AtomicBoolean();
-        private Tail(SrsCaptureWriter writer,Subscription subscription,CaptureHealth health) {
-            this.writer = writer; this.subscription = subscription; this.health = health;
+        private Tail(SrsCaptureWriter writer,Subscription subscription,CaptureHealth health,Runnable owner) {
+            this.writer = writer; this.subscription = subscription; this.health = health; this.owner = owner;
         }
         public CaptureHealth health() { return health; }
-        @Override public void close() {
-            if (!ended.compareAndSet(false,true)) return;
-            writer.close(); tails.remove(this); subscription.close();
+        @Override public synchronized void close() {
+            if (ended.get()) return;
+            writer.close(); if(subscription!=null)subscription.close(); writer.stopSources(); ended.set(true); tails.remove(this);
         }
     }
     public synchronized void stopSnapshot(CaptureRun original) {
-        if (snapshots.remove(Objects.requireNonNull(original,"original"))) original.close();
+        if (snapshots.contains(Objects.requireNonNull(original,"original"))) { original.close(); snapshots.remove(original); runOwners.remove(original); }
     }
+    private void register(CaptureRun original,Runnable owner) {runOwners.put(original,owner);snapshots.add(original);}
+    /** Retries only this opening's retained handles, even when business authorization has ended. */
+    public synchronized void stopOpenings(Runnable originalOwner) {
+        Objects.requireNonNull(originalOwner);Throwable first=null;
+        for(var run:List.copyOf(snapshots))if(runOwners.get(run)==originalOwner)first=closeAfter(first,() -> stopSnapshot(run));
+        for(var tail:List.copyOf(tails))if(tail.owner==originalOwner)first=closeAfter(first,tail::close);
+        for(var pending:List.copyOf(pendingCloses.keySet()))if(pendingCloses.get(pending)==originalOwner)first=closeAfter(first,() -> closePending(pending));
+        if(first instanceof RuntimeException runtime)throw runtime;if(first instanceof Error error)throw error;
+    }
+    private SnapshotSession retainSession(SnapshotSession original,Runnable owner) {
+        Runnable close=original::close;pendingCloses.put(close,owner);
+        return new SnapshotSession() {
+            @Override public CaptureBatch read(String table){return original.read(table);}
+            @Override public void close(){closePending(close);}
+        };
+    }
+    private CaptureBatch retainBatch(CaptureBatch original,Runnable owner) {
+        Runnable close=original::close;pendingCloses.put(close,owner);
+        return new CaptureBatch() {
+            @Override public boolean hasNext(){return original.hasNext();}
+            @Override public io.tapstate.core.event.Envelope next(){return original.next();}
+            @Override public Optional<SourcePosition> seam(){return original.seam();}
+            @Override public void close(){closePending(close);}
+        };
+    }
+    private void closePending(Runnable original){original.run();pendingCloses.remove(original);}
     private Runnable guard(Runnable original) {
         Objects.requireNonNull(original,"requireActive");
         return () -> {
@@ -219,10 +249,11 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         return primary;
     }
     @Override public synchronized void close() {
-        if (!closed.compareAndSet(false,true)) return;
+        closed.set(true);
         Throwable first = null;
         for (var run : List.copyOf(snapshots)) first = closeAfter(first,() -> stopSnapshot(run));
         for (var tail : List.copyOf(tails)) first = closeAfter(first,tail::close);
+        for(var pending:List.copyOf(pendingCloses.keySet()))first=closeAfter(first,() -> closePending(pending));
         first = closeAfter(first,acknowledgements::close);
         if (first instanceof RuntimeException runtime) throw runtime;
         if (first instanceof Error error) throw error;

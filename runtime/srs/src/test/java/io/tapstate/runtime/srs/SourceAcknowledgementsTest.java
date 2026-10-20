@@ -55,6 +55,16 @@ class SourceAcknowledgementsTest {
         acknowledgements.close();
     }
 
+    @Test void failedOriginalTailCloseIsRetriedWithoutResumingAcknowledgements() {
+        var closes=new java.util.concurrent.atomic.AtomicInteger();var failure=new IllegalStateException("original close is still pending");
+        var tail=new Subscription() {
+            @Override public void close(){if(closes.incrementAndGet()==1)throw failure;}
+        };
+        var followed=acknowledgements.follow(meta,CHAIN,tail,new CaptureHealth(),false);
+        org.assertj.core.api.Assertions.assertThatThrownBy(followed::close).isSameAs(failure);
+        followed.close();followed.close();assertThat(closes).hasValue(2);
+    }
+
     @Test void closingAFollowedTailTwiceClosesTheUnderlyingSourceOnlyOnce() {
         var closes = new AtomicInteger();
         followed = acknowledgements.follow(meta, CHAIN, new Subscription() {
