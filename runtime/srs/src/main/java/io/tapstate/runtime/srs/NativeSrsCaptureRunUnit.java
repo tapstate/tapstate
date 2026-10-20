@@ -49,6 +49,13 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         }
     }
 
+    /** Resolves the existing durable read rule without publishing a cursor or treating read-ahead as confirmation. */
+    public long initialReadAfter(CacheBusinessScope scope,String chain,String table,StartFrom start,String retention,Runnable requireActive) {
+        Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);String ring=SrsRingbuffer.ringName(chain,table);
+        long next=SrsRingReader.from(new SrsRingbuffer(member.getRingbuffer(ring)),start,ignored -> {},retention,ring,stores.log()).nextReadSequence();
+        fixed.run();return next-1;
+    }
+
     /** Opens the first prepared read before returning, then drains only this consumer on a bounded worker. */
     public synchronized CaptureRun beginSnapshot(SrsConsumerRun run,CaptureConfig config,long firstSnapshotEpoch,
             Function<SrsSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,Runnable requireActive) {

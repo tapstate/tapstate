@@ -39,6 +39,219 @@ class PipelineDirectPreparationIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node","boot");
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-19T00:00:00Z"),ZoneOffset.UTC);
 
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void sharedMetadataPreflightDoesNotCancelTheOriginalTailBeforeItsStartCallback(boolean snapshot) {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,snapshot?ReadMode.SNAPSHOT_AND_CDC:ReadMode.CDC_ONLY,"latest",null));
+            var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+            f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());var claims=f.cache.workloadClaims(f.business());
+            var fence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+            var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log());var ports=new CopyOnWriteArrayList<NativeSharedPort>();
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),stores,member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {
+                            var port=new NativeSharedPort(config,guard,preparation,stream,stream!=null);ports.add(port);return port;
+                        })) {
+                var run=coordinator.forRun(f.scope,fence,new ExecutionFence(f.scope,fence));
+                assertThatCode(() -> run.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),models)).doesNotThrowAnyException();
+                var binding=run.captureBindings().logged().get("input");var physical=ports.stream().filter(port -> port.stream!=null).findFirst().orElseThrow();
+                var before=stores.chains().load(binding.run().miningChainId()).orElseThrow();
+                assertThat(before.epoch()).isOne();assertThat(before.checkpoint()).isNull();assertThat(physical.closed).hasValue(0);
+                assertThat(binding.recoveryAfter()).containsEntry("orders",-1L).containsEntry("quiet",-1L);
+                physical.started();
+                physical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("after-delayed-start")));
+                var after=stores.chains().load(binding.run().miningChainId()).orElseThrow();
+                assertThat(after.epoch()).isOne();assertThat(after.checkpoint().position().token()).isEqualTo("after-delayed-start");
+                assertThat(run.captureFailure("flow")).isEmpty();
+                if(snapshot)awaitSharedCounts(run,"flow");
+                run.stopCapture("flow",false);assertThat(physical.closed).hasValue(1);
+            } finally {member.shutdown();}
+        });
+    }
+    @Test void actualSharedConsumersKeepSeparatePinsAndStoppingOneLeavesThePhysicalTailRunning() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.SNAPSHOT_AND_CDC,"latest",null));
+            var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+            f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());var claims=f.cache.workloadClaims(f.business());
+            var firstClaim=claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow();
+            var firstFence=WorkloadClaimFence.from(firstClaim);var ownership=cacheOwnership(f,OWNER);var provisioner=fixtureProvisioner();
+            var nativeStores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(nativeStores.log());var ports=new CopyOnWriteArrayList<NativeSharedPort>();var buffer=new SnapshotBuffer(8);
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),nativeStores,member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,buffer,provisioner,(fixed,config,guard,preparation,stream) -> {var port=new NativeSharedPort(config,guard,preparation,stream);ports.add(port);return port;})) {
+                var first=coordinator.forRun(f.scope,firstFence,new ExecutionFence(f.scope,firstFence));first.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),models);awaitLoadedCounts(first);
+                var firstBinding=first.captureBindings().logged().get("input");var physical=ports.stream().filter(port -> port.stream!=null).findFirst().orElseThrow();
+                assertThat(firstBinding.recoveryAfter()).containsOnlyKeys("orders","quiet").allSatisfy((table,sequence) -> assertThat(sequence).isEqualTo(-1));
+                physical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("shared-one")));
+                var otherPipeline=new PipelineResource("other",null,List.of(SourceRef.spec("input",true)),null,null,null,new Settings(null,null,null,null,ReadMode.SNAPSHOT_AND_CDC,null),null);
+                f.configuration.artifacts().create(otherPipeline);var otherScope=new PipelineIntentScope("cluster",1,f.scope.cacheIncarnation(),"other",1);
+                var otherModels=SourceModelSnapshot.capture("other",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+                var otherInputs=otherModels.preparationInputs(otherScope,otherPipeline,otherPipeline,Map.of("input",f.source()));
+                f.preparer(f.configuration,f.cache).prepare(otherScope,otherInputs);
+                var otherClaim=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(otherScope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+                var second=coordinator.forRun(otherScope,otherClaim,new ExecutionFence(otherScope,otherClaim));second.startCapture("other",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),otherModels);awaitSharedCounts(second,"other");
+                var secondBinding=second.captureBindings().logged().get("input");
+                assertThat(secondBinding.recoveryAfter()).containsEntry("orders",0L).containsEntry("quiet",-1L);
+                assertThat(secondBinding.run().context()).isNotEqualTo(firstBinding.run().context());
+                var a=nativeStores.consumers().progress(firstBinding.run().context()).orElseThrow();var b=nativeStores.consumers().progress(secondBinding.run().context()).orElseThrow();
+                assertThat(a.snapshot().sourcePosition()).isEqualTo("snapshot-flow");assertThat(b.snapshot().sourcePosition()).isEqualTo("snapshot-other");
+                assertThat(ports.stream().filter(port -> port.stream!=null)).hasSize(1);
+                first.stopCapture("flow",false);assertThat(physical.closed).hasValue(0);
+                physical.listener.get().onBatch(List.of(Envelope.insert(2,"orders",Map.of("id",3),null)),Optional.of(new SourcePosition("shared-two")));
+                assertThat(nativeStores.log().bounds(SrsRingbuffer.ringName(firstBinding.run().miningChainId(),"orders")).largestSequence()).isEqualTo(1);
+                assertThat(nativeStores.consumers().progress(secondBinding.run().context()).orElseThrow()).isEqualTo(b);
+                second.stopCapture("other",false);assertThat(physical.closed).hasValue(1);
+                var next=WorkloadClaimFence.from(claims.advanceExecution(firstClaim,1,Set.of(OWNER.nodeId())).orElseThrow());
+                var resumed=coordinator.forRun(f.scope,next,new ExecutionFence(f.scope,next));resumed.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),models);awaitLoadedCounts(resumed);
+                var replay=resumed.captureBindings().logged().get("input");assertThat(replay.snapshotEpoch()).isEqualTo(1);
+                assertThat(replay.recoveryAfter()).containsEntry("orders",-1L).containsEntry("quiet",-1L);
+                var latestPhysical=ports.stream().filter(port -> port.stream!=null).reduce((previous,current) -> current).orElseThrow();
+                assertThat(latestPhysical.start.get()).isEqualTo(CaptureStart.resume(new SourcePosition("shared-two")));
+                assertThat(nativeStores.chains().load(firstBinding.run().miningChainId()).orElseThrow().epoch()).isEqualTo(2);
+                assertThat(nativeStores.consumers().progress(secondBinding.run().context()).orElseThrow()).isEqualTo(b);resumed.stopCapture("flow",false);
+            } finally {member.shutdown();}
+            assertThat(f.configDatabase.getCollection("capture_preparations").countDocuments()).isOne();
+            assertThat(f.cacheDatabase.getCollection("srs_consumers").countDocuments()).isEqualTo(2);
+            assertThat(f.cacheDatabase.getCollection("direct_channel_offsets").countDocuments()).isZero();
+        });
+    }
+    @Test void aForeignSharedConsumerWidensTheOriginalTailAndTakesOverWithoutChangingItsReadFloor() {
+        withFixture(f -> {
+            var firstSource=f.source();f.configuration.artifacts().save(new SourceResource(firstSource.id(),null,firstSource.connector(),firstSource.config(),firstSource.mode(),List.of(TableRef.literal("orders")),firstSource.srs(),null));
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,"latest",null));
+            var otherSource=new SourceResource("other-input",null,firstSource.connector(),firstSource.config(),firstSource.mode(),List.of(TableRef.literal("quiet")),firstSource.srs(),null);
+            var otherPipeline=new PipelineResource("other",null,List.of(SourceRef.spec(otherSource.id(),true)),null,null,null,new Settings(null,null,null,null,ReadMode.CDC_ONLY,"latest"),null);
+            f.configuration.artifacts().create(otherSource);f.configuration.artifacts().create(otherPipeline);
+            var otherScope=new PipelineIntentScope("cluster",1,f.scope.cacheIncarnation(),"other",1);
+            var otherOwner=new WorkloadOwner("node-b","boot-b");var claims=f.cache.workloadClaims(f.business());
+            var otherNode=WorkloadClaimFence.from(claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,otherOwner.nodeId()),otherOwner,1,TTL).claim());
+            var firstModels=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+            var otherModels=SourceModelSnapshot.capture("other",List.of(otherSource),f.cache.schemas(f.business(),ACTIVE));
+            f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());
+            var otherInputs=otherModels.preparationInputs(otherScope,otherPipeline,otherPipeline,Map.of(otherSource.id(),otherSource));
+            new PipelineFirstStatePreparer(f.business(),f.configuration.preparations(),f.cache.pipelinePreparations(f.business(),ACTIVE),() -> Optional.of(otherNode),ACTIVE,CLOCK,TTL).prepare(otherScope,otherInputs);
+            var firstFence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+            var otherFence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(otherScope).orElseThrow().claim(),1,Set.of(otherOwner.nodeId())).orElseThrow());
+            status(f,f.scope,firstFence,"RUNNING");status(f,otherScope,otherFence,"RUNNING");
+            var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log());
+            var firstPorts=new CopyOnWriteArrayList<NativeSharedPort>();var otherPorts=new CopyOnWriteArrayList<NativeSharedPort>();
+            try(var firstAuthorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var otherAuthorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var firstRuntime=new NativeSrsCaptureRunUnit(f.business(),stores,member);var otherRuntime=new NativeSrsCaptureRunUnit(f.business(),stores,member);
+                var firstRoot=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),firstAuthorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        firstRuntime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {var port=new NativeSharedPort(config,guard,preparation,stream);firstPorts.add(port);return port;});
+                var otherRoot=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(otherNode),otherAuthorization,cacheOwnership(f,otherOwner),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        otherRuntime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {var port=new NativeSharedPort(config,guard,preparation,stream);otherPorts.add(port);return port;})) {
+                var first=firstRoot.forRun(f.scope,firstFence,new ExecutionFence(f.scope,firstFence));
+                first.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),firstModels);
+                var firstPhysical=firstPorts.getFirst();var chain=first.captureBindings().logged().get("input").run().miningChainId();
+                firstPhysical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",1),null)),Optional.of(new SourcePosition("orders-one")));
+                var other=otherRoot.forRun(otherScope,otherFence,new ExecutionFence(otherScope,otherFence));
+                assertThatThrownBy(() -> other.startCapture("other",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),otherModels)).isInstanceOf(RingNotOpenYet.class);
+                assertThat(otherPorts).isEmpty();
+                awaitNative(() -> stores.chains().load(chain).orElseThrow().checkpoint().position().order().epoch()==2);
+                assertThat(firstPorts).hasSize(2);var widened=firstPorts.getLast();assertThat(widened.config.node()).isEqualTo(firstPhysical.config.node());
+                assertThat(widened.config.streams()).containsExactly("orders","quiet");assertThat(widened.start.get()).isEqualTo(CaptureStart.resume(new SourcePosition("orders-one")));
+                assertThat(firstPhysical.closed).hasValue(1);
+                other.startCapture("other",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),otherModels);
+                var binding=other.captureBindings().logged().get(otherSource.id());var progress=stores.consumers().progress(binding.run().context()).orElseThrow();
+                assertThat(binding.recoveryAfter()).containsOnlyKeys("quiet").containsEntry("quiet",-1L);assertThat(otherPorts).isEmpty();
+                long events=f.cacheDatabase.getCollection("srs_events").countDocuments();
+                assertCode(() -> firstPhysical.listener.get().onBatch(List.of(Envelope.insert(2,"orders",Map.of("id",99),null)),Optional.of(new SourcePosition("late-closed-tail"))),IoError.CACHE_BUSINESS_FENCED);
+                assertThat(f.cacheDatabase.getCollection("srs_events").countDocuments()).isEqualTo(events);
+                status(f,f.scope,firstFence,"STOPPED");first.stopCapture("flow",false);assertThat(widened.closed).hasValue(0);
+                widened.listener.get().onBatch(List.of(Envelope.insert(3,"quiet",Map.of("id",3),null)),Optional.of(new SourcePosition("quiet-two")));
+                assertThat(stores.consumers().progress(binding.run().context()).orElseThrow()).isEqualTo(progress);
+                firstRoot.close();assertThat(widened.closed).hasValue(1);
+                awaitNative(() -> !otherPorts.isEmpty());var successor=otherPorts.getFirst();
+                assertThat(other.captureFailure("other")).isEmpty();assertThat(successor.start.get()).isEqualTo(CaptureStart.resume(new SourcePosition("quiet-two")));
+                assertThat(stores.chains().load(chain).orElseThrow().epoch()).isEqualTo(3);
+                assertThat(other.captureBindings().logged().get(otherSource.id())).isEqualTo(binding);
+                assertThat(stores.consumers().progress(binding.run().context()).orElseThrow()).isEqualTo(progress);
+                successor.listener.get().onBatch(List.of(Envelope.insert(4,"quiet",Map.of("id",4),null)),Optional.of(new SourcePosition("quiet-three")));
+                assertThat(stores.log().bounds(SrsRingbuffer.ringName(chain,"quiet")).largestSequence()).isEqualTo(1);
+                status(f,otherScope,otherFence,"STOPPED");other.stopCapture("other",false);assertThat(successor.closed).hasValue(1);
+            } finally {member.shutdown();}
+            assertThat(f.configDatabase.getCollection("capture_preparations").countDocuments()).isOne();
+        });
+    }
+    private static void status(Fixture f,PipelineIntentScope scope,WorkloadClaimFence original,String status) {
+        var states=f.cache.pipelineStates(scope,original,ACTIVE);var prior=states.read(scope.pipelineId()).orElseThrow();
+        assertThat(states.compareAndSwap(scope.pipelineId(),prior.epoch(),status,CLOCK.instant())).isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+    }
+    private static void awaitNative(java.util.function.BooleanSupplier ready) throws InterruptedException {
+        long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();while(!ready.getAsBoolean() && System.nanoTime()<deadline)Thread.sleep(10);
+        assertThat(ready.getAsBoolean()).isTrue();
+    }
+    private static CaptureOwnership cacheOwnership(Fixture f,WorkloadOwner owner) {
+        var claims=f.cache.workloadClaims(f.business());var ownership=mock(CaptureOwnership.class);
+        when(ownership.acquire(any())).thenAnswer(call -> {var id=call.getArgument(0,CaptureId.class);
+            var attempt=claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id.value()),owner,1,TTL);return attempt.acquired()?new CaptureOwnership.Permit(true,attempt.claim()):CaptureOwnership.Permit.denied();});
+        when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
+        doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());return ownership;
+    }
+    private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner() {
+        var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false);
+        when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb","c".repeat(64))).thenReturn(ref);return provisioner;
+    }
+    private static HazelcastInstance sharedMember(SrsLogStore log) {
+        var config=new com.hazelcast.config.Config().setClusterName("scoped-shared-native-"+UUID.randomUUID());
+        config.setProperty("hazelcast.phone.home.enabled","false");config.setProperty("hazelcast.shutdownhook.enabled","false");
+        config.setProperty("hazelcast.operation.thread.count","2");config.setProperty("hazelcast.operation.generic.thread.count","2");
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);config.getJetConfig().setEnabled(false);
+        config.addRingBufferConfig(new com.hazelcast.config.RingbufferConfig("srs.*").setCapacity(8).setBackupCount(0).setInMemoryFormat(com.hazelcast.config.InMemoryFormat.OBJECT)
+                .setRingbufferStoreConfig(new com.hazelcast.config.RingbufferStoreConfig().setEnabled(true).setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
+        config.getSerializationConfig().addSerializerConfig(new com.hazelcast.config.SerializerConfig().setTypeClass(SrsItem.class).setImplementation(new SrsItemSerializer()));
+        return com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+    }
+    private static void awaitSharedCounts(PipelineCaptureCoordinator run,String pipeline) throws InterruptedException {
+        long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();while(run.snapshotProgress(pipeline).byTable().size()!=2 && System.nanoTime()<deadline) {
+            if(run.captureFailure(pipeline).isPresent())throw new AssertionError("native shared source failed",run.captureFailure(pipeline).orElseThrow());Thread.sleep(10);
+        }
+        assertThat(run.snapshotProgress(pipeline).byTable()).containsOnlyKeys("orders","quiet");
+    }
+    private static final class NativeSharedPort implements CapturePort,SnapshotSession.PreparedProvider {
+        final CaptureConfig config;final Runnable guard;final io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer snapshot;final io.tapstate.adapters.pdk.PdkCapturePort.StreamPreparer stream;
+        final AtomicReference<CaptureStartedListener> listener=new AtomicReference<>();final AtomicReference<CaptureStart> start=new AtomicReference<>();final java.util.concurrent.atomic.AtomicInteger closed=new java.util.concurrent.atomic.AtomicInteger();
+        final boolean delayedStart;
+        NativeSharedPort(CaptureConfig config,Runnable guard,io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer snapshot,io.tapstate.adapters.pdk.PdkCapturePort.StreamPreparer stream) {
+            this(config,guard,snapshot,stream,false);
+        }
+        NativeSharedPort(CaptureConfig config,Runnable guard,io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer snapshot,io.tapstate.adapters.pdk.PdkCapturePort.StreamPreparer stream,boolean delayedStart) {
+            this.config=config;this.guard=guard;this.snapshot=snapshot;this.stream=stream;this.delayedStart=delayedStart;assertThat(config.sharedNotes()).isNotNull();
+        }
+        void started(){guard.run();var original=start.get();listener.get().onStart(original instanceof CaptureStart.Resume resume?resume.position():new SourcePosition("shared-start"));}
+        Map<String,SourceTable> tables(CaptureConfig actual) {var models=new HashMap<String,SourceTable>();actual.streams().forEach(table -> models.put(table,new SourceTable(table,List.of(new SourceField("id","INT")),List.of("id"),List.of())));return models;}
+        public Subscription cdc(CaptureConfig actual,CaptureStart original,CaptureListener target) {
+            guard.run();stream.prepare(tables(actual));listener.set((CaptureStartedListener)target);start.set(original);
+            if(!delayedStart)started();
+            return new Subscription(){public void close(){closed.incrementAndGet();}};
+        }
+        public SnapshotSession snapshotSession(CaptureConfig actual){throw new AssertionError("unprepared shared read");}
+        public SnapshotSession snapshotSession(CaptureConfig actual,SnapshotPreparation request) {
+            guard.run();return new SnapshotSession(){boolean prepared;
+                public CaptureBatch read(String table) {
+                    guard.run();var seam=new SourcePosition("snapshot-"+actual.node().pipelineId());
+                    if(!prepared){snapshot.prepare(request,seam,tables(actual));prepared=true;}
+                    var rows=table.equals("orders")?List.of(Envelope.read(1,table,Map.of("id",1),null)).iterator():Collections.<Envelope>emptyIterator();
+                    return new CaptureBatch(){public boolean hasNext(){guard.run();return rows.hasNext();}public Envelope next(){guard.run();return rows.next();}
+                        public Optional<SourcePosition> seam(){return Optional.of(seam);}public void close(){}};
+                }};
+        }
+        public CaptureBatch snapshot(CaptureConfig actual){throw new AssertionError("unprepared shared read");}
+        public ConnectionReport testConnection(CaptureConfig actual){throw new AssertionError();}public DiscoveredSchema discoverSchema(CaptureConfig actual){throw new AssertionError();}
+    }
     @Test void aNewDirectBaselineCannotReclaimAnOldUndeliveredNestRelease() {
         withFixture(f -> {
             var inputs=f.inputs();f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
@@ -92,7 +305,7 @@ class PipelineDirectPreparationIT {
                 var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
                         new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
-                        runtime,buffer,provisioner,(fixed,config,guard,preparation) -> {
+                        runtime,buffer,provisioner,(fixed,config,guard,preparation,stream) -> {
                             var port=new NativeDirectSnapshotPort(guard,preparation,ports.isEmpty()?"sampled-original":"sampled-later",ports.isEmpty()?"sampled-original":"settled",
                                     () -> {var current=f.cache.directChannels(f.business(),ACTIVE).load(inputs.directChannels().getFirst().context());
                                         assertThat(current.cursor().snapshotEpoch()).isOne();assertThat(current.current().anchor()).isNotNull();});
@@ -182,7 +395,7 @@ class PipelineDirectPreparationIT {
                 var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
                         new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
-                        runtime,buffer,provisioner,(fixed,config,guard,preparation) -> {guard.run();var port=new DirectPort(ports.isEmpty()?"anchor":"settled");ports.add(port);return port;})) {
+                        runtime,buffer,provisioner,(fixed,config,guard,preparation,stream) -> {guard.run();var port=new DirectPort(ports.isEmpty()?"anchor":"settled");ports.add(port);return port;})) {
                 local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);local.put(SrsStoreViews.USER_CONTEXT_KEY,f.cache);
                 var artifacts=ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts());
                 var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
@@ -250,7 +463,7 @@ class PipelineDirectPreparationIT {
                 var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
                         new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
-                        runtime,buffer,provisioner,(fixed,config,guard,preparation) -> { guard.run();opened.add(config);return new NativeBoundedPort(guard); })) {
+                        runtime,buffer,provisioner,(fixed,config,guard,preparation,stream) -> { guard.run();opened.add(config);return new NativeBoundedPort(guard); })) {
                 var artifacts=ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts());
                 var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
                 var first=coordinator.forRun(f.scope,original,new ExecutionFence(f.scope,original)); first.startCapture("flow",artifacts,models);
