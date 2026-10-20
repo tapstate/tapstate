@@ -7,6 +7,7 @@ import com.hazelcast.map.IMap;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.NestReleaseStore;
 import io.tapstate.spi.store.OperatorPlacement;
 
 import java.util.ArrayList;
@@ -191,7 +192,7 @@ public final class OperatorMapBindings implements AutoCloseable {
     }
 
     /** A name selects this local placeholder, but never supplies a cold location or authorization. */
-    private final class PendingStore implements KeyedStateStore {
+    private final class PendingStore implements NestReleaseStore {
         final String name, database;
         final boolean nest;
         Bound bound;
@@ -207,6 +208,16 @@ public final class OperatorMapBindings implements AutoCloseable {
             synchronized (OperatorMapBindings.this) {
                 requireOpen(); if (!name.equals(namespace) || bound == null) throw fenced(); bound.requireActive(); return bound.store;
             }
+        }
+        private NestReleaseStore releases(String namespace) {
+            if (!nest || !(delegate(namespace) instanceof NestReleaseStore releases)) throw fenced();
+            return releases;
+        }
+        @Override public void saveWithRelease(String namespace, String key, byte[] state, byte[] routingKey) {
+            releases(namespace).saveWithRelease(namespace, key, state, routingKey);
+        }
+        @Override public List<PendingKey> pendingReleases(String namespace, String afterKey) {
+            return releases(namespace).pendingReleases(namespace, afterKey);
         }
         @Override public Optional<byte[]> load(String namespace, String key) { return delegate(namespace).load(namespace, key); }
         @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { return delegate(namespace).loadAll(namespace, keys); }
@@ -233,8 +244,19 @@ public final class OperatorMapBindings implements AutoCloseable {
 
     private KeyedStateStore forMap(Bound original, KeyedStateStore cold) {
         String hotName = original.binding.mapName(); String coldName = original.binding.placement().mapName();
-        return new KeyedStateStore() {
+        return new NestReleaseStore() {
             private void check(String namespace) { if (!hotName.equals(namespace)) throw fenced(); original.requireActive(); }
+            @Override public void saveWithRelease(String namespace, String key, byte[] state, byte[] routingKey) {
+                check(namespace);
+                if (cold instanceof NestReleaseStore releases) releases.saveWithRelease(coldName, key, state, routingKey);
+                else if (routingKey == null) cold.save(coldName, key, state);
+                else throw fenced();
+            }
+            @Override public List<PendingKey> pendingReleases(String namespace, String afterKey) {
+                check(namespace);
+                if (!(cold instanceof NestReleaseStore releases)) throw fenced();
+                return releases.pendingReleases(coldName, afterKey);
+            }
             @Override public Optional<byte[]> load(String namespace, String key) { check(namespace); return cold.load(coldName, key); }
             @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { check(namespace); return cold.loadAll(coldName, keys); }
             @Override public void save(String namespace, String key, byte[] value) { check(namespace); cold.save(coldName, key, value); }

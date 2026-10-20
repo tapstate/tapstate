@@ -37,10 +37,10 @@ import java.util.Objects;
 public final class ResolverState implements Serializable {
 
     /**
-     * Explicit so a compatible payload's Java identity is not derived from incidental method changes.
-     * The storage layout controls admission; this is not an old-layout migration mechanism.
+     * Durable handoff fields have no safe absent values. This identity rejects earlier resolver bytes
+     * rather than accepting null release/context fields as evidence that no work remains.
      */
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private Object parentKey;
     private SourceOrder order;

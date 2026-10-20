@@ -427,7 +427,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (!flush()) {
             return;
         }
-        NestInbound edge = vertex.inbound().get(ordinal);
+        NestInbound edge = ordinal == vertex.inbound().size() ? null : vertex.inbound().get(ordinal);
         Map<Object, ResolverState> touched = new LinkedHashMap<>();
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
@@ -477,6 +477,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
      */
     @Override
     public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        if (ordinal == vertex.inbound().size()) return true;
         if (bounds == null) {
             return true;
         }
@@ -504,6 +505,19 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
     }
 
     private void handle(NestInbound edge, Object item, Map<Object, ResolverState> touched) {
+        if (item instanceof NestReleaseRecovery.Wake wake) {
+            if (edge != null) throw new IllegalStateException("recovery wake arrived on a data edge");
+            if (!touched.containsKey(wake.key())) {
+                Object loaded = store.load(wake.key());
+                if (!(loaded instanceof ResolverState kept)) throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id",vertex.mapName(),"field","operator-release-state"),null);
+                restoreReleases(wake.key(), kept, false);
+                touched.put(wake.key(), kept);
+            }
+            return;
+        }
+        if (edge == null) throw new IllegalStateException("data arrived on the recovery edge");
+
         // Asked of the item rather than of the edge: word of an edit reaches a level both on the edge from
         // the vertex filing the rows that level points at, and on an ordinary cascade from a level below
         // that points at something of its own. The ordinal tells the two levels apart, not the two kinds.

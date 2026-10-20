@@ -36,6 +36,114 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void pendingReleasePagesUseTheirPartialIndexWithoutLoadingOrdinaryState() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var writer = (NestReleaseStore) f.writer(at);
+            writer.saveWithRelease(at.mapName(), "initial", new byte[]{1}, new byte[]{9});
+            var table = SystemCollections.CACHE_NEST_STATE.on(f.database); var template = table.find().first();
+            var placement = template.get("_id",Document.class).get("placement",Document.class);
+            var rows = new ArrayList<Document>(); var expected = new HashSet<String>(); expected.add("initial");
+            for (int index = 0; index < 1800; index++) {
+                var row = new Document(template); row.put("_id",new Document("placement",placement).append("key",OperatorStateText.encode("ordinary-"+index)));
+                row.remove("pendingRelease"); row.remove("releaseKey"); rows.add(row);
+            }
+            for (int index = 0; index < NestReleaseStore.MAX_PAGE_KEYS+3; index++) {
+                String key = "pending-"+index; expected.add(key); var row = new Document(template);
+                row.put("_id",new Document("placement",placement).append("key",OperatorStateText.encode(key))); rows.add(row);
+            }
+            var foreign = new Document(template); var otherPlacement = new Document(placement); otherPlacement.put("namespace",OperatorStateText.encode("foreign"));
+            foreign.put("_id",new Document("placement",otherPlacement).append("key",OperatorStateText.encode("foreign"))); rows.add(foreign);
+            table.insertMany(rows);
+            var observedFind = new java.util.concurrent.atomic.AtomicReference<Document>();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("find") && event.getCommand().getString("find").getValue().equals("nest_state")
+                        && event.getCommand().getDocument("filter").containsKey("pendingRelease"))
+                    observedFind.set(Document.parse(event.getCommand().toJson()));
+            }};
+            Document actualFind;
+            try (var client = observed(listener)) {
+                var reader = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,client.getDatabase(f.database.getName()),
+                        SCOPE,WorkloadClaimFence.from(f.claim),ACTIVE),at);
+                var first = reader.pendingReleases(at.mapName(),null); assertThat(first).hasSize(NestReleaseStore.MAX_PAGE_KEYS);
+                actualFind = observedFind.get(); assertThat(actualFind).isNotNull().containsEntry("hint","nest_pending_releases");
+                assertThat(actualFind.get("projection",Document.class)).doesNotContainKey("state");
+                var second = reader.pendingReleases(at.mapName(),first.getLast().stateKey()); assertThat(second).hasSize(4);
+                assertThat(reader.pendingReleases(at.mapName(),second.getLast().stateKey())).isEmpty();
+                var actual = new ArrayList<String>(); first.forEach(key -> actual.add(key.stateKey())); second.forEach(key -> actual.add(key.stateKey()));
+                assertThat(actual).doesNotHaveDuplicates().containsExactlyInAnyOrderElementsOf(expected);
+                assertThat(first).allSatisfy(key -> assertThat(key.routingKey()).containsExactly((byte)9));
+            }
+            var command = new Document();
+            for (String key : List.of("find","filter","sort","projection","limit","hint"))
+                if (actualFind.containsKey(key)) command.put(key,actualFind.get(key));
+            var explained = f.database.runCommand(new Document("explain",command).append("verbosity","executionStats"));
+            var stats = explained.get("executionStats",Document.class);
+            assertThat(((Number)stats.get("nReturned")).intValue()).isEqualTo(NestReleaseStore.MAX_PAGE_KEYS);
+            assertThat(((Number)stats.get("totalDocsExamined")).intValue()).isLessThanOrEqualTo(NestReleaseStore.MAX_PAGE_KEYS);
+            assertThat(explained.get("queryPlanner",Document.class).toJson()).contains("nest_pending_releases").doesNotContain("COLLSCAN");
+            writer.saveWithRelease(at.mapName(),"initial",new byte[]{2},null);
+            var current = table.find(new Document("_id.key",OperatorStateText.encode("initial"))).first();
+            assertThat(current).doesNotContainKeys("pendingRelease","releaseKey");
+            assertThat(((Binary)current.get("state")).getData()).containsExactly((byte)2);
+        });
+    }
+
+    @Test void aPendingMarkerAndPayloadRollBackTogetherAfterTheOriginalGuardIsLost() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});
+            var before = f.snapshot(); var lost = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("nest_state")) lost.set(true);
+            }};
+            try (var client = observed(listener)) {
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,client.getDatabase(f.database.getName()),SCOPE,
+                        WorkloadClaimFence.from(f.claim),() -> { if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }),at);
+                code(() -> writer.saveWithRelease(at.mapName(),"key",new byte[]{2},new byte[]{9}),IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void missingOrWeakenedPendingIndexesAreRejectedWithoutOrdinaryDdl() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var writer = (NestReleaseStore) f.writer(at);
+            writer.saveWithRelease(at.mapName(),"key",new byte[]{1},new byte[]{9});
+            var table = SystemCollections.CACHE_NEST_STATE.on(f.database); table.dropIndex("nest_pending_releases"); var before = f.snapshot();
+            code(() -> writer.pendingReleases(at.mapName(),null),IoError.DOCUMENT_UNREADABLE);
+            code(() -> writer.saveWithRelease(at.mapName(),"key",new byte[]{2},null),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(table.listIndexes().into(new ArrayList<>())).noneSatisfy(index -> assertThat(index.getString("name")).isEqualTo("nest_pending_releases"));
+            table.createIndex(new Document("_id.placement",1).append("_id.key",1),new com.mongodb.client.model.IndexOptions()
+                    .name("nest_pending_releases").partialFilterExpression(new Document("pendingRelease",false)));
+            code(() -> writer.pendingReleases(at.mapName(),null),IoError.DOCUMENT_UNREADABLE);
+        });
+    }
+
+    @Test void anOldExecutionCannotDiscoverOrClearPendingReleaseRows() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var writer = (NestReleaseStore) f.writer(at);
+            writer.saveWithRelease(at.mapName(),"key",new byte[]{1},new byte[]{9});
+            f.domain.workloadClaims(BUSINESS).advanceExecution(f.claim,1,Set.of(OWNER.nodeId())).orElseThrow();
+            var before = f.snapshot();
+            code(() -> writer.pendingReleases(at.mapName(),null),IoError.WORKLOAD_CLAIM_FENCED);
+            code(() -> writer.saveWithRelease(at.mapName(),"key",new byte[]{2},null),IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void aPendingRowWithAnExtendedIdCannotBecomeANonexistentCanonicalKey() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var writer = (NestReleaseStore)f.writer(at);
+            writer.saveWithRelease(at.mapName(),"key",new byte[]{1},new byte[]{9});
+            var table = SystemCollections.CACHE_NEST_STATE.on(f.database); var row = table.find().first();
+            var extended = new Document(row); extended.put("_id",new Document(row.get("_id",Document.class)).append("extra","unexpected"));
+            table.deleteMany(new Document()); table.insertOne(extended); var before = f.snapshot();
+            code(() -> writer.pendingReleases(at.mapName(),null),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void losingBothKnownShapeAndColdBytesStillCannotBecomeANewFirstShape() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});
@@ -367,7 +475,8 @@ class MongoCacheOperatorStateStoreIT {
             assertThat(shape.recordIfAbsent("extra-step",Set.of("root"))).isEmpty();
             var at = new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.NEST_STATE,"extra-step","root","extra-logical");
             var state = bound.operatorState(at,WorkloadClaimFence.from(f.claim),ACTIVE);
-            state.save(at.mapName(),"key",new byte[]{1,2,3});
+            ((NestReleaseStore)state).saveWithRelease(at.mapName(),"key",new byte[]{1,2,3},new byte[]{9});
+            assertThat(((NestReleaseStore)state).pendingReleases(at.mapName(),null)).singleElement().satisfies(key -> assertThat(key.stateKey()).isEqualTo("key"));
             assertThat(state.load(at.mapName(),"key")).hasValue(new byte[]{1,2,3});
             assertThat(SystemCollections.CACHE_NEST_STATE.on(target).countDocuments()).isEqualTo(1);
             assertThat(SystemCollections.CACHE_NEST_SHAPES.on(target).countDocuments()).isEqualTo(1);

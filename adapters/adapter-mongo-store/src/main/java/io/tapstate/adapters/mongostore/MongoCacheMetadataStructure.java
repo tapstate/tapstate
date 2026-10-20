@@ -154,7 +154,9 @@ final class MongoCacheMetadataStructure {
         var keys = new Document(); index.keys().forEach(key -> keys.append(key, 1));
         Object ttl = found.get("expireAfterSeconds");
         if (!keys.equals(found.get("key")) || Boolean.TRUE.equals(found.get("unique")) != index.unique()
-                || Boolean.TRUE.equals(found.get("hidden")) || Boolean.TRUE.equals(found.get("sparse")) || found.containsKey("partialFilterExpression")) throw unreadable("index");
+                || Boolean.TRUE.equals(found.get("hidden")) || Boolean.TRUE.equals(found.get("sparse"))
+                || !java.util.Objects.equals(found.get("partialFilterExpression"),
+                        index.partialFilterJson() == null ? null : Document.parse(index.partialFilterJson()))) throw unreadable("index");
         if (index.expireAfterSeconds() == null) { if (ttl != null) throw unreadable("index"); }
         else {
             if (!(ttl instanceof Long || ttl instanceof Integer)) throw unreadable("index");

@@ -176,6 +176,15 @@ class PipelineFirstStatePreparerIT {
                 assertThat(f.state()).isEqualTo(before); assertThat(current.load(key)).isEqualTo("after");
                 assertThat(registry.release(original)).isFalse(); assertThat(current.load(key)).isEqualTo("after");
                 assertThat(registry.release(embeddedOriginal)).isFalse(); assertThat(embeddedCurrent.load(key)).isEqualTo("embedded-after");
+                var encoded = new java.io.ByteArrayOutputStream();
+                try (var output = new java.io.ObjectOutputStream(encoded)) { output.writeObject(key); }
+                var rows = f.cacheDatabase.getCollection("nest_state");
+                rows.updateMany(new Document(),new Document("$set",new Document("state",new org.bson.types.Binary(new byte[]{1}))
+                        .append("pendingRelease",true).append("releaseKey",new org.bson.types.Binary(encoded.toByteArray()))));
+                var damaged = rows.find().into(new ArrayList<>());
+                assertCode(() -> current.load(key),IoError.DOCUMENT_UNREADABLE);
+                assertCode(() -> current.loadAll(List.of(key)),IoError.DOCUMENT_UNREADABLE);
+                assertThat(rows.find().into(new ArrayList<>())).isEqualTo(damaged);
             }
         });
     }
@@ -239,6 +248,128 @@ class PipelineFirstStatePreparerIT {
             } finally { member.shutdown(); }
         });
     }
+
+    @Test void theActualGraphFindsColdHandoffsWithoutAnyNewSourceRows() {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var owned = claims.acquirePipeline(f.scope, OWNER, 1, TTL).claim();
+            var run = claims.advanceExecution(owned, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var fence = new ExecutionFence(f.scope, WorkloadClaimFence.from(run));
+            var topology = literalRootTopology();
+            f.cache.nestShapes(f.scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(run), ACTIVE)
+                    .recordIfAbsent("step", topology.stateIdentityPaths());
+            var bindings = new ArrayList<io.tapstate.runtime.engine.OperatorMapBinding>();
+            for (var vertex : topology.vertices()) for (var kind : List.of(
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.PARKING)) {
+                var at = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope, f.cacheDatabase.getName(), "step", vertex.pathId(), kind, null);
+                bindings.add(new io.tapstate.runtime.engine.OperatorMapBinding(at, fence, fence.operatorExecutionKey()));
+            }
+            var manifest = new io.tapstate.runtime.engine.OperatorRunManifest("flow", fence, bindings);
+            var config = isolatedNestMember();
+            for (var binding : bindings) {
+                var mapConfig = io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(binding.mapName());
+                mapConfig.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY,"true");
+                config.addMapConfig(mapConfig);
+            }
+            var member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+            try (var authorization = ExecutionAuthorization.scoped(f.business(), claims, Duration.ofSeconds(10), System::nanoTime, () -> true);
+                 var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,new ScopedOperatorStateProvider(f.cache,authorization))) {
+                registry.install(bindings);
+                var names = manifest.forStep("flow","step");
+                var rootName = names.nest(List.of(),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName();
+                var resolverName = names.nest(List.of("$root"),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName();
+                var roots = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName);
+                var states = member.<Object,io.tapstate.runtime.engine.nest.ResolverState>getMap(resolverName);
+                var spec = topology.vertexAt(List.of("$root"));
+                var axes = io.tapstate.runtime.engine.ChainAxes.assign(List.of("policy","claim"));
+                for (int key = 1; key <= 2; key++) {
+                    String parentId = "P"+key, customer = "C"+key;
+                    var parent = Map.<String,Object>of("policy_id",parentId,"customer_id",customer,"policy_no","PN"+key);
+                    var assembly = new io.tapstate.runtime.engine.nest.RootAssembly();
+                    assembly.applyRoot(Map.of("customer_id",customer),new io.tapstate.core.event.SourceOrder(1,io.tapstate.core.event.SourceOrder.SNAPSHOT_SEQ));
+                    assembly.applyElement(new io.tapstate.runtime.engine.nest.ElementRef(List.of("$root"),null,List.of("PN"+key),List.of(parentId)),
+                            parent,new io.tapstate.core.event.SourceOrder(1,2),Map.of());
+                    roots.set(List.of(customer),assembly);
+                    io.tapstate.runtime.engine.nest.NestStore<io.tapstate.runtime.engine.nest.ResolverState> state = new io.tapstate.runtime.engine.nest.NestStore<>() {
+                        @Override public io.tapstate.runtime.engine.nest.ResolverState load(Object at) { return states.get(at); }
+                        @Override public void save(Object at,io.tapstate.runtime.engine.nest.ResolverState value) { states.set(at,value); }
+                        @Override public void remove(Object at) { states.delete(at); }
+                        @Override public long count() { return states.size(); }
+                    };
+                    var receiver = new io.tapstate.runtime.engine.nest.ResolverProcessor(spec,state,(from,child) -> {},axes,
+                            Map.of(0,List.of("policy"),1,List.of("claim")));
+                    var remaining = new java.util.concurrent.atomic.AtomicInteger(1);
+                    var out = org.mockito.Mockito.mock(com.hazelcast.jet.core.Outbox.class, invocation -> {
+                        if (invocation.getMethod().getName().equals("bucketCount")) return 1;
+                        if (invocation.getMethod().getName().equals("offer")) {
+                            Object value = invocation.getArguments()[invocation.getArguments().length-1];
+                            return value instanceof com.hazelcast.jet.core.Watermark || remaining.getAndDecrement() > 0;
+                        }
+                        return org.mockito.Mockito.RETURNS_DEFAULTS.answer(invocation);
+                    });
+                    receiver.init(out,org.mockito.Mockito.mock(com.hazelcast.jet.core.Processor.Context.class));
+                    feedNest(receiver,0,io.tapstate.core.event.Envelope.delete(1,"policy",parent,null).withOrder(new io.tapstate.core.event.SourceOrder(1,1)));
+                    receiver.tryProcessWatermark(0,new com.hazelcast.jet.core.Watermark(
+                            io.tapstate.runtime.engine.FrontierOrders.pack("policy",new io.tapstate.core.event.SourceOrder(1,50)),axes.axisOf("policy")));
+                    feedNest(receiver,1,io.tapstate.core.event.Envelope.insert(3,"claim",Map.of("claim_id","K"+key,"policy_id",parentId,"value",1),null)
+                            .withOrder(new io.tapstate.core.event.SourceOrder(1,3)).withSrcPos("original-child-"+key));
+                    remaining.set(1);
+                    feedNest(receiver,0,io.tapstate.core.event.Envelope.insert(2,"policy",parent,null).withOrder(new io.tapstate.core.event.SourceOrder(1,2)));
+                    assertThat(states.get(List.of(parentId)).pending()).isEqualTo(1);
+                }
+                assertThat(f.cacheDatabase.getCollection("nest_state").countDocuments(new Document("pendingRelease",true))).isEqualTo(2);
+                roots.destroy(); states.destroy();
+                var stores = io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).forStep("flow","step");
+                var binding = new io.tapstate.runtime.engine.nest.NestBinding(alias -> null,stores,(from,child) -> {},
+                        ignored -> chain -> Optional.of(new io.tapstate.core.event.SourceOrder(1,50)));
+                var dag = new com.hazelcast.jet.core.DAG();
+                var inputs = new java.util.HashMap<String,com.hazelcast.jet.core.Vertex>();
+                for (String alias : List.of("customer","policy","claim")) inputs.put(alias,dag.newVertex(alias+"-empty",
+                        com.hazelcast.jet.core.ProcessorMetaSupplier.of(com.hazelcast.jet.core.ProcessorSupplier.of(EmptyNestInput::new))).localParallelism(1));
+                var ordinal = new java.util.HashMap<com.hazelcast.jet.core.Vertex,Integer>();
+                var assembled = io.tapstate.runtime.engine.nest.NestDag.attach(dag,topology,"step","customer","out",
+                        alias -> List.of(inputs.get(alias)),binding,vertex -> ordinal.merge(vertex,1,Integer::sum)-1,null,
+                        new io.tapstate.runtime.engine.NodeWidth("step",2,1,null));
+                var sink = dag.newVertex("collected",com.hazelcast.jet.core.processor.SinkProcessors.writeListP("recovered-documents"));
+                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink));
+                member.getJet().newJob(dag).getFuture().toCompletableFuture().get(20,java.util.concurrent.TimeUnit.SECONDS);
+                for (int key = 1; key <= 2; key++) {
+                    var restored = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName).get(List.of("C"+key));
+                    var document = restored.render(topology.slots()).orElseThrow();
+                    var parents = (List<?>) document.get("$root");
+                    assertThat(parents).hasSize(1);
+                    var children = (List<?>) ((Map<?,?>)parents.getFirst()).get("child");
+                    assertThat(children).hasSize(1);
+                    assertThat(((Map<?,?>)children.getFirst()).get("value")).isEqualTo(1);
+                }
+                assertThat(member.getList("recovered-documents")).hasSize(2);
+            } finally { member.shutdown(); }
+        });
+    }
+
+    private static com.hazelcast.config.Config isolatedNestMember() {
+        var config = new com.hazelcast.config.Config();
+        config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
+        config.getSerializationConfig().addSerializerConfig(new com.hazelcast.config.SerializerConfig()
+                .setTypeClass(io.tapstate.core.event.Envelope.class).setImplementation(new io.tapstate.runtime.engine.EnvelopeSerializer()));
+        config.setProperty("hazelcast.phone.home.enabled","false"); config.setProperty("hazelcast.shutdownhook.enabled","false");
+        config.setProperty("hazelcast.operation.thread.count","2"); config.setProperty("hazelcast.operation.generic.thread.count","2");
+        var join = config.getNetworkConfig().getJoin(); join.getMulticastConfig().setEnabled(false);
+        join.getTcpIpConfig().setEnabled(false); join.getAutoDetectionConfig().setEnabled(false);
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
+        return config;
+    }
+    private static void feedNest(io.tapstate.runtime.engine.nest.ResolverProcessor receiver,int ordinal,Object value) {
+        var queue = new java.util.ArrayDeque<>(); queue.add(value);
+        var inbox = org.mockito.Mockito.mock(com.hazelcast.jet.core.Inbox.class);
+        org.mockito.Mockito.when(inbox.peek()).thenAnswer(ignored -> queue.peek());
+        org.mockito.Mockito.doAnswer(ignored -> { queue.remove(); return null; }).when(inbox).remove();
+        receiver.process(ordinal,inbox);
+    }
+    private static final class EmptyNestInput extends com.hazelcast.jet.core.AbstractProcessor {}
 
     private static io.tapstate.runtime.engine.nest.NestTopology literalRootTopology() {
         var child = new io.tapstate.core.model.Embed("claim",Map.of("policy_id","policy_id"),io.tapstate.core.model.EmbedAs.ARRAY,"child",List.of("claim_id"),null,null,null);

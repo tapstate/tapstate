@@ -105,10 +105,32 @@ class ADeferredParkingHandoffStaysDurableTest {
         var restarted = new ResolverProcessor(VERTEX,state,(from,child) -> {},axes,edges,
                 chain -> Optional.ofNullable(floors.get(chain)),NestClock.SYSTEM,NestSettings.defaults(),parking);
         restarted.init(restartedOut,new TestProcessorContext());
-        // The old parent is below the confirmed floor, so no event is delivered to this key again.
+        // The old parent is below the confirmed floor. The production startup input discovers only
+        // pending handoffs and routes internal wakes, with no new source row for this key.
+        var recoveryOut = new TestOutbox(16);
+        var recovery = new NestReleaseRecovery(state::pendingReleases);
+        recovery.init(recoveryOut, new TestProcessorContext());
+        assertThat(recovery.complete()).isTrue();
+        var wakes = new ArrayList<Object>(); recoveryOut.drainQueueAndReset(0, wakes, false);
+        for (Object wake : wakes) feed(restarted, VERTEX.inbound().size(), wake);
         for (int i = 0; i < 3; i++) restarted.tryProcess();
         var recovered = new ArrayList<Object>(); restartedOut.drainQueueAndReset(0,recovered,false);
         assertThat(recovered).anySatisfy(item -> assertThat(((KeyedElement)item).element().fields()).containsEntry("claim_id","K2"));
+    }
+
+    @Test void aDiscoveredHandoffCannotTurnIntoNewEmptyStateAfterItsColdRowDisappears() throws Exception {
+        var state = new ColdState(); var parking = new HeapNestStore<ParkedSubtree>();
+        var first = receiver(state,parking,new TestOutbox(16),10);
+        feed(first,1,Envelope.insert(1,"claim",row("claim_id","K1","policy_id","P2"),null).withOrder(at(1)));
+        feed(first,0,renamed());
+        var recoveryOut = new TestOutbox(16); var recovery = new NestReleaseRecovery(state::pendingReleases);
+        recovery.init(recoveryOut,new TestProcessorContext()); assertThat(recovery.complete()).isTrue();
+        var wakes = new ArrayList<Object>(); recoveryOut.drainQueueAndReset(0,wakes,false); assertThat(wakes).hasSize(1);
+        state.remove(KEY);
+        var restarted = receiver(state,parking,new TestOutbox(16),10);
+        assertThatThrownBy(() -> feed(restarted,VERTEX.inbound().size(),wakes.getFirst()))
+                .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE));
+        assertThat(state.load(KEY)).isNull(); assertThat(state.count()).isZero();
     }
 
     private static ResolverProcessor receiver(ColdState state, NestStore<ParkedSubtree> parking,
@@ -132,7 +154,13 @@ class ADeferredParkingHandoffStaysDurableTest {
         var inbox = new TestInbox(); inbox.queue().add(event); processor.process(ordinal, inbox);
     }
     private static final class ColdState implements NestStore<ResolverState> {
-        private final Map<Object, byte[]> entries = new LinkedHashMap<>(); boolean fail;
+        private final Map<Object, byte[]> entries = new LinkedHashMap<>();
+        private final Map<String, byte[]> pending = new TreeMap<>(); boolean fail;
+        List<io.tapstate.spi.store.NestReleaseStore.PendingKey> pendingReleases(String after) {
+            return pending.entrySet().stream().filter(entry -> after == null || entry.getKey().compareTo(after) > 0)
+                    .limit(io.tapstate.spi.store.NestReleaseStore.MAX_PAGE_KEYS)
+                    .map(entry -> new io.tapstate.spi.store.NestReleaseStore.PendingKey(entry.getKey(),entry.getValue())).toList();
+        }
         @Override public ResolverState load(Object key) {
             var bytes = entries.get(key); if (bytes == null) return null;
             try (var in = new ObjectInputStream(new ByteArrayInputStream(bytes))) { return (ResolverState) in.readObject(); }
@@ -144,8 +172,15 @@ class ADeferredParkingHandoffStaysDurableTest {
             try (var out = new ObjectOutputStream(bytes)) { out.writeObject(state); }
             catch (IOException failure) { throw new AssertionError(failure); }
             entries.put(key, bytes.toByteArray());
+            if (state.releases().isEmpty()) pending.remove(NestStateKeys.nameOf(key));
+            else {
+                var encoded = new ByteArrayOutputStream();
+                try (var out = new ObjectOutputStream(encoded)) { out.writeObject(key); }
+                catch (IOException failure) { throw new AssertionError(failure); }
+                pending.put(NestStateKeys.nameOf(key), encoded.toByteArray());
+            }
         }
-        @Override public void remove(Object key) { entries.remove(key); }
+        @Override public void remove(Object key) { entries.remove(key); pending.remove(NestStateKeys.nameOf(key)); }
         @Override public long count() { return entries.size(); }
     }
 }

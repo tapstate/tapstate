@@ -132,6 +132,14 @@ public record NestBinding(
     public interface NestStores extends Serializable {
         default NestStores forStep(String pipelineId,String stepId) { return this; }
         default boolean hasTypedPlacements() { return false; }
+        default boolean hasReleaseRecovery() { return false; }
+
+        /** Only explicitly marked unfinished handoffs are discoverable; ordinary state remains lazy. */
+        default java.util.List<io.tapstate.spi.store.NestReleaseStore.PendingKey> pendingReleaseKeys(
+                NestVertex vertex, String afterKey) {
+            throw new IllegalStateException("no pending-release recovery is bound");
+        }
+
 
 
         /**
@@ -244,6 +252,17 @@ public record NestBinding(
             this.names = original == null || stepId == null ? null : original.forStep(original.pipelineId(),stepId);
         }
         @Override public boolean hasTypedPlacements() { return original != null; }
+        @Override public boolean hasReleaseRecovery() { return original != null; }
+        @Override public java.util.List<io.tapstate.spi.store.NestReleaseStore.PendingKey> pendingReleaseKeys(
+                NestVertex vertex, String afterKey) {
+            if (member == null || original == null) throw new IllegalStateException("recovery store is not bound");
+            String namespace = name(vertex.pathId(), NestMap.STATE, null, vertex.mapName());
+            var store = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, true).nest(namespace, null);
+            if (!(store instanceof io.tapstate.spi.store.NestReleaseStore releases))
+                throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline",original.pipelineId()),null);
+            return releases.pendingReleases(namespace, afterKey);
+        }
+
         @Override public NestStores forStep(String pipelineId,String stepId) {
             if (original == null) return this;
             original.requirePipeline(pipelineId); return new MapNestStores(member,gauges,original,Objects.requireNonNull(stepId,"stepId"));

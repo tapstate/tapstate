@@ -165,6 +165,18 @@ final class MongoCachePipelineAccess {
         } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("scope"); }
     }
 
+    /** A recovery discovery read may use only its original live execution, without advancing state. */
+    void verifyOriginalClaim(ClientSession session) {
+        if (original == null) throw fenced();
+        MongoCacheWorkloadClaimStore.requireCollection(database);
+        var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        var filter = WorkloadClaimDocuments.live(original)
+                .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
+        Document row = table.find(session, filter).first();
+        if (row == null) throw claimFenced();
+        new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
+    }
+
     void proveClaim(ClientSession session) { proveClaim(session,"fencedPipelineWrites"); }
 
     void proveConsumerClaim(ClientSession session) { proveClaim(session,"fencedConsumerWrites"); }

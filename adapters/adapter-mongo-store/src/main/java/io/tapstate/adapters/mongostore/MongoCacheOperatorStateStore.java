@@ -2,7 +2,7 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.model.ReplaceOptions;
-import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.NestReleaseStore;
 import io.tapstate.spi.store.OperatorPlacement;
 import org.bson.Document;
 import org.bson.types.Binary;
@@ -15,7 +15,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /** Opaque operator bytes, split by resource type and fenced by the original Pipeline execution. */
-final class MongoCacheOperatorStateStore implements KeyedStateStore {
+final class MongoCacheOperatorStateStore implements NestReleaseStore {
     private static final int BATCH_KEYS = 256;
     private static final int BATCH_BYTES = 4 * 1024 * 1024;
     private final MongoCachePipelineAccess access;
@@ -79,9 +79,47 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
     }
 
     @Override public void save(String namespace, String key, byte[] state) {
+        saveWithRelease(namespace, key, state, null);
+    }
+
+    @Override public void saveWithRelease(String namespace, String key, byte[] state, byte[] routingKey) {
         requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
+        byte[] fixedKey = routingKey == null ? null : routingKey.clone();
+        if (fixedKey != null && table != SystemCollections.CACHE_NEST_STATE) throw MongoCachePipelineAccess.fenced();
         transaction(true, session -> {
-            table.on(target).replaceOne(session, new Document("_id", id), row(id, captured), new ReplaceOptions().upsert(true)); return null;
+            var value = row(id, captured);
+            if (fixedKey != null) value.append("pendingRelease", true).append("releaseKey", new Binary(fixedKey));
+            table.on(target).replaceOne(session, new Document("_id", id), value, new ReplaceOptions().upsert(true)); return null;
+        });
+    }
+
+    @Override public List<PendingKey> pendingReleases(String namespace, String afterKey) {
+        requireNamespace(namespace);
+        if (table != SystemCollections.CACHE_NEST_STATE) throw MongoCachePipelineAccess.fenced();
+        return transaction(false, session -> {
+            access.verifyOriginalClaim(session);
+            var filter = new Document("_id.placement", address).append("pendingRelease", true);
+            if (afterKey != null) filter.append("_id.key", new Document("$gt", OperatorStateText.encode(afterKey)));
+            var found = new java.util.ArrayList<PendingKey>(); long bytes = 0;
+            try (var cursor = table.on(target).find(session, filter)
+                    .hintString(SystemCollections.CACHE_NEST_STATE.indexes().get(1).indexName())
+                    .sort(new Document("_id.key", 1)).projection(new Document("_id", 1).append("releaseKey", 1).append("formatVersion", 1))
+                    .limit(MAX_PAGE_KEYS).batchSize(1).iterator()) {
+                while (cursor.hasNext()) {
+                    var value = cursor.next();
+                    if (!(value.get("_id") instanceof Document id) || !id.keySet().equals(java.util.Set.of("placement","key"))
+                            || !Integer.valueOf(2).equals(value.get("formatVersion")) || !address.equals(id.get("placement"))
+                            || !(id.get("key") instanceof String encoded) || !(value.get("releaseKey") instanceof Binary key)
+                            || key.getType() != 0) throw access.unreadable("operator-release-key");
+                    long held = addressBytes + 2L * encoded.length() + key.getData().length;
+                    if (!found.isEmpty() && bytes + held > BATCH_BYTES) break;
+                    String decoded;
+                    try { decoded = OperatorStateText.decode(encoded); }
+                    catch (IllegalArgumentException invalid) { throw access.unreadable("operator-release-key"); }
+                    found.add(new PendingKey(decoded, key.getData())); bytes += held;
+                }
+            }
+            return List.copyOf(found);
         });
     }
 
@@ -124,10 +162,15 @@ final class MongoCacheOperatorStateStore implements KeyedStateStore {
 
     private void requireNamespace(String namespace) { if (!mapName.equals(namespace)) throw MongoCachePipelineAccess.fenced(); }
     private Document id(String key) { return new Document("placement", address).append("key", OperatorStateText.encode(Objects.requireNonNull(key, "key"))); }
-    private static Document row(Document id, byte[] value) { return new Document("_id", id).append("formatVersion", 1).append("state", new Binary(value)); }
+    private Document row(Document id, byte[] value) { return new Document("_id", id).append("formatVersion", table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).append("state", new Binary(value)); }
     private byte[] decode(Document row, Document id) {
-        if (!id.equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))
+        if (!id.equals(row.get("_id")) || !Integer.valueOf(table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).equals(row.get("formatVersion"))
                 || !(row.get("state") instanceof Binary binary) || binary.getType() != 0) throw access.unreadable("operator-state");
+        if (row.containsKey("pendingRelease") || row.containsKey("releaseKey")) {
+            if (table != SystemCollections.CACHE_NEST_STATE || !Boolean.TRUE.equals(row.get("pendingRelease"))
+                    || !(row.get("releaseKey") instanceof Binary key) || key.getType() != 0)
+                throw access.unreadable("operator-release-key");
+        }
         return binary.getData().clone();
     }
 }
