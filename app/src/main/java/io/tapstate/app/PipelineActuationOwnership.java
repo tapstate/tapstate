@@ -84,6 +84,11 @@ final class PipelineActuationOwnership {
         private final WorkloadClaimFence claim;
         private Control(PipelineIntentScope scope, WorkloadClaimFence claim) { this.scope = scope; this.claim = claim; }
         WorkloadClaimFence claim() { return claim; }
+        void requireHeld() {
+            synchronized (PipelineActuationOwnership.this) {
+                if (closing || controls.get(scope.pipelineId()) != this || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
+            }
+        }
         void requireActive() {
             synchronized (PipelineActuationOwnership.this) {
                 if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
@@ -97,14 +102,27 @@ final class PipelineActuationOwnership {
             synchronized (PipelineActuationOwnership.this) { controls.remove(scope.pipelineId(), this); }
         }
     }
+    private final Map<String, Pass> passes = new HashMap<>();
+    final class Pass implements AutoCloseable {
+        private final String pipeline;
+        private Pass(String pipeline) { this.pipeline = pipeline; }
+        @Override public void close() {
+            synchronized (PipelineActuationOwnership.this) { passes.remove(pipeline, this); }
+        }
+    }
+    synchronized Pass enterPass(PipelineIntentScope scope) {
+        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())) throw ThreeLayerStorePort.refused();
+        var pass = new Pass(scope.pipelineId()); passes.put(scope.pipelineId(), pass); return pass;
+    }
     synchronized Control control(PipelineIntentScope scope) {
+        if (passes.containsKey(scope.pipelineId())) throw ThreeLayerStorePort.refused();
         var admitted = permit(scope);
         if (!admitted.granted() || admitted.claim() == null) throw ThreeLayerStorePort.refused();
         var command = new Control(scope, WorkloadClaimFence.from(admitted.claim()));
         controls.put(scope.pipelineId(), command); return command;
     }
     synchronized Control unpreparedControl(PipelineIntentScope scope) {
-        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
+        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId()) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
         var command = new Control(scope, null); controls.put(scope.pipelineId(), command); return command;
     }
     private volatile boolean closing;

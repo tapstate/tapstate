@@ -74,6 +74,25 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     @Override public void startCapture(String pipeline) { throw refused(); }
     @Override public void stopCapture(String pipeline,boolean purge) { throw refused(); }
 
+    synchronized void retireScope(PipelineIntentScope scope, WorkloadClaimFence ceiling) {
+        active(); var captured = sessions.values().stream().filter(session -> session.original.scope().equals(scope)).toList();
+        if (ceiling == null && !captured.isEmpty()) throw refused();
+        for (var session : captured) requireNotLater(session.original, ceiling);
+        for (var session : captured) { stop(session); sessions.remove(session.original, session); }
+    }
+    synchronized boolean hasScope(PipelineIntentScope scope) {
+        active(); return sessions.keySet().stream().anyMatch(original -> original.scope().equals(scope));
+    }
+    static void requireNotLater(ExecutionFence original, WorkloadClaimFence ceiling) {
+        if (!original.pipelineId().equals(ceiling.key().resourceId()) || original.scope() == null
+                || !original.scope().clusterId().equals(ceiling.key().clusterId())
+                || ceiling.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || original.claimGeneration() > ceiling.claimGeneration() || original.executionGeneration() > ceiling.executionGeneration()
+                || original.topologyRevision() > ceiling.topologyRevision()
+                || original.claimGeneration() == ceiling.claimGeneration() && (!original.ownerNodeId().equals(ceiling.owner().nodeId())
+                        || !original.ownerBootId().equals(ceiling.owner().bootId()))) throw refused();
+    }
+
     private final class Run implements PipelineCaptureCoordinator {
         private final PipelineIntentScope commandScope;
         private final WorkloadClaimFence command;

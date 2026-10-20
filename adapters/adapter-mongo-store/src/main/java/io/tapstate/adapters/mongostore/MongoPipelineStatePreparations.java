@@ -126,6 +126,51 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
             return Optional.of(original);
         });
     }
+    void requireRetiredPredecessor(PipelineIntentScope scope, PipelineIntentScope earlier) {
+        transaction(session -> {
+            var business=bindings.cachePreparationForTransaction(session).orElseThrow(MongoPipelineStatePreparations::fenced).businessScope();
+            if (!MongoPipelineRetirementFacts.sameBusiness(scope,earlier) || !scope.pipelineId().equals(earlier.pipelineId())
+                    || earlier.stateGeneration()>=scope.stateGeneration() || !business.clusterId().equals(scope.clusterId())
+                    || business.bindingVersion()!=scope.bindingVersion() || !business.cacheIncarnation().equals(scope.cacheIncarnation())) throw fenced();
+            var row=mappings.find(session,new Document("_id",scope.pipelineId())).first();
+            var current=MongoPipelineStateMappings.decode(scope.pipelineId(),row);
+            if (current.stateGeneration()!=scope.stateGeneration()
+                    || current.phase()!=PipelineStateMapping.Phase.ACTIVE && current.phase()!=PipelineStateMapping.Phase.RETIRING) throw fenced();
+            if (current.phase()==PipelineStateMapping.Phase.RETIRING) {
+                var deleting=MongoPipelineRetirementFacts.read(row);
+                if (!deleting.request().scope().equals(scope) || !deleting.request().operationId().equals(current.operationId())) throw fenced();
+            }
+            if (row.containsKey("stateRebuild")) {
+                var prepared=MongoPipelinePreparationFacts.decode(scope.pipelineId(),row,clusterId);
+                var annex=row.get("stateRebuild",Document.class);
+                // Deletion changes the current operation while the completed rebuild publication remains fixed.
+                var published=new Document(row).append("operationId",annex==null?null:annex.get("operationId"));
+                MongoPipelineStateRebuilds.requireCompletedPrior(published,prepared);
+                var previous=MongoPipelinePreparationFacts.scope(annex.get("originalScope",Document.class));
+                if (!prepared.scope().equals(scope) || !MongoPipelineRetirementFacts.sameBusiness(scope,previous)
+                        || !scope.pipelineId().equals(previous.pipelineId()) || earlier.stateGeneration()>previous.stateGeneration()) throw fenced();
+                return null;
+            }
+            if (!row.containsKey("retirement")) throw fenced();
+            var fact=MongoPipelineRetirementFacts.read(row);
+            if (current.phase()==PipelineStateMapping.Phase.ACTIVE) {
+                var previous=fact.completed();
+                if (!MongoPipelineRetirementFacts.sameBusiness(scope,previous.scope()) || !scope.pipelineId().equals(previous.scope().pipelineId())
+                        || previous.scope().stateGeneration()+1!=scope.stateGeneration() || earlier.stateGeneration()>previous.scope().stateGeneration()) throw fenced();
+            } else if (current.phase()==PipelineStateMapping.Phase.RETIRING) {
+                if (!fact.request().scope().equals(scope) || !fact.request().operationId().equals(current.operationId())) throw fenced();
+                var prepared=MongoPipelinePreparationFacts.decode(scope.pipelineId(),row,clusterId);
+                // A pending deletion retains the native allocation of this later generation.
+                // Unprepared reuse additionally retains the exact preceding CACHE retirement.
+                if (prepared.phase()==PipelinePreparation.Phase.UNASSIGNED) {
+                    var previous=fact.predecessor().orElseThrow(MongoPipelineStatePreparations::fenced);
+                    if (!MongoPipelineRetirementFacts.sameBusiness(scope,previous.scope()) || !scope.pipelineId().equals(previous.scope().pipelineId())
+                            || earlier.stateGeneration()>previous.scope().stateGeneration()) throw fenced();
+                } else if (prepared.phase()!=PipelinePreparation.Phase.COMPLETE || !scope.equals(prepared.scope())) throw fenced();
+            } else throw fenced();
+            return null;
+        });
+    }
     PipelinePreparationInputs verifyInputs(ClientSession session,PipelineIntentScope scope,PipelinePreparationInputs requested) {
         var resource = artifacts.getInTransaction(session,scope.pipelineId()).orElseThrow(MongoPipelineStatePreparations::fenced);
         if (!(resource instanceof PipelineResource pipeline)) throw fenced();

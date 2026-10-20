@@ -13,6 +13,9 @@ import io.tapstate.runtime.engine.OperatorMapCapacity;
 import io.tapstate.runtime.engine.OperatorMapConfigurations;
 import io.tapstate.runtime.engine.OperatorRunManifest;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.runtime.engine.OperatorMapBinding;
 import java.io.Serializable;
 import java.time.Duration;
 import java.util.Collection;
@@ -34,6 +37,11 @@ final class HazelcastOperatorReadiness {
     static final String EXECUTOR = "tapstate.operator-readiness";
     private final HazelcastInstance member;
     private final Duration timeout;
+    private static final String RETIREMENT_CONTEXT = "tapstate.pipeline-retirement";
+    private record LocalRetirement(ScopedPipelineCaptureCoordinator captures, Runnable active) {}
+    static void bindRetirement(HazelcastInstance member, ScopedPipelineCaptureCoordinator captures, Runnable active) {
+        if (member.getUserContext().putIfAbsent(RETIREMENT_CONTEXT, new LocalRetirement(captures, active)) != null) throw fenced();
+    }
 
     HazelcastOperatorReadiness(HazelcastInstance member,Duration timeout) {
         this.member = Objects.requireNonNull(member,"member"); this.timeout = Objects.requireNonNull(timeout,"timeout");
@@ -73,6 +81,10 @@ final class HazelcastOperatorReadiness {
 
     /** The caller has already stopped the original writer. Only its exact hot names are released. */
     void releaseHot(OperatorRunManifest original) {
+        releaseHot(original, true);
+    }
+    void releaseRetiredHot(OperatorRunManifest original) { releaseHot(original, false); }
+    private void releaseHot(OperatorRunManifest original, boolean flush) {
         requireOriginal(original);
         try {
             Snapshot before = snapshot(original.pipelineId());
@@ -81,7 +93,7 @@ final class HazelcastOperatorReadiness {
             // Enumerate existing objects: getMap would recreate a missing old namespace during cleanup.
             for (var object : member.getDistributedObjects()) {
                 if (object instanceof com.hazelcast.map.IMap<?,?> map && names.contains(object.getName())) {
-                    map.flush(); map.destroy();
+                    if (flush) map.flush(); map.destroy();
                 }
             }
             long deadline = System.nanoTime()+timeout.toNanos();
@@ -98,6 +110,39 @@ final class HazelcastOperatorReadiness {
         } catch (HazelcastInstanceNotActiveException | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
             throw refused(original.pipelineId(),"cluster","member-unavailable");
         }
+    }
+    /** Stops only the fixed physical scope on each original data member and returns its retained hot descriptors. */
+    List<OperatorRunManifest> isolate(PipelineIntentScope scope, WorkloadClaimFence ceiling, Runnable active) {
+        var values = collect(scope, ceiling, true, active); var groups = new LinkedHashMap<ExecutionFence, java.util.Set<OperatorMapBinding>>();
+        for (var binding : values) {
+            if (ceiling == null) throw fenced();
+            if (!binding.placement().scope().equals(scope) || !(binding.executionIdentity() instanceof ExecutionFence original)
+                    || !scope.equals(original.scope()) || !original.operatorExecutionKey().equals(binding.executionKey())) throw fenced();
+            ScopedPipelineCaptureCoordinator.requireNotLater(original, ceiling);
+            groups.computeIfAbsent(original, ignored -> new java.util.LinkedHashSet<>()).add(binding);
+        }
+        return groups.entrySet().stream().map(entry -> new OperatorRunManifest(scope.pipelineId(), entry.getKey(), List.copyOf(entry.getValue()))).toList();
+    }
+    void requireRetired(PipelineIntentScope scope, WorkloadClaimFence ceiling, Runnable active) {
+        if (!collect(scope, ceiling, false, active).isEmpty()) throw fenced();
+    }
+    private List<OperatorMapBinding> collect(PipelineIntentScope scope, WorkloadClaimFence ceiling, boolean stop, Runnable active) {
+        try { return collectAvailable(scope,ceiling,stop,active); }
+        catch (HazelcastInstanceNotActiveException | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
+            throw refused(scope.pipelineId(),"cluster","member-unavailable");
+        }
+    }
+    private List<OperatorMapBinding> collectAvailable(PipelineIntentScope scope, WorkloadClaimFence ceiling, boolean stop, Runnable active) {
+        active.run(); var before = snapshot(scope.pipelineId()); long deadline = System.nanoTime() + timeout.toNanos();
+        var replies = member.getExecutorService(EXECUTOR).submitToMembers(new Collect(scope, ceiling, stop, before.identities()), before.members().values());
+        var result = new java.util.ArrayList<OperatorMapBinding>();
+        for (var target : before.members().entrySet()) {
+            active.run(); var reply = answer(scope.pipelineId(), target.getKey(), replies.get(target.getValue()), deadline);
+            if (reply == null || !before.identities().get(target.getKey()).equals(reply.identity())) throw fenced();
+            if (reply.refusalCode() != null) throw refused(scope.pipelineId(), target.getKey(), reply.refusalCode());
+            result.addAll(reply.bindings());
+        }
+        active.run(); if (!before.identities().equals(snapshot(scope.pipelineId()).identities())) throw fenced(); return List.copyOf(result);
     }
     private static void requireOriginal(OperatorRunManifest original) {
         Objects.requireNonNull(original,"original");
@@ -119,7 +164,7 @@ final class HazelcastOperatorReadiness {
         }
         return new Snapshot(Map.copyOf(members),Map.copyOf(identities));
     }
-    private Result answer(String pipeline,String target,Future<Result> future,long deadline) {
+    private <T> T answer(String pipeline,String target,Future<T> future,long deadline) {
         if (future == null) throw refused(pipeline,target,"no-answer");
         try { return future.get(Math.max(0,deadline-System.nanoTime()),TimeUnit.NANOSECONDS); }
         catch (TimeoutException slow) { throw refused(pipeline,target,"timeout"); }
@@ -137,6 +182,7 @@ final class HazelcastOperatorReadiness {
     record Identity(String nodeId,String bootId,UUID engineId) implements Serializable {}
     private record Snapshot(Map<String,Member> members,Map<String,Identity> identities) {}
     record Result(Identity identity,String refusalCode) implements Serializable {}
+    record Collected(Identity identity, List<OperatorMapBinding> bindings, String refusalCode) implements Serializable {}
     private static Identity identity(Member member) {
         String node = member.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE), boot = member.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE);
         if (node == null || node.isBlank() || boot == null || boot.isBlank() || member.getUuid() == null) throw fenced();
@@ -183,6 +229,37 @@ final class HazelcastOperatorReadiness {
                 for (var binding : original.bindings()) registry.release(binding);
                 return new Result(actual,null);
             } catch (TapstateException refused) { return new Result(actual,refused.code().code()); }
+        }
+    }
+    static final class Collect implements Callable<Collected>, Serializable, HazelcastInstanceAware {
+        private final PipelineIntentScope scope; private final Ceiling ceiling; private final boolean stop;
+        private final Map<String,Identity> expected; private transient HazelcastInstance member;
+        Collect(PipelineIntentScope scope, WorkloadClaimFence ceiling, boolean stop, Map<String,Identity> expected) {
+            this.scope=scope; this.ceiling=ceiling==null?null:Ceiling.from(ceiling); this.stop=stop; this.expected=Map.copyOf(expected);
+        }
+        @Override public void setHazelcastInstance(HazelcastInstance member) { this.member=member; }
+        @Override public Collected call() {
+            Identity actual=null;
+            try {
+                actual=identity(member.getCluster().getLocalMember());
+                if (!actual.equals(expected.get(actual.nodeId())) || !(member.getUserContext().get(RETIREMENT_CONTEXT) instanceof LocalRetirement local)) throw fenced();
+                local.active().run(); if (stop) local.captures().retireScope(scope,ceiling==null?null:ceiling.local());
+                if (local.captures().hasScope(scope)) throw fenced();
+                var bindings=io.tapstate.runtime.engine.OperatorMapBindings.resolve(member,true).originals(scope); local.active().run();
+                return new Collected(actual,bindings,null);
+            } catch (TapstateException refused) { return new Collected(actual,List.of(),refused.code().code()); }
+        }
+    }
+    /** Carries coordinates as data; it is not a transported grant or an enum serialization. */
+    private record Ceiling(String cluster,String pipeline,String node,String boot,long claim,long execution,long topology) implements Serializable {
+        static Ceiling from(WorkloadClaimFence original) {
+            if (original.key().type()!=io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION) throw fenced();
+            return new Ceiling(original.key().clusterId(),original.key().resourceId(),original.owner().nodeId(),original.owner().bootId(),
+                    original.claimGeneration(),original.executionGeneration(),original.topologyRevision());
+        }
+        WorkloadClaimFence local() {
+            return new WorkloadClaimFence(new io.tapstate.spi.store.WorkloadClaimKey(cluster,io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION,pipeline),
+                    new io.tapstate.spi.store.WorkloadOwner(node,boot),claim,execution,topology);
         }
     }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }

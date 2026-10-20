@@ -53,7 +53,8 @@ class ScopedConvergenceDriverTest {
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
     private final Intents intents = new Intents();
     private final Views views = new Views();
-    private final PipelineActuationOwnership ownership = mock(PipelineActuationOwnership.class);
+    private PipelineActuationOwnership ownership = mock(PipelineActuationOwnership.class);
+    private boolean realOwnership;
     private final AtomicBoolean eligible = new AtomicBoolean(true);
     private final AtomicBoolean carrying = new AtomicBoolean();
     private final List<PipelineConvergencePass> passes = new ArrayList<>();
@@ -66,9 +67,10 @@ class ScopedConvergenceDriverTest {
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
-        when(ownership.permit(any(PipelineIntentScope.class))).thenAnswer(call -> deny
+        if (!realOwnership) when(ownership.permit(any(PipelineIntentScope.class))).thenAnswer(call -> deny
                 ? PipelineActuationOwnership.Permit.denied()
                 : new PipelineActuationOwnership.Permit(true, claims.read(KEY).orElseThrow().claim()));
+        if (!realOwnership) when(ownership.enterPass(any())).thenReturn(mock(PipelineActuationOwnership.Pass.class));
         var bindings = new ConvergenceDriver.ScopedPorts(intents, views, () -> {}, pass -> {
             passes.add(pass);
             return new LifecycleActuator() {
@@ -101,8 +103,11 @@ class ScopedConvergenceDriverTest {
 
     private void advance(PipelineConvergencePass pass) {
         assertThat(pass.claim()).isEqualTo(WorkloadClaimFence.from(claims.read(KEY).orElseThrow().claim()));
-        var actual = claims.advanceExecution(claims.read(KEY).orElseThrow().claim(), 7, Set.of("node")).orElseThrow();
-        pass.advanced(WorkloadClaimFence.from(actual));
+        if (realOwnership) pass.advanced(ownership.beginExecution(pass.scope(), pass.claim()).claimFence());
+        else {
+            var actual = claims.advanceExecution(claims.read(KEY).orElseThrow().claim(), 7, Set.of("node")).orElseThrow();
+            pass.advanced(WorkloadClaimFence.from(actual));
+        }
         if (startFailure != null) throw startFailure;
         carrying.set(true);
     }
@@ -131,6 +136,27 @@ class ScopedConvergenceDriverTest {
         assertThat(views.writes.stream().filter(w -> w.kind().equals("observation")).map(w -> w.claim().executionGeneration()))
                 .containsExactly(1L);
         assertThat(views.observations(FIRST).read("orders").orElseThrow().state()).isEqualTo(PipelineState.RUNNING);
+    }
+
+    @Test void aControlCannotEnterWhileAnAdvancedConvergencePassHasNotReturned() {
+        var membership = mock(ClusterMembershipGate.class);
+        when(membership.businessEligible()).thenReturn(true);
+        when(membership.committed()).thenReturn(new io.tapstate.spi.store.ClusterMembership("cluster", 7, Set.of("node")));
+        var scopedClaims = mock(io.tapstate.spi.store.WorkloadClaimStore.class);
+        when(scopedClaims.acquirePipeline(any(), any(), org.mockito.ArgumentMatchers.anyLong(), any()))
+                .thenAnswer(call -> claims.acquire(KEY, call.getArgument(1), call.getArgument(2), call.getArgument(3)));
+        when(scopedClaims.readPipeline(any())).thenAnswer(call -> claims.read(KEY));
+        when(scopedClaims.advanceExecution(any(), org.mockito.ArgumentMatchers.anyLong(), any()))
+                .thenAnswer(call -> claims.advanceExecution(call.getArgument(0), call.getArgument(1), call.getArgument(2)));
+        ownership = PipelineActuationOwnership.scoped(new io.tapstate.spi.store.CacheBusinessScope("cluster", 3, "cache-a"), OWNER,
+                membership, new ClusterWorkloadClaims(scopedClaims, membership), Duration.ofMinutes(1), Duration.ofSeconds(10), System::nanoTime);
+        realOwnership = true;
+        onStart = pass -> {
+            advance(pass);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> ownership.control(FIRST)).isInstanceOf(TapstateException.class);
+        };
+        var driver = driver(); driver.reconcile();
+        try (var control = ownership.control(FIRST)) { control.requireActive(); }
     }
 
     @Test void aCodedFailureAfterAdvancePublishesUnderThatSameActualClaim() {

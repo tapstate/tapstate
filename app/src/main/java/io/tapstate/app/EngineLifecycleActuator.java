@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.OperatorRunManifest;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import org.slf4j.Logger;
@@ -122,6 +123,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     LifecycleActuator forPass(PipelineConvergencePass pass, ScopedEngineLifecycleActuator.Ports ports) {
         return new ScopedEngineLifecycleActuator(pass, engine, dagSource, captureCoordinator, actuation,
                 defaultDatabase, connectors, clock, ports, scopedSubmissions);
+    }
+    void requireResolvedSubmission(String pipeline, Optional<OperatorRunManifest> captured) {
+        scopedSubmissions.observed(pipeline, captured.orElse(null));
     }
 
     @Override

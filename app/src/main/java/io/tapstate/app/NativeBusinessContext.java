@@ -151,9 +151,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
     @Override public synchronized void close() {
         active.set(false); handlers = List.of();
+        Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
         try { if (memberStorage != null) memberStorage.close(); } catch (RuntimeException | Error cleanup) { failure = cleanup; }
         try { if (context != null) context.close(); } catch (RuntimeException | Error cleanup) {
+            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+        }
+        try {
+            if (member instanceof HazelcastInstance actual && actual.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
+        } catch (RuntimeException | Error cleanup) {
             if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
         }
         if (failure instanceof Error error) throw error;
@@ -265,6 +271,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 HazelcastInstance member, Clock clock) {
             return new EngineLifecycleActuator(engine, dags, captures, owner.port.operatorStateStores().defaultDatabase(),
                     ownership, plans, clock, new HazelcastConnectorReadiness(member, Duration.ofSeconds(60)));
+        }
+        @Bean ArtifactMutationService.PipelineDeletion nativePipelineDeletion(NativeBusinessContext owner,
+                PipelineActuationOwnership ownership, NodeSessionLease node, Engine engine, EngineLifecycleActuator actuator,
+                PipelineCaptureCoordinator captures, HazelcastInstance member, HazelcastExecutionPlans plans, ConnectorProvisioner connectors) {
+            if (!(captures instanceof ScopedPipelineCaptureCoordinator nativeCaptures)) throw ThreeLayerStorePort.refused();
+            HazelcastOperatorReadiness.bindRetirement(member,nativeCaptures,owner.memberStorage::requireNode);
+            return new NativePipelineDeletion(owner.configuration,owner.original.cache(),owner.original.preparation().businessScope(),
+                    ownership,() -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),owner.memberStorage::requireNode,
+                    engine,actuator,new HazelcastOperatorReadiness(member,Duration.ofSeconds(30)),plans,connectors);
         }
         @Bean RebuildAdmission rebuildAdmission(ClusterProperties cluster, HazelcastProperties hazelcast,
                 PipelineActuationOwnership ownership, Engine engine) {

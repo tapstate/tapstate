@@ -180,6 +180,12 @@ public final class OperatorMapBindings implements AutoCloseable {
         requireOpen(); return initializingMaps.entrySet().stream().filter(entry -> entry.getValue().bound == null)
                 .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
+    /** Returns fixed descriptors only; retirement never reconstructs an address from a map name. */
+    public synchronized List<OperatorMapBinding> originals(io.tapstate.spi.store.PipelineIntentScope scope) {
+        requireOpen();
+        return slots.values().stream().filter(held -> held.active.get() && held.binding.placement().scope().equals(scope))
+                .map(held -> held.binding).toList();
+    }
     private KeyedStateStore initializing(String name, boolean nest, String database) {
         requireOpen(); PendingStore existing = initializingMaps.get(name);
         if (existing != null) {

@@ -137,6 +137,7 @@ final class ConvergenceDriver {
             // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
             MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
             PipelineConvergencePass pass = null;
+            PipelineActuationOwnership.Pass localPass = null;
             try {
                 PipelineActuationOwnership.Permit permit;
                 if (scoped == null) {
@@ -150,6 +151,7 @@ final class ConvergenceDriver {
                     }
                     permit = actuation.permit(snapshot.get().scope());
                     if (permit.granted()) {
+                        localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
                         pass = new PipelineConvergencePass(snapshot.get(), WorkloadClaimFence.from(permit.claim()),
                                 scoped.stores(), scoped.requireActive());
                     }
@@ -206,6 +208,7 @@ final class ConvergenceDriver {
                     LOG.warn("Could not publish the reconcile failure for pipeline {}", pipelineId, unpublishable);
                 }
             } finally {
+                if (localPass != null) localPass.close();
                 MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
             }
         }

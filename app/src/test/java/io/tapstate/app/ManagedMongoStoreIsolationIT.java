@@ -343,7 +343,111 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(root.runtime().requireConfiguration().preparations().read("partial_model_flow").orElseThrow().phase())
                         .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
                 assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
-                ((NativeBusinessContext)root.runtime().business().orElseThrow()).close();
+                var originalModelFlow = root.runtime().requireConfiguration().artifacts().get("model_flow").orElseThrow();
+                client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
+                        .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
+                        .retrieve().toBodilessEntity();
+                assertThat(root.runtime().requireConfiguration().artifacts().get("model_flow")).isEmpty();
+                assertThat(root.runtime().requireConfiguration().pipelineStates().read("model_flow").orElseThrow().phase())
+                        .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED);
+                var configuration = root.runtime().requireConfiguration();
+                configuration.artifacts().create(originalModelFlow);
+                var reusedScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                        current.preparation().authScope().cacheIncarnation(), "model_flow", 2);
+                var inputs = SourceModelSnapshot.capture("model_flow", List.of(modelSource),
+                        current.cache().schemas(current.preparation().businessScope(), () -> {}))
+                        .preparationInputs(reusedScope, (io.tapstate.core.model.PipelineResource)originalModelFlow,
+                                (io.tapstate.core.model.PipelineResource)originalModelFlow, Map.of(modelSource.id(), modelSource));
+                child.getBean(PipelineFirstStatePreparer.class).prepare(reusedScope, inputs);
+                var driving=child.getBean(PipelineActuationOwnership.class);
+                var permitted=driving.permit(reusedScope);
+                assertThat(permitted.granted()).isTrue();
+                var execution=driving.beginExecution(reusedScope,io.tapstate.spi.store.WorkloadClaimFence.from(permitted.claim()));
+                assertThat(execution.allowed()).isTrue();
+                var completedDag=new com.hazelcast.jet.core.DAG();
+                completedDag.newVertex("done",com.hazelcast.jet.core.ProcessorMetaSupplier.forceTotalParallelismOne(
+                        com.hazelcast.jet.core.ProcessorSupplier.of((com.hazelcast.function.SupplierEx<com.hazelcast.jet.core.Processor>) FinishedPipelineProcessor::new)));
+                var retainedRun=child.getBean(io.tapstate.runtime.engine.Engine.class).submitRun("model_flow",completedDag,Map.of(),
+                        io.tapstate.runtime.engine.nest.NestSettings.defaults(),new io.tapstate.runtime.engine.OperatorRunManifest("model_flow",execution.fence(),List.of()));
+                assertThat(retainedRun.awaitTerminal(Duration.ofSeconds(15))).isTrue();
+                String role = "retire_until_commit_" + suffix;
+                admin.getDatabase("admin").runCommand(new Document("createRole", role).append("privileges", List.of(
+                        new Document("resource", new Document("db", configDb).append("collection", ""))
+                                .append("actions", List.of("find", "insert", "update", "createIndex", "listIndexes", "listCollections"))))
+                        .append("roles", List.of()));
+                admin.getDatabase("admin").runCommand(new Document("updateUser", configUser).append("roles", List.of(new Document("role", role).append("db", "admin"))));
+                try {
+                    assertThatThrownBy(() -> client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
+                            .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
+                            .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.HttpServerErrorException.class);
+                    assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().phase())
+                            .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
+                    assertThat(configuration.artifacts().get("model_flow")).isPresent();
+                    assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").find(new Document("pipelineScope.pipelineId", "model_flow"))
+                            .first()).containsKey("pipelineRetirement");
+                } finally {
+                    admin.getDatabase("admin").runCommand(new Document("updateUser", configUser)
+                            .append("roles", List.of(new Document("role", "readWrite").append("db", configDb))));
+                }
+                client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
+                        .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
+                        .retrieve().toBodilessEntity();
+                assertThat(configuration.artifacts().get("model_flow")).isEmpty();
+                assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().phase())
+                        .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED);
+                configuration.artifacts().create(originalModelFlow);
+                assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().stateGeneration()).isEqualTo(3);
+                assertThat(child.getBean(io.tapstate.runtime.engine.Engine.class).captureRun("model_flow").orElseThrow().jobId()).isEqualTo(retainedRun.jobId());
+                client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
+                        .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
+                        .retrieve().toBodilessEntity();
+                assertThat(configuration.artifacts().get("model_flow")).isEmpty();
+                configuration.artifacts().create(originalModelFlow);
+                var beforeFull = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                        current.preparation().authScope().cacheIncarnation(), "model_flow", 4);
+                var fullInputs = SourceModelSnapshot.capture("model_flow", List.of(modelSource),
+                        current.cache().schemas(current.preparation().businessScope(), () -> {}))
+                        .preparationInputs(beforeFull, (io.tapstate.core.model.PipelineResource)originalModelFlow,
+                                (io.tapstate.core.model.PipelineResource)originalModelFlow, Map.of(modelSource.id(), modelSource));
+                child.getBean(PipelineFirstStatePreparer.class).prepare(beforeFull, fullInputs);
+                // The fixture seeds the accepted stop intent; the production driver performs the actual replacement.
+                child.getBean(io.tapstate.spi.store.StorePort.class).desired().save(new io.tapstate.core.lifecycle.DesiredState("model_flow",
+                        io.tapstate.core.lifecycle.PipelineState.STOPPED, io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow), true));
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> {
+                    child.getBean(ConvergenceDriver.class).reconcile();
+                    var mapping = configuration.pipelineStates().read("model_flow").orElseThrow();
+                    return mapping.phase() == io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE && mapping.stateGeneration() == 5;
+                });
+                var serverFailure = new AtomicReference<Throwable>();
+                var deletion = child.getBean(io.tapstate.control.core.ArtifactMutationService.PipelineDeletion.class);
+                org.springframework.test.util.ReflectionTestUtils.setField(child.getBean(io.tapstate.control.core.ArtifactMutationService.class), "pipelineDeletion",
+                        (io.tapstate.control.core.ArtifactMutationService.PipelineDeletion)(definition, expected) -> {
+                            try {
+                                var command = deletion.prepare(definition, expected);
+                                return () -> { try { command.run(); } catch (RuntimeException | Error failure) { serverFailure.set(failure); throw failure; } };
+                            } catch (RuntimeException | Error failure) { serverFailure.set(failure); throw failure; }
+                        });
+                // Publication can precede the previous synchronous pass's finally block; only its busy fence is retried.
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+                    try {
+                        client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
+                                .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
+                                .retrieve().toBodilessEntity();
+                    } catch (org.springframework.web.client.RestClientResponseException busy) {
+                        var body = (Map<?,?>)io.tapstate.core.common.JsonReader.parse(busy.getResponseBodyAsString());
+                        if (busy.getStatusCode().value() == 500 && "io.workload-claim-fenced".equals(body.get("code")))
+                            throw new AssertionError("the native control is not yet available",serverFailure.get());
+                        throw busy;
+                    }
+                });
+                assertThat(configuration.artifacts().get("model_flow")).isEmpty();
+                var businessOwner = (NativeBusinessContext)root.runtime().business().orElseThrow();
+                var businessContext = (org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(businessOwner, "context");
+                var originalMember = businessContext.getBean(com.hazelcast.core.HazelcastInstance.class);
+                var originalNode = businessContext.getBean(NodeSessionLease.class).currentFence().orElseThrow();
+                businessOwner.close();
+                assertThat(originalMember.getLifecycleService().isRunning()).isFalse();
+                assertThat(current.cache().workloadClaims(current.preparation().businessScope()).read(originalNode.key()).orElseThrow().leased()).isFalse();
                 assertThat(root.runtime().businessStarted()).isFalse();
                 String degraded = client.post().uri("/api/storage/status").header("Authorization", "Bearer " + login.token())
                         .body(Map.of()).retrieve().body(String.class);
@@ -357,6 +461,10 @@ class ManagedMongoStoreIsolationIT {
                                 failure -> assertThat(failure.getStatusCode().value()).isEqualTo(503));
             }
         }
+    }
+
+    private static final class FinishedPipelineProcessor extends com.hazelcast.jet.core.AbstractProcessor {
+        @Override public boolean complete() { return true; }
     }
 
     /** Native control-service composition; the target fixture does not certify a registered connector or TLS. */

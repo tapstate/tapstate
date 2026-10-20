@@ -91,6 +91,33 @@ class HazelcastOperatorReadinessTest {
         verify(f.member,never()).getDistributedObjects();
     }
 
+    @Test void aSynchronousCollectionDisconnectUsesTheCodedMemberBoundary() {
+        var f=new MockMembers(); var executor=f.member.getExecutorService(HazelcastOperatorReadiness.EXECUTOR);
+        when(executor.submitToMembers(any(HazelcastOperatorReadiness.Collect.class),anyCollection()))
+                .thenThrow(new com.hazelcast.core.OperationTimeoutException("member stopped"));
+        assertThatThrownBy(() -> f.readiness().isolate(SCOPE,null,() -> {}))
+                .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ActuationError.OPERATOR_STATE_UNAVAILABLE_ON_MEMBER));
+    }
+
+    @Test void scopeIsolationCollectsBothMembersAndALateCeilingCannotReleaseTheNextRun() {
+        try(var f=new RealMembers()) {
+            var left=mock(ScopedPipelineCaptureCoordinator.class); var right=mock(ScopedPipelineCaptureCoordinator.class);
+            HazelcastOperatorReadiness.bindRetirement(f.a,left,() -> {}); HazelcastOperatorReadiness.bindRetirement(f.b,right,() -> {});
+            var readiness=new HazelcastOperatorReadiness(f.a,Duration.ofSeconds(5)); var original=manifest(1);
+            readiness.prepare(original,CAPACITIES,List.of("a","b"),() -> {});
+            var ceiling=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"p"),
+                    new WorkloadOwner("a","boot-a"),3,1,1);
+            var collected=readiness.isolate(SCOPE,ceiling,() -> {});
+            assertThat(collected).containsExactly(original);
+            verify(left).retireScope(SCOPE,ceiling); verify(right).retireScope(SCOPE,ceiling);
+            collected.forEach(readiness::releaseHot); readiness.requireRetired(SCOPE,ceiling,() -> {});
+            var next=manifest(2); readiness.prepare(next,CAPACITIES,List.of("a","b"),() -> {});
+            assertThatThrownBy(() -> readiness.isolate(SCOPE,ceiling,() -> {})).isInstanceOf(TapstateException.class);
+            assertThat(f.registryA.originals(SCOPE)).containsExactlyInAnyOrderElementsOf(next.bindings());
+            assertThat(f.registryB.originals(SCOPE)).containsExactlyInAnyOrderElementsOf(next.bindings());
+        }
+    }
+
     @Test void oneActualMemberRefusalIsReturnedAsACanonicalCodeAndCannotBeMistakenForPreparation() {
         try (var f = new RealMembers()) {
             f.refuseB.set(true);

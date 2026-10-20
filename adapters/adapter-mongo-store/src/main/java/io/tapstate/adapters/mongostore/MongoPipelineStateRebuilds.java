@@ -165,7 +165,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         pending.owner.requireActive.run();
     }
 
-    private static void requireCompletedPrior(Document mapping, PipelinePreparation prepared) {
+    static void requireCompletedPrior(Document mapping, PipelinePreparation prepared) {
         if (!mapping.containsKey("stateRebuild")) return;
         try {
             var annex = mapping.get("stateRebuild", Document.class); var fields = new java.util.HashSet<>(ANNEX); fields.add("result");

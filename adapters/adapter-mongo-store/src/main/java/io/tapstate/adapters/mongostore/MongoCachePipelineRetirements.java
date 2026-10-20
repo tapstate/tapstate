@@ -79,6 +79,21 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             return new Receipt(this,original,Optional.of(retired));
         });
     }
+    @Override public Optional<PipelineRetirementReceipt> completed(PipelineRetirementPreparation original, WorkloadClaimFence node) {
+        MongoPipelineRetirements.requireOriginalPending(original); requireScope(original.request().scope()); Objects.requireNonNull(node);
+        return transaction(original, session -> {
+            MongoCachePipelinePreparations.proveNode(session, database, business, node);
+            if (original.request().cache().isEmpty()) return Optional.empty();
+            var scope = original.request().scope(); var key = original.request().cache().orElseThrow().claim().key();
+            var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            if (row == null) throw rebuild(scope);
+            if (!(row.get("pipelineRetirement") instanceof Document saved)) return Optional.empty();
+            var retired = MongoPipelineRetirementFacts.cache(saved);
+            if (!retired.scope().equals(scope) || !retired.operationId().equals(original.request().operationId())) return Optional.empty();
+            verifyRetired(session, retired); models(scope).requireAbsentInTransaction(session);
+            return Optional.of(new Receipt(this, original, Optional.of(retired)));
+        });
+    }
     void verifyRetired(ClientSession session,PipelineRetiredState retired) {
         requireScope(retired.scope());var claims=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         var row=claims.find(session,new Document("_id",MongoWorkloadClaimStore.id(retired.claim().key()))).first();if(row==null)throw rebuild(retired.scope());
