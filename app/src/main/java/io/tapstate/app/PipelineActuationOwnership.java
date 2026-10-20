@@ -88,7 +88,7 @@ final class PipelineActuationOwnership {
             synchronized (PipelineActuationOwnership.this) {
                 if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
             }
-            if (!proveClaim(scope, claim)) throw ThreeLayerStorePort.refused();
+            if (claim == null ? closing || !membership.businessEligible() : !proveClaim(scope, claim)) throw ThreeLayerStorePort.refused();
             synchronized (PipelineActuationOwnership.this) {
                 if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
             }
@@ -102,6 +102,10 @@ final class PipelineActuationOwnership {
         if (!admitted.granted() || admitted.claim() == null) throw ThreeLayerStorePort.refused();
         var command = new Control(scope, WorkloadClaimFence.from(admitted.claim()));
         controls.put(scope.pipelineId(), command); return command;
+    }
+    synchronized Control unpreparedControl(PipelineIntentScope scope) {
+        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
+        var command = new Control(scope, null); controls.put(scope.pipelineId(), command); return command;
     }
     private volatile boolean closing;
 

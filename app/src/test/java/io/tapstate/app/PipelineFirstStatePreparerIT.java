@@ -55,6 +55,79 @@ class PipelineFirstStatePreparerIT {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-18T08:00:00Z"), ZoneOffset.UTC);
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
 
+    @Test void unpreparedAuthoringModelsAreRetiredWithoutInventingExecutionHistory() {
+        withFixture(f -> {
+            var models = f.cache.unpreparedPipelineDerivedSchemas(f.scope, f.node, () -> {
+                if (f.configuration.pipelineStates().read("flow").orElseThrow().phase() != io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE
+                        || f.configuration.preparations().read("flow").orElseThrow().phase() != PipelinePreparation.Phase.UNASSIGNED) throw fenced();
+            });
+            models.record("flow", "source.orders", Map.of("id", "INT64 NULL"), "source", "discovery", "test");
+            var old = f.configuration.intents().load("flow").orElseThrow();
+            f.configuration.intents().compareAndSet(f.scope, old.intentRevision(), new DesiredState("flow", PipelineState.STOPPED, old.desired().revision()));
+            var pipeline = f.configuration.artifacts().get("flow").orElseThrow();
+            var request = new io.tapstate.spi.store.PipelineRetirementRequest(UUID.randomUUID().toString(), f.scope, CanonicalHash.of(pipeline), Optional.empty());
+            var original = f.configuration.retirements().begin(request);
+            var receipt = f.cache.pipelineRetirements(f.business(), ACTIVE).retire(original, f.node, Optional.empty());
+            f.configuration.retirements().complete(receipt);
+            assertThat(f.configuration.artifacts().get("flow")).isEmpty();
+            assertThat(f.cacheDatabase.getCollection("derived_schemas").countDocuments()).isZero();
+            assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+            f.configuration.artifacts().create(pipeline);
+            var next = new PipelineIntentScope(f.scope.clusterId(), f.scope.bindingVersion(), f.scope.cacheIncarnation(), "flow", 2);
+            var proof = f.configuration.authoringModels(next);
+            var reused = f.cache.unpreparedPipelineDerivedSchemas(proof, f.node, ACTIVE);
+            reused.record("flow", "source.orders", Map.of("id", "INT64 NULL"), "source", "discovery", "test");
+            assertThat(reused.latest("flow", "source.orders")).isPresent();
+            assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+            assertCode(() -> f.cache.unpreparedPipelineDerivedSchemas(next, f.node, ACTIVE)
+                    .record("flow", "other", Map.of("id", "INT64 NULL"), "source", "discovery", "test"), IoError.CACHE_BUSINESS_FENCED);
+            f.preparer(f.configuration, f.cache).prepare(next);
+            assertThat(f.cache.pipelineDerivedSchemas(next).latest("flow", "source.orders")).isPresent();
+            assertThatThrownBy(() -> reused.record("flow", "late", Map.of(), "source", "discovery", "test")).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test void anotherNodesRetirementCannotPassTheLastAuthoringGuardAndLeaveALateModel() {
+        withFixture(f -> {
+            var old = f.configuration.intents().load("flow").orElseThrow();
+            f.configuration.intents().compareAndSet(f.scope, old.intentRevision(), new DesiredState("flow", PipelineState.STOPPED, old.desired().revision()));
+            var owner = new WorkloadOwner("node-b", "boot-b");
+            var other = WorkloadClaimFence.from(f.cache.workloadClaims(f.business()).acquire(
+                    new WorkloadClaimKey(f.scope.clusterId(), WorkloadClaimType.NODE_SESSION, owner.nodeId()), owner, 1, TTL).claim());
+            var staged = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+            var begun = new java.util.concurrent.CountDownLatch(1); var checks = new java.util.concurrent.atomic.AtomicInteger();
+            var models = f.cache.unpreparedPipelineDerivedSchemas(f.scope, f.node, () -> {
+                if (f.configuration.pipelineStates().read("flow").orElseThrow().phase() != io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE
+                        || f.configuration.preparations().read("flow").orElseThrow().phase() != PipelinePreparation.Phase.UNASSIGNED) throw fenced();
+                if (checks.incrementAndGet() == 3) {
+                    staged.countDown();
+                    try { if (!release.await(15, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("authoring cut timed out"); }
+                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                }
+            });
+            var request = new io.tapstate.spi.store.PipelineRetirementRequest(UUID.randomUUID().toString(), f.scope,
+                    CanonicalHash.of(f.configuration.artifacts().get("flow").orElseThrow()), Optional.empty());
+            try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+                var writing = workers.submit(() -> models.record("flow", "source.orders", Map.of("id", "INT64 NULL"), "source", "discovery", "test"));
+                try {
+                    assertThat(staged.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                    var retiring = workers.submit(() -> {
+                        var original = f.configuration.retirements().begin(request); begun.countDown();
+                        return f.cache.pipelineRetirements(f.business(), ACTIVE).retire(original, other, Optional.empty());
+                    });
+                    assertThat(begun.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                    assertThatThrownBy(() -> retiring.get(2, java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.TimeoutException.class);
+                    release.countDown();
+                    assertThatThrownBy(() -> writing.get(5, java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.ExecutionException.class);
+                    var receipt = retiring.get(10, java.util.concurrent.TimeUnit.SECONDS);
+                    f.configuration.retirements().complete(receipt);
+                    assertThat(f.cacheDatabase.getCollection("derived_schemas").countDocuments()).isZero();
+                    assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+                } finally { release.countDown(); }
+            }
+        });
+    }
+
     @Test void theAppPreparerConsumesConcretePrivateGrantAndReceiptAcrossTwoInstances() {
         withFixture(f -> {
             long revision = f.version();
@@ -535,6 +608,7 @@ class PipelineFirstStatePreparerIT {
         return (com.hazelcast.map.MapStore<Object,Object>)loader;
     }
 
+    private static TapstateException fenced() { return new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null); }
     private static void assertCode(org.assertj.core.api.ThrowableAssert.ThrowingCallable action, IoError code) {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(code));
     }

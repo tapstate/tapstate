@@ -29,6 +29,9 @@ final class MongoCachePipelineAccess {
     private final MongoClient client;
     private final WorkloadClaimFence original;
     private final Runnable requireActive;
+    private final boolean unpreparedModels;
+    private final WorkloadClaimFence originalNode;
+    private final java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor;
     final java.time.Duration rateRetention;
     final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
 
@@ -45,6 +48,14 @@ final class MongoCachePipelineAccess {
     MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
+        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, false, null, java.util.Optional.empty());
+    }
+    private MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
+            io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases, boolean unpreparedModels, WorkloadClaimFence originalNode,
+            java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor) {
+        this.unpreparedModels = unpreparedModels; this.originalNode = originalNode;
+        this.authoringPredecessor = Objects.requireNonNull(authoringPredecessor);
         this.operatorDatabases = operatorDatabases;
         this.rateRetention = MongoCacheMetadataStructure.requireRetention(rateRetention);
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
@@ -53,6 +64,16 @@ final class MongoCachePipelineAccess {
         if (original != null && (original.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
                 || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))) throw fenced();
     }
+    static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
+        return new MongoCachePipelineAccess(client, database, scope, null, active, retention, null, true, node, java.util.Optional.empty());
+    }
+    static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, MongoConfigurationDomain.AuthoringModels original,
+            WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
+        return new MongoCachePipelineAccess(client, database, original.scope(), null,
+                () -> { original.requireActive(); active.run(); }, retention, null, true, node, original.predecessor());
+    }
+    void requireModelPin() { if (unpreparedModels) throw fenced(); }
 
     <T> T transaction(Function<ClientSession, T> action) { return transaction(false, action); }
 
@@ -87,6 +108,18 @@ final class MongoCachePipelineAccess {
 
     <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation, Function<ClientSession, T> action) {
         T result = transaction(session -> {
+            if (unpreparedModels) {
+                if (table != SystemCollections.CACHE_DERIVED_SCHEMAS || !database.getName().equals(target.getName())) throw fenced();
+                requireUnpreparedModels(session);
+                new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(table);
+                if (mutation) {
+                    if (originalNode == null) throw fenced();
+                    var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+                    new MongoCacheBusinessIdentity(database, business).admitMetadataWrite(session);
+                    MongoCachePipelinePreparations.proveNode(session, database, business, originalNode);
+                }
+                return action.apply(session);
+            }
             Document current = state(session);
             if (!database.getName().equals(target.getName())) {
                 String preparation = MongoCacheOperatorDatabases.require(session, target, operatorDatabases);
@@ -97,6 +130,27 @@ final class MongoCachePipelineAccess {
             return action.apply(session);
         });
         requireActive.run(); return result;
+    }
+    private void requireUnpreparedModels(ClientSession session) {
+        var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+        var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+        var state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
+        if (claim == null && state == null) {
+            if (scope.stateGeneration() == 1 && authoringPredecessor.isEmpty()) return;
+            var previous = authoringPredecessor.orElseThrow(MongoCachePipelineAccess::fenced);
+            if (previous.scope().stateGeneration() + 1 != scope.stateGeneration()) throw fenced();
+            if (previous.cache().isEmpty() || !MongoPipelineRetirementFacts.sameBusiness(scope, previous.cache().orElseThrow().scope())) return;
+            throw fenced();
+        }
+        if (claim == null || state == null || !(claim.get("pipelineRetirement") instanceof Document retiredRow)) throw fenced();
+        var retired = MongoPipelineRetirementFacts.cache(retiredRow);
+        var expected = authoringPredecessor.flatMap(io.tapstate.spi.store.PipelineRetirementResult::cache).orElseThrow(MongoCachePipelineAccess::fenced);
+        if (!expected.equals(retired)) throw fenced();
+        if (!MongoPipelineRetirementFacts.sameBusiness(scope, retired.scope()) || !scope.pipelineId().equals(retired.scope().pipelineId())
+                || scope.stateGeneration() <= retired.scope().stateGeneration()) throw fenced();
+        new MongoCachePipelineRetirements(client, database,
+                new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()), requireActive).verifyRetired(session, retired);
     }
 
     <T> T operatorPreparation(Function<ClientSession, T> action) {

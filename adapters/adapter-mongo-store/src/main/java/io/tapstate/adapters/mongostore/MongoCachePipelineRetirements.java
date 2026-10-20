@@ -32,6 +32,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
                 if(original.previousPreparation().phase()!=PipelinePreparation.Phase.UNASSIGNED)throw fenced();
                 if(original.predecessor().isPresent())verifyRetired(session,original.predecessor().orElseThrow());
                 else requireAbsent(session,original.request().scope());
+                models(original.request().scope()).retireInTransaction(session, true);
                 return new Receipt(this,original,original.predecessor());
             }
             var scope=original.request().scope();var declared=original.request().cache().orElseThrow();
@@ -40,7 +41,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             if(row.get("pipelineRetirement") instanceof Document saved) {
                 var retired=MongoPipelineRetirementFacts.cache(saved);
                 if(retired.scope().equals(scope) && retired.operationId().equals(original.request().operationId())) {
-                    verifyRetired(session,retired);return new Receipt(this,original,Optional.of(retired));
+                    verifyRetired(session,retired);models(scope).retireInTransaction(session, false);return new Receipt(this,original,Optional.of(retired));
                 }
             }
             var request=isolated.orElseThrow(MongoCachePipelineRetirements::fenced);
@@ -74,6 +75,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
                 if(!MongoPipelinePreparationFacts.scope(scope).equals(previous.get("scope")))throw rebuild(scope);
                 observation.deleteOne(session,new Document("_id",scope.pipelineId()).append("scope",previous.get("scope")));
             }
+            models(scope).retireInTransaction(session, false);
             return new Receipt(this,original,Optional.of(retired));
         });
     }
@@ -100,8 +102,11 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
         for(var entry:List.of(Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,"_id.scope.pipelineId"),Map.entry(SystemCollections.DIRECT_BATCHES,"_id.channel.scope.pipelineId"),
                 Map.entry(SystemCollections.CACHE_NEST_SHAPES,"_id.scope.pipelineId"),Map.entry(SystemCollections.CACHE_SINK_PREPARATIONS,"_id.scope.pipelineId"),
                 Map.entry(SystemCollections.CACHE_SNAPSHOT_ORDERS,"_id.pipelineId"),Map.entry(SystemCollections.CACHE_SNAPSHOT_COUNTS,"_id.scope.pipelineId"),
-                Map.entry(SystemCollections.CACHE_DERIVED_SCHEMAS,"scope.pipelineId"),Map.entry(SystemCollections.CACHE_PIPELINE_RATE_HISTORY,"scope.pipelineId")))
+                Map.entry(SystemCollections.CACHE_PIPELINE_RATE_HISTORY,"scope.pipelineId")))
             if(entry.getKey().on(database).find(session,new Document(entry.getValue(),scope.pipelineId())).first()!=null)throw rebuild(scope);
+    }
+    private MongoCacheDerivedSchemaStore models(PipelineIntentScope scope) {
+        return new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(client, database, scope, null, active));
     }
     private record Receipt(MongoCachePipelineRetirements owner,PipelineRetirementPreparation preparation,Optional<PipelineRetiredState> retiredState) implements PipelineRetirementReceipt {}
     static void requireNativeReceipt(PipelineRetirementReceipt receipt) {
@@ -111,15 +116,17 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
         requireNativeReceipt(candidate);var receipt=(Receipt)candidate;
         receipt.owner.transaction(receipt.preparation(),session -> {
             if(receipt.retiredState().isPresent())receipt.owner.verifyRetired(session,receipt.retiredState().orElseThrow());
-            else receipt.owner.requireAbsent(session,receipt.preparation().request().scope());return null;
+            else receipt.owner.requireAbsent(session,receipt.preparation().request().scope());
+            receipt.owner.models(receipt.preparation().request().scope()).requireAbsentInTransaction(session);return null;
         });
     }
     private <T>T transaction(PipelineRetirementPreparation original,Function<ClientSession,T> action) {
         return StoreIo.call(() -> {check(original);try(var session=client.startSession()) {
             return session.withTransaction(() -> {
-                check(original);new MongoCacheBusinessIdentity(database,business).requireAdmissionState(session);
+                check(original);new MongoCacheBusinessIdentity(database,business).admitMetadataWrite(session);
                 var structure=new MongoCacheMetadataStructure(database,MongoRateHistoryStore.DEFAULT_RETENTION);structure.verifyDirect();structure.verifySrs();
-                for(var table:List.of(SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_PIPELINE_OBSERVATION))structure.verifyFacet(table);
+                for(var table:List.of(SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_PIPELINE_OBSERVATION,
+                        SystemCollections.CACHE_DERIVED_SCHEMAS))structure.verifyFacet(table);
                 T result=action.apply(session);check(original);return result;
             },TRANSACTION);
         }});

@@ -63,6 +63,37 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         verifyAuthCollections(expected.mode());
         return expected;
     }
+    void requireRecoveryTarget(StorageBinding binding) {
+        businessActive();
+        if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(binding.cache()))) throw MongoCacheIdentity.fenced();
+    }
+    boolean emptyForAuthenticationRecovery() {
+        businessActive();
+        return StoreIo.call(() -> database.listCollectionNames().into(new ArrayList<>()).isEmpty());
+    }
+    void prepareRecoveryAuthentication(io.tapstate.spi.store.CachePreparation original, Runnable pending) {
+        pending.run(); requireAuthOnlyRecovery(original.authScope());
+        connection.verifyStoragePermissions();
+        prepareAuth(original.authScope(), original.operationId(), pending);
+        requireAuthOnlyRecovery(original.authScope());
+        var current = facts(original.authScope());
+        current.transaction(session -> { pending.run(); current.fence(session); pending.run(); return null; });
+        loadAuthScope(original.authScope()); pending.run();
+    }
+    void verifyRecoveryPermissions() { businessActive(); connection.verifyStoragePermissions(); }
+    private void requireAuthOnlyRecovery(CacheAuthScope expected) {
+        StoreIo.run(() -> {
+            var allowed = new java.util.HashSet<String>();
+            allowed.add(SystemCollections.CACHE_IDENTITY.collectionName()); allowed.add(SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName());
+            authTables(expected.mode()).forEach(table -> allowed.add(table.collectionName()));
+            for (String name : database.listCollectionNames()) if (!allowed.contains(name)) throw MongoCacheIdentity.fenced();
+            var identities = SystemCollections.CACHE_IDENTITY.on(database).find().limit(2).into(new ArrayList<>());
+            if (identities.size() > 1 || identities.size() == 1 && (!"cluster".equals(identities.getFirst().get("_id"))
+                    || !"ABSENT".equals(identities.getFirst().get("businessPhase")))) throw MongoCacheIdentity.fenced();
+            var schemas = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find().limit(2).into(new ArrayList<>());
+            if (schemas.size() > 1 || schemas.size() == 1 && !"auth".equals(schemas.getFirst().get("_id"))) throw MongoCacheIdentity.fenced();
+        });
+    }
 
     /** The scope was durably allocated by the original configuration setup or recovery operation. */
     public CacheAuthScope prepareAuth(CacheAuthScope scope, String operationId, Runnable requireActive) {
@@ -305,6 +336,19 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     @Override public io.tapstate.spi.store.DerivedSchemaStore pipelineDerivedSchemas(io.tapstate.spi.store.PipelineIntentScope scope) {
         return new MongoCacheDerivedSchemaStore(pipelineAccess(scope, null, () -> {}));
+    }
+    /** Authoring model copies precede execution preparation; this view cannot prepare claims, state or model pins. */
+    public io.tapstate.spi.store.DerivedSchemaStore unpreparedPipelineDerivedSchemas(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence originalNode, Runnable unassignedConfiguration) {
+        Objects.requireNonNull(unassignedConfiguration);
+        Runnable guard = () -> { businessActive(); unassignedConfiguration.run(); };
+        return new MongoCacheDerivedSchemaStore(MongoCachePipelineAccess.unpreparedModels(client, database, scope, originalNode, guard, rateRetention));
+    }
+    public io.tapstate.spi.store.DerivedSchemaStore unpreparedPipelineDerivedSchemas(MongoConfigurationDomain.AuthoringModels original,
+            io.tapstate.spi.store.WorkloadClaimFence originalNode, Runnable active) {
+        Objects.requireNonNull(original); Objects.requireNonNull(active);
+        return new MongoCacheDerivedSchemaStore(MongoCachePipelineAccess.unpreparedModels(client, database, original, originalNode,
+                () -> { businessActive(); active.run(); }, rateRetention));
     }
     @Override public io.tapstate.spi.store.DerivedSchemaStore pipelineDerivedSchemas(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {

@@ -121,6 +121,50 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             return transaction(session -> load(session).map(Loaded::cachePreparation));
         });
     }
+    MongoStorageRecoveryStore.Authentication authenticationRecovery() {
+        return StoreIo.call(() -> transaction(session -> {
+            var binding = requireAuthenticationRecoveryConfiguration(session);
+            return MongoStorageRecoveryStore.authentication(session, database, binding);
+        }));
+    }
+    MongoStorageRecoveryStore.Authentication reserveAuthenticationRecovery(CachePreparation original) {
+        String operation = java.util.UUID.randomUUID().toString(), incarnation = java.util.UUID.randomUUID().toString();
+        return StoreIo.call(() -> transaction(session -> {
+            var binding = requireAuthenticationRecoveryConfiguration(session); cipherForWrite(session);
+            return MongoStorageRecoveryStore.reserve(session, database, binding, original, operation, incarnation);
+        }));
+    }
+    void requireAuthenticationRecoveryPending(CachePreparation original) {
+        StoreIo.call(() -> transaction(session -> {
+            var binding = requireAuthenticationRecoveryConfiguration(session);
+            var current = MongoStorageRecoveryStore.authentication(session, database, binding);
+            if (!current.pending() || !current.preparation().equals(original)) throw refused();
+            return null;
+        }));
+    }
+    CachePreparation publishAuthenticationRecovery(CachePreparation original) {
+        return StoreIo.call(() -> transaction(session -> {
+            var binding = requireAuthenticationRecoveryConfiguration(session); cipherForWrite(session);
+            return MongoStorageRecoveryStore.publish(session, database, binding, original);
+        }));
+    }
+    void requireAuthenticationPublished(CachePreparation original) {
+        StoreIo.call(() -> transaction(session -> {
+            var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
+            var current = MongoStorageRecoveryStore.authentication(session, database, bound);
+            if (current.pending() || !current.preparation().equals(original)) throw refused();
+            return null;
+        }));
+    }
+    private StorageBinding requireAuthenticationRecoveryConfiguration(ClientSession session) {
+        var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
+        var stage = setup.find(session, new Document("_id", "cluster")).first();
+        if (stage == null || !"COMPLETE".equals(stage.get("phase"))) throw refused();
+        var account = new MongoFirstAdminStore(client, database, this).load(session);
+        if (bound.mode() == StorageBinding.Mode.OP && (account.isEmpty()
+                || account.orElseThrow().phase() != io.tapstate.spi.store.FirstAdminStore.Phase.COMPLETE)) throw refused();
+        return bound;
+    }
 
     @Override public StorageBinding commit(StorageSetupScope expected, StorageBinding.Mode mode,
             StorageBinding.Connection cache, SourceResource defaultSource) {
@@ -197,7 +241,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         .append("ownerId", expected.clusterId()).append("generation", 1L).append("writeFence", 0L)
                         .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L));
                 MongoStorageRecoveryStore.allocate(session, database, binding, incarnation);
-                return new Committed(binding, MongoStorageRecoveryStore.loadInitial(session, database, binding), true);
+                return new Committed(binding, MongoStorageRecoveryStore.load(session, database, binding), true);
             }, requireCommit);
             if (checkAfterCommit) requireActive.run();
             return new io.tapstate.spi.store.StorageBindingCommit(result.binding(), result.preparation(), result.won()
@@ -293,7 +337,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     || !Long.valueOf(0).equals(global.get("incomingCarries"))
                     || !Long.valueOf(0).equals(global.get("originGeneration"))) throw unreadable();
             StorageBinding binding = new StorageBinding(scope, mode, version, defaultId, cache);
-            return Optional.of(new Loaded(binding, candidateHash, MongoStorageRecoveryStore.loadInitial(session, database, binding)));
+            return Optional.of(new Loaded(binding, candidateHash, MongoStorageRecoveryStore.load(session, database, binding)));
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
             // Stored or decrypted values may contain credentials. Never attach parser input or causes.
             throw unreadable();

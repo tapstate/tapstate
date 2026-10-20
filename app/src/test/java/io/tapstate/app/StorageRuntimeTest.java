@@ -99,6 +99,20 @@ class StorageRuntimeTest {
         }
     }
 
+    @Test void intactAuthenticationReloadPreservesTheOriginalBusinessOwner() {
+        var config = configuration(); var cache = mock(MongoCacheDomain.class); var probe = mock(MongoCacheDomain.class);
+        var business = mock(StorageRuntime.Business.class); var connections = new AtomicInteger();
+        when(business.available()).thenReturn(true);
+        when(config.prepareAuthenticationRecovery(any(), any())).thenReturn(PREPARATION);
+        try (var root = new StorageRuntime(config, ignored -> connections.getAndIncrement() == 0 ? cache : probe)) {
+            var original = root.loadBound().orElseThrow(); original.verifyAuthentication();
+            root.startBusiness(original, ignored -> business);
+            assertThat(root.restoreAuthentication()).isSameAs(original);
+            assertThat(root.businessStarted()).isTrue(); original.requireActive();
+            verify(business, never()).close(); verify(cache, never()).close(); verify(probe).close();
+        }
+    }
+
     private static MongoConfigurationDomain configuration() {
         var config = mock(MongoConfigurationDomain.class);
         var bindings = mock(StorageBindingStore.class); var setup = mock(StorageSetupStateStore.class);

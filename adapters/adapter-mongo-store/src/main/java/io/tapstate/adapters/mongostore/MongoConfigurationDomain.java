@@ -159,6 +159,29 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen();
         return new MongoPipelineStatePreparations(connection.client(), connection.database(), clusterId, bindings, artifacts, this::requireOpen);
     }
+    /** A native, load-only proof for model copies before this exact physical generation is prepared. */
+    public AuthoringModels authoringModels(io.tapstate.spi.store.PipelineIntentScope scope) {
+        requireOpen();
+        var previous = ((MongoPipelineStatePreparations) preparations()).authoringPredecessor(scope);
+        return new AuthoringModels(this, scope, previous);
+    }
+    public static final class AuthoringModels {
+        private final MongoConfigurationDomain owner;
+        private final io.tapstate.spi.store.PipelineIntentScope scope;
+        private final java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor;
+        private AuthoringModels(MongoConfigurationDomain owner, io.tapstate.spi.store.PipelineIntentScope scope,
+                java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor) {
+            this.owner = owner; this.scope = scope; this.predecessor = predecessor;
+        }
+        public io.tapstate.spi.store.PipelineIntentScope scope() { return scope; }
+        java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor() { return predecessor; }
+        void requireActive() {
+            owner.requireOpen();
+            if (!predecessor.equals(((MongoPipelineStatePreparations) owner.preparations()).authoringPredecessor(scope)))
+                throw MongoCachePipelineAccess.fenced();
+        }
+        @Override public String toString() { return "AuthoringModels[original]"; }
+    }
 
     public long configurationRevision() {
         requireOpen();
@@ -175,6 +198,48 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public io.tapstate.spi.store.StorageRecoveryCommands recoveryCommands() {
         requireOpen();
         return new MongoStorageRecoveryCommands(connection.client(), connection.database(), bindings, artifacts, this::requireOpen);
+    }
+    /** Inspects the exact original endpoint without disturbing a still-owned business runtime. */
+    public boolean authenticationRecoveryRequired(MongoCacheDomain candidate, Runnable active) {
+        requireOpen(); Objects.requireNonNull(candidate); Objects.requireNonNull(active); active.run();
+        var original = bindings.authenticationRecovery();
+        candidate.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
+        if (original.pending()) return true;
+        if (candidate.emptyForAuthenticationRecovery()) {
+            candidate.verifyRecoveryPermissions(); active.run(); return true;
+        }
+        candidate.loadAuthScope(original.preparation().authScope());
+        bindings.requireAuthenticationPublished(original.preparation()); active.run(); return false;
+    }
+
+    /** Internal startup continuation only: this prepares no business structure and never changes the saved endpoint. */
+    public io.tapstate.spi.store.CachePreparation prepareAuthenticationRecovery(MongoCacheDomain candidate, Runnable active) {
+        requireOpen(); Objects.requireNonNull(candidate); Objects.requireNonNull(active);
+        active.run();
+        var original = bindings.authenticationRecovery();
+        var bound = bindings.load().orElseThrow(MongoCachePipelineAccess::fenced);
+        candidate.requireRecoveryTarget(bound);
+        if (!original.pending()) {
+            if (!candidate.emptyForAuthenticationRecovery()) {
+                candidate.loadAuthScope(original.preparation().authScope());
+                bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
+            }
+            candidate.verifyRecoveryPermissions(); active.run();
+            original = bindings.reserveAuthenticationRecovery(original.preparation());
+            if (!original.pending()) {
+                candidate.loadAuthScope(original.preparation().authScope());
+                bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
+            }
+        }
+        var expected = original.preparation();
+        Runnable pending = () -> { requireOpen(); active.run(); bindings.requireAuthenticationRecoveryPending(expected); };
+        candidate.prepareRecoveryAuthentication(expected, pending);
+        var published = bindings.publishAuthenticationRecovery(expected);
+        candidate.loadAuthScope(published.authScope()); bindings.requireAuthenticationPublished(published); active.run();
+        return published;
+    }
+    public void requireAuthenticationPublished(io.tapstate.spi.store.CachePreparation original) {
+        requireOpen(); bindings.requireAuthenticationPublished(Objects.requireNonNull(original));
     }
 
     public io.tapstate.spi.store.StorageSetupStateStore setupStates() {

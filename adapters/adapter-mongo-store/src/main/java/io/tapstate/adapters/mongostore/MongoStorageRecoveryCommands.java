@@ -50,6 +50,8 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
         return transaction(session -> {
             Document root = root(session, current);
             Plan previous = pending(root).orElse(null);
+            if (previous != null && !previous.originalScope().equals(current)
+                    && (operationId != null || previous.phase() != Phase.COMPLETE || !previous.operationId().equals(previousOperationId))) throw refused();
             long revision = revision(session);
             if (operationId != null) {
                 if (previousOperationId != null || previous == null || !operationId.equals(previous.operationId())) throw refused();

@@ -72,12 +72,43 @@ final class StorageRoot implements AutoCloseable {
                 phase = Phase.SETUP_REQUIRED; return;
             }
             phase = Phase.CACHE_UNAVAILABLE;
-            authentication.install(original.orElseThrow()); phase = Phase.AUTH_READY;
+            try { authentication.install(original.orElseThrow()); }
+            catch (TapstateException unavailable) { restoreAuthentication(); }
+            original = runtime.current(); phase = Phase.AUTH_READY;
             if (runtime.requireConfiguration().setupStates().load().phase() == StorageSetupStateStore.Phase.COMPLETE) {
                 runtime.startBusiness(original.orElseThrow(), assembly); phase = Phase.BUSINESS_READY;
             }
         } catch (TapstateException unavailable) {
             if (phase != Phase.AUTH_READY) phase = Phase.CACHE_UNAVAILABLE;
+        }
+    }
+
+    synchronized LocalAuthenticationContext localAuthentication() {
+        requireOpen();
+        try { return authentication.local(); }
+        catch (TapstateException unavailable) {
+            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
+            restoreAuthentication(); return authentication.local();
+        }
+    }
+
+    synchronized ManagedAuthenticationContext managedAuthentication() {
+        requireOpen();
+        try { return authentication.managed(); }
+        catch (TapstateException unavailable) {
+            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
+            restoreAuthentication(); return authentication.managed();
+        }
+    }
+
+    private void restoreAuthentication() {
+        phase = Phase.CACHE_UNAVAILABLE;
+        authentication.invalidateFormal();
+        try {
+            var restored = runtime.restoreAuthentication();
+            authentication.install(restored); phase = runtime.businessStarted() ? Phase.BUSINESS_READY : Phase.AUTH_READY;
+        } catch (TapstateException unavailable) {
+            throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), unavailable);
         }
     }
 
@@ -101,8 +132,12 @@ final class StorageRoot implements AutoCloseable {
             case SETUP_REQUIRED -> StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED;
             default -> StorageControlDispatcher.BusinessPhase.UNAVAILABLE;
         };
+        boolean awaitingRebuild = !admitted && preparation.map(value -> value.authScope().authGeneration() > 1).orElse(false)
+                && phase == Phase.AUTH_READY;
+        if (awaitingRebuild) business = StorageControlDispatcher.BusinessPhase.AWAITING_REBUILD_CONFIRMATION;
         active.run();
-        return new StorageControlDispatcher.Snapshot(mode(), status.scope().clusterId(), status.scope().operationId(),
+        return new StorageControlDispatcher.Snapshot(mode(), status.scope().clusterId(), awaitingRebuild
+                ? preparation.orElseThrow().operationId() : status.scope().operationId(),
                 status.scope().generation(), status.bindingVersion(), preparation.map(value -> value.authScope().authGeneration()).orElse(0L),
                 configuration.configurationRevision(), status.phase().name(), business, health,
                 status.phase() == StorageSetupStateStore.Phase.CONFIG_PREPARED && mode() == StorageBinding.Mode.CLOUD

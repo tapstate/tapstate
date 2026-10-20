@@ -179,6 +179,78 @@ class ManagedMongoStoreIsolationIT {
     }
 
     /** Low-level fixture preparation isolates production-root loading; it does not certify the installer or a registered target JAR. */
+    @Test
+    void wholeCacheLossUsesNormalOpLoginAndDoesNotRecreateBusinessState() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "loss_config_" + suffix, cacheDb = "loss_cache_" + suffix, masterDb = "loss_master_" + suffix;
+        String user = "loss_" + suffix;
+        var original = new io.tapstate.spi.store.StorageSetupScope("loss-" + suffix, "installation", "setup", 1);
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(configDb, cacheDb, masterDb));
+            var cacheConnection = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                    uri(user, cacheDb), cacheDb, null);
+            try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                    new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(user, configDb), null, Duration.ofSeconds(5)),
+                    original.clusterId(), original.installationId(), original.operationId(), 1)) {
+                var target = new SourceResource("views", null, "mongodb", Map.of("uri", uri(user, masterDb)), null, null, null, null);
+                var initial = configuration.bindings().commitWithFirstCache(original, io.tapstate.spi.store.StorageBinding.Mode.OP, cacheConnection, target);
+                try (var cached = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(cacheConnection, Duration.ofSeconds(5), "loss-fixture")) {
+                    cached.prepareFirstAuth(initial.firstCreation().orElseThrow()); cached.prepareInitialBusiness(initial.preparation(), () -> {});
+                }
+                configuration.bindings().complete(original);
+                configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
+                        new io.tapstate.spi.store.User("admin", new BCryptPasswordHasher().hash("sentinel-login-password"), "admin"));
+            }
+            var config = admin.getDatabase(configDb);
+            String keyId = config.getCollection("cluster_keys").find().first().getString("keyId");
+            Document binding = config.getCollection("storage_binding").find().first();
+            Document firstAdmin = config.getCollection("op_bootstrap").find().first();
+            io.tapstate.control.restapi.LoginResponse old;
+            try (var first = nativeRoot(uri(user, configDb))) { old = ordinaryLogin(first, true); }
+            admin.getDatabase(cacheDb).drop();
+            try (var restarted = nativeRoot(uri(user, configDb))) {
+                var fresh = ordinaryLogin(restarted, true);
+                var root = restarted.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                assertThat(root.runtime().business()).isEmpty();
+                var current = root.runtime().current().orElseThrow().preparation().authScope();
+                assertThat(current.authGeneration()).isEqualTo(2);
+                var client = rootClient(restarted);
+                assertThatThrownBy(() -> client.post().uri("/api/storage/status").header("Authorization", "Bearer " + old.token())
+                        .body(Map.of()).retrieve().body(String.class)).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                failure -> assertThat(failure.getStatusCode().value()).isEqualTo(401));
+                assertThatThrownBy(() -> client.post().uri("/auth/session").header("Authorization", "TapstateSession " + old.sessionToken())
+                        .retrieve().body(String.class)).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                failure -> assertThat(failure.getStatusCode().value()).isEqualTo(401));
+                String status = client.post().uri("/api/storage/status").header("Authorization", "Bearer " + fresh.token())
+                        .body(Map.of()).retrieve().body(String.class);
+                assertThat(((Map<?,?>)io.tapstate.core.common.JsonReader.parse(status)).get("businessPhase")).isEqualTo("AWAITING_REBUILD_CONFIRMATION");
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>()))
+                        .containsExactlyInAnyOrder("cache_identity", "schema_migrations", "op_sessions");
+                assertThat(config.getCollection("cluster_keys").find().first().getString("keyId")).isEqualTo(keyId);
+                assertThat(binding.equals(config.getCollection("storage_binding").find().first())).isTrue();
+                assertThat(firstAdmin.equals(config.getCollection("op_bootstrap").find().first())).isTrue();
+            }
+        }
+    }
+
+    private ConfigurableApplicationContext nativeRoot(String configurationUri) {
+        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0", "--logging.level.root=ERROR",
+                "--tapstate.hz.jet.cooperative-thread-count=2", "--SDK_STATUS_SENDER_ENABLED=false",
+                "--tapstate.store.mongo.uri=" + configurationUri, "--tapstate.control.auth.jwt-secret=loss-restart-stable-test-key",
+                "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"), "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"));
+    }
+    private static org.springframework.web.client.RestClient rootClient(ConfigurableApplicationContext application) {
+        int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
+        return org.springframework.web.client.RestClient.create("http://127.0.0.1:" + port);
+    }
+    private static io.tapstate.control.restapi.LoginResponse ordinaryLogin(ConfigurableApplicationContext application, boolean session) {
+        return rootClient(application).post().uri("/auth/login")
+                .body(Map.of("username", "admin", "password", "sentinel-login-password", "createSession", session))
+                .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void nativeProductionRootLoadsConfigAndAuthBeforeAdmittingItsCacheRuntime(boolean businessPrepared) {
@@ -249,14 +321,28 @@ class ManagedMongoStoreIsolationIT {
                 current.cache().schemas(current.preparation().businessScope(), () -> {}).save(new io.tapstate.spi.store.DiscoveredSourceModel(
                         "model_source", "mongodb", 1L, new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
                         List.of(new io.tapstate.spi.store.SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of())))));
-                ((ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(
-                        root.runtime().business().orElseThrow(), "context")).getBean(StoreBackedDerivedSchemas.class).accept("admin", "model_flow");
                 client.post().uri("/api/pipelines/model_flow:accept-derived-schema").header("Authorization", "Bearer " + login.token())
                         .retrieve().toBodilessEntity();
                 var modelScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
                         current.preparation().authScope().cacheIncarnation(), "model_flow", 1);
-                assertThat(current.cache().pipelineDerivedSchemas(modelScope).latest("model_flow", "model_source.orders").orElseThrow().schema())
+                assertThat(current.cache().unpreparedPipelineDerivedSchemas(modelScope, null, () -> {}).latest("model_flow", "model_source.orders").orElseThrow().schema())
                         .containsEntry("id", "INT64 NULL");
+                root.runtime().requireConfiguration().artifacts().create(new SourceResource("pending_model", null, "mongodb",
+                        Map.of("uri", uri(masterUser, masterDb)), io.tapstate.core.model.SourceMode.SNAPSHOT, null, null, null));
+                root.runtime().requireConfiguration().artifacts().create(new io.tapstate.core.model.PipelineResource("partial_model_flow", null,
+                        List.of(io.tapstate.core.model.SourceRef.spec("pending_model", false), io.tapstate.core.model.SourceRef.spec("model_source", false)),
+                        null, null, null, null, null));
+                var child = (ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(root.runtime().business().orElseThrow(), "context");
+                child.getBean(io.tapstate.control.core.SchemaDerivation.class).derive("partial_model_flow");
+                var partialScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                        current.preparation().authScope().cacheIncarnation(), "partial_model_flow", 1);
+                assertThat(current.cache().unpreparedPipelineDerivedSchemas(partialScope, null, () -> {}).latest("partial_model_flow", "model_source.orders"))
+                        .isPresent();
+                assertThat(root.runtime().requireConfiguration().preparations().read("model_flow").orElseThrow().phase())
+                        .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
+                assertThat(root.runtime().requireConfiguration().preparations().read("partial_model_flow").orElseThrow().phase())
+                        .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
                 ((NativeBusinessContext)root.runtime().business().orElseThrow()).close();
                 assertThat(root.runtime().businessStarted()).isFalse();
                 String degraded = client.post().uri("/api/storage/status").header("Authorization", "Bearer " + login.token())

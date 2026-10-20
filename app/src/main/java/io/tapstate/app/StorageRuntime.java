@@ -71,6 +71,52 @@ final class StorageRuntime implements AutoCloseable {
 
     synchronized Optional<Bound> current() { requireOpen(); return Optional.ofNullable(bound); }
 
+    /** Retires this process's original owners before loading a newly published authentication scope. */
+    synchronized Bound restoreAuthentication() {
+        requireOpen();
+        if (configuration == null || cleanupUnknown) throw unavailable();
+        var binding = configuration.bindings().load().orElseThrow(StorageRuntime::unavailable);
+        MongoCacheDomain candidate = connections.apply(binding);
+        Throwable failure = null;
+        try {
+            boolean recovery = configuration.authenticationRecoveryRequired(candidate, this::requireOpen);
+            var preparation = configuration.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable);
+            if (recovery || bound != null && (!bound.binding.equals(binding) || !bound.preparation.equals(preparation))) retireBound();
+            if (recovery) configuration.prepareAuthenticationRecovery(candidate, this::requireOpen);
+        } catch (RuntimeException | Error stopped) {
+            failure = stopped;
+            throw stopped;
+        } finally {
+            try { candidate.close(); } catch (RuntimeException | Error cleanup) {
+                cleanupUnknown = true;
+                if (failure != null) { if (failure != cleanup) failure.addSuppressed(cleanup); }
+                else throw cleanup;
+            }
+        }
+        return loadBound().orElseThrow(StorageRuntime::unavailable);
+    }
+
+    private void retireBound() {
+        Bound original = bound;
+        AutoCloseable owned = business;
+        bound = null; business = null;
+        if (original != null) original.active = false;
+        Throwable failure = null;
+        if (owned != null) {
+            try { owned.close(); } catch (Exception | Error cleanup) { failure = cleanup; }
+        }
+        if (original != null) {
+            try { original.cache.close(); } catch (RuntimeException | Error cleanup) {
+                if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+            }
+        }
+        if (failure != null) {
+            cleanupUnknown = true;
+            if (failure instanceof Error error) throw error;
+            var unavailable = unavailable(); unavailable.addSuppressed(failure); throw unavailable;
+        }
+    }
+
     /** The caller passes the original owner, so a late callback cannot activate or close its successor. */
     synchronized void startBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
         requireOriginal(original);

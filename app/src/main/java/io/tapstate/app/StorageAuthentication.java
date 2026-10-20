@@ -38,11 +38,17 @@ final class StorageAuthentication implements AutoCloseable {
             if (existing.bound != original) throw StorageRuntime.unavailable();
             existing.requireActive(); return;
         }
+        configuration.requireAuthenticationPublished(original.preparation());
         original.verifyAuthentication();
         Epoch candidate = new Epoch(original);
         original.requireAuthentication();
         if (bootstrap != null) bootstrap.sessions.close();
         current.set(candidate);
+    }
+
+    synchronized void invalidateFormal() {
+        current.set(null);
+        if (bootstrap != null) bootstrap.sessions.close();
     }
 
     LocalAuthenticationContext local() {
@@ -152,7 +158,10 @@ final class StorageAuthentication implements AutoCloseable {
         void requireActive() {
             bound.requireAuthentication();
             if (closed || current.get() != this) throw unauthenticated();
-            try { bound.cache().loadAuthScope(bound.preparation().authScope()); }
+            try {
+                configuration.requireAuthenticationPublished(bound.preparation());
+                bound.cache().loadAuthScope(bound.preparation().authScope());
+            }
             catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
             bound.requireAuthentication();
             if (closed || current.get() != this) throw unauthenticated();

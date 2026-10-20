@@ -17,7 +17,8 @@ final class ThreeLayerStorePort implements StorePort {
     private final PipelineConvergencePass pass;
     private final Consumer<PipelineIntentScope> prepare;
     private final Control control;
-    private record Control(PipelineIntentScope scope, WorkloadClaimFence claim, Runnable active) {}
+    private record Control(PipelineIntentScope scope, WorkloadClaimFence claim, Runnable active,
+            MongoConfigurationDomain.AuthoringModels models) {}
 
     ThreeLayerStorePort(MongoConfigurationDomain configuration, StorageRuntime.Bound bound,
             Consumer<PipelineIntentScope> prepare) {
@@ -39,7 +40,14 @@ final class ThreeLayerStorePort implements StorePort {
         Objects.requireNonNull(guard).run();
         if (!scope.equals(scope(scope.pipelineId())) || claim.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
                 || !claim.key().resourceId().equals(scope.pipelineId()) || !claim.key().clusterId().equals(scope.clusterId())) throw refused();
-        return new ThreeLayerStorePort(configuration, bound, prepare, null, new Control(scope, claim, guard));
+        return new ThreeLayerStorePort(configuration, bound, prepare, null, new Control(scope, claim, guard, null));
+    }
+    ThreeLayerStorePort forUnpreparedControl(MongoConfigurationDomain.AuthoringModels models, WorkloadClaimFence node, Runnable guard) {
+        var scope = models.scope();
+        Objects.requireNonNull(guard).run();
+        if (!scope.equals(scope(scope.pipelineId())) || node.key().type() != WorkloadClaimType.NODE_SESSION
+                || !node.key().clusterId().equals(scope.clusterId())) throw refused();
+        return new ThreeLayerStorePort(configuration, bound, prepare, null, new Control(scope, node, guard, models));
     }
     private void active() {
         bound.requireBusiness();
@@ -116,14 +124,22 @@ final class ThreeLayerStorePort implements StorePort {
     }
     @Override public DerivedSchemaStore derivedSchemas() {
         if (pass != null) return pass.derivedSchemas();
-        if (control != null) return bound.cache().pipelineDerivedSchemas(control.scope(), control.claim(), this::active);
+        if (control != null) return control.claim().key().type() == WorkloadClaimType.NODE_SESSION
+                ? bound.cache().unpreparedPipelineDerivedSchemas(control.models(), control.claim(), this::active)
+                : bound.cache().pipelineDerivedSchemas(control.scope(), control.claim(), this::active);
         return new DerivedSchemaStore() {
-            private DerivedSchemaStore view(String pipeline) { return bound.cache().pipelineDerivedSchemas(scope(pipeline)); }
+            private DerivedSchemaStore view(String pipeline) {
+                var original = scope(pipeline);
+                return unprepared(pipeline) ? bound.cache().unpreparedPipelineDerivedSchemas(configuration.authoringModels(original), null, () -> {
+                    active();
+                    if (!unprepared(pipeline) || !original.equals(scope(pipeline))) throw refused();
+                }) : bound.cache().pipelineDerivedSchemas(original);
+            }
             @Override public Optional<DerivedSchema> latest(String pipeline, String step) {
-                return unprepared(pipeline) ? Optional.empty() : view(pipeline).latest(pipeline, step);
+                return view(pipeline).latest(pipeline, step);
             }
             @Override public Optional<DerivedSchema> pinned(String pipeline, String step) {
-                return unprepared(pipeline) ? Optional.empty() : view(pipeline).pinned(pipeline, step);
+                return view(pipeline).pinned(pipeline, step);
             }
             @Override public void record(String pipeline, String step, Map<String,String> columns, String statement, String from, String by) { throw refused(); }
             @Override public void pin(String pipeline, String step, long version) { throw refused(); }

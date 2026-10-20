@@ -111,6 +111,21 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         Objects.requireNonNull(inputs,"inputs");
         transaction(session -> { requireCurrent(session,scope); verifyInputs(session,scope,inputs); return null; });
     }
+    Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor(PipelineIntentScope scope) {
+        return transaction(session -> {
+            Document row = requireCurrent(session, scope);
+            if (MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId).phase() != PipelinePreparation.Phase.UNASSIGNED) throw fenced();
+            if (!row.containsKey("retirement")) {
+                if (scope.stateGeneration() != 1) throw fenced();
+                return Optional.empty();
+            }
+            var original = MongoPipelineRetirementFacts.read(row).completed();
+            if (original.scope().stateGeneration() + 1 != scope.stateGeneration()
+                    || !original.scope().pipelineId().equals(scope.pipelineId()) || !original.scope().clusterId().equals(scope.clusterId())
+                    || original.scope().bindingVersion() != scope.bindingVersion()) throw fenced();
+            return Optional.of(original);
+        });
+    }
     PipelinePreparationInputs verifyInputs(ClientSession session,PipelineIntentScope scope,PipelinePreparationInputs requested) {
         var resource = artifacts.getInTransaction(session,scope.pipelineId()).orElseThrow(MongoPipelineStatePreparations::fenced);
         if (!(resource instanceof PipelineResource pipeline)) throw fenced();

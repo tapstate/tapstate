@@ -118,29 +118,33 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
 
     @Override
     public void accept(String principal, String pipelineId) {
-        if (commands != null) {
-            try (var command = commands.bind(pipelineId)) { new StoreBackedDerivedSchemas(command.ports(), auditGate).accept(principal, pipelineId); }
-            return;
-        }
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
         refuseUnlessAtRest(pipelineId);
         auditGate.dispatch(ControlOperations.PIPELINE_ACCEPT_DERIVED_SCHEMA,
                 new AuditContext(principal, pipelineId), () -> {
-                    // The physical model first, then everything worked out from it. This order is what
-                    // makes the act one thing rather than two: a re-derivation over source copies that
-                    // were not refreshed records today's answer to yesterday's question, and the report
-                    // afterwards agrees with itself while agreeing with nothing outside.
-                    joins.copySourceSchemas(pipelineId);
-                    // Recorded through the same class the gate records through, so accepting cannot
-                    // write a shape a start would then refuse - which is what a second write path here
-                    // would eventually do.
-                    JoinSchemaDrift accepting = new JoinSchemaDrift(storePort.derivedSchemas());
-                    joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> accepting.record(
-                            pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
-                    joins.refreshStepSchemas(pipelineId);
+                    if (commands == null) acceptModels(pipelineId);
+                    else try (var command = commands.bind(pipelineId)) {
+                        var fixed = new StoreBackedDerivedSchemas(command.ports(), auditGate);
+                        fixed.refuseUnlessAtRest(pipelineId); fixed.acceptModels(pipelineId);
+                    }
                     return null;
                 });
+    }
+
+    private void acceptModels(String pipelineId) {
+        // The physical model first, then everything worked out from it. This order is what
+        // makes the act one thing rather than two: a re-derivation over source copies that
+        // were not refreshed records today's answer to yesterday's question, and the report
+        // afterwards agrees with itself while agreeing with nothing outside.
+        joins.copySourceSchemas(pipelineId);
+        // Recorded through the same class the gate records through, so accepting cannot
+        // write a shape a start would then refuse - which is what a second write path here
+        // would eventually do.
+        JoinSchemaDrift accepting = new JoinSchemaDrift(storePort.derivedSchemas());
+        joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> accepting.record(
+                pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
+        joins.refreshStepSchemas(pipelineId);
     }
 
     @Override

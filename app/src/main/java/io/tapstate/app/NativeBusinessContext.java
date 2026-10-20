@@ -112,7 +112,21 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             if (!live.isAtRest(pipeline)) throw new io.tapstate.core.common.TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
                     Map.of("pipeline", pipeline, "state", live.actualStateOf(pipeline).name(), "desired", live.intentOf(pipeline).name()), null);
         };
-        resting.run(); var scope = port.scope(pipeline); preparePipeline(scope); resting.run();
+        resting.run(); var scope = port.scope(pipeline);
+        var preparation = configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
+        if (preparation.phase() == PipelinePreparation.Phase.UNASSIGNED) {
+            var models = configuration.authoringModels(scope);
+            var node = context.getBean(NodeSessionLease.class).currentFence().orElseThrow(ThreeLayerStorePort::refused);
+            var command = ownership.unpreparedControl(scope);
+            Runnable guard = () -> {
+                resting.run(); command.requireActive();
+                if (!scope.equals(port.scope(pipeline)) || configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused).phase()
+                        != PipelinePreparation.Phase.UNASSIGNED) throw ThreeLayerStorePort.refused();
+            };
+            try { return new StoreBackedDerivedSchemas.Command(port.forUnpreparedControl(models, node, guard), command::close); }
+            catch (RuntimeException | Error failed) { command.close(); throw failed; }
+        }
+        if (preparation.phase() != PipelinePreparation.Phase.COMPLETE) throw ThreeLayerStorePort.refused();
         var command = ownership.control(scope);
         var claim = command.claim();
         Runnable guard = () -> {

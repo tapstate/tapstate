@@ -57,6 +57,7 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
     }
 
     @Override public void pin(String pipelineId, String stepId, long version) {
+        access.requireModelPin();
         String key = key(pipelineId, stepId);
         if (version < 0) throw new IllegalArgumentException("a derived schema pin is non-negative");
         access.metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, session -> {
@@ -84,6 +85,25 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
         });
     }
 
+    /** Called only inside the original retirement's CACHE transaction after its exact authorization is fenced. */
+    void retireInTransaction(ClientSession session, boolean unprepared) {
+        for (Document row : rows.find(session, pipelineRows())) {
+            if (!(row.get("_id") instanceof String id) || !MongoPipelinePreparationFacts.scope(access.scope).equals(row.get("scope"))) throw unreadable();
+            Stored stored = read(session, id);
+            if (stored == null || unprepared && stored.pin() != null) throw unreadable();
+            requireIntactHistory(stored);
+        }
+        rows.deleteMany(session, pipelineRows().append("scope", MongoPipelinePreparationFacts.scope(access.scope)));
+    }
+    void requireAbsentInTransaction(ClientSession session) {
+        if (rows.find(session, pipelineRows()).limit(1).first() != null) throw unreadable();
+    }
+    private Document pipelineRows() {
+        String pipeline = access.scope.pipelineId();
+        return new Document("$or", List.of(new Document("_id", new Document("$gte", pipeline + '.').append("$lt", pipeline + '/')),
+                new Document("scope.pipelineId", pipeline)));
+    }
+
     private Stored read(ClientSession session, String key) {
         Document row = rows.find(session, new Document("_id", key)).first();
         if (row == null) return null;
@@ -103,6 +123,7 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
             }
             Long pin = null;
             if (row.containsKey("pin")) {
+                access.requireModelPin();
                 if (!(row.get("pin") instanceof Long value) || value < 0) throw unreadable();
                 pin = value;
             }

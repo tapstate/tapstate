@@ -55,6 +55,16 @@ class DerivedSchemaReportTest {
 
     private final List<AuditRecord> audited = new ArrayList<>();
     private final AuditGate auditGate = new AuditGate(audited::add, FIXED);
+    @Test void aBlockedAuditCannotBindAnEffectfulNativeModelCommand() {
+        var store = partlyDiscovered(List.of(TableRef.literal("orders")));
+        var bound = new java.util.concurrent.atomic.AtomicBoolean();
+        var rejected = new AuditGate(record -> { throw new IllegalStateException("audit unavailable"); }, FIXED);
+        var schemas = new StoreBackedDerivedSchemas(store, rejected, pipeline -> {
+            bound.set(true); return new StoreBackedDerivedSchemas.Command(store, () -> {});
+        });
+        assertThatThrownBy(() -> schemas.accept("admin", "new_pipeline")).isInstanceOf(TapstateException.class);
+        assertThat(bound).isFalse();
+    }
 
     @ParameterizedTest
     @MethodSource("undiscoveredSelections")

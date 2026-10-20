@@ -42,8 +42,8 @@ class StorageRootConfiguration {
     }
     @Bean OperationRegistry operationRegistry() { return ControlOperations.registry(); }
     @Bean CredentialAuthenticator credentialAuthenticator(StorageRoot root) { return root.authentication().credentials(); }
-    @Bean LocalAuthenticationContext.Provider localAuthenticationContexts(StorageRoot root) { return () -> root.authentication().local(); }
-    @Bean ManagedAuthenticationContext.Provider managedAuthenticationContexts(StorageRoot root) { return () -> root.authentication().managed(); }
+    @Bean LocalAuthenticationContext.Provider localAuthenticationContexts(StorageRoot root) { return root::localAuthentication; }
+    @Bean ManagedAuthenticationContext.Provider managedAuthenticationContexts(StorageRoot root) { return root::managedAuthentication; }
     @Bean ClusterIdentityService clusterIdentityService(StorageRoot root) {
         return new ClusterIdentityService(new ClusterIdentityStore() {
             @Override public java.util.Optional<ClusterIdentity> find() { return root.runtime().requireConfiguration().clusterIdentity().find(); }
