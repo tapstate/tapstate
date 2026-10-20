@@ -29,7 +29,7 @@ import java.util.*;
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
-/** Native preparation and producer/writer recovery over separate replica sets; no connector, Jet or target is exercised. */
+/** Native preparation and producer/writer recovery over separate replica sets; no registered connector, running Jet job or target I/O is exercised. */
 @RequiresDocker
 class PipelineDirectPreparationIT {
     @Container private static final MongoDBContainer CONFIG = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
@@ -39,6 +39,125 @@ class PipelineDirectPreparationIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node","boot");
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-19T00:00:00Z"),ZoneOffset.UTC);
 
+    @Test void aNewDirectBaselineCannotReclaimAnOldUndeliveredNestRelease() {
+        withFixture(f -> {
+            var inputs=f.inputs();f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims=f.cache.workloadClaims(f.business());var initial=claims.readPipeline(f.scope).orElseThrow().claim();
+            var running=claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow();var original=WorkloadClaimFence.from(running);
+            var capture=f.capture(original,inputs);var channels=f.cache.directChannels(f.business(),ACTIVE);var context=inputs.directChannels().getFirst().context();
+            channels.beginCapture(context,0,0,capture,original);channels.confirmAnchor(context,1,"anchor",capture,original);
+            channels.beginWriterRun(context,1,"old-writers",Map.of("orders",List.of("writer"),"quiet",List.of("writer")),original);
+            channels.recordBatch(new DirectBatch(context,1,1,new ChainPosition(new SourceOrder(1,5),"settled"),Map.of("orders",4L,"quiet",3L)),0,capture,original);
+            channels.advanceWriter(context,1,"old-writers","orders","writer",new WriterProgress(new SourceOrder(1,4),new ChainPosition(new SourceOrder(1,4),"settled")),original);
+            channels.advanceWriter(context,1,"old-writers","quiet","writer",new WriterProgress(new SourceOrder(1,3),null),original);
+            var member=mock(HazelcastInstance.class);var local=new ConcurrentHashMap<String,Object>();when(member.getUserContext()).thenReturn(local);
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true)) {
+                local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);local.put(SrsStoreViews.USER_CONTEXT_KEY,f.cache);
+                var before=DirectSourceRun.of(new ExecutionFence(f.scope,original),channels.load(context));
+                var first=new ScopedSrsReplayFloorFactory(Map.of(),Map.of("orders",new ScopedDirectSinkAckFactory.Source(before,"orders"),"quiet",new ScopedDirectSinkAckFactory.Source(before,"quiet"))).resolve(member);
+                var pending=io.tapstate.runtime.engine.nest.DirectNestReleaseProbe.seed(first);
+                var next=WorkloadClaimFence.from(claims.advanceExecution(running,1,Set.of(OWNER.nodeId())).orElseThrow());var held=channels.load(context);
+                channels.beginCapture(context,held.revision(),1,capture,next);channels.confirmAnchor(context,2,"settled",capture,next);
+                var after=DirectSourceRun.of(new ExecutionFence(f.scope,next),channels.load(context));
+                var restored=new ScopedSrsReplayFloorFactory(Map.of(),Map.of("orders",new ScopedDirectSinkAckFactory.Source(after,"orders"),"quiet",new ScopedDirectSinkAckFactory.Source(after,"quiet"))).resolve(member);
+                pending.assertRecovered(restored);
+                assertThat(restored.of("orders")).contains(new SourceOrder(1,4));assertThat(restored.of("quiet")).contains(new SourceOrder(1,3));
+                assertThat(channels.load(context).cursor().sinkAcked().order()).isEqualTo(SourceOrder.snapshotRow(2));
+                channels.recordBatch(new DirectBatch(context,2,1,new ChainPosition(new SourceOrder(2,0),"heartbeat"),Map.of()),0,capture,next);
+                assertThat(channels.load(context).cursor().sinkAckedSrcpos()).isEqualTo("heartbeat");
+                pending.assertRecovered(restored);assertThat(restored.of("orders")).contains(new SourceOrder(1,4));
+                assertThat(restored.of("quiet")).contains(new SourceOrder(1,3));
+            }
+        });
+    }
+    @Test void aPrivatePartialSnapshotKeepsItsPinAndCountsWhileCdcResumesTheSettledPrefix() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",false,ReadMode.SNAPSHOT_AND_CDC,"latest",null));
+            var inputs=f.inputs();f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims=f.cache.workloadClaims(f.business());var initial=claims.readPipeline(f.scope).orElseThrow().claim();
+            var running=claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow();var original=WorkloadClaimFence.from(running);
+            var ownership=mock(CaptureOwnership.class);
+            when(ownership.acquire(any())).thenAnswer(call -> {
+                var id=call.getArgument(0,CaptureId.class);var attempt=claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id.value()),OWNER,1,TTL);
+                return new CaptureOwnership.Permit(attempt.acquired(),attempt.claim());
+            });
+            when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
+            doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());
+            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
+            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var ports=new CopyOnWriteArrayList<NativeDirectSnapshotPort>();var buffer=new SnapshotBuffer(8);
+            var member=mock(HazelcastInstance.class);var local=new ConcurrentHashMap<String,Object>();when(member.getUserContext()).thenReturn(local);
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),f.cache.srs(f.business(),ACTIVE),member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,buffer,provisioner,(fixed,config,guard,preparation) -> {
+                            var port=new NativeDirectSnapshotPort(guard,preparation,ports.isEmpty()?"sampled-original":"sampled-later",ports.isEmpty()?"sampled-original":"settled",
+                                    () -> {var current=f.cache.directChannels(f.business(),ACTIVE).load(inputs.directChannels().getFirst().context());
+                                        assertThat(current.cursor().snapshotEpoch()).isOne();assertThat(current.current().anchor()).isNotNull();});
+                            ports.add(port);return port;
+                        })) {
+                local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);local.put(SrsStoreViews.USER_CONTEXT_KEY,f.cache);
+                var artifacts=ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts());var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+                var first=coordinator.forRun(f.scope,original,new ExecutionFence(f.scope,original));first.startCapture("flow",artifacts,models);awaitLoadedCounts(first);awaitStarted(ports.getFirst().direct);
+                var one=first.captureBindings().direct().get("input");assertThat(one.snapshotEpoch()).isOne();assertThat(one.epoch()).isOne();
+                assertThat(buffer.drain(first.captureBindings().bufferKey("input"),SrsRingbuffer.ringName(one.context().channelId(),"orders")))
+                        .singleElement().satisfies(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(1)));
+                var firstFactory=copied(new ScopedSrsSinkAckFactory(Map.of(),Map.of("orders",new ScopedDirectSinkAckFactory.Source(one,"orders"),"quiet",new ScopedDirectSinkAckFactory.Source(one,"quiet")),"first-snapshot"));
+                firstFactory.beginRun(member,Map.of("orders",List.of("writer"),"quiet",List.of("writer")),original);var firstAck=firstFactory.resolve(member).forWriter("writer");
+                firstAck.bounded("orders",SourceOrder.snapshotRow(1),original);assertThat(first.loadDelivered("flow")).isFalse();
+                ports.getFirst().direct.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("settled")));
+                var changes=buffer.drain(first.captureBindings().bufferKey("input"),SrsRingbuffer.ringName(one.context().channelId(),"orders"));
+                firstAck.advance("orders",changes.getFirst().position(),original);awaitTold(ports.getFirst().direct,"settled");first.stopCapture("flow",false);
+                var next=WorkloadClaimFence.from(claims.advanceExecution(running,1,Set.of(OWNER.nodeId())).orElseThrow());
+                var second=coordinator.forRun(f.scope,next,new ExecutionFence(f.scope,next));second.startCapture("flow",artifacts,models);awaitLoadedCounts(second);awaitStarted(ports.getLast().direct);
+                var two=second.captureBindings().direct().get("input");assertThat(two.epoch()).isEqualTo(2);assertThat(two.snapshotEpoch()).isOne();assertThat(two.loadEpoch()).isOne();
+                assertThat(ports.getLast().reads).containsExactly("quiet");assertThat(ports.getLast().request.get().replayAnchor()).isEqualTo(new SourcePosition("sampled-original"));
+                assertThat(ports.getLast().direct.start.get()).isEqualTo(CaptureStart.resume(new SourcePosition("settled")));
+                assertThat(second.snapshotProgress("flow").byTable().get("orders").rowsDone()).isOne();assertThat(second.snapshotProgress("flow").byTable().get("quiet").rowsDone()).isZero();
+                var secondFactory=copied(new ScopedSrsSinkAckFactory(Map.of(),Map.of("orders",new ScopedDirectSinkAckFactory.Source(two,"orders"),"quiet",new ScopedDirectSinkAckFactory.Source(two,"quiet")),"second-snapshot"));
+                secondFactory.beginRun(member,Map.of("orders",List.of("writer"),"quiet",List.of("writer")),next);
+                assertThat(second.loadDelivered("flow")).isFalse();secondFactory.resolve(member).forWriter("writer").bounded("quiet",SourceOrder.snapshotRow(1),next);
+                assertThat(second.loadDelivered("flow")).isTrue();second.stopCapture("flow",false);
+            }
+            assertThat(f.cacheDatabase.getCollection("srs_chains").countDocuments()).isZero();
+            assertThat(f.cacheDatabase.getCollection("snapshot_orders").find().first().getLong("order")).isZero();
+        });
+    }
+    private static void awaitStarted(DirectPort port) throws InterruptedException {
+        long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();while(port.start.get()==null && System.nanoTime()<deadline)Thread.sleep(10);
+        assertThat(port.start.get()).isNotNull();
+    }
+    private static final class NativeDirectSnapshotPort implements CapturePort,SnapshotSession.PreparedProvider {
+        final Runnable guard,beforeRow;final io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer preparation;
+        final String sampled;final DirectPort direct;final List<String> reads=new CopyOnWriteArrayList<>();final AtomicReference<SnapshotPreparation> request=new AtomicReference<>();
+        NativeDirectSnapshotPort(Runnable guard,io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer preparation,String sampled,String resume,Runnable beforeRow) {
+            this.guard=guard;this.preparation=Objects.requireNonNull(preparation);this.sampled=sampled;this.direct=new DirectPort(resume);this.beforeRow=beforeRow;
+        }
+        public SnapshotSession snapshotSession(CaptureConfig config){throw new AssertionError("unprepared snapshot");}
+        public SnapshotSession snapshotSession(CaptureConfig config,SnapshotPreparation original) {
+            guard.run();request.set(original);return new SnapshotSession() {
+                boolean prepared;
+                public CaptureBatch read(String table) {
+                    guard.run();reads.add(table);
+                    if(!prepared){var actual=new HashMap<String,SourceTable>();for(String selected:config.streams())actual.put(selected,new SourceTable(selected,List.of(new SourceField("id","INT")),List.of("id"),List.of()));
+                        preparation.prepare(original,new SourcePosition(sampled),actual);prepared=true;}
+                    var rows=table.equals("orders")?List.of(Envelope.read(1,table,Map.of("id",1),null)).iterator():Collections.<Envelope>emptyIterator();
+                    return new CaptureBatch() {
+                        public boolean hasNext(){guard.run();return rows.hasNext();}
+                        public Envelope next(){guard.run();beforeRow.run();return rows.next();}
+                        public Optional<SourcePosition> seam(){return Optional.of(new SourcePosition(sampled));}
+                        public void close(){}
+                    };
+                }
+            };
+        }
+        public CaptureBatch snapshot(CaptureConfig config){throw new AssertionError("unprepared snapshot");}
+        public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener listener){guard.run();return direct.cdc(config,start,listener);}
+        public ConnectionReport testConnection(CaptureConfig config){throw new AssertionError();}
+        public DiscoveredSchema discoverSchema(CaptureConfig config){throw new AssertionError();}
+    }
     @ParameterizedTest @ValueSource(strings={"latest","earliest","2026-10-18T00:00:00Z"})
     void actualScopedDirectCoordinatorFeedsOriginalWritersAndResumesItsSettledToken(String firstStart) {
         withFixture(f -> {
@@ -63,7 +182,7 @@ class PipelineDirectPreparationIT {
                 var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
                         new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
-                        runtime,buffer,provisioner,(fixed,config,guard) -> {guard.run();var port=new DirectPort(ports.isEmpty()?"anchor":"settled");ports.add(port);return port;})) {
+                        runtime,buffer,provisioner,(fixed,config,guard,preparation) -> {guard.run();var port=new DirectPort(ports.isEmpty()?"anchor":"settled");ports.add(port);return port;})) {
                 local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);local.put(SrsStoreViews.USER_CONTEXT_KEY,f.cache);
                 var artifacts=ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts());
                 var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
@@ -131,7 +250,7 @@ class PipelineDirectPreparationIT {
                 var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
                         new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
-                        runtime,buffer,provisioner,(fixed,config,guard) -> { guard.run();opened.add(config);return new NativeBoundedPort(guard); })) {
+                        runtime,buffer,provisioner,(fixed,config,guard,preparation) -> { guard.run();opened.add(config);return new NativeBoundedPort(guard); })) {
                 var artifacts=ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts());
                 var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
                 var first=coordinator.forRun(f.scope,original,new ExecutionFence(f.scope,original)); first.startCapture("flow",artifacts,models);
@@ -348,14 +467,14 @@ class PipelineDirectPreparationIT {
                     assertThat(channels.pending(context,1)).hasSize(2);
                     fast.advance("input.orders",rows.get(2).position(),original); fast.advance("input.quiet",rows.get(1).position(),original);
                     assertThat(channels.load(context).cursor().sinkAckedSrcpos()).isEqualTo("anchor");
-                    assertThat(floor.of("input.orders")).contains(SourceOrder.snapshotRow(1));
+                    assertThat(floor.of("input.orders")).isEmpty();
                     slow.advance("input.orders",rows.getFirst().position(),original);
                     assertThat(channels.load(context).cursor().sinkAckedSrcpos()).isEqualTo("anchor");
                     slow.advance("input.quiet",rows.get(1).position(),original);
                     assertThat(channels.pending(context,1)).singleElement().satisfies(batch -> assertThat(batch.boundary().token()).isEqualTo("last"));
                     assertThat(channels.load(context).cursor().sinkAckedSrcpos()).isEqualTo("first");
-                    assertThat(floor.of("input.orders")).contains(new SourceOrder(1,2));
-                    assertThat(floor.of("input.quiet")).contains(new SourceOrder(1,2));
+                    assertThat(floor.of("input.orders")).contains(new SourceOrder(1,0));
+                    assertThat(floor.of("input.quiet")).contains(new SourceOrder(1,1));
                     awaitTold(port,"first");
                     slow.advance("input.orders",rows.get(2).position(),original);
                     assertThat(channels.pending(context,1)).isEmpty(); awaitTold(port,"last");

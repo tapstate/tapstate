@@ -97,6 +97,45 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         }
     }
 
+    /** Opens the original private seam before returning; its CDC tail follows the bounded load on the same worker. */
+    public synchronized CaptureRun beginDirectSnapshot(CaptureConfig config,DirectChannelProgress opened,DirectChannelStore channels,
+            Function<DirectSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,int capacity,Runnable requireActive) {
+        Runnable fixed=guard(requireActive);fixed.run();var preparation=new DirectSnapshotPreparation(opened,channels,fixed);
+        SnapshotPhase.Load load=null;CaptureRun provisional=null;
+        try {
+            var port=Objects.requireNonNull(ports.apply(preparation),"prepared direct snapshot port");
+            load=SnapshotPhase.openDirectPrepared(port,config,preparation);fixed.run();var health=new CaptureHealth();
+            CaptureHandoff guarded=new CaptureHandoff() {
+                @Override public void accept(io.tapstate.core.event.Envelope row){fixed.run();handoff.accept(row);}
+                @Override public void loaded(String table){fixed.run();handoff.loaded(table);}
+            };
+            var background=new BackgroundLoad(load,guarded,() -> {
+                fixed.run();var current=channels.load(opened.context());fixed.run();
+                var window=current.current();var original=opened.current();
+                if(window==null || window.epoch()!=opened.epoch() || !window.captureFence().equals(original.captureFence())
+                        || !window.pipelineFence().equals(original.pipelineFence()))throw new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",opened.context().channelId()),null);
+                var saved=current.cursor().sinkAcked();if(saved==null)throw new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",opened.context().channelId()),null);
+                var writer=new DirectCaptureWriter(current,window.captureFence(),window.pipelineFence(),channels,row -> {
+                    fixed.run();handoff.accept(row);fixed.run();
+                },capacity,fixed);
+                Subscription source=null;
+                try {
+                    source=writer.start(port,config,CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(saved.token())),health);fixed.run();
+                    return Optional.of(acknowledgements.follow(channels,current,source,health,fixed));
+                } catch(RuntimeException|Error failure) {
+                    writer.close();if(source!=null)closeAfter(failure,source::close);throw failure;
+                }
+            },health,"tapstate-native-direct-load-"+opened.context().sourceId());
+            var result=new CaptureRun(Optional.empty(),false,Optional.empty(),health,background);
+            provisional=result;snapshots.add(result);fixed.run();background.start();return result;
+        } catch(RuntimeException|Error failure) {
+            preparation.close();
+            if(provisional!=null){var abandoned=provisional;snapshots.remove(abandoned);closeAfter(failure,abandoned::close);}
+            else if(load!=null)closeAfter(failure,load::close);
+            throw failure;
+        }
+    }
+
     /** A bounded-only source opens no change chain or CDC seam and uses the already allocated row order. */
     public synchronized CaptureRun beginSnapshotOnly(CaptureConfig config,long snapshotEpoch,CapturePort port,
             CaptureHandoff handoff,Runnable requireActive) {

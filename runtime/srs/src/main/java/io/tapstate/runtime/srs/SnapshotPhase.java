@@ -190,12 +190,42 @@ public final class SnapshotPhase {
         }
     }
 
+    /** A private load pins only its own existing channel and never creates an SRS consumer or model. */
+    public static Load openDirectPrepared(CapturePort port,CaptureConfig config,DirectSnapshotPreparation preparation) {
+        Objects.requireNonNull(port,"port");Objects.requireNonNull(config,"config");Objects.requireNonNull(preparation,"preparation");
+        var owed=preparation.stillOwed();var tables=preparation.tables();var order=SourceOrder.snapshotRow(preparation.request().snapshotEpoch());
+        preparation.beginRead();SnapshotSession session=null;CaptureBatch first=null;
+        try {
+            if(owed.isEmpty()) {
+                preparation.prepareRetained();String seam=preparation.accepted().token();preparation.close();
+                return new Load(null,preparation.channel(),tables,owed,order,seam,null,false);
+            }
+            var opened=SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
+                    new TapstateException(io.tapstate.spi.store.IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",preparation.channel()),null));
+            session=new SnapshotSession() {
+                @Override public CaptureBatch read(String table) {
+                    preparation.requireReading();var batch=opened.read(table);
+                    try {preparation.requireReading();return guardedBatch(batch,preparation::requireReading);}
+                    catch(RuntimeException|Error failure){closing(failure,batch::close);throw failure;}
+                }
+                @Override public void close(){preparation.close();opened.close();}
+            };
+            first=session.read(owed.getFirst());seamOf(first,preparation.channel());String anchor=preparation.accepted().token();
+            return new Load(session,preparation.channel(),tables,owed,order,anchor,first,false);
+        } catch(RuntimeException|Error failure) {
+            preparation.close();if(first!=null)closing(failure,first::close);if(session!=null)closing(failure,session::close);throw failure;
+        }
+    }
+
     private static CaptureBatch guardedBatch(CaptureBatch original,SrsSnapshotPreparation preparation) {
+        return guardedBatch(original,preparation::requireReading);
+    }
+    private static CaptureBatch guardedBatch(CaptureBatch original,Runnable requireReading) {
         return new CaptureBatch() {
             private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
-            @Override public Optional<SourcePosition> seam() { preparation.requireReading(); return original.seam(); }
-            @Override public boolean hasNext() { preparation.requireReading(); return original.hasNext(); }
-            @Override public Envelope next() { preparation.requireReading(); return original.next(); }
+            @Override public Optional<SourcePosition> seam() { requireReading.run(); return original.seam(); }
+            @Override public boolean hasNext() { requireReading.run(); return original.hasNext(); }
+            @Override public Envelope next() { requireReading.run(); return original.next(); }
             @Override public void close() { if (closed.compareAndSet(false,true)) original.close(); }
         };
     }

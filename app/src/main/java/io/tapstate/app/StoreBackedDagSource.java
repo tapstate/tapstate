@@ -3100,7 +3100,7 @@ final class StoreBackedDagSource implements DagSource {
             if (!captureBindings.snapshots().isEmpty()) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
             if (direct) {
                 var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
-                return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.epoch(),
+                return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.loadEpoch(),
                         order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
             }
             var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());

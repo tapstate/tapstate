@@ -22,8 +22,13 @@ final class ScopedSrsReplayFloorFactory implements ReplayFloorFactory {
         direct.values().forEach(source -> privateBound.computeIfAbsent(source.run(),run -> ScopedDirectSinkAckFactory.bind(member,run)));
         return stream -> {
             var privateSource = direct.get(stream);
-            if (privateSource != null) return Optional.ofNullable(privateBound.get(privateSource.run()).progress().cursor().sinkAcked())
-                    .map(io.tapstate.core.event.ChainPosition::order);
+            if (privateSource != null) {
+                var cursor=privateBound.get(privateSource.run()).progress().cursor();
+                var settled=cursor.sinkAcked();var delivered=cursor.sinkAckedByTable().get(privateSource.table());
+                if(settled==null || delivered==null)return Optional.empty();
+                // A renamed baseline or empty source batch proves no new delivery on this table.
+                return Optional.of(delivered.order().compareTo(settled.order())<0?delivered.order():settled.order());
+            }
             var source = sources.get(stream); if (source == null) return Optional.empty();
             var progress = bound.get(source.run()).progress();
             return Optional.ofNullable(progress.cursor().sinkAckedByTable().get(source.table())).map(io.tapstate.core.event.ChainPosition::order);
