@@ -1,0 +1,11 @@
+<testsuite name="io.tapstate.testsupport.CiDisabledContainerEvidenceTest" tests="3" errors="0" skipped="3" failures="0">
+  <testcase name="ordinaryDisabledByClass" classname="io.tapstate.testsupport.CiDisabledContainerEvidenceTest">
+    <skipped message="source-bound container skip control" />
+  </testcase>
+  <testcase name="disabledByClass(String)" classname="io.tapstate.testsupport.CiDisabledContainerEvidenceTest">
+    <skipped message="source-bound container skip control" />
+  </testcase>
+  <testcase name="" classname="io.tapstate.testsupport.CiDisabledContainerEvidenceTest$NestedContainer">
+    <skipped message="source-bound container skip control" />
+  </testcase>
+</testsuite>

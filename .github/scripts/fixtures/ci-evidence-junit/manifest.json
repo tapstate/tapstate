@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "versions": {
+    "junit": "5.11.4",
+    "surefire": "3.5.2"
+  },
+  "source_hashes": {
+    "test-support/src/test/java/io/tapstate/testsupport/CiInjectedEvidenceTest.java": "257bfb18cc2bf51ea5e138c50ce5693ba28c540174454b03673c8b8babe540cf",
+    "test-support/src/test/java/io/tapstate/testsupport/CiDisabledContainerEvidenceTest.java": "8514d8f3946e3963073de8efc9c89103521ae8c4e512281d2a0f21746204285b",
+    "test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java": "ee66efe7f75e1a7502436273debe944e168ef695d830cdac10f35d6081170d48"
+  },
+  "reports": {
+    "TEST-io.tapstate.testsupport.CiInjectedEvidenceTest.xml": "49357d6c60d0f0fb01f9d7ffcb280ad0c725a0de423302c2b6928974b095ad7d",
+    "TEST-io.tapstate.testsupport.CiDisabledContainerEvidenceTest.xml": "9c1ee87e7f95ff984f1886336948cb690a4db64b23b558108e9fc29a671b383d"
+  },
+  "projection": "Actual JUnit XML with environment properties, timing and non-marker output removed; original testcase names, skips and identity markers retained.",
+  "command": "mvn -B -pl test-support -Dtest=CiInjectedEvidenceTest,CiDisabledContainerEvidenceTest -Dtapstate.ci.case-evidence=true -Djunit.jupiter.extensions.autodetection.enabled=true verify"
+}

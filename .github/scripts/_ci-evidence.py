@@ -15,7 +15,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import textwrap
 import tarfile
 import tempfile
 import time
@@ -218,15 +217,42 @@ def source_modules(root):
     return result
 
 
-def declarations(text, outer, package):
-    clean = masked(text)
+def disabled_annotation(text, clean, position, floor=0):
+    # Walk past whole annotation arguments; array braces and strings are not
+    # declaration boundaries and cannot supply a Disabled annotation.
+    depth, start = 0, floor
+    for index in range(position - 1, floor - 1, -1):
+        char = clean[index]
+        if char == ')':
+            depth += 1
+        elif char == '(':
+            depth -= 1
+        elif depth == 0 and char in '{};':
+            start = index + 1
+            break
+    prefix = clean[start:position]
+    found = re.search(r'@(?:org\.junit\.jupiter\.api\.)?Disabled\b(?:\s*\((.*?)\))?', prefix, re.S)
+    if found is None:
+        return None
+    return text[start + found.start(1):start + found.end(1)] if found.group(1) is not None else ''
+
+
+def class_declarations(text, clean, package):
     classes = []
     for match in re.finditer(r'\b(class|interface|enum|record)\s+(\w+)\b[^;{]*\{', clean):
         start = match.end() - 1
         end = close_at(clean, start, '{', '}')
         parent = next((c for c in reversed(classes) if c['start'] < start < c['end']), None)
         name = parent['name'] + '$' + match.group(2) if parent else package + match.group(2)
-        classes.append(dict(start=start, end=end, name=name))
+        local_disabled = disabled_annotation(text, clean, match.start(), parent['start'] + 1 if parent else 0)
+        classes.append(dict(start=start, end=end, name=name, disabled_source=local_disabled
+                            if local_disabled is not None else parent['disabled_source'] if parent else None))
+    return classes
+
+
+def declarations(text, outer, package):
+    clean = masked(text)
+    classes = class_declarations(text, clean, package)
     result, consumed = [], -1
     for found in re.finditer(r'@([\w.]+)\b', clean):
         if found.start() < consumed or found.group(1).rsplit('.', 1)[-1] not in TEST_ANNOTATIONS:
@@ -277,15 +303,11 @@ def declarations(text, outer, package):
         if owner is None or not (owner['name'] == package + outer or owner['name'].startswith(package + outer + '$')):
             continue
         # Include preceding Disabled annotations in the declaration's contract.
-        prefix_start = max(owner['start'], clean.rfind('}', 0, found.start()),
-                           clean.rfind(';', 0, found.start())) + 1
-        prefix = clean[prefix_start:found.start()]
-        disabled = re.search(r'@(?:org\.junit\.jupiter\.api\.)?Disabled\b(?:\s*\((.*?)\))?', prefix, re.S)
-        reason = (text[prefix_start + disabled.start(1):prefix_start + disabled.end(1)]
-                  if disabled and disabled.group(1) is not None else '')
-        disabled_source = annotations.get('Disabled', reason if disabled else None)
+        method_disabled = annotations.get('Disabled', disabled_annotation(text, clean, found.start(), owner['start'] + 1))
+        disabled_source = method_disabled if method_disabled is not None else owner['disabled_source']
         result.append(dict(**{'class': owner['name']}, method=name, annotations=annotations,
-                           disabled_source=disabled_source,
+                           disabled_source=disabled_source, method_disabled_source=method_disabled,
+                           class_disabled_source=owner['disabled_source'],
                            parameter_types=parameter_types, parameter_injected=parameter_injected, declaration_sha256=digest(text[found.start():consumed].encode())))
     return result
 
@@ -352,8 +374,7 @@ def canonical_expression(expression, root, source, sources, body):
     if expression == 'null':
         return ['null']
     if expression.startswith('"""') and expression.endswith('"""'):
-        value = expression[3:-3]
-        value = textwrap.dedent(value.removeprefix('\n'))
+        value = text_block_content(expression)
         escapes = {'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f', '"': '"', '\\': '\\'}
         decoded, position = [], 0
         while position < len(value):
@@ -549,6 +570,7 @@ def inherited_declarations(root, source, sources, stack=None):
     overrides = {(item['class'].removeprefix(prefix + source.stem), item['method']) for _, item in own if 'method' in item}
     base_package = re.search(r'\bpackage\s+([\w.]+)\s*;', masked(base.read_text()))
     base_name = (base_package.group(1) + '.' if base_package else '') + base.stem
+    owners = {c['name']: c for c in class_declarations(text, clean, prefix)}
     for declaring_source, item in inherited_declarations(root, base, sources, stack):
         if 'class' not in item:
             own.append((declaring_source, item))
@@ -557,6 +579,11 @@ def inherited_declarations(root, source, sources, stack=None):
         if (suffix, item['method']) not in overrides:
             inherited = dict(item)
             inherited['class'] = prefix + source.stem + suffix
+            # Disabled is not inherited from a superclass; method annotations are.
+            container = owners.get(inherited['class'], owners[prefix + source.stem])
+            local = inherited.get('method_disabled_source')
+            inherited['disabled_source'] = local if local is not None else container['disabled_source']
+            inherited['class_disabled_source'] = container['disabled_source']
             own.append((declaring_source, inherited))
     return own
 
@@ -714,23 +741,40 @@ def csv_record(row, delimiter):
         position += 1
 
 
-def csv_text_block(value):
-    """Apply the bounded Java text-block indentation before default CSV comments."""
+def text_block_content(value):
+    """Normalize the supported Java text-block whitespace before escape decoding."""
     block = re.fullmatch(r'"""([\s\S]*?)"""', value)
-    require(block is not None, 'unsupported CSV text block')
+    require(block is not None, 'unsupported Java text block')
     raw = block.group(1).replace('\r\n', '\n').replace('\r', '\n')
-    opening = re.match(r'^[ \t]*\n', raw)
-    require(opening is not None and '\\' not in raw and
-            all(not char.isspace() or char in ' \t\n' for char in raw) and
-            all(ord(char) >= 32 or char in '\t\n' for char in raw),
-            'CSV text-block escapes or whitespace require independent enumeration')
+    whitespace = ' \t\f'
+    opening = re.match(r'^[ \t\f]*\n', raw)
+    require(opening is not None and all(not c.isspace() or c in whitespace + '\n' for c in raw),
+            'unsupported Java text block opening or whitespace')
     lines = raw[opening.end():].split('\n')
-    indentation = [len(line) - len(line.lstrip(' \t')) for line in lines if line.strip(' \t')]
-    if not lines[-1].strip(' \t'):
+    indentation = [len(line) - len(line.lstrip(whitespace)) for line in lines if line.strip(whitespace)]
+    if not lines[-1].strip(whitespace):
         indentation.append(len(lines[-1]))
     common = min(indentation, default=0)
-    lines = [line[min(common, len(line) - len(line.lstrip(' \t'))):].rstrip(' \t') for line in lines]
-    return [line for line in lines if line.strip(' \t') and not line.startswith('#')]
+    return '\n'.join(line[min(common, len(line) - len(line.lstrip(whitespace))):].rstrip(whitespace)
+                     if line.strip(whitespace) else '' for line in lines)
+
+
+def csv_text_block(value):
+    """Apply bounded Java whitespace normalization before default CSV comments."""
+    require('\\' not in value and all(not c.isspace() or c in ' \t\r\n' for c in value)
+            and all(ord(c) >= 32 or c in '\t\r\n' for c in value),
+            'CSV text-block escapes or whitespace require independent enumeration')
+    return [line for line in text_block_content(value).split('\n') if line.strip(' \t') and not line.startswith('#')]
+
+
+def signature_types(declaration):
+    result = []
+    for typename in declaration['parameter_types']:
+        typename = re.sub(r'<.*>', '', typename)
+        typename = re.sub(r'\s*\.\.\.\s*$', '[]', typename)
+        typename = re.sub(r'\s*\[\s*\]', '[]', typename)
+        result.append(typename.rsplit('.', 1)[-1])
+    return result
 
 
 def source_parameters(root, source, declaration, sources):
@@ -1164,6 +1208,7 @@ def reports(args):
                 break
             classname = classname.rsplit('$', 1)[0]
     cases, unknown, files, suites = [], [], {}, []
+    xml_case_count = 0
     for path in sorted(root.rglob('TEST-*.xml')):
         if path.parent.name not in ('surefire-reports', 'failsafe-reports'):
             continue
@@ -1174,13 +1219,14 @@ def reports(args):
         require(suite.tag == 'testsuite' and path.name == 'TEST-' + suite.get('name', '') + '.xml', 'report filename or root differs')
         require((module, kind, suite.get('name')) in allowed_suites, 'report suite is outside independent source declarations: ' + relative)
         actual = suite.findall('testcase')
+        xml_case_count += len(actual)
         require(int(suite.get('tests', '-1')) == len(actual), 'test count differs from testcase records: ' + relative)
         require(int(suite.get('skipped', '0')) == sum(c.find('skipped') is not None for c in actual), 'skip count differs from testcase records')
         require(int(suite.get('errors', '0')) == 0 and int(suite.get('failures', '0')) == 0 and
                 suite.find('.//error') is None and suite.find('.//failure') is None, 'non-success report: ' + relative)
         files[relative] = digest(path.read_bytes())
         suites.append(dict(module=module, kind=kind, **{'class': suite.get('name')}, count=len(actual), path=relative))
-        for case in actual:
+        for case_index, case in enumerate(actual):
             classname = case.get('classname', suite.get('name'))
             require(classname.split('$', 1)[0] == suite.get('name', '').split('$', 1)[0], 'testcase classname differs from source-selected report family')
             reported = case.get('name', '')
@@ -1191,13 +1237,29 @@ def reports(args):
                        for line in (out.text or '').splitlines() if line.startswith('tapstate.published-case=')]
             stable_markers = [line.removeprefix('tapstate.ci-case=') for out in case.findall('system-out')
                               for line in (out.text or '').splitlines() if line.startswith('tapstate.ci-case=')]
+            if not reported and case.find('skipped') is not None and not stable_markers and not markers:
+                # Surefire emits one skipped nested container when an enclosing
+                # class is disabled. Retain its raw count and map only the
+                # independently disabled source methods, never executions.
+                disabled = [m for m in inv['methods'] if m['module'] == module and m['kind'] == kind
+                            and (m['class'] == classname or m['class'].startswith(classname + '$'))]
+                if disabled and all(m.get('class_disabled_source') is not None and m['mapping'] == 'disabled-method'
+                                    and m['parameters'] == [''] for m in disabled):
+                    for method_record in disabled:
+                        cases.append(dict((key, method_record[key]) for key in ('lane', 'module', 'kind', 'class', 'method'))
+                            | dict(parameter='', reported=reported, status='skipped', skip=skip_record(case.find('skipped')),
+                                   report=relative, report_sha256=files[relative],
+                                   source_disabled_container=dict(container_class=classname, xml_case_index=case_index,
+                                       source_sha256=inv['sources'][method_record['source']],
+                                       disabled_source_sha256=digest(method_record['class_disabled_source'].encode()))))
+                    continue
             parameter = None
             if declaration is None:
                 unknown.append(dict(**base, reported=reported, reason='report has no independently discovered source method'))
             elif declaration['parameters'] is None:
                 unknown.append(dict(**base, reported=reported, reason='source parameter identities are unresolved'))
             elif declaration['mapping'] == 'disabled-method':
-                types = [re.sub(r'<.*>', '', typename).rsplit('.', 1)[-1].replace('...', '[]') for typename in declaration['parameter_types']]
+                types = signature_types(declaration)
                 signatures = {method + '(' + ', '.join(types) + ')'} | ({method} if not types else set())
                 if (declaration.get('disabled_source') is not None and case.find('skipped') is not None
                         and not stable_markers and not markers and reported in signatures):
@@ -1233,7 +1295,7 @@ def reports(args):
                 else:
                     unknown.append(dict(**base, reported=reported, reason='published case requires exactly one stable execution marker'))
             elif declaration['mapping'] == 'method':
-                types = [re.sub(r'<.*>', '', typename).rsplit('.', 1)[-1].replace('...', '[]') for typename in declaration['parameter_types']]
+                types = signature_types(declaration)
                 signatures = {method} if not types else set()
                 signatures.add(method + '(' + ', '.join(types) + ')')
                 if reported in signatures:
@@ -1293,7 +1355,7 @@ def reports(args):
         _, class_unknown = class_not_applicable(inv, suites, cases, [], {})
         unknown.extend(class_unknown)
     value = dict(schema=SCHEMA, type='test-observation', lane=args.lane, source_inventory_sha256=digest(Path(args.inventory).read_bytes()),
-                 cases=cases, suites=suites, class_gate_records=class_records, class_gate_files=class_files, input_binding=run_binding, inputs_sha256=inputs_sha256, source_not_applicable=source_not_applicable, source_not_applicable_count=len(source_not_applicable), actual_xml_case_count=len(cases), ledger=ledgers, canonical_ledger=canonical_ledgers, ledger_selector=ledger_selection, files=files, unresolved=unknown, complete=inv['complete'] and not unknown)
+                 cases=cases, suites=suites, class_gate_records=class_records, class_gate_files=class_files, input_binding=run_binding, inputs_sha256=inputs_sha256, source_not_applicable=source_not_applicable, source_not_applicable_count=len(source_not_applicable), actual_xml_case_count=xml_case_count, ledger=ledgers, canonical_ledger=canonical_ledgers, ledger_selector=ledger_selection, files=files, unresolved=unknown, complete=inv['complete'] and not unknown)
     output(args.output, value)
     print(json.dumps(dict(cases=len(cases), source_not_applicable=len(source_not_applicable), unresolved=len(unknown), complete=value['complete']), sort_keys=True))
 
@@ -2471,6 +2533,8 @@ def export_hashes(args):
                 row['execution_contract'] = dict(expected_status='requires-entry-contract', applicable=None)
         if value['type'] == 'test-observation':
             row.update(status=record['status'], skip=(None if record['skip'] is None else dict(type=record['skip']['type'], reason_sha256=digest(record['skip']['reason'].encode()))))
+            if record.get('source_disabled_container'):
+                row['source_disabled_container'] = record['source_disabled_container']
             if record['status'] == 'not_applicable':
                 row['source_gate_evidence'] = {field: record['evidence'][field] for field in ('contract_sha256', 'source_sha256', 'compiled_class_sha256', 'reason_digest', 'callback')}
                 row['source_gate_evidence']['predicate_flags_sha256'] = digest(json.dumps(record['evidence']['gate_inputs'], sort_keys=True, separators=(',', ':')).encode())
@@ -2480,7 +2544,7 @@ def export_hashes(args):
         row = {field: method[field] for field in ('lane', 'module', 'kind', 'class', 'method', 'source')}
         row['declaration_sha256'] = method['declaration_sha256']
         row['mapping'] = method['mapping']
-        row['signature_types'] = [re.sub(r'<.*>', '', typename).rsplit('.', 1)[-1].replace('...', '[]') for typename in method['parameter_types']]
+        row['signature_types'] = signature_types(method)
         row['source_sha256'] = value['sources'].get(method['source'])
         row['provider_contract_sha256'] = digest(json.dumps(method.get('provider_contract'), sort_keys=True, separators=(',', ':')).encode())
         methods.append(row)

@@ -38,6 +38,18 @@ class CiInjectedEvidenceTest {
                 """);
     }
 
+    @ParameterizedTest
+    @MethodSource("indentedTextBlocks")
+    void closingDelimiterPreservesSignificantIndent(String value) {
+        assertThat(value).isEqualTo("    content\n");
+    }
+
+    static Stream<String> indentedTextBlocks() {
+        return Stream.of("""
+            content
+        """);
+    }
+
     @Disabled("source-bound skip control")
     @ParameterizedTest
     @ValueSource(strings = {"a", "b"})
@@ -49,5 +61,12 @@ class CiInjectedEvidenceTest {
     @Disabled
     void disabledRepeated(RepetitionInfo info) {
         throw new AssertionError("a disabled repetition must never execute");
+    }
+
+    @Disabled("source-bound varargs skip control")
+    @ParameterizedTest
+    @ValueSource(strings = {"a", "b"})
+    void disabledVarargs(String... values) {
+        throw new AssertionError("disabled varargs must not invoke their provider");
     }
 }

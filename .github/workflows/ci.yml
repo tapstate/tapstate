@@ -151,6 +151,8 @@ jobs:
                          'reason': 'original test evidence could not be parsed completely'}, output)
           PY_INCOMPLETE
           fi
+      - name: Read back the executed JUnit observer controls
+        run: python3 .github/scripts/_ci-evidence-regression-smoke.py --junit-shard "$RUNNER_TEMP/shards.json" "${{ matrix.shard }}"
       - name: Record post-test input hashes
         if: always()
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --phase post-test-before-pack --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode" --output "$RUNNER_TEMP/ci-inputs/post-test-inputs.json" --shard-id "${{ matrix.shard }}" --maven-observation "$RUNNER_TEMP/maven-observation/summary.json"
