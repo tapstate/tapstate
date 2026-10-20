@@ -45,6 +45,8 @@ import static org.mockito.Mockito.spy;
 /** Test-only stage evidence before the startup boundary replaces a connector refusal. */
 final class CloudStartupDerivationWitness implements ApplicationContextInitializer<ConfigurableApplicationContext> {
     static final String REFUSAL_CLASSIFICATION_PROPERTY = "tapstate.test.mysql-seed-refusal-classification";
+    static final String ARTIFACT_READ_FAILURE_PROPERTY = "tapstate.test.mysql-artifact-read-failure-classification";
+    private final CloudArtifactReadFailureClassifier artifactReadFailureClassifier;
     private final Consumer<Map<String, Object>> output;
     private final Consumer<Map<String, Object>> storeOutput;
     private final Path expectedSeed;
@@ -71,6 +73,13 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
 
     CloudStartupDerivationWitness(Consumer<Map<String, Object>> output,
             Consumer<Map<String, Object>> storeOutput, Path expectedSeed, boolean refusalClassificationEnabled) {
+        this(output, storeOutput, expectedSeed, refusalClassificationEnabled, false);
+    }
+
+    CloudStartupDerivationWitness(Consumer<Map<String, Object>> output,
+            Consumer<Map<String, Object>> storeOutput, Path expectedSeed, boolean refusalClassificationEnabled,
+            boolean artifactReadFailureClassificationEnabled) {
+        this.artifactReadFailureClassifier = new CloudArtifactReadFailureClassifier(artifactReadFailureClassificationEnabled);
         this.output = output;
         this.storeOutput = storeOutput;
         this.expectedSeed = expectedSeed == null ? null : expectedSeed.toAbsolutePath().normalize();
@@ -85,7 +94,8 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
                             ? "CLOUD_MYSQL_SEED_STORE " : "CLOUD_MYSQL_STORE_READ ";
                     System.out.println(prefix + JsonWriter.write(event));
                 }, CloudConnectorTestInputs.seedDirectory().resolve("mysql-connector.jar"),
-                Boolean.getBoolean(REFUSAL_CLASSIFICATION_PROPERTY));
+                Boolean.getBoolean(REFUSAL_CLASSIFICATION_PROPERTY),
+                Boolean.getBoolean(ARTIFACT_READ_FAILURE_PROPERTY));
     }
 
     @Override
@@ -305,7 +315,14 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
         event.put("exception_type", failure.getClass().getName());
         if (failure instanceof MongoException mongo) event.put("driver_code", mongo.getCode());
         if (!attempt.seed && "artifact".equals(attempt.operation)) {
-            event.put("artifact_step", CloudArtifactReadStep.current().wireValue());
+            CloudArtifactReadStep.Step step = CloudArtifactReadStep.current();
+            event.put("artifact_step", step.wireValue());
+            if (failure instanceof MongoException mongo) {
+                artifactReadFailureClassifier.classify(new CloudArtifactReadFailureClassifier.Scope(
+                        "mysql", attempt.seed, attempt.operation, command, step.wireValue(),
+                        failure.getClass().getName(), mongo.getCode()), failure::getCause)
+                        .ifPresent(category -> event.put("read_failure_category", category.name()));
+            }
         }
         if (refusalClassificationEnabled && attempt.seed && "spec-put".equals(attempt.operation)
                 && "update".equals(command) && failure instanceof MongoCommandException mongo
