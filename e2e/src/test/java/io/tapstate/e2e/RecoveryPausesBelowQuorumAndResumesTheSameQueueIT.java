@@ -366,6 +366,260 @@ class RecoveryPausesBelowQuorumAndResumesTheSameQueueIT {
         }
     }
 
+    @Test
+    void aCrashedCoordinatorResumesTheSameUnallocatedStepWithoutAnotherExecution(@TempDir Path directory) throws Exception {
+        List<String> nodes = List.of("node-a", "node-b", "node-c", "node-d", "node-e");
+        String run = UUID.randomUUID().toString().replace("-", "");
+        String uri = SharedMongo.replicaSetUrl("e2e_coordinator_death_" + run);
+        String targetUri = SharedMongo.replicaSetUrl("e2e_coordinator_target_" + run);
+        Path source = Files.createDirectories(directory.resolve("coordinator-source"));
+        Path reads = Files.createDirectories(directory.resolve("coordinator-reads"));
+        Path sourceEntries = directory.resolve("coordinator-source-entries.tsv");
+        Path writerEntries = directory.resolve("coordinator-writer-entries.tsv");
+        Path sdk = E2eConnectorJar.buildInto(Files.createDirectories(directory.resolve("coordinator-connector")));
+        byte[] connector = ObservedCsvConnectorJar.build(Files.readAllBytes(sdk), sourceEntries);
+        byte[] targets = ObservedMongoConnectorJar.build(ConnectorJars.bytesFor("mongodb"), writerEntries);
+        // This explicit fixture lease fits process death plus takeover inside the real schema hold.
+        // One intervening reacquisition must also fit the unchanged physical-write observation window.
+        // The original three-member witness and production lease defaults remain unchanged.
+        Duration lease = Duration.ofSeconds(6);
+        try (MongoClient mongo = MongoClients.create(readSettings(uri));
+                MongoClient holderClient = MongoClients.create(holderSettings(uri));
+                PartitionableCluster cluster = PartitionableCluster.start(uri, "coordinator-death", nodes, lease)) {
+            MongoDatabase store = mongo.getDatabase(new ConnectionString(uri).getDatabase());
+            Lane lane = new Lane("coordinator_death", "coordinator_source", "coordinator_target", "orders", source,
+                    targetUri, mongo.getDatabase(new ConnectionString(targetUri).getDatabase()), reads);
+            List<Lane> lanes = List.of(lane);
+            Set<String> pipelines = Set.of(lane.pipeline());
+            ControlPlane initial = cluster.member(nodes.getFirst());
+            awaitActive(initial, nodes, SETUP);
+            ClusterRecoveryItemView.Profile profile = initial.clusterProfile();
+            assertThat(profile).isNotNull();
+            initial.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
+            initial.registerConnector("mongodb", targets);
+            publish(lane, false, 1);
+            initial.apply(Map.of(
+                    lane.source() + ".tap.yml", Workspaces.cdcSourceYaml(lane.source(), source,
+                            List.of(lane.table()), Map.of("read_witness", reads.toString())),
+                    lane.target() + ".tap.yml", """
+                            version: tapstate/v1
+                            kind: source
+                            id: %s
+                            connector: mongodb
+                            config: { uri: "%s" }
+                            """.formatted(lane.target(), targetUri),
+                    lane.pipeline() + ".tap.yml", Workspaces.pipelineYaml(
+                            lane.pipeline(), lane.source(), lane.target(), lane.table(), nodes.size())));
+            initial.discoverSchema(lane.source(), E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            initial.lifecycle(lane.pipeline(), LifecycleVerb.START);
+            Await.until("the original five-member execution and snapshot", SETUP,
+                    () -> initial.state(lane.pipeline()).filter(PipelineState.RUNNING::equals).isPresent()
+                            && initial.membersCarryingPartOf(lane.pipeline()).equals(Set.copyOf(nodes))
+                            && rowPresent(lane, 1) && initial.snapshotTables(lane.pipeline()).containsKey(lane.table())
+                            && initial.snapshotTables(lane.pipeline()).get(lane.table()).landed(),
+                    () -> String.valueOf(initial.clusterStatus()));
+            publish(lane, false, 2);
+            Await.until("the original source and sink to acknowledge a new row", SETUP,
+                    () -> rowPresent(lane, 2), () -> "confirmed source row has not landed");
+            String floor = awaitConfirmedFloor(initial, store, lane);
+            ClusterClaimView originalClaim = claim(initial, lane);
+            assertThat(originalClaim.executionContextCurrent()).isTrue();
+            assertThat(originalClaim.executionClaimGeneration()).isEqualTo(originalClaim.claimGeneration());
+            assertThat(originalClaim.executionMembers().stream().map(ClusterClaimView.Member::nodeId))
+                    .containsExactlyInAnyOrderElementsOf(nodes);
+            NativeIds originalNative = awaitNative(initial, lane, originalClaim, nodes, SETUP);
+            var committed = ClusterProjectionAssertions.committedFacts(store, cluster.clusterId());
+            assertThat(committed.nodeIds()).containsExactlyInAnyOrderElementsOf(nodes);
+            ClusterProjectionAssertions.assertProjectionFacts(cluster, nodes.getFirst(), store, pipelines, nodes, committed);
+            MongoDerivedSchemaStore derived = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(store));
+            DerivedSchema originalSchema = derived.pinned(lane.pipeline(), lane.step()).orElseThrow();
+            assertThat(originalSchema.version()).isZero();
+            Truth originalTruth = truth(store, lane);
+            long originalSnapshots = snapshotReads(lane);
+            long originalBatchCalls = operationCount(sourceEntries, "BATCH_READ");
+            long writesBeforeLoss = writerRows(writerEntries);
+            publish(lane, true, 2);
+            initial.discoverSchema(lane.source(), E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            assertThat(initial.sourceSchemaFields(lane.source(), lane.table())).containsExactly("id", "seq", "note");
+            Map<String, String> columns = Map.of("id", "STRING NULL", "seq", "STRING NULL", "note", "STRING NULL");
+            String victim = initial.captureOwnersOf(lane.pipeline()).values().stream().findFirst().orElseThrow();
+            List<String> firstSurvivors = nodes.stream().filter(node -> !node.equals(victim)).toList();
+            ControlPlane observing = cluster.member(firstSurvivors.getFirst());
+            Map<String, ClusterMemberView> originalBoots = nodes.stream().collect(Collectors.toMap(
+                    node -> node, node -> member(initial, node)));
+            Map<String, ClusterMemberView> boots = firstSurvivors.stream().collect(Collectors.toMap(
+                    node -> node, originalBoots::get));
+            assertThat(queue(store, cluster.clusterId())).isEmpty();
+            QueueTrace trace = new QueueTrace(pipelines);
+            try (NativeReaders lossReaders = new NativeReaders(cluster, firstSurvivors, originalBoots, profile, store);
+                    MongoChangeStreamCursor<ChangeStreamDocument<Document>> changes =
+                    SystemCollections.CLUSTER_RECOVERY_QUEUE.on(store).watch().maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor()) {
+                lossReaders.assertMembers(Set.copyOf(nodes));
+                trace.drain(changes);
+                cluster.kill(victim);
+                assertThat(cluster.isAlive(victim)).isFalse();
+                Await.until("the independently observed surviving four-member native cohort", SETUP,
+                        () -> lossReaders.sameMembers(Set.copyOf(firstSurvivors)), lossReaders::describe);
+                Await.until("one durable item for the first actual member loss", SETUP,
+                        () -> { trace.drain(changes); return trace.inserted.keySet().equals(pipelines); }, trace::describe);
+                assertThat(queue(store, cluster.clusterId())).hasSize(1);
+                awaitLateArm(store, cluster.clusterId(), lanes, Map.of(lane.pipeline(), originalClaim), trace, changes);
+                Number lifetime = mongo.getDatabase("admin").runCommand(
+                        new Document("getParameter", 1).append("transactionLifetimeLimitSeconds", 1))
+                        .get("transactionLifetimeLimitSeconds", Number.class);
+                assertThat(lifetime).isNotNull();
+                try (SchemaHold hold = new SchemaHold(holderClient, store, lanes, Duration.ofSeconds(lifetime.longValue()))) {
+                    CoordinatorBlockEvidence.Arm arm = CoordinatorBlockEvidence.arm(store, cluster.clusterId(), lane.pipeline());
+                    try {
+                        awaitBlocked(mongo, store, cluster.clusterId(), boots, profile, lanes,
+                                Map.of(lane.pipeline(), originalClaim), Map.of(lane.pipeline(), originalSchema),
+                                Map.of(lane.pipeline(), columns), trace, changes, hold);
+                    } catch (AssertionError precondition) {
+                        CoordinatorBlockEvidence.retain(mongo, store, cluster.clusterId(), lane.pipeline(), lane.key(),
+                                boots.values(), originalSchema, columns, originalClaim.executionGeneration(), arm);
+                        throw precondition;
+                    }
+                    trace.drain(changes);
+                    Step paused = steps(trace.latest).get(lane.pipeline());
+                    String phase = trace.latest.get(lane.pipeline()).getString("status");
+                    assertThat(paused.attempt()).isZero();
+                    assertThat(paused.reservation()).isNotBlank();
+                    assertThat(trace.latest.get(lane.pipeline()).get("successor")).isNull();
+                    ClusterRecoveryItemView.ClaimReading owner = observing.clusterRecovery(READ_BOUND).coordinatorClaim();
+                    assertThat(owner).isNotNull();
+                    assertThat(owner.leased()).isTrue();
+                    String coordinator = owner.claim().ownerNodeId();
+                    assertThat(firstSurvivors).contains(coordinator);
+                    assertThat(member(observing, coordinator).bootId()).isEqualTo(owner.claim().ownerBootId());
+                    List<String> survivors = firstSurvivors.stream().filter(node -> !node.equals(coordinator)).toList();
+                    assertThat(survivors).hasSize(3);
+                    ControlPlane successorReader = cluster.member(survivors.getFirst());
+                    hold.remaining(Duration.ofSeconds(40));
+                    cluster.kill(coordinator);
+                    assertThat(cluster.isAlive(coordinator)).isFalse();
+                    long takeoverDeadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+                    Map<String, Boolean> takeoverFacts = new LinkedHashMap<>();
+                    try {
+                        awaitPhase("a new live coordinator over the same unallocated durable item", Duration.ofSeconds(20), hold, () -> {
+                            trace.drain(changes);
+                            Step current = steps(trace.latest).get(lane.pipeline());
+                            assertThat(current.id()).isEqualTo(paused.id());
+                            assertThat(current.sequence()).isEqualTo(paused.sequence());
+                            assertThat(current.attempt()).isEqualTo(paused.attempt());
+                            assertThat(current.frontier()).isEqualTo(paused.frontier());
+                            assertThat(trace.latest.get(lane.pipeline()).get("successor")).isNull();
+                            assertUnallocated(store, cluster.clusterId(), lanes, Map.of(lane.pipeline(), originalClaim), hold);
+                            ClusterRecoveryView recovery = successorReader.clusterRecovery(READ_BOUND);
+                            var replacement = recovery.coordinatorClaim();
+                            boolean liveOwner = replacement != null && replacement.leased()
+                                    && survivors.contains(replacement.claim().ownerNodeId())
+                                    && boots.get(replacement.claim().ownerNodeId()).bootId().equals(replacement.claim().ownerBootId())
+                                    && replacement.claim().claimGeneration() > owner.claim().claimGeneration();
+                            boolean nativeReady = lossReaders.readers.entrySet().stream()
+                                    .filter(entry -> survivors.contains(entry.getKey())).allMatch(entry -> {
+                                        var members = entry.getValue().members();
+                                        members.forEach(lossReaders::assertIdentity);
+                                        return members.size() == survivors.size()
+                                                && members.stream().noneMatch(NativeMemberWitness.MemberFacts::lite)
+                                                && members.stream().map(NativeMemberWitness.MemberFacts::nodeId)
+                                                        .collect(Collectors.toSet()).equals(Set.copyOf(survivors));
+                                    });
+                            ClusterRecoveryItemView item = recovery.items().stream()
+                                    .filter(value -> lane.pipeline().equals(value.pipelineId())).findFirst().orElse(null);
+                            takeoverFacts.put("newLiveOwner", liveOwner);
+                            takeoverFacts.put("nativeCohortReady", nativeReady);
+                            takeoverFacts.put("quorumReady", Boolean.TRUE.equals(recovery.quorumReady()));
+                            takeoverFacts.put("itemPresent", item != null);
+                            takeoverFacts.put("permitPresent", item != null && item.permit() != null);
+                            takeoverFacts.put("originalReservationPresent", item != null && item.permit() != null
+                                    && item.permit().reservationId().equals(paused.reservation()));
+                            // A data-member death changes the complete capacity cohort. The durable step
+                            // survives even when its old reservation must retire before replanning.
+                            return liveOwner && nativeReady && Boolean.TRUE.equals(recovery.quorumReady()) && item != null;
+                        }, () -> "a replacement has not qualified over the retained unallocated item");
+                    } catch (AssertionError takeoverFailure) {
+                        CoordinatorBlockEvidence.retainTakeover(takeoverFacts);
+                        throw takeoverFailure;
+                    }
+                    assertThat(System.nanoTime()).as("the successful takeover observation stays within its declared bound")
+                            .isLessThan(takeoverDeadline);
+                    trace.drain(changes);
+                    Step retained = steps(trace.latest).get(lane.pipeline());
+                    assertThat(retained.id()).isEqualTo(paused.id());
+                    assertThat(retained.sequence()).isEqualTo(paused.sequence());
+                    assertThat(retained.attempt()).isEqualTo(paused.attempt());
+                    assertThat(retained.frontier()).isEqualTo(paused.frontier());
+                    assertThat(trace.latest.get(lane.pipeline()).get("successor")).isNull();
+                    assertThat(trace.latest.get(lane.pipeline()).getString("status")).isIn(phase, "WAITING_PERMIT");
+                    assertThat(queue(store, cluster.clusterId())).hasSize(1);
+                    assertThat(truth(store, lane)).isEqualTo(originalTruth);
+                    assertThat(derived.pinned(lane.pipeline(), lane.step())).contains(originalSchema);
+                    publish(lane, true, 3);
+                    hold.abort();
+                    try {
+                        Await.until("the retained item and one native successor to recover", RECOVERY, () -> {
+                            trace.drain(changes);
+                            return "RECOVERED".equals(trace.latest.get(lane.pipeline()).getString("status")) && rowPresent(lane, 3);
+                        }, trace::describe);
+                    } catch (AssertionError recoveryFailure) {
+                        CoordinatorBlockEvidence.retain(mongo, store, cluster.clusterId(), lane.pipeline(), lane.key(),
+                                survivors.stream().map(boots::get).toList(), originalSchema, columns, originalClaim.executionGeneration());
+                        throw recoveryFailure;
+                    }
+                    trace.drain(changes);
+                    Document completed = trace.latest.get(lane.pipeline());
+                    assertThat(completed.get("_id")).isEqualTo(paused.id());
+                    assertThat(number(completed, "enqueueSequence")).isEqualTo(paused.sequence());
+                    assertThat(number(completed, "attempt")).isEqualTo(paused.attempt() + 1);
+                    assertThat(number(completed.get("event", Document.class), "originalExecutionGeneration")).isEqualTo(paused.frontier());
+                    ClusterClaimView successorClaim = claim(successorReader, lane);
+                    assertThat(successorClaim.executionGeneration()).isEqualTo(originalClaim.executionGeneration() + 1);
+                    ClusterRecoveryItemView recovered = successorReader.clusterRecovery().items().stream()
+                            .filter(value -> lane.pipeline().equals(value.pipelineId())).findFirst().orElseThrow();
+                    assertThat(recovered.successor().nativeInitializedAt()).isNotNull();
+                    assertThat(recovered.successor().sourcesAcceptedAt()).isNotNull();
+                    assertThat(recovered.originalPositions().get(lane.source()).token()).isEqualTo(floor);
+                    assertThat(recovered.successor().requiredSourceIds()).containsExactly(lane.source());
+                    assertThat(recovered.successor().requestedPositions()).containsOnlyKeys(lane.source());
+                    assertThat(recovered.successor().acceptedPositions()).containsOnlyKeys(lane.source());
+                    assertThat(recovered.successor().requestedPositions().get(lane.source()).connectorId())
+                            .isEqualTo(E2eConnectorJar.CONNECTOR_ID);
+                    assertThat(recovered.successor().acceptedPositions().get(lane.source()).connectorId())
+                            .isEqualTo(E2eConnectorJar.CONNECTOR_ID);
+                    assertThat(recovered.successor().requestedPositions().get(lane.source()).token()).isEqualTo(floor);
+                    assertThat(recovered.successor().acceptedPositions().get(lane.source()).token()).isEqualTo(floor);
+                    NativeIds actual = awaitNative(successorReader, lane, successorClaim, survivors, RECOVERY);
+                    assertThat(actual.job()).isEqualTo(recovered.successor().nativeJobId()).isNotEqualTo(originalNative.job());
+                    awaitActive(successorReader, survivors, RECOVERY);
+                    ClusterProjectionAssertions.assertProjectionFacts(cluster, survivors.getFirst(), store, pipelines, survivors, committed);
+                    Map<String, ClusterMemberView> remainingBoots = survivors.stream()
+                            .collect(Collectors.toMap(node -> node, boots::get));
+                    try (NativeReaders nativeReaders = new NativeReaders(cluster, survivors, remainingBoots, profile, store)) {
+                        nativeReaders.assertInventory(Set.of(originalNative.job(), actual.job()), null);
+                        long stableUntil = System.nanoTime() + WATCH.toNanos();
+                        while (System.nanoTime() < stableUntil) {
+                            trace.drain(changes);
+                            assertThat(claim(successorReader, lane).executionGeneration()).isEqualTo(successorClaim.executionGeneration());
+                            assertThat(queue(store, cluster.clusterId())).hasSize(1);
+                            Await.pauseBeforeNextPoll(Duration.ofMillis(100));
+                        }
+                        successorReader.stop(lane.pipeline(), false);
+                        Await.until("the single recovered execution to stop", SETUP,
+                                () -> successorReader.state(lane.pipeline()).filter(PipelineState.STOPPED::equals).isPresent(),
+                                () -> "the recovered execution has not stopped");
+                        assertThat(lane.targetDatabase().getCollection(lane.table()).countDocuments()).isEqualTo(3);
+                        assertThat(writerRows(writerEntries) - writesBeforeLoss).isEqualTo(1);
+                        assertThat(snapshotReads(lane)).isEqualTo(originalSnapshots);
+                        assertThat(operationCount(sourceEntries, "BATCH_READ")).isEqualTo(originalBatchCalls);
+                        assertThat(trace.inserted).hasSize(1);
+                        assertThat(trace.peakPermits).isEqualTo(1);
+                        nativeReaders.assertInventory(Set.of(originalNative.job(), actual.job()), null);
+                    }
+                }
+            }
+        }
+    }
+
     private static void publish(Lane lane, boolean note, int through) {
         StringBuilder bytes = new StringBuilder(note ? "id,seq,note\n" : "id,seq\n");
         for (int id = 1; id <= through; id++) bytes.append(id).append(',').append(id).append('\n');

@@ -604,6 +604,67 @@ class ClusterRecoveryStoreIT {
     }
 
     @Test
+    void unallocatedPermitAttributionIsExactReadOnlyAndUnavailableAfterAllocation() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("permit-attribution", true);
+            ClusterRecoveryItem item = fixture.permit(fixture.enqueue(pipeline).item(), DEMAND, LIMITS).item();
+            assertThat(item).isNotNull();
+            Document occupancy = fixture.occupancy.find(new Document("_id", item.permit().reservationId())).first();
+            WorkloadClaimFence owner = MongoClusterCapacityStore.reservation(occupancy).pipelineClaim();
+
+            Map<String, List<Document>> beforeRead = fixture.storedFacts();
+            assertThat(fixture.store.unallocatedPermitPipelineClaim(item)).contains(owner);
+            assertThat(fixture.store.unallocatedPermitPipelineClaim(item.retargeted(item.targetProfile(),
+                    item.targetTopologyRevision(), item.updatedAt().plusMillis(1)))).isEmpty();
+            assertThat(fixture.storedFacts()).isEqualTo(beforeRead);
+
+            for (String field : List.of("recovery", "executionGeneration", "nativeJobId", "clusterId", "pipelineId",
+                    "incarnationId", "intentFingerprint", "reservedAt")) {
+                Document changed = Document.parse(occupancy.toJson());
+                changed.put(field, switch (field) {
+                    case "recovery" -> false;
+                    case "executionGeneration" -> 99L;
+                    case "reservedAt" -> new java.util.Date(((java.util.Date) occupancy.get(field)).getTime() + 1);
+                    default -> "mismatched";
+                });
+                if (field.equals("clusterId")) {
+                    changed.get("profile", Document.class).put("clusterId", "mismatched");
+                    changed.get("pipelineClaim", Document.class).put("clusterId", "mismatched");
+                    assertThat(MongoClusterCapacityStore.reservation(changed).clusterId()).isEqualTo("mismatched");
+                } else if (field.equals("pipelineId")) {
+                    changed.get("pipelineClaim", Document.class).put("resourceId", "mismatched");
+                    assertThat(MongoClusterCapacityStore.reservation(changed).pipelineId()).isEqualTo("mismatched");
+                }
+                fixture.occupancy.replaceOne(new Document("_id", occupancy.get("_id")), changed);
+                Map<String, List<Document>> beforeRejectedRead = fixture.storedFacts();
+                assertThat(fixture.store.unallocatedPermitPipelineClaim(item)).isEmpty();
+                assertThat(fixture.storedFacts()).isEqualTo(beforeRejectedRead);
+            }
+            for (String field : List.of("executionGeneration", "profileGeneration")) {
+                Document changed = Document.parse(occupancy.toJson());
+                Document claim = changed.get("pipelineClaim", Document.class);
+                claim.put(field, claim.get(field, Number.class).longValue() + 1);
+                fixture.occupancy.replaceOne(new Document("_id", occupancy.get("_id")), changed);
+                Map<String, List<Document>> beforeRejectedRead = fixture.storedFacts();
+                assertThat(fixture.store.unallocatedPermitPipelineClaim(item)).isEmpty();
+                assertThat(fixture.storedFacts()).isEqualTo(beforeRejectedRead);
+            }
+            fixture.occupancy.deleteOne(new Document("_id", occupancy.get("_id")));
+            Map<String, List<Document>> withoutOccupancy = fixture.storedFacts();
+            assertThat(fixture.store.unallocatedPermitPipelineClaim(item)).isEmpty();
+            assertThat(fixture.storedFacts()).isEqualTo(withoutOccupancy);
+            fixture.occupancy.insertOne(occupancy);
+            ClusterRecoveryItem allocated = fixture.advance(item, pipeline.claim()).item();
+            assertThat(allocated).isNotNull();
+            assertThat(allocated.successor()).isNotNull();
+            Map<String, List<Document>> afterAllocation = fixture.storedFacts();
+            assertThat(fixture.store.unallocatedPermitPipelineClaim(item)).isEmpty();
+            assertThat(fixture.store.unallocatedPermitPipelineClaim(allocated)).isEmpty();
+            assertThat(fixture.storedFacts()).isEqualTo(afterAllocation);
+        }
+    }
+
+    @Test
     void anExplicitResumeMarkerIsAtomicWithItsAcceptedEpochAndOrdinaryCasSupersedesIt() {
         try (Fixture fixture = new Fixture()) {
             Resume resume = fixture.resumePipeline("orders", Duration.ofSeconds(3));
@@ -3134,6 +3195,8 @@ class ClusterRecoveryStoreIT {
         private Map<String, List<Document>> storedFacts() {
             return Map.of("queue", queue.find().into(new ArrayList<>()),
                     "profiles", profileDocuments.find().into(new ArrayList<>()),
+                    "membership", memberDocuments.find().into(new ArrayList<>()),
+                    "nodes", nodeDocuments.find().into(new ArrayList<>()),
                     "claims", claims.find().into(new ArrayList<>()),
                     "capacity", occupancy.find().into(new ArrayList<>()),
                     "state", stateDocuments.find().into(new ArrayList<>()),

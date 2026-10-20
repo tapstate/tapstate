@@ -26,6 +26,15 @@ public interface ClusterRecoveryStore {
 
     Optional<ClusterRecoveryItem> read(ClusterRecoveryKey key);
 
+    /**
+     * Read-only attribution of this exact untransferred permit to its recorded pipeline authority.
+     * Missing or changed evidence remains unknown. This neither releases occupancy nor authorizes
+     * another execution; the owner must retire its exact claim before normal expiry can release it.
+     */
+    default Optional<WorkloadClaimFence> unallocatedPermitPipelineClaim(ClusterRecoveryItem expected) {
+        return Optional.empty();
+    }
+
     /** A bounded read of active items and latest terminal results, ordered by enqueue sequence. */
     List<ClusterRecoveryItem> list(String clusterId, int offset, int limit);
 

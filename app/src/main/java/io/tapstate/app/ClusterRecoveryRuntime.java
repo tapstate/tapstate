@@ -191,8 +191,20 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         if (item != null && !item.status().terminal()
                 && item.event().intentFingerprint().equals(DesiredStateFingerprint.of(intent))
                 && (resume == null || item.event().originalExecutionGeneration() > resume.originalClaim().executionGeneration())) {
-            if (item.permit() == null || !item.permit().demandByNode().equals(facts.perMemberUpperBounds())
-                    || !item.targetProfile().equals(profile)) { return false; }
+            if (item.permit() == null || !item.targetProfile().equals(profile)) { return false; }
+            if (!item.permit().demandByNode().equals(facts.perMemberUpperBounds())) {
+                if (!item.permit().demandByNode().keySet().equals(facts.perMemberUpperBounds().keySet())
+                        && verdictRecorded(current) && current.failureAfterMemberLoss()
+                        && current.claimGeneration() > current.executionClaimGeneration()
+                        && unallocatedMemberLoss(item, current, intent)) {
+                    WorkloadClaimFence recorded = stores.clusterRecovery().unallocatedPermitPipelineClaim(item).orElse(null);
+                    // Only this obsolete reservation's own controller retires. A later controller must
+                    // keep its tenure while the original horizon and normal expiry release are pending.
+                    if (recorded != null && recorded.sameAuthorityAs(WorkloadClaimFence.from(current))
+                            && ownership.retireStoppedExecution(current)) { allocations.remove(pipelineId); }
+                }
+                return false;
+            }
             allocations.put(pipelineId, new Allocation(facts, profile, key, null, true));
             return true;
         }

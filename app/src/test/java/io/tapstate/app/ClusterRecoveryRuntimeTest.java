@@ -415,6 +415,81 @@ class ClusterRecoveryRuntimeTest {
         assertNoNativeSubmission();
     }
 
+    @Test void anUnallocatedCohortChangeRetiresOnlyItsRecordedPipelineControllerOnce() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim controller = pending.held().get();
+        Set<String> survivors = NODES.stream().sorted().limit(NODES.size() - 1).collect(java.util.stream.Collectors.toSet());
+        when(gate.visibleNodeIds()).thenReturn(survivors);
+        WorkloadClaimFence recorded = new WorkloadClaimFence(controller.key(), controller.owner(), controller.claimGeneration(),
+                controller.executionGeneration(), controller.topologyRevision() - 1, controller.profileGeneration());
+        when(store.clusterRecovery().unallocatedPermitPipelineClaim(pending.item().get()))
+                .thenReturn(Optional.of(recorded));
+        when(ownership.retireStoppedExecution(controller)).thenReturn(true);
+
+        assertThat(runtime.prepare("p", plan(List.of(), survivors), ownership)).isFalse();
+        verify(ownership).retireStoppedExecution(controller);
+        assertThat(pending.item().get().attempt()).isZero();
+        assertThat(pending.item().get().successor()).isNull();
+
+        WorkloadClaim next = controllerWithVerdict(3, 1, 1, true);
+        pending.held().set(next);
+        assertThat(runtime.prepare("p", plan(List.of(), survivors), ownership)).isFalse();
+        verify(ownership, times(1)).retireStoppedExecution(any());
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void missingOrDifferentUnallocatedProvenanceCannotRetireTheCurrentController() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        WorkloadClaim current = pending.held().get();
+        Set<String> survivors = NODES.stream().sorted().limit(NODES.size() - 1).collect(java.util.stream.Collectors.toSet());
+        when(gate.visibleNodeIds()).thenReturn(survivors);
+        for (Optional<WorkloadClaimFence> fact : List.of(Optional.<WorkloadClaimFence>empty(),
+                Optional.of(new WorkloadClaimFence(current.key(), new WorkloadOwner("b", "boot-b"), current.claimGeneration(),
+                        current.executionGeneration(), current.topologyRevision(), current.profileGeneration())),
+                Optional.of(new WorkloadClaimFence(current.key(), current.owner(), current.claimGeneration() + 1,
+                        current.executionGeneration(), current.topologyRevision(), current.profileGeneration())),
+                Optional.of(new WorkloadClaimFence(current.key(), current.owner(), current.claimGeneration(),
+                        current.executionGeneration() + 1, current.topologyRevision(), current.profileGeneration())),
+                Optional.of(new WorkloadClaimFence(current.key(), current.owner(), current.claimGeneration(),
+                        current.executionGeneration(), current.topologyRevision(), current.profileGeneration() + 1)))) {
+            when(store.clusterRecovery().unallocatedPermitPipelineClaim(pending.item().get())).thenReturn(fact);
+            assertThat(runtime.prepare("p", plan(List.of(), survivors), ownership)).isFalse();
+        }
+        verify(ownership, never()).retireStoppedExecution(any());
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void resourceChangesWithinTheSameCohortCannotRetireAnUnallocatedController() {
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        assertThat(runtime.prepare("p", pending.planned(), ownership)).isTrue();
+        assertThat(runtime.prepare("p", plan(List.of(), NODES, new ClusterCapacityDemand(2, 0, 1, 2, 4, 5)), ownership)).isFalse();
+        verify(store.clusterRecovery(), never()).unallocatedPermitPipelineClaim(any());
+        verify(ownership, never()).retireStoppedExecution(any());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
+    @Test void explicitIntentAndOrdinaryFailureCannotRetireAnUnallocatedRecoveryControllerForCohortChange() {
+        Set<String> survivors = NODES.stream().sorted().limit(NODES.size() - 1).collect(java.util.stream.Collectors.toSet());
+        when(gate.visibleNodeIds()).thenReturn(survivors);
+        for (DesiredState intent : List.of(
+                new DesiredState("p", PipelineState.RUNNING, "a".repeat(64), true),
+                new DesiredState("p", PipelineState.RUNNING, "a".repeat(64), false, null, true, 2L),
+                new DesiredState("p", PipelineState.RUNNING, "a".repeat(64), false, null, false, 2L))) {
+            when(store.desired().read("p")).thenReturn(Optional.of(intent));
+            unallocatedMemberLossController();
+            assertThat(runtime.prepare("p", plan(List.of(), survivors), ownership)).isFalse();
+        }
+        when(store.desired().read("p")).thenReturn(Optional.of(new DesiredState("p", PipelineState.RUNNING, "a".repeat(64))));
+        RecoveryPermitStart pending = unallocatedMemberLossController();
+        pending.held().set(controllerWithVerdict(2, 1, 1, false));
+        assertThat(runtime.prepare("p", plan(List.of(), survivors), ownership)).isFalse();
+        verify(store.clusterRecovery(), never()).unallocatedPermitPipelineClaim(any());
+        verify(ownership, never()).retireStoppedExecution(any());
+        verifyNoInteractions(capacity, captures, engine);
+    }
+
     @Test void aPendingOrdinaryAllocationRefusesAReincarnatedMemberWithTheSameStableId() {
         useLiveMembers(ORIGINAL_MEMBERS);
         when(gate.committed()).thenReturn(new ClusterMembership("cluster", 7, NODES, 2));
@@ -1585,7 +1660,11 @@ class ClusterRecoveryRuntimeTest {
     }
 
     private DagSource.PlannedStart plan(List<String> unknown, Set<String> nodes) {
-        Map<String, ClusterCapacityDemand> demands = nodes.stream().collect(java.util.stream.Collectors.toMap(node -> node, node -> demand));
+        return plan(unknown, nodes, demand);
+    }
+
+    private DagSource.PlannedStart plan(List<String> unknown, Set<String> nodes, ClusterCapacityDemand requested) {
+        Map<String, ClusterCapacityDemand> demands = nodes.stream().collect(java.util.stream.Collectors.toMap(node -> node, node -> requested));
         ClusterCapacityDemand total = demands.values().stream().reduce(ClusterCapacityDemand.ZERO, ClusterCapacityDemand::plus);
         var facts = new DagSource.PlanningFacts(nodes.stream().sorted().toList(), new ExecutionShape(nodes.size(), Map.of(), Map.of()),
                 demands, total,

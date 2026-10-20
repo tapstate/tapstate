@@ -65,6 +65,34 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
     }
 
     @Override
+    public Optional<WorkloadClaimFence> unallocatedPermitPipelineClaim(ClusterRecoveryItem expected) {
+        Objects.requireNonNull(expected, "expected");
+        return capacity.profileStore.transaction(session -> {
+            Document stored = queue.find(session, new Document("_id", ClusterRecoveryDocuments.id(expected.event().key()))
+                    .append("itemRevision", expected.itemRevision())).first();
+            if (stored == null) { return Optional.empty(); }
+            ClusterRecoveryItem item = ClusterRecoveryDocuments.item(stored);
+            ClusterRecoveryPermit permit = item.permit();
+            if (!item.equals(expected) || item.status().terminal() || permit == null || permit.transferredExecutionGeneration() != 0
+                    || item.successor() != null) { return Optional.empty(); }
+            Document row = capacity.occupancy.find(session, new Document("_id", permit.reservationId())
+                    .append("recovery", true).append("executionGeneration", null).append("nativeJobId", null)).first();
+            if (row == null) { return Optional.empty(); }
+            ClusterCapacityReservation reservation = MongoClusterCapacityStore.reservation(row);
+            ClusterRecoveryKey key = item.event().key();
+            if (!reservation.clusterId().equals(key.clusterId()) || !reservation.pipelineId().equals(key.pipelineId())
+                    || !reservation.incarnationId().equals(key.incarnation())
+                    || !reservation.intentFingerprint().equals(item.event().intentFingerprint())
+                    || !reservation.profile().equals(item.targetProfile())
+                    || !reservation.demandByNode().equals(permit.demandByNode())
+                    || !reservation.reservedAt().equals(permit.reservedAt())
+                    || reservation.pipelineClaim().profileGeneration() != item.targetProfile().generation()
+                    || reservation.pipelineClaim().executionGeneration() != item.executionFrontier()) { return Optional.empty(); }
+            return Optional.of(reservation.pipelineClaim());
+        });
+    }
+
+    @Override
     public List<ClusterRecoveryItem> list(String clusterId, int offset, int limit) {
         if (offset < 0 || limit < 1) {
             throw new IllegalArgumentException("queue offset must be non-negative and limit must be positive");
