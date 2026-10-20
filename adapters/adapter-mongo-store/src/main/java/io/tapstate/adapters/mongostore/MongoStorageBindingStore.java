@@ -147,8 +147,13 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 Optional<Loaded> previous = load(session);
                 if (previous.isPresent()) {
                     Loaded loaded = previous.get();
-                    if (!expected.equals(loaded.binding().setup()) || mode != loaded.binding().mode()
+                    StorageSetupScope original = loaded.binding().setup();
+                    Document stage = setup.find(session, new Document("_id", "cluster")).first();
+                    if (!expected.clusterId().equals(original.clusterId())
+                            || !expected.installationId().equals(original.installationId())
+                            || !expected.operationId().equals(original.operationId()) || mode != loaded.binding().mode()
                             || !candidateHash.equals(loaded.candidateHash())) throw refused();
+                    requireSetup(stage, expected, stage.getString("phase"));
                     return new Committed(loaded.binding(), loaded.cachePreparation(), false);
                 }
                 Document state = setup.find(session, new Document("_id", "cluster")).first();

@@ -48,6 +48,58 @@ class MongoStorageBindingStoreIT {
             "cache", "CA-material-sentinel");
 
     @Test
+    void setupGenerationReissueRevokesOldWritesAndPreservesTheOriginalBinding() {
+        withPrepared(f -> {
+            var original = f.domain.setupStates().load();
+            assertThat(original.scope()).isEqualTo(SCOPE);
+            assertThat(original.phase()).isEqualTo(io.tapstate.spi.store.StorageSetupStateStore.Phase.CONFIG_PREPARED);
+            var master = source("views", "secret");
+            f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, master);
+            var bound = f.domain.bindings().load().orElseThrow();
+            var next = f.domain.setupStates().rotate(SCOPE, io.tapstate.spi.store.StorageSetupStateStore.Purpose.SETUP);
+            assertThat(next.scope().generation()).isEqualTo(2);
+            assertThatThrownBy(() -> f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, master))
+                    .isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.domain.bindings().complete(SCOPE)).isInstanceOf(TapstateException.class);
+            assertThat(f.domain.bindings().commit(next.scope(), StorageBinding.Mode.OP, CACHE, master)).isEqualTo(bound);
+            f.domain.bindings().complete(next.scope());
+            assertThatThrownBy(() -> f.domain.setupStates().rotate(next.scope(), io.tapstate.spi.store.StorageSetupStateStore.Purpose.SETUP))
+                    .isInstanceOf(TapstateException.class);
+            var first = f.domain.setupStates().rotate(next.scope(), io.tapstate.spi.store.StorageSetupStateStore.Purpose.FIRST_ADMIN);
+            assertThat(first.scope().generation()).isEqualTo(3);
+            assertThat(f.domain.firstAdmin().load().orElseThrow().scope()).isEqualTo(first.scope());
+            assertThatThrownBy(() -> f.domain.firstAdmin().create(next.scope(), new io.tapstate.spi.store.User("old", "hash", "admin")))
+                    .isInstanceOf(TapstateException.class);
+            f.domain.firstAdmin().create(first.scope(), new io.tapstate.spi.store.User("admin", "hash", "admin"));
+            assertThatThrownBy(() -> f.domain.setupStates().rotate(first.scope(), io.tapstate.spi.store.StorageSetupStateStore.Purpose.FIRST_ADMIN))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.domain.bindings().load()).contains(bound);
+        });
+    }
+
+    @Test
+    void independentSetupIssuersCompeteOnTheSameConfigurationGeneration() throws Exception {
+        withPrepared(f -> {
+            try (var other = MongoConfigurationDomain.open(f.settings, SCOPE.clusterId()); var threads = Executors.newFixedThreadPool(2)) {
+                var start = new CountDownLatch(1);
+                var results = new java.util.ArrayList<java.util.concurrent.Future<Boolean>>();
+                for (var states : List.of(f.domain.setupStates(), other.setupStates())) results.add(threads.submit(() -> {
+                    start.await();
+                    try { states.rotate(SCOPE, io.tapstate.spi.store.StorageSetupStateStore.Purpose.SETUP); return true; }
+                    catch (TapstateException refused) { return false; }
+                }));
+                start.countDown();
+                int winners = 0;
+                for (var result : results) try { if (result.get(10, TimeUnit.SECONDS)) winners++; }
+                catch (Exception failure) { throw new AssertionError(failure); }
+                assertThat(winners).isEqualTo(1);
+                assertThat(f.domain.setupStates().load().scope().generation()).isEqualTo(2);
+                assertThat(f.revision()).isEqualTo(1);
+            }
+        });
+    }
+
+    @Test
     void bindingAllocatesOneOriginalCacheIdentityAcrossReplayCompletionAndRestart() {
         for (var mode : StorageBinding.Mode.values()) {
             withPrepared(f -> {

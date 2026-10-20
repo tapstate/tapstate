@@ -194,6 +194,39 @@ public final class MongoConnection implements AutoCloseable {
         }
     }
 
+    /**
+     * Exercises the storage permission set on an isolated namespace, including index creation and
+     * multi-document transactional CRUD. The transaction is always aborted; no probe namespace or
+     * document becomes durable, including when authorization fails halfway through the check.
+     */
+    public void verifyStoragePermissions() {
+        UUID probeId = UUID.randomUUID();
+        var collection = SystemCollections.accessProbeOn(database(), probeId);
+        String id = probeId.toString();
+        try (var session = client().startSession()) {
+            session.startTransaction(TransactionOptions.builder().readConcern(ReadConcern.LOCAL)
+                    .writeConcern(WriteConcern.MAJORITY.withJournal(true))
+                    .timeout(Math.max(1L, settings.serverSelectionTimeout().toMillis()), TimeUnit.MILLISECONDS).build());
+            try {
+                collection.createIndex(session, new Document("value", 1),
+                        new com.mongodb.client.model.IndexOptions().name("storage_probe_value").unique(true));
+                collection.insertOne(session, new Document("_id", id).append("value", "initial"));
+                Document read = collection.find(session, new Document("_id", id)).first();
+                if (read == null || !"initial".equals(read.get("value"))
+                        || collection.updateOne(session, new Document("_id", id),
+                        new Document("$set", new Document("value", "updated"))).getModifiedCount() != 1
+                        || collection.deleteOne(session, new Document("_id", id)).getDeletedCount() != 1) {
+                    throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED,
+                            Map.of("database", databaseName), null);
+                }
+            } finally {
+                if (session.hasActiveTransaction()) session.abortTransaction();
+            }
+        } catch (MongoException refused) {
+            throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED, Map.of("database", databaseName), null);
+        }
+    }
+
     /** Verifies existing Source envelopes and logical identity before handing out the store connection. */
     private void verifySourceConfigStorage() {
         EncryptedArtifactCodec codec = new EncryptedArtifactCodec(sourceConfigKeyring);
@@ -372,7 +405,8 @@ public final class MongoConnection implements AutoCloseable {
             if (credential == null || credential.getPassword() == null || !"admin".equals(credential.getSource())
                     || (credential.getAuthenticationMechanism() != null
                     && credential.getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_256)) throw unsupportedStorage();
-            builder.credential(credential.withMechanism(AuthenticationMechanism.SCRAM_SHA_256));
+            builder.credential(credential.getAuthenticationMechanism() == null
+                    ? credential.withMechanism(AuthenticationMechanism.SCRAM_SHA_256) : credential);
         }
         if (useTls && caPem != null) {
             builder.applyToSslSettings(b -> b.context(buildPemSslContext(caPem)));

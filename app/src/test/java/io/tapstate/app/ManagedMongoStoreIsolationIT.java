@@ -112,6 +112,38 @@ class ManagedMongoStoreIsolationIT {
     }
 
     @Test
+    void storageProbeRequiresTransactionalCrudAndIndexPrivilegesWithoutKeepingProbeNamespaces() {
+        String database = "setup_probe_" + UUID.randomUUID().toString().replace("-", "");
+        String writer = "writer_" + database;
+        String reader = "reader_" + database;
+        String noIndex = "noindex_" + database;
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, writer, List.of(database));
+            admin.getDatabase("admin").runCommand(new Document("createUser", reader).append("pwd", PASSWORD)
+                    .append("roles", List.of(new Document("role", "read").append("db", database))));
+            admin.getDatabase(database).runCommand(new Document("createRole", "crud_without_indexes")
+                    .append("roles", List.of()).append("privileges", List.of(new Document("resource",
+                            new Document("db", database).append("collection", ""))
+                            .append("actions", List.of("find", "insert", "update", "remove", "createCollection", "listCollections")))));
+            admin.getDatabase("admin").runCommand(new Document("createUser", noIndex).append("pwd", PASSWORD)
+                    .append("roles", List.of(new Document("role", "crud_without_indexes").append("db", database))));
+            for (String user : List.of(writer, reader, noIndex)) {
+                var candidate = new io.tapstate.spi.store.StorageBinding.Connection(
+                        io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, database), database, null);
+                try (var connection = io.tapstate.adapters.mongostore.MongoConnection.forCache(candidate, Duration.ofSeconds(5), null)) {
+                    connection.verifyConnectivity();
+                    if (user.equals(writer)) connection.verifyStoragePermissions();
+                    else assertThatThrownBy(connection::verifyStoragePermissions)
+                            .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                    failure -> assertThat(failure.code()).isEqualTo(
+                                            io.tapstate.adapters.mongostore.StoreError.DATABASE_ACCESS_FAILED));
+                }
+                assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>())).isEmpty();
+            }
+        }
+    }
+
+    @Test
     void twoClusterUsersCanUseOnlyTheirOwnThreeDatabasesAndRecoverAfterRestart() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String a = "isolation_a_" + suffix;
