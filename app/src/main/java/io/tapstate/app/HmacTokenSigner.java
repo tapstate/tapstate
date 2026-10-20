@@ -42,11 +42,20 @@ public final class HmacTokenSigner implements TokenSigner {
     private final byte[] secret;
     private final Duration ttl;
     private final Clock clock;
+    private final io.tapstate.spi.store.CacheAuthScope authScope;
 
     public HmacTokenSigner(byte[] secret, Duration ttl, Clock clock) {
+        this(secret, ttl, clock, null);
+    }
+
+    /** A formal OP issuer binds access tokens to its original durable authentication identity. */
+    public HmacTokenSigner(byte[] secret, Duration ttl, Clock clock, io.tapstate.spi.store.CacheAuthScope authScope) {
         Objects.requireNonNull(secret, "secret");
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.authScope = authScope;
+        if (authScope != null && authScope.mode() != io.tapstate.spi.store.StorageBinding.Mode.OP)
+            throw new IllegalArgumentException("the local token issuer requires an OP authentication scope");
         if (secret.length == 0) {
             throw new IllegalArgumentException("token signing secret must not be empty");
         }
@@ -96,6 +105,7 @@ public final class HmacTokenSigner implements TokenSigner {
             String subject = claims.get("sub");
             String scopeName = claims.get("scope");
             String expText = claims.get("exp");
+            if (!matchesScope(claims)) return Optional.empty();
             if (subject == null || scopeName == null || expText == null) {
                 return Optional.empty();
             }
@@ -126,11 +136,28 @@ public final class HmacTokenSigner implements TokenSigner {
     }
 
     /** Builds the flat claims object; the subject is JSON-escaped, the rest are safe literals. */
-    private static String claimsJson(String subject, Scope scope, long iat, long exp) {
+    private String claimsJson(String subject, Scope scope, long iat, long exp) {
         return "{\"sub\":" + jsonString(subject)
                 + ",\"scope\":" + jsonString(scope.name())
                 + ",\"iat\":" + iat
-                + ",\"exp\":" + exp + "}";
+                + ",\"exp\":" + exp + scopeClaims() + "}";
+    }
+
+    private String scopeClaims() {
+        if (authScope == null) return "";
+        return ",\"clusterId\":" + jsonString(authScope.clusterId())
+                + ",\"bindingVersion\":" + authScope.bindingVersion()
+                + ",\"cacheIncarnation\":" + jsonString(authScope.cacheIncarnation())
+                + ",\"authGeneration\":" + authScope.authGeneration();
+    }
+
+    private boolean matchesScope(Map<String,String> claims) {
+        if (authScope == null) return java.util.Collections.disjoint(claims.keySet(),
+                java.util.Set.of("clusterId", "bindingVersion", "cacheIncarnation", "authGeneration"));
+        return authScope.clusterId().equals(claims.get("clusterId"))
+                && Long.toString(authScope.bindingVersion()).equals(claims.get("bindingVersion"))
+                && authScope.cacheIncarnation().equals(claims.get("cacheIncarnation"))
+                && Long.toString(authScope.authGeneration()).equals(claims.get("authGeneration"));
     }
 
     /** Writes a JSON string literal, escaping the quote, backslash and control characters. */

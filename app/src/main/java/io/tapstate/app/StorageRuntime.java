@@ -1,0 +1,173 @@
+package io.tapstate.app;
+
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.control.core.ControlError;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CachePreparation;
+import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.StorageSetupStateStore;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
+
+/** Owns CONFIG independently from one original cache connection and its admitted runtime resources. */
+final class StorageRuntime implements AutoCloseable {
+    interface Business extends AutoCloseable {
+        /** Resources are registered with this owner before startup creates members or background work. */
+        void start();
+        @Override void close();
+    }
+    private final MongoConfigurationDomain configuration;
+    private final Function<StorageBinding, MongoCacheDomain> connections;
+    private Bound bound;
+    private AutoCloseable business;
+    private volatile boolean closed;
+    private boolean cleanupUnknown;
+
+    StorageRuntime(MongoConfigurationDomain configuration, Function<StorageBinding, MongoCacheDomain> connections) {
+        this.configuration = configuration;
+        this.connections = Objects.requireNonNull(connections, "connections");
+    }
+
+    synchronized Optional<MongoConfigurationDomain> configuration() {
+        requireOpen(); return Optional.ofNullable(configuration);
+    }
+
+    synchronized MongoConfigurationDomain requireConfiguration() {
+        return configuration().orElseThrow(StorageRuntime::unavailable);
+    }
+
+    /** An ordinary restart only loads retained identities; it never creates auth or business facts. */
+    synchronized Optional<Bound> loadBound() {
+        requireOpen();
+        if (configuration == null) return Optional.empty();
+        var binding = configuration.bindings().load();
+        if (binding.isEmpty()) {
+            if (bound != null) throw unavailable();
+            return Optional.empty();
+        }
+        var preparation = configuration.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable);
+        if (bound != null) {
+            if (!bound.binding.equals(binding.orElseThrow()) || !bound.preparation.equals(preparation)) throw unavailable();
+            bound.requireActive(); return Optional.of(bound);
+        }
+        if (cleanupUnknown) throw unavailable();
+        MongoCacheDomain cache = connections.apply(binding.orElseThrow());
+        try {
+            Bound candidate = new Bound(binding.orElseThrow(), preparation, cache);
+            bound = candidate;
+            return Optional.of(candidate);
+        } catch (RuntimeException | Error failure) {
+            try { cache.close(); } catch (RuntimeException | Error cleanup) {
+                cleanupUnknown = true;
+                if (cleanup != failure) failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
+    }
+
+    synchronized Optional<Bound> current() { requireOpen(); return Optional.ofNullable(bound); }
+
+    /** The caller passes the original owner, so a late callback cannot activate or close its successor. */
+    synchronized void startBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
+        requireOriginal(original);
+        if (business != null) return;
+        if (cleanupUnknown) throw unavailable();
+        verifyCompletedSetup(original);
+        original.requireAuthentication(); original.verifyBusiness();
+        Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
+        try {
+            candidate.start();
+            requireOriginal(original);
+            verifyCompletedSetup(original);
+            original.requireActive();
+            business = candidate;
+        } catch (RuntimeException | Error failure) {
+            closeCandidate(candidate, failure);
+            throw failure;
+        }
+    }
+
+    synchronized boolean businessStarted() { return !closed && business != null; }
+
+    private void verifyCompletedSetup(Bound original) {
+        if (loadBound().orElseThrow(StorageRuntime::unavailable) != original) throw unavailable();
+        var status = configuration.setupStates().load();
+        var setup = original.binding.setup();
+        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE
+                || status.bindingVersion() != original.binding.bindingVersion()
+                || !status.scope().clusterId().equals(setup.clusterId())
+                || !status.scope().installationId().equals(setup.installationId())
+                || !status.scope().operationId().equals(setup.operationId())) throw unavailable();
+    }
+
+    private void requireOriginal(Bound original) {
+        requireOpen();
+        if (bound != original || original == null) throw unavailable();
+        original.requireActive();
+    }
+
+    private void requireOpen() { if (closed) throw unavailable(); }
+
+    final class Bound {
+        private final StorageBinding binding;
+        private final CachePreparation preparation;
+        private final MongoCacheDomain cache;
+        private volatile boolean active = true;
+        private volatile boolean authReady;
+        private volatile boolean businessReady;
+
+        private Bound(StorageBinding binding, CachePreparation preparation, MongoCacheDomain cache) {
+            this.binding = binding; this.preparation = preparation; this.cache = Objects.requireNonNull(cache, "cache");
+            var scope = preparation.authScope();
+            if (!binding.setup().clusterId().equals(scope.clusterId()) || binding.bindingVersion() != scope.bindingVersion()
+                    || binding.mode() != scope.mode()) throw new IllegalArgumentException("original cache scope disagrees with binding");
+        }
+        StorageBinding binding() { requireActive(); return binding; }
+        CachePreparation preparation() { requireActive(); return preparation; }
+        MongoCacheDomain cache() { requireActive(); return cache; }
+        void requireActive() { if (!active || closed) throw unavailable(); }
+        void verifyAuthentication() {
+            requireActive(); authReady = false; cache.loadAuthScope(preparation.authScope()); requireActive(); authReady = true;
+        }
+        void verifyBusiness() {
+            requireActive(); businessReady = false; cache.loadBusinessScope(preparation.businessScope()); requireActive(); businessReady = true;
+        }
+        void requireAuthentication() { requireActive(); if (!authReady) throw unavailable(); }
+        void requireBusiness() { requireActive(); if (!businessReady) throw unavailable(); }
+        @Override public String toString() { return "BoundStorageRuntime[redacted]"; }
+    }
+
+    @Override public synchronized void close() {
+        if (closed) return;
+        closed = true;
+        if (bound != null) bound.active = false;
+        Throwable failure = null;
+        if (business != null) {
+            try { business.close(); } catch (Exception | Error stopped) { failure = stopped; }
+        }
+        if (bound != null) {
+            try { bound.cache.close(); } catch (RuntimeException | Error stopped) {
+                if (failure == null) failure = stopped; else if (failure != stopped) failure.addSuppressed(stopped);
+            }
+        }
+        if (configuration != null) {
+            try { configuration.close(); } catch (RuntimeException | Error stopped) {
+                if (failure == null) failure = stopped; else if (failure != stopped) failure.addSuppressed(stopped);
+            }
+        }
+        if (failure instanceof Error error) throw error;
+        if (failure != null) throw unavailable();
+    }
+
+    private void closeCandidate(AutoCloseable candidate, Throwable failure) {
+        if (candidate == null) return;
+        try { candidate.close(); } catch (Exception | Error cleanup) {
+            cleanupUnknown = true;
+            if (cleanup != failure) failure.addSuppressed(cleanup);
+        }
+    }
+    static TapstateException unavailable() { return new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null); }
+}

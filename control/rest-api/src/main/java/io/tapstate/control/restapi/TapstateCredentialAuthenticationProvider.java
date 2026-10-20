@@ -23,13 +23,14 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
     @Override
     public Authentication authenticate(Authentication authentication) {
         TapstateCredentialAuthenticationToken credential = (TapstateCredentialAuthenticationToken) authentication;
-        VerifiedToken verified = credentials.authenticate(credential.credential())
+        var original = credentials.authenticateContext(credential.credential())
                 .orElseThrow(() -> new BadCredentialsException("invalid bearer credential"));
+        VerifiedToken verified = original.token();
         TapstatePrincipal principal = TokenService.isMachineToken(credential.credential())
                 ? TapstatePrincipal.machineToken(verified)
                 : CloudSessionService.isSessionToken(credential.credential())
                         ? TapstatePrincipal.cloudSession(verified) : TapstatePrincipal.humanJwt(verified);
-        return new TapstateAuthentication(principal);
+        return new TapstateAuthentication(principal, original);
     }
 
     @Override

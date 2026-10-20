@@ -108,6 +108,23 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
     }
 
+    /** An OP restart reads its existing identity from the owner-selected configuration endpoint; it never creates one. */
+    public static MongoConfigurationDomain openExisting(MongoConnectionSettings settings) {
+        MongoConnection connection = MongoConnection.forConfiguration(settings);
+        try {
+            connection.verifyConnectivity();
+            Document identity = StoreIo.call(() -> durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(connection.database()))
+                    .find(new Document("_id", "cluster")).first());
+            if (identity == null || !(identity.get("clusterId") instanceof String clusterId) || clusterId.isBlank())
+                throw unreadable("cluster", "identity");
+            return new MongoConfigurationDomain(connection, clusterId);
+        } catch (RuntimeException | Error failure) {
+            connection.close(); throw failure;
+        }
+    }
+
+    public String clusterId() { requireOpen(); return clusterId; }
+
     public ArtifactStore artifacts() {
         return artifacts;
     }
