@@ -406,9 +406,15 @@ def reset_test_evidence(root, shard):
             path.unlink(missing_ok=True)
 
 
-def validate_provenance(value, plan, shard):
+def validate_provenance(value, plan, shard, retained=False):
     identity = execution_identity()
     require(isinstance(value, dict), 'invalid run provenance object')
+    if retained and identity['execution'] == 'github-actions':
+        attempt = value.get('run_attempt')
+        require(type(attempt) is int and 0 < attempt <= identity['run_attempt'],
+                'invalid retained producer attempt: ' + shard['id'])
+        # Validate every phase against its own successful producer, never rewrite it.
+        identity = {**identity, 'run_attempt': attempt}
     require(type(value.get('schema')) is int and value['schema'] == 1 and value.get('source_sha') == plan['source_sha']
             and value.get('cohort_hash') == plan['cohort_hash'] and value.get('shard_id') == shard['id']
             and all(value.get(k) == v for k, v in identity.items()), 'run provenance differs: ' + shard['id'])
@@ -956,7 +962,7 @@ def verify(args, root, plan):
         provenance = manifest.pop('provenance')
         marker = manifest.pop('provenance_path')
         ledgers = manifest.pop('witness_ledgers')
-        validate_provenance(provenance, plan, shard)
+        validate_provenance(provenance, plan, shard, retained=True)
         require(marker == provenance_path(shard).as_posix(), 'run provenance path differs')
         require(isinstance(ledgers, list) and ledgers == sorted(set(ledgers))
                 and all(re.fullmatch(r'e2e/target/(?:witness-ledger\.txt|witness-ledgers/[0-9]+\.txt)', p) for p in ledgers)

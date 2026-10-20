@@ -50,6 +50,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ci-shard-plan
+          overwrite: true
           path: |
             ${{ runner.temp }}/shards.json
             ${{ runner.temp }}/ci-event-inputs.json
@@ -163,6 +164,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ci-test-results-${{ matrix.shard }}
+          overwrite: true
           path: ${{ runner.temp }}/ci-artifacts/
           if-no-files-found: error
           retention-days: 7
@@ -170,6 +172,7 @@ jobs:
         if: always()
         with:
           name: ci-inputs-${{ matrix.shard }}
+          overwrite: true
           path: ${{ runner.temp }}/ci-inputs/
           if-no-files-found: error
           retention-days: 7
@@ -178,6 +181,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-failure-${{ matrix.shard }}
+          overwrite: true
           path: |
             **/target/surefire-reports/
             **/target/failsafe-reports/
@@ -272,11 +276,12 @@ jobs:
           pattern: ci-inputs-*
           path: ${{ runner.temp }}/ci-shard-inputs
       - name: Admit independent build input hashes
-        run: .github/scripts/ci-receipt.sh compare-inputs --root . --plan "$RUNNER_TEMP/shards.json" --inputs-root "$RUNNER_TEMP/ci-shard-inputs" --aggregate-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --output "$RUNNER_TEMP/ci-inputs/build-input-equivalence.json"
+        run: .github/scripts/ci-receipt.sh compare-inputs --root . --plan "$RUNNER_TEMP/shards.json" --inputs-root "$RUNNER_TEMP/ci-shard-inputs" --aggregate-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --output "$RUNNER_TEMP/ci-inputs/build-input-equivalence.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ci-inputs-build
+          overwrite: true
           path: ${{ runner.temp }}/ci-inputs/
           if-no-files-found: error
           retention-days: 7
@@ -442,6 +447,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-aggregate
+          overwrite: true
           path: |
             target/ci-shards/
             target/jacoco-reactor.exec

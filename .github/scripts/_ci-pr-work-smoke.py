@@ -80,6 +80,15 @@ with tempfile.TemporaryDirectory(prefix='ci-pr-work-') as temporary:
     def planner_snapshot(body, env=environment):
         return w.receipt.event_snapshot(repo, body, {**env, 'GITHUB_JOB': 'shard-plan'})
     check(w.scope(repo, original, environment)['head_sha'] == head, 'actual merge checkout binds the original head')
+    retry_environment = {**environment, 'GITHUB_RUN_ATTEMPT': '2'}
+    check(w.scope(repo, original, retry_environment)['head_sha'] == head,
+          'a retried worker retains the same original plan event from an earlier attempt')
+    for attempt in (0, 3, True, '1'):
+        changed_attempt = copy.deepcopy(original); changed_attempt['run_attempt'] = attempt
+        rejected(lambda: w.scope(repo, changed_attempt, retry_environment),
+                 'missing, future or malformed planner attempts cannot authorize work')
+    foreign_retry = copy.deepcopy(original); foreign_retry['run_id'] += 1
+    rejected(lambda: w.scope(repo, foreign_retry, retry_environment), 'retry cannot reuse a plan from another run')
     missing_environment = {k: v for k, v in environment.items() if k not in ('GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_JOB')}
     missing_original = w.receipt.event_snapshot(repo, payload, missing_environment)
     check(w.scope(repo, missing_original, missing_environment) is None, 'missing workflow binding never authorizes termination')

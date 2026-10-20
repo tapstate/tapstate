@@ -27,6 +27,23 @@ captured byte hash remain compared. Unknown or inconsistent formats keep their
 original exact comparison. This does not waive toolchain changes during verify
 or certify compiler consumption.
 
+## Partial job retries
+
+A retained planner and successful shard producers may come from an earlier attempt
+of the same run. The run, event, checkout, source, shard and cohort stay bound;
+producer attempts remain recorded and cannot be zero, future, foreign or internally
+mixed. Worker-local reset, verify, pack and input observations remain exact to that
+worker's attempt. Aggregate input capture remains exact to the aggregate attempt.
+Actions input comparison also binds every selected successful result to the digest
+and attempt of its own prepared input. Missing or failed producers are not substitutes.
+
+Each CI upload replaces only its own same-run artifact name on a retry, using the
+artifact action's explicit overwrite behavior; downloads still select one name per
+role. Earlier remote ZIPs with that name are replaced, while already collected local
+archives and per-attempt job logs remain unchanged. This is latest-producer retention,
+not a claim that all superseded remote ZIP bytes remain downloadable. A retry is
+never relabeled as a first PR event or a qualified first-attempt comparison.
+
 ## Request and command
 
 The request has exactly `schema: 1`, `type: archive-inputs-request` and `source`,

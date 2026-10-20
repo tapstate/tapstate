@@ -736,8 +736,11 @@ def compare_input_snapshots(plan, aggregate, workers):
         require(isinstance(value, dict), 'invalid input snapshot: ' + name)
         require(type(value.get('schema')) is int and value['schema'] == 1
                 and value.get('phase') == 'pre-test-after-install', 'input is not a pre-test snapshot: ' + name)
+        producer_attempt = str(value.get('run_attempt'))
+        valid_attempt = (producer_attempt == attempt if run == 'local' else
+                         producer_attempt.isdecimal() and 0 < int(producer_attempt) <= int(attempt))
         require(value.get('source_sha') == source and value.get('run_id') == run
-                and str(value.get('run_attempt')) == attempt, 'input source/run/attempt differs: ' + name)
+                and valid_attempt, 'input source/run/attempt differs: ' + name)
         for field in BUILD_INPUT_FIELDS:
             observed, expected = value.get(field), aggregate[field]
             if field == 'toolchain':
@@ -783,6 +786,27 @@ def compare_input_snapshots(plan, aggregate, workers):
     if maven is not None:
         result['maven_execution_observation'] = maven
     return result
+
+
+def compare_input_producers(plan, workers, input_hashes, producers):
+    expected = {shard['id'] for shard in plan['shards']}
+    require(set(workers) == set(input_hashes) == set(producers) == expected,
+            'worker input producer set differs from the plan')
+    for name, value in workers.items():
+        producer = producers[name]
+        require(isinstance(producer, dict) and type(producer.get('schema')) is int
+                and producer['schema'] == 1 and producer.get('status') == 'success'
+                and producer.get('source_sha') == plan['source_sha']
+                and producer.get('cohort_hash') == plan['cohort_hash']
+                and producer.get('shard_id') == name
+                and producer.get('run_id') == value.get('run_id')
+                and type(producer.get('run_attempt')) is int
+                and str(producer['run_attempt']) == str(value.get('run_attempt')),
+                'worker input/result producer differs: ' + name)
+        observer = producer.get('case_observer')
+        require(isinstance(observer, dict) and observer.get('enabled') is True
+                and observer.get('build_inputs_sha256') == input_hashes[name],
+                'worker result is not bound to its prepared input snapshot: ' + name)
 
 
 def worker_input_paths(plan, worker_root):
@@ -832,6 +856,21 @@ def compare_inputs(args):
     require(aggregate.get('run_id') == expected_run and str(aggregate.get('run_attempt')) == str(expected_attempt),
             'aggregate input snapshot differs from the current run/attempt')
     result = compare_input_snapshots(plan, aggregate, workers)
+    artifacts = getattr(args, 'artifacts', None)
+    require(identity['execution'] != 'github-actions' or artifacts,
+            'Actions input comparison requires the successful shard result producers')
+    if artifacts:
+        artifact_root = Path(artifacts)
+        require(artifact_root.is_dir() and not artifact_root.is_symlink(), 'unsafe shard result root')
+        producers = {}
+        for name in workers:
+            directory = artifact_root / name
+            path = directory / 'manifest.json'
+            require(directory.is_dir() and not directory.is_symlink() and path.is_file()
+                    and not path.is_symlink() and path.stat().st_size <= 64 * 1024 * 1024,
+                    'unsafe or missing shard result manifest: ' + name)
+            producers[name] = json.loads(path.read_text())['provenance']
+        compare_input_producers(plan, workers, {name: digest(path) for name, path in worker_paths.items()}, producers)
     result['input_files'] = {'build': digest(aggregate_path), **{
         shard['id']: digest(worker_root / ('ci-inputs-' + shard['id']) / 'build-inputs.json')
         for shard in plan['shards']}}
@@ -1267,6 +1306,7 @@ def main():
     p.add_argument('--plan', required=True)
     p.add_argument('--inputs-root', required=True)
     p.add_argument('--aggregate-inputs', required=True)
+    p.add_argument('--artifacts', help='successful shard result manifests; required on Actions')
     p.add_argument('--output', required=True)
     p = commands.add_parser('event-inputs')
     p.add_argument('--root', default='.')

@@ -47,6 +47,14 @@ def check(workflows, contexts, inputs):
     assert 'ci-aggregate.sh verify' in build, 'build must admit the global report set'
     assert 'ci-receipt.sh compare-inputs' in build and 'pattern: ci-inputs-*' in build, \
         'build must compare every independent worker input snapshot before report admission'
+    input_command = re.search(r'^        run: (.*ci-receipt\.sh compare-inputs .*)$', build, re.M)
+    assert input_command and '--artifacts "$RUNNER_TEMP/ci-artifacts"' in input_command[1], 'worker inputs must bind the selected successful result producers'
+    for step in re.finditer(r'(?ms)^      - [^\n]+\n.*?(?=^      - |^  [A-Za-z]|\Z)', workflows['ci.yml']):
+        if not re.search(r'^        uses: actions/upload-artifact@v4$|^      - uses: actions/upload-artifact@v4$', step[0], re.M):
+            continue
+        settings = dict(re.findall(r'^          ([\w-]+): (.+)$', step[0], re.M))
+        if settings.get('name', '').startswith('ci-'):
+            assert settings.get('overwrite') == 'true', 'same-run retries must replace only their named role artifact'
     shards = ci.get('test-shards', '')
     assert 'matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}' in shards, \
         'workers must consume the planner matrix without a second shard list'
@@ -199,6 +207,8 @@ for original, replacement in [
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
     ('ci-receipt.sh compare-inputs', 'echo input-comparison-removed'),
+    (' --artifacts "$RUNNER_TEMP/ci-artifacts"', ''),
+    ('          overwrite: true', '          overwrite: false'),
     ('--shard-id "${{ matrix.shard }}"', '--shard-id omitted'),
     ('--shard-id build', '--shard-id omitted'),
     ('pattern: ci-inputs-*', 'pattern: no-worker-inputs'),

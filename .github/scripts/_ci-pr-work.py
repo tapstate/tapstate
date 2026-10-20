@@ -23,8 +23,13 @@ OBSOLETE = 78
 def scope(root, original, environment):
     payload = json.loads(Path(environment['GITHUB_EVENT_PATH']).read_text())
     actual = receipt.event_snapshot(root, payload, environment)
-    # The planner and worker have different job IDs; their event and checkout must agree.
-    comparable = lambda value: {k: v for k, v in value.items() if k != 'workflow_source'}
+    # Partial retries retain the successful planner from an earlier attempt.
+    receipt.require(type(original.get('run_attempt')) is int
+                    and type(actual.get('run_attempt')) is int
+                    and 0 < original['run_attempt'] <= actual['run_attempt'],
+                    'planner attempt is invalid or newer than the worker')
+    # Only attempt and job identity differ; event, run and checkout remain exact.
+    comparable = lambda value: {k: v for k, v in value.items() if k not in ('workflow_source', 'run_attempt')}
     receipt.require(comparable(original) == comparable(actual), 'worker event differs from original plan event')
     before = receipt.event_workflow_source(original, actual['repository'])
     now = receipt.event_workflow_source(actual, actual['repository'])

@@ -10,6 +10,7 @@ from collections import Counter
 import xml.etree.ElementTree as ET
 with tempfile.TemporaryDirectory() as tmp:
     root=pathlib.Path(tmp); artifacts=root/'artifacts'
+    os.environ.update(GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1')
     def put(path,text):
         p=root/path; p.parent.mkdir(parents=True,exist_ok=True); p.write_text(text)
     put('pom.xml','<project><modules><module>e2e</module><module>runtime/engine</module><module>core</module><module>app</module></modules></project>')
@@ -88,6 +89,35 @@ with tempfile.TemporaryDirectory() as tmp:
     assert not (root/'restored/e2e/target/witness-ledger.txt').exists(), 'raw shard ledgers must not collide'
     backup=root/'backup'; shutil.copytree(artifacts,backup)
     def reset(): shutil.rmtree(artifacts); shutil.copytree(backup,artifacts)
+    # Partial retries retain successful producer receipts from earlier attempts.
+    os.environ['GITHUB_RUN_ATTEMPT']='2'
+    verify()
+    import importlib.util, sys
+    sys.dont_write_bytecode=True
+    spec=importlib.util.spec_from_file_location('retry_shards',pathlib.Path(os.environ['SHARD_GATE']).with_name('_ci-shards.py'))
+    retry_shards=importlib.util.module_from_spec(spec); spec.loader.exec_module(retry_shards)
+    prior=json.loads((artifacts/'engine/manifest.json').read_text())['provenance']
+    try:
+        retry_shards.validate_provenance(prior,plan,next(s for s in plan['shards'] if s['id']=='engine'))
+    except ValueError as error:
+        assert 'run provenance differs' in str(error)
+    else:
+        raise AssertionError('worker-local pack cannot admit another attempt')
+    manifest=artifacts/'engine/manifest.json'; m=json.loads(manifest.read_text())
+    m['provenance']['run_attempt']=2
+    for phase in ('reset','verify'): m['provenance'][phase]['run_attempt']=2
+    manifest.write_text(json.dumps(m)); (artifacts/'engine/files'/m['provenance_path']).write_text(json.dumps(m['provenance']))
+    verify(rehash=True)
+    # Each retained receipt must still agree with its own actual phases.
+    m['provenance']['verify']['run_attempt']=1
+    manifest.write_text(json.dumps(m)); (artifacts/'engine/files'/m['provenance_path']).write_text(json.dumps(m['provenance']))
+    verify(False,rehash=True); reset()
+    for attempt in (0,3,True,'1'):
+        m=json.loads(manifest.read_text()); m['provenance']['run_attempt']=attempt
+        for phase in ('reset','verify'):m['provenance'][phase]['run_attempt']=attempt
+        manifest.write_text(json.dumps(m)); (artifacts/'engine/files'/m['provenance_path']).write_text(json.dumps(m['provenance']))
+        verify(False,rehash=True); reset()
+    os.environ['GITHUB_RUN_ATTEMPT']='1'
     for path in ['engine/files/runtime/engine/target/classes/sample/Production.class',
                  'engine/files/core/target/test-classes/sample/Helper.class']:
         put('artifacts/'+path,'unexpected-bytecode')

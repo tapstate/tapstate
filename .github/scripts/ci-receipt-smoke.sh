@@ -253,6 +253,41 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
     result = compare_current()
     check(result['declared_input_hashes_equal'] and not result['whole_build_provenance_complete']
           and not result['ability_proven'] and not result['raw_bytes_uploaded'], 'current declared hashes agree without inventing complete provenance')
+    # A retry retains successful peers and records their original producer attempt.
+    retry_aggregate = copy.deepcopy(prepared); retry_aggregate['run_attempt'] = '2'
+    retry_workers = copy.deepcopy(worker_inputs)
+    retry_workers['engine']['run_attempt'] = '2'
+    retry_raw = (copy.deepcopy(retry_aggregate), copy.deepcopy(retry_workers))
+    retry_result = m.compare_input_snapshots(input_plan, retry_aggregate, retry_workers)
+    check(retry_result['declared_input_hashes_equal'], 'failed-shard retry admits retained and current successful inputs')
+    check((retry_aggregate, retry_workers) == retry_raw, 'retry comparison preserves every producer attempt')
+    check(m.compare_input_snapshots(input_plan, retry_aggregate, worker_inputs)['declared_input_hashes_equal'],
+          'aggregate-only retry admits all retained successful inputs')
+    for attempt in ('0', '3', True, None, 'not-an-attempt'):
+        bad_retry = copy.deepcopy(worker_inputs); bad_retry['engine']['run_attempt'] = attempt
+        rejected(lambda: m.compare_input_snapshots(input_plan, retry_aggregate, bad_retry),
+                 'retry must reject invalid or future producer attempts')
+    producer_hashes = {name: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+                       for name, value in retry_workers.items()}
+    producers = {name: dict(schema=1, status='success', source_sha=input_plan['source_sha'],
+                           cohort_hash=input_plan['cohort_hash'], shard_id=name, run_id=value['run_id'],
+                           run_attempt=int(value['run_attempt']),
+                           case_observer=dict(enabled=True, build_inputs_sha256=producer_hashes[name]))
+                 for name, value in retry_workers.items()}
+    m.compare_input_producers(input_plan, retry_workers, producer_hashes, producers)
+    check(True, 'mixed successful producers bind their own original input digest and attempt')
+    for field, value in [('run_id','foreign-run'), ('run_attempt',1), ('run_attempt',True),
+                         ('source_sha','f'*40), ('cohort_hash','f'*64), ('shard_id','other'), ('status','failure')]:
+        changed_producers = copy.deepcopy(producers); changed_producers['engine'][field] = value
+        rejected(lambda: m.compare_input_producers(input_plan,retry_workers,producer_hashes,changed_producers),
+                 'retry input and result producer mismatch must reject: '+field)
+    for field, value in [('enabled',False), ('build_inputs_sha256','f'*64)]:
+        changed_producers = copy.deepcopy(producers); changed_producers['engine']['case_observer'][field] = value
+        rejected(lambda: m.compare_input_producers(input_plan,retry_workers,producer_hashes,changed_producers),
+                 'retry result must bind its own successful prepared input: '+field)
+    missing_producer = copy.deepcopy(producers); missing_producer.pop('engine')
+    rejected(lambda: m.compare_input_producers(input_plan,retry_workers,producer_hashes,missing_producer),
+             'retry cannot substitute a missing producer')
     # Hosted Linux kernels may differ while compiler and dependency identities agree.
     def linux_toolchain(release):
         return dict(java='openjdk version "21.0.12.1"\nOpenJDK Runtime Environment Temurin-21.0.12.1+1\n',

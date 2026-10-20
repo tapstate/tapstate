@@ -142,7 +142,7 @@ def packaged_test_fixture(pre, work, bytecode, resolved_artifacts=False, maven_s
     return raw
 
 
-def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False, maven_schema=3, event_name='pull_request', source_setup=None):
+def run(callback=None, source_case='package io.tapstate.fixture; class SampleTest { @Test void holds() {} }\n', two_workers=False, only_callback=False, maven_source=False, workflow_sources=None, dependency_metadata=False, base_source=False, variant='C', run_id=42, temporary_parent=None, case_variants=None, extra_source_files=None, test_resource_bytes=None, test_jar=False, resolved_artifacts=False, maven_schema=3, event_name='pull_request', source_setup=None, actual_comparator=False):
     global count
     count = 0
     with tempfile.TemporaryDirectory(prefix='ci-archive-inputs-', dir=temporary_parent) as temporary:
@@ -347,6 +347,28 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             build_pre['maven_execution_observation']['runner_context'] = copy.deepcopy(build_pre['runner_context'])
         equality = g.receipt.compare_input_snapshots(plan, build_pre, worker_pre)
         equality['input_files'] = {'build': g.checksum(encode(build_pre)), **{n: g.checksum(encode(v)) for n,v in worker_pre.items()}}
+        if actual_comparator:
+            assert not two_workers, 'actual comparator boundary fixture has one successful producer'
+            from argparse import Namespace
+            from unittest.mock import patch
+            probe = root / 'comparator-source'
+            v.git(work, 'worktree', 'add', '--detach', str(probe), merge)
+            inputs_root = root / 'comparator-inputs'
+            worker_path = inputs_root / 'ci-inputs-rest' / 'build-inputs.json'
+            worker_path.parent.mkdir(parents=True); worker_path.write_bytes(encode(pre))
+            aggregate_path = root / 'comparator-build.json'; aggregate_path.write_bytes(encode(build_pre))
+            plan_path = root / 'comparator-plan.json'; plan_path.write_bytes(encode(plan))
+            manifest_path = root / 'comparator-results/rest/manifest.json'
+            manifest_path.parent.mkdir(parents=True); manifest_path.write_bytes(encode(manifest))
+            output = root / 'actual-comparator.json'
+            try:
+                with patch.dict(os.environ, {'GITHUB_RUN_ID': str(run_id), 'GITHUB_RUN_ATTEMPT': '1'}):
+                    g.receipt.compare_inputs(Namespace(root=str(probe), plan=str(plan_path),
+                        inputs_root=str(inputs_root), aggregate_inputs=str(aggregate_path),
+                        artifacts=str(manifest_path.parent.parent), output=str(output)))
+                equality = json.loads(output.read_bytes())
+            finally:
+                v.git(work, 'worktree', 'remove', str(probe))
         artifacts = {'ci-shard-plan': {'shards.json': plan, 'ci-event-inputs.json': event},
                      'ci-inputs-rest': {'build-inputs.json': pre, 'post-test-inputs.json': post},
                      'ci-inputs-build': {'build-inputs.json': build_pre, 'build-input-equivalence.json': equality},
@@ -636,3 +658,6 @@ if __name__ == '__main__':
     run()
     run(packaged_archive_controls, test_jar=True, only_callback=True)
     print('CI packaged test archive controls passed:', count)
+    run(lambda context: check(context['project']()['type'] == 'archived-input-readback',
+        'actual input comparator output must replay through the archive consumer'), actual_comparator=True, only_callback=True)
+    print('CI actual comparator archive readback controls passed:', count)
