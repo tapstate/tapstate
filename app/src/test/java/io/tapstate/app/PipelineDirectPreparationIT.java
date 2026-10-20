@@ -39,6 +39,62 @@ class PipelineDirectPreparationIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node","boot");
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-19T00:00:00Z"),ZoneOffset.UTC);
 
+    @ParameterizedTest @ValueSource(strings={"latest","earliest","2026-10-18T00:00:00Z"})
+    void actualScopedDirectCoordinatorFeedsOriginalWritersAndResumesItsSettledToken(String firstStart) {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",false,ReadMode.CDC_ONLY,firstStart,null));
+            var inputs=f.inputs();f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
+            var claims=f.cache.workloadClaims(f.business());var initial=claims.readPipeline(f.scope).orElseThrow().claim();
+            var running=claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow();var original=WorkloadClaimFence.from(running);
+            var ownership=mock(CaptureOwnership.class);
+            when(ownership.acquire(any())).thenAnswer(call -> {
+                var id=call.getArgument(0,CaptureId.class);
+                var attempt=claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id.value()),OWNER,1,TTL);
+                return new CaptureOwnership.Permit(attempt.acquired(),attempt.claim());
+            });
+            when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
+            doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());
+            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
+            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var ports=new ArrayList<DirectPort>();var buffer=new SnapshotBuffer(8);
+            var member=mock(HazelcastInstance.class);var local=new ConcurrentHashMap<String,Object>();when(member.getUserContext()).thenReturn(local);
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),f.cache.srs(f.business(),ACTIVE),member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,ownership,Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,buffer,provisioner,(fixed,config,guard) -> {guard.run();var port=new DirectPort(ports.isEmpty()?"anchor":"settled");ports.add(port);return port;})) {
+                local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);local.put(SrsStoreViews.USER_CONTEXT_KEY,f.cache);
+                var artifacts=ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts());
+                var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+                var run=coordinator.forRun(f.scope,original,new ExecutionFence(f.scope,original));run.startCapture("flow",artifacts,models);
+                var fixed=run.captureBindings().direct().get("input");assertThat(fixed.epoch()).isOne();assertThat(run.captureBindings().freshFullLoad()).isFalse();
+                assertThat(ports.getFirst().start.get()).isEqualTo(switch(firstStart) {
+                    case "latest" -> CaptureStart.present();case "earliest" -> CaptureStart.earliest();default -> CaptureStart.at(Instant.parse(firstStart));
+                });
+                var streams=Map.of("orders",new ScopedDirectSinkAckFactory.Source(fixed,"orders"),"quiet",new ScopedDirectSinkAckFactory.Source(fixed,"quiet"));
+                var factory=copied(new ScopedSrsSinkAckFactory(Map.of(),streams,"native-direct-run"));
+                factory.beginRun(member,Map.of("orders",List.of("writer"),"quiet",List.of("writer")),original);
+                ports.getFirst().listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",1),null)),Optional.of(new SourcePosition("settled")));
+                var rows=buffer.drain(run.captureBindings().bufferKey("input"),SrsRingbuffer.ringName(fixed.context().channelId(),"orders"));
+                assertThat(rows).hasSize(1);factory.resolve(member).forWriter("writer").advance("orders",rows.getFirst().position(),original);
+                awaitTold(ports.getFirst(),"settled");assertThat(run.loadDelivered("flow")).isTrue();
+                var old=run.captureBindings();run.stopCapture("flow",false);
+                var next=WorkloadClaimFence.from(claims.advanceExecution(running,1,Set.of(OWNER.nodeId())).orElseThrow());
+                var resumed=coordinator.forRun(f.scope,next,new ExecutionFence(f.scope,next));resumed.startCapture("flow",artifacts,models);
+                assertThat(resumed.captureBindings().direct().get("input").epoch()).isEqualTo(2);
+                assertThat(ports.getLast().start.get()).isEqualTo(CaptureStart.resume(new SourcePosition("settled")));
+                var before=f.cacheSnapshot();
+                assertThatThrownBy(() -> ports.getFirst().listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",99),null)),Optional.of(new SourcePosition("late"))))
+                        .isInstanceOf(TapstateException.class);
+                assertThat(buffer.drain(old.bufferKey("input"),SrsRingbuffer.ringName(fixed.context().channelId(),"orders"))).isEmpty();
+                assertThat(f.cacheSnapshot()).isEqualTo(before);resumed.stopCapture("flow",false);
+            }
+            assertThat(f.cacheDatabase.getCollection("srs_chains").countDocuments()).isZero();
+            assertThat(f.cacheDatabase.getCollection("direct_channel_offsets").countDocuments()).isOne();
+            assertThat(f.cacheDatabase.getCollection("snapshot_orders").find().first().getLong("order")).isZero();
+        });
+    }
     @Test void actualScopedCoordinatorUsesNativePreparationNotesAndCountsAcrossAKeepStateRestart() {
         withFixture(f -> {
             var definition=(PipelineResource)new io.tapstate.core.dsl.DslParser().parse("""

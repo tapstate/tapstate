@@ -75,6 +75,28 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         }
     }
 
+    /** A private change stream records batches before handoff and acknowledges only its original settled prefix. */
+    public synchronized CaptureRun startDirect(CaptureConfig config,DirectChannelProgress opened,DirectChannelStore channels,
+            CaptureStart start,CapturePort port,CaptureHandoff handoff,int capacity,Runnable requireActive) {
+        Objects.requireNonNull(opened,"opened");Objects.requireNonNull(channels,"channels");Objects.requireNonNull(handoff,"handoff");
+        Runnable fixed=guard(requireActive);fixed.run();var window=Objects.requireNonNull(opened.current(),"opened capture");
+        var writer=new DirectCaptureWriter(opened,window.captureFence(),window.pipelineFence(),channels,row -> {
+            fixed.run();handoff.accept(row);fixed.run();
+        },capacity,fixed);
+        var health=new CaptureHealth();Subscription source=null;CaptureRun provisional=null;
+        try {
+            source=writer.start(port,config,start,health);fixed.run();
+            source=acknowledgements.follow(channels,opened,source,health,fixed);
+            provisional=new CaptureRun(Optional.empty(),false,0L,Optional.empty(),Optional.of(source),health);
+            snapshots.add(provisional);fixed.run();return provisional;
+        } catch(RuntimeException|Error failure) {
+            writer.close();
+            if(provisional!=null) { var abandoned=provisional;snapshots.remove(abandoned);closeAfter(failure,abandoned::close); }
+            else if(source!=null)closeAfter(failure,source::close);
+            throw failure;
+        }
+    }
+
     /** A bounded-only source opens no change chain or CDC seam and uses the already allocated row order. */
     public synchronized CaptureRun beginSnapshotOnly(CaptureConfig config,long snapshotEpoch,CapturePort port,
             CaptureHandoff handoff,Runnable requireActive) {
