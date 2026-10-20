@@ -145,6 +145,110 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    /** Native control-service composition; the target fixture does not certify a registered connector or TLS. */
+    @Test
+    void setupAndFirstAdministratorServicesKeepNativeAuthorityAcrossAuditFailureAndReopen() {
+        String configDb = "control_config_" + UUID.randomUUID().toString().replace("-", "");
+        String cacheDb = configDb + "_cache";
+        String masterDb = configDb + "_master";
+        String user = "owner_" + configDb;
+        var clock = java.time.Clock.systemUTC();
+        var allowedAudit = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var targetTests = new AtomicInteger();
+        var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(configDb, cacheDb, masterDb));
+            var config = new io.tapstate.spi.store.StorageBinding.Connection(
+                    io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, configDb), configDb, null);
+            var cache = new io.tapstate.spi.store.StorageBinding.Connection(config.kind(), uri(user, cacheDb), cacheDb, null);
+            var master = new io.tapstate.spi.store.StorageBinding.Connection(config.kind(), uri(user, masterDb), masterDb, null);
+            var settings = new io.tapstate.adapters.mongostore.MongoConnectionSettings(config.uri(), null, Duration.ofSeconds(5));
+            var original = new io.tapstate.spi.store.StorageSetupScope("control-cluster", "installation", "original-setup", 1);
+            var candidate = new io.tapstate.control.core.StorageSetupService.Candidate(config, cache, master);
+            var target = new io.tapstate.control.core.StorageSetupService.DefaultTarget() {
+                @Override public io.tapstate.control.core.StorageSetupService.ConnectorIdentity identity(
+                        io.tapstate.spi.store.StorageBinding.Connection connection) {
+                    return new io.tapstate.control.core.StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64));
+                }
+                @Override public SourceResource definition(io.tapstate.spi.store.StorageBinding.Connection connection, String id) {
+                    return new SourceResource(id, null, "mongodb", Map.of("uri", connection.uri()), null, null, null, null);
+                }
+                @Override public void test(io.tapstate.spi.store.StorageBinding.Connection connection, SourceResource source,
+                        io.tapstate.control.core.StorageSetupService.ConnectorIdentity identity) {
+                    assertThat(source.config().get("uri")).isEqualTo(probe.normalize(master).uri());
+                    targetTests.incrementAndGet();
+                }
+            };
+            try (var domain = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                    settings, original.clusterId(), original.installationId(), original.operationId(), original.generation())) {
+                var audit = new io.tapstate.control.core.AuditGate(record -> {
+                    if (!allowedAudit.get()) throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "audit-unavailable"), null);
+                    domain.audit().record(record);
+                }, clock);
+                var authority = new io.tapstate.control.core.SetupCapabilityService(domain.setupStates(), clock, () -> {}, () -> {}, () -> {});
+                var issued = authority.issue(original, io.tapstate.spi.store.StorageSetupStateStore.Purpose.SETUP);
+                var permission = authority.authorize(issued.token(), issued.scope(), issued.purpose());
+                var service = new io.tapstate.control.core.StorageSetupService(io.tapstate.spi.store.StorageBinding.Mode.OP,
+                        domain.bindings(), domain.setupStates(), probe, target, () -> java.util.Optional.of(config), audit, clock, () -> {});
+                var stamps = new java.util.EnumMap<io.tapstate.control.core.StorageSetupService.Layer, String>(
+                        io.tapstate.control.core.StorageSetupService.Layer.class);
+                for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values())
+                    stamps.put(layer, service.test(issued.scope(), permission, candidate, layer).testStamp());
+                assertThat(targetTests).hasValue(1);
+                allowedAudit.set(false);
+                assertThatThrownBy(() -> service.commit("owner", issued.scope(), permission, candidate, stamps))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code())
+                                .isEqualTo(io.tapstate.control.core.ControlError.AUDIT_BLOCKED));
+                assertThat(domain.bindings().load()).isEmpty();
+                assertThat(domain.artifacts().list()).isEmpty();
+                allowedAudit.set(true);
+                var bound = service.commit("owner", issued.scope(), permission, candidate, stamps);
+                assertThat(bound.setupPhase()).isEqualTo(io.tapstate.spi.store.StorageSetupStateStore.Phase.STORAGE_BOUND);
+                var first = service.pending(issued.scope(), permission).orElseThrow().firstCreation().orElseThrow();
+                var originalPreparation = domain.bindings().cachePreparation().orElseThrow();
+                try (var reopened = io.tapstate.adapters.mongostore.MongoConfigurationDomain.open(settings, original.clusterId())) {
+                    var nextAuthority = new io.tapstate.control.core.SetupCapabilityService(reopened.setupStates(), clock, () -> {}, () -> {}, () -> {});
+                    var next = nextAuthority.issue(issued.scope(), issued.purpose());
+                    var nextPermission = nextAuthority.authorize(next.token(), next.scope(), next.purpose());
+                    assertThatThrownBy(permission::run).isInstanceOf(TapstateException.class);
+                    var resumed = new io.tapstate.control.core.StorageSetupService(io.tapstate.spi.store.StorageBinding.Mode.OP,
+                            reopened.bindings(), reopened.setupStates(), probe, target, () -> java.util.Optional.of(config), audit, clock, () -> {});
+                    assertThat(resumed.commit("owner", next.scope(), nextPermission, candidate, Map.of()).bindingVersion()).isEqualTo(1);
+                    assertThat(resumed.pending(next.scope(), nextPermission).orElseThrow().firstCreation()).isEmpty();
+                    assertThat(reopened.bindings().cachePreparation()).contains(originalPreparation);
+                    assertThat(reopened.artifacts().list()).hasSize(1);
+                    first.requireActive();
+                    reopened.bindings().complete(next.scope());
+                    assertThatThrownBy(nextPermission::run).isInstanceOf(TapstateException.class);
+                    var adminIssued = nextAuthority.issue(next.scope(), io.tapstate.spi.store.StorageSetupStateStore.Purpose.FIRST_ADMIN);
+                    var adminPermission = nextAuthority.authorize(adminIssued.token(), adminIssued.scope(), adminIssued.purpose());
+                    var passwords = new BCryptPasswordHasher();
+                    var administrators = new io.tapstate.control.core.FirstAdministratorService(reopened.firstAdmin(), passwords, audit);
+                    allowedAudit.set(false);
+                    assertThatThrownBy(() -> administrators.create(adminPermission, "first-admin", "sentinel-password"))
+                            .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code())
+                                    .isEqualTo(io.tapstate.control.core.ControlError.AUDIT_BLOCKED));
+                    assertThat(reopened.users().isEmpty()).isTrue();
+                    allowedAudit.set(true);
+                    assertThat(administrators.create(adminPermission, "first-admin", "sentinel-password").phase())
+                            .isEqualTo(io.tapstate.spi.store.FirstAdminStore.Phase.COMPLETE);
+                    assertThat(passwords.matches("sentinel-password", reopened.users().find("first-admin").orElseThrow().passwordHash())).isTrue();
+                    assertThatThrownBy(adminPermission::run).isInstanceOf(TapstateException.class);
+                    assertThatThrownBy(() -> administrators.create(adminPermission, "another", "another-password"))
+                            .isInstanceOf(TapstateException.class);
+                    assertThat(reopened.users().find("another")).isEmpty();
+                }
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
+                assertThat(admin.getDatabase(masterDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
+                assertThat(SystemCollections.AUDIT.on(admin.getDatabase(configDb)).find().into(new ArrayList<>()).toString())
+                        .doesNotContain(PASSWORD, "sentinel-password", "mongodb://");
+            } finally {
+                for (String database : List.of(configDb, cacheDb, masterDb)) admin.getDatabase(database).drop();
+                admin.getDatabase("admin").runCommand(new Document("dropUser", user));
+            }
+        }
+    }
+
     @Test
     void twoClusterUsersCanUseOnlyTheirOwnThreeDatabasesAndRecoverAfterRestart() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
