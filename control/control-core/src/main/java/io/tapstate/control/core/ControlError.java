@@ -93,6 +93,7 @@ public enum ControlError implements TapstateErrorCode {
      */
     FORBIDDEN("control.forbidden", Set.of("op", "required")),
 
+    STORAGE_DATABASES_OVERLAP("control.storage-databases-overlap", Set.of()),
     STORAGE_TEST_REQUIRED("control.storage-test-required", Set.of()),
     STORAGE_TEST_FAILED("control.storage-test-failed", Set.of("layer", "causeCode")),
     STORAGE_SCOPE_CONFLICT("control.storage-scope-conflict", Set.of()),

@@ -134,7 +134,7 @@ class ManagedMongoStoreIsolationIT {
                     connection.verifyConnectivity();
                     var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
                     var normalized = probe.normalize(candidate);
-                    if (user.equals(writer)) assertThat(probe.test(normalized)).isPresent();
+                    if (user.equals(writer)) probe.test(normalized);
                     else assertThatThrownBy(() -> probe.test(normalized))
                             .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                                     failure -> assertThat(failure.code()).isEqualTo(

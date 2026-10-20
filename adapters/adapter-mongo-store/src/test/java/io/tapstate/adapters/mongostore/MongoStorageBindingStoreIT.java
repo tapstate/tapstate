@@ -48,6 +48,52 @@ class MongoStorageBindingStoreIT {
             "cache", "CA-material-sentinel");
 
     @Test
+    void committedFirstCacheInvocationKeepsItsOperationOwnerWithoutSubmissionChecks() {
+        withPrepared(f -> {
+            var owner = new java.util.concurrent.atomic.AtomicBoolean(true);
+            var checks = new AtomicInteger();
+            var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    MONGO.getReplicaSetUrl("late_cache_" + UUID.randomUUID().toString().replace("-", "")),
+                    "cache_" + UUID.randomUUID().toString().replace("-", ""), null);
+            Runnable lifetime = () -> { if (!owner.get()) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null); };
+            Runnable submission = () -> {
+                checks.incrementAndGet();
+                if (SystemCollections.STORAGE_BINDING.on(f.database).find().first() != null)
+                    throw new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null);
+            };
+            var committed = f.domain.bindings().guardedBy(lifetime).commitWithFirstCache(
+                    SCOPE, StorageBinding.Mode.OP, cache, source("views", "secret"), submission);
+            int originalChecks = checks.get();
+            assertThat(originalChecks).isGreaterThanOrEqualTo(2);
+            var invocation = committed.firstCreation().orElseThrow();
+            f.domain.setupStates().rotate(SCOPE, io.tapstate.spi.store.StorageSetupStateStore.Purpose.SETUP);
+            invocation.requireActive();
+            try (var connected = MongoCacheDomain.connect(cache, Duration.ofSeconds(5), null)) {
+                assertThat(connected.prepareFirstAuth(invocation)).isEqualTo(committed.preparation().authScope());
+                connected.loadAuthScope(committed.preparation().authScope());
+            }
+            assertThat(checks.get()).isEqualTo(originalChecks);
+            owner.set(false);
+            assertThatThrownBy(invocation::requireActive).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test
+    void losingSubmissionAuthorizationAfterTheWriteRollsBackTheWholeBinding() {
+        withPrepared(f -> {
+            var checks = new AtomicInteger();
+            assertThatThrownBy(() -> f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE,
+                    source("views", "secret"), () -> {
+                        if (checks.incrementAndGet() == 2) throw new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null);
+                    })).isInstanceOf(TapstateException.class);
+            assertThat(f.domain.bindings().load()).isEmpty();
+            assertThat(SystemCollections.SOURCES.on(f.database).find().first()).isNull();
+            assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).find().first()).isNull();
+            assertThat(f.revision()).isZero();
+        });
+    }
+
+    @Test
     void setupGenerationReissueRevokesOldWritesAndPreservesTheOriginalBinding() {
         withPrepared(f -> {
             var original = f.domain.setupStates().load();

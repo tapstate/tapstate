@@ -49,13 +49,22 @@ class StorageSetupServiceTest {
         }
         @Override public StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
                 StorageBinding.Connection cache, SourceResource source) {
-            active.run(); root.beforeCommit.run(); active.run();
-            if (root.binding == null) {
+            return commitWithFirstCache(expected, mode, cache, source, () -> {});
+        }
+        @Override public StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
+                StorageBinding.Connection cache, SourceResource source, Runnable requireCommit) {
+            active.run(); requireCommit.run(); root.beforeCommit.run(); requireCommit.run(); active.run();
+            boolean first = root.binding == null;
+            if (first) {
                 root.inserts++;
                 root.binding = new StorageBinding(expected, mode, 1, source.id(), cache);
                 states.state = new StorageSetupStateStore.Status(expected, StorageSetupStateStore.Phase.STORAGE_BOUND, 1);
             }
-            return new StorageBindingCommit(root.binding, preparation(), Optional.empty());
+            return new StorageBindingCommit(root.binding, preparation(), first ? Optional.of(new FirstCacheCreation() {
+                @Override public CachePreparation preparation() { return Binding.this.preparation(); }
+                @Override public void consume() { active.run(); }
+                @Override public void requireActive() { active.run(); }
+            }) : Optional.empty());
         }
         @Override public StorageBinding complete(StorageSetupScope expected) { throw new UnsupportedOperationException(); }
     }
@@ -72,13 +81,16 @@ class StorageSetupServiceTest {
         final Time time = new Time(); final States states = new States(); final Binding binding = new Binding(states); final Target target = new Target();
         final List<AuditRecord> audit = new ArrayList<>();
         Runnable onAudit = () -> {};
+        boolean operationAlive = true;
         StorageConnectionProbe probe = new StorageConnectionProbe() {
             @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
-            @Override public Optional<String> test(StorageBinding.Connection input) { return Optional.of("server/" + input.database()); }
+            @Override public void test(StorageBinding.Connection input) {}
         };
         StorageSetupService service() {
             return new StorageSetupService(StorageBinding.Mode.OP, binding, states, probe, target, CANDIDATE::configuration,
-                    new AuditGate(record -> { onAudit.run(); audit.add(record); }, time), time);
+                    new AuditGate(record -> { onAudit.run(); audit.add(record); }, time), time, () -> {
+                        if (!operationAlive) throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+                    });
         }
         Map<StorageSetupService.Layer,String> tested(StorageSetupService service, StorageSetupService.Candidate candidate) {
             var stamps = new EnumMap<StorageSetupService.Layer,String>(StorageSetupService.Layer.class);
@@ -94,6 +106,40 @@ class StorageSetupServiceTest {
         assertThat(service.commit("admin", SCOPE, () -> {}, CANDIDATE, Map.of()).bindingVersion()).isEqualTo(1);
         assertThat(f.binding.inserts).isEqualTo(1);
         assertThat(f.audit).allSatisfy(record -> assertThat(record.operationId()).isEqualTo("storage.setup.commit"));
+    }
+    @Test void aCommittedFirstCacheInvocationIsIndependentFromExpiringSubmissionStamps() {
+        var f = new Fixture(); var service = f.service(); var stamps = f.tested(service, CANDIDATE);
+        service.commit("admin", SCOPE, () -> {}, CANDIDATE, stamps);
+        var retained = service.pending(SCOPE, () -> {}).orElseThrow().firstCreation().orElseThrow();
+        f.time.now = f.time.now.plus(StorageSetupService.TEST_LIFETIME);
+        assertThatCode(retained::requireActive).doesNotThrowAnyException();
+        f.operationAlive = false;
+        assertThatThrownBy(retained::requireActive).isInstanceOf(TapstateException.class);
+    }
+    @Test void changedMembershipCannotProveThatEqualDatabaseNamesAreIsolated() {
+        var f = new Fixture(); var counter = new java.util.concurrent.atomic.AtomicInteger();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) { counter.incrementAndGet(); }
+        };
+        var service = f.service(); var shared = new StorageSetupService.Candidate(CANDIDATE.configuration(), CANDIDATE.configuration(), CANDIDATE.master());
+        assertThatThrownBy(() -> {
+            var stamps = f.tested(service, shared);
+            service.commit("admin", SCOPE, () -> {}, shared, stamps);
+        }).isInstanceOf(TapstateException.class);
+        assertThat(f.binding.inserts).isZero();
+    }
+    @Test void revokedDatabasePermissionsAreCheckedAgainBeforeBindingPublication() {
+        var f = new Fixture(); var allowed = new java.util.concurrent.atomic.AtomicBoolean(true);
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {
+                if (!allowed.get()) throw new TapstateException(ControlError.UNREACHABLE, Map.of(), null);
+            }
+        };
+        var service = f.service(); var stamps = f.tested(service, CANDIDATE); allowed.set(false);
+        assertThatThrownBy(() -> service.commit("admin", SCOPE, () -> {}, CANDIDATE, stamps)).isInstanceOf(TapstateException.class);
+        assertThat(f.binding.inserts).isZero(); assertThat(f.audit).isEmpty();
     }
     @Test void changingAnyConnectionInvalidatesAllLayerProofs() {
         var f = new Fixture(); var service = f.service(); var stamps = f.tested(service, CANDIDATE);
@@ -131,7 +177,7 @@ class StorageSetupServiceTest {
         var f = new Fixture();
         f.probe = new StorageConnectionProbe() {
             @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
-            @Override public Optional<String> test(StorageBinding.Connection input) {
+            @Override public void test(StorageBinding.Connection input) {
                 throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "sentinel-secret"), null);
             }
         };

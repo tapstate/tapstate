@@ -129,6 +129,16 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     @Override public io.tapstate.spi.store.StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
             StorageBinding.Connection cache, SourceResource defaultSource) {
+        return commitCandidate(expected, mode, cache, defaultSource, () -> {}, true);
+    }
+
+    @Override public io.tapstate.spi.store.StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
+            StorageBinding.Connection cache, SourceResource defaultSource, Runnable requireCommit) {
+        return commitCandidate(expected, mode, cache, defaultSource, Objects.requireNonNull(requireCommit, "requireCommit"), false);
+    }
+
+    private io.tapstate.spi.store.StorageBindingCommit commitCandidate(StorageSetupScope expected, StorageBinding.Mode mode,
+            StorageBinding.Connection cache, SourceResource defaultSource, Runnable requireCommit, boolean checkAfterCommit) {
         Objects.requireNonNull(expected, "expected");
         Objects.requireNonNull(mode, "mode");
         Objects.requireNonNull(cache, "cache");
@@ -188,8 +198,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L));
                 MongoStorageRecoveryStore.allocate(session, database, binding, incarnation);
                 return new Committed(binding, MongoStorageRecoveryStore.loadInitial(session, database, binding), true);
-            });
-            requireActive.run();
+            }, requireCommit);
+            if (checkAfterCommit) requireActive.run();
             return new io.tapstate.spi.store.StorageBindingCommit(result.binding(), result.preparation(), result.won()
                     ? Optional.of(new Creation(result.preparation(), targetFingerprint(cache), requireActive)) : Optional.empty());
         });
@@ -299,10 +309,16 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     private <T> T transaction(Function<ClientSession, T> body) {
+        return transaction(body, () -> {});
+    }
+
+    private <T> T transaction(Function<ClientSession, T> body, Runnable requireCommit) {
         try (ClientSession session = client.startSession()) {
             return session.withTransaction(() -> {
                 requireActive.run();
+                requireCommit.run();
                 T result = body.apply(session);
+                requireCommit.run();
                 requireActive.run();
                 return result;
             }, TRANSACTION);

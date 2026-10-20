@@ -1180,3 +1180,6 @@ control.storage-scope-conflict:
   message: "The storage operation or installation phase has changed. Read its current status."
 control.storage-unavailable:
   message: "The storage operation is temporarily unavailable. Query the original operation before retrying."
+
+control.storage-databases-overlap:
+  message: "Choose a different logical database name for each storage layer. Equal names cannot prove storage isolation."

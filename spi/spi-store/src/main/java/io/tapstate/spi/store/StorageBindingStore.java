@@ -34,6 +34,16 @@ public interface StorageBindingStore {
     }
 
     /**
+     * Submission checks run on every CONFIG transaction callback, but never become the first-cache
+     * invocation's lifetime. guardedBy supplies the operation owner's lifetime separately. A confirmed
+     * winner is returned without post-commit submission checks that could discard its invocation.
+     */
+    default StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
+            StorageBinding.Connection cache, SourceResource defaultSource, Runnable requireCommit) {
+        throw new io.tapstate.core.common.TapstateException(IoError.CACHE_BUSINESS_FENCED, java.util.Map.of(), null);
+    }
+
+    /**
      * Publish setup completion only after the caller verifies the saved clients, default Source and
      * formal authentication readiness. OP first-admin pending is created in this same transaction;
      * Cloud never creates a local first-admin record. The original guard remains required.

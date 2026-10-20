@@ -182,6 +182,7 @@ control.preview-overloaded
 control.schema-derivation-incomplete
 control.source-config-reveal-unavailable
 control.state-database-unavailable
+control.storage-databases-overlap
 control.storage-scope-conflict
 control.storage-test-failed
 control.storage-test-required

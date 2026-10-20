@@ -56,7 +56,7 @@ public final class StorageSetupService {
     public record Status(StorageBinding.Mode mode, String clusterId, String operationId, long generation,
             StorageSetupStateStore.Phase setupPhase, long bindingVersion) {}
     private record Prepared(Candidate candidate, SourceResource target, ConnectorIdentity connector, String hash) {}
-    private record Tested(StorageSetupScope scope, String hash, String token, Instant expiresAt, Optional<String> databaseIdentity) {}
+    private record Tested(StorageSetupScope scope, String hash, String token, Instant expiresAt) {}
 
     private final StorageBinding.Mode mode;
     private final StorageBindingStore bindings;
@@ -66,26 +66,27 @@ public final class StorageSetupService {
     private final Supplier<StorageBinding.Connection> configuration;
     private final AuditGate audit;
     private final Clock clock;
+    private final Runnable operationActive;
     // Bounded to the one original installation operation and three layer proofs. No credential is persisted here.
     private final EnumMap<Layer,Tested> tests = new EnumMap<>(Layer.class);
     private StorageBindingCommit pending;
 
     public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
             StorageConnectionProbe probe, DefaultTarget target, Supplier<StorageBinding.Connection> configuration,
-            AuditGate audit, Clock clock) {
+            AuditGate audit, Clock clock, Runnable operationActive) {
         this.mode = Objects.requireNonNull(mode, "mode"); this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.states = Objects.requireNonNull(states, "states"); this.probe = Objects.requireNonNull(probe, "probe");
         this.target = Objects.requireNonNull(target, "target"); this.configuration = Objects.requireNonNull(configuration, "configuration");
         this.audit = Objects.requireNonNull(audit, "audit"); this.clock = Objects.requireNonNull(clock, "clock");
+        this.operationActive = Objects.requireNonNull(operationActive, "operationActive");
     }
 
     /** The caller guard is established by the server's existing Cloud identity or OP management capability. */
     public synchronized TestResult test(StorageSetupScope expected, Runnable active, Candidate candidate, Layer layer) {
         requireSetup(expected, active);
         Prepared prepared = prepare(candidate);
-        Optional<String> identity;
         try {
-            identity = probe.test(prepared.candidate().connection(layer));
+            probe.test(prepared.candidate().connection(layer));
             if (layer == Layer.MASTER) target.test(prepared.candidate().master(), prepared.target(), prepared.connector());
         } catch (TapstateException refused) {
             throw new TapstateException(ControlError.STORAGE_TEST_FAILED,
@@ -96,7 +97,7 @@ public final class StorageSetupService {
         if (tests.values().stream().anyMatch(test -> !test.scope().equals(expected) || !test.hash().equals(prepared.hash()))) tests.clear();
         String stamp = UUID.randomUUID().toString();
         Instant expires = clock.instant().plus(TEST_LIFETIME);
-        tests.put(layer, new Tested(expected, prepared.hash(), stamp, expires, identity));
+        tests.put(layer, new Tested(expected, prepared.hash(), stamp, expires));
         return new TestResult(layer, stamp, expires, layer == Layer.MASTER
                 ? List.of("transactional-crud", "index-permissions", "registered-connector")
                 : List.of("transactional-crud", "index-permissions"));
@@ -112,6 +113,13 @@ public final class StorageSetupService {
         if (previous.isEmpty()) {
             requireSetup(expected, active);
             requireTests(expected, prepared, stamps);
+            for (Layer layer : Layer.values()) {
+                try { probe.test(prepared.candidate().connection(layer)); }
+                catch (TapstateException refused) {
+                    throw new TapstateException(ControlError.STORAGE_TEST_FAILED,
+                            Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
+                }
+            }
         }
         Runnable writeGuard = previous.isPresent() ? active : () -> {
             requireSetup(expected, active);
@@ -119,7 +127,8 @@ public final class StorageSetupService {
             if (!prepared.connector().equals(target.identity(prepared.candidate().master()))) throw testsRequired();
         };
         audit.dispatch(ControlOperations.STORAGE_SETUP_COMMIT, new AuditContext(subject, expected.operationId()), () -> {
-            StorageBindingCommit result = bindings.guardedBy(writeGuard).commitWithFirstCache(expected, mode, prepared.candidate().cache(), prepared.target());
+            StorageBindingCommit result = bindings.guardedBy(operationActive).commitWithFirstCache(expected, mode,
+                    prepared.candidate().cache(), prepared.target(), writeGuard);
             if (pending == null || result.firstCreation().isPresent()) pending = result;
             return result.binding();
         });
@@ -145,6 +154,9 @@ public final class StorageSetupService {
     private Prepared prepare(Candidate input) {
         Candidate normalized = new Candidate(probe.normalize(input.configuration()), probe.normalize(input.cache()), probe.normalize(input.master()));
         if (!normalized.configuration().equals(probe.normalize(configuration.get()))) throw conflict();
+        if (java.util.stream.Stream.of(normalized.configuration(), normalized.cache(), normalized.master())
+                .map(StorageBinding.Connection::database).distinct().count() != Layer.values().length)
+            throw new TapstateException(ControlError.STORAGE_DATABASES_OVERLAP, Map.of(), null);
         if (mode == StorageBinding.Mode.CLOUD && (normalized.cache().kind() != StorageBinding.Connection.Kind.ATLAS
                 || normalized.master().kind() != StorageBinding.Connection.Kind.ATLAS)) throw conflict();
         ConnectorIdentity connector = target.identity(normalized.master());
@@ -166,16 +178,10 @@ public final class StorageSetupService {
             if (tested == null || !tested.scope().equals(expected) || !tested.hash().equals(prepared.hash())
                     || !tested.token().equals(stamps.get(layer)) || !tested.expiresAt().isAfter(clock.instant())) throw testsRequired();
         }
-        for (Layer left : Layer.values()) for (Layer right : Layer.values()) {
-            if (left.ordinal() >= right.ordinal() || !prepared.candidate().connection(left).database()
-                    .equals(prepared.candidate().connection(right).database())) continue;
-            Optional<String> a = tests.get(left).databaseIdentity(), b = tests.get(right).databaseIdentity();
-            // Unknown topology identity cannot prove that equal logical names belong to different databases.
-            if (a.isEmpty() || b.isEmpty() || a.equals(b)) throw conflict();
-        }
+
     }
     private void requireSetup(StorageSetupScope expected, Runnable active) {
-        active.run(); states.guardedBy(active).requireCurrent(expected, StorageSetupStateStore.Purpose.SETUP);
+        operationActive.run(); active.run(); states.guardedBy(active).requireCurrent(expected, StorageSetupStateStore.Purpose.SETUP);
     }
     private static Object connectionTree(StorageBinding.Connection connection) {
         return List.of(connection.kind().name(), connection.uri(), connection.database(), connection.caPem() == null ? "" : connection.caPem());
