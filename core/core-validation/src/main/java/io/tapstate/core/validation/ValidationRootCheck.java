@@ -363,6 +363,14 @@ public final class ValidationRootCheck {
             }
         }
 
+        Builder requireBlocked(Check check, Location location) {
+            return mutate(() -> {
+                if (blocked.stream().noneMatch(item -> item.check() == check && item.location().equals(location))) {
+                    throw ValidationError.invalid("rootCheck.requiredBlock");
+                }
+            });
+        }
+
         Builder requireSampleRead(Side side, SampledSide sample) {
             return mutate(() -> sampleRead(Objects.requireNonNull(side, "side"), Objects.requireNonNull(sample, "sample")));
         }

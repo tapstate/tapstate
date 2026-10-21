@@ -23,9 +23,18 @@ public final class ValidationNestSingleSource {
     public static final class Result {
         private final State state;
         private final Optional<ValidationRelationRows.Sample> unique;
-        private Result(State state, Optional<ValidationRelationRows.Sample> unique) { this.state = state; this.unique = unique; }
+        private final ValidationObservation observation;
+        private final ValidationCheckEvent.ReadBoundary read;
+        private final Location location;
+        private Result(State state, Optional<ValidationRelationRows.Sample> unique, ValidationRelationRows.Result rows, Location location) {
+            this.state = state; this.unique = unique;
+            this.observation = rows.observation(); this.read = rows.read(); this.location = location;
+        }
         public State state() { return state; }
         public Optional<ValidationRelationRows.Sample> unique() { return unique; }
+        public ValidationObservation observation() { return observation; }
+        public ValidationCheckEvent.ReadBoundary read() { return read; }
+        public Location location() { return location; }
     }
     private ValidationNestSingleSource() {}
 
@@ -67,17 +76,17 @@ public final class ValidationNestSingleSource {
                         Optional.of(new Multiplicity(rows.included(), rows.participationComplete())));
                 root.finding(cause, sample(rows.includedSamples().getFirst(), rows.read().readId()), Optional.empty());
                 block(root, affected, cause);
-                return new Result(State.BLOCKED, Optional.empty());
+                return new Result(State.BLOCKED, Optional.empty(), rows, location);
             }
-            if (!rows.participationComplete()) return new Result(State.BLOCKED, Optional.empty());
+            if (!rows.participationComplete()) return new Result(State.BLOCKED, Optional.empty(), rows, location);
             if (rows.definitelyEmpty()) {
-                if (relation == Relation.GATHER) return new Result(State.EMPTY, Optional.empty());
+                if (relation == Relation.GATHER) return new Result(State.EMPTY, Optional.empty(), rows, location);
                 Finding cause = new Finding(Kind.SOURCE_REFERENCE_MISSING, location);
                 root.finding(cause, Optional.of(reference.orElseThrow().parent()), Optional.empty());
                 block(root, affected, cause);
-                return new Result(State.BLOCKED, Optional.empty());
+                return new Result(State.BLOCKED, Optional.empty(), rows, location);
             }
-            return new Result(State.UNIQUE, rows.unique());
+            return new Result(State.UNIQUE, rows.unique(), rows, location);
         } catch (RuntimeException | Error failure) {
             root.close();
             throw failure;
