@@ -21,6 +21,8 @@ import io.tapstate.runtime.engine.validation.ValidationStaticMap;
 import java.time.Clock;
 import java.util.Optional;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationFieldCheck;
+import java.time.Instant;
 import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationKeyBinding;
 import io.tapstate.core.validation.ValidationPhysicalIdentity;
@@ -113,12 +115,22 @@ class ValidationJdbcMongoReadIT {
             String uri = mongo.getReplicaSetUrl(DATABASE);
             try (var observer = MongoClients.create(uri)) {
                 observer.getDatabase(DATABASE).getCollection("target_records").insertMany(
-                        List.of(6L, 4L, 2L, 5L, 1L).stream().map(id -> new Document("target_key", id)
-                                .append("amount", id == 2 ? EXACT - 1 : EXACT)
-                                .append("label", id == 5 ? "001" : " 001 ").append("nullable", null)).toList());
+                        List.of(6L, 4L, 2L, 5L, 1L).stream().map(id -> {
+                            var document = new Document("target_key", id).append("amount", id == 2 ? EXACT - 1 : EXACT)
+                                    .append("label", id == 5 ? "001" : " 001 ").append("nullable", null);
+                            if (id == 4) document.append("extra_business", 9);
+                            return document;
+                        }).toList());
+                observer.getDatabase(DATABASE).getCollection("target_records").find().forEach(document ->
+                        assertThat(document.get("_id")).isInstanceOf(org.bson.types.ObjectId.class));
             }
             var facts = new ArrayList<String>();
             var checks = new ArrayList<String>();
+            var fullChecks = new ArrayList<String>();
+            var projection = ValidationStaticMap.compile("fixed-output", new TransformBody.MapProjection(Map.of(
+                    "target_key", FieldRule.rename("source_key"), "fractional", FieldRule.drop(), "payload", FieldRule.drop(),
+                    "local_time", FieldRule.drop(), "body", FieldRule.drop())), LIMITS);
+            Instant readStarted = Instant.now();
             try (var queryIo = Executors.newFixedThreadPool(2); var decodeIo = Executors.newFixedThreadPool(2);
                  var source = scan(kind, sourceRef, sourceSettings, "source_records", "source_key", queryIo, decodeIo);
                  var target = scan("mongodb", targetRef, Map.of("uri", uri, "database", DATABASE, "isUri", true),
@@ -153,11 +165,34 @@ class ValidationJdbcMongoReadIT {
                         if (pair.source().isPresent() && pair.target().isPresent()) {
                             var left = pair.source().orElseThrow().sampleValues().fields();
                             var right = pair.target().orElseThrow().sampleValues().fields();
-                            // Only these controlled common payload fields are compared. This does not
-                            // implement general key mapping or an exemption for generated target fields.
+                            // Retain the small scalar control alongside the complete fixed projection.
                             var difference = ValidationValueComparison.compare(payload(left), payload(right));
                             checks.add(value(left.get("source_key")) + ":"
                                     + difference.map(diff -> diff.path() + ":" + diff.kind()).orElse("EQUAL"));
+                            var sourceGroup = pair.source().orElseThrow();
+                            var targetGroup = pair.target().orElseThrow();
+                            var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                                    "task", "native-fields-" + kind, ValidationMode.FULL, "fixed-projection", 1, "rules"),
+                                    new ValidationRoot("mapping", "output", sourceGroup.key().comparison(), List.of()), 1);
+                            try (var root = ValidationRootCheck.builder(observation, ValidationMethod.FULL_COLUMN,
+                                    ValidationCheckEvent.Participation.SHOULD_EXIST, ValidationRootCheck.TargetPresence.PRESENT,
+                                    new ValidationRootCheck.Limits(1024 * 1024, 100, 100, 20, 4))) {
+                                Instant observed = Instant.now();
+                                // Conservative diagnostic intervals cover session creation through group delivery.
+                                root.read(ValidationRootCheck.Side.SOURCE, new ValidationCheckEvent.ReadBoundary("source", "native-group-v1", readStarted, observed));
+                                root.read(ValidationRootCheck.Side.TARGET, new ValidationCheckEvent.ReadBoundary("target", "native-group-v1", readStarted, observed));
+                                // This fixture inserted without _id, confirmed native ObjectId values,
+                                // maps no source _id and uses only source_key/target_key as identity.
+                                var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
+                                        id -> id instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+                                ValidationFieldCheck.check(observation, List.of(), projection.apply(sourceGroup.sampleValues()), targetGroup.sampleValues(),
+                                        Optional.of(new ValidationRootCheck.SampledSide(sourceGroup.key().physical(), sourceGroup.sampleValues(), "source")),
+                                        Optional.of(new ValidationRootCheck.SampledSide(targetGroup.key().physical(), targetGroup.sampleValues(), "target")),
+                                        generated, String::equals, new ValidationValueComparison.TraversalLimits(LIMITS, 10000), root);
+                                for (var check : ValidationRootCheck.Check.values()) root.checked(check);
+                                var result = root.finish();
+                                fullChecks.add(value(left.get("source_key")) + ":" + (result.observedAgreement() ? "EQUAL" : result.counts()));
+                            }
                         }
                     }
                 }
@@ -165,6 +200,7 @@ class ValidationJdbcMongoReadIT {
             assertThat(facts).containsExactly("MATCHED:1:1", "MATCHED:1:1", "SOURCE_ONLY:1:0",
                     "MATCHED:1:1", "MATCHED:1:1", "TARGET_ONLY:0:1");
             assertThat(checks).containsExactly("1:EQUAL", "2:[amount]:VALUE", "4:EQUAL", "5:[label]:VALUE");
+            assertThat(fullChecks).containsExactly("1:EQUAL", "2:{TARGET_VALUE=1}", "4:{TARGET_EXTRA=1}", "5:{TARGET_VALUE=1}");
             verifyLookups(jdbc, mysql, kind, sourceRef, sourceSettings, targetRef, uri);
             // These are fresh read-only sessions; no CDC slot or source mutation was needed.
             assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM source_records;").trim()).isEqualTo("5");
