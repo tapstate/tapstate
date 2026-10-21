@@ -47,7 +47,7 @@ class RowImagesTest {
         var instant = java.time.Instant.parse("2021-11-22T00:08:03.849711123Z");
         var value = new ConvertedValue(instant, "timestamp(9)", "TapDateTimeValue",
                 "{\"fraction\":9,\"withTimeZone\":true}", "{\"seconds\":1637539683,\"nano\":849711123}");
-        assertThat(overTheWire(Map.of("stamp", value)).get("stamp")).isEqualTo(value);
+        assertThat(overTheWire(Map.of("stamp", value))).containsEntry("stamp", value);
     }
 
     @Test

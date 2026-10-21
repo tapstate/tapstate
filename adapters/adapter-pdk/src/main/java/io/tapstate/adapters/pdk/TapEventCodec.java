@@ -122,8 +122,8 @@ public final class TapEventCodec {
             SchemaNames names =
                     SchemaNames.read(codecs, schema.declared(), update.getBefore(), update.getAfter());
             return Envelope.update(ts(update), src(update),
-                    PdkValueConversions.read(update.getBefore(), codecs, schema.fields(), names::of, TapEventCodec::portable),
-                    PdkValueConversions.read(update.getAfter(), codecs, schema.fields(), names::of, TapEventCodec::portable),
+                    PdkValueConversions.read(update.getBefore(), codecs, schema.fields(), names::of, TapEventCodec::portable).orElse(null),
+                    PdkValueConversions.read(update.getAfter(), codecs, schema.fields(), names::of, TapEventCodec::portable).orElse(null),
                     null);
         }
         if (event instanceof TapDeleteRecordEvent delete) {
@@ -165,7 +165,7 @@ public final class TapEventCodec {
     private static Map<String, Object> row(
             Map<String, Object> row, TapCodecsRegistry codecs, PdkRowSchema schema) {
         SchemaNames names = SchemaNames.read(codecs, schema.declared(), row, null);
-        return PdkValueConversions.read(row, codecs, schema.fields(), names::of, TapEventCodec::portable);
+        return PdkValueConversions.read(row, codecs, schema.fields(), names::of, TapEventCodec::portable).orElse(null);
     }
 
     /**
@@ -565,7 +565,7 @@ public final class TapEventCodec {
      * every carried value put back the way the target wants it.
      */
     private static Map<String, Object> mutable(Map<String, Object> map, TapCodecsRegistry codecs) {
-        return PdkValueConversions.write(map, codecs, carrier -> restored(carrier, codecs));
+        return PdkValueConversions.write(map, codecs, carrier -> restored(carrier, codecs)).orElse(null);
     }
 
     /**

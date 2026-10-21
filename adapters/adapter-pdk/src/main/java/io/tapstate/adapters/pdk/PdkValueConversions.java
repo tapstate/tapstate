@@ -15,6 +15,8 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.BinaryOperator;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
@@ -33,11 +35,12 @@ final class PdkValueConversions {
 
     private PdkValueConversions() { }
 
-    static Map<String, Object> read(Map<String, Object> row, TapCodecsRegistry codecs,
+    /** An absent row image stays absent rather than becoming an empty document. */
+    static Optional<Map<String, Object>> read(Map<String, Object> row, TapCodecsRegistry codecs,
             Map<String, TapField> fields, BiFunction<Object, String, String> origin,
-            BiFunction<Object, Object, Object> compatibility) {
+            BinaryOperator<Object> compatibility) {
         if (row == null) {
-            return null;
+            return Optional.empty();
         }
         Map<String, Object> converted = copyRow(row);
         new TapCodecsFilterManager(codecs).transformToTapValueMap(converted, fields);
@@ -45,68 +48,103 @@ final class PdkValueConversions {
         ReadContext context = new ReadContext(fields, origin, compatibility);
         converted.forEach((key, value) -> result.put(key,
                 carry(value, row.get(key), key, key, context)));
-        return result;
+        return Optional.of(result);
     }
 
     private record ReadContext(Map<String, TapField> fields, BiFunction<Object, String, String> origin,
-            BiFunction<Object, Object, Object> compatibility) { }
+            BinaryOperator<Object> compatibility) { }
 
     private static Object carry(Object value, Object original, String path, String schemaPath, ReadContext context) {
         if (value instanceof TapValue<?, ?> tap) {
-            Object payload = tap.getValue();
-            if (payload == null) {
-                return null;
-            }
-            if (original != null) {
-                payload = context.compatibility().apply(original, payload);
-            }
-            Object originalPayload = original instanceof TapValue<?, ?> previous ? previous.getValue() : original;
-            String temporal = payload instanceof DateTime time ? describeTime(time) : null;
-            Object portable = payload instanceof DateTime time
-                    ? time.isContainsIllegal() ? time.getIllegalDate() : time.toInstant()
-                    : payload instanceof ByteData bytes ? new Bytes(bytes.getType(), bytes.getValue())
-                    : carry(payload, originalPayload, path, schemaPath, context);
-            String kind = tap.getClass().getSimpleName();
-            if (!VALUES.containsKey(kind)) {
-                throw new IllegalArgumentException("unsupported PDK value kind: " + kind);
-            }
-            // The PDK flattens array indexes when finding fields. An element must not inherit
-            // the container's declared database type when the schema cannot name the element.
-            TapField field = positionalElement(schemaPath) ? null
-                    : context.fields().get(TapCodecsFilterManager.fieldName(schemaPath));
-            boolean matches = field != null && tap.tapTypeClass().isInstance(field.getTapType());
-            var type = tap.getTapType();
-            if (type == null && matches) {
-                // Already-converted values are skipped by the PDK filter and may inherit their
-                // type from the table. Read that metadata without modifying a connector-owned value.
-                type = field.getTapType();
-            }
-            String declared = path == null || tap.getOriginType() == null
-                    ? matches ? field.getDataType()
-                            : original == null ? null : context.origin().apply(original, path)
-                    : tap.getOriginType();
-            return new ConvertedValue(portable, declared, kind,
-                    type == null ? null : parser().toJson(type), temporal);
+            return carryTapValue(tap, original, path, schemaPath, context);
         }
         if (value instanceof Map<?, ?> map) {
-            Map<String, Object> result = new LinkedHashMap<>();
-            Map<?, ?> source = original instanceof Map<?, ?> raw ? raw : Map.of();
-            map.forEach((key, element) -> result.put((String) key,
-                    carry(element, source.get(key), path == null ? null : path + "." + key,
-                            schemaPath + "." + key, context)));
-            return result;
+            return carryMap(map, original, path, schemaPath, context);
         }
         if (value instanceof Collection<?> collection) {
-            List<?> source = original instanceof List<?> raw ? raw : List.of();
-            List<Object> result = new ArrayList<>(collection.size());
-            int index = 0;
-            for (Object element : collection) {
-                result.add(carry(element, index < source.size() ? source.get(index) : null,
-                        null, schemaPath + ".#" + index, context));
-                index++;
-            }
-            return result;
+            return carryList(collection, original, schemaPath, context);
         }
+        return portableScalar(value);
+    }
+
+    private static Object carryTapValue(TapValue<?, ?> tap, Object original, String path,
+            String schemaPath, ReadContext context) {
+        Object payload = tap.getValue();
+        if (payload == null) {
+            return null;
+        }
+        if (original != null) {
+            payload = context.compatibility().apply(original, payload);
+        }
+        Object originalPayload = original instanceof TapValue<?, ?> previous ? previous.getValue() : original;
+        String temporal = payload instanceof DateTime time ? describeTime(time) : null;
+        Object portable = portablePayload(payload, originalPayload, path, schemaPath, context);
+        String kind = tap.getClass().getSimpleName();
+        if (!VALUES.containsKey(kind)) {
+            throw new IllegalArgumentException("unsupported PDK value kind: " + kind);
+        }
+        // The PDK flattens array indexes when finding fields. An element must not inherit
+        // the container's declared database type when the schema cannot name the element.
+        TapField field = positionalElement(schemaPath) ? null
+                : context.fields().get(TapCodecsFilterManager.fieldName(schemaPath));
+        boolean matches = field != null && tap.tapTypeClass().isInstance(field.getTapType());
+        var type = tap.getTapType();
+        if (type == null && matches) {
+            // Already-converted values are skipped by the PDK filter and may inherit their
+            // type from the table. Read that metadata without modifying a connector-owned value.
+            type = field.getTapType();
+        }
+        String declared = declaredType(tap, matches ? field : null, original, path, context);
+        return new ConvertedValue(portable, declared, kind,
+                type == null ? null : parser().toJson(type), temporal);
+    }
+
+    private static Object portablePayload(Object payload, Object original, String path,
+            String schemaPath, ReadContext context) {
+        if (payload instanceof DateTime time) {
+            return time.isContainsIllegal() ? time.getIllegalDate() : time.toInstant();
+        }
+        if (payload instanceof ByteData bytes) {
+            return new Bytes(bytes.getType(), bytes.getValue());
+        }
+        return carry(payload, original, path, schemaPath, context);
+    }
+
+    private static String declaredType(TapValue<?, ?> tap, TapField field, Object original,
+            String path, ReadContext context) {
+        if (path != null && tap.getOriginType() != null) {
+            return tap.getOriginType();
+        }
+        if (field != null) {
+            return field.getDataType();
+        }
+        return original == null ? null : context.origin().apply(original, path);
+    }
+
+    private static Map<String, Object> carryMap(Map<?, ?> map, Object original, String path,
+            String schemaPath, ReadContext context) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        Map<?, ?> source = original instanceof Map<?, ?> raw ? raw : Map.of();
+        map.forEach((key, element) -> result.put((String) key,
+                carry(element, source.get(key), path == null ? null : path + "." + key,
+                        schemaPath + "." + key, context)));
+        return result;
+    }
+
+    private static List<Object> carryList(Collection<?> collection, Object original,
+            String schemaPath, ReadContext context) {
+        List<?> source = original instanceof List<?> raw ? raw : List.of();
+        List<Object> result = new ArrayList<>(collection.size());
+        int index = 0;
+        for (Object element : collection) {
+            result.add(carry(element, index < source.size() ? source.get(index) : null,
+                    null, schemaPath + ".#" + index, context));
+            index++;
+        }
+        return result;
+    }
+
+    private static Object portableScalar(Object value) {
         if (value instanceof Integer || value instanceof Short || value instanceof Byte) {
             return ((Number) value).longValue();
         }
@@ -125,15 +163,16 @@ final class PdkValueConversions {
         return value;
     }
 
-    static Map<String, Object> write(Map<String, Object> row, TapCodecsRegistry codecs,
+    /** Preserve the distinction between an absent image and a present, empty document. */
+    static Optional<Map<String, Object>> write(Map<String, Object> row, TapCodecsRegistry codecs,
             java.util.function.Function<ConvertedValue, Object> legacy) {
         if (row == null) {
-            return null;
+            return Optional.empty();
         }
         Map<String, Object> restored = new LinkedHashMap<>(row.size());
         row.forEach((key, value) -> restored.put(key, restore(value, legacy)));
         new TapCodecsFilterManager(new RetainingTargetCodecs(codecs)).transformFromTapValueMap(restored);
-        return restored;
+        return Optional.of(restored);
     }
 
     private static final class RetainingTargetCodecs extends TapCodecsRegistry {
@@ -166,38 +205,9 @@ final class PdkValueConversions {
         }
     }
 
-    @SuppressWarnings({"rawtypes", "unchecked"})
     private static Object restore(Object value, java.util.function.Function<ConvertedValue, Object> legacy) {
         if (value instanceof ConvertedValue carrier) {
-            if (carrier.valueKind() == null) {
-                return legacy.apply(carrier);
-            }
-            Supplier<TapValue<?, ?>> factory = VALUES.get(carrier.valueKind());
-            if (factory == null) {
-                throw new IllegalArgumentException("unsupported stored PDK value kind: " + carrier.valueKind());
-            }
-            TapValue tap = factory.get();
-            Object payload = carrier.value();
-            // A compatibility correction can preserve an exact numeric value wider than the PDK box.
-            if (tap instanceof TapNumberValue && !(payload instanceof Double)) {
-                return payload;
-            }
-            if (carrier.temporalDescription() != null) {
-                payload = restoreTime(carrier.temporalDescription(), carrier.valueKind());
-            } else if (payload instanceof Bytes bytes) {
-                payload = new ByteData(bytes.tag(), bytes.value());
-            } else if (payload instanceof Map<?, ?> map) {
-                payload = restoreMap(map, legacy);
-            } else if (payload instanceof Collection<?> collection) {
-                payload = restoreList(collection, legacy);
-            }
-            tap.setValue(payload);
-            tap.setOriginType(carrier.originType());
-            if (carrier.typeDescription() != null) {
-                tap.setTapType((io.tapdata.entity.schema.type.TapType)
-                        parser().fromJson(carrier.typeDescription(), tap.tapTypeClass()));
-            }
-            return tap;
+            return restoreCarrier(carrier, legacy);
         }
         if (value instanceof Map<?, ?> map) {
             return new TapMapValue(restoreMap(map, legacy));
@@ -206,6 +216,48 @@ final class PdkValueConversions {
             return new TapArrayValue(restoreList(collection, legacy));
         }
         return value;
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static Object restoreCarrier(ConvertedValue carrier,
+            java.util.function.Function<ConvertedValue, Object> legacy) {
+        if (carrier.valueKind() == null) {
+            return legacy.apply(carrier);
+        }
+        Supplier<TapValue<?, ?>> factory = VALUES.get(carrier.valueKind());
+        if (factory == null) {
+            throw new IllegalArgumentException("unsupported stored PDK value kind: " + carrier.valueKind());
+        }
+        TapValue tap = factory.get();
+        // A compatibility correction can preserve an exact numeric value wider than the PDK box.
+        if (tap instanceof TapNumberValue && !(carrier.value() instanceof Double)) {
+            return carrier.value();
+        }
+        tap.setValue(restorePayload(carrier, legacy));
+        tap.setOriginType(carrier.originType());
+        if (carrier.typeDescription() != null) {
+            tap.setTapType((io.tapdata.entity.schema.type.TapType)
+                    parser().fromJson(carrier.typeDescription(), tap.tapTypeClass()));
+        }
+        return tap;
+    }
+
+    private static Object restorePayload(ConvertedValue carrier,
+            java.util.function.Function<ConvertedValue, Object> legacy) {
+        if (carrier.temporalDescription() != null) {
+            return restoreTime(carrier.temporalDescription(), carrier.valueKind());
+        }
+        Object payload = carrier.value();
+        if (payload instanceof Bytes bytes) {
+            return new ByteData(bytes.tag(), bytes.value());
+        }
+        if (payload instanceof Map<?, ?> map) {
+            return restoreMap(map, legacy);
+        }
+        if (payload instanceof Collection<?> collection) {
+            return restoreList(collection, legacy);
+        }
+        return payload;
     }
 
     private static Map<String, Object> restoreMap(Map<?, ?> map,

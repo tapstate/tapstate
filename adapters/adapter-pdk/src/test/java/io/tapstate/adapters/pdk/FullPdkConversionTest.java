@@ -33,6 +33,22 @@ class FullPdkConversionTest {
     private record DriverCell(TapValue<?, ?> converted) { }
 
     @Test
+    void absentAndEmptyUpdateImagesRemainDistinctThroughBothCodecDirections() {
+        TapCodecsRegistry codecs = new TapCodecsRegistry();
+        var absent = TapEventCodec.decodeChange(TapUpdateRecordEvent.create().table("values")
+                .after(Map.of("id", 1L)), codecs, Map.of());
+        assertThat(absent.before()).isNull();
+        assertThat(((TapUpdateRecordEvent) TapEventCodec.encode(absent, codecs)).getBefore()).isNull();
+        assertThat(absent.after()).containsEntry("id", 1L);
+
+        var empty = TapEventCodec.decodeChange(TapUpdateRecordEvent.create().table("values")
+                .before(Map.of()).after(Map.of("id", 1L)), codecs, Map.of());
+        assertThat(empty.before()).isEmpty();
+        assertThat(((TapUpdateRecordEvent) TapEventCodec.encode(empty, codecs)).getBefore()).isEmpty();
+        assertThat(empty.after()).containsEntry("id", 1L);
+    }
+
+    @Test
     void aPositionalNestedArrayDoesNotInheritItsOuterArraysDeclaration() {
         TapTable table = new TapTable("values");
         table.add(new TapField("rows", "outer-array").tapType(new io.tapdata.entity.schema.type.TapArray()));
@@ -57,7 +73,7 @@ class FullPdkConversionTest {
             assertThat(restored.getTapType().getFraction()).isEqualTo(9);
             return restored.getValue().toInstant();
         });
-        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(decoded, target)).getAfter().get("stamp")).isEqualTo(PRECISE);
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(decoded, target)).getAfter()).containsEntry("stamp", PRECISE);
         assertThat(value.getTapType()).isNull();
     }
 
@@ -184,7 +200,7 @@ class FullPdkConversionTest {
         BigDecimal exact = new BigDecimal("12345678901234.5678901234");
         var event = TapInsertRecordEvent.create().table("values").after(Map.of("value", exact));
         var decoded = TapEventCodec.decodeChange(event, new TapCodecsRegistry(), Map.of("value", "decimal(24,10)"));
-        assertThat(decoded.after().get("value")).isEqualTo(exact);
+        assertThat(decoded.after()).containsEntry("value", exact);
     }
 
     @Test
@@ -208,8 +224,8 @@ class FullPdkConversionTest {
                 assertThat(value.getTapType().getFraction()).isEqualTo(fraction);
                 return value.getValue().toInstant();
             });
-            assertThat(((TapInsertRecordEvent) TapEventCodec.encode(cdc, target)).getAfter().get("stamp"))
-                    .isEqualTo(expected);
+            assertThat(((TapInsertRecordEvent) TapEventCodec.encode(cdc, target)).getAfter())
+                    .containsEntry("stamp", expected);
         }
     }
 
@@ -242,7 +258,7 @@ class FullPdkConversionTest {
         assertThat(ConvertedValue.unwrap(update.before().get("stamp"))).isEqualTo(expected);
         assertThat(ConvertedValue.unwrap(update.after().get("stamp"))).isEqualTo(expected);
         assertThat(ConvertedValue.unwrap(delete.before().get("stamp"))).isEqualTo(expected);
-        assertThat(before.get("stamp")).isEqualTo(1637539683849711L);
+        assertThat(before).containsEntry("stamp", 1637539683849711L);
     }
 
     private static Object roundTrip(TapValue<?, ?> value, TapCodecsRegistry target) {

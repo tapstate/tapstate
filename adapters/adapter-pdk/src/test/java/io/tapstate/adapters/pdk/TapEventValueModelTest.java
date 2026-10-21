@@ -1048,8 +1048,8 @@ class TapEventValueModelTest {
         // 2026 value into January 1970 and silently leaves a plausible but wrong instant on the row.
         assertThat(decoded).isInstanceOf(ConvertedValue.class);
         Object instant = ((ConvertedValue) decoded).value();
-        assertThat(instant).isInstanceOf(Instant.class);
-        assertThat(instant).isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+        assertThat(instant).isInstanceOf(Instant.class)
+                .isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
     }
 
     @Test

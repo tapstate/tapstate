@@ -139,7 +139,7 @@ class RealPdkSchemaConversionIT {
     }
 
     private static void assertTypes(List<Document> rows) {
-        assertThat(rows).allSatisfy(row -> {
+        assertThat(rows).isNotEmpty().allSatisfy(row -> {
             assertThat(row.get("c_date")).isInstanceOf(Date.class).isEqualTo(Date.from(DAY));
             assertThat(row.get("c_ts")).isInstanceOf(Date.class).isEqualTo(Date.from(STAMP));
             assertThat(row.get("ordinary_number")).isInstanceOf(Long.class).isEqualTo(ORDINARY_NUMBER);

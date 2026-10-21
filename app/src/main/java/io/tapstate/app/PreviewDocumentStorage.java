@@ -143,6 +143,9 @@ final class PreviewDocumentStorage {
         if (PdkPreviewDateTimes.isDateTime(value)) {
             return "datetime";
         }
+        if (value instanceof java.time.Instant) {
+            return "instant";
+        }
         return switch (value) {
             case Bytes ignored -> "bytes";
             case String ignored -> "string";
@@ -155,7 +158,6 @@ final class PreviewDocumentStorage {
             case Byte ignored -> "byte";
             case Float ignored -> "float";
             case Date ignored -> "date";
-            case java.time.Instant ignored -> "instant";
             case byte[] ignored -> "byte-array";
             case Boolean ignored -> "boolean";
             case Character ignored -> "character";
