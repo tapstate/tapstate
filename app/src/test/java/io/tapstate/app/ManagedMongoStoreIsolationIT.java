@@ -71,7 +71,6 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 /** Enforced Mongo authorization, not an unauthenticated simulation of database routing. */
 @RequiresDocker
 class ManagedMongoStoreIsolationIT {
-    enum Missing { OPERATOR, VIEWS }
 
     @Test void encryptedConfigurationMovesBetweenIsolatedRootsAndRetainsItsOriginalResultAfterCacheLoss() {
         String suffix = UUID.randomUUID().toString().replace("-", "");
@@ -2192,43 +2191,6 @@ class ManagedMongoStoreIsolationIT {
                 .countDocuments(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID))).isZero();
     }
 
-    @ParameterizedTest
-    @EnumSource(Missing.class)
-    void readableButUnwritableDerivedDatabaseCannotReportReady(Missing readOnly) {
-        String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_readonly_" + suffix;
-        String denied = metadata + (readOnly == Missing.OPERATOR ? "_operator" : "_views");
-        String other = metadata + (readOnly == Missing.OPERATOR ? "_views" : "_operator");
-        String user = "user_readonly_" + suffix;
-        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
-            admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD).append("roles", List.of(
-                    new Document("role", "readWrite").append("db", metadata),
-                    new Document("role", "readWrite").append("db", other),
-                    new Document("role", "read").append("db", denied))));
-            try (MongoClient limited = MongoClients.create(uri(user, metadata))) {
-                assertThat(limited.getDatabase(denied).getCollection("proof").countDocuments()).isZero();
-                assertThatThrownBy(() -> limited.getDatabase(denied).getCollection("proof")
-                        .insertOne(new Document("_id", "denied-write")))
-                        .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
-            }
-            AtomicInteger ready = new AtomicInteger();
-            Throwable failure = catchThrowable(() -> {
-                try (var unexpected = start(uri(user, metadata), metadata, ready)) {
-                    throw new AssertionError("Cloud startup accepted a read-only deployment database");
-                }
-            });
-            assertThat(ready.get()).isZero();
-            Throwable coded = failure;
-            for (int depth = 0; depth < 16 && coded != null && !(coded instanceof TapstateException); depth++) coded = coded.getCause();
-            assertThat(coded).isInstanceOfSatisfying(TapstateException.class, error -> {
-                assertThat(error.code()).isEqualTo(StoreError.DATABASE_ACCESS_FAILED);
-                assertThat(error.args()).containsExactlyEntriesOf(java.util.Map.of("database", denied));
-                assertThat(error.getCause()).isNull();
-            });
-            assertNoProbes(admin, metadata);
-        }
-    }
-
     private static void assertNoProbes(MongoClient admin, String metadata) {
         for (String database : List.of(metadata, metadata + "_operator", metadata + "_views")) {
             assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>()))
@@ -2237,36 +2199,92 @@ class ManagedMongoStoreIsolationIT {
     }
 
     @ParameterizedTest
-    @EnumSource(Missing.class)
-    void missingDerivedDatabaseRightsCannotReportReady(Missing missing) {
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void cloudSetupConsumesTheOriginalSdkWithoutAccessToLegacyDatabases(boolean legacyReadable) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_missing_" + suffix;
-        String denied = metadata + (missing == Missing.OPERATOR ? "_operator" : "_views");
-        String allowed = metadata + (missing == Missing.OPERATOR ? "_views" : "_operator");
-        String user = "user_missing_" + suffix;
-        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
-            createUser(admin, user, List.of(metadata, allowed));
-            try (MongoClient limited = MongoClients.create(uri(user, metadata))) { assertDenied(limited, denied); }
+        String config = "consumer_config_" + suffix, user = "consumer_" + suffix, cluster = "consumer-" + suffix;
+        var legacy = List.of(config + "_operator", config + "_views");
+        var marker = new Document("_id", "retained").append("value", "must-not-change");
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"));
+                var wire = new CloudConsumerWireFixture(cluster)) {
+            var roles = new ArrayList<Document>();
+            roles.add(new Document("role", "readWrite").append("db", config));
+            for (String database : legacy) {
+                admin.getDatabase(database).getCollection("retained").insertOne(marker);
+                if (legacyReadable) roles.add(new Document("role", "read").append("db", database));
+            }
+            admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD).append("roles", roles));
+            try (MongoClient limited = MongoClients.create(uri(user, config))) {
+                for (String database : legacy) {
+                    if (legacyReadable) assertThat(limited.getDatabase(database).getCollection("retained").countDocuments()).isOne();
+                    else assertDenied(limited, database);
+                    assertThatThrownBy(() -> limited.getDatabase(database).getCollection("retained")
+                            .insertOne(new Document("_id", "denied")))
+                            .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
+                }
+            }
+            // Seed only the original CONFIG authority; this test exercises consumption, not allocation.
+            try (var ignored = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                    new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(user, config), null, Duration.ofSeconds(5)),
+                    cluster, "installation", "setup", 1)) { }
             AtomicInteger ready = new AtomicInteger();
-            AtomicReference<ConfigurableApplicationContext> started = new AtomicReference<>();
-            Throwable failure = catchThrowable(() -> started.set(start(uri(user, metadata), metadata, ready)));
-            if (started.get() != null) started.get().close();
-            assertThat(failure).as("Cloud startup refuses the missing %s grant before reporting ready", missing).isNotNull();
-            assertThat(ready.get()).as("no ApplicationReadyEvent was published").isZero();
-            Throwable coded = failure;
-            for (int depth = 0; depth < 16 && !(coded instanceof TapstateException) && coded != null; depth++) {
-                coded = coded.getCause();
+            try (var application = start(uri(user, config), cluster, ready, "--tapstate.cloud.base-url=" + wire.baseUrl())) {
+                assertThat(ready).hasValue(1);
+                var root = application.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.SETUP_REQUIRED);
+                assertThat(root.configurationEndpoint().orElseThrow().uri()).isEqualTo(uri(user, config));
+                assertThat(root.runtime().current()).isEmpty();
+                assertThat(root.runtime().business()).isEmpty();
+                assertThat(application.getBeansOfType(com.hazelcast.core.HazelcastInstance.class)).isEmpty();
+                assertThat(application.getBeansOfType(UserStore.class)).isEmpty();
+                assertThat(application.getBeansOfType(OnPremInstallation.class)).isEmpty();
+
+                String cookie = exchangeCookie(application, "accepted");
+                var snapshot = cloudPost(application, cookie, "/api/storage/status", Map.of());
+                assertThat(snapshot).containsEntry("setupPhase", "CONFIG_PREPARED").containsEntry("businessPhase", "NOT_CONFIGURED");
+                assertThat(snapshot.toString()).doesNotContain(PASSWORD, "controlled-sdk-token");
+                assertThat(((List<?>) snapshot.get("allowedActions")).contains("storage.setup.commit")).isTrue();
+                rootClient(application).post().uri(wire.invalidationPath("blocked")).retrieve().toBodilessEntity();
+                assertThatThrownBy(() -> exchangeCookie(application, "blocked"))
+                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                error -> assertThat(error.getStatusCode().value()).isEqualTo(401));
+                rootClient(application).post().uri(wire.invalidationPath("accepted")).retrieve().toBodilessEntity();
+                assertCloudStatus(application, cookie, 401);
+                assertThat(wire.exchanges).hasSize(2).allSatisfy(request -> {
+                    assertThat(request.method()).isEqualTo("POST");
+                    assertThat(request.authorization()).isEqualTo("controlled-sdk-token");
+                    assertThat(request.body().path("clusterId").asText()).isEqualTo(cluster);
+                    assertThat(request.body().size()).isEqualTo(2);
+                });
+
+                var reporter = application.getBean(io.tapstate.control.core.CloudStatusReporter.class);
+                assertThat(reporter.report().activePipelines()).isZero();
+                assertThat(reporter.report().lastErrorAt()).isNull();
+                assertThat(wire.reports).hasSize(2).allSatisfy(request -> {
+                    assertThat(request.method()).isEqualTo("POST");
+                    assertThat(request.authorization()).isEqualTo("Bearer controlled-sdk-token");
+                    var fields = new ArrayList<String>(); request.body().fieldNames().forEachRemaining(fields::add);
+                    assertThat(fields).contains("nonce", "runtimeVersion", "uptimeMs", "activePipelines")
+                            .isSubsetOf("nonce", "runtimeVersion", "uptimeMs", "activePipelines", "lastErrorAt");
+                    assertThat(request.body().path("activePipelines").asInt()).isZero();
+                    assertThat(request.body().path("uptimeMs").asLong()).isNotNegative();
+                    assertThat(request.body().toString()).doesNotContain(PASSWORD, "controlled-sdk-token", "mongodb", "consumer-user");
+                });
+                assertThat(wire.reports.get(0).body().path("nonce")).isNotEqualTo(wire.reports.get(1).body().path("nonce"));
+                admin.getDatabase("admin").runCommand(new Document("updateUser", user).append("roles", List.of()));
+                assertThatThrownBy(reporter::report).isInstanceOf(TapstateException.class);
+                assertThat(wire.reports).as("unreadable CONFIG must not be reported as an empty healthy runtime").hasSize(2);
+                assertThat(root.runtime().business()).isEmpty();
+                assertThat(wire.unexpected).isEmpty();
             }
-            assertThat(coded).as("a storage authorization failure is diagnosable with a canonical code")
-                    .isInstanceOfSatisfying(TapstateException.class, error -> {
-                        assertThat(error.code()).isEqualTo(StoreError.DATABASE_ACCESS_FAILED);
-                        assertThat(error.args()).containsExactlyEntriesOf(java.util.Map.of("database", denied));
-                        assertThat(error.getCause()).isNull();
-                    });
-            for (String database : List.of(metadata, allowed, denied)) {
-                assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>()))
-                        .noneMatch(name -> name.startsWith("tapstate_access_probe_"));
+            for (String database : legacy) {
+                assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>())).containsExactly("retained");
+                assertThat(admin.getDatabase(database).getCollection("retained").find().into(new ArrayList<>())).containsExactly(marker);
             }
+            assertThat(admin.getDatabase(config).getCollection("users").countDocuments()).isZero();
+            assertThat(admin.getDatabase(config).getCollection("op_bootstrap").countDocuments()).isZero();
+            assertThat(admin.getDatabase(config).getCollection("storage_binding").countDocuments()).isZero();
+            assertNoProbes(admin, config);
         }
     }
 
@@ -2278,7 +2296,11 @@ class ManagedMongoStoreIsolationIT {
                 "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
                 "--tapstate.cloud.base-url=https://cloud.example.invalid", "--tapstate.cloud.token=controlled-sdk-token",
                 "--tapstate.cloud.cluster-id=" + clusterId, "--tapstate.cloud.atlas-uri=" + metadataUri));
-        args.addAll(List.of(overrides));
+        for (String override : overrides) {
+            String key = override.substring(0, override.indexOf('=') + 1);
+            args.removeIf(argument -> argument.startsWith(key));
+            args.add(override);
+        }
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
                 .listeners((ApplicationListener<ApplicationReadyEvent>) event -> ready.incrementAndGet())
                 .run(args.toArray(String[]::new));

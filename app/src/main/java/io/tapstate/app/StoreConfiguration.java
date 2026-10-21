@@ -44,11 +44,6 @@ class StoreConfiguration {
         // store is unreachable or is not a replica-set, rather than a bare driver stack trace.
         try {
             connection.verify();
-            if (cloud.cloud()) {
-                connection.verifyDeploymentDatabases(java.util.List.of(
-                        cloud.operatorStateDatabase(properties.getOperatorStateDatabase()),
-                        cloud.viewsDatabase("views")));
-            }
             return connection;
         } catch (RuntimeException | Error failure) {
             // Spring cannot destroy a connection whose factory failed before returning the bean.
@@ -70,7 +65,7 @@ class StoreConfiguration {
         // The one configured bound among the stores: how long a movement sample is kept. Written onto
         // the history's expiring index as the port comes up, so a changed retention is a changed index.
         return new MongoStorePort(
-                storeConnection, cloud.operatorStateDatabase(mongo.getOperatorStateDatabase()),
+                storeConnection, mongo.getOperatorStateDatabase(),
                 history.getRetention());
     }
 
