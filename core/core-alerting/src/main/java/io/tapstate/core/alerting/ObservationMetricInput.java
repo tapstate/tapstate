@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.Observation;
 import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -95,8 +96,9 @@ public final class ObservationMetricInput {
         }
         // Keep the original point, including its accumulation start and measurement time. Never use the
         // lossy numeric map or an export overflow aggregate to invent a missing resource measurement.
-        MetricFact exact = point == null ? null
-                : MetricFact.single(selected.name(), selected.type(), selected.unit(), point);
+        MetricFact exact = selected == null ? null
+                : new MetricFact(selected.name(), selected.type(), selected.unit(),
+                        point == null ? List.of() : List.of(point));
         MetricAlertEvaluator.Result measured = MetricAlertEvaluator.evaluate(metric, exact, previous,
                 firing, now, expected.maxAge(), expected.maxGap());
         Instant observedAt = point == null ? observation.observedAt() : point.observedAt();

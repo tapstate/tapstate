@@ -132,6 +132,16 @@ class ObservationMetricInputTest {
                 .isEqualTo(MetricAlertEvaluator.Quality.UNSUPPORTED);
     }
 
+    @Test void absentSeriesDoesNotEraseThePresentInstrumentsUnitMismatch() {
+        MetricFact wrongUnit = MetricFact.single(METRIC.name(), MetricType.GAUGE, "ms",
+                MetricPoint.reading(Map.of(), T, 0));
+        Reading reading = read(RULE, new Publication(RULE, 1, observation("orders", T, List.of(wrongUnit))),
+                BUDGET, metric(Map.of(MetricAttributes.TABLE_ID, "absent")), true, T);
+        assertThat(reading.signal().condition()).isEqualTo(AlertSignal.Condition.UNKNOWN);
+        assertThat(reading.evaluation().quality()).isEqualTo(MetricAlertEvaluator.Quality.UNSUPPORTED);
+        assertThat(reading.point()).isNull();
+    }
+
     @Test void missingOrInconsistentPublicationTimeCannotBecomeANewSample() {
         assertThat(read(observation("orders", null, List.of(fact(T, 11))), 1, T).status()).isEqualTo(Status.MISSING_OBSERVATION_TIME);
         assertThat(read(observation("orders", T.plusSeconds(1), List.of(fact(T, 11))), 1, T).status()).isEqualTo(Status.INVALID_OBSERVATION_TIME);
