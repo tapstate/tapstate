@@ -15,6 +15,10 @@ class AlertCoreContractTest {
                 + fields("alarm-key", AlarmKey.class) + fields("scope", AlarmKey.Scope.class)
                 + fields("resource", AlarmKey.Resource.class) + fields("rule", AlertRule.class)
                 + fields("signal", AlertSignal.class) + fields("permit", DeliveryAttempt.Permit.class)
+                + fields("group-member", FrozenGroupPolicy.Member.class) + fields("frozen-group", FrozenGroupPolicy.Batch.class)
+                + fields("group-disposition-key", FrozenGroupPolicy.DispositionKey.class)
+                + fields("target-limit-domain", AlertTargetLimit.Domain.class) + fields("target-limit", AlertTargetLimit.class)
+                + "group-max-members=" + FrozenGroupPolicy.MAX_MEMBERS + "\n"
                 + "severity=" + names(AlarmSeverity.values()) + "\n"
                 + "condition=" + names(AlertSnapshot.Status.values()) + "\n"
                 + "quality=" + names(AlertSnapshot.Quality.values()) + "\n"
