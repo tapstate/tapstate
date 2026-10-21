@@ -343,5 +343,6 @@ validation.owner-not-authorized
 validation.read-cancelled
 validation.read-failed
 validation.read-protocol-violation
+validation.rule-unsupported
 validation.value-limit-exceeded
 validation.value-type-unsupported

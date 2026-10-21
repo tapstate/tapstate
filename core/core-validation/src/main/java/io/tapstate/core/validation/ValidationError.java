@@ -8,6 +8,7 @@ import java.util.Set;
 
 /** Diagnosable refusals at independent validation boundaries. */
 public enum ValidationError implements TapstateErrorCode {
+    RULE_UNSUPPORTED("validation.rule-unsupported", Set.of("node", "field", "rule")),
     INVALID_CONTRACT("validation.invalid-contract", Set.of("field")),
     KEY_LIMIT_EXCEEDED("validation.key-limit-exceeded", Set.of("limit")),
     INCOMPATIBLE_KEY("validation.incompatible-key", Set.of("component")),
