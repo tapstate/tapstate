@@ -1,12 +1,15 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.entity.FilterResults;
 import io.tapdata.pdk.apis.entity.Projection;
 import io.tapdata.pdk.apis.entity.SortOn;
 import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationKey;
+import io.tapstate.core.validation.ValidationKeyBinding;
 import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.spi.store.ValidationRowCursor;
@@ -40,8 +43,21 @@ final class PdkValidationSession {
         PdkValidationCursor.Decoder prepare(TapTable model, PdkValidationCodecs codecs);
     }
 
+    /** Supplies session-owned native equality values under this connector's loader and fixed model. */
+    @FunctionalInterface interface MatchEncoding {
+        Map<String, ?> encode(TapTable model, PdkValidationCodecs codecs, ValidationKey logicalKey);
+    }
+
+    sealed interface Request permits Scan, Lookup {
+        String table();
+        List<String> ascendingKeys();
+        List<String> projection();
+        int batchSize();
+        default List<String> matchFields() { return List.of(); }
+    }
+
     /** Empty projection reads the complete row; a nonempty projection lists literal physical fields. */
-    record Scan(String table, List<String> ascendingKeys, List<String> projection, int batchSize) {
+    record Scan(String table, List<String> ascendingKeys, List<String> projection, int batchSize) implements Request {
         Scan(String table, List<String> ascendingKeys, int batchSize) {
             this(table, ascendingKeys, List.of(), batchSize);
         }
@@ -63,11 +79,49 @@ final class PdkValidationSession {
         }
     }
 
+    /**
+     * One complete conjunction lookup, optionally ordered. The fixed binding covers every predicate
+     * field so returned facts can be checked without filling absent fields from the requested key.
+     * The encoder separately admits native field syntax, value conversion, memory and query semantics.
+     */
+    record Lookup(String table, List<String> ascendingKeys, List<String> projection, int batchSize,
+                  ValidationKeyBinding matchBinding, ValidationKey logicalKey) implements Request {
+        Lookup {
+            Objects.requireNonNull(table, "table");
+            ascendingKeys = List.copyOf(ascendingKeys);
+            projection = List.copyOf(projection);
+            Objects.requireNonNull(matchBinding, "matchBinding");
+            Objects.requireNonNull(logicalKey, "logicalKey");
+            if (table.isBlank() || table.length() > 512 || ascendingKeys.size() > 32 || batchSize < 1 || batchSize > 64
+                    || ascendingKeys.stream().anyMatch(key -> key.isBlank() || key.length() > 512)
+                    || ascendingKeys.stream().distinct().count() != ascendingKeys.size()
+                    || projection.size() > 4096 || projection.stream().anyMatch(field -> field.isBlank() || field.length() > 512)
+                    || projection.stream().distinct().count() != projection.size()
+                    || matchBinding.components().size() != logicalKey.parts().size()
+                    || matchBinding.components().stream().anyMatch(component -> component.path().size() != 1)) {
+                throw new IllegalArgumentException("invalid independent lookup shape");
+            }
+            for (int i = 0; i < matchBinding.components().size(); i++) {
+                if (matchBinding.components().get(i).domain() != logicalKey.parts().get(i).kind()) {
+                    throw new IllegalArgumentException("lookup binding and key domains differ");
+                }
+            }
+            List<String> fields = matchBinding.components().stream().map(component -> component.path().getFirst()).toList();
+            if (!projection.isEmpty() && (!projection.containsAll(ascendingKeys) || !projection.containsAll(fields))) {
+                throw new IllegalArgumentException("lookup projection omits required fields");
+            }
+        }
+        @Override public List<String> matchFields() {
+            return matchBinding.components().stream().map(component -> component.path().getFirst()).toList();
+        }
+    }
+
     private final String connectorId;
     private final ConnectorRef artifact;
     private final Map<String, Object> settings;
     private final String codecBinding;
-    private final Scan scan;
+    private final Request scan;
+    private final MatchEncoding matchEncoding;
     private final ReadAdmission admission;
     private final ExecutorService decodeIo;
     private final Runnable requireAuthorized;
@@ -81,7 +135,8 @@ final class PdkValidationSession {
     private PdkValidationCursor.Decoder decoder;
 
     private PdkValidationSession(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
-            String codecBinding, Scan scan, ReadAdmission admission, Runnable requireAuthorized, ExecutorService decodeIo) {
+            String codecBinding, Request scan, ReadAdmission admission, MatchEncoding matchEncoding,
+            Runnable requireAuthorized, ExecutorService decodeIo) {
         this.connectorId = Objects.requireNonNull(connectorId, "connectorId");
         this.artifact = Objects.requireNonNull(artifact, "artifact");
         // Nested settings must already belong to the admitted, fixed run configuration.
@@ -89,6 +144,7 @@ final class PdkValidationSession {
         this.codecBinding = Objects.requireNonNull(codecBinding, "codecBinding");
         this.scan = Objects.requireNonNull(scan, "scan");
         this.admission = Objects.requireNonNull(admission, "admission");
+        this.matchEncoding = matchEncoding;
         this.decodeIo = Objects.requireNonNull(decodeIo, "decodeIo");
         this.requireAuthorized = Objects.requireNonNull(requireAuthorized, "requireAuthorized");
         if (connectorId.isBlank() || codecBinding.isBlank()) throw new IllegalArgumentException("missing reader identity");
@@ -99,8 +155,18 @@ final class PdkValidationSession {
             ExecutorService io, ExecutorService decodeIo, int maxInFlightRows, ValidationValues.Limits rowLimits) {
         if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
         var session = new PdkValidationSession(connectorId, artifact, settings, codecBinding, scan,
-                admission, requireAuthorized, decodeIo);
+                admission, null, requireAuthorized, decodeIo);
         return new PdkValidationCursor(scan.table(), session::read, row -> session.decoder.decode(session.project(row)),
+                session::checkActive, session::cancel, io, maxInFlightRows, rowLimits);
+    }
+
+    static ValidationRowCursor lookup(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
+            String codecBinding, Lookup lookup, ReadAdmission admission, MatchEncoding encoding, Runnable requireAuthorized,
+            ExecutorService io, ExecutorService decodeIo, int maxInFlightRows, ValidationValues.Limits rowLimits) {
+        if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
+        var session = new PdkValidationSession(connectorId, artifact, settings, codecBinding, lookup,
+                admission, Objects.requireNonNull(encoding, "encoding"), requireAuthorized, decodeIo);
+        return new PdkValidationCursor(lookup.table(), session::read, row -> session.decoder.decode(session.project(row)),
                 session::checkActive, session::cancel, io, maxInFlightRows, rowLimits);
     }
 
@@ -120,11 +186,20 @@ final class PdkValidationSession {
                 checkAlive(opened);
                 TapTable model = discover(opened);
                 checkAlive(opened);
-                decoder = Objects.requireNonNull(admission.prepare(model,
-                        new PdkValidationCodecs(connectorId, codecBinding, opened.codecs())), "admitted decoder");
+                var codecs = new PdkValidationCodecs(connectorId, codecBinding, opened.codecs());
+                var admittedDecoder = Objects.requireNonNull(admission.prepare(model, codecs), "admitted decoder");
+                decoder = raw -> {
+                    ValidationValues.Row decoded = admittedDecoder.decode(raw);
+                    if (scan instanceof Lookup lookup) {
+                        var actual = lookup.matchBinding().read(decoded);
+                        if (!(actual instanceof ValidationKeyBinding.Bound bound) || !lookup.logicalKey().equals(bound.key())) throw protocol();
+                    }
+                    return decoded;
+                };
                 checkAlive(opened);
                 TapAdvanceFilter filter = TapAdvanceFilter.create().batchSize(scan.batchSize());
                 for (String key : scan.ascendingKeys()) filter.sort(SortOn.ascending(key));
+                if (scan instanceof Lookup lookup) filter.match(match(model, codecs, lookup));
                 if (!scan.projection().isEmpty()) {
                     Projection projection = Projection.create();
                     scan.projection().forEach(projection::include);
@@ -161,6 +236,23 @@ final class PdkValidationSession {
                 if (primary == null || dominant instanceof Error) throw dominant;
             }
         }
+    }
+
+    private DataMap match(TapTable model, PdkValidationCodecs codecs, Lookup lookup) {
+        Map<String, ?> encoded = Objects.requireNonNull(matchEncoding.encode(model, codecs, lookup.logicalKey()), "encoded lookup");
+        List<String> fields = lookup.matchFields();
+        if (encoded.size() != fields.size() || !encoded.keySet().containsAll(fields)) {
+            throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "lookup.matchFields"), null);
+        }
+        DataMap values = DataMap.create();
+        for (String field : fields) {
+            Object value = encoded.get(field);
+            if (value == null) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "lookup.nullMatch"), null);
+            // The admitted encoder owns nested/native values. Never expose its map to connector mutation.
+            values.put(field, value);
+        }
+        checkActive();
+        return values;
     }
 
     private void deliver(PdkConnector opened, Consumer<FilterResults> consumer, FilterResults result) {
@@ -226,6 +318,7 @@ final class PdkValidationSession {
         TapTable model = discovery.result();
         if (model.getNameFieldMap() == null || model.getNameFieldMap().size() > 4096) throw protocol();
         if (!model.getNameFieldMap().keySet().containsAll(scan.ascendingKeys())
+                || !model.getNameFieldMap().keySet().containsAll(scan.matchFields())
                 || !model.getNameFieldMap().keySet().containsAll(scan.projection())) throw protocol();
         if (!scan.projection().isEmpty()) {
             var required = new LinkedHashMap<String, io.tapdata.entity.schema.TapField>();

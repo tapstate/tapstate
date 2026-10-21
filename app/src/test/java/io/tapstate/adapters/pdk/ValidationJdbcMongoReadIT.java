@@ -4,6 +4,7 @@ import com.mongodb.client.MongoClients;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationKey;
+import io.tapstate.core.validation.ValidationKeyBinding;
 import io.tapstate.core.validation.ValidationPhysicalIdentity;
 import io.tapstate.core.validation.ValidationValueComparison;
 import io.tapstate.core.validation.ValidationValues;
@@ -21,6 +22,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.bson.Document;
@@ -145,6 +147,7 @@ class ValidationJdbcMongoReadIT {
             assertThat(facts).containsExactly("MATCHED:1:1", "MATCHED:1:1", "SOURCE_ONLY:1:0",
                     "MATCHED:1:1", "MATCHED:1:1", "TARGET_ONLY:0:1");
             assertThat(checks).containsExactly("1:EQUAL", "2:[amount]:VALUE", "4:EQUAL", "5:[label]:VALUE");
+            verifyLookups(jdbc, mysql, kind, sourceRef, sourceSettings, targetRef, uri);
             // These are fresh read-only sessions; no CDC slot or source mutation was needed.
             assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM source_records;").trim()).isEqualTo("5");
             if (!mysql) {
@@ -178,6 +181,58 @@ class ValidationJdbcMongoReadIT {
                 }
             }
         }
+    }
+
+    private static void verifyLookups(GenericContainer<?> jdbc, boolean mysql, String kind, ConnectorRef sourceRef,
+            Map<String, Object> sourceSettings, ConnectorRef targetRef, String uri) throws Exception {
+        // Native equality is admitted for this controlled exact-numeric and binary-collation fixture.
+        // This is not a blanket text-collation or portable-to-native guarantee for other models.
+        String labelType = mysql ? "VARCHAR(40) COLLATE utf8mb4_0900_bin" : "VARCHAR(40) COLLATE \"C\"";
+        sql(jdbc, mysql, "CREATE TABLE lookup_records (record_key BIGINT NOT NULL, amount DECIMAL(30,0), label " + labelType + ");"
+                + "INSERT INTO lookup_records VALUES "
+                + "(1," + EXACT + ",' O''Brien '),(2," + EXACT + ",' O''Brien '),(3," + EXACT + ",' O''Brien '),"
+                + "(4," + (EXACT - 1) + ",' O''Brien '),(5," + EXACT + ",'O''Brien'),"
+                + "(6," + EXACT + ",' O''BRIEN '),(7," + (EXACT + 1) + ",' O''Brien ');");
+        try (var client = MongoClients.create(uri)) {
+            client.getDatabase(DATABASE).getCollection("lookup_records").insertMany(
+                    List.of(7L, 6L, 5L, 4L, 3L, 2L, 1L).stream().map(id -> new Document("record_key", id)
+                            .append("amount", id == 4 ? EXACT - 1 : id == 7 ? EXACT + 1 : EXACT)
+                            .append("label", id == 5 ? "O'Brien" : id == 6 ? " O'BRIEN " : " O'Brien ")).toList());
+        }
+        for (boolean source : List.of(true, false)) {
+            String connector = source ? kind : "mongodb";
+            ConnectorRef artifact = source ? sourceRef : targetRef;
+            Map<String, Object> settings = source ? sourceSettings : Map.of("uri", uri, "database", DATABASE, "isUri", true);
+            assertThat(lookupIds(connector, artifact, settings, EXACT)).containsExactlyInAnyOrder(1L, 2L, 3L);
+            assertThat(lookupIds(connector, artifact, settings, EXACT - 1)).containsExactly(4L);
+            assertThat(lookupIds(connector, artifact, settings, EXACT + 10)).isEmpty();
+        }
+        assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM lookup_records;").trim()).isEqualTo("7");
+    }
+
+    private static List<Long> lookupIds(String kind, ConnectorRef artifact, Map<String, Object> settings, long amount) {
+        var binding = new ValidationKeyBinding("lookup", List.of(
+                new ValidationKeyBinding.Component(List.of("amount"), ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number")),
+                new ValidationKeyBinding.Component(List.of("label"), ValidationKey.Kind.TEXT, Set.of("text"))), Set.of(), LIMITS);
+        var logical = new ValidationKey(List.of(ValidationKey.Part.number(amount), ValidationKey.Part.text(" O'Brien ")));
+        var lookup = new PdkValidationSession.Lookup("lookup_records", List.of(), List.of("record_key", "amount", "label"), 2, binding, logical);
+        var ids = new ArrayList<Long>();
+        try (var queryIo = Executors.newSingleThreadExecutor(); var decodeIo = Executors.newSingleThreadExecutor();
+             var cursor = PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact", lookup,
+                     (model, codecs) -> new PdkValidationRows(model, codecs, path ->
+                             PdkValidationRows.Rule.of(path.equals(List.of("label")) ? PdkValidationRows.Shape.TEXT : PdkValidationRows.Shape.EXACT_NUMBER), LIMITS),
+                     (model, codecs, key) -> Map.of("amount", key.parts().get(0).value(), "label", key.parts().get(1).value()),
+                     () -> {}, queryIo, decodeIo, 1, LIMITS)) {
+            while (true) {
+                var next = cursor.next();
+                if (next.isEmpty()) break;
+                try (var row = next.orElseThrow()) {
+                    ids.add(((Number) value(row.values().fields().get("record_key"))).longValue());
+                    assertThat(value(row.values().fields().get("label"))).isEqualTo(" O'Brien ");
+                }
+            }
+        }
+        return ids;
     }
 
     private static void addJson(GenericContainer<?> jdbc, boolean mysql) throws Exception {
