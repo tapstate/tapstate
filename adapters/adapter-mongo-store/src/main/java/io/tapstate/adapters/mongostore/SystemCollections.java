@@ -402,6 +402,15 @@ public enum SystemCollections {
         return collectionName;
     }
 
+    /** Stable engineering identity shared with the closed storage contract inventory. */
+    public String resourceId() {
+        return "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
+    }
+
+    public Kind kind() { return kind; }
+
+    public Class<?> owner() { return owner; }
+
     public Database database() {
         return database;
     }

@@ -1,0 +1,2584 @@
+{
+  "schemaVersion": 1,
+  "recoveryProfiles": {
+    "configuration-backup": {
+      "goal": "Restore original authoritative facts without inventing identity or history.",
+      "entry": "Restore matching Configuration and keyring through database/deployment backup tools.",
+      "prerequisites": [
+        "Original Cluster identity, binding and supported layout are trusted.",
+        "Encrypted definitions and keys belong to the same backup; partial or unknown facts remain refused."
+      ]
+    },
+    "runtime-state": {
+      "goal": "Continue only from complete original durable state; otherwise require explicitly scoped recovery.",
+      "entry": "Original runtime restart, or storage.recovery.plan/confirm for an admitted pending recovery.",
+      "prerequisites": [
+        "Original CACHE identity, membership, full claim/fence and model/checkpoint closure are intact for continuation.",
+        "Loss does not mint creation rights; isolate old writers and confirm source, model, target and scope before rebuilding."
+      ]
+    },
+    "authentication": {
+      "goal": "Re-enter through the original account or Cloud identity without resurrecting old sessions.",
+      "entry": "Original OP login or Cloud exchange after native authentication preparation.",
+      "prerequisites": [
+        "Trusted CONFIG binding, completion and original account; bound CACHE is writable.",
+        "Only verified whole-empty CACHE may obtain a new scope; partial loss and conflicting identity refuse."
+      ]
+    },
+    "derived-cache": {
+      "goal": "Recreate derivable data from original definitions and verified artifacts after storage admission.",
+      "entry": "Registered connector test/discovery, artifact registration or current runtime observation.",
+      "prerequisites": [
+        "Original definition and exact connector artifact are available; CACHE identity is admitted.",
+        "Derived data is not saved schema history, an old observation or permission to resume a checkpoint."
+      ]
+    },
+    "legacy-preserve": {
+      "goal": "Retain old-layout facts without treating them as a new three-layer installation.",
+      "entry": "Matching old-version backup/diagnostics; no automatic cross-layout migration.",
+      "prerequisites": [
+        "Original legacy identity and matching version/backup are retained.",
+        "The current three-layer root does not admit this legacy layout."
+      ]
+    },
+    "installation-files": {
+      "goal": "Resume the original installation and immutable Configuration handoff.",
+      "entry": "Server installation --authorize and startup with the same installation directory.",
+      "prerequisites": [
+        "OS owner, restrictive permissions, file lock and original scope remain valid.",
+        "URI, CA and database facts match; required restart and purpose-specific authorization still apply."
+      ]
+    },
+    "artifact-cache": {
+      "goal": "Reacquire byte-identical verified connector artifacts.",
+      "entry": "RegistryConnectorProvisioner.stage with original content hash.",
+      "prerequisites": [
+        "Original artifact remains available and matches its hash.",
+        "Local cache files do not grant runtime ownership or registry authority."
+      ]
+    },
+    "temporary-files": {
+      "goal": "Recreate disposable staging material for the original owned attempt.",
+      "entry": "Owning operation creates bounded temporary files and closes/deletes them.",
+      "prerequisites": [
+        "Authoritative input and original operation remain valid.",
+        "No checkpoint, keyring or ownership is recovered from temporary files."
+      ]
+    },
+    "user-files": {
+      "goal": "Restore user-owned settings/artifacts or recreate them with explicit user input.",
+      "entry": "Existing CLI authoring/context/auth/deployment command or user backup.",
+      "prerequisites": [
+        "User-selected path and permissions are valid.",
+        "Local files do not grant server roles or replace CONFIG/CACHE recovery."
+      ]
+    },
+    "build-output": {
+      "goal": "Rebuild metadata from the same controlled input artifacts.",
+      "entry": "Existing catalog build tool.",
+      "prerequisites": [
+        "Original input is retained.",
+        "Build output is not production ownership or a recovery checkpoint."
+      ]
+    },
+    "cache-identity": {
+      "goal": "Verify authentication and business preparation independently under the original binding.",
+      "entry": "Original staged startup and native preparation under the retained CONFIG operation.",
+      "prerequisites": [
+        "Original CONFIG scope and one-time preparation authority are trusted.",
+        "Authentication readiness does not authorize business creation; missing or conflicting facts remain refused."
+      ]
+    }
+  },
+  "consistencyProfiles": {
+    "config": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Same CONFIG client/session with resource revision/CAS, original scope and configuration_version where applicable; never a runtime lease mirror."
+    },
+    "cache": {
+      "atomicDomain": "CACHE",
+      "fencing": "Same CACHE client/session with original identity and resource-specific guard/revision. Ownership-protected writes additionally compete with the full live claim; CONFIG cannot supply a CACHE fence."
+    },
+    "auth": {
+      "atomicDomain": "CACHE",
+      "fencing": "Original incarnation/auth generation and authWriteFence compete in the same CACHE transaction; late credentials cannot acquire a new scope."
+    },
+    "legacy": {
+      "atomicDomain": "LEGACY",
+      "fencing": "Matching legacy migration/ownership behavior; not admitted by the three-layer root."
+    },
+    "installation": {
+      "atomicDomain": "LOCAL_FILES",
+      "fencing": "Owner lock, immutable scope/generation, atomic replacement and fsync; file/Mongo handoff is not one transaction."
+    },
+    "file-cache": {
+      "atomicDomain": "LOCAL_FILES",
+      "fencing": "Original attempt ownership, content-hash validation and publication; no server execution rights."
+    },
+    "user-file": {
+      "atomicDomain": "USER_FILES",
+      "fencing": "Existing path/ownership checks and command-local locking/atomic replacement where supported; no cross-file/server transaction promise."
+    }
+  },
+  "resources": [
+    {
+      "id": "mongo.store.artifacts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "artifacts"
+      ],
+      "responsibility": "Legacy mixed authored resources.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoArtifactStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_state",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_state"
+      ],
+      "responsibility": "Actual durable Pipeline checkpoint/state in its original scope.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoStateStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_desired",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_desired"
+      ],
+      "responsibility": "Legacy latest desired Pipeline state.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoDesiredStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoDesiredStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_observation",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_observation"
+      ],
+      "responsibility": "Latest observed Pipeline state; absent observations remain unknown.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoObservationStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoObservationStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.workload_claims",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "workload_claims"
+      ],
+      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.cluster_membership",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "cluster_membership"
+      ],
+      "responsibility": "Committed runtime member/topology history.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoClusterMembershipStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoClusterMembershipStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connections",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connections"
+      ],
+      "responsibility": "Authored connection definitions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCatalogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCatalogStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.source_schemas",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "source_schemas"
+      ],
+      "responsibility": "Discovered source schemas for authoring.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSchemaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSchemaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connector_catalog",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connector_catalog"
+      ],
+      "responsibility": "Derived connector catalog metadata.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorCatalogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorCatalogStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connector_specs",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connector_specs"
+      ],
+      "responsibility": "Immutable connector specifications addressed by verified content.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorSpecStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorSpecStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connection_test_results",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connection_test_results"
+      ],
+      "responsibility": "Bounded latest connection diagnostics; not submission authority.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectionTestResultStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectionTestResultStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.users",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "users"
+      ],
+      "responsibility": "Original OP account hashes and roles.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.tokens",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "tokens"
+      ],
+      "responsibility": "Durable API token grants and revocations.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.sessions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "sessions"
+      ],
+      "responsibility": "Legacy session records.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.audit",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "audit"
+      ],
+      "responsibility": "Necessary append-only security/operation audit facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Append-only facts grow with audited operations; required history is not a cache optimization.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.cluster_identity",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "cluster_identity"
+      ],
+      "responsibility": "Stable Cluster identity.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connector_artifacts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "GRIDFS_BUCKET",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connector_artifacts.files",
+        "connector_artifacts.chunks"
+      ],
+      "responsibility": "Content-addressed original connector artifact bytes.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorRegistry"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorRegistry"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Artifact bytes grow with retained hashes; originals must remain obtainable for rebuild.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.srs_meta",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "srs_meta"
+      ],
+      "responsibility": "Legacy mixed source-replay metadata.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.system_meta",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "system_meta"
+      ],
+      "responsibility": "Legacy schema/key metadata.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnection"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnection"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_layouts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_layouts"
+      ],
+      "responsibility": "Authored Pipeline editor layout.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineLayoutStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineLayoutStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_drafts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_drafts"
+      ],
+      "responsibility": "Unpublished authored Pipeline drafts and publication revisions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineDraftStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineDraftStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.srs_log",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "srs_log"
+      ],
+      "responsibility": "Legacy durable source event log.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.derived_schemas",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "derived_schemas"
+      ],
+      "responsibility": "Derived model versions and required pins.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoDerivedSchemaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoDerivedSchemaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_rate_history",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_rate_history"
+      ],
+      "responsibility": "Reconstructable observed rate-history samples.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRateHistoryStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRateHistoryStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Observed samples use configured TTL/indexes; no promise to reconstruct old curves.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.srs_consumer_offsets",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "srs_consumer_offsets"
+      ],
+      "responsibility": "Per-consumer durable read, target ACK, snapshot pin and writer facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.nest.operator_state",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "NEST",
+      "physicalNames": [
+        "operator_state"
+      ],
+      "responsibility": "Legacy mixed operator/connector state.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoKeyedStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoKeyedStateStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.nest.nest_dead_letters",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "NEST",
+      "physicalNames": [
+        "nest_dead_letters"
+      ],
+      "responsibility": "Necessary unique discarded-row facts; not reconstructable from source replay.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoNestDeadLetterStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoNestDeadLetterStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.sources",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "sources"
+      ],
+      "responsibility": "Authoritative Source definitions and encrypted connector configuration.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pipelines",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pipelines"
+      ],
+      "responsibility": "Authoritative Pipeline definitions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.configuration_version",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "configuration_version"
+      ],
+      "responsibility": "Configuration-wide authoring/import concurrency revision.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.configuration_imports",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "configuration_imports"
+      ],
+      "responsibility": "Bounded import identity, pending attempts and immutable result receipts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationImportStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationImportStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "At most 16 pending and 256 committed/unknown receipts; bounded bytes; no deletion of unknown results.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationImportStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.cluster_identity",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "cluster_identity"
+      ],
+      "responsibility": "Stable Cluster identity.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.schema_migrations",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "schema_migrations"
+      ],
+      "responsibility": "Storage-domain schema version and migration ownership.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.cluster_keys",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "cluster_keys"
+      ],
+      "responsibility": "Original Cluster configuration encryption keyring.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.storage_setup",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "storage_setup"
+      ],
+      "responsibility": "Original setup operation, purpose generation and completion facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationBootstrap"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationBootstrap"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pipeline_layouts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pipeline_layouts"
+      ],
+      "responsibility": "Authored Pipeline editor layout.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineLayoutStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineLayoutStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineLayoutStoreTest.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pdk_note_scopes",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pdk_note_scopes"
+      ],
+      "responsibility": "Required connector note namespace ownership and clear generations.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoRequiredNoteStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pdk_notes",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pdk_notes"
+      ],
+      "responsibility": "Necessary opaque connector notes with per-key CAS and tombstones.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoRequiredNoteStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pdk_note_migrations",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pdk_note_migrations"
+      ],
+      "responsibility": "Necessary note migration completion facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoRequiredNoteStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.operator_generations",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "operator_generations"
+      ],
+      "responsibility": "Stable Pipeline state generations, preparation and bounded previous/target recovery scopes.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineStateMappings"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineStateMappings"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineStateMappingsIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.storage_binding",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "storage_binding"
+      ],
+      "responsibility": "Immutable three-layer binding and system default target identity.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoStorageBindingStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoStorageBindingStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoStorageBindingStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.storage_recovery",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "storage_recovery"
+      ],
+      "responsibility": "Authentication/runtime recovery identity, scope and bounded operation summary.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoStorageRecoveryStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoStorageRecoveryStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pdk_note_origins",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pdk_note_origins"
+      ],
+      "responsibility": "Original encrypted connector context and exact artifact identity for note lifecycle.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoRequiredNoteStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pdk_note_carries",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pdk_note_carries"
+      ],
+      "responsibility": "Static dependencies protecting carried required notes.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoRequiredNoteStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.transform_definitions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "transform_definitions"
+      ],
+      "responsibility": "Reusable authored transform definitions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.view_definitions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "view_definitions"
+      ],
+      "responsibility": "Reusable authored view definitions; no materialized user rows.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.serve_definitions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "serve_definitions"
+      ],
+      "responsibility": "Reusable authored serve definitions; no materialized user rows.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.connections",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "connections"
+      ],
+      "responsibility": "Authored connection definitions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationCatalogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationCatalogStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationCatalogStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.tokens",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "tokens"
+      ],
+      "responsibility": "Durable API token grants and revocations.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationSecurityStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationSecurityStores"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationSecurityStoresIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.audit",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "audit"
+      ],
+      "responsibility": "Necessary append-only security/operation audit facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationSecurityStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationSecurityStores"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Append-only facts grow with audited operations; required history is not a cache optimization.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationSecurityStoresIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.users",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "users"
+      ],
+      "responsibility": "Original OP account hashes and roles.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoFirstAdminStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoFirstAdminStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoFirstAdminStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.op_bootstrap",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "op_bootstrap"
+      ],
+      "responsibility": "Permanent first-administrator pending/completion facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoFirstAdminStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoFirstAdminStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoFirstAdminStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pipeline_drafts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pipeline_drafts"
+      ],
+      "responsibility": "Unpublished authored Pipeline drafts and publication revisions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDraftStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationDraftStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationDraftStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.cache_identity",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "cache_identity"
+      ],
+      "responsibility": "Bound CACHE identity with separate authentication/business preparation.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheIdentity"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheIdentity"
+      ],
+      "recovery": "cache-identity",
+      "consistency": "cache",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.schema_migrations",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "schema_migrations"
+      ],
+      "responsibility": "Storage-domain schema version and migration ownership.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheIdentity"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheIdentity"
+      ],
+      "recovery": "cache-identity",
+      "consistency": "cache",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.op_sessions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "op_sessions"
+      ],
+      "responsibility": "OP session hashes, expiry and revocation in the original authentication scope.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDomain"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDomain"
+      ],
+      "recovery": "authentication",
+      "consistency": "auth",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheDomainIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.cloud_sessions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "cloud_sessions"
+      ],
+      "responsibility": "Cloud session hashes and exact verified context.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDomain"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDomain"
+      ],
+      "recovery": "authentication",
+      "consistency": "auth",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheDomainIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.cloud_revocations",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "cloud_revocations"
+      ],
+      "responsibility": "Cloud JTI revocation tombstones, including revocation before session creation.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDomain"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDomain"
+      ],
+      "recovery": "authentication",
+      "consistency": "auth",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheDomainIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pipeline_intents",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pipeline_intents"
+      ],
+      "responsibility": "Latest desired Pipeline intent; not an execution queue or runtime claim.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineIntentStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineIntentStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineIntentStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.srs_events",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "srs_events"
+      ],
+      "responsibility": "Durable ordered shared source events.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsLogStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.srs_log_bounds",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "srs_log_bounds"
+      ],
+      "responsibility": "Monotonic event bounds and retained trim frontier.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsLogStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.workload_claims",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "workload_claims"
+      ],
+      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.srs_chains",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "srs_chains"
+      ],
+      "responsibility": "Capture chain membership and actual source checkpoint facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsChainStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsChainStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsChainStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.srs_models",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "srs_models"
+      ],
+      "responsibility": "Immutable actual models used by original event versions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsModelStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsModelStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsModelStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.nest_dead_letters",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "nest_dead_letters"
+      ],
+      "responsibility": "Necessary unique discarded-row facts; not reconstructable from source replay.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredDeadLetterStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRequiredDeadLetterStore"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoRequiredDeadLetterStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.srs_model_contexts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "srs_model_contexts"
+      ],
+      "responsibility": "Model publication ordering and context boundaries.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsModelStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsModelStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsModelStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.srs_consumers",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "srs_consumers"
+      ],
+      "responsibility": "Original shared chain/Pipeline membership and revisions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsConsumerStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsConsumerStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.srs_consumer_offsets",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "srs_consumer_offsets"
+      ],
+      "responsibility": "Per-consumer durable read, target ACK, snapshot pin and writer facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsConsumerStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsConsumerStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.direct_channel_offsets",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "direct_channel_offsets"
+      ],
+      "responsibility": "Private direct-channel original checkpoint and target ACK frontier.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoDirectChannelStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoDirectChannelStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoDirectChannelStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.direct_batches",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "direct_batches"
+      ],
+      "responsibility": "Ordered pending direct-batch settlement boundaries without event bodies.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoDirectChannelStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoDirectChannelStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoDirectChannelStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.pipeline_state",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "pipeline_state"
+      ],
+      "responsibility": "Actual durable Pipeline checkpoint/state in its original scope.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.pipeline_observation",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "pipeline_observation"
+      ],
+      "responsibility": "Latest observed Pipeline state; absent observations remain unknown.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
+      ],
+      "recovery": "derived-cache",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.source_schemas",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "source_schemas"
+      ],
+      "responsibility": "Discovered source schemas for authoring.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheSchemaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheSchemaStore"
+      ],
+      "recovery": "derived-cache",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheSchemaStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.connector_catalog",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "connector_catalog"
+      ],
+      "responsibility": "Derived connector catalog metadata.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorCatalogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorCatalogStore"
+      ],
+      "recovery": "derived-cache",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.connector_specs",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "connector_specs"
+      ],
+      "responsibility": "Immutable connector specifications addressed by verified content.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorSpecStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorSpecStore"
+      ],
+      "recovery": "derived-cache",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.connection_test_results",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "connection_test_results"
+      ],
+      "responsibility": "Bounded latest connection diagnostics; not submission authority.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectionTestResultStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectionTestResultStore"
+      ],
+      "recovery": "derived-cache",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.connector_artifacts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "GRIDFS_BUCKET",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "connector_artifacts.files",
+        "connector_artifacts.chunks"
+      ],
+      "responsibility": "Content-addressed original connector artifact bytes.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorRegistry"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorRegistry"
+      ],
+      "recovery": "derived-cache",
+      "consistency": "cache",
+      "growth": "Artifact bytes grow with retained hashes; originals must remain obtainable for rebuild.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheConnectorRegistryIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.derived_schemas",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "derived_schemas"
+      ],
+      "responsibility": "Derived model versions and required pins.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDerivedSchemaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheDerivedSchemaStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheDerivedSchemaStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.pipeline_rate_history",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "pipeline_rate_history"
+      ],
+      "responsibility": "Reconstructable observed rate-history samples.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheRateHistoryStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheRateHistoryStore"
+      ],
+      "recovery": "derived-cache",
+      "consistency": "cache",
+      "growth": "Observed samples use configured TTL/indexes; no promise to reconstruct old curves.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheRateHistoryStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.cluster_membership",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "cluster_membership"
+      ],
+      "responsibility": "Committed runtime member/topology history.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheClusterMembershipStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheClusterMembershipStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheClusterMembershipStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.nest_state",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "nest_state"
+      ],
+      "responsibility": "Write-through Nest payload state including pending parent state.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.join_facts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "join_facts"
+      ],
+      "responsibility": "Join fact mirror.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.join_dimensions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "join_dimensions"
+      ],
+      "responsibility": "Join dimension mirror.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.join_indexes",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "join_indexes"
+      ],
+      "responsibility": "Join lookup indexes.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.join_writers",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "join_writers"
+      ],
+      "responsibility": "Join writer participation.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.nest_shapes",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "nest_shapes"
+      ],
+      "responsibility": "Original Nest shape and exact physical placement.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheNestShapeStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheNestShapeStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.operator_cleanup",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "operator_cleanup"
+      ],
+      "responsibility": "Exact resource retirement and pending physical cleanup inventory.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoOperatorInventory"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoOperatorInventory"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.sink_preparations",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "sink_preparations"
+      ],
+      "responsibility": "Original target preparation operation and READY/unknown outcome.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSinkPreparationStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSinkPreparationStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSinkPreparationStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.capture_preparations",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "capture_preparations"
+      ],
+      "responsibility": "One-time CONFIG authority for original capture state creation.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCaptureStatePreparations"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCaptureStatePreparations"
+      ],
+      "recovery": "configuration-backup",
+      "consistency": "config",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.snapshot_orders",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "snapshot_orders"
+      ],
+      "responsibility": "Original snapshot ordering facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSnapshotStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSnapshotStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.snapshot_counts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "snapshot_counts"
+      ],
+      "responsibility": "Snapshot target-count accounting.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSnapshotStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSnapshotStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+      ]
+    },
+    {
+      "id": "local.installation",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "FILE_SET",
+      "layer": "CONFIG",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${installation}/stage.json",
+        "${installation}/configuration.uri",
+        "${installation}/config-ca.pem",
+        "${installation}/capability.json",
+        "${installation}/owner.lock"
+      ],
+      "responsibility": "Original local installation authority and immutable Configuration handoff.",
+      "writers": [
+        "io.tapstate.app.InstallationFiles"
+      ],
+      "readers": [
+        "io.tapstate.app.InstallationFiles"
+      ],
+      "recovery": "installation-files",
+      "consistency": "installation",
+      "growth": "A bounded directory per installation; capabilities expire and are replaced for the same scope.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/InstallationCommandTest.java"
+      ]
+    },
+    {
+      "id": "local.connector-cache",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "FILE_SET",
+      "layer": "CACHE",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${pluginCache}/${verifiedHash}.jar"
+      ],
+      "responsibility": "Verified local connector artifact bytes.",
+      "writers": [
+        "io.tapstate.adapters.pdk.RegistryConnectorProvisioner"
+      ],
+      "readers": [
+        "io.tapstate.adapters.pdk.RegistryConnectorProvisioner"
+      ],
+      "recovery": "artifact-cache",
+      "consistency": "file-cache",
+      "growth": "Content-hash artifacts bounded by retained registrations and the existing local cache lifecycle.",
+      "evidence": [
+        "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/RegistryConnectorProvisionerTest.java"
+      ]
+    },
+    {
+      "id": "temporary.connector-registration",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "TEMPORARY_FILES",
+      "layer": "TEMPORARY",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${temporaryRegistrationJar}"
+      ],
+      "responsibility": "Staged artifact verification input for one registration attempt.",
+      "writers": [
+        "io.tapstate.adapters.pdk.ConnectorArtifactRegistrar"
+      ],
+      "readers": [
+        "io.tapstate.adapters.pdk.ConnectorArtifactRegistrar"
+      ],
+      "recovery": "temporary-files",
+      "consistency": "file-cache",
+      "growth": "One owned staging file per bounded artifact operation.",
+      "evidence": [
+        "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/ConnectorArtifactRegistrarTest.java"
+      ]
+    },
+    {
+      "id": "temporary.connector-trust",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "TEMPORARY_FILES",
+      "layer": "TEMPORARY",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${temporaryTrustDirectory}/ca.pem"
+      ],
+      "responsibility": "Materialized native connector CA for one owned connector lifetime.",
+      "writers": [
+        "io.tapstate.adapters.pdk.ConnectorTrustMaterial"
+      ],
+      "readers": [
+        "io.tapstate.adapters.pdk.ConnectorTrustMaterial"
+      ],
+      "recovery": "temporary-files",
+      "consistency": "file-cache",
+      "growth": "Bounded CA bundle; removed on owner close.",
+      "evidence": [
+        "arch-tests/src/test/java/io/tapstate/archtests/SystemCollectionsGatesTest.java"
+      ]
+    },
+    {
+      "id": "temporary.connector-download",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "TEMPORARY_FILES",
+      "layer": "TEMPORARY",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${verifiedDownloadSpool}"
+      ],
+      "responsibility": "Bounded download spool before content verification.",
+      "writers": [
+        "io.tapstate.cli.PublishedConnectorArtifacts"
+      ],
+      "readers": [
+        "io.tapstate.cli.PublishedConnectorArtifacts"
+      ],
+      "recovery": "temporary-files",
+      "consistency": "file-cache",
+      "growth": "Bounded download size and one spool per attempt; removed on exit.",
+      "evidence": [
+        "cli/src/test/java/io/tapstate/cli/PublishedConnectorArtifactsTest.java"
+      ]
+    },
+    {
+      "id": "user.cli-context",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "FILE_SET",
+      "layer": "USER",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${cliContextFile}"
+      ],
+      "responsibility": "User-selected CLI server contexts and active selection.",
+      "writers": [
+        "io.tapstate.cli.ContextConfigStore"
+      ],
+      "readers": [
+        "io.tapstate.cli.ContextConfigStore"
+      ],
+      "recovery": "user-files",
+      "consistency": "user-file",
+      "growth": "One local context record per saved user context.",
+      "evidence": [
+        "cli/src/test/java/io/tapstate/cli/ContextConfigStoreTest.java"
+      ]
+    },
+    {
+      "id": "user.cli-auth",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "FILE_SET",
+      "layer": "USER",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${cliAuthFile}",
+        "${cliAuthLock}"
+      ],
+      "responsibility": "User-owned CLI authentication records and lock.",
+      "writers": [
+        "io.tapstate.cli.AuthFileStore"
+      ],
+      "readers": [
+        "io.tapstate.cli.AuthFileStore"
+      ],
+      "recovery": "user-files",
+      "consistency": "user-file",
+      "growth": "Bounded local session data by saved contexts; server authentication remains authoritative.",
+      "evidence": [
+        "cli/src/test/java/io/tapstate/cli/AuthFileStoreTest.java"
+      ]
+    },
+    {
+      "id": "user.workspace",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "USER_OUTPUT",
+      "layer": "USER",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${workspace}/authored-files"
+      ],
+      "responsibility": "User-authored workspace resources and local environment/binding files.",
+      "writers": [
+        "io.tapstate.cli.WorkspaceWrite",
+        "io.tapstate.cli.NewCmd",
+        "io.tapstate.cli.ServerBinding"
+      ],
+      "readers": [
+        "io.tapstate.cli.WorkspaceWrite",
+        "io.tapstate.cli.NewCmd",
+        "io.tapstate.cli.ServerBinding"
+      ],
+      "recovery": "user-files",
+      "consistency": "user-file",
+      "growth": "Grows with explicitly authored resources; no hidden server state.",
+      "evidence": [
+        "arch-tests/src/test/java/io/tapstate/archtests/SystemCollectionsGatesTest.java"
+      ]
+    },
+    {
+      "id": "user.local-stack",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "USER_OUTPUT",
+      "layer": "USER",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${localStackDirectory}/deployment-files"
+      ],
+      "responsibility": "Explicitly selected local development deployment files.",
+      "writers": [
+        "io.tapstate.cli.LocalStack"
+      ],
+      "readers": [
+        "io.tapstate.cli.LocalStack"
+      ],
+      "recovery": "user-files",
+      "consistency": "user-file",
+      "growth": "One managed local demo deployment directory.",
+      "evidence": [
+        "cli/src/test/java/io/tapstate/cli/LocalStackTest.java"
+      ]
+    },
+    {
+      "id": "user.alias-links",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "USER_OUTPUT",
+      "layer": "USER",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${userAliasLink}"
+      ],
+      "responsibility": "User-selected CLI executable alias link.",
+      "writers": [
+        "io.tapstate.cli.AliasLinks"
+      ],
+      "readers": [
+        "io.tapstate.cli.AliasLinks"
+      ],
+      "recovery": "user-files",
+      "consistency": "user-file",
+      "growth": "One selected symlink per alias.",
+      "evidence": [
+        "cli/src/test/java/io/tapstate/cli/AliasLinksTest.java"
+      ]
+    },
+    {
+      "id": "build.catalog",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "USER_OUTPUT",
+      "layer": "BUILD",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${catalogOutputDirectory}/catalog-files"
+      ],
+      "responsibility": "Build-time derived connector catalog metadata.",
+      "writers": [
+        "io.tapstate.tools.catalog.derive.CatalogDerive"
+      ],
+      "readers": [
+        "io.tapstate.tools.catalog.derive.CatalogDerive"
+      ],
+      "recovery": "build-output",
+      "consistency": "user-file",
+      "growth": "Bounded by the selected connector input set.",
+      "evidence": [
+        "tools/catalog-derive/src/test/java/io/tapstate/tools/catalog/derive/CatalogDeriveTest.java"
+      ]
+    }
+  ]
+}
