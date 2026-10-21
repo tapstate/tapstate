@@ -23,6 +23,7 @@ import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.runtime.engine.validation.ValidationCandidateQueue;
 import io.tapstate.runtime.engine.validation.ValidationRootHintInbox;
 import io.tapstate.runtime.engine.validation.ValidationRootHintOutbox;
+import io.tapstate.app.ValidationCaptureHintTap;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CaptureStart;
@@ -112,27 +113,21 @@ class ValidationJdbcCdcHintsIT {
                     @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                         try {
                             if (events.size() > 32) throw new AssertionError("unexpected fixture batch size");
-                            var changes = new ArrayList<Change>();
                             for (Envelope event : events) {
                                 if (event.op() == Op.DDL) continue;
                                 assertThat(event.src()).isEqualTo(TABLE);
-                                var changeKind = switch (event.op()) {
-                                    case INSERT -> INSERT;
-                                    case UPDATE -> UPDATE;
-                                    case DELETE -> DELETE;
-                                    default -> throw new AssertionError("unexpected snapshot event in present-only capture");
-                                };
-                                Change change = extractor.extract(changeKind, event.before(), event.after());
+                                assertThat(event.op()).isIn(Op.INSERT, Op.UPDATE, Op.DELETE);
                                 if (count.incrementAndGet() > 8) throw new AssertionError("unexpected fixture event count");
-                                changes.add(change);
                             }
-                            if (!changes.isEmpty()) assertThat(outbox.tryOffer(changes)).isEqualTo(ValidationRootHintOutbox.Offer.ACCEPTED);
                         } catch (RuntimeException | Error failure) { failures.record(failure); }
                     }
                     @Override public void onError(Throwable failure) { failures.record(failure); }
                 };
+                CaptureListener tapped = ValidationCaptureHintTap.wrap(listener,
+                        List.of(new ValidationCaptureHintTap.Binding(outbox, extractor::extract)),
+                        new ValidationCaptureHintTap.Limits(32, 1, 65536));
                 MysqlReader mysqlReader = null;
-                try (var tail = capture.cdc(config, CaptureStart.present(), listener)) {
+                try (var tail = capture.cdc(config, CaptureStart.present(), tapped)) {
                     awaitReader(source, mysql, failures, true);
                     if (mysql) {
                         mysqlReader = mysqlReader(source);

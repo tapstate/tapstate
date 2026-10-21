@@ -90,7 +90,8 @@ public record ValidationRootHintBatch(ValidationRunIdentity run, Sender sender, 
             };
             if (!valid) throw ValidationError.invalid("hint.changeKeys");
         }
-        private long retainedBytes() {
+        /** Conservative owned-key charge without exposing or copying binary payloads. */
+        public long retainedBytes() {
             return 64L + (before == null ? 0 : before.retainedBytes()) + (after == null ? 0 : after.retainedBytes());
         }
     }
@@ -102,7 +103,7 @@ public record ValidationRootHintBatch(ValidationRunIdentity run, Sender sender, 
         if (changes == null || changes.isEmpty() || changes.size() > MAX_CHANGES) {
             throw ValidationError.invalid("hint.changes");
         }
-        long bytes = baseBytes(run, sender);
+        long bytes = headerBytes(run, sender);
         for (Change change : changes) {
             if (change == null) throw ValidationError.invalid("hint.change");
             sender.check(change.before()); sender.check(change.after());
@@ -113,7 +114,7 @@ public record ValidationRootHintBatch(ValidationRunIdentity run, Sender sender, 
     }
 
     public long retainedBytes() {
-        long bytes = baseBytes(run, sender);
+        long bytes = headerBytes(run, sender);
         for (Change change : changes) bytes += change.retainedBytes();
         return bytes;
     }
@@ -186,7 +187,8 @@ public record ValidationRootHintBatch(ValidationRunIdentity run, Sender sender, 
     private static void number(MessageDigest digest, long value) {
         for (int shift = 56; shift >= 0; shift -= 8) digest.update((byte) (value >>> shift));
     }
-    private static long baseBytes(ValidationRunIdentity run, Sender sender) {
+    /** Conservative immutable header charge for bounded producers before they copy a change list. */
+    public static long headerBytes(ValidationRunIdentity run, Sender sender) {
         ValidationOwner owner = run.owner();
         return 1024L + sender.retainedBytes() + 2L * (run.taskId().length() + run.runId().length()
                 + run.specHash().length() + run.comparisonRulesVersion().length() + owner.clusterId().length()

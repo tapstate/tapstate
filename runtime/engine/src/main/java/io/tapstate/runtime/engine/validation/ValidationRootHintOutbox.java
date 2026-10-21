@@ -84,6 +84,19 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
         if (run.mode() != ValidationMode.INCREMENTAL) throw invalid("hint.mode");
     }
 
+    public ValidationRunIdentity run() { return run; }
+    public Sender sender() { return sender; }
+    public Limits limits() { return limits; }
+    /** Local open state only, never a renewal or proof of distributed authority. */
+    public boolean isOpen() { return !closed; }
+
+    /**
+     * Records an extraction or capture fault without transport, locking the buffer, or running callbacks.
+     * The background controller must observe failure/liveness and retire the original run. A caller that
+     * caught an Error must still rethrow it after recording; this method does not consume that Error.
+     */
+    public void reportFailure(Throwable problem) { fail(Objects.requireNonNull(problem, "problem")); }
+
     /**
      * One nonwaiting capture-side attempt. Inputs are a stable, admitted list of immutable key facts,
      * not borrowed row/driver values. Rejection retires hint coverage, never normal synchronization.
