@@ -118,7 +118,7 @@ public final class StorageControlDispatcher {
             }
             case "storage.recovery.status" -> {
                 input.only("operationId"); String id = input.uuid("operationId");
-                yield available(recoveries).status(caller.cache(), active, id).map(StorageControlDispatcher::recovery)
+                yield available(recoveries).status(caller.cache(), active, id).map(this::recovery)
                         .orElseGet(() -> Map.of("operationId", id, "phase", "UNKNOWN"));
             }
             case "configuration.export" -> {
@@ -186,14 +186,17 @@ public final class StorageControlDispatcher {
         return Map.of("mode", value.mode().name(), "clusterId", value.clusterId(), "operationId", value.operationId(), "generation", value.generation(),
                 "setupPhase", value.setupPhase().name(), "bindingVersion", value.bindingVersion());
     }
-    private static Map<String,Object> recovery(StorageRecoveryCommands.Plan plan) {
+    private Map<String,Object> recovery(StorageRecoveryCommands.Plan plan) {
         var out = new LinkedHashMap<String,Object>(); out.put("operationId", plan.operationId()); out.put("previousOperationId", plan.previousOperationId());
         out.put("phase", plan.phase().name()); out.put("scope", plan.manifest().selection().extent().name());
         out.put("pipelineIds", new ArrayList<>(plan.manifest().selection().pipelineIds())); out.put("affectedPipelineIds", new ArrayList<>(plan.manifest().affectedPipelineIds()));
         out.put("definitionHashes", plan.manifest().definitionHashes()); out.put("dependencyHash", plan.manifest().dependencyHash());
         out.put("configurationRevision", plan.manifest().configurationRevision()); out.put("controlRevision", plan.controlRevision()); out.put("planHash", plan.planHash());
         var scope = plan.originalScope(); out.put("clusterId", scope.clusterId()); out.put("bindingVersion", scope.bindingVersion());
-        out.put("mode", scope.mode().name()); out.put("cacheIncarnation", scope.cacheIncarnation()); out.put("authGeneration", scope.authGeneration()); return out;
+        out.put("mode", scope.mode().name()); out.put("cacheIncarnation", scope.cacheIncarnation()); out.put("authGeneration", scope.authGeneration());
+        var display=available(recoveries).presentation(plan);out.put("preflightCurrent",display.current());
+        out.put("targetPolicies",display.targets().stream().map(target -> Map.of("node",target.node(),"source",target.source(),"policy",target.policy())).toList());
+        out.put("executionErrorCode",display.executionErrorCode());return out;
     }
     private static Map<String,Object> ticket(ConfigurationImportStore.Ticket ticket) {
         var scope = new LinkedHashMap<String,Object>(); scope.put("clusterId", ticket.scope().clusterId()); scope.put("bindingVersion", ticket.scope().bindingVersion());

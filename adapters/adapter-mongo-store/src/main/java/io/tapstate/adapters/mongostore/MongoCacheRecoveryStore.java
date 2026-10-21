@@ -120,6 +120,29 @@ final class MongoCacheRecoveryStore implements CacheRecoveryStore {
         return transaction(session -> MongoCacheRecoveryFacts.read(SystemCollections.OPERATOR_GENERATIONS.on(database)
                 .find(session, new Document("_id", pipelineId)).first()));
     }
+    @Override public List<RequiredNoteContext> inspectPrivateContexts(String pipelineId) {
+        return transaction(session -> inspectNotes(session,pipelineId));
+    }
+    @Override public void requirePrivateRetirable(String pipelineId,RequiredNoteScope original) {
+        transaction(session -> {
+            var found=inspectNotes(session,pipelineId).stream().filter(context -> context.scope().equals(original)).findFirst().orElseThrow(MongoCacheRecoveryFacts::refused);
+            if(!found.completed())artifacts.configurationNotes().requireRecoveryRetirable(session,original);
+            return null;
+        });
+    }
+    private List<RequiredNoteContext> inspectNotes(ClientSession session,String pipelineId) {
+        var auth=bindings.cachePreparationForTransaction(session).orElseThrow(MongoCacheRecoveryFacts::refused).authScope();requireTarget(session,auth);
+        var row=SystemCollections.OPERATOR_GENERATIONS.on(database).find(session,new Document("_id",pipelineId)).first();
+        var summary=MongoCacheRecoveryFacts.read(row).orElseThrow(MongoCacheRecoveryFacts::refused);
+        var mapping=MongoPipelineStateMappings.decode(pipelineId,row);
+        if(mapping.phase()!=PipelineStateMapping.Phase.ACTIVE || mapping.operationId()==null || !matches(auth,summary.targetScope()))throw MongoCacheRecoveryFacts.refused();
+        var pipeline=artifacts.getInTransaction(session,pipelineId).filter(io.tapstate.core.model.PipelineResource.class::isInstance)
+                .map(io.tapstate.core.model.PipelineResource.class::cast).orElseThrow(MongoCacheRecoveryFacts::refused);
+        var notes=artifacts.configurationNotes();
+        for(var node:io.tapstate.core.model.PipelineConnectorNodes.of(pipeline,id -> artifacts.getInTransaction(session,id).orElseThrow(MongoCacheRecoveryFacts::refused)))
+            notes.reserveAuthoring(session,RequiredNoteOwner.forNode(auth.bindingVersion(),node.node(),node.purpose(),mapping.stateGeneration()),true);
+        return notes.inspectRecoveryContexts(session,summary,mapping.operationId());
+    }
     @Override public FullPreparation authorizeFull(StorageRecoveryCommands.Plan running, String pipelineId) {
         if (running.phase() != StorageRecoveryCommands.Phase.RUNNING || running.manifest().selection().extent() != StorageRecoveryCommands.Extent.PIPELINE
                 || !running.manifest().selection().pipelineIds().equals(Set.of(pipelineId)) || !running.manifest().affectedPipelineIds().equals(Set.of(pipelineId)))
@@ -162,6 +185,15 @@ final class MongoCacheRecoveryStore implements CacheRecoveryStore {
                     || !plan.operationId().equals(mapping.get("operationId"))
                     || MongoPipelineStateMappings.decode(recovery.targetScope().pipelineId(), mapping).phase() != PipelineStateMapping.Phase.ACTIVE)
                 throw MongoCacheRecoveryFacts.refused();
+        }
+        void requireCacheTarget(MongoCacheDomain cache) {
+            owner.transaction(session -> {
+                require(session,owner.client,owner.database);
+                var mapping=SystemCollections.OPERATOR_GENERATIONS.on(owner.database).find(session,new Document("_id",recovery.targetScope().pipelineId())).first();
+                if(MongoPipelinePreparationFacts.decode(recovery.targetScope().pipelineId(),mapping,owner.clusterId).phase()!=PipelinePreparation.Phase.COMPLETE)
+                    throw MongoCacheRecoveryFacts.refused();
+                cache.requireRecoveryTarget(owner.bindings.loadForTransaction(session).orElseThrow(MongoCacheRecoveryFacts::refused));return null;
+            });
         }
         void fence(ClientSession session, MongoClient client, MongoDatabase database) {
             require(session, client, database); owner.fencePlan(session, plan);

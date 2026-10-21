@@ -26,9 +26,12 @@ final class RecordingActuator implements LifecycleActuator {
      * was written against - a converge loop driving a pipeline it has itself been running.
      */
     private boolean carryingAJob = true;
+    private boolean boundedComplete;
 
     /** Armed to make start() throw, as if building the job refused before any job existed. */
     private RuntimeException refuseStartWith;
+    private RuntimeException refuseStopWith;
+    void refuseStopWith(RuntimeException failure){refuseStopWith=failure;}
 
     @Override
     public void start(String pipelineId) {
@@ -52,6 +55,8 @@ final class RecordingActuator implements LifecycleActuator {
     @Override
     public void stop(String pipelineId, boolean purgeState) {
         calls.add("stop:" + pipelineId + (purgeState ? ":purge" : ":keep"));
+        carryingAJob=false;
+        if(refuseStopWith!=null)throw refuseStopWith;
     }
 
     @Override
@@ -68,6 +73,8 @@ final class RecordingActuator implements LifecycleActuator {
     public boolean isCarryingAJob(String pipelineId) {
         return carryingAJob;
     }
+    @Override public boolean completed(String pipelineId){return boundedComplete && carryingAJob;}
+    void completeLoad(){boundedComplete=true;}
 
     /** The verbs actuated so far, in order. */
     List<String> calls() {

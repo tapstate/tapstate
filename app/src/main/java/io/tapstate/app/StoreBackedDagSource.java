@@ -132,6 +132,12 @@ final class StoreBackedDagSource implements DagSource {
     // The one member a source built without a cluster plans over: no cluster names it, so it is named here.
     private static final String LOCAL_MEMBER = "local";
     private final ParallelismBudget parallelismBudget;
+    interface CapturedStartGuard {
+        Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models);
+        CapturedStartGuard NONE=(pass,artifacts,models) -> Map.of();
+    }
+    private final CapturedStartGuard capturedStartGuard;
+    private final java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -232,9 +238,10 @@ final class StoreBackedDagSource implements DagSource {
         PipelineResource pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,pipelineId),snapshot);
         var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
         SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
+        Map<String,String> confirmedHashes=pass==null?Map.of():capturedStartGuard.inspect(pass,snapshot,models);
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
-                requireMarkedStore, members, parallelismBudget, records, models::model);
+                requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads);
         captured.validateStart(pipelineId);
         PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
         NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
@@ -245,7 +252,7 @@ final class StoreBackedDagSource implements DagSource {
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
                 () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
-                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates));
+                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),confirmedHashes);
     }
 
     private record PreparedOperators(OperatorCoordinatePlan coordinates,Map<String,NestTable> tables,
@@ -385,6 +392,24 @@ final class StoreBackedDagSource implements DagSource {
             StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
             boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
             io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs) {
+        this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,
+                requireMarkedStore,members,parallelismBudget,modelRecords,modelInputs,(fence,epochs) -> SinkAckFactory.NONE);
+    }
+    private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
+            StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
+            boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads) {
+        this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,requireMarkedStore,
+                members,parallelismBudget,modelRecords,modelInputs,boundedLoads,CapturedStartGuard.NONE);
+    }
+    private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
+            StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
+            boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
+        this.capturedStartGuard=Objects.requireNonNull(capturedStartGuard);
+        this.boundedLoads=Objects.requireNonNull(boundedLoads);
         this.modelInputs = Objects.requireNonNull(modelInputs,"modelInputs");
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
@@ -412,8 +437,29 @@ final class StoreBackedDagSource implements DagSource {
     static StoreBackedDagSource scopedRoot(StorePort store, NestSettings nests, StoreReachability reachability,
             SourcePlacement placement, boolean marked, Supplier<List<String>> members, ParallelismBudget budget,
             io.tapstate.spi.store.RequiredNoteStore notes, io.tapstate.adapters.pdk.ConnectorProvisioner connectors, ArtifactStore artifacts) {
-        return new StoreBackedDagSource(store, new PdkSinkWriterBinder(notes, connectors), nests, reachability,
-                placement, artifacts, marked, members, budget);
+        return scopedRoot(store,nests,reachability,placement,marked,members,budget,notes,connectors,artifacts,ignored -> false);
+    }
+    static StoreBackedDagSource scopedRoot(StorePort store,NestSettings nests,StoreReachability reachability,
+            SourcePlacement placement,boolean marked,Supplier<List<String>> members,ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner connectors,ArtifactStore artifacts,
+            java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned) {
+        return scopedRoot(store,nests,reachability,placement,marked,members,budget,notes,connectors,artifacts,recoveryPinned,
+                (fence,epochs) -> SinkAckFactory.NONE);
+    }
+    static StoreBackedDagSource scopedRoot(StorePort store,NestSettings nests,StoreReachability reachability,
+            SourcePlacement placement,boolean marked,Supplier<List<String>> members,ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner connectors,ArtifactStore artifacts,
+            java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads) {
+        return scopedRoot(store,nests,reachability,placement,marked,members,budget,notes,connectors,artifacts,recoveryPinned,boundedLoads,CapturedStartGuard.NONE);
+    }
+    static StoreBackedDagSource scopedRoot(StorePort store,NestSettings nests,StoreReachability reachability,
+            SourcePlacement placement,boolean marked,Supplier<List<String>> members,ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner connectors,ArtifactStore artifacts,
+            java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
+        return new StoreBackedDagSource(store,new PdkSinkWriterBinder(notes,connectors,recoveryPinned),nests,reachability,
+                placement,artifacts,marked,members,budget,unscopedModelRecords(store),source -> SourceDiscovery.model(store,source),boundedLoads,capturedStartGuard);
     }
 
     /** Resolves the candidate's selected source tables without opening a connector or changing a store. */
@@ -749,7 +795,7 @@ final class StoreBackedDagSource implements DagSource {
                             serveLanding,viewLanding,stepIds,frontier,compiledJoins,
                             capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources,scopedDirect,targetPreparations),
                     FencedSinkAckFactory.heldTo(scopedSources == null ? sinkAckFactory(pipeline,pipelineId,fence) :
-                            scopedSources.isEmpty() && scopedDirect.isEmpty() ? SinkAckFactory.NONE : new ScopedSrsSinkAckFactory(scopedSources,scopedDirect,runIdOf(fence)),fence),frontier,
+                            scopedSources.isEmpty() && scopedDirect.isEmpty() ? boundedLoads.apply(fence,snapshotEpochs(sourceVertices,capturedSources)) : new ScopedSrsSinkAckFactory(scopedSources,scopedDirect,runIdOf(fence)),fence),frontier,
                     shape, drawn);
             if(original!=null)operators.pass().prepareSinkTargets(original.claim(),targetPreparations);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
@@ -3154,6 +3200,15 @@ final class StoreBackedDagSource implements DagSource {
                 readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.sourceId())));
     }
 
+    private static Map<String,Long> snapshotEpochs(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var epochs=new TreeMap<String,Long>();
+        for(var vertex:vertices.values()) {
+            var source=bindings.requireSnapshot(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+            if(epochs.put(vertex.stream(),source.epoch())!=null)throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        }
+        return Map.copyOf(epochs);
+    }
+
     private static Map<String,ScopedSrsSinkAckFactory.Source> scopedSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
         var sources = new LinkedHashMap<String,ScopedSrsSinkAckFactory.Source>(); var selected = new HashSet<String>();
         for (var vertex : vertices.values()) {
@@ -3508,15 +3563,17 @@ final class StoreBackedDagSource implements DagSource {
     static final class PdkSinkWriterBinder implements SinkWriterBinder {
         private final io.tapstate.spi.store.RequiredNoteStore notes;
         private final io.tapstate.adapters.pdk.ConnectorProvisioner provisioner;
-        PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;}
-        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this.notes=Objects.requireNonNull(notes,"notes");this.provisioner=Objects.requireNonNull(provisioner,"provisioner");}
+        private final java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned;
+        PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;this.recoveryPinned=ignored -> false;}
+        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this(notes,provisioner,ignored -> false);}
+        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned){this.notes=Objects.requireNonNull(notes,"notes");this.provisioner=Objects.requireNonNull(provisioner,"provisioner");this.recoveryPinned=Objects.requireNonNull(recoveryPinned);}
         @Override public SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
                 List<io.tapstate.spi.store.SinkPreparationStore.Input> roster,Runnable requireActive) {
             if(original==null || original.scope()==null)return factory;
             if(!(factory instanceof PdkSinkWriterFactory sink))throw new IllegalStateException("the configured binder requires a concrete target factory");
             if(notes==null || provisioner==null)throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
             var inputs=sink.preparationInputs(original.scope());
-            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive);
+            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
             roster.addAll(inputs);return sink.forRun(run);
         }
 

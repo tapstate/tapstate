@@ -9,11 +9,21 @@ import java.util.Optional;
 
 /** Authenticated range confirmation; runtime actuation separately observes the original CONFIG intent. */
 public final class StorageRecoveryService {
+    public record TargetPolicy(String node,String source,String policy) {
+        public TargetPolicy {Objects.requireNonNull(node);Objects.requireNonNull(source);if(!java.util.Set.of("APPEND","CLEAR","FAIL").contains(policy))throw new IllegalArgumentException("unknown full-load policy");}
+    }
+    /** Read-time display data only; it never changes the original durable confirmation. */
+    public record Presentation(boolean current,java.util.List<TargetPolicy> targets,String executionErrorCode) {
+        public Presentation {targets=java.util.List.copyOf(targets);}
+    }
     /** Reads actual store relationships and registered source/target capabilities, without starting jobs. */
     public interface Inspector {
         StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection);
         /** Rechecks the original influence/capability closure before every CONFIG transaction attempt. */
         void requireCurrent(CacheAuthScope scope, StorageRecoveryCommands.Manifest original);
+        /** Optional live source probes run before CONFIG transactions; their retry guards remain store-only. */
+        default void verifyExternal(CacheAuthScope scope,StorageRecoveryCommands.Manifest original) {}
+        default Presentation present(StorageRecoveryCommands.Plan original) {return new Presentation(true,java.util.List.of(),null);}
     }
     private final StorageRecoveryCommands commands;
     private final Inspector inspector;
@@ -60,6 +70,7 @@ public final class StorageRecoveryService {
         if (original.phase() != StorageRecoveryCommands.Phase.PLANNED) {
             return publish(original);
         }
+        inspector.verifyExternal(scope,original.manifest());active.run();
         Runnable current = () -> { active.run(); inspector.requireCurrent(scope, original.manifest()); };
         var result = audit.dispatch(ControlOperations.STORAGE_RECOVERY_CONFIRM, new AuditContext(subject, operationId),
                 () -> commands.guardedBy(current).confirm(original));
@@ -74,6 +85,7 @@ public final class StorageRecoveryService {
             throw new IllegalStateException("recovery publication changed its original confirmation");
         return result;
     }
+    public Presentation presentation(StorageRecoveryCommands.Plan original) {return inspector.present(original);}
     public Optional<StorageRecoveryCommands.Plan> status(CacheAuthScope scope, Runnable active, String originalId) {
         active.run();
         return commands.guardedBy(active).find(scope, originalId);

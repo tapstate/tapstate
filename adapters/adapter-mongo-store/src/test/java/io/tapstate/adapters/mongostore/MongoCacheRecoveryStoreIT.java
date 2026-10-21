@@ -6,6 +6,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.model.*;
 import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.model.canonical.SourceCaptureIdentity;
 import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.RequiresDocker;
 import java.time.Duration;
@@ -236,6 +237,148 @@ class MongoCacheRecoveryStoreIT {
             assertThatThrownBy(() -> notes.open(newOwner)).isInstanceOf(TapstateException.class);
         });
     }
+    @Test void anotherLossRequiresNewPreflightNamingTheOldOperationWithoutRedirectingItsConfirmation() {
+        fixture(f -> {
+            f.domain.cacheRecoveries().stageCluster(f.confirmed());
+            var commands=f.domain.recoveryCommands();var previous=commands.current(f.current()).orElseThrow();
+            f.cache.drop();try(var cache=MongoCacheDomain.connect(f.binding.cache(),Duration.ofSeconds(5),"next-loss")) {
+                f.domain.prepareAuthenticationRecovery(cache,ACTIVE);
+            }
+            var current=f.current();var manifest=f.manifest();
+            assertThat(commands.find(current,previous.operationId())).contains(previous);
+            assertThatThrownBy(() -> commands.confirm(previous)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> commands.plan(current,manifest,null,null)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> commands.plan(current,manifest,previous.operationId(),null)).isInstanceOf(TapstateException.class);
+            var next=commands.plan(current,manifest,null,previous.operationId());
+            assertThat(next.operationId()).isNotEqualTo(previous.operationId());assertThat(next.phase()).isEqualTo(StorageRecoveryCommands.Phase.PLANNED);
+            assertThat(next.originalScope()).isEqualTo(current);assertThat(next.previousOperationId()).isEqualTo(previous.operationId());
+            assertThatThrownBy(() -> f.domain.cacheRecoveries().stageCluster(next)).isInstanceOf(TapstateException.class);
+            assertThat(f.domain.cacheRecoveries().stageCluster(commands.confirm(next))).allSatisfy(summary -> assertThat(summary.targetScope().stateGeneration()).isEqualTo(3));
+        });
+    }
+    @Test void anExplicitFullRebindsOnlyItsNamedOriginalOperatorDatabaseWithoutInventingOldInventory() {
+        fixture(f -> {
+            f.domain.cacheRecoveries().stageCluster(f.confirmed());var commands=f.domain.recoveryCommands();
+            var cluster=commands.current(f.current()).orElseThrow();var business=f.domain.bindings().cachePreparation().orElseThrow().businessScope();
+            var binding=new OperatorDatabaseBinding(business,f.cache.getName(),f.config.getName(),"master");
+            String extra=f.cache.getName()+"_nest";
+            try(var client=MongoClients.create(MONGO.getReplicaSetUrl());var cache=MongoCacheDomain.connect(f.binding.cache(),Duration.ofSeconds(5),"extra-full",MongoRateHistoryStore.DEFAULT_RETENTION,binding)) {
+                var target=client.getDatabase(extra);
+                try {
+                    f.domain.prepareStoppedRecovery(cache,cluster,ACTIVE);cluster=commands.complete(cluster);
+                    var permission=f.fullAfterCluster("a",cluster.operationId());var summary=permission.recovery();var scope=summary.targetScope();
+                    var oldBinding=new OperatorDatabaseBinding(new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),summary.previousScope().cacheIncarnation()),binding.cacheDatabase(),binding.configurationDatabase(),binding.masterDatabase());
+                    try(var session=client.startSession()) {
+                        session.withTransaction(() -> MongoCacheOperatorDatabases.prepare(session,client.getDatabase(f.cache.getName()),target,oldBinding,UUID.randomUUID().toString(),ACTIVE));
+                    }
+                    var oldIdentity=target.getCollection("cache_identity").find().first();
+                    var retained=new Document("_id","old-scope-payload").append("value","must-remain-isolated");target.getCollection("nest_state").insertOne(retained);
+                    cache.inspectRecoveredOperatorDatabase(summary,extra,ACTIVE);
+                    assertThat(target.getCollection("cache_identity").find().first()).isEqualTo(oldIdentity);
+                    var node=WorkloadClaimFence.from(cache.workloadClaims(business).acquire(NODE.key(),NODE.owner(),1,Duration.ofSeconds(60)).claim());
+                    assertThatThrownBy(() -> cache.prepareRecoveredOperatorDatabase(permission,node,extra,ACTIVE)).isInstanceOf(TapstateException.class);
+                    var result=f.domain.preparations().issueRecoveredFirstCreate(scope,node,inputs(scope),permission,() -> {});
+                    var preparations=cache.pipelinePreparations(business,ACTIVE);
+                    var reservation=preparations.reserveFirst(((FirstPipelineCreationResult.Issued)result).creation(),Duration.ofSeconds(60));
+                    f.domain.preparations().complete(preparations.seed(reservation,f.domain.preparations(),java.time.Instant.now()));
+                    cache.prepareRecoveredOperatorDatabase(permission,node,extra,ACTIVE);
+                    var newIdentity=target.getCollection("cache_identity").find().first();
+                    assertThat(newIdentity.getString("cacheIncarnation")).isEqualTo(scope.cacheIncarnation());
+                    assertThat(target.getCollection("nest_state").find().into(new ArrayList<>())).containsExactly(retained);
+                    var inventory=f.cache.getCollection("operator_cleanup").find().into(new ArrayList<>());
+                    assertThat(inventory).hasSize(1);assertThat(inventory.getFirst().getList("databases",Document.class))
+                            .containsExactly(new Document("database",extra).append("operationId",permission.operationId()));
+                    cache.prepareRecoveredOperatorDatabase(permission,node,extra,ACTIVE);
+                    assertThat(f.cache.getCollection("operator_cleanup").find().into(new ArrayList<>())).isEqualTo(inventory);
+                    assertThatThrownBy(() -> cache.prepareRecoveredOperatorDatabase(permission,node,f.config.getName(),ACTIVE)).isInstanceOf(TapstateException.class);
+                    var forged=new CacheRecoveryStore.FullPreparation(){public PipelineCacheRecovery recovery(){return summary;}public String operationId(){return permission.operationId();}public void requireActive(){}};
+                    assertThatThrownBy(() -> cache.prepareRecoveredOperatorDatabase(forged,node,extra,ACTIVE)).isInstanceOf(TapstateException.class);
+                    target.getCollection("cache_identity").replaceOne(new Document("_id","operator"),new Document(oldIdentity).append("cacheIncarnation","foreign"));
+                    assertThatThrownBy(() -> cache.inspectRecoveredOperatorDatabase(summary,extra,ACTIVE)).isInstanceOf(TapstateException.class);
+                    assertThatThrownBy(() -> cache.prepareRecoveredOperatorDatabase(permission,node,extra,ACTIVE)).isInstanceOf(TapstateException.class);
+                    assertThat(target.getCollection("nest_state").find().into(new ArrayList<>())).containsExactly(retained);
+                    assertThat(f.cache.getCollection("operator_cleanup").find().into(new ArrayList<>())).isEqualTo(inventory);
+                } finally {target.drop();}
+            }
+        });
+    }
+
+    @Test void recoveredGrantSeedsOnlyTheNewScopeAndStartCasPreservesAConcurrentStop() {
+        fixture(f -> {
+            f.domain.cacheRecoveries().stageCluster(f.confirmed());var commands=f.domain.recoveryCommands();
+            var cluster=commands.current(f.current()).orElseThrow();
+            try(var cache=MongoCacheDomain.connect(f.binding.cache(),Duration.ofSeconds(5),"full-preparation")) {
+                f.domain.prepareStoppedRecovery(cache,cluster,ACTIVE);cluster=commands.complete(cluster);
+                var permission=f.fullAfterCluster("a",cluster.operationId());var scope=permission.recovery().targetScope();
+                var business=f.domain.bindings().cachePreparation().orElseThrow().businessScope();
+                var node=WorkloadClaimFence.from(cache.workloadClaims(business).acquire(NODE.key(),NODE.owner(),1,Duration.ofSeconds(30)).claim());
+                var result=f.domain.preparations().issueRecoveredFirstCreate(scope,node,inputs(scope),permission,
+                        () -> f.domain.requiredNotes().privateContexts(permission));
+                var grant=((FirstPipelineCreationResult.Issued)result).creation();
+                var preparations=cache.pipelinePreparations(business,ACTIVE);
+                var reservation=preparations.reserveFirst(grant,Duration.ofSeconds(30));
+                var receipt=preparations.seed(reservation,f.domain.preparations(),java.time.Instant.now());
+                assertThat(f.domain.preparations().complete(receipt).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+                var before=f.domain.intents().load("a").orElseThrow();var hash=CanonicalHash.of(pipeline("a"));
+                var running=new DesiredState("a",PipelineState.RUNNING,hash,false,null,false,null);
+                assertThatThrownBy(() -> f.domain.intents().compareAndSet(scope,before.intentRevision(),running)).isInstanceOf(TapstateException.class);
+                assertThat(f.domain.intents().compareAndSet(scope,before.intentRevision(),before.desired())).isTrue();
+                assertThat(f.domain.intents().startRecovered(permission,before.intentRevision(),hash)).isFalse();
+                assertThat(f.domain.intents().load("a").orElseThrow().desired().targetState()).isEqualTo(PipelineState.STOPPED);
+                var stopped=f.domain.intents().load("a").orElseThrow();
+                assertThat(f.domain.intents().startRecovered(permission,stopped.intentRevision(),hash)).isTrue();
+                assertThat(f.domain.intents().startRecovered(permission,stopped.intentRevision(),hash)).isFalse();
+                assertThat(f.domain.intents().load("a").orElseThrow().intentRevision()).isEqualTo(stopped.intentRevision()+1);
+                assertThat(f.domain.intents().load("b").orElseThrow().desired().targetState()).isEqualTo(PipelineState.STOPPED);
+                assertThat(f.cache.getCollection("workload_claims").countDocuments()).isEqualTo(2);
+                assertThat(f.cache.getCollection("pipeline_state").countDocuments()).isOne();
+                assertThat(reservation.claim().claimGeneration()).isEqualTo(1);
+            }
+        });
+    }
+    @Test void preflightReadsOriginalContextsWithoutGrantingAccessAndKeepsCarryProtection() {
+        fixture(f -> {
+            var notes=f.domain.requiredNotes();var old=notes.initialize(RequiredNoteOwner.forNode(1,new PipelineNode("a","source"),PipelineNode.Purpose.CAPTURE,1));
+            var origin=new RequiredNoteOrigin("mysql","a".repeat(64),new byte[]{1});notes.prepareOrigin(old,origin);notes.compareAndSet(old,"slot",0,new byte[]{7},false);
+            var shared=notes.initialize(new RequiredNoteOwner(1,"pdk.chain.retained",RequiredNoteOwner.Kind.CHAIN,"retained",0));
+            notes.prepareOrigin(shared,origin);
+            notes.prepareCarry(new RequiredNoteCarry(shared,old));
+            f.domain.cacheRecoveries().stageCluster(f.confirmed());
+            var before=f.config.getCollection("pdk_note_scopes").find().into(new ArrayList<>());long version=f.domain.configurationRevision();
+            assertThat(f.domain.cacheRecoveries().inspectPrivateContexts("a")).filteredOn(context -> context.scope().equals(old)).singleElement()
+                    .satisfies(context -> assertThat(context.origin()).contains(origin));
+            assertThatThrownBy(() -> f.domain.cacheRecoveries().requirePrivateRetirable("a",old)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> notes.open(old.owner())).isInstanceOf(TapstateException.class);
+            assertThat(f.config.getCollection("pdk_note_scopes").find().into(new ArrayList<>())).isEqualTo(before);
+            assertThat(f.domain.configurationRevision()).isEqualTo(version);
+            f.config.getCollection("pdk_note_scopes").deleteOne(new Document("_id.bindingVersion",1L).append("_id.namespace",old.owner().namespace()));
+            assertThatThrownBy(() -> f.domain.cacheRecoveries().inspectPrivateContexts("a")).isInstanceOf(TapstateException.class);
+        });
+    }
+    @Test void sharedPreflightDistinguishesANewPoolFromRetainedAndMissingOrigins() {
+        fixture(f -> {
+            var scope=f.domain.bindings().cachePreparation().orElseThrow().businessScope();var captures=f.domain.capturePreparations();
+            assertThat(captures.inspectSharedOrigin(scope,"source",CanonicalHash.of(SOURCE))).isEmpty();
+            String chain=SourceCaptureIdentity.resolve(SOURCE.connector(),SOURCE.config(),null),capture=SourceCaptureIdentity.sharedCapture(chain);
+            var previous=new CapturePreparation(new CacheBusinessScope("cluster",1,f.previous.cacheIncarnation()),CapturePreparation.Mode.SHARED_SRS,
+                    chain,capture,SourceCaptureIdentity.physical(SOURCE.connector(),SOURCE.config()),UUID.randomUUID().toString());
+            f.config.getCollection("capture_preparations").insertOne(MongoCapturePreparationFacts.row(previous));
+            assertThatThrownBy(() -> captures.inspectSharedOrigin(scope,"source",CanonicalHash.of(SOURCE))).isInstanceOf(TapstateException.class);
+            var token=f.domain.requiredNotes().initialize(new RequiredNoteOwner(1,"pdk.chain."+chain,RequiredNoteOwner.Kind.CHAIN,chain,0));
+            var origin=new RequiredNoteOrigin("mysql","a".repeat(64),new byte[]{3});f.domain.requiredNotes().prepareOrigin(token,origin);
+            assertThat(captures.inspectSharedOrigin(scope,"source",CanonicalHash.of(SOURCE))).contains(origin);
+            assertThatThrownBy(() -> captures.inspectSharedOrigin(scope,"source","f".repeat(64))).isInstanceOf(TapstateException.class);
+        });
+    }
+    @Test void aRunningFullKeepsItsDefinitionsFixedWhileUnrelatedAuthoringRemainsAvailable() {
+        fixture(f -> {
+            f.full("a");var previous=pipeline("a");
+            var changed=new PipelineResource("a",new Metadata(Map.of(),"during full"),previous.sources(),previous.transforms(),previous.view(),previous.serve(),previous.settings(),previous.experimental());
+            assertThatThrownBy(() -> f.domain.artifacts().replace("a",CanonicalHash.of(previous),changed)).isInstanceOf(TapstateException.class);
+            f.domain.artifacts().saveAll(List.of(new SourceResource("unrelated",null,"mysql",Map.of(),SourceMode.SNAPSHOT,List.of(TableRef.literal("other")),null,null)));
+            assertThat(f.domain.artifacts().get("unrelated")).isPresent();assertThat(f.domain.artifacts().get("a")).contains(previous);
+        });
+    }
     private static PipelinePreparationInputs inputs(PipelineIntentScope scope) {
         return PipelinePreparationInputs.of(scope,pipeline(scope.pipelineId()),Map.of("source",SOURCE),Map.of("source",Set.of("orders")));
     }
@@ -257,9 +400,13 @@ class MongoCacheRecoveryStoreIT {
         CacheRecoveryStore.FullPreparation full(String pipeline) {
             var commands=domain.recoveryCommands();domain.cacheRecoveries().stageCluster(confirmed());
             var cluster=commands.complete(commands.current(current()).orElseThrow());
+            return fullAfterCluster(pipeline,cluster.operationId());
+        }
+        CacheRecoveryStore.FullPreparation fullAfterCluster(String pipeline,String previousOperation) {
+            var commands=domain.recoveryCommands();
             var all=manifest();var full=new StorageRecoveryCommands.Manifest(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.PIPELINE,Set.of(pipeline)),
                     Set.of(pipeline),all.definitionHashes(),CanonicalHash.ofText("explicit-full-"+pipeline),domain.configurationRevision());
-            var running=commands.start(commands.confirm(commands.plan(current(),full,null,cluster.operationId())));
+            var running=commands.start(commands.confirm(commands.plan(current(),full,null,previousOperation)));
             return domain.cacheRecoveries().authorizeFull(running,pipeline);
         }
     }

@@ -767,19 +767,21 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
-    /** Real production roots and CONFIG/CACHE boundaries; source execution and Atlas remain separate checks. */
+    /** Real production roots and CONFIG/CACHE boundaries; each selected full executes the installed connector against actual source and target values. */
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
     void wholeCacheRecoveryPublishesAllStoppedBeforeStartingTheNewRuntime(boolean cloud) {
         String suffix=UUID.randomUUID().toString().replace("-","");String configDb="stopped_config_"+suffix,cacheDb="stopped_cache_"+suffix,masterDb="stopped_master_"+suffix;
-        String user="stopped_"+suffix;var setup=new StorageSetupScope("stopped-"+suffix,"installation","setup",1);
+        String sourceDb="stopped_source_"+suffix;String user="stopped_"+suffix;var setup=new StorageSetupScope("stopped-"+suffix,"installation","setup",1);
         var mode=cloud?StorageBinding.Mode.CLOUD:StorageBinding.Mode.OP;var sdk=new RecoverySdk(setup.clusterId());
         try(var admin=MongoClients.create(uri("root","admin"))) {
-            createUser(admin,user,List.of(configDb,cacheDb,masterDb));
+            createUser(admin,user,List.of(configDb,cacheDb,masterDb,sourceDb));
+            admin.getDatabase(sourceDb).getCollection("orders").insertMany(List.of(new Document("_id",1).append("value","first"),new Document("_id",2).append("value","second")));
+            admin.getDatabase(masterDb).getCollection("orders").insertOne(new Document("_id",99).append("value","stale"));
             var cache=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,uri(user,cacheDb),cacheDb,null);
             try(var configuration=io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
                     new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(user,configDb),null,Duration.ofSeconds(5)),setup.clusterId(),setup.installationId(),setup.operationId(),1)) {
-                var target=new SourceResource(StorageBinding.defaultSourceId(mode),null,"mongodb",Map.of("uri",uri(user,masterDb)),null,null,null,null);
+                var target=new SourceResource(StorageBinding.defaultSourceId(mode),null,"mongodb",Map.of("isUri",true,"uri",uri(user,masterDb)),null,null,null,null);
                 var initial=configuration.bindings().commitWithFirstCache(setup,mode,cache,target);
                 try(var old=io.tapstate.adapters.mongostore.MongoCacheDomain.connect(cache,Duration.ofSeconds(5),"old-fixture")) {
                     old.prepareFirstAuth(initial.firstCreation().orElseThrow());old.prepareInitialBusiness(initial.preparation(),() -> {});
@@ -787,11 +789,12 @@ class ManagedMongoStoreIsolationIT {
                 configuration.bindings().complete(setup);
                 if(!cloud)configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
                         new User("admin",new BCryptPasswordHasher().hash("sentinel-login-password"),"admin"));
-                var source=new SourceResource("input",null,"mysql",Map.of("host","unused.invalid"),SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null);
+                var source=new SourceResource("input",null,"mongodb",Map.of("isUri",true,"uri",uri(user,sourceDb)),SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null);
                 configuration.artifacts().saveAll(List.of(source));
                 for(String id:List.of("a","b")) {
-                    var pipeline=new PipelineResource(id,null,List.of(SourceRef.spec("input",true)),null,null,
-                            new ServeBlock.Inline("serve",FromRef.literal("orders"),List.of(new SyncElement("sync",target.id(),null,null,null)),null,null),null,null);
+                    var pipeline=new PipelineResource(id,null,List.of(SourceRef.spec("input",false)),null,null,
+                            new ServeBlock.Inline("serve",FromRef.literal("orders"),List.of(new SyncElement("sync",target.id(),null,null,null,OnFullLoad.CLEAR)),null,null),
+                            new Settings(null,null,null,null,ReadMode.SNAPSHOT_ONLY,null),null);
                     configuration.artifacts().saveAll(List.of(pipeline));
                     var scope=new PipelineIntentScope(setup.clusterId(),1,initial.preparation().authScope().cacheIncarnation(),id,1);
                     configuration.intents().compareAndSet(scope,0,new io.tapstate.core.lifecycle.DesiredState(id,
@@ -801,7 +804,7 @@ class ManagedMongoStoreIsolationIT {
             }
             // Every fixture-owned old client is closed before the operator's explicit recovery confirmation.
             admin.getDatabase(cacheDb).drop();
-            try(var application=cloud?cloudRecoveryRoot(uri(user,configDb),sdk,CloudConnectorTestInputs.seedDirectory()):nativeRoot(uri(user,configDb))) {
+            try(var application=cloud?cloudRecoveryRoot(uri(user,configDb),sdk,CloudConnectorTestInputs.seedDirectory()):nativeRoot(uri(user,configDb),CloudConnectorTestInputs.seedDirectory())) {
                 String credential=cloud?exchangeCookie(application,"fresh"):ordinaryLogin(application,false).token();
                 java.util.function.BiFunction<String,Map<String,Object>,Map<?,?>> post=(path,body) -> cloud?cloudPost(application,credential,path,body):
                         rootClient(application).post().uri(path).header("Authorization","Bearer "+credential).body(body).retrieve().body(Map.class);
@@ -824,6 +827,40 @@ class ManagedMongoStoreIsolationIT {
                 }
                 assertThat(admin.getDatabase(cacheDb).getCollection("pipeline_state").countDocuments()).isZero();
                 assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                var recoveryService=application.getBean(io.tapstate.control.core.StorageRecoveryService.class);
+                var delegate=(io.tapstate.control.core.StorageRecoveryService.Inspector)org.springframework.test.util.ReflectionTestUtils.getField(recoveryService,"inspector");
+                org.springframework.test.util.ReflectionTestUtils.setField(recoveryService,"inspector",new io.tapstate.control.core.StorageRecoveryService.Inspector() {
+                    private <T> T checked(String stage,java.util.function.Supplier<T> call) {
+                        long start=System.nanoTime();System.out.println("CACHE_FULL mode="+mode+" stage="+stage+" begin");
+                        try {return call.get();}
+                        catch(TapstateException failure){System.out.println("CACHE_FULL mode="+mode+" stage="+stage+" code="+failure.code().code());throw failure;}
+                        finally {System.out.println("CACHE_FULL mode="+mode+" stage="+stage+" elapsedMs="+Duration.ofNanos(System.nanoTime()-start).toMillis());}
+                    }
+                    public StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope,StorageRecoveryCommands.Selection selection) {return checked("inspect",() -> delegate.inspect(scope,selection));}
+                    public void requireCurrent(CacheAuthScope scope,StorageRecoveryCommands.Manifest manifest) {checked("current",() -> {delegate.requireCurrent(scope,manifest);return null;});}
+                    public void verifyExternal(CacheAuthScope scope,StorageRecoveryCommands.Manifest manifest) {checked("external",() -> {delegate.verifyExternal(scope,manifest);return null;});}
+                    public io.tapstate.control.core.StorageRecoveryService.Presentation present(StorageRecoveryCommands.Plan plan) {return checked("present",() -> delegate.present(plan));}
+                });
+                post.apply("/api/connections:discover-schema",Map.of("id","input","connectorId","mongodb","settings",Map.of("isUri",true,"uri",uri(user,sourceDb))));
+                var full=post.apply("/api/storage/recovery/plan",Map.of("scope","PIPELINE","pipelineIds",List.of("a"),"previousOperationId",planned.get("operationId")));
+                assertThat(full.get("preflightCurrent")).isEqualTo(true);
+                assertThat((List<?>)full.get("targetPolicies")).hasSize(1);
+                post.apply("/api/storage/recovery/confirm",Map.of("operationId",full.get("operationId"),"planHash",full.get("planHash"),"controlRevision",full.get("controlRevision"),"confirmed",true));
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    var failed=(TapstateException)org.springframework.test.util.ReflectionTestUtils.getField(root,"recoveryFailure");if(failed!=null)throw failed;
+                    assertThat(post.apply("/api/storage/recovery/status",Map.of("operationId",full.get("operationId"))).get("phase")).isEqualTo("COMPLETE");
+                    var business=(NativeBusinessContext)root.runtime().business().orElseThrow();
+                    assertThat(io.tapstate.core.lifecycle.StateJson.parse(business.statusStore().state().read("a").orElseThrow().stateJson())).isEqualTo(io.tapstate.core.lifecycle.PipelineState.COMPLETED);
+                });
+                var rows=admin.getDatabase(masterDb).getCollection("orders").find().sort(new Document("_id",1)).into(new ArrayList<>());
+                assertThat(rows).containsExactly(new Document("_id",1L).append("value","first"),new Document("_id",2L).append("value","second"));
+                assertThat(root.runtime().requireConfiguration().intents().load("b").orElseThrow().desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.STOPPED);
+                assertThat(root.runtime().requireConfiguration().preparations().read("b").orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                assertThatThrownBy(() -> post.apply("/api/pipelines/b:start",Map.of())).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                admin.getDatabase(masterDb).getCollection("orders").insertOne(new Document("_id",100).append("value","after-completion"));
+                post.apply("/api/storage/recovery/confirm",Map.of("operationId",full.get("operationId"),"planHash",full.get("planHash"),"controlRevision",full.get("controlRevision"),"confirmed",true));
+                assertThat(admin.getDatabase(masterDb).getCollection("orders").countDocuments()).isEqualTo(3);
+
             }
         }
     }
@@ -1453,12 +1490,13 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
-    private ConfigurableApplicationContext nativeRoot(String configurationUri) {
+    private ConfigurableApplicationContext nativeRoot(String configurationUri) {return nativeRoot(configurationUri,work.resolve("no-seeds"));}
+    private ConfigurableApplicationContext nativeRoot(String configurationUri,Path seeds) {
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                 "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0", "--logging.level.root=ERROR",
                 "--tapstate.hz.jet.cooperative-thread-count=2", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.store.mongo.uri=" + configurationUri, "--tapstate.control.auth.jwt-secret=loss-restart-stable-test-key",
-                "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"), "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"));
+                "--tapstate.connectors.seed-dir=" + seeds, "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"));
     }
     private static org.springframework.web.client.RestClient rootClient(ConfigurableApplicationContext application) {
         int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();

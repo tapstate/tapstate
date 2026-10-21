@@ -22,6 +22,15 @@ class ConfiguredCaptureRunTest {
     private static final ConnectorRef ARTIFACT=new ConnectorRef(List.of(),"must.not.load","2.0.8",null,null,HASH,false);
 
     @ParameterizedTest @ValueSource(booleans={false,true})
+    void recoveredPrivateAndSharedCapturesUseThePreviouslyConfirmedArtifact(boolean shared) {
+        var notes=notes();var config=config(shared);var origin=ConnectorNoteOrigin.capture("demo",HASH,config.settings());
+        when(notes.origin(any())).thenReturn(origin);var provisioner=mock(ConnectorProvisioner.class);
+        when(provisioner.resolve("demo",HASH)).thenReturn(ARTIFACT);
+        var run=ConfiguredCaptureRun.prepare(ORIGINAL,config,notes,provisioner,() -> {},true);
+        assertThat(run.artifactHash()).isEqualTo(HASH);verify(provisioner).resolve("demo",HASH);verify(provisioner,never()).resolve("demo");
+    }
+
+    @ParameterizedTest @ValueSource(booleans={false,true})
     void pluginOpenUsesTheOriginalTokensAndExactArtifactWithoutOpeningCurrentScopes(boolean shared) {
         var notes=notes(); var provisioner=mock(ConnectorProvisioner.class);
         when(provisioner.resolve("demo")).thenReturn(ARTIFACT); when(provisioner.resolve("demo",HASH)).thenReturn(ARTIFACT);

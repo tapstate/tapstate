@@ -104,6 +104,17 @@ class ScopedEngineLifecycleActuatorTest {
     private static OperatorRunManifest manifest(long execution) { return new OperatorRunManifest("p",new ExecutionFence(SCOPE,claim(execution)),List.of()); }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
 
+    @Test void aCompletedCheckpointStillSettlesCaptureAndHotResourcesAfterTheJobWasCancelled() {
+        when(previous.isCarryingAJob()).thenReturn(false);
+        var desired=mock(io.tapstate.spi.store.DesiredStore.class);var state=mock(io.tapstate.spi.store.StateStore.class);
+        when(desired.read("p")).thenReturn(Optional.of(pass.intent().desired()));
+        when(state.read("p")).thenReturn(Optional.of(io.tapstate.core.lifecycle.CheckpointDoc.initial("p",
+                io.tapstate.core.lifecycle.StateJson.of(io.tapstate.core.lifecycle.PipelineState.COMPLETED),java.time.Instant.now())));
+        new io.tapstate.runtime.scheduler.PipelineConverger(desired,state,actuator(),Clock.systemUTC()).converge("p");
+        verify(fixedCapture).stopCapture("p",false);assertThat(released).containsExactly(manifest(1));
+        assertThat(forgottenPlans).containsExactly(new ExecutionFence(SCOPE,claim(1)));verify(dags,never()).prepareStart(any(PipelineConvergencePass.class),anyString());
+    }
+
     @Test void ordinaryStopUsesTheCapturedJobAndNeverResolvesItsReplacementOrPurgesColdState() {
         var actor = actuator(); var replacement = mock(Engine.Run.class);
         when(engine.captureRun("p")).thenReturn(Optional.of(replacement));

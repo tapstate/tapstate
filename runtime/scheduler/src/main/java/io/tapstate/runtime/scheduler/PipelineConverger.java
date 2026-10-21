@@ -135,6 +135,11 @@ public final class PipelineConverger {
             // out. Driving it would start the whole run again -- on this tick, and on every tick after
             // it, since each new run reaches the same end. Running it again is a user's stop and start,
             // which arrives as the one instruction handled above.
+            try {
+                actuator.settleCompleted(pipelineId);
+            } catch(TapstateException refused) {
+                return ConvergeResult.failed(actualDoc.orElseThrow(),refused);
+            }
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
@@ -153,6 +158,7 @@ public final class PipelineConverger {
                     .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
                     .orElse(driven);
         }
+        if(actuator.completed(pipelineId))return driveTo(pipelineId,PipelineState.COMPLETED,false,current,false);
         // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
         // earlier one wrote. The state already matches the intent, so the drive below would call
         // this converged and actuate nothing - which is how a pipeline ends up reporting RUNNING,
@@ -248,6 +254,7 @@ public final class PipelineConverger {
                 try {
                     actuate(pipelineId, from, target, purgeState, rebuild);
                 } catch (TapstateException refused) {
+                    if(target==PipelineState.COMPLETED)return ConvergeResult.failed(applied.next(),refused);
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,
                     // because to everyone reading the product they are the same event: the pipeline is not
                     // going to run, and here is why. Letting it escape instead leaves the pass to abort
@@ -267,10 +274,10 @@ public final class PipelineConverger {
             if (current.stateJson().equals(targetJson)) {
                 return ConvergeResult.converged(current);
             }
-            if (target == PipelineState.FAILED) {
+            if (target == PipelineState.FAILED || target == PipelineState.COMPLETED) {
                 // Every other target is an intent, and an intent survives being fenced: it is still what
                 // is wanted, so rebasing onto the fresh epoch and asking again is right. FAILED is not an
-                // intent -- it is a conclusion about the state that was read, and being fenced means that
+                // intent -- both terminal observations describe the state read, and being fenced means that
                 // state is no longer there. Re-driving it would record a failure over whatever the other
                 // writer just landed (a user's stop, most often), actuate a second stop for it, and be
                 // corrected by the next pass: one tick of a pipeline reading failed that nothing failed,

@@ -30,13 +30,19 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
     /** Explicit original start preparation, after CONFIG authoring reserved every scope and before plugin code. */
     static ConfiguredSinkRun prepare(ExecutionFence original,SinkConfig config,PipelineNode.Purpose purpose,
             RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable requireActive) {
+        return prepare(original,config,purpose,notes,provisioner,requireActive,false);
+    }
+    static ConfiguredSinkRun prepare(ExecutionFence original,SinkConfig config,PipelineNode.Purpose purpose,
+            RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable requireActive,boolean recoveryPinned) {
         Objects.requireNonNull(requireActive,"requireActive");requireActive.run();
         if(original.scope()==null || config.node()==null || !config.node().pipelineId().equals(original.pipelineId()))throw unavailable();
         var fixed=notes.guardedBy(requireActive);var scope=original.scope();
         var primary=fixed.open(RequiredNoteOwner.forNode(scope.bindingVersion(),config.node(),purpose,scope.stateGeneration()));
         var global=fixed.open(new RequiredNoteOwner(scope.bindingVersion(),"pdk.global-state",RequiredNoteOwner.Kind.GLOBAL,scope.clusterId(),0));
-        var ref=provisioner.resolve(config.connectorId());requireActive.run();
+        var pinned=recoveryPinned?fixed.origin(primary):null;
+        var ref=pinned==null?provisioner.resolve(config.connectorId()):provisioner.resolve(config.connectorId(),pinned.artifactHash());requireActive.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),ref.contentHash(),config.settings());
+        if(pinned!=null && !pinned.equals(expected))throw unavailable();
         if(!expected.equals(fixed.prepareOrigin(primary,expected)))throw unavailable();
         requireActive.run();return new ConfiguredSinkRun(original,config.node(),purpose,new Note(primary),new Note(global),ref.contentHash());
     }

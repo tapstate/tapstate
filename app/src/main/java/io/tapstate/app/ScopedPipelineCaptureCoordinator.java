@@ -16,9 +16,20 @@ import java.util.function.*;
 
 /** Native source owners retain the original Pipeline, capture and physical handoff identities. */
 final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinator,AutoCloseable {
+    interface BoundedLoads {
+        boolean complete(ExecutionFence original);
+        void forget(ExecutionFence original);
+        BoundedLoads NONE=new BoundedLoads(){public boolean complete(ExecutionFence original){return false;}public void forget(ExecutionFence original){}};
+    }
     record Stores(CacheBusinessScope scope,PipelineStoreViews pipelines,SrsStoreViews sources,
-            CaptureStatePreparations configuration,CaptureCachePreparations preparations,RequiredNoteStore notes) {
-        Stores { Objects.requireNonNull(scope); Objects.requireNonNull(pipelines); Objects.requireNonNull(sources); Objects.requireNonNull(configuration); Objects.requireNonNull(preparations); Objects.requireNonNull(notes); }
+            CaptureStatePreparations configuration,CaptureCachePreparations preparations,RequiredNoteStore notes,Predicate<PipelineIntentScope> recoveryPinned,BoundedLoads boundedLoads) {
+        Stores(CacheBusinessScope scope,PipelineStoreViews pipelines,SrsStoreViews sources,CaptureStatePreparations configuration,CaptureCachePreparations preparations,RequiredNoteStore notes) {
+            this(scope,pipelines,sources,configuration,preparations,notes,ignored -> false,BoundedLoads.NONE);
+        }
+        Stores(CacheBusinessScope scope,PipelineStoreViews pipelines,SrsStoreViews sources,CaptureStatePreparations configuration,CaptureCachePreparations preparations,RequiredNoteStore notes,Predicate<PipelineIntentScope> recoveryPinned) {
+            this(scope,pipelines,sources,configuration,preparations,notes,recoveryPinned,BoundedLoads.NONE);
+        }
+        Stores { Objects.requireNonNull(scope); Objects.requireNonNull(pipelines); Objects.requireNonNull(sources); Objects.requireNonNull(configuration); Objects.requireNonNull(preparations); Objects.requireNonNull(notes);Objects.requireNonNull(recoveryPinned);Objects.requireNonNull(boundedLoads); }
     }
     record Execution(Supplier<Optional<WorkloadClaimFence>> node,ExecutionAuthorization authorization,
             CaptureOwnership ownership,Duration renewal,Runnable active,Clock clock) {
@@ -124,7 +135,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             }
         }
         @Override public boolean loadDelivered(String pipeline) { requireId(pipeline); var held=current(); if(held==null || !held.snapshot || held.sources.isEmpty())return true;
-            requireSession(held);if(held.bounded)return false;
+            requireSession(held);if(held.bounded)return stores.boundedLoads().complete(original);
             return held.sources.values().stream().allMatch(source -> {
                 ConsumerOffset cursor;
                 if(source.shared){var progress=source.srs.consumers().progress(source.consumer.context()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
@@ -266,7 +277,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 var config=source.selected.config().at(new PipelineNode(run.original.pipelineId(),source.id));
                 if(source.shared)config=config.sharing(new SharedNotes(source.prepared.chainId(),List.of()));
                 var fixedConfig=config;
-                var notes=ConfiguredCaptureRun.prepare(run.original,config,stores.notes(),connectors,guard);
+                var notes=ConfiguredCaptureRun.prepare(run.original,config,stores.notes(),connectors,guard,stores.recoveryPinned().test(run.original.scope()));
                 CaptureHandoff output=new CaptureHandoff() {
                     @Override public void accept(Envelope row) {
                         guard.run(); if(!source.selected.tables().contains(row.src()))throw refused();
@@ -389,7 +400,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(owner.physical!=null && !owner.physical.live.get())throw refused();
         if(owner.physical!=null && before.servingTables().containsAll(requested))return;
         var configured=owner.configured;
-        if(configured==null)configured=ConfiguredCaptureRun.prepare(owner.origin,owner.config,stores.notes(),connectors,owner::require);
+        if(configured==null)configured=ConfiguredCaptureRun.prepare(owner.origin,owner.config,stores.notes(),connectors,owner::require,stores.recoveryPinned().test(owner.origin.scope()));
         else {stores.notes().guardedBy(owner::require).origin(configured.primary());connectors.resolve(configured.connectorId(),configured.artifactHash());owner.require();}
         if(owner.physical!=null){owner.physical.close();owner.physical=null;before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);}
         if(before.epoch()>0 && before.checkpoint()==null)throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",owner.prepared.chainId()),null);
@@ -446,6 +457,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private void stop(Session session) {
         session.ended.set(true); Throwable first=null;
+        stores.boundedLoads().forget(session.original);
         for(var source:session.sources.values()) {
             if(source.run!=null)first=cleanup(first,() -> runtime.stopSnapshot(source.run));
             if(source.guard!=null)first=cleanup(first,() -> runtime.stopOpenings(source.guard));

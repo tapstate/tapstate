@@ -58,10 +58,19 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
                     && current.mode() == io.tapstate.spi.store.StorageBinding.Mode.OP && current.authGeneration() == 1
                     && operationId == null && previous.operationId().equals(previousOperationId)
                     && previous.phase() != Phase.COMPLETE && MongoInitialOpRecovery.shape(previous.manifest()) && MongoInitialOpRecovery.shape(verified);
+            boolean replaceStaleCluster = !replaceStaleInitial && previous != null && operationId == null && previous.operationId().equals(previousOperationId)
+                    && previous.originalScope().clusterId().equals(current.clusterId()) && previous.originalScope().bindingVersion()==current.bindingVersion()
+                    && previous.originalScope().mode()==current.mode() && previous.originalScope().authGeneration()<current.authGeneration()
+                    && !previous.originalScope().cacheIncarnation().equals(current.cacheIncarnation()) && verified.selection().extent()==Extent.CLUSTER;
+            if(replaceStaleCluster) {
+                var changes=new MongoCacheRecoveryStore(client,database,bindings,artifacts,current.clusterId(),active).inspect(session,current);
+                if(!verified.dependencyHash().equals(io.tapstate.spi.store.CacheRecoveryStore.clusterDependencyHash(current,changes)))
+                    replaceStaleCluster=false;
+            }
             if (replaceEmptyInitialOp) MongoInitialOpRecovery.requireManifest(client, session, database, bindings, artifacts, current, verified, false);
             if (replaceStaleInitial) MongoInitialCloudRecovery.requireManifest(session, database, bindings, artifacts, current, verified);
             if (previous != null && !previous.originalScope().equals(current)
-                    && !replaceStaleInitial
+                    && !replaceStaleInitial && !replaceStaleCluster
                     && (operationId != null || previous.phase() != Phase.COMPLETE || !previous.operationId().equals(previousOperationId))) throw refused();
             long revision = revision(session);
             if (operationId != null) {
@@ -76,7 +85,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
                 // A new operation explicitly names the completed predecessor; it cannot be inferred from a missing response.
                 if (previous.originalScope().equals(current) && Objects.equals(previous.previousOperationId(), previousOperationId)
                         && previous.manifest().selection().equals(verified.selection())) return previous;
-                if (!replaceStaleInitial && !replaceEmptyInitialOp && (previous.phase() != Phase.COMPLETE || !previous.operationId().equals(previousOperationId))) throw refused();
+                if (!replaceStaleInitial && !replaceStaleCluster && !replaceEmptyInitialOp && (previous.phase() != Phase.COMPLETE || !previous.operationId().equals(previousOperationId))) throw refused();
             } else if (previousOperationId != null) throw refused();
             requireInitialOpManifest(session, current, verified);
             requireManifest(session, verified);

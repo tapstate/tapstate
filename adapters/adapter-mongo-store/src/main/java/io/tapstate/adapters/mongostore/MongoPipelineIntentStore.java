@@ -35,6 +35,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             "stateGeneration", "intentRevision", "deleted");
     private static final Set<String> BODY = Set.of("targetState", "revision", "purgeState", "assemblyRevision", "reassemble", "rebuiltAtStateEpoch");
     private final MongoClient client;
+    private final MongoDatabase database;
     private final MongoCollection<Document> intents;
     private final MongoCollection<Document> mappings;
     private final MongoCollection<Document> pipelines;
@@ -50,6 +51,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     private MongoPipelineIntentStore(MongoClient client, MongoDatabase database, String clusterId,
             MongoStorageBindingStore bindings, Runnable requireActive) {
         this.client = Objects.requireNonNull(client, "client"); this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
+        this.database=Objects.requireNonNull(database,"database");
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         if (!bindings.belongsTo(client, database.getName())) {
             throw new IllegalArgumentException("configuration intent and binding must share one original client and database");
@@ -124,7 +126,17 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
     @Override public boolean remove(PipelineIntentScope scope, long expected) { return change(scope, expected, null); }
 
+    @Override public boolean startRecovered(io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,long expected,String pipelineHash) {
+        if(!(confirmation instanceof MongoCacheRecoveryStore.Permission permission))throw fenced();
+        var scope=permission.recovery().targetScope();
+        var desired=new DesiredState(scope.pipelineId(),PipelineState.RUNNING,pipelineHash,false,null,false,null);
+        return change(scope,expected,desired,permission);
+    }
+
     private boolean change(PipelineIntentScope scope, long expected, DesiredState desired) {
+        return change(scope,expected,desired,null);
+    }
+    private boolean change(PipelineIntentScope scope,long expected,DesiredState desired,MongoCacheRecoveryStore.Permission permission) {
         Objects.requireNonNull(scope, "scope");
         if (expected < 0 || expected >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected intent revision");
         return transaction(session -> {
@@ -133,6 +145,22 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             long revision = held == null ? 0 : held.intentRevision();
             if (revision != expected) return false;
             Document generation = requireScope(session, scope);
+            var recovery=MongoCacheRecoveryFacts.read(generation);
+            if(permission!=null) {
+                permission.fence(session,client,database);
+                if(!recovery.filter(permission.recovery()::equals).isPresent()
+                        || MongoPipelinePreparationFacts.decode(scope.pipelineId(),generation,clusterId).phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE)
+                    throw fenced();
+            } else if(recovery.isPresent() && desired!=null && desired.targetState()==PipelineState.RUNNING) {
+                var preparation=MongoPipelinePreparationFacts.decode(scope.pipelineId(),generation,clusterId);
+                var root=SystemCollections.STORAGE_RECOVERY.on(database).find(session,new Document("_id","cluster")).first();
+                if(root==null)throw fenced();
+                var pending=MongoStorageRecoveryCommands.pending(root);
+                if(preparation.phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE
+                        || pending.filter(plan -> plan.phase()==io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING
+                        && plan.manifest().affectedPipelineIds().contains(scope.pipelineId())).isPresent())
+                    throw new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",scope.pipelineId()),null);
+            }
             if (held != null && !held.scope().equals(scope)) throw fenced();
             Document artifact = pipelines.find(session, new Document("_id", scope.pipelineId())).first();
             if (artifact == null) throw fenced();

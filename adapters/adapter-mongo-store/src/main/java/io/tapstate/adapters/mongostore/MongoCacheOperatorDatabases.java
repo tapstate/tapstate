@@ -42,6 +42,36 @@ final class MongoCacheOperatorDatabases {
         return operationId;
     }
 
+    static void inspectRecovery(ClientSession session,MongoDatabase target,OperatorDatabaseBinding binding,
+            io.tapstate.spi.store.PipelineIntentScope previous) {
+        if(target.listCollectionNames().into(new ArrayList<>()).isEmpty())return;
+        var current=SystemCollections.CACHE_IDENTITY.on(target).find(session,new Document("_id","operator")).first();
+        if(identity(target,binding).equals(current)){require(session,target,binding);return;}
+        require(session,target,previousBinding(binding,previous));
+    }
+
+    /** Rebinding preserves all old payload. Only newly scoped keys can be used by the recovered run. */
+    static String recover(ClientSession session,MongoDatabase control,MongoDatabase target,OperatorDatabaseBinding binding,
+            io.tapstate.spi.store.PipelineIntentScope previous,String operationId,Runnable guard) {
+        if(target.listCollectionNames().into(new ArrayList<>()).isEmpty())return prepare(session,control,target,binding,operationId,guard);
+        var identities=SystemCollections.CACHE_IDENTITY.on(target);
+        var current=identities.find(session,new Document("_id","operator")).first();
+        if(identity(target,binding).equals(current))return prepare(session,control,target,binding,operationId,guard);
+        var old=previousBinding(binding,previous);String oldOperation=require(session,target,old);
+        if(MongoOperatorInventory.databaseHistory(session,control,binding.scope(),target.getName()).isPresent())throw unavailable();
+        guard.run();
+        if(identities.replaceOne(session,identity(target,old),identity(target,binding)).getMatchedCount()!=1)throw unavailable();
+        if(SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(target).updateOne(session,new Document("_id","operator").append("operationId",oldOperation),
+                new Document("$set",new Document("operationId",operationId))).getMatchedCount()!=1)throw unavailable();
+        guard.run();return require(session,target,binding);
+    }
+    private static OperatorDatabaseBinding previousBinding(OperatorDatabaseBinding current,io.tapstate.spi.store.PipelineIntentScope previous) {
+        if(previous==null || !previous.clusterId().equals(current.scope().clusterId()) || previous.bindingVersion()!=current.scope().bindingVersion()
+                || previous.cacheIncarnation().equals(current.scope().cacheIncarnation()))throw unavailable();
+        return new OperatorDatabaseBinding(new io.tapstate.spi.store.CacheBusinessScope(previous.clusterId(),previous.bindingVersion(),previous.cacheIncarnation()),
+                current.cacheDatabase(),current.configurationDatabase(),current.masterDatabase());
+    }
+
     static String require(ClientSession session, MongoDatabase target, OperatorDatabaseBinding binding) {
         if (binding == null) throw MongoCachePipelineAccess.fenced();
         var structure = new MongoCacheMetadataStructure(target, MongoRateHistoryStore.DEFAULT_RETENTION);

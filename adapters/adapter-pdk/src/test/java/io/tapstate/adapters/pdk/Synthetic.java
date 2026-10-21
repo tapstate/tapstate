@@ -1296,6 +1296,13 @@ final class Synthetic {
                         "functions.supportBatchCount((context, table) -> 4200000L);"));
     }
 
+    /** Structural recovery probes must never invoke this count callback. */
+    static Path countTracingDiscoverableSource(Path dir) {
+        return SyntheticJar.compileToJar(dir,"synthetic.TracingCount",
+                discoverSource("TracingCount",ORDERS_TABLE,"functions.supportBatchCount((context, table) -> {"
+                        + "java.nio.file.Files.writeString(java.nio.file.Path.of((String)context.getConnectionConfig().get(\"countTrace\")),\"counted\");return 7L;});"));
+    }
+
     /** The two-table discoverSchema body the multi-table counting fixtures share. */
     private static final String ORDERS_AND_ITEMS = ""
             + "TapTable orders = new TapTable(\"orders\");"

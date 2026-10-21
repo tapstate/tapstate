@@ -166,6 +166,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     boolean belongsTo(MongoClient expected,String database) {
         return client == expected && versions.getNamespace().getDatabaseName().equals(database);
     }
+    MongoRequiredNoteStore configurationNotes(){return notes;}
 
     Optional<Resource> getInTransaction(ClientSession session, String id) {
         return Optional.ofNullable(find(session, id)).map(this::decode);
@@ -174,6 +175,15 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     /** A pending rebuild keeps its exact authoring dependencies; unrelated configuration remains writable. */
     private void requireRebuildDependenciesUnchanged(ClientSession session, Set<String> changed) {
         if (changed.isEmpty()) return;
+        var recovery=SystemCollections.STORAGE_RECOVERY.on(client.getDatabase(versions.getNamespace().getDatabaseName()))
+                .find(session,new Document("_id","cluster")).first();
+        if(recovery!=null) {
+            var pending=MongoStorageRecoveryCommands.pending(recovery);
+            if(pending.filter(plan -> plan.phase()==io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING
+                    && !java.util.Collections.disjoint(plan.manifest().definitionHashes().keySet(),changed)
+                    && bindings.cachePreparationForTransaction(session).map(value -> value.authScope().equals(plan.originalScope())).orElse(false)).isPresent())
+                throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        }
         var known = new java.util.HashMap<String, Resource>();
         try (var pending = mappings.find(session, new Document("phase", "REBUILDING")).iterator()) {
             while (pending.hasNext()) {

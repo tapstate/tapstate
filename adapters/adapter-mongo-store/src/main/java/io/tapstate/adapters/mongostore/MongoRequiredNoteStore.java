@@ -509,16 +509,37 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
             var result=new ArrayList<io.tapstate.spi.store.RequiredNoteContext>();
             for(var fixed:tokens) {
-                var token=fixed.scope();checkRetiringOwner(session,fixed,false);
-                var metadata=scopes.find(session,byScope(token.owner())).first();
-                if(retiredResult(fixed,metadata)!=null){result.add(new io.tapstate.spi.store.RequiredNoteContext(token,java.util.Optional.empty(),true));continue;}
-                metadata=verifyPhysicalScope(session,token,false);var origin=retainedOrigin(session,token,metadata);
-                if(origin==null && notes.find(session,new Document("_id.bindingVersion",token.owner().bindingVersion())
-                        .append("_id.namespace",token.owner().namespace())).first()!=null)throw unavailable();
-                result.add(new io.tapstate.spi.store.RequiredNoteContext(token,java.util.Optional.ofNullable(origin),false));
+                checkRetiringOwner(session,fixed,false);result.add(inspectContext(session,fixed));
             }
             return List.copyOf(result);
         })));
+    }
+    private io.tapstate.spi.store.RequiredNoteContext inspectContext(ClientSession session,Retirement fixed) {
+        var token=fixed.scope();var metadata=scopes.find(session,byScope(token.owner())).first();
+        if(retiredResult(fixed,metadata)!=null)return new io.tapstate.spi.store.RequiredNoteContext(token,java.util.Optional.empty(),true);
+        metadata=verifyPhysicalScope(session,token,false);var origin=retainedOrigin(session,token,metadata);
+        if(origin==null && notes.find(session,new Document("_id.bindingVersion",token.owner().bindingVersion()).append("_id.namespace",token.owner().namespace())).first()!=null)throw unavailable();
+        return new io.tapstate.spi.store.RequiredNoteContext(token,java.util.Optional.ofNullable(origin),false);
+    }
+    /** The native recovery store has checked the current summary in this same CONFIG snapshot. */
+    List<io.tapstate.spi.store.RequiredNoteContext> inspectRecoveryContexts(ClientSession session,io.tapstate.spi.store.PipelineCacheRecovery summary,String operation) {
+        requireOrdinary();requireActive.run();
+        if(summary.previousScope()==null){requireEmptyAuthoringReservations(session,summary.targetScope());return List.of();}
+        return retirementScopes(session,summary.previousScope(),operation).stream().map(token -> inspectContext(session,new Retirement(token,operation))).toList();
+    }
+    void requireRecoveryRetirable(ClientSession session,RequiredNoteScope original) {
+        requireOrdinary();checkBinding(session,original.owner());verifyPhysicalScope(session,original,false);requirePrivateUnreferenced(session,original);
+    }
+    java.util.Optional<RequiredNoteOrigin> inspectSharedOrigin(ClientSession session,RequiredNoteOwner owner,boolean known) {
+        requireOrdinary();checkBinding(session,owner);
+        if(owner.kind()!=RequiredNoteOwner.Kind.CHAIN)throw unavailable();
+        var metadata=scopes.find(session,byScope(owner)).first();
+        if(!known){if(metadata!=null)throw unavailable();refuseRetainedFacts(session,owner);return java.util.Optional.empty();}
+        var token=scopeOf(owner,metadata);var origin=retainedOrigin(session,token,metadata);
+        outgoing(session,owner,metadata);
+        if(origin!=null)return java.util.Optional.of(origin);
+        if(token.generation()!=1 || !Long.valueOf(0).equals(metadata.get("outgoingCarries")))throw unavailable();
+        refuseRetainedFacts(session,owner);return java.util.Optional.empty();
     }
     private List<RequiredNoteScope> privateTokens(io.tapstate.spi.store.PipelineIntentScope original,String operationId) {
         requireOrdinary();Objects.requireNonNull(original,"original");if(operationId==null || operationId.isBlank())throw unavailable();

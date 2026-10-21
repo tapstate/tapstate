@@ -318,6 +318,30 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoSinkPreparationStore(pipelineAccess(scope,original,requireActive));
     }
 
+    /** Read-only inspection of a database explicitly named by the confirmed Pipeline definition. */
+    public void inspectRecoveredOperatorDatabase(io.tapstate.spi.store.PipelineCacheRecovery summary,String targetDatabase,Runnable active) {
+        Objects.requireNonNull(summary);Objects.requireNonNull(active);active.run();
+        var access=pipelineAccess(summary.targetScope(),null,active);
+        var target=access.operatorDatabase(targetDatabase,io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE);
+        if(target.getName().equals(database.getName()))return;
+        access.transaction(session -> {MongoCacheOperatorDatabases.inspectRecovery(session,target,operatorDatabases,summary.previousScope());return null;});
+        active.run();
+    }
+    /** Only a native confirmed full may rebind a surviving extra cache, after the replacement Pipeline has been prepared. */
+    public void prepareRecoveredOperatorDatabase(io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,
+            io.tapstate.spi.store.WorkloadClaimFence node,String targetDatabase,Runnable active) {
+        if(!(confirmation instanceof MongoCacheRecoveryStore.Permission permission))throw MongoCachePipelineAccess.fenced();
+        Objects.requireNonNull(node);Objects.requireNonNull(active);active.run();permission.requireCacheTarget(this);
+        var summary=permission.recovery();var access=pipelineAccess(summary.targetScope(),null,active);
+        var target=access.operatorDatabase(targetDatabase,io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE);
+        if(!target.getName().equals(database.getName()))access.recoveredOperatorPreparation(node,session -> {
+            var inventory=MongoOperatorInventory.require(session,database,summary.targetScope());
+            String preparation=MongoCacheOperatorDatabases.recover(session,database,target,operatorDatabases,summary.previousScope(),permission.operationId(),active);
+            MongoOperatorInventory.rememberDatabase(session,database,summary.targetScope(),inventory,target.getName(),preparation);return null;
+        });
+        active.run();permission.requireCacheTarget(this);
+    }
+
     /** Explicit schema preparation is separate from every ordinary operator facet open. */
     @Override public void prepareOperatorDatabase(io.tapstate.spi.store.PipelineIntentScope scope, String targetDatabase,
             io.tapstate.spi.store.WorkloadClaimFence original, String operationId, Runnable requireActive) {

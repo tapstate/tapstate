@@ -25,6 +25,20 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         Objects.requireNonNull(scope,"scope");if(capture==null || capture.isBlank())throw new IllegalArgumentException("blank capture identity");
         return transaction(session -> {requireScope(session,scope);return Optional.ofNullable(SystemCollections.CAPTURE_PREPARATIONS.on(database).find(session,new Document("_id",MongoCapturePreparationFacts.id(scope,capture))).first()).map(MongoCapturePreparationFacts::decode);});
     }
+    @Override public Optional<RequiredNoteOrigin> inspectSharedOrigin(CacheBusinessScope scope,String sourceId,String sourceHash) {
+        return transaction(session -> {
+            requireScope(session,scope);
+            var source=artifacts.getInTransaction(session,sourceId).filter(SourceResource.class::isInstance).map(SourceResource.class::cast).orElseThrow(MongoCaptureStatePreparations::fenced);
+            if(!CanonicalHash.of(source).equals(sourceHash))throw fenced();
+            String chain=SourceCaptureIdentity.resolve(source.connector(),source.config(),source.srs()==null?null:source.srs().key());
+            String capture=SourceCaptureIdentity.sharedCapture(chain);
+            var prior=SystemCollections.CAPTURE_PREPARATIONS.on(database).find(session,new Document("_id.clusterId",scope.clusterId())
+                    .append("_id.bindingVersion",scope.bindingVersion()).append("_id.capture",OperatorStateText.encode(capture))).first();
+            if(prior!=null){var original=MongoCapturePreparationFacts.decode(prior);if(original.mode()!=CapturePreparation.Mode.SHARED_SRS || !original.chainId().equals(chain)
+                    || !original.sourceIdentityHash().equals(SourceCaptureIdentity.physical(source.connector(),source.config())))throw fenced();}
+            return artifacts.configurationNotes().inspectSharedOrigin(session,new RequiredNoteOwner(scope.bindingVersion(),"pdk.chain."+chain,RequiredNoteOwner.Kind.CHAIN,chain,0),prior!=null);
+        });
+    }
     @Override public CaptureCreationResult issueFirstCreate(CapturePreparationRequest request) {
         Objects.requireNonNull(request,"request");String operation=UUID.randomUUID().toString();
         var issued=transaction(session -> {

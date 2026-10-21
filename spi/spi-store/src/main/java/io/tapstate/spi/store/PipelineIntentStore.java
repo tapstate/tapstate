@@ -24,6 +24,11 @@ public interface PipelineIntentStore {
     /** Expected zero means never written; a refusal leaves the latest value and all versions unchanged. */
     boolean compareAndSet(PipelineIntentScope scope, long expectedIntentRevision, DesiredState desired);
 
+    /** Only the current native full-recovery permission may publish its first RUNNING intent. */
+    default boolean startRecovered(CacheRecoveryStore.FullPreparation confirmation,long expectedIntentRevision,String pipelineHash) {
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /** Retains only the next revision and coordinates, and removes the id from the reconcile set. */
     boolean remove(PipelineIntentScope scope, long expectedIntentRevision);
 

@@ -227,6 +227,16 @@ final class ExecutionAuthorization implements AutoCloseable {
         return authorizedEntry(fence) != null;
     }
 
+    /** Rechecks only an already-published proof and its original deadline, without store IO. */
+    WorkloadClaimFence requireLocal(ExecutionFence fence) {
+        Objects.requireNonNull(fence,"fence");
+        Entry entry=entries.get(ReadKey.of(fence));
+        if(!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean() || entry==null
+                || nanoTime.getAsLong()-entry.deadlineNanos()>=0 || !matches(entry.claim(),fence))
+            throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",fence.pipelineId()),null);
+        return entry.claim();
+    }
+
     /** The current matching entry, refreshing it under the same rules as the boolean guard. */
     private Entry authorizedEntry(ExecutionFence fence) {
         Objects.requireNonNull(fence, "fence");

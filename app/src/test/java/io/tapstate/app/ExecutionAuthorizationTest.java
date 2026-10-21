@@ -62,6 +62,19 @@ class ExecutionAuthorizationTest {
     private final ClusterMembershipGate membership = eligibleGate();
     private final AtomicLong nanos = new AtomicLong();
 
+    @Test void aLocalCompletionCheckNeverRefreshesAnAbsentOrExpiredProof() {
+        var fence=submittedRun();var observed=org.mockito.Mockito.spy(claims);
+        try(var guard=new ExecutionAuthorization("cluster-a",observed,Duration.ofDays(1),nanos::get)) {
+            assertThatThrownBy(() -> guard.requireLocal(fence)).isInstanceOf(TapstateException.class);
+            org.mockito.Mockito.verifyNoInteractions(observed);
+            var proof=guard.require(fence);org.mockito.Mockito.clearInvocations(observed);
+            assertThat(guard.requireLocal(fence)).isEqualTo(proof);
+            nanos.set(TTL.plusSeconds(1).toNanos());
+            assertThatThrownBy(() -> guard.requireLocal(fence)).isInstanceOf(TapstateException.class);
+            org.mockito.Mockito.verifyNoInteractions(observed);
+        }
+    }
+
     @Test
     void everySubmissionTakesTheNextExecutionGenerationEvenWhenNobodyElseTookTheClaim() {
         PipelineActuationOwnership nodeA = ownership(NODE_A);

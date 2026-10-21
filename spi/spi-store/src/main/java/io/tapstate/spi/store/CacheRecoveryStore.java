@@ -22,6 +22,14 @@ public interface CacheRecoveryStore {
     /** The exact Cluster confirmation publishes RUNNING, all mappings and stopped intents together. */
     List<PipelineCacheRecovery> stageCluster(StorageRecoveryCommands.Plan confirmed);
     Optional<PipelineCacheRecovery> read(String pipelineId);
+    /** Read-only inspection of original private contexts; this never grants release or access to their values. */
+    default List<RequiredNoteContext> inspectPrivateContexts(String pipelineId) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,java.util.Map.of(),null);
+    }
+    /** A changed connection must prove its private context is not retained by another shared owner. */
+    default void requirePrivateRetirable(String pipelineId,RequiredNoteScope original) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,java.util.Map.of(),null);
+    }
     /** Opaque same-domain authority for the one explicitly confirmed Pipeline preparation. */
     FullPreparation authorizeFull(StorageRecoveryCommands.Plan running, String pipelineId);
     interface FullPreparation {

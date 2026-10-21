@@ -27,6 +27,8 @@ public final class ConnectorNoteOrigin {
             throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
         }
     }
+    /** Validates retained settings without exposing their decoded credentials to the caller. */
+    public static void requireReadable(RequiredNoteOrigin origin) { settings(origin); }
 
     @SuppressWarnings("unchecked")
     static Map<String, Object> settings(RequiredNoteOrigin origin) {

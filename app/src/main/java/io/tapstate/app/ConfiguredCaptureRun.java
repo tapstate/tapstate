@@ -27,6 +27,10 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
     /** Original start preparation opens only CONFIG-reserved scopes, before any connector code. */
     static ConfiguredCaptureRun prepare(ExecutionFence original, CaptureConfig config, RequiredNoteStore notes,
             ConnectorProvisioner provisioner, Runnable requireOriginalStart) {
+        return prepare(original,config,notes,provisioner,requireOriginalStart,false);
+    }
+    static ConfiguredCaptureRun prepare(ExecutionFence original,CaptureConfig config,RequiredNoteStore notes,
+            ConnectorProvisioner provisioner,Runnable requireOriginalStart,boolean recoveryPinned) {
         Objects.requireNonNull(requireOriginalStart,"requireOriginalStart"); requireOriginalStart.run();
         if (original.scope()==null || config.node()==null || !original.pipelineId().equals(config.node().pipelineId())) throw unavailable();
         var fixed=notes.guardedBy(requireOriginalStart); var scope=original.scope();
@@ -36,8 +40,10 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
                         RequiredNoteOwner.Kind.CHAIN,config.sharedNotes().sharedBy(),0);
         var primary=fixed.open(owner);
         var global=fixed.open(new RequiredNoteOwner(scope.bindingVersion(),"pdk.global-state",RequiredNoteOwner.Kind.GLOBAL,scope.clusterId(),0));
-        var artifact=provisioner.resolve(config.connectorId()); requireOriginalStart.run();
+        var pinned=recoveryPinned?fixed.origin(fixed.open(RequiredNoteOwner.forNode(scope.bindingVersion(),config.node(),PipelineNode.Purpose.CAPTURE,scope.stateGeneration()))):null;
+        var artifact=pinned==null?provisioner.resolve(config.connectorId()):provisioner.resolve(config.connectorId(),pinned.artifactHash()); requireOriginalStart.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),artifact.contentHash(),config.settings());
+        if(pinned!=null && !pinned.equals(expected))throw unavailable();
         if (!expected.equals(fixed.prepareOrigin(primary,expected))) throw unavailable();
         requireOriginalStart.run(); return new ConfiguredCaptureRun(original,config.node(),primary,global,config.connectorId(),artifact.contentHash());
     }

@@ -154,8 +154,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // Every member the run would take part on loads the connectors its sinks open, asked before the run
             // is fenced or anything is opened: a member that finds out only as its sink opens fails a run that
             // is already reading, and its reason stays on that member.
-            sharedConnectors = connectors.requireEveryMemberCanLoad(
-                    pipelineId, Set.copyOf(prepared.sinkConnectors().values()));
+            sharedConnectors = prepared.connectorHashes().isEmpty()?connectors.requireEveryMemberCanLoad(pipelineId,Set.copyOf(prepared.sinkConnectors().values())):
+                    connectors.requireEveryMemberCanLoad(pipelineId,Set.copyOf(prepared.sinkConnectors().values()),prepared.connectorHashes());
         } catch (TapstateException refused) {
             // Refused before this start took a run, so the claim still names the run before it. Judged by that
             // run, the failure this refusal records would read as its death - and right after a member left,

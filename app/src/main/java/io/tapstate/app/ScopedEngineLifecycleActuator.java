@@ -118,7 +118,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         try {
             prepared = dags.prepareStart(pass,defaultDatabase); require();
             if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
-            shared = Set.copyOf(connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values()))); require();
+            shared = Set.copyOf(prepared.connectorHashes().isEmpty()?connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values())):
+                    connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values()),prepared.connectorHashes())); require();
         } catch (TapstateException refused) {
             ownership.startRefusedBeforeItsRun(pass.scope(),command); throw refused;
         }
@@ -211,6 +212,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     @Override public synchronized boolean isCarryingAJob(String pipeline) {
         requireId(pipeline); boolean carrying = run != null && isCurrentRun() && run.isCarryingAJob(); require(); return carrying;
+    }
+    @Override public synchronized void settleCompleted(String pipeline) {requireId(pipeline);stopOriginal();}
+    @Override public synchronized boolean completed(String pipeline) {
+        requireId(pipeline);
+        if(run==null || !isCurrentRun() || capture==null || !capture.isCapturing(pipeline))return false;
+        var bindings=capture.captureBindings();
+        boolean complete=!bindings.snapshots().isEmpty() && capture.loadDelivered(pipeline)
+                && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
+        require();return complete;
     }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
 }

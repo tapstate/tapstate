@@ -71,6 +71,9 @@ final class StorageOperationSchemas {
         recovery.put("definitionHashes", stringMap()); recovery.put("dependencyHash", text()); recovery.put("configurationRevision", nonnegative());
         recovery.put("controlRevision", positive()); recovery.put("planHash", text()); recovery.put("clusterId", text()); recovery.put("bindingVersion", positive());
         recovery.put("mode", choice("CLOUD", "OP")); recovery.put("cacheIncarnation", text()); recovery.put("authGeneration", positive());
+        recovery.put("preflightCurrent",Map.of("type","boolean"));
+        recovery.put("targetPolicies",Map.of("type","array","items",object(List.of("node","source","policy"),Map.of("node",text(),"source",text(),"policy",choice("APPEND","CLEAR","FAIL")))));
+        recovery.put("executionErrorCode",Map.of("anyOf",List.of(text(),Map.of("type","null"))));
         var recoveryResult = object(List.copyOf(recovery.keySet()), recovery);
         defs.put("StorageRecoveryPlanResult", recoveryResult); defs.put("StorageRecoveryConfirmResult", recoveryResult);
         defs.put("StorageRecoveryStatusResult", Map.of("anyOf", List.of(recoveryResult, object(List.of("operationId", "phase"),

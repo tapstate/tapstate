@@ -166,6 +166,17 @@ final class MongoCachePipelineAccess {
         });
     }
 
+    <T> T recoveredOperatorPreparation(WorkloadClaimFence node,Function<ClientSession,T> action) {
+        var local=TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+        return transaction(false,local,session -> {
+            var business=new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation());
+            new MongoCacheBusinessIdentity(database,business).admitMetadataWrite(session);
+            MongoCachePipelinePreparations.proveNode(session,database,business,node);
+            Document current=state(session);updateState(session,current,new Document(),false);
+            return action.apply(session);
+        });
+    }
+
     MongoDatabase operatorDatabase(String name, io.tapstate.spi.store.OperatorPlacement.Resource resource) {
         if (database.getName().equals(name)) return database;
         if (operatorDatabases == null || resource != io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE

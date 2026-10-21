@@ -160,7 +160,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         if (!available()) throw StorageRuntime.unavailable();
         return context.getBean(ApplyService.class);
     }
+    NativePipelineRecovery pipelineRecovery() {
+        if(!available())throw StorageRuntime.unavailable();return context.getBean(NativePipelineRecovery.class);
+    }
     StorePort statusStore() { if (!available()) throw StorageRuntime.unavailable(); return port; }
+    private boolean recoveryPinned(PipelineIntentScope scope) {
+        original.requireBusiness();return configuration.cacheRecoveries().read(scope.pipelineId()).filter(value -> value.targetScope().equals(scope)).isPresent();
+    }
     @Override public HandlerExecutionChain handlerFor(HttpServletRequest request) throws Exception {
         if (!active.get()) return null;
         for (var mapping : handlers) {
@@ -230,6 +236,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean(destroyMethod = "close") ExecutionAuthorization executionAuthorization(HazelcastInstance member, NativeBusinessContext owner) {
             return owner.memberStorage.authorization();
         }
+        @Bean(destroyMethod = "close") SnapshotLoadReceipts snapshotLoadReceipts(HazelcastInstance member,
+                NativeBusinessContext owner,ExecutionAuthorization authorization) {
+            return new SnapshotLoadReceipts(member,owner.memberStorage::requireNode,authorization);
+        }
         @Bean PipelineActuationOwnership pipelineActuationOwnership(HazelcastInstance member,
                 NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
@@ -259,13 +269,18 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean(destroyMethod = "close") PipelineCaptureCoordinator pipelineCaptureCoordinator(NativeBusinessContext owner,
                 NodeSessionLease node, ExecutionAuthorization authorization, CaptureOwnership ownership, ClusterProperties cluster,
-                NativeSrsCaptureRunUnit runtime, SnapshotBuffer buffer, ConnectorProvisioner connectors, Clock clock) {
+                NativeSrsCaptureRunUnit runtime, SnapshotBuffer buffer, ConnectorProvisioner connectors, Clock clock, SnapshotLoadReceipts boundedLoads) {
             var scope = owner.original.preparation().businessScope();
             return new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(scope, owner.original.cache(),
                     owner.memberStorage.sourceViews(), owner.configuration.capturePreparations(),
-                    owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes()),
+                    owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::recoveryPinned,boundedLoads),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
                             cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors);
+        }
+        @Bean NativePipelineRecovery nativePipelineRecovery(NativeBusinessContext owner,PipelineFirstStatePreparer preparer,
+                ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization) {
+            return new NativePipelineRecovery(owner.configuration,owner.original.preparation().authScope(),owner.port,preparer,
+                    connectors,engine,captures,authorization,owner.original::requireActive,owner::available,owner.original.cache());
         }
         @Bean io.tapstate.core.lifecycle.ParallelismBudget parallelismBudget(org.springframework.core.env.Environment environment) {
             return new DataPlaneActuationConfiguration().parallelismBudget(
@@ -275,10 +290,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     environment.getProperty("tapstate.execution.max-blocking-processors-per-member", Integer.class, 128));
         }
         @Bean DagSource dagSource(NativeBusinessContext owner, NestSettings nests, ConnectionTester tester, HazelcastInstance member,
-                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts) {
+                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts, SnapshotLoadReceipts boundedLoads,NativePipelineRecovery recovery) {
             return StoreBackedDagSource.scopedRoot(owner.port, nests, StoreReachability.probing(tester, Duration.ofSeconds(10)),
                     SourcePlacement.on(member.getCluster().getLocalMember().getAddress()), cloud.cloud(),
-                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts);
+                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::recoveryPinned,boundedLoads::forRun,recovery::inspectCaptured);
         }
         @Bean(destroyMethod = "close") BoundedPipelinePreviewExecutor boundedPipelinePreviewExecutor(StorePort store, ConnectorProvisioner connectors,
                 HazelcastInstance member, NestSettings nests, Clock clock) {

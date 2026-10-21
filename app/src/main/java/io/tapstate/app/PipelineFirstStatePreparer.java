@@ -131,6 +131,11 @@ final class PipelineFirstStatePreparer {
         return completed;
     }
 
+    WorkloadClaimFence requireCurrentNode() {
+        requireActive.run();var node=currentNode.get().orElseThrow(PipelineFirstStatePreparer::claimFenced);
+        requireNode(node);requireActive.run();return node;
+    }
+
     private void requireNode(WorkloadClaimFence node) {
         if (node.key().type() != WorkloadClaimType.NODE_SESSION || !business.clusterId().equals(node.key().clusterId())
                 || !node.key().resourceId().equals(node.owner().nodeId()) || node.claimGeneration() >= Long.MAX_VALUE - 1
