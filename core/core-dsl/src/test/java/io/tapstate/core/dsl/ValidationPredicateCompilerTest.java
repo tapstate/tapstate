@@ -33,7 +33,7 @@ class ValidationPredicateCompilerTest {
         for (String text : List.of("before.x == 1", "op == 'i'", "ts > 0", "has(schema.x)",
                 "after.x[0] == 1", "after['x'] == 1", "now() == now()", "after.x + 1 > 2",
                 "string(after.x) == '1'", "after.x.startsWith('a')", "after.x ? true : false",
-                "size(after.items) == 0", "after.items.size() == 0", "after.items.exists(x, x == 1)",
+                "after.items.size() == 0",
                 "after.items.all(x, x == 1)", "after.items.map(x, x).size() == 0")) {
             assertThatThrownBy(() -> compile(text)).as(text).isInstanceOfSatisfying(TapstateException.class,
                     failure -> assertThat(failure.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED));

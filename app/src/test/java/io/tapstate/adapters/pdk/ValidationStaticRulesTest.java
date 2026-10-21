@@ -9,6 +9,7 @@ import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
@@ -58,6 +59,22 @@ class ValidationStaticRulesTest {
         assertThat(nullable.problem().kind()).isEqualTo(ValidationPredicate.ProblemKind.INCOMPATIBLE_TYPE);
         var guarded = ValidationPredicateCompiler.compile("guarded", "has(after.price) && after.price != null && after.price >= 10", PREDICATE);
         assertThat(guarded.evaluate(first.apply(row(values))).matches()).isFalse();
+    }
+
+    @Test void aMemberPredicateSelectsTheRootWithoutRemovingOrReindexingItsArray() {
+        var rename = ValidationStaticMap.compile("rename", new TransformBody.MapProjection(Map.of("items", FieldRule.rename("lines"))), ROW);
+        var filter = ValidationPredicateCompiler.compile("eligible",
+                "size(after.items) > 0 && after.items.exists(item, item.amount >= 10)", PREDICATE);
+        var items = List.of(Map.of("amount", 9L), Map.of("amount", 11L));
+        var source = row(Map.of("id", 7L, "lines", items));
+        var working = rename.apply(source);
+        assertThat(filter.evaluate(working).matches()).isTrue();
+        assertThat(working.fields()).containsEntry("items", items);
+        assertThat(source.fields()).containsEntry("lines", items).doesNotContainKey("items");
+        assertThat(ValidationValueComparison.compare(working, row(Map.of("id", 7L, "items", items)))).isEmpty();
+        // This is an ordinary array, so a root-level exists decision does not erase its ordering duty.
+        assertThat(ValidationValueComparison.compare(working,
+                row(Map.of("id", 7L, "items", List.of(Map.of("amount", 11L), Map.of("amount", 9L)))))).isPresent();
     }
 
     private static ValidationValues.Row row(Map<String, ?> fields) { return ValidationValues.ownRow(fields, ROW); }
