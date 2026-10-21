@@ -74,6 +74,7 @@ class ManagedMongoStoreIsolationIT {
     enum Missing { OPERATOR, VIEWS }
     private static final String PASSWORD = "controlled-mongo-permissions-password";
     private static final String REPLICA_SET = "permissions-rs";
+    private static final TestTrust TLS = TestTrust.create();
     @Container
     private static final GenericContainer<?> MONGO = mongo();
     @TempDir Path work;
@@ -86,12 +87,48 @@ class ManagedMongoStoreIsolationIT {
                 .withEnv("MONGO_INITDB_ROOT_USERNAME", "root")
                 .withEnv("MONGO_INITDB_ROOT_PASSWORD", PASSWORD)
                 .withCopyToContainer(Transferable.of(Base64.getEncoder().encode(key), 0400), "/data/configdb/member.key")
-                .withCommand("--replSet", REPLICA_SET, "--keyFile", "/data/configdb/member.key", "--bind_ip_all")
+                .withCopyToContainer(Transferable.of(TLS.server(), 0400), "/data/configdb/server.pem")
+                .withCopyToContainer(Transferable.of(TLS.ca().getBytes(StandardCharsets.UTF_8), 0444), "/data/configdb/ca.pem")
+                .withCommand("--replSet", REPLICA_SET, "--keyFile", "/data/configdb/member.key", "--bind_ip_all",
+                        "--tlsMode", "allowTLS", "--tlsCertificateKeyFile", "/data/configdb/server.pem",
+                        "--tlsCAFile", "/data/configdb/ca.pem", "--tlsAllowConnectionsWithoutCertificates")
                 // The image opens a temporary unauthenticated server while creating its administrator.
                 .waitingFor(new WaitAllStrategy()
                         .withStrategy(Wait.forLogMessage(".*MongoDB init process complete; ready for start up.*", 1))
                         .withStrategy(Wait.forLogMessage("(?i).*waiting for connections.*", 2))
                         .withStrategy(Wait.forListeningPort())).withStartupTimeout(Duration.ofSeconds(90));
+    }
+
+    /** Test-only ephemeral material; never reads, replaces or trusts any operator's retained certificate. */
+    private record TestTrust(String ca, byte[] server) {
+        static TestTrust create() {
+            Path directory = null;
+            try {
+                directory = Files.createTempDirectory("tapstate-mongo-fixture-trust-");
+                Path store = directory.resolve("server.p12"), output = directory.resolve("keytool.log");
+                var process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "keytool").toString(),
+                        "-genkeypair", "-alias", "server", "-keyalg", "RSA", "-keysize", "2048", "-storetype", "PKCS12",
+                        "-keystore", store.toString(), "-storepass", "fixture-only-password", "-dname", "CN=localhost",
+                        "-ext", "SAN=dns:localhost,ip:127.0.0.1", "-ext", "BC=ca:true", "-validity", "2", "-noprompt")
+                        .redirectErrorStream(true).redirectOutput(output.toFile()).start();
+                if (!process.waitFor(30, TimeUnit.SECONDS)) { process.destroyForcibly(); throw new AssertionError("test key generation timed out"); }
+                if (process.exitValue() != 0) throw new AssertionError("test key generation failed: " + Files.readString(output));
+                var keys = java.security.KeyStore.getInstance("PKCS12");
+                try (var input = Files.newInputStream(store)) { keys.load(input, "fixture-only-password".toCharArray()); }
+                String ca = pem("CERTIFICATE", keys.getCertificate("server").getEncoded());
+                String key = pem("PRIVATE KEY", keys.getKey("server", "fixture-only-password".toCharArray()).getEncoded());
+                return new TestTrust(ca, (key + ca).getBytes(StandardCharsets.UTF_8));
+            } catch (Exception failure) { throw new IllegalStateException("cannot prepare test TLS material", failure); }
+            finally {
+                if (directory != null) try {
+                    Files.deleteIfExists(directory.resolve("server.p12")); Files.deleteIfExists(directory.resolve("keytool.log")); Files.delete(directory);
+                } catch (java.io.IOException failure) { throw new IllegalStateException("cannot remove test TLS material", failure); }
+            }
+        }
+        private static String pem(String type, byte[] bytes) {
+            return "-----BEGIN " + type + "-----\n" + Base64.getMimeEncoder(64, new byte[]{'\n'}).encodeToString(bytes)
+                    + "\n-----END " + type + "-----\n";
+        }
     }
 
     @BeforeAll
@@ -300,15 +337,132 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    /** The SDK and connector are owned fixtures; storage, TLS, HTTP and the business child are real. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void cloudFirstSetupContinuesInTheSameProcessAndReauthenticatesAfterCutover(boolean failAfterCompletion) throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "setup_config_" + suffix, cacheDb = "setup_cache_" + suffix, masterDb = "setup_master_" + suffix;
+        String configUser = "config_" + suffix, customerUser = "customer_" + suffix;
+        String cluster = "setup-" + suffix; var sdk = new RecoverySdk(cluster);
+        Path trace = work.resolve("target-tests"), seeds = Files.createDirectory(work.resolve("setup-seeds"));
+        Path artifact = io.tapstate.adapters.pdk.SyntheticSinkJars.registeredStorageProbe(work.resolve("probe-build"), trace, "mongodb-atlas", "mongodb://");
+        Files.copy(artifact, seeds.resolve("mongodb-atlas.jar"));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, configUser, List.of(configDb)); createUser(admin, customerUser, List.of(cacheDb, masterDb));
+            var settings = new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(configUser, configDb), null, Duration.ofSeconds(5));
+            try (var ignored = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(settings, cluster, "installation", "setup", 1)) { }
+            try (var application = cloudRecoveryRoot(uri(configUser, configDb), sdk, CloudConnectorTestInputs.seedDirectory(), seeds)) {
+                long pid = ProcessHandle.current().pid(); var root = application.getBean(StorageRoot.class);
+                var configuration = root.runtime().requireConfiguration();
+                var cutoverFault = new java.util.concurrent.atomic.AtomicBoolean(failAfterCompletion);
+                var injected = new AtomicReference<Throwable>();
+                var bindings = org.mockito.Mockito.spy(configuration.bindings());
+                org.mockito.Mockito.doAnswer(call -> {
+                    Object result = call.callRealMethod();
+                    if (configuration.setupStates().load().phase() == StorageSetupStateStore.Phase.COMPLETE && cutoverFault.compareAndSet(true, false)) {
+                        var failure = StorageRuntime.unavailable(); injected.set(failure); throw failure;
+                    }
+                    return result;
+                }).when(bindings).load();
+                org.springframework.test.util.ReflectionTestUtils.setField(configuration, "bindings", bindings);
+                String temporary = exchangeCookie(application, "old");
+                var oldContext = root.managedAuthentication();
+                var original = configuration.setupStates().load().scope();
+                String cacheUri = uri(customerUser, cacheDb) + "&tls=true&authMechanism=SCRAM-SHA-256";
+                String masterUri = uri(customerUser, masterDb) + "&tls=true&authMechanism=SCRAM-SHA-256";
+                var candidate = Map.of("cache", Map.of("kind", "ATLAS", "uri", cacheUri, "database", cacheDb, "caPem", TLS.ca()),
+                        "master", Map.of("kind", "ATLAS", "uri", masterUri, "database", masterDb, "caPem", TLS.ca()));
+                var stamps = new java.util.LinkedHashMap<String,Object>();
+                for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                    var tested = cloudPost(application, temporary, "/api/storage/test", Map.of("operationId", original.operationId(),
+                            "generation", original.generation(), "candidate", candidate, "layer", layer.name()));
+                    stamps.put(layer.name(), tested.get("testStamp"));
+                }
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
+                var request = Map.<String,Object>of("operationId", original.operationId(), "generation", original.generation(),
+                        "candidate", candidate, "testStamps", stamps);
+                if (failAfterCompletion) assertThatThrownBy(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request))
+                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                failure -> assertThat(failure.getStatusCode().value()).withFailMessage("%s; injected at %s",
+                                        failure.getResponseBodyAsString(), injected.get() == null ? "never" : java.util.Arrays.toString(injected.get().getStackTrace())).isEqualTo(503));
+                else assertThat(cloudPost(application, temporary, "/api/storage/setup/commit", request)).containsEntry("setupPhase", "COMPLETE");
+                assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+                assertThat(admin.getDatabase(cacheDb).getCollection("cloud_sessions").countDocuments()).isZero();
+                assertCloudStatus(application, temporary, 401);
+                assertThatThrownBy(() -> oldContext.service().exchangeCode("late", "127.0.0.1")).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> exchangeCookie(application, "old")).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                String fresh = exchangeCookie(application, "fresh");
+                assertThat(cloudPost(application, fresh, "/api/storage/setup/commit", request)).containsEntry("setupPhase", "COMPLETE");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
+                assertThat(cloudPost(application, fresh, "/api/storage/status", Map.of())).containsEntry("businessPhase", "READY");
+                assertThat(ProcessHandle.current().pid()).isEqualTo(pid);
+                String sources = rootClient(application).get().uri("/api/sources").header("Cookie", fresh).retrieve().body(String.class);
+                assertThat(sources).contains("atlas-store").doesNotContain(PASSWORD, "BEGIN CERTIFICATE");
+                var saved = (SourceResource)configuration.artifacts().get("atlas-store").orElseThrow();
+                assertThat(saved.config()).containsEntry("tlsCaPem", TLS.ca());
+                assertThat(root.runtime().current().orElseThrow().binding().cache().caPem()).isEqualTo(TLS.ca());
+                assertThat(Files.readAllLines(trace)).hasSize(2);
+                assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+                assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
+                assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
+                    assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
+                    assertDenied(limited, configDb + "_operator"); assertDenied(limited, configDb + "_views");
+                }
+                var owner = (NativeBusinessContext)root.runtime().business().orElseThrow();
+                var child = (org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(owner, "context");
+                var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
+                root.close(); assertThat(member.getLifecycleService().isRunning()).isFalse();
+                assertThat(rootClient(application).get().uri("/healthz").retrieve().toBodilessEntity().getStatusCode().value()).isEqualTo(200);
+                var claims = admin.getDatabase(cacheDb).getCollection("workload_claims").aggregate(List.of(
+                        new Document("$project", new Document("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW")))))).into(new ArrayList<>());
+                assertThat(claims).hasSize(1);
+                assertThat(claims.getFirst().get("leased")).isEqualTo(false);
+            }
+            // A new process context reconstructs clients from the same persisted bundle, never a probe file.
+            try (var restarted = cloudRecoveryRoot(uri(configUser, configDb), new RecoverySdk(cluster), CloudConnectorTestInputs.seedDirectory(), seeds)) {
+                assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+                assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String,Object> cloudPost(ConfigurableApplicationContext application, String cookie, String path, Map<String,?> body) {
+        int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
+        return rootClient(application).post().uri(path).header("Cookie", cookie).header("Origin", "http://127.0.0.1:" + port)
+                .body(body).retrieve().body(Map.class);
+    }
+
     private ConfigurableApplicationContext cloudRecoveryRoot(String configurationUri, RecoverySdk sdk) {
+        return cloudRecoveryRoot(configurationUri, sdk, work.resolve("no-seeds"));
+    }
+    private ConfigurableApplicationContext cloudRecoveryRoot(String configurationUri, RecoverySdk sdk, Path seeds) {
+        return cloudRecoveryRoot(configurationUri, sdk, seeds, null);
+    }
+    private ConfigurableApplicationContext cloudRecoveryRoot(String configurationUri, RecoverySdk sdk, Path seeds, Path setupFixtureSeeds) {
         return new SpringApplicationBuilder(Bootstrap.class, RecoverySdkConfiguration.class)
                 .environment(CloudFixtureEnvironment.isolated())
-                .initializers(context -> context.getBeanFactory().registerSingleton("fixtureRecoverySdk", sdk)).run(
+                .initializers(context -> {
+                    context.getBeanFactory().registerSingleton("fixtureRecoverySdk", sdk);
+                    if (setupFixtureSeeds != null) {
+                        var properties = new ConnectorPluginProperties(); properties.setSeedDir(setupFixtureSeeds);
+                        properties.setPluginsDir(work.resolve("setup-fixture-plugins"));
+                        var definition = new org.springframework.beans.factory.support.RootBeanDefinition(InstalledConnectorTests.class,
+                                () -> new InstalledConnectorTests(properties, java.time.Clock.systemUTC()));
+                        definition.setPrimary(true);
+                        ((org.springframework.beans.factory.support.BeanDefinitionRegistry)context.getBeanFactory())
+                                .registerBeanDefinition("fixtureInstalledConnectorTests", definition);
+                    }
+                }).run(
                         "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR", "--SDK_STATUS_SENDER_ENABLED=false",
                         "--tapstate.cloud.base-url=https://cloud.example", "--tapstate.cloud.token=fixture-runtime-token",
                         "--tapstate.cloud.cluster-id=" + sdk.cluster, "--tapstate.cloud.atlas-uri=" + configurationUri,
                         "--tapstate.control.auth.jwt-secret=cloud-loss-stable-test-key",
-                        "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"));
+                        "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
+                        "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"), "--tapstate.connectors.seed-dir=" + seeds);
     }
     private static String exchangeCookie(ConfigurableApplicationContext application, String code) {
         int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
@@ -341,7 +495,7 @@ class ManagedMongoStoreIsolationIT {
         final java.util.Set<String> consumed = java.util.concurrent.ConcurrentHashMap.newKeySet();
         RecoverySdk(String cluster) { this.cluster = cluster; }
         @Override public CloudSdkBridge.ExchangeResult exchange(String code) {
-            if (!List.of("old", "blocked", "fresh").contains(code) || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
+            if (!List.of("old", "blocked", "fresh", "late").contains(code) || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
             return new CloudSdkBridge.ExchangeResult(code, "organization", cluster, "Fixture", "Cluster", "local");
         }
         @Override public CloudSdkBridge.VerifiedClaims verify(String jwt) {
@@ -524,7 +678,10 @@ class ManagedMongoStoreIsolationIT {
     }
     private static org.springframework.web.client.RestClient rootClient(ConfigurableApplicationContext application) {
         int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
-        return org.springframework.web.client.RestClient.create("http://127.0.0.1:" + port);
+        // A 503 after a committed command is an unknown result, never an instruction to repeat POST.
+        return org.springframework.web.client.RestClient.builder().baseUrl("http://127.0.0.1:" + port)
+                .requestFactory(new org.springframework.http.client.JdkClientHttpRequestFactory(java.net.http.HttpClient.newBuilder()
+                        .followRedirects(java.net.http.HttpClient.Redirect.NEVER).build())).build();
     }
     private static io.tapstate.control.restapi.LoginResponse ordinaryLogin(ConfigurableApplicationContext application, boolean session) {
         return rootClient(application).post().uri("/auth/login")

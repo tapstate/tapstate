@@ -61,7 +61,7 @@ class StorageRootConfiguration {
     }
     @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService storageSetupService(StorageRoot root, ObjectProvider<InstalledConnectorTests> connectors,
-            MongoProperties mongo, Clock clock) {
+            MongoProperties mongo, Clock clock, ObjectProvider<StorageBusinessFactory> factories) {
         var configuration = root.runtime().requireConfiguration();
         StorageSetupService.DefaultTarget target = new StorageSetupService.DefaultTarget() {
             @Override public StorageSetupService.ConnectorIdentity identity(StorageBinding.Connection master) {
@@ -76,7 +76,11 @@ class StorageRootConfiguration {
         return new StorageSetupService(root.mode(), configuration.bindings(), configuration.setupStates(),
                 new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(mongo.getServerSelectionTimeout()),
                 target, root::configurationEndpoint,
-                new AuditGate(configuration.audit(), clock), clock, root::requireActive);
+                new AuditGate(configuration.audit(), clock), clock, root::requireActive,
+                committed -> {
+                    if (root.mode() == StorageBinding.Mode.CLOUD)
+                        root.continueCloudSetup(committed, target, original -> factories.getObject().create(original));
+                });
     }
     @Bean StorageBusinessFactory storageBusinessFactory(StorageRoot root, org.springframework.context.ConfigurableApplicationContext context) {
         return original -> new NativeBusinessContext(root, original, context);

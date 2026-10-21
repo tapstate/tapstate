@@ -131,7 +131,9 @@ public final class StorageControlDispatcher {
             }
             default -> throw new IllegalStateException("registered storage operation has no dispatch");
         };
-        active.run(); return result;
+        boolean completedSetup = operationId.equals("storage.setup.commit") && "COMPLETE".equals(result.get("setupPhase"));
+        if (!completedSetup) active.run();
+        return result;
     }
     private static void originalSetup(Input input, StorageControlAccess caller) {
         if (!input.text("operationId").equals(caller.setup().operationId())) throw conflict();

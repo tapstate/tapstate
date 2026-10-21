@@ -81,6 +81,7 @@ class StorageSetupServiceTest {
         final Time time = new Time(); final States states = new States(); final Binding binding = new Binding(states); final Target target = new Target();
         final List<AuditRecord> audit = new ArrayList<>();
         Runnable onAudit = () -> {};
+        java.util.function.Consumer<StorageBindingCommit> continuation = committed -> {};
         boolean operationAlive = true;
         StorageBinding.Mode mode = StorageBinding.Mode.OP;
         StorageBinding.Connection installedConfiguration = CANDIDATE.configuration();
@@ -92,7 +93,7 @@ class StorageSetupServiceTest {
             return new StorageSetupService(mode, binding, states, probe, target, () -> Optional.ofNullable(installedConfiguration),
                     new AuditGate(record -> { onAudit.run(); audit.add(record); }, time), time, () -> {
                         if (!operationAlive) throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
-                    });
+                    }, continuation);
         }
         Map<StorageSetupService.Layer,String> tested(StorageSetupService service, StorageSetupService.Candidate candidate) {
             var stamps = new EnumMap<StorageSetupService.Layer,String>(StorageSetupService.Layer.class);
@@ -144,6 +145,30 @@ class StorageSetupServiceTest {
         assertThatCode(retained::requireActive).doesNotThrowAnyException();
         f.operationAlive = false;
         assertThatThrownBy(retained::requireActive).isInstanceOf(TapstateException.class);
+    }
+    @Test void aLostRequestDoesNotDiscardTheCommittedOperationOrItsOriginalFirstCreation() {
+        var f = new Fixture(); var allowed = new java.util.concurrent.atomic.AtomicBoolean(true);
+        Runnable request = () -> { if (!allowed.get()) throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null); };
+        var seen = new ArrayList<StorageBindingCommit>();
+        f.continuation = committed -> {
+            seen.add(committed); allowed.set(false);
+            throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        };
+        var service = f.service(); var stamps = f.tested(service, CANDIDATE);
+        assertThatThrownBy(() -> service.commit("admin", SCOPE, request, CANDIDATE, stamps)).isInstanceOf(TapstateException.class);
+        assertThat(service.pending(SCOPE, () -> {}).orElseThrow()).isSameAs(seen.getFirst());
+        allowed.set(true); f.time.now = f.time.now.plus(Duration.ofDays(1));
+        assertThatThrownBy(() -> service.commit("admin", SCOPE, request, CANDIDATE, Map.of())).isInstanceOf(TapstateException.class);
+        assertThat(seen).hasSize(2); assertThat(seen.getLast()).isSameAs(seen.getFirst());
+        assertThat(f.binding.inserts).isOne();
+    }
+    @Test void auditFailureNeverCallsContinuation() {
+        var f = new Fixture(); var continuations = new java.util.concurrent.atomic.AtomicInteger();
+        f.continuation = committed -> continuations.incrementAndGet();
+        f.onAudit = () -> { throw new IllegalStateException("audit unavailable"); };
+        var service = f.service(); var stamps = f.tested(service, CANDIDATE);
+        assertThatThrownBy(() -> service.commit("admin", SCOPE, () -> {}, CANDIDATE, stamps)).isInstanceOf(TapstateException.class);
+        assertThat(continuations).hasValue(0); assertThat(f.binding.inserts).isZero();
     }
     @Test void changedMembershipCannotProveThatEqualDatabaseNamesAreIsolated() {
         var f = new Fixture(); var counter = new java.util.concurrent.atomic.AtomicInteger();

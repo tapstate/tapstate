@@ -58,7 +58,7 @@ final class StorageAuthentication implements AutoCloseable {
     }
     ManagedAuthenticationContext managed() {
         if (!cloud.cloud()) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "on_prem"), null);
-        if (current.get() == null && bootstrap != null) {
+        if (current.get() == null && bootstrap != null && bootstrap.incomplete()) {
             bootstrap.requireActive(); return new ManagedAuthenticationContext(bootstrap.managed, bootstrap::requireActive);
         }
         Epoch original = selected();
@@ -94,6 +94,10 @@ final class StorageAuthentication implements AutoCloseable {
             var observer = CloudRuntimeConfiguration.authenticationObserver();
             managed = new CloudAuthenticationService(bridge, bridge,
                     new CloudSessionService(sessions, identity, secrets, clock, observer), observer);
+        }
+        boolean incomplete() {
+            try { return configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE; }
+            catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
         }
         void requireActive() {
             if (closed || current.get() != null) throw unauthenticated();

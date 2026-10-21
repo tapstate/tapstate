@@ -18,6 +18,7 @@ final class StorageRoot implements AutoCloseable {
     private final Optional<StorageBinding.Connection> endpoint;
     private volatile Phase phase;
     private volatile boolean closed;
+    private FirstCacheCreation attemptedCreation;
 
     StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
             MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey) {
@@ -29,7 +30,9 @@ final class StorageRoot implements AutoCloseable {
         if (mongo.isEnabled() && uri != null && !uri.isBlank()) {
             try {
                 selectedEndpoint = new StorageBinding.Connection(
-                        cloud.cloud() ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB,
+                        // Platform CONFIG retains its supplied driver/authentication policy. Only the
+                        // customer's CACHE and MASTER inputs use the restricted Atlas setup policy.
+                        StorageBinding.Connection.Kind.MONGODB,
                         uri, MongoDatabaseNames.fromUri(uri), readCa(mongo.getTlsCaFile()));
                 var settings = new MongoConnectionSettings(uri, mongo.getTlsCaFile(), mongo.getServerSelectionTimeout(), boot.value());
                 configuration = cloud.cloud() ? MongoConfigurationDomain.open(settings, cloud.clusterId())
@@ -60,6 +63,47 @@ final class StorageRoot implements AutoCloseable {
     Optional<StorageBinding.Connection> configurationEndpoint() { requireOpen(); return endpoint; }
     void requireActive() { requireOpen(); }
     StorageBinding.Mode mode() { return cloud.cloud() ? StorageBinding.Mode.CLOUD : StorageBinding.Mode.OP; }
+
+    /** Continues only the original committed setup. No request owns or closes the retained CACHE client. */
+    synchronized void continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        requireOpen();
+        if (!cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.CLOUD || runtime.cleanupRequired())
+            throw StorageRuntime.unavailable();
+        var original = runtime.loadBound().orElseThrow(StorageRuntime::unavailable);
+        Runnable active = () -> {
+            requireOpen(); original.requireActive();
+            if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original
+                    || !original.binding().equals(committed.binding()) || !original.preparation().equals(committed.preparation())
+                    || !runtime.requireConfiguration().bindings().load().orElseThrow(StorageRuntime::unavailable).equals(committed.binding())
+                    || !runtime.requireConfiguration().bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable).equals(committed.preparation()))
+                throw StorageRuntime.unavailable();
+        };
+        active.run();
+        var configuration = runtime.requireConfiguration();
+        if (configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE) {
+            phase = Phase.SETUP_REQUIRED;
+            // Reload the saved encrypted definition and its trust material; a probe's live client is never adopted.
+            var source = configuration.artifacts().get(committed.binding().defaultSourceId())
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
+            if (!source.connector().equals("mongodb-atlas") || !(source.config().get("uri") instanceof String uri))
+                throw StorageRuntime.unavailable();
+            var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, uri, MongoDatabaseNames.fromUri(uri),
+                    source.config().get(StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca ? ca : null);
+            target.test(master, source, target.identity(master)); active.run();
+            if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) {
+                attemptedCreation = committed.firstCreation().orElseThrow();
+                original.cache().prepareFirstAuth(attemptedCreation);
+            } else original.cache().resumeInitialAuth(committed.preparation(), active);
+            original.verifyAuthentication();
+            original.cache().prepareInitialBusiness(committed.preparation(), active);
+            original.verifyBusiness(); active.run();
+            configuration.bindings().guardedBy(active).complete(committed.binding().setup());
+        }
+        active.run();
+        authentication.install(original); phase = Phase.AUTH_READY;
+        runtime.startBusiness(original, assembly); phase = Phase.BUSINESS_READY;
+    }
 
     /** Explicit startup/operation continuation only. Status reads never connect or initialize a cache. */
     synchronized void loadExisting(Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
@@ -132,6 +176,8 @@ final class StorageRoot implements AutoCloseable {
             case SETUP_REQUIRED -> StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED;
             default -> StorageControlDispatcher.BusinessPhase.UNAVAILABLE;
         };
+        if (status.phase() == StorageSetupStateStore.Phase.STORAGE_BOUND) business = StorageControlDispatcher.BusinessPhase.PREPARING;
+        if (runtime.cleanupRequired()) business = StorageControlDispatcher.BusinessPhase.CLEANUP_REQUIRED;
         boolean awaitingRebuild = !admitted && preparation.map(value -> value.authScope().authGeneration() > 1).orElse(false)
                 && phase == Phase.AUTH_READY;
         if (awaitingRebuild) business = StorageControlDispatcher.BusinessPhase.AWAITING_REBUILD_CONFIRMATION;
@@ -140,7 +186,7 @@ final class StorageRoot implements AutoCloseable {
                 ? preparation.orElseThrow().operationId() : status.scope().operationId(),
                 status.scope().generation(), status.bindingVersion(), preparation.map(value -> value.authScope().authGeneration()).orElse(0L),
                 configuration.configurationRevision(), status.phase().name(), business, health,
-                status.phase() == StorageSetupStateStore.Phase.CONFIG_PREPARED && mode() == StorageBinding.Mode.CLOUD
+                status.phase() != StorageSetupStateStore.Phase.COMPLETE && mode() == StorageBinding.Mode.CLOUD && !runtime.cleanupRequired()
                         ? List.of("storage.status", "storage.setup.status", "storage.test", "storage.setup.commit")
                         : List.of("storage.status", "storage.setup.status"), false);
     }

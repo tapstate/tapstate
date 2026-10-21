@@ -68,6 +68,7 @@ public final class StorageSetupService {
     private final AuditGate audit;
     private final Clock clock;
     private final Runnable operationActive;
+    private final java.util.function.Consumer<StorageBindingCommit> continuation;
     // Bounded to the one original installation operation and three layer proofs. No credential is persisted here.
     private final EnumMap<Layer,Tested> tests = new EnumMap<>(Layer.class);
     private StorageBindingCommit pending;
@@ -75,11 +76,19 @@ public final class StorageSetupService {
     public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
             StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
             AuditGate audit, Clock clock, Runnable operationActive) {
+        this(mode, bindings, states, probe, target, configuration, audit, clock, operationActive, committed -> {});
+    }
+
+    public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
+            StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
+            AuditGate audit, Clock clock, Runnable operationActive,
+            java.util.function.Consumer<StorageBindingCommit> continuation) {
         this.mode = Objects.requireNonNull(mode, "mode"); this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.states = Objects.requireNonNull(states, "states"); this.probe = Objects.requireNonNull(probe, "probe");
         this.target = Objects.requireNonNull(target, "target"); this.configuration = Objects.requireNonNull(configuration, "configuration");
         this.audit = Objects.requireNonNull(audit, "audit"); this.clock = Objects.requireNonNull(clock, "clock");
         this.operationActive = Objects.requireNonNull(operationActive, "operationActive");
+        this.continuation = Objects.requireNonNull(continuation, "continuation");
     }
 
     /** The caller guard is established by the server's existing Cloud identity or OP management capability. */
@@ -134,7 +143,13 @@ public final class StorageSetupService {
             if (pending == null || result.firstCreation().isPresent()) pending = result;
             return result.binding();
         });
-        return status(expected, active);
+        // The committed operation owns continuation even if the HTTP request or its test stamps expire.
+        continuation.accept(pending);
+        Status result = status(expected, operationActive);
+        // Completing Cloud setup deliberately retires this request's temporary credential. Only its
+        // secret-free completion receipt may return; no later request inherits that authorization.
+        if (result.setupPhase() != StorageSetupStateStore.Phase.COMPLETE) active.run();
+        return result;
     }
 
     /** Internal operation ownership only; no frontend serializes this grant or takes ownership per HTTP request. */

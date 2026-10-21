@@ -70,6 +70,7 @@ final class StorageRuntime implements AutoCloseable {
     }
 
     synchronized Optional<Bound> current() { requireOpen(); return Optional.ofNullable(bound); }
+    synchronized boolean cleanupRequired() { return cleanupUnknown; }
 
     /** Retires this process's original owners before loading a newly published authentication scope. */
     synchronized Bound restoreAuthentication() {

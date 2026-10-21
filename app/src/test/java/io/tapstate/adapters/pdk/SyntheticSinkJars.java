@@ -46,6 +46,11 @@ public final class SyntheticSinkJars {
 
     /** A registered storage-test artifact: connectionTest is observable, while init and discovery refuse. */
     public static Path registeredStorageProbe(Path workDir, Path trace) {
+        return registeredStorageProbe(workDir, trace, "mongodb", "mongodb://fixture/accepted");
+    }
+
+    /** A synthetic registered adapter used to observe persisted URI and trust handoff, not certify a release artifact. */
+    public static Path registeredStorageProbe(Path workDir, Path trace, String connectorId, String acceptedPrefix) {
         String file = trace.toAbsolutePath().toString().replace("\\", "\\\\").replace("\"", "\\\"");
         String code = """
                 package synthetic;
@@ -74,13 +79,19 @@ public final class SyntheticSinkJars {
                         String uri = context.getConnectionConfig().getString("uri");
                         java.nio.file.Files.writeString(java.nio.file.Path.of("%s"), uri + "\\n",
                                 java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
-                        sink.accept(new TestItem("fixture", "mongodb://fixture/accepted".equals(uri)
+                        String ca = context.getConnectionConfig().getString("sslCA");
+                        if (ca != null) {
+                            try (var input = java.nio.file.Files.newInputStream(java.nio.file.Path.of(ca))) {
+                                java.security.cert.CertificateFactory.getInstance("X.509").generateCertificates(input);
+                            }
+                        }
+                        sink.accept(new TestItem("fixture", uri.startsWith("%s")
                                 ? TestItem.RESULT_SUCCESSFULLY : TestItem.RESULT_FAILED));
                         return ConnectionOptions.create();
                     }
                 }
-                """.formatted(file);
+                """.formatted(file, acceptedPrefix);
         return SyntheticJar.compileToJar(workDir, "synthetic.StorageProbe", code,
-                java.util.Map.of("mongodb-spec.json", "{\"properties\":{\"id\":\"mongodb\"}}"), java.util.Map.of());
+                java.util.Map.of("mongodb-spec.json", "{\"properties\":{\"id\":\"" + connectorId + "\"}}"), java.util.Map.of());
     }
 }

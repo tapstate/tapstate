@@ -77,6 +77,22 @@ class StorageControlDispatcherTest {
         assertThat(dispatcher.dispatch("storage.recovery.confirm",access,confirmation)).containsEntry("phase","CONFIRMED");
         dispatcher.dispatch("storage.recovery.confirm",access,confirmation); assertThat(f.recoveries.confirms).isEqualTo(1);
     }
+    @Test void completionReturnsOnlyItsReceiptAndTheRetiredSetupCredentialCannotQueryAgain() {
+        var f = new Fixture();
+        f.setup.continuation = committed -> f.setup.states.state = new StorageSetupStateStore.Status(SCOPE, StorageSetupStateStore.Phase.COMPLETE, 1);
+        var dispatcher = f.dispatcher(); var access = f.owner(); var proofs = new LinkedHashMap<String,Object>();
+        for (var layer : StorageSetupService.Layer.values()) {
+            var result = dispatcher.dispatch("storage.test", access, Map.of("operationId", SCOPE.operationId(), "generation", 1,
+                    "candidate", candidate(), "layer", layer.name()));
+            proofs.put(layer.name(), result.get("testStamp"));
+        }
+        var input = Map.<String,Object>of("operationId", SCOPE.operationId(), "generation", 1, "candidate", candidate(), "testStamps", proofs);
+        assertThat(dispatcher.dispatch("storage.setup.commit", access, input)).containsEntry("setupPhase", "COMPLETE");
+        assertThatThrownBy(() -> dispatcher.dispatch("storage.setup.status", access, Map.of("operationId", SCOPE.operationId())))
+                .isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> dispatcher.dispatch("storage.setup.commit", access, input)).isInstanceOf(TapstateException.class);
+        assertThat(f.setup.binding.inserts).isOne();
+    }
     @Test void importsReturnTheOriginalReceiptAndNeitherKeysNorDecryptedDefinitions() {
         var f = new Fixture(); var dispatcher = f.dispatcher(); var access = f.admin();
         f.imports.codec.packages.put("input", new ConfigurationImportStore.Payload(List.of(),List.of(new User("admin2","sentinel-hash","admin")),List.of(),Map.of(),Map.of()));
