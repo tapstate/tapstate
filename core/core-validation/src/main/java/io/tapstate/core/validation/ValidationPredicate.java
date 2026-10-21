@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** A bounded independent current-row predicate. It contains no expression-runtime or event-envelope API. */
 public final class ValidationPredicate {
@@ -136,12 +137,24 @@ public final class ValidationPredicate {
      * array path. The caller must not insert guessed values or omit unresolved paths from this mask.
      */
     public Result evaluate(ValidationValues.Row row, List<List<Object>> unavailablePaths) {
+        return evaluate(row, unavailablePaths, Set.of());
+    }
+
+    /** Explicit static rules can define a top-level field, including absence, within a whole-unknown row. */
+    public Result evaluate(ValidationValues.Row row, List<List<Object>> unavailablePaths, Set<String> definedFields) {
         Objects.requireNonNull(row);
         if (row.accountedBytes() > limits.row().bytes() || row.nodes() > limits.row().nodes() || row.depth() > limits.row().depth())
             throw limit("filter.input");
         var budget = new Budget(limits.maxOperations());
         if (unavailablePaths == null || unavailablePaths.size() > 256) throw ValidationError.invalid("predicate.unavailablePaths");
         long bytes = row.accountedBytes();
+        if (definedFields == null || definedFields.size() > 256) throw ValidationError.invalid("predicate.definedFields");
+        for (String field : definedFields) {
+            ValidationError.fieldName(field, "predicate.definedFields"); budget.spend(1L + field.length());
+            bytes += 48L + 2L * field.length();
+            if (bytes > limits.row().bytes()) throw limit("filter.input");
+        }
+        budget.definedFields = Set.copyOf(definedFields);
         var unavailable = new ArrayList<List<Object>>(unavailablePaths.size());
         for (var path : unavailablePaths) {
             budget.spend(1);
@@ -389,10 +402,15 @@ public final class ValidationPredicate {
     private static final class Budget {
         private long remaining;
         private List<List<Object>> unavailable = List.of();
+        private Set<String> definedFields = Set.of();
         Budget(long remaining) { this.remaining = remaining; }
         Problem unavailable(List<Object> requested) {
             for (var path : unavailable) {
                 spend(1);
+                if (path.isEmpty() && !requested.isEmpty() && requested.getFirst() instanceof String field) {
+                    spend(1L + field.length());
+                    if (definedFields.contains(field)) continue;
+                }
                 if (path.size() > requested.size()) continue;
                 boolean matches = true;
                 for (int i = 0; i < path.size(); i++) {

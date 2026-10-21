@@ -5,6 +5,7 @@ import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationValues;
+import io.tapstate.core.validation.ValidationPredicate;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -118,14 +119,21 @@ public final class ValidationStaticMap {
     public static final class Projection {
         private final ValidationValues.Row row;
         private final List<List<Object>> unavailablePaths;
+        private final Set<String> definedFields;
         private final long accountedBytes;
-        private Projection(ValidationValues.Row row, List<List<Object>> paths, long accountedBytes) {
+        private Projection(ValidationValues.Row row, List<List<Object>> paths, Set<String> definedFields, long accountedBytes) {
             this.row = row;
             this.unavailablePaths = List.copyOf(paths);
+            this.definedFields = Set.copyOf(definedFields);
             this.accountedBytes = accountedBytes;
         }
         public ValidationValues.Row row() { return row; }
         public List<List<Object>> unavailablePaths() { return unavailablePaths; }
+        /** Overrides only whole-row uncertainty; more specific unavailable paths remain in force. */
+        public Set<String> definedFields() { return definedFields; }
+        public ValidationPredicate.Result evaluate(ValidationPredicate predicate) {
+            return Objects.requireNonNull(predicate, "predicate").evaluate(row, unavailablePaths, definedFields);
+        }
         public long accountedBytes() { return accountedBytes; }
     }
 
@@ -133,29 +141,47 @@ public final class ValidationStaticMap {
      * Carries unresolved paths through these explicit forward rules. A literal replaces uncertainty;
      * a rename reads the original view, including its unavailable descendants, and a drop removes its
      * field contribution. This does not infer physical keys, trace key lineage or resolve source issues.
-     * A whole unknown view remains conservatively unknown because its unknown fields cannot be listed.
-     * Reserve input and output masks in addition to the ordinary projection's working copies.
+     * A whole unknown view retains that marker while explicit assignments/removals define their own
+     * fields. Reserve input and output knowledge metadata in addition to ordinary working copies.
      */
     public Projection apply(ValidationValues.Row input, List<List<Object>> unavailablePaths) {
+        return applyPartial(input, unavailablePaths, Set.of());
+    }
+
+    /** Carries all partial knowledge across another declared Map node without losing known overrides. */
+    public Projection apply(Projection input) {
+        Objects.requireNonNull(input, "input");
+        return applyPartial(input.row(), input.unavailablePaths(), input.definedFields());
+    }
+
+    private Projection applyPartial(ValidationValues.Row input, List<List<Object>> unavailablePaths, Set<String> definedFields) {
         checkInput(input);
         var inputPaths = new PathSet(input.accountedBytes());
         if (unavailablePaths == null || unavailablePaths.size() > 256) throw invalid("map.unavailablePaths");
         for (var path : unavailablePaths) inputPaths.add(path);
+        for (String field : definedFields) inputPaths.define(field);
         var projected = apply(input);
         var outputPaths = new PathSet(projected.accountedBytes());
-        if (inputPaths.paths.contains(List.of())) {
-            outputPaths.add(List.of());
-            return new Projection(projected, new ArrayList<>(outputPaths.paths), outputPaths.bytes);
-        }
+        boolean wholeUnknown = inputPaths.paths.contains(List.of());
+        if (wholeUnknown) outputPaths.add(List.of());
         var byField = new LinkedHashMap<String, List<List<Object>>>();
-        for (var path : inputPaths.paths) byField.computeIfAbsent((String)path.getFirst(), ignored -> new ArrayList<>()).add(path);
+        for (var path : inputPaths.paths) if (!path.isEmpty())
+            byField.computeIfAbsent((String)path.getFirst(), ignored -> new ArrayList<>()).add(path);
         var assigned = new HashSet<String>();
         for (Assignment assignment : assignments) {
             switch (assignment) {
-                case Assignment.Literal literal -> assigned.add(literal.output());
+                case Assignment.Literal literal -> {
+                    assigned.add(literal.output());
+                    if (wholeUnknown) outputPaths.define(literal.output());
+                }
                 case Assignment.Rename rename -> {
                     var paths = byField.getOrDefault(rename.source(), List.of());
-                    if (input.fields().containsKey(rename.source()) || !paths.isEmpty()) assigned.add(rename.output());
+                    boolean writes = input.fields().containsKey(rename.source()) || !paths.isEmpty()
+                            || wholeUnknown && !inputPaths.defined.contains(rename.source());
+                    if (writes) {
+                        assigned.add(rename.output());
+                        if (wholeUnknown && inputPaths.defined.contains(rename.source())) outputPaths.define(rename.output());
+                    }
                     for (var path : paths) {
                         var renamed = new ArrayList<Object>(path); renamed.set(0, rename.output());
                         outputPaths.add(renamed);
@@ -164,16 +190,30 @@ public final class ValidationStaticMap {
             }
         }
         for (var path : inputPaths.paths) {
+            if (path.isEmpty()) continue;
             String field = (String)path.getFirst();
             if (!consumed.contains(field) && !assigned.contains(field)) outputPaths.add(path);
         }
-        return new Projection(projected, new ArrayList<>(outputPaths.paths), outputPaths.bytes);
+        if (wholeUnknown) {
+            for (String field : inputPaths.defined) if (!consumed.contains(field) && !assigned.contains(field)) outputPaths.define(field);
+            for (String field : consumed) if (!assigned.contains(field)) outputPaths.define(field);
+        }
+        return new Projection(projected, new ArrayList<>(outputPaths.paths), outputPaths.defined, outputPaths.bytes);
     }
 
     private final class PathSet {
         private final Set<List<Object>> paths = new LinkedHashSet<>();
+        private final Set<String> defined = new LinkedHashSet<>();
         private long bytes;
         private PathSet(long rowBytes) { bytes = rowBytes; }
+        private void define(String field) {
+            ValidationError.fieldName(field, "map.definedField");
+            if (defined.contains(field)) return;
+            if (defined.size() == 256) throw limit("map.definedFields");
+            long amount = 48L + 2L * field.length();
+            if (amount > limits.bytes() - bytes) throw limit("map.unavailableBytes");
+            bytes += amount; defined.add(field);
+        }
         private void add(List<Object> path) {
             if (path == null || path.size() > 64 || !path.isEmpty() && !(path.getFirst() instanceof String))
                 throw invalid("map.unavailablePath");

@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import io.tapstate.core.common.TapstateException;
@@ -71,6 +72,12 @@ public final class ValidationValueComparison {
     static long visitKnownDifferences(ValidationValues.Row source, ValidationValues.Row target,
             BiPredicate<String, String> compatible, TraversalLimits limits, List<List<Object>> unavailable,
             Consumer<Difference> consumer) {
+        return visitKnownDifferences(source, target, compatible, limits, unavailable, Set.of(), consumer);
+    }
+
+    static long visitKnownDifferences(ValidationValues.Row source, ValidationValues.Row target,
+            BiPredicate<String, String> compatible, TraversalLimits limits, List<List<Object>> unavailable,
+            Set<String> definedFields, Consumer<Difference> consumer) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(compatible, "compatible");
@@ -80,7 +87,7 @@ public final class ValidationValueComparison {
             if (row.accountedBytes() > limits.row().bytes() || row.nodes() > limits.row().nodes()
                     || row.depth() > limits.row().depth()) throw comparisonLimit("row");
         }
-        Walker walker = new Walker(compatible, limits.operations(), unavailable, consumer);
+        Walker walker = new Walker(compatible, limits.operations(), unavailable, definedFields, consumer);
         walker.walk(source.fields(), target.fields(), new ArrayList<>());
         return walker.differences;
     }
@@ -89,11 +96,13 @@ public final class ValidationValueComparison {
         private final BiPredicate<String, String> compatible;
         private final Consumer<Difference> consumer;
         private final List<List<Object>> unavailable;
+        private final Set<String> definedFields;
         private long remaining;
         private long differences;
-        private Walker(BiPredicate<String, String> compatible, long operations, List<List<Object>> unavailable, Consumer<Difference> consumer) {
+        private Walker(BiPredicate<String, String> compatible, long operations, List<List<Object>> unavailable, Set<String> definedFields, Consumer<Difference> consumer) {
             this.compatible = compatible;
             this.unavailable = unavailable;
+            this.definedFields = definedFields;
             this.remaining = operations;
             this.consumer = consumer;
         }
@@ -187,6 +196,13 @@ public final class ValidationValueComparison {
         private boolean unavailable(List<Object> path) {
             for (var blocked : unavailable) {
                 work(1);
+                if (blocked.isEmpty() && !definedFields.isEmpty()) {
+                    if (path.isEmpty()) continue;
+                    if (path.getFirst() instanceof String field) {
+                        work(1L + field.length());
+                        if (definedFields.contains(field)) continue;
+                    }
+                }
                 if (blocked.size() > path.size()) continue;
                 boolean prefix = true;
                 for (int i = 0; i < blocked.size(); i++) {
