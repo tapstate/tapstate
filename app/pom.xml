@@ -46,6 +46,11 @@
   </dependencyManagement>
 
   <dependencies>
+    <!-- The schedule parser stays in the assembly implementation behind the pure validation contract. -->
+    <dependency>
+      <groupId>com.cronutils</groupId>
+      <artifactId>cron-utils</artifactId>
+    </dependency>
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-validation</artifactId>

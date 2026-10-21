@@ -8,6 +8,18 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+validation.schedule-field-count:
+  message: "A validation cron schedule needs five fields; this expression has {count}."
+  solution: "Use minute, hour, day of month, month and day of week. Seconds and years are not supported."
+validation.schedule-invalid:
+  message: "Validation schedule field {field} has an invalid value `{value}` at position {position}."
+  solution: "Check the field range and supported UNIX syntax, or choose an explicit IANA time zone. Technical details retain the parser cause."
+validation.schedule-no-date:
+  message: "The validation schedule has no possible calendar date."
+  solution: "Check the selected months and days. Leap days are supported."
+validation.schedule-search-exhausted:
+  message: "Validation schedule calculation reached its {limit} limit."
+  solution: "This is a calculation limit, not proof of an invalid expression. Retry within the available calculation budget before enabling the schedule."
 validation.execution-cancelled:
   message: "Validation execution at node {node} was cancelled before completion."
   solution: "A cancelled expansion is incomplete. Read the original run state before starting new work."

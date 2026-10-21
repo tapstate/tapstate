@@ -345,6 +345,10 @@ validation.read-cancelled
 validation.read-failed
 validation.read-protocol-violation
 validation.rule-unsupported
+validation.schedule-field-count
+validation.schedule-invalid
+validation.schedule-no-date
+validation.schedule-search-exhausted
 validation.source-field-conflict
 validation.value-limit-exceeded
 validation.value-type-unsupported
