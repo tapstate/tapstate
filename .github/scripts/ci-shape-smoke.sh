@@ -30,6 +30,8 @@ def jobs(text):
 
 
 def check(workflows, contexts, inputs):
+    assert re.search(r'^env:\n  JAVA_TOOL_OPTIONS: "-Dapi\.version=1\.44"\n', workflows['ci.yml'], re.M), \
+        'hosted Docker API compatibility must reach every Maven and fork JVM'
     ci = jobs(workflows['ci.yml'])
     plan = ci.get('shard-plan', '')
     assert 'ci-receipt.sh event-inputs' in plan and '${{ runner.temp }}/ci-event-inputs.json' in plan, \
@@ -178,6 +180,8 @@ assert contexts, 'required context list is empty'
 check(workflows, contexts, inputs)
 mutations = 0
 for original, replacement in [
+    ('  JAVA_TOOL_OPTIONS: "-Dapi.version=1.44"', ''),
+    ('  JAVA_TOOL_OPTIONS: "-Dapi.version=1.44"', '  JAVA_TOOL_OPTIONS: "-Dapi.version=1.32"'),
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),
     ('matrix: ${{ steps.plan.outputs.matrix }}', 'matrix: wrong-output'),

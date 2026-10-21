@@ -28,6 +28,10 @@ on:
 
   workflow_dispatch:
 
+# Apply the Docker API setting to Maven and every forked test JVM.
+env:
+  JAVA_TOOL_OPTIONS: "-Dapi.version=1.44"
+
 permissions:
   contents: read
   pull-requests: write
