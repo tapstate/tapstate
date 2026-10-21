@@ -5,8 +5,8 @@
 # separate workflow (no-agent-footprint.yml).
 # Specifications (e2e/*IT) run here against real containers: this runner has a Docker daemon, and
 # the e2e module fails rather than skips when one is missing, so a green build here means they ran.
-# On a developer machine they skip instead — and note Docker 29 rejects the API version the client
-# negotiates by default, so running them locally needs -Dapi.version=1.44.
+# On a developer machine they skip instead. Docker 29 rejects the client's default API version;
+# the test steps pass API 1.44 explicitly, as local verification can with -Dapi.version=1.44.
 # Deliberately excluded for now: native-image build (pinned to local darwin-arm64 until D5) and the
 # connector catalog *refresh* - regenerating it needs a connectors checkout and built connector jars.
 # The catalog's own consistency gates are PDK-free and run in the build above; the shell that drives
@@ -105,6 +105,7 @@ jobs:
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
+          MAVEN_ARGS: -Dapi.version=1.44
         run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Preserve downloaded dependencies
         if: always()
