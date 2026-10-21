@@ -209,11 +209,39 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         return id == null ? "none" : id;
     }
 
+    ConfigurationInitialization claimConfiguration(String bootId, String hash) {
+        try {
+            var result = sdk.claimConfiguration(bootId, hash);
+            if (!settings.clusterId().equals(result.clusterId()) || !hash.equals(result.configurationHash())) throw new ProviderFailure();
+            return result;
+        } catch (ProviderFailure failure) { throw CloudAuthenticationService.unavailable(); }
+    }
+
+    void completeConfiguration(String operationId, String hash) {
+        try {
+            var result = sdk.completeConfiguration(operationId, hash);
+            if (!settings.clusterId().equals(result.clusterId()) || !hash.equals(result.configurationHash())
+                    || !operationId.equals(result.operationId()) || !"COMPLETE".equals(result.phase()) || result.creationGranted()) throw new ProviderFailure();
+        } catch (ProviderFailure failure) { throw CloudAuthenticationService.unavailable(); }
+    }
+
+    record ConfigurationInitialization(String clusterId, String operationId, String phase, String configurationHash, boolean creationGranted) {
+        ConfigurationInitialization {
+            try {
+                if (!text(clusterId) || operationId == null || !java.util.UUID.fromString(operationId).toString().equals(operationId)
+                        || !List.of("CLAIMED", "COMPLETE").contains(phase) || configurationHash == null || !configurationHash.matches("[0-9a-f]{64}")
+                        || creationGranted && !phase.equals("CLAIMED")) throw new ProviderFailure();
+            } catch (IllegalArgumentException invalid) { throw new ProviderFailure(); }
+        }
+    }
+
     interface SdkRuntime {
         ExchangeResult exchange(String code);
         VerifiedClaims verify(String jwt);
         boolean verifyCallback(String method, String timestamp, String nonce, String data, String signature);
         void report(String clusterId, String nonce, CloudRuntimeStatus status, String token);
+        default ConfigurationInitialization claimConfiguration(String bootId, String hash) { throw new ProviderFailure(); }
+        default ConfigurationInitialization completeConfiguration(String operationId, String hash) { throw new ProviderFailure(); }
     }
 
     record ExchangeResult(
@@ -255,8 +283,10 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     private static final class TypedSdkRuntime implements SdkRuntime {
         private final CloudControlPlaneSdk sdk;
         private final C2StatusReportApi status;
+        private final CloudRuntimeSettings settings;
 
         TypedSdkRuntime(CloudRuntimeSettings settings) {
+            this.settings = settings;
             sdk = CloudControlPlaneSdk.builder()
                     .baseUrl(settings.baseUrl().toString())
                     .issuer(settings.baseUrl().toString())
@@ -264,6 +294,30 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                     .sdkStaticToken(settings.token())
                     .build();
             status = new C2StatusReportApi(new ApiClient().setBasePath(settings.baseUrl().toString()));
+        }
+
+        @Override public ConfigurationInitialization claimConfiguration(String bootId, String hash) {
+            return configuration("claim", Map.of("bootId", bootId, "configurationHash", hash));
+        }
+        @Override public ConfigurationInitialization completeConfiguration(String operationId, String hash) {
+            return configuration("complete", Map.of("operationId", operationId, "configurationHash", hash));
+        }
+        private ConfigurationInitialization configuration(String action, Map<String,String> body) {
+            // Reuse the installed SDK transport and JSON envelope. Unknown writes are never retried or redirected.
+            try (var transport = org.apache.hc.client5.http.impl.classic.HttpClients.custom()
+                    .disableAutomaticRetries().disableRedirectHandling().build()) {
+                var api = new ApiClient(transport).setBasePath(settings.baseUrl().toString()).setConnectTimeout(5000).setReadTimeout(10000);
+                Map<String,Object> response = api.invokeAPI("/v1/api/clusters/" + api.escapeString(settings.clusterId()) + "/configuration-initialization/" + action,
+                        "POST", new java.util.ArrayList<>(), new java.util.ArrayList<>(), null, body,
+                        new java.util.HashMap<>(Map.of("Authorization", "Bearer " + settings.token())), new java.util.HashMap<>(),
+                        new java.util.HashMap<>(), "application/json", "application/json", new String[0],
+                        new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {});
+                if (response == null || !"ok".equals(response.get("code")) || !(response.get("data") instanceof Map<?,?> value)
+                        || !(value.get("clusterId") instanceof String cluster) || !(value.get("operationId") instanceof String operation)
+                        || !(value.get("phase") instanceof String phase) || !(value.get("configurationHash") instanceof String hash)
+                        || !(value.get("creationGranted") instanceof Boolean granted)) throw new ProviderFailure();
+                return new ConfigurationInitialization(cluster, operation, phase, hash, granted);
+            } catch (ApiException | java.io.IOException failure) { throw new ProviderFailure(); }
         }
 
         @Override

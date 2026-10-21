@@ -47,6 +47,7 @@ class StorageMinimumStartupTest {
         assertThat(response.statusCode()).isEqualTo(503);
         assertThat(((Map<?,?>)JsonReader.parse(response.body())).get("code")).isEqualTo("control.storage-unavailable");
         assertThat(response.body()).doesNotContain("sentinel-password");
+        assertThat(context.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_REQUIRED);
     }
     @Test void directBusinessRequestsCannotConstructTheRuntimeOrUseTheOldBootstrapAlias() throws Exception {
         var client = HttpClient.newHttpClient();

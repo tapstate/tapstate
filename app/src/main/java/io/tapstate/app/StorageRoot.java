@@ -13,19 +13,25 @@ import java.util.function.Function;
 final class StorageRoot implements AutoCloseable {
     enum Phase { CONFIGURATION_REQUIRED, CONFIGURATION_UNAVAILABLE, SETUP_REQUIRED, CACHE_UNAVAILABLE, AUTH_READY, BUSINESS_READY }
     private final CloudRuntimeSettings cloud;
-    private final StorageRuntime runtime;
-    private final StorageAuthentication authentication;
+    private volatile StorageRuntime runtime;
+    private volatile StorageAuthentication authentication;
     private final Optional<StorageBinding.Connection> endpoint;
+    private final java.util.function.Supplier<MongoConfigurationDomain> configurationLoader;
+    private final Function<MongoConfigurationDomain, StorageRuntime> runtimes;
+    private final Function<MongoConfigurationDomain, StorageAuthentication> authentications;
+    private final CloudConfigurationInitialization initialization;
+    private final byte[] authenticationKey;
     private volatile Phase phase;
     private volatile boolean closed;
     private FirstCacheCreation attemptedCreation;
+    private Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> retainedAssembly;
 
     StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
             MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey) {
         this.cloud = Objects.requireNonNull(cloud);
         String uri = cloud.metadataUri(mongo.getUri());
         StorageBinding.Connection selectedEndpoint = null;
-        MongoConfigurationDomain configuration = null;
+        MongoConnectionSettings selectedSettings = null;
         phase = Phase.CONFIGURATION_REQUIRED;
         if (mongo.isEnabled() && uri != null && !uri.isBlank()) {
             try {
@@ -34,17 +40,18 @@ final class StorageRoot implements AutoCloseable {
                         // customer's CACHE and MASTER inputs use the restricted Atlas setup policy.
                         StorageBinding.Connection.Kind.MONGODB,
                         uri, MongoDatabaseNames.fromUri(uri), readCa(mongo.getTlsCaFile()));
-                var settings = new MongoConnectionSettings(uri, mongo.getTlsCaFile(), mongo.getServerSelectionTimeout(), boot.value());
-                configuration = cloud.cloud() ? MongoConfigurationDomain.open(settings, cloud.clusterId())
-                        : MongoConfigurationDomain.openExisting(settings);
-                phase = Phase.SETUP_REQUIRED;
+                selectedSettings = new MongoConnectionSettings(uri, mongo.getTlsCaFile(), mongo.getServerSelectionTimeout(), boot.value());
             } catch (TapstateException unavailable) {
                 phase = Phase.CONFIGURATION_UNAVAILABLE;
             }
         }
-        endpoint = configuration == null ? Optional.empty() : Optional.of(selectedEndpoint);
-        MongoConfigurationDomain original = configuration;
-        this.runtime = new StorageRuntime(configuration, binding -> {
+        endpoint = Optional.ofNullable(selectedEndpoint);
+        var settings = selectedSettings;
+        initialization = settings != null && cloud.cloud() ? new CloudConfigurationInitialization(settings, cloud, bridge, boot) : null;
+        configurationLoader = settings == null ? null : initialization != null ? initialization::open : () -> MongoConfigurationDomain.openExisting(settings);
+        authenticationKey = signingKey.clone();
+        authentications = configuration -> new StorageAuthentication(configuration, cloud, bridge, secrets, clock, authenticationKey);
+        runtimes = original -> new StorageRuntime(original, binding -> {
             if (original == null) throw StorageRuntime.unavailable();
             var preparation = original.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable);
             var target = original.artifacts().get(binding.defaultSourceId()).filter(SourceResource.class::isInstance)
@@ -54,13 +61,35 @@ final class StorageRoot implements AutoCloseable {
                     original.databaseName(), MongoDatabaseNames.fromUri(masterUri));
             return MongoCacheDomain.connect(binding.cache(), mongo.getServerSelectionTimeout(), boot.value(), history.getRetention(), databases);
         });
-        this.authentication = new StorageAuthentication(configuration, cloud, bridge, secrets, clock, signingKey);
+        runtime = runtimes.apply(null); authentication = authentications.apply(null);
+        loadConfiguration();
+    }
+
+    /** Explicit Cloud entry can retry initial CONFIG IO using the same process-owned creation invocation. */
+    private synchronized void loadConfiguration() {
+        requireOpen();
+        if (configurationLoader == null || runtime.configuration().isPresent()) return;
+        MongoConfigurationDomain candidate = null;
+        try {
+            candidate = configurationLoader.get();
+            var nextRuntime = runtimes.apply(candidate);
+            var nextAuthentication = authentications.apply(candidate);
+            authentication.close(); runtime.close();
+            runtime = nextRuntime; authentication = nextAuthentication; phase = Phase.SETUP_REQUIRED;
+        } catch (RuntimeException | Error failure) {
+            if (candidate != null) try { candidate.close(); }
+            catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            if (!(failure instanceof TapstateException)) throw failure;
+            phase = Phase.CONFIGURATION_UNAVAILABLE;
+        }
     }
 
     Phase phase() { requireOpen(); return phase; }
     StorageRuntime runtime() { requireOpen(); return runtime; }
     StorageAuthentication authentication() { requireOpen(); return authentication; }
-    Optional<StorageBinding.Connection> configurationEndpoint() { requireOpen(); return endpoint; }
+    Optional<StorageBinding.Connection> configurationEndpoint() {
+        requireOpen(); return runtime.configuration().isPresent() ? endpoint : Optional.empty();
+    }
     void requireActive() { requireOpen(); }
     StorageBinding.Mode mode() { return cloud.cloud() ? StorageBinding.Mode.CLOUD : StorageBinding.Mode.OP; }
 
@@ -108,6 +137,7 @@ final class StorageRoot implements AutoCloseable {
     /** Explicit startup/operation continuation only. Status reads never connect or initialize a cache. */
     synchronized void loadExisting(Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
         requireOpen();
+        retainedAssembly = Objects.requireNonNull(assembly);
         if (runtime.configuration().isEmpty()) return;
         try {
             var original = runtime.loadBound();
@@ -129,6 +159,7 @@ final class StorageRoot implements AutoCloseable {
 
     synchronized LocalAuthenticationContext localAuthentication() {
         requireOpen();
+        if (runtime.configuration().isEmpty()) throw StorageRuntime.unavailable();
         try { return authentication.local(); }
         catch (TapstateException unavailable) {
             if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
@@ -138,10 +169,27 @@ final class StorageRoot implements AutoCloseable {
 
     synchronized ManagedAuthenticationContext managedAuthentication() {
         requireOpen();
-        try { return authentication.managed(); }
+        if (runtime.configuration().isEmpty()) loadConfiguration();
+        if (runtime.configuration().isEmpty()) throw StorageRuntime.unavailable();
+        ManagedAuthenticationContext context;
+        try { context = authentication.managed(); }
         catch (TapstateException unavailable) {
             if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
-            restoreAuthentication(); return authentication.managed();
+            restoreAuthentication(); context = authentication.managed();
+        }
+        resumeRetainedBusiness(); return context;
+    }
+
+    private void resumeRetainedBusiness() {
+        if (retainedAssembly == null || runtime.cleanupRequired() || runtime.business().isPresent()) return;
+        if (runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE) return;
+        try {
+            var original = runtime.current().orElseThrow(StorageRuntime::unavailable);
+            runtime.startBusiness(original, retainedAssembly);
+            phase = Phase.BUSINESS_READY;
+        } catch (TapstateException unavailable) {
+            // Formal login remains usable while a missing or failed business domain stays gated.
+            phase = Phase.AUTH_READY;
         }
     }
 
@@ -199,6 +247,8 @@ final class StorageRoot implements AutoCloseable {
     }
     @Override public synchronized void close() {
         if (closed) return; closed = true;
-        authentication.close(); runtime.close();
+        if (initialization != null) initialization.close();
+        try { authentication.close(); runtime.close(); }
+        finally { java.util.Arrays.fill(authenticationKey, (byte)0); }
     }
 }

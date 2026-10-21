@@ -31,12 +31,14 @@ class CloudStorageContinuationTest {
         final StorageSetupStateStore states = mock(StorageSetupStateStore.class);
         final StorageSetupService.DefaultTarget target = mock(StorageSetupService.DefaultTarget.class);
         final FirstCacheCreation grant = mock(FirstCacheCreation.class);
+        final CloudSdkBridge bridge = mock(CloudSdkBridge.class);
         final StorageBindingCommit committed = new StorageBindingCommit(CONNECTION, PREPARATION, Optional.of(grant));
         final AtomicReference<StorageSetupStateStore.Phase> phase = new AtomicReference<>(StorageSetupStateStore.Phase.STORAGE_BOUND);
         final MockedStatic<MongoConfigurationDomain> configurations = mockStatic(MongoConfigurationDomain.class);
         final MockedStatic<MongoCacheDomain> caches = mockStatic(MongoCacheDomain.class);
         final StorageRoot root;
-        Fixture() {
+        Fixture() { this(false); }
+        Fixture(boolean configurationUnavailable) {
             when(configuration.bindings()).thenReturn(bindings); when(configuration.setupStates()).thenReturn(states);
             when(configuration.databaseName()).thenReturn("config");
             when(bindings.load()).thenReturn(Optional.of(CONNECTION)); when(bindings.cachePreparation()).thenReturn(Optional.of(PREPARATION));
@@ -47,11 +49,14 @@ class CloudStorageContinuationTest {
             when(artifacts.get("atlas-store")).thenReturn(Optional.of(SOURCE));
             when(cache.cloudSessions(PREPARATION.authScope())).thenReturn(mock(CloudSessionStore.class));
             when(target.identity(any())).thenReturn(new StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64)));
-            configurations.when(() -> MongoConfigurationDomain.open(any(MongoConnectionSettings.class), eq("cluster"))).thenReturn(configuration);
+            var open = configurations.when(() -> MongoConfigurationDomain.open(any(MongoConnectionSettings.class), eq("cluster")));
+            if (configurationUnavailable) open.thenThrow(StorageRuntime.unavailable()).thenReturn(configuration);
+            else open.thenReturn(configuration);
+            doThrow(StorageRuntime.unavailable()).when(bridge).claimConfiguration(anyString(), anyString());
             caches.when(() -> MongoCacheDomain.connect(any(), any(), anyString(), any(), any())).thenReturn(cache);
             var cloud = new CloudProperties(); cloud.setBaseUrl("https://cloud.example"); cloud.setToken("fixture-token");
             cloud.setClusterId("cluster"); cloud.setAtlasUri("mongodb://config/config");
-            root = new StorageRoot(new MongoProperties(), CloudRuntimeSettings.resolve(cloud), mock(CloudSdkBridge.class),
+            root = new StorageRoot(new MongoProperties(), CloudRuntimeSettings.resolve(cloud), bridge,
                     BootId.fresh(), new MetricsHistoryProperties(), new RandomTokenSecrets(), Clock.systemUTC(), new byte[32]);
         }
         StorageRuntime.Business business() {
@@ -161,6 +166,21 @@ class CloudStorageContinuationTest {
             assertThatThrownBy(() -> f.root.continueCloudSetup(new StorageBindingCommit(CONNECTION, other, Optional.empty()), f.target,
                     ignored -> { throw new AssertionError("must not assemble a different owner"); })).isInstanceOf(TapstateException.class);
             assertThat(f.root.runtime().businessStarted()).isTrue(); verify(business, never()).close(); verify(f.cache, never()).close();
+        }
+    }
+
+    @Test void deferredConfigurationLoadResumesItsCompletedBusinessInTheSameRoot() {
+        try (var f = new Fixture(true)) {
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var business = f.business();
+            f.root.loadExisting(ignored -> business);
+            var probe = mock(MongoCacheDomain.class);
+            f.caches.when(() -> MongoCacheDomain.connect(any(), any(), anyString(), any(), any())).thenReturn(probe, f.cache);
+            assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
+            assertThat(f.root.runtime().businessStarted()).isTrue();
+            verify(business).start(); verify(probe).close();
+            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache, never()).prepareInitialBusiness(any(), any());
         }
     }
 }

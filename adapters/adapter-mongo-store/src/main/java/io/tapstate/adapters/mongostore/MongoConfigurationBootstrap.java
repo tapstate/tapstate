@@ -31,6 +31,17 @@ public final class MongoConfigurationBootstrap {
     /** Repeating the same installation operation loads its winner; a different operation never resets it. */
     public static MongoConfigurationDomain prepare(MongoConnectionSettings settings, String clusterId,
             String installationId, String operationId, long generation) {
+        return prepare(settings, clusterId, installationId, operationId, generation, true);
+    }
+
+    /** A replacement process may finish the original retained preparation, but never recreate missing authority. */
+    public static MongoConfigurationDomain resume(MongoConnectionSettings settings, String clusterId,
+            String installationId, String operationId, long generation) {
+        return prepare(settings, clusterId, installationId, operationId, generation, false);
+    }
+
+    private static MongoConfigurationDomain prepare(MongoConnectionSettings settings, String clusterId,
+            String installationId, String operationId, long generation, boolean mayCreate) {
         requireText(clusterId);
         requireText(installationId);
         requireText(operationId);
@@ -67,7 +78,7 @@ public final class MongoConfigurationBootstrap {
                                         || !PREPARED.equals(setup.get("phase"))) throw refused();
                                 return null;
                             }
-                            if (!emptyTarget) throw refused();
+                            if (!mayCreate || !emptyTarget) throw refused();
                             SystemCollections.CAPTURE_PREPARATIONS.prepareCollectionOn(database,session);
                             for(var index:SystemCollections.CAPTURE_PREPARATIONS.indexes())
                                 IndexEnsure.createInTransaction(session,SystemCollections.CAPTURE_PREPARATIONS.on(database),index);

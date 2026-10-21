@@ -338,6 +338,49 @@ class ManagedMongoStoreIsolationIT {
     }
 
     /** The SDK and connector are owned fixtures; storage, TLS, HTTP and the business child are real. */
+    @Test
+    void cloudConfigurationInitializationRetriesConfirmationInTheSameProcessAndNeverRecreatesLostKeys() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "first_config_" + suffix, user = "config_" + suffix;
+        var sdk = new RecoverySdk("new-" + suffix);
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(configDb));
+            sdk.configurationHash = io.tapstate.core.model.canonical.CanonicalHash.ofText(uri(user, configDb));
+            sdk.failCompletionResponses = 1;
+            Document key;
+            try (var application = cloudRecoveryRoot(uri(user, configDb), sdk)) {
+                var root = application.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
+                key = admin.getDatabase(configDb).getCollection("cluster_keys").find().first();
+                assertThat(key).isNotNull();
+                assertThat(root.runtime().configuration()).isEmpty();
+                assertThat(sdk.configurationClaims).hasValue(1);
+                String temporary = exchangeCookie(application, "old");
+                assertThat(temporary).isNotBlank();
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.SETUP_REQUIRED);
+                assertThat(root.runtime().requireConfiguration().setupStates().load().scope().operationId()).isEqualTo(sdk.configurationOperation);
+                assertThat(sdk.configurationClaims).hasValue(1); assertThat(sdk.configurationCompletions).hasValue(2);
+                assertThat(admin.getDatabase(configDb).getCollection("cluster_keys").find().first()).isEqualTo(key);
+                assertThat(root.runtime().current()).isEmpty(); assertThat(root.runtime().business()).isEmpty();
+            }
+            try (var restarted = cloudRecoveryRoot(uri(user, configDb), sdk)) {
+                assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.SETUP_REQUIRED);
+                assertThat(sdk.configurationClaims).hasValue(1);
+                assertThat(admin.getDatabase(configDb).getCollection("cluster_keys").find().first()).isEqualTo(key);
+            }
+            admin.getDatabase(configDb).drop();
+            try (var lost = cloudRecoveryRoot(uri(user, configDb), sdk)) {
+                var root = lost.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
+                assertThatThrownBy(() -> exchangeCookie(lost, "fresh")).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
+                assertThat(root.runtime().configuration()).isEmpty();
+                assertThat(admin.getDatabase(configDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
+                assertThat(sdk.configurationClaims).hasValue(2);
+            }
+        }
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void cloudFirstSetupContinuesInTheSameProcessAndReauthenticatesAfterCutover(boolean failAfterCompletion) throws Exception {
@@ -422,7 +465,17 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(claims.getFirst().get("leased")).isEqualTo(false);
             }
             // A new process context reconstructs clients from the same persisted bundle, never a probe file.
+            if (failAfterCompletion) admin.getDatabase("admin").runCommand(new Document("updateUser", configUser).append("roles", List.of()));
             try (var restarted = cloudRecoveryRoot(uri(configUser, configDb), new RecoverySdk(cluster), CloudConnectorTestInputs.seedDirectory(), seeds)) {
+                if (failAfterCompletion) {
+                    assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
+                    admin.getDatabase("admin").runCommand(new Document("updateUser", configUser)
+                            .append("roles", List.of(new Document("role", "readWrite").append("db", configDb))));
+                    String reauthenticated = exchangeCookie(restarted, "restarted");
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20))
+                            .until(restarted.getBean(StorageRoot.class).runtime()::businessStarted);
+                    assertThat(cloudPost(restarted, reauthenticated, "/api/storage/status", Map.of())).containsEntry("businessPhase", "READY");
+                }
                 assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
             }
@@ -493,9 +546,13 @@ class ManagedMongoStoreIsolationIT {
     static final class RecoverySdk implements CloudSdkBridge.SdkRuntime {
         final String cluster;
         final java.util.Set<String> consumed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        final String configurationOperation = UUID.randomUUID().toString();
+        final AtomicInteger configurationClaims = new AtomicInteger(), configurationCompletions = new AtomicInteger();
+        String configurationHash, configurationOwner, configurationPhase = "AVAILABLE";
+        int failCompletionResponses;
         RecoverySdk(String cluster) { this.cluster = cluster; }
         @Override public CloudSdkBridge.ExchangeResult exchange(String code) {
-            if (!List.of("old", "blocked", "fresh", "late").contains(code) || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
+            if (!List.of("old", "blocked", "fresh", "late", "restarted").contains(code) || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
             return new CloudSdkBridge.ExchangeResult(code, "organization", cluster, "Fixture", "Cluster", "local");
         }
         @Override public CloudSdkBridge.VerifiedClaims verify(String jwt) {
@@ -507,6 +564,21 @@ class ManagedMongoStoreIsolationIT {
         }
         @Override public void report(String cluster, String nonce, io.tapstate.control.core.CloudRuntimeStatus status, String token) {
             throw new AssertionError("the fixture disables status reporting");
+        }
+        @Override public synchronized CloudSdkBridge.ConfigurationInitialization claimConfiguration(String boot, String hash) {
+            configurationClaims.incrementAndGet();
+            if (configurationHash == null || !configurationHash.equals(hash)) throw new CloudSdkBridge.ProviderFailure();
+            if (configurationPhase.equals("AVAILABLE")) { configurationPhase = "CLAIMED"; configurationOwner = boot; }
+            return new CloudSdkBridge.ConfigurationInitialization(cluster, configurationOperation, configurationPhase, hash,
+                    configurationPhase.equals("CLAIMED") && boot.equals(configurationOwner));
+        }
+        @Override public synchronized CloudSdkBridge.ConfigurationInitialization completeConfiguration(String operation, String hash) {
+            configurationCompletions.incrementAndGet();
+            if (!configurationOperation.equals(operation) || !hash.equals(configurationHash) || configurationPhase.equals("AVAILABLE"))
+                throw new CloudSdkBridge.ProviderFailure();
+            configurationPhase = "COMPLETE";
+            if (failCompletionResponses-- > 0) throw new CloudSdkBridge.ProviderFailure();
+            return new CloudSdkBridge.ConfigurationInitialization(cluster, operation, "COMPLETE", hash, false);
         }
     }
 

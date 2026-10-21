@@ -41,7 +41,9 @@ class StorageRootConfiguration {
         return cloud.cloud() ? AuthenticationMode.CLOUD : AuthenticationMode.ON_PREM;
     }
     @Bean OperationRegistry operationRegistry() { return ControlOperations.registry(); }
-    @Bean CredentialAuthenticator credentialAuthenticator(StorageRoot root) { return root.authentication().credentials(); }
+    @Bean CredentialAuthenticator credentialAuthenticator(StorageRoot root) {
+        return CredentialAuthenticator.scoped(presented -> root.authentication().credentials().authenticateContext(presented));
+    }
     @Bean LocalAuthenticationContext.Provider localAuthenticationContexts(StorageRoot root) { return root::localAuthentication; }
     @Bean ManagedAuthenticationContext.Provider managedAuthenticationContexts(StorageRoot root) { return root::managedAuthentication; }
     @Bean ClusterIdentityService clusterIdentityService(StorageRoot root) {
