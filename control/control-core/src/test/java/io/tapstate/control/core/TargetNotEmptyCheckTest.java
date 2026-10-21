@@ -78,6 +78,16 @@ class TargetNotEmptyCheckTest {
     }
 
     @Test
+    void anyWriterConfiguredToClearWillClearTheTargetEvenIfAnotherAppends() {
+        StartFinding finding = only(evaluate(plan(StartLoad.FULL_LOAD,
+                entry("out", OnFullLoad.CLEAR, null), entry("shared", OnFullLoad.APPEND, "shared_view")), rows(5L)));
+
+        assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.PASS);
+        assertThat(finding.code()).isEqualTo(StartCheckCode.TARGET_SET_TO_CLEAR);
+        assertThat(finding.actions()).isEmpty();
+    }
+
+    @Test
     void aTargetThatRefusesANonEmptyLoadRefusesTheStart() {
         StartFinding finding = only(evaluate(plan(StartLoad.FULL_LOAD, entry("out", OnFullLoad.FAIL, null)),
                 rows(3L)));

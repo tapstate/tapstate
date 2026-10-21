@@ -313,6 +313,41 @@ class PipelineStartServiceTest {
         assertThat(bench.audit).isEmpty();
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void keepOnlyOnASharedTargetCannotBeOverriddenThroughAnotherTarget(boolean planUnavailable) {
+        bench.planUnavailableWhenCleared = planUnavailable;
+        bench.artifacts.put(StartChecksBench.SOURCE.replace("[ orders ]", "[ orders, customers ]"));
+        bench.artifacts.put(StartChecksBench.WAREHOUSE.replace("id: warehouse", "id: views"));
+        bench.artifacts.put("""
+                version: tapstate/v1
+                kind: view
+                id: shared_view
+                primary_key: id
+                storage: { warm: { collection: customers } }
+                """);
+        bench.artifacts.put(StartChecksBench.pipeline(null).replace("from: orders", "from: [orders, customers]")
+                .replace("source: warehouse", "source: views") + "view: { use: shared_view, from: customers }\n");
+        bench.servedTables = List.of("orders", "customers");
+        bench.holding("views/orders", new TargetProbe.TargetRows(false, 5L, true));
+        bench.holding("views/customers", new TargetProbe.TargetRows(false, 7L, true));
+        String before = bench.hash("pl");
+        assertThat(bench.service().checks("pl", StartIntent.START).findings())
+                .filteredOn(finding -> finding.key().equals("target-not-empty/views/customers"))
+                .singleElement().satisfies(finding ->
+                        assertThat(finding.actions()).extracting(StartCheckReport.Action::id).containsExactly("keep"));
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class, () -> bench.service().start(
+                "alice", "pl", List.of(new StartDecision("target-not-empty/views/orders", "clear"),
+                        new StartDecision("target-not-empty/views/customers", "keep")), before));
+
+        assertThat(refused).isNotNull();
+        assertThat(refused.code().code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(bench.hash("pl")).isEqualTo(before);
+        assertThat(bench.desiredById).isEmpty();
+        assertThat(bench.audit).isEmpty();
+    }
+
     @Test
     void aNoOpDefinitionChangeCannotBeReportedAsAppliedOrStartThePipeline() {
         bench.artifacts.put(StartChecksBench.pipeline(null));

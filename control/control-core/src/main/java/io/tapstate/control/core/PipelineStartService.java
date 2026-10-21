@@ -94,6 +94,7 @@ public final class PipelineStartService {
                 throw changeNotApplied(pipelineId);
             }
             started = evaluate(pipelineId, startable, definition, StartIntent.START);
+            refuseNewClearsOfAcknowledgedTargets(pipelineId, first, started, taken);
             // A changing answer is fulfilled by the changed definition, not by its original question's key.
             Set<String> acknowledged = new LinkedHashSet<>();
             taken.acknowledged().forEach(chosen -> acknowledged.add(chosen.finding().key()));
@@ -187,6 +188,33 @@ public final class PipelineStartService {
                 throw invalid(pipelineId, new StartDecision(kept.finding().key(), kept.action().id()));
             }
         }
+    }
+
+    /** A keep-only finding has no alternative change preview, so also compare the actual start plans. */
+    private static void refuseNewClearsOfAcknowledgedTargets(String pipelineId, StartEvaluation before,
+            StartEvaluation after, Reconciled taken) {
+        Set<String> newlyCleared = clearingTargets(after);
+        newlyCleared.removeAll(clearingTargets(before));
+        for (Chosen kept : taken.acknowledged()) {
+            StartFinding.Subject subject = kept.finding().subject();
+            if (StartFinding.Subject.TARGET.equals(subject.kind())
+                    && (after.plan() == null || newlyCleared.contains(subject.id()))) {
+                throw invalid(pipelineId, new StartDecision(kept.finding().key(), kept.action().id()));
+            }
+        }
+    }
+
+    private static Set<String> clearingTargets(StartEvaluation evaluation) {
+        Set<String> cleared = new LinkedHashSet<>();
+        if (evaluation.plan() != null) {
+            for (StartPlan.Entry entry : evaluation.plan().entries()) {
+                if (entry.load() == io.tapstate.spi.store.StartLoad.FULL_LOAD
+                        && entry.onFullLoad() == io.tapstate.core.model.OnFullLoad.CLEAR) {
+                    cleared.add(entry.coordinate());
+                }
+            }
+        }
+        return cleared;
     }
 
     private static boolean sameField(StartAction.Change one, StartAction.Change other) {

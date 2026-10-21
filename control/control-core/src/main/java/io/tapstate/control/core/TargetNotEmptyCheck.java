@@ -133,16 +133,15 @@ public final class TargetNotEmptyCheck implements StartCheck {
     }
 
     /**
-     * The policy a full load applies to the target: one element's own, or -- when several elements write
-     * the same target -- the one that keeps the most, because a target is cleared only when every element
-     * writing it would clear it.
+     * Each element prepares its target independently: one clearing writer is enough to remove existing
+     * rows. A failing writer conservatively refuses a non-empty start before any writer can change it.
      */
     private static OnFullLoad policy(List<StartPlan.Entry> writers) {
         boolean fails = writers.stream().anyMatch(entry -> entry.onFullLoad() == OnFullLoad.FAIL);
         if (fails) {
             return OnFullLoad.FAIL;
         }
-        return writers.stream().allMatch(entry -> entry.onFullLoad() == OnFullLoad.CLEAR)
+        return writers.stream().anyMatch(entry -> entry.onFullLoad() == OnFullLoad.CLEAR)
                 ? OnFullLoad.CLEAR : OnFullLoad.APPEND;
     }
 

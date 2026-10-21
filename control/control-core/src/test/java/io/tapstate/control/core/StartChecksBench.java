@@ -81,6 +81,7 @@ final class StartChecksBench {
     final List<StartCheck> checks = new ArrayList<>(List.of(new TargetNotEmptyCheck()));
     final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     List<String> servedTables = List.of("orders");
+    boolean planUnavailableWhenCleared;
     Duration budget = StartCheckEvaluator.BUDGET;
     Duration perTarget = StartCheckEvaluator.PER_TARGET;
 
@@ -151,6 +152,11 @@ final class StartChecksBench {
 
     /** A plain sync of the one source table, and the view's collection named after the view. */
     List<PipelineWriteTargets.WriteTarget> writeTargets(PipelineResource definition) {
+        if (planUnavailableWhenCleared && definition.serve() instanceof ServeBlock.Inline inline
+                && inline.sync().stream().anyMatch(element -> element.onFullLoad() == OnFullLoad.CLEAR)) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                    Map.of("detail", "source models became unavailable"), null);
+        }
         List<PipelineWriteTargets.WriteTarget> written = new ArrayList<>();
         List<SyncElement> sync = null;
         String definedIn = null;
@@ -172,6 +178,13 @@ final class StartChecksBench {
         if (definition.view() instanceof ViewBlock.Inline view) {
             written.add(new PipelineWriteTargets.WriteTarget(view.id(), PipelineWriteTargets.WriteTarget.Kind.VIEW,
                     "views", view.id(), view.onFullLoad() == null ? OnFullLoad.APPEND : view.onFullLoad(), null));
+        }
+        if (definition.view() instanceof ViewBlock.Use use) {
+            var view = (io.tapstate.core.model.ViewResource) artifacts.get(use.use()).orElseThrow();
+            String table = view.storage() != null && view.storage().warm() != null
+                    ? view.storage().warm().collection() : use.id();
+            written.add(new PipelineWriteTargets.WriteTarget(use.id(), PipelineWriteTargets.WriteTarget.Kind.VIEW,
+                    "views", table, view.onFullLoad() == null ? OnFullLoad.APPEND : view.onFullLoad(), use.use()));
         }
         return written;
     }
