@@ -2,6 +2,13 @@ package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.validation.ValidationKey;
+import io.tapstate.core.validation.ValidationKeyBinding;
+import io.tapstate.core.validation.ValidationValues;
+import io.tapstate.runtime.engine.validation.ValidationStaticMap;
+import io.tapstate.runtime.engine.validation.ValidationNestLookupBinding;
+import java.util.Set;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
@@ -64,5 +71,18 @@ class ValidationNestRelationsDslTest {
         var flat = plan.children().get(1);
         assertThat(flat.outputPath()).isEmpty();
         assertThat(flat.treePath()).containsExactly("$flat[profiles]");
+
+        var limits = new ValidationValues.Limits(8192, 100, 16);
+        var projection = ValidationStaticMap.compile("rename-reference", new TransformBody.MapProjection(
+                Map.of("customer_id", FieldRule.rename("raw_customer"))), limits);
+        var original = ValidationValues.ownRow(Map.of("line_id", 11, "raw_customer", 9007199254740993L), limits);
+        var parentComponent = new ValidationKeyBinding.Component(List.of("customer_id"), ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"));
+        var physical = new ValidationKeyBinding("confirmed-customer", List.of(new ValidationKeyBinding.Component(List.of("customer_db"),
+                ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), limits);
+        var lookup = new ValidationNestLookupBinding("document", reference, List.of(parentComponent), physical, limits);
+        var prepared = (ValidationNestLookupBinding.Ready) lookup.prepare(projection.apply(original));
+        assertThat(prepared.key()).isEqualTo(new ValidationKey(List.of(ValidationKey.Part.number(9007199254740993L))));
+        assertThat(lookup.physical().components().getFirst().path()).containsExactly("customer_db");
+        assertThat(original.fields()).containsKey("raw_customer").doesNotContainKey("customer_id");
     }
 }
