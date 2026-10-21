@@ -5,6 +5,13 @@ only module permitted to depend on the adapters ring: the assembly root is where
 are bound into the runtime. It runs on the JVM (Spring Boot), packaged as a fat-jar and a `tar.gz`
 distribution (`bin/` launcher + `conf/` external config + `lib/` jar).
 
+## Installation and recovery
+
+Follow the [storage operator guide](../docs/storage/README.md) for OP installation, Cloud storage
+setup, TLS, original-operation recovery and Configuration/keyring backups. Start an OP server with
+its retained `tapstate.installation.directory`; the launcher forwards the `installation` owner
+command and supplies the required JVM module-opening option.
+
 ## Operational logging
 
 The server has two, deliberately separate, ways of saying something went wrong:

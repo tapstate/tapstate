@@ -894,6 +894,9 @@ Upgrades are supported within one MAJOR line — `0.2.1` to `0.3.0` and onward. 
 `./tapstate --version` afterwards: it is the CLI's own version, and it should be the
 one you just installed.
 
+The downloaded demo is tied to its pinned release. Do not reuse an older demo's database volumes
+as a three-layer installation or mix its bootstrap procedure with the from-source steps below.
+
 ## Alternative: build and run the server from source
 
 Prefer to run the server process directly on the host — to attach a debugger, or to
@@ -935,32 +938,16 @@ the server and databases are hosted changes.
    fact, and the seed file's `REPLICA IDENTITY FULL` is what lets a deleted shipment leave
    the array it was in (see the note in [step 5](#5-author-the-resources)).
 
-3. **Start the server** on the host with JDK 21, pointing it at your Mongo:
+3. **Initialize and start the server** with the three-layer installation in this checkout.
+   Use the [OP installation procedure](storage/README.md#install-op-and-create-its-first-administrator),
+   including its owner-only directory, three connection tests and saved binding. A built JAR uses
+   `--add-opens java.base/java.lang=ALL-UNNAMED`; the distribution launcher supplies it.
+   Keep your normal port/TLS and packaged connector seed settings.
 
-   ```sh
-   mkdir -p ./plugins       # a writable cache the server unpacks registered connectors into
-   java -jar app/target/app-<version>-boot.jar --role=all \
-     --tapstate.store.mongo.uri="mongodb://127.0.0.1:27017/tapstate?replicaSet=rs0" \
-     --tapstate.store.mongo.operator-state-database=tapstate_nest \
-     --tapstate.connectors.plugins-dir=./plugins
-   ```
-
-   It listens on port **8080**. If that port is taken, set `SERVER_PORT` to another one
-   before starting it, and point the rest of this section at the same value:
-
-   ```sh
-   export TAPSTATE_URL=http://127.0.0.1:8080     # match SERVER_PORT if you set one
-   ```
-
-   A Hazelcast `--add-opens` warning at startup is harmless.
-
-4. **First admin.** There is no bootstrap sidecar here, so create the first user with
-   a one-time, localhost-only `curl` (a `204 No Content` means success):
-
-   ```sh
-   curl -X POST "$TAPSTATE_URL/auth/bootstrap" \
-     -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}'
-   ```
+4. **Restart and create the first administrator.** After the setup page requests a restart,
+   restart with the same installation directory and issue `installation --authorize`. Create
+   the first account on the dedicated management channel, then sign in at the ordinary service
+   address. A public `/auth/bootstrap` request cannot replace that procedure.
 
 5. **Resources.** Use the same three resources as [step 5](#5-author-the-resources),
    with one change: the server now runs on the host, not in the compose network, so
@@ -969,13 +956,13 @@ the server and databases are hosted changes.
    `config: { host: 127.0.0.1, port: 5432, … }` in `fulfillment_db`. Both of them, not one:
    a source left pointing at a compose service name resolves to nothing from the host, and
    the pipeline names every source it reads. The pipeline itself needs no change — the
-   managed store it materializes into is addressed by the server, through the store settings you
-   passed in step 3, not by a resource here. The operator-state database defaults to `tapstate_nest`;
-   changing its setting selects another database and does not copy the old state.
+   default target is the system-owned `views` Source created by storage setup. Its Application data
+   database is the one you selected, while operator state uses the separate bound Durable cache.
+   Changing a URI or database name is not a state migration.
 
 6. **Online verbs, observe, CDC** are identical to steps 6–8, except you reach the
    databases with your own client (`docker exec tapstate-mysql …` /
-   `docker exec tapstate-mongo mongosh "mongodb://127.0.0.1:27017/views" …`)
+   `docker exec tapstate-mongo mongosh "mongodb://127.0.0.1:27017/tapstate_views" …`)
    rather than `docker compose exec`.
 
 Tear down with `docker rm -f tapstate-mysql tapstate-postgres tapstate-mongo` and `Ctrl-C` in the
@@ -1002,8 +989,9 @@ This runtime is a preview. Known constraints in this slice:
   idempotent upserts absorb overlap, but there is no exactly-once guarantee.
 - **`logs` is thin.** The per-pipeline `logs` face is a node-local operational tail
   and is often sparse; full runtime detail is in the server process log.
-- **No CLI bootstrap verb.** The compose stack creates the first admin for you; on
-  the from-source path it is the `curl` above.
+- **Installation and application commands are separate.** The released demo has its own bootstrap
+  setup. A server built from this checkout uses the server's `installation` owner command and
+  dedicated management channel; the client CLI does not install the server.
 - **Temporary connections and machine tokens are process-scoped.** A persistent human
   session is created only by `auth login` against a named context; `connect`,
   `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.
@@ -1011,8 +999,11 @@ This runtime is a preview. Known constraints in this slice:
 ### Restart recovery
 
 A single-member process restart with the same MongoDB data re-adopts pipelines
-recorded as running. Keep the store volume and operator-state database: recovery
-positions and state are part of that data. Completed finite runs stay completed;
+recorded as running when its original storage and recovery state are complete. In a three-layer
+installation, retain Configuration and Durable cache, including any additional Nest cache databases:
+recovery positions and state are part of that data. For missing cache state, use the
+[explicit storage recovery procedure](storage/README.md#recover-a-wholly-lost-durable-cache); it leaves
+affected Pipelines stopped until each full rebuild is confirmed. Completed finite runs stay completed;
 failed runs require an explicit recovery action.
 
 All supported database sources use the connector capture path. The runtime passes
