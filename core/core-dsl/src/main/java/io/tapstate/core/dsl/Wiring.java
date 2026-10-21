@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -8,13 +9,14 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.ViewBlock;
-
+import io.tapstate.core.validation.ValidationError;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -37,33 +39,55 @@ final class Wiring {
     private final Map<String, Set<String>> tablesBySelector = new LinkedHashMap<>();
     /** Sources whose table set cannot be enumerated offline, so any table name may come from them. */
     private final Set<String> openSources = new LinkedHashSet<>();
+    private final Set<String> indexedSources = new HashSet<>();
+    private final InspectionBudget inspection;
 
-    Wiring(PipelineResource pipeline, Map<String, Resource> byId) {
+    Wiring(PipelineResource pipeline, Map<String, Resource> byId) { this(pipeline, byId, null); }
+
+    private Wiring(PipelineResource pipeline, Map<String, Resource> byId, InspectionBudget inspection) {
+        this.inspection = inspection;
         this.pipeline = pipeline;
         this.byId = byId;
+        if (inspection != null) {
+            int steps = pipeline.transforms() == null ? 0 : pipeline.transforms().size();
+            if (pipeline.sources().size() + (long)steps + (pipeline.view() == null ? 0 : 1) > inspection.limits.nodes()) throw inspection.limit("nodes");
+        }
+        if (inspection != null) {
+            for (var source : pipeline.sources()) inspection.charge(128L + 2L * source.id().length());
+        }
         this.allSources = new LinkedHashSet<>(pipeline.sourceIds());
         if (pipeline.transforms() != null) {
             for (Step step : pipeline.transforms()) {
+                if (inspection != null) inspection.nodeDeclaration(step.id(), nodeFrom.containsKey(step.id()) || allSources.contains(step.id()));
                 nodeFrom.put(step.id(), step.from());
                 stepsById.put(step.id(), step);
             }
         }
         indexView(pipeline.view());
-        for (String sourceId : allSources) {
-            indexSource(sourceId);
-        }
+        if (inspection == null) for (String sourceId : allSources) indexSource(sourceId);
     }
 
     private void indexView(ViewBlock view) {
         switch (view) {
             case null -> {
             }
-            case ViewBlock.Inline inline -> nodeFrom.put(inline.id(), new FromClause.Flow(List.of(inline.from())));
-            case ViewBlock.Use use -> nodeFrom.put(use.id(), new FromClause.Flow(List.of(use.from())));
+            case ViewBlock.Inline inline -> {
+                if (inspection != null) inspection.nodeDeclaration(inline.id(), nodeFrom.containsKey(inline.id()) || allSources.contains(inline.id()));
+                nodeFrom.put(inline.id(), new FromClause.Flow(List.of(inline.from())));
+            }
+            case ViewBlock.Use use -> {
+                if (inspection != null) inspection.nodeDeclaration(use.id(), nodeFrom.containsKey(use.id()) || allSources.contains(use.id()));
+                nodeFrom.put(use.id(), new FromClause.Flow(List.of(use.from())));
+            }
         }
     }
 
     private void indexSource(String sourceId) {
+        if (!indexedSources.add(sourceId)) return;
+        if (inspection != null) {
+            inspection.sourceDeclarations.add(sourceId); inspection.charge(128L + 2L * sourceId.length());
+            if (!(byId.get(sourceId) instanceof SourceResource source) || !sourceId.equals(source.id())) throw missing("source", sourceId);
+        }
         Set<String> tables = new LinkedHashSet<>();
         if (!(byId.get(sourceId) instanceof SourceResource source) || source.tables() == null) {
             openSources.add(sourceId);      // no table selector: the whole source is in play
@@ -71,6 +95,15 @@ final class Wiring {
             return;
         }
         for (TableRef table : source.tables()) {
+            if (inspection != null) {
+                inspection.touch();
+                String selector = switch (table) {
+                    case TableRef.Literal literal -> literal.name();
+                    case TableRef.Spec spec -> spec.name();
+                    case TableRef.Regex regex -> regex.pattern();
+                };
+                inspection.charge(64L + 2L * selector.length());
+            }
             switch (table) {
                 case TableRef.Literal literal -> tables.add(literal.name());
                 case TableRef.Spec spec -> tables.add(spec.name());
@@ -97,7 +130,7 @@ final class Wiring {
     List<Route> routesReaching(FromClause from) {
         List<Route> routes = new ArrayList<>();
         collect(from, new LinkedHashSet<>(), new HashSet<>(), routes, new ArrayList<>());
-        if (routes.isEmpty()) {
+        if (routes.isEmpty() && inspection == null) {
             for (Upstream upstream : whole(allSources)) {
                 routes.add(new Route(upstream, List.of()));
             }
@@ -107,6 +140,40 @@ final class Wiring {
 
     List<Route> routesReaching(FromRef ref) {
         return routesReaching(new FromClause.Flow(List.of(ref)));
+    }
+
+    record InspectionLimits(int nodes, int references, int routes, int depth, long bytes) {
+        InspectionLimits {
+            if (nodes < 1 || nodes > 4096 || references < 1 || references > 65536 || routes < 1 || routes > 4096
+                    || depth < 1 || depth > 256 || bytes < 1 || bytes > 16L * 1024 * 1024)
+                throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "validation.wiringLimits"), null);
+        }
+    }
+    record InspectedRoute(Upstream upstream, FromRef selector, List<Step> steps) {}
+    record PendingReference(FromRef reference, List<Step> downstreamSteps) {}
+    record Inspection(List<InspectedRoute> routes, Set<String> nodes, Set<String> sourceDeclarations,
+                      List<PendingReference> pending, long accountedBytes) {
+        Inspection {
+            routes = List.copyOf(routes); nodes = Set.copyOf(nodes); sourceDeclarations = Set.copyOf(sourceDeclarations);
+            pending = List.copyOf(pending);
+        }
+        boolean declarationComplete() { return pending.isEmpty() && !routes.isEmpty(); }
+    }
+
+    /**
+     * Bounded declaration inspection for validation. Dynamic links and ambiguous open table sets
+     * remain pending; they never become an inferred all-source execution range. A complete declaration
+     * still requires separately pinned discovery/models, reusable bodies and physical table binding.
+     * Input resources and their materialization are admitted by the caller. Legacy discovery rules
+     * retain their conservative over-approximation through the ordinary constructor above.
+     */
+    static Inspection inspect(PipelineResource pipeline, Map<String, Resource> byId, FromClause selected,
+            InspectionLimits limits) {
+        Objects.requireNonNull(pipeline, "pipeline"); Objects.requireNonNull(byId, "byId");
+        Objects.requireNonNull(selected, "selected");
+        var budget = new InspectionBudget(Objects.requireNonNull(limits, "limits"));
+        new Wiring(pipeline, byId, budget).routesReaching(selected);
+        return new Inspection(budget.routes, budget.nodes, budget.sourceDeclarations, budget.pending, budget.bytes);
     }
 
     /**
@@ -159,9 +226,15 @@ final class Wiring {
 
     private void collect(FromRef ref, Set<Upstream> reached, Set<String> visiting,
             List<Route> routes, List<Step> steps) {
+        if (inspection != null) {
+            inspection.touch();
+            String value = ref instanceof FromRef.Literal literal ? literal.ref() : ((FromRef.Regex)ref).pattern();
+            inspection.charge(64L + 2L * value.length());
+        }
         if (ref instanceof FromRef.Regex) {
+            if (inspection != null) { inspection.pending(ref, steps); return; }
             // which tables it selects needs a connection to answer, so every table is in play
-            arrive(whole(allSources), reached, routes, steps);
+            arrive(whole(allSources), reached, routes, steps, ref);
             return;
         }
         String token = ((FromRef.Literal) ref).ref();
@@ -170,9 +243,14 @@ final class Wiring {
             String prefix = token.substring(0, dot);
             String table = token.substring(dot + 1);
             if (allSources.contains(prefix)) {
-                arrive(Set.of(new Upstream(prefix, table)), reached, routes, steps);
+                if (inspection != null) {
+                    indexSource(prefix);
+                    if (table.isEmpty() || !openSources.contains(prefix) && !tablesBySelector.get(prefix).contains(table)) throw missing("validation.from", token);
+                }
+                arrive(Set.of(new Upstream(prefix, table)), reached, routes, steps, ref);
             } else {
-                arrive(whole(allSources), reached, routes, steps);
+                if (inspection != null) throw missing("validation.from", token);
+                arrive(whole(allSources), reached, routes, steps, ref);
             }
             return;
         }
@@ -180,25 +258,45 @@ final class Wiring {
             followNode(token, reached, visiting, routes, steps);
             return;
         }
+        if (inspection != null) {
+            if (allSources.contains(token)) {
+                indexSource(token);
+                arrive(Set.of(new Upstream(token, null)), reached, routes, steps, ref);
+                return;
+            }
+            for (String sourceId : allSources) indexSource(sourceId);
+        }
         // A bare token is a table name, so the table is known even where the source is not: it is
         // read from whichever sources can supply that name.
         Set<String> supplying = new LinkedHashSet<>(openSources);
-        tablesBySelector.forEach((sourceId, tables) -> {
-            if (tables.contains(token)) {
-                supplying.add(sourceId);
+        int declaredSuppliers = 0;
+        for (var entry : tablesBySelector.entrySet()) {
+            if (inspection != null) inspection.touch();
+            if (entry.getValue().contains(token)) {
+                supplying.add(entry.getKey());
+                declaredSuppliers++;
             }
-        });
+        }
+        if (inspection != null) {
+            if (declaredSuppliers > 1) throw new DslException(DslError.AMBIGUOUS_REFERENCE, "validation.from", 0, 0, null, Map.of("ref", token));
+            if (!openSources.isEmpty()) { inspection.pending(ref, steps); return; }
+            if (supplying.isEmpty()) throw missing("validation.from", token);
+        }
         // A name nothing claims cannot be attributed, so no source may be ruled out.
         for (String sourceId : supplying.isEmpty() ? allSources : supplying) {
-            arrive(Set.of(new Upstream(sourceId, token)), reached, routes, steps);
+            arrive(Set.of(new Upstream(sourceId, token)), reached, routes, steps, ref);
         }
     }
 
     private void followNode(String token, Set<Upstream> reached, Set<String> visiting,
             List<Route> routes, List<Step> steps) {
+        if (inspection != null && visiting.size() >= inspection.limits.depth()) throw inspection.limit("depth");
         if (!visiting.add(token)) {
+            if (inspection != null) throw new TapstateException(ValidationError.RULE_UNSUPPORTED,
+                    Map.of("node", token, "field", "from", "rule", "cyclic-reference"), null);
             return;
         }
+        if (inspection != null) inspection.nodes.add(token);
         Step step = stepsById.get(token);
         boolean trackStep = routes != null && step != null;
         if (trackStep) {
@@ -215,12 +313,13 @@ final class Wiring {
         }
     }
 
-    private static void arrive(Set<Upstream> upstream, Set<Upstream> reached,
-            List<Route> routes, List<Step> steps) {
+    private void arrive(Set<Upstream> upstream, Set<Upstream> reached,
+            List<Route> routes, List<Step> steps, FromRef selector) {
         reached.addAll(upstream);
         if (routes != null) {
             List<Step> ordered = List.copyOf(steps.reversed());
             for (Upstream up : upstream) {
+                if (inspection != null) inspection.route(up, selector, ordered);
                 routes.add(new Route(up, ordered));
             }
         }
@@ -233,6 +332,39 @@ final class Wiring {
             all.add(new Upstream(sourceId, null));
         }
         return all;
+    }
+
+    private static DslException missing(String path, String reference) {
+        return new DslException(DslError.MISSING_REFERENCE, path, 0, 0, null, Map.of("ref", reference));
+    }
+    private static final class InspectionBudget {
+        private final InspectionLimits limits;
+        private final List<InspectedRoute> routes = new ArrayList<>();
+        private final List<PendingReference> pending = new ArrayList<>();
+        private final Set<String> nodes = new LinkedHashSet<>();
+        private final Set<String> sourceDeclarations = new LinkedHashSet<>();
+        private int references;
+        private long bytes;
+        private InspectionBudget(InspectionLimits limits) { this.limits = limits; charge(512); }
+        private void touch() { if (references++ == limits.references()) throw limit("references"); }
+        private void nodeDeclaration(String id, boolean duplicate) {
+            if (duplicate) throw new DslException(DslError.DUPLICATE_ID, "validation.nodes", 0, 0, null, Map.of("id", id));
+            charge(128L + 2L * id.length());
+        }
+        private void route(Upstream upstream, FromRef selector, List<Step> steps) {
+            if (routes.size() + pending.size() == limits.routes()) throw limit("routes");
+            charge(192L + 2L * upstream.source().length() + (upstream.table() == null ? 0 : 2L * upstream.table().length()) + 8L * steps.size());
+            routes.add(new InspectedRoute(upstream, selector, steps));
+        }
+        private void pending(FromRef reference, List<Step> steps) {
+            if (routes.size() + pending.size() == limits.routes()) throw limit("routes");
+            charge(128L + 8L * steps.size());
+            pending.add(new PendingReference(reference, List.copyOf(steps.reversed())));
+        }
+        private void charge(long amount) { if (amount > limits.bytes() - bytes) throw limit("bytes"); bytes += amount; }
+        private TapstateException limit(String dimension) {
+            return new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "validation.wiring." + dimension), null);
+        }
     }
 
     @Override
