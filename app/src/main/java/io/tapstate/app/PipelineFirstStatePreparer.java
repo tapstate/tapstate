@@ -42,17 +42,28 @@ final class PipelineFirstStatePreparer {
         if (ttl.isNegative() || ttl.isZero() || ttl.toMillis() < 1) throw new IllegalArgumentException("preparation ttl must be at least one millisecond");
     }
 
-    PipelinePreparation prepare(PipelineIntentScope original) { return prepareAttempt(original,null); }
+    PipelinePreparation prepare(PipelineIntentScope original) { return prepareAttempt(original,null,null,() -> {}); }
 
     /** Runtime preparation requires the current captured source contract even when CONFIG already says COMPLETE. */
     PipelinePreparation prepare(PipelineIntentScope original,PipelinePreparationInputs inputs) {
         Objects.requireNonNull(inputs,"inputs"); requireActive.run();
         configuration.validateSources(original,inputs); requireActive.run();
-        var result = prepareAttempt(original,inputs); requireActive.run();
+        var result = prepareAttempt(original,inputs,null,() -> {}); requireActive.run();
         cache.verifySources(original,inputs); requireActive.run(); return result;
     }
 
-    private PipelinePreparation prepareAttempt(PipelineIntentScope original,PipelinePreparationInputs inputs) {
+    PipelinePreparation prepareRecovered(io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,
+            PipelinePreparationInputs inputs,Runnable verifyPredecessor) {
+        Objects.requireNonNull(confirmation);Objects.requireNonNull(inputs);Objects.requireNonNull(verifyPredecessor);
+        requireActive.run();confirmation.requireActive();var scope=confirmation.recovery().targetScope();
+        configuration.validateSources(scope,inputs);
+        var result=prepareAttempt(scope,inputs,confirmation,verifyPredecessor);
+        requireActive.run();confirmation.requireActive();cache.verifySources(scope,inputs);requireActive.run();
+        return result;
+    }
+
+    private PipelinePreparation prepareAttempt(PipelineIntentScope original,PipelinePreparationInputs inputs,
+            io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,Runnable verifyPredecessor) {
         Objects.requireNonNull(original, "original");
         if (!business.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation()))) throw fenced();
         requireActive.run();
@@ -64,7 +75,8 @@ final class PipelineFirstStatePreparer {
         requireNode(node);
         requireActive.run();
         if (facts.phase() == PipelinePreparation.Phase.UNASSIGNED) {
-            var issued = inputs == null ? configuration.issueFirstCreate(original,node) : configuration.issueFirstCreate(original,node,inputs);
+            var issued = confirmation!=null ? configuration.issueRecoveredFirstCreate(original,node,inputs,confirmation,verifyPredecessor)
+                    : inputs == null ? configuration.issueFirstCreate(original,node) : configuration.issueFirstCreate(original,node,inputs);
             requireActive.run();
             if (issued instanceof FirstPipelineCreationResult.Issued winner) {
                 facts = winner.creation().preparation();

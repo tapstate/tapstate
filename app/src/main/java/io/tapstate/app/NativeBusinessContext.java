@@ -141,6 +141,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         return active.get() && memberStorage != null && memberStorage.nodeActive()
                 && context.getBean(ClusterMembershipGate.class).businessEligible();
     }
+    @Override public void awaitAvailability() {
+        long deadline=System.nanoTime()+Duration.ofSeconds(30).toNanos();
+        while(!available()) {
+            original.requireBusiness();memberStorage.requireNode();
+            if(System.nanoTime()-deadline>=0 || Thread.currentThread().isInterrupted())throw StorageRuntime.unavailable();
+            java.util.concurrent.locks.LockSupport.parkNanos(Duration.ofMillis(25).toNanos());
+        }
+        original.requireBusiness();memberStorage.requireNode();
+    }
     void refreshImportedSecrets(Set<String> ids) {
         if (!active.get()) return;
         var artifacts = context.getBean(ArtifactStore.class);

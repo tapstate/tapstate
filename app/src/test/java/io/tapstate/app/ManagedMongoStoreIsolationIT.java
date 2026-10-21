@@ -767,6 +767,67 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    /** Real production roots and CONFIG/CACHE boundaries; source execution and Atlas remain separate checks. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void wholeCacheRecoveryPublishesAllStoppedBeforeStartingTheNewRuntime(boolean cloud) {
+        String suffix=UUID.randomUUID().toString().replace("-","");String configDb="stopped_config_"+suffix,cacheDb="stopped_cache_"+suffix,masterDb="stopped_master_"+suffix;
+        String user="stopped_"+suffix;var setup=new StorageSetupScope("stopped-"+suffix,"installation","setup",1);
+        var mode=cloud?StorageBinding.Mode.CLOUD:StorageBinding.Mode.OP;var sdk=new RecoverySdk(setup.clusterId());
+        try(var admin=MongoClients.create(uri("root","admin"))) {
+            createUser(admin,user,List.of(configDb,cacheDb,masterDb));
+            var cache=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,uri(user,cacheDb),cacheDb,null);
+            try(var configuration=io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                    new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(user,configDb),null,Duration.ofSeconds(5)),setup.clusterId(),setup.installationId(),setup.operationId(),1)) {
+                var target=new SourceResource(StorageBinding.defaultSourceId(mode),null,"mongodb",Map.of("uri",uri(user,masterDb)),null,null,null,null);
+                var initial=configuration.bindings().commitWithFirstCache(setup,mode,cache,target);
+                try(var old=io.tapstate.adapters.mongostore.MongoCacheDomain.connect(cache,Duration.ofSeconds(5),"old-fixture")) {
+                    old.prepareFirstAuth(initial.firstCreation().orElseThrow());old.prepareInitialBusiness(initial.preparation(),() -> {});
+                }
+                configuration.bindings().complete(setup);
+                if(!cloud)configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
+                        new User("admin",new BCryptPasswordHasher().hash("sentinel-login-password"),"admin"));
+                var source=new SourceResource("input",null,"mysql",Map.of("host","unused.invalid"),SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null);
+                configuration.artifacts().saveAll(List.of(source));
+                for(String id:List.of("a","b")) {
+                    var pipeline=new PipelineResource(id,null,List.of(SourceRef.spec("input",true)),null,null,
+                            new ServeBlock.Inline("serve",FromRef.literal("orders"),List.of(new SyncElement("sync",target.id(),null,null,null)),null,null),null,null);
+                    configuration.artifacts().saveAll(List.of(pipeline));
+                    var scope=new PipelineIntentScope(setup.clusterId(),1,initial.preparation().authScope().cacheIncarnation(),id,1);
+                    configuration.intents().compareAndSet(scope,0,new io.tapstate.core.lifecycle.DesiredState(id,
+                            id.equals("a")?io.tapstate.core.lifecycle.PipelineState.RUNNING:io.tapstate.core.lifecycle.PipelineState.STOPPED,
+                            io.tapstate.core.model.canonical.CanonicalHash.of(pipeline),false,null,false,null));
+                }
+            }
+            // Every fixture-owned old client is closed before the operator's explicit recovery confirmation.
+            admin.getDatabase(cacheDb).drop();
+            try(var application=cloud?cloudRecoveryRoot(uri(user,configDb),sdk,CloudConnectorTestInputs.seedDirectory()):nativeRoot(uri(user,configDb))) {
+                String credential=cloud?exchangeCookie(application,"fresh"):ordinaryLogin(application,false).token();
+                java.util.function.BiFunction<String,Map<String,Object>,Map<?,?>> post=(path,body) -> cloud?cloudPost(application,credential,path,body):
+                        rootClient(application).post().uri(path).header("Authorization","Bearer "+credential).body(body).retrieve().body(Map.class);
+                var root=application.getBean(StorageRoot.class);assertThat(root.runtime().business()).isEmpty();
+                var planned=post.apply("/api/storage/recovery/plan",Map.of("scope","CLUSTER","pipelineIds",List.of()));
+                assertThat(planned.get("affectedPipelineIds")).isEqualTo(List.of("a","b"));
+                post.apply("/api/storage/recovery/confirm",Map.of("operationId",planned.get("operationId"),"planHash",planned.get("planHash"),
+                        "controlRevision",planned.get("controlRevision"),"confirmed",true));
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(35)).untilAsserted(() -> {
+                    var failed=(TapstateException)org.springframework.test.util.ReflectionTestUtils.getField(root,"recoveryFailure");
+                    if(failed!=null)throw failed;
+                    assertThat(post.apply("/api/storage/recovery/status",Map.of("operationId",planned.get("operationId"))).get("phase")).isEqualTo("COMPLETE");
+                    assertThat(root.runtime().businessStarted()).isTrue();
+                });
+                for(String id:List.of("a","b")) {
+                    var intent=root.runtime().requireConfiguration().intents().load(id).orElseThrow();
+                    assertThat(intent.desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.STOPPED);
+                    assertThat(intent.scope().stateGeneration()).isEqualTo(2);
+                    assertThat(root.runtime().requireConfiguration().preparations().read(id).orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                }
+                assertThat(admin.getDatabase(cacheDb).getCollection("pipeline_state").countDocuments()).isZero();
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+            }
+        }
+    }
+
     /** Real production-root routing and Mongo persistence; the SDK boundary remains a local fixture. */
     @Test
     void wholeCacheLossUsesOriginalCloudExchangeAndDurableRevocationWithoutBusinessState() {

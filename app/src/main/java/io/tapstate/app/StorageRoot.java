@@ -30,6 +30,7 @@ final class StorageRoot implements AutoCloseable {
     private java.util.concurrent.ExecutorService recoveryWorker;
     private volatile boolean recoveryQueued;
     private volatile boolean recoveryFailed;
+    private volatile TapstateException recoveryFailure;
     private final Runnable installationActive;
 
     StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
@@ -219,11 +220,13 @@ final class StorageRoot implements AutoCloseable {
     synchronized LocalAuthenticationContext localAuthentication() {
         requireOpen();
         if (runtime.configuration().isEmpty()) throw StorageRuntime.unavailable();
-        try { return authentication.local(); }
+        LocalAuthenticationContext context;
+        try { context = authentication.local(); }
         catch (TapstateException unavailable) {
             if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
-            restoreAuthentication(); return authentication.local();
+            restoreAuthentication(); context = authentication.local();
         }
+        resumeRetainedBusiness();wakeRecovery();return context;
     }
 
     synchronized ManagedAuthenticationContext managedAuthentication() {
@@ -268,11 +271,11 @@ final class StorageRoot implements AutoCloseable {
         var configuration = runtime.requireConfiguration();
         return new StorageRecoveryService(configuration.recoveryCommands(), new StorageRecoveryService.Inspector() {
             @Override public StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection) {
-                synchronized (StorageRoot.this) { return initialManifest(scope, selection, true); }
+                synchronized (StorageRoot.this) { return recoveryManifest(scope, selection, true); }
             }
             @Override public void requireCurrent(CacheAuthScope scope, StorageRecoveryCommands.Manifest manifest) {
                 synchronized (StorageRoot.this) {
-                    var actual = initialManifest(scope, manifest.selection(), true);
+                    var actual = recoveryManifest(scope, manifest.selection(), true);
                     if (!actual.definitionHashes().equals(manifest.definitionHashes()) || !actual.dependencyHash().equals(manifest.dependencyHash()))
                         throw StorageRuntime.unavailable();
                 }
@@ -282,12 +285,26 @@ final class StorageRoot implements AutoCloseable {
 
     private StorageRuntime.Bound requireRecoveryOwner(CacheAuthScope scope) {
         requireOpen();
-        if (!cloud.cloud() || runtime.cleanupRequired() || retainedTarget == null || retainedAssembly == null) throw StorageRuntime.unavailable();
+        if (runtime.cleanupRequired() || retainedTarget == null || retainedAssembly == null) throw StorageRuntime.unavailable();
         var original = runtime.current().orElseThrow(StorageRuntime::unavailable);
         original.requireActive();
         if (!original.preparation().authScope().equals(scope)) throw StorageRuntime.unavailable();
         runtime.requireConfiguration().requireAuthenticationPublished(original.preparation());
         original.verifyAuthentication(); return original;
+    }
+
+    private StorageRecoveryCommands.Manifest recoveryManifest(CacheAuthScope scope, StorageRecoveryCommands.Selection selection, boolean authOnly) {
+        if (runtime.requireConfiguration().setupStates().load().phase()!=StorageSetupStateStore.Phase.COMPLETE)
+            return initialManifest(scope,selection,authOnly);
+        var original=requireRecoveryOwner(scope);
+        if (selection.extent()!=StorageRecoveryCommands.Extent.CLUSTER || runtime.business().isPresent()) throw StorageRuntime.unavailable();
+        if (authOnly) original.cache().verifyAuthenticationOnly(scope);
+        var configuration=runtime.requireConfiguration();
+        var changes=configuration.cacheRecoveries().inspectCluster(scope);
+        var hashes=new TreeMap<String,String>();
+        for(var resource:configuration.artifacts().list()) hashes.put(resource.id(),io.tapstate.core.model.canonical.CanonicalHash.of(resource));
+        var affected=changes.stream().map(change -> change.targetScope().pipelineId()).collect(java.util.stream.Collectors.toSet());
+        return new StorageRecoveryCommands.Manifest(selection,affected,hashes,CacheRecoveryStore.clusterDependencyHash(scope,changes),configuration.configurationRevision());
     }
 
     private StorageRecoveryCommands.Manifest initialManifest(CacheAuthScope scope, StorageRecoveryCommands.Selection selection, boolean authOnly) {
@@ -306,7 +323,7 @@ final class StorageRoot implements AutoCloseable {
     }
 
     private void wakeRecovery() {
-        if (!cloud.cloud() || runtime.cleanupRequired() || runtime.current().isEmpty()) return;
+        if (runtime.cleanupRequired() || runtime.current().isEmpty()) return;
         var scope = runtime.current().orElseThrow().preparation().authScope();
         if (scope.authGeneration() < 2) return;
         runtime.requireConfiguration().recoveryCommands().current(scope).filter(plan -> plan.originalScope().equals(scope)).ifPresent(this::scheduleRecovery);
@@ -314,19 +331,60 @@ final class StorageRoot implements AutoCloseable {
 
     private synchronized void scheduleRecovery(StorageRecoveryCommands.Plan original) {
         requireOpen();
+        if (original.phase()==StorageRecoveryCommands.Phase.COMPLETE) {
+            requireRecoveryOwner(original.originalScope());
+            if(runtime.requireConfiguration().recoveryCommands().find(original.originalScope(),original.operationId()).filter(original::equals).isEmpty())
+                throw StorageRuntime.unavailable();
+            resumeRetainedBusiness();return;
+        }
         if (original.phase() != StorageRecoveryCommands.Phase.CONFIRMED && original.phase() != StorageRecoveryCommands.Phase.RUNNING) return;
         requireRecoveryOwner(original.originalScope());
         if (recoveryQueued) return;
         if (recoveryWorker == null) recoveryWorker = java.util.concurrent.Executors.newSingleThreadExecutor(
-                Thread.ofPlatform().daemon(true).name("initial-cache-recovery").factory());
-        recoveryQueued = true; recoveryFailed = false;
+                Thread.ofPlatform().daemon(true).name("cache-recovery").factory());
+        recoveryQueued = true; recoveryFailed = false; recoveryFailure = null;
         recoveryWorker.execute(() -> {
             synchronized (StorageRoot.this) {
-                try { runInitialRecovery(original); }
-                catch (TapstateException unavailable) { recoveryFailed = true; }
+                try {
+                    if(runtime.requireConfiguration().setupStates().load().phase()==StorageSetupStateStore.Phase.COMPLETE && !isInitialRecovery(original)) runStoppedRecovery(original);
+                    else runInitialRecovery(original);
+                }
+                catch (TapstateException unavailable) { recoveryFailure = unavailable; recoveryFailed = true; }
                 finally { recoveryQueued = false; }
             }
         });
+    }
+
+    private boolean isInitialRecovery(StorageRecoveryCommands.Plan original) {
+        if (!cloud.cloud() || original.manifest().selection().extent()!=StorageRecoveryCommands.Extent.CLUSTER
+                || !original.manifest().affectedPipelineIds().isEmpty())return false;
+        try {
+            var expected=initialManifest(original.originalScope(),original.manifest().selection(),false);
+            return expected.definitionHashes().equals(original.manifest().definitionHashes()) && expected.dependencyHash().equals(original.manifest().dependencyHash());
+        } catch(TapstateException unavailable) {return false;}
+    }
+
+    /** Confirmation includes operator isolation of all old members and external in-flight writes. */
+    private void runStoppedRecovery(StorageRecoveryCommands.Plan requested) {
+        var original=requireRecoveryOwner(requested.originalScope());var configuration=runtime.requireConfiguration();
+        var commands=configuration.recoveryCommands();
+        var current=commands.find(requested.originalScope(),requested.operationId()).orElseThrow(StorageRuntime::unavailable);
+        if(current.phase()==StorageRecoveryCommands.Phase.COMPLETE){resumeRetainedBusiness();return;}
+        if(current.manifest().selection().extent()!=StorageRecoveryCommands.Extent.CLUSTER)throw StorageRuntime.unavailable();
+        var inspected=recoveryManifest(current.originalScope(),current.manifest().selection(),current.phase()==StorageRecoveryCommands.Phase.CONFIRMED);
+        if(!inspected.definitionHashes().equals(current.manifest().definitionHashes()) || !inspected.dependencyHash().equals(current.manifest().dependencyHash()))
+            throw StorageRuntime.unavailable();
+        Runnable local=() -> {
+            requireOpen();original.requireActive();
+            if(runtime.current().orElseThrow(StorageRuntime::unavailable)!=original || runtime.cleanupRequired() || runtime.business().isPresent())
+                throw StorageRuntime.unavailable();
+        };
+        local.run();configuration.cacheRecoveries().guardedBy(local).stageCluster(current);
+        var running=commands.find(current.originalScope(),current.operationId()).orElseThrow(StorageRuntime::unavailable);
+        configuration.prepareStoppedRecovery(original.cache(),running,local);
+        original.verifyBusiness();local.run();
+        runtime.startRecoveredBusiness(original,retainedAssembly,running,() -> commands.guardedBy(local).complete(running));
+        phase=Phase.BUSINESS_READY;
     }
 
     private void runInitialRecovery(StorageRecoveryCommands.Plan requested) {
@@ -368,7 +426,7 @@ final class StorageRoot implements AutoCloseable {
         try {
             var original = runtime.current().orElseThrow(StorageRuntime::unavailable);
             runtime.startBusiness(original, retainedAssembly);
-            phase = Phase.BUSINESS_READY;
+            phase = Phase.BUSINESS_READY;recoveryFailed=false;recoveryFailure=null;
         } catch (TapstateException unavailable) {
             // Formal login remains usable while a missing or failed business domain stays gated.
             phase = Phase.AUTH_READY;
@@ -425,7 +483,7 @@ final class StorageRoot implements AutoCloseable {
         if (!runtime.cleanupRequired()) {
             if (formalRecovery) {
                 actions.add("storage.recovery.status");
-                if (!admitted && mode() == StorageBinding.Mode.CLOUD && status.phase() != StorageSetupStateStore.Phase.COMPLETE) {
+                if (!admitted && (status.phase() == StorageSetupStateStore.Phase.COMPLETE || mode() == StorageBinding.Mode.CLOUD)) {
                     actions.add("storage.recovery.plan");
                     if (pending.filter(plan -> plan.originalScope().equals(preparation.orElseThrow().authScope())).isPresent())
                         actions.add("storage.recovery.confirm");

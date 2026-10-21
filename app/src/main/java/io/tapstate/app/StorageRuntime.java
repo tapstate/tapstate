@@ -18,6 +18,8 @@ final class StorageRuntime implements AutoCloseable {
         /** Resources are registered with this owner before startup creates members or background work. */
         void start();
         default boolean available() { return true; }
+        /** A candidate may wait for its existing membership gate; it must never override that gate. */
+        default void awaitAvailability() {}
         @Override void close();
     }
     private final MongoConfigurationDomain configuration;
@@ -139,6 +141,7 @@ final class StorageRuntime implements AutoCloseable {
         Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
         try {
             candidate.start();
+            if (running != null) candidate.awaitAvailability();
             requireOriginal(original);
             verifyCompletedSetup(original);
             original.requireActive();

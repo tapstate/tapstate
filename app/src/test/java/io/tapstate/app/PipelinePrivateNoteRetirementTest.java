@@ -9,6 +9,29 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class PipelinePrivateNoteRetirementTest {
+    @Test void recoveredFullPreservesUnchangedPrivateOriginsAndDoesNotCompleteFailedRelease() {
+        var notes=mock(RequiredNoteStore.class);when(notes.guardedBy(any())).thenReturn(notes);
+        var permission=mock(CacheRecoveryStore.FullPreparation.class);
+        var previous=new PipelineIntentScope("cluster",1,"old","flow",1);var target=new PipelineIntentScope("cluster",1,"new","flow",2);
+        when(permission.recovery()).thenReturn(new PipelineCacheRecovery(UUID.randomUUID().toString(),previous,target));
+        var token=new RequiredNoteScope(RequiredNoteOwner.forNode(1,new PipelineNode("flow","source"),PipelineNode.Purpose.CAPTURE,1),7);
+        var connection=Map.<String,Object>of("uri","database-x");var held=io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture("connector","a".repeat(64),connection);
+        when(notes.privateContexts(permission)).thenReturn(List.of(new RequiredNoteContext(token,Optional.of(held),false)));
+        var retirement=mock(RequiredNoteRetirement.class);when(notes.retirement(token,permission)).thenReturn(retirement);
+        when(retirement.scope()).thenReturn(token);when(retirement.origin()).thenReturn(Optional.of(held));
+        var failure=new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
+        var executor=new PipelinePrivateNoteRetirement(notes,mock(PipelineStateRebuilds.class),
+                (id,settings) -> io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(id,"a".repeat(64),settings),
+                (fixed,config,purpose,cluster,guard) -> {guard.run();return Optional.of(failure);});
+        var unchanged=new io.tapstate.core.model.SourceResource("source",null,"connector",connection,null,null,null,null);
+        executor.reconcileRecovered(permission,Map.of(token.owner().namespace(),unchanged),() -> {});
+        verify(notes,never()).retirement(any(),any(CacheRecoveryStore.FullPreparation.class));
+        var changed=new io.tapstate.core.model.SourceResource("source",null,"connector",Map.of("uri","database-y"),null,null,null,null);
+        assertThatThrownBy(() -> executor.reconcileRecovered(permission,Map.of(token.owner().namespace(),changed),() -> {})).isSameAs(failure);
+        verify(retirement,never()).completeAfterVerifiedRelease();
+        doThrow(failure).when(permission).requireActive();
+        assertThatThrownBy(() -> executor.reconcileRecovered(permission,Map.of(),() -> {})).isSameAs(failure);
+    }
     @Test void cacheReconciliationKeepsTheSameContextAndReleasesOnlyAChangedConnection() {
         var notes=mock(RequiredNoteStore.class);when(notes.guardedBy(any())).thenReturn(notes);var operations=mock(PipelineStateRebuilds.class);
         var original=mock(PipelineRebuildPreparation.class);var request=mock(PipelineRebuildRequest.class);when(original.request()).thenReturn(request);

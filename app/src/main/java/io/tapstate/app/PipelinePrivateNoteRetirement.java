@@ -66,6 +66,19 @@ final class PipelinePrivateNoteRetirement {
         operations.requirePending(original);requireRetiredExecution.run();
     }
 
+    /** Runs only for the winning first-preparation invocation after the original execution is isolated. */
+    void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,Runnable requireRetiredExecution) {
+        Runnable guard=() -> {requireRetiredExecution.run();confirmation.requireActive();};
+        guard.run();
+        for(var context:notes.guardedBy(requireRetiredExecution).privateContexts(confirmation)) {
+            guard.run();if(context.completed() || context.origin().isEmpty())continue;
+            var source=desired.get(context.scope().owner().namespace());
+            if(source==null || context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))continue;
+            releaseOne(confirmation.recovery().targetScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),confirmation),guard);
+        }
+        guard.run();
+    }
+
     /** The lifecycle caller has already terminated the original job, writers, capture and hot state. */
     void retire(PipelineRebuildPreparation original,Runnable requireRetiredExecution) {
         Objects.requireNonNull(original);Objects.requireNonNull(requireRetiredExecution);

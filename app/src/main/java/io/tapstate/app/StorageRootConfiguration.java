@@ -128,7 +128,7 @@ class StorageRootConfiguration {
     @Bean @org.springframework.context.annotation.Lazy
     StorageRecoveryService storageRecoveryService(StorageRoot root, Clock clock, ObjectProvider<OnPremInstallation> installations) {
         var installation = installations.getIfAvailable();
-        return installation == null ? root.recoveryService(clock) : installation.recoveryService();
+        return installation == null || installation.normalStartupAllowed() ? root.recoveryService(clock) : installation.recoveryService();
     }
     @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService storageSetupService(StorageRoot root, ObjectProvider<InstalledConnectorTests> connectors,
