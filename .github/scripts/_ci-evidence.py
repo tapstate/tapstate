@@ -231,7 +231,7 @@ def annotation_prefix(text, clean, position, floor=0):
             start = index + 1
             break
     result, consumed = [], start
-    for found in re.finditer(r'@([\w.]+)\b', clean[start:position]):
+    for found in re.finditer(r'@\s*([\w.]+)\b', clean[start:position]):
         offset = start + found.start()
         if offset < consumed:
             continue
@@ -256,7 +256,7 @@ def disabled_annotation(text, clean, position, floor=0, lookup=None, source=None
                 return found
         return None
     prefix = clean[start:position]
-    found = re.search(r'@(?:org\.junit\.jupiter\.api\.)?Disabled\b(?:\s*\((.*?)\))?', prefix, re.S)
+    found = re.search(r'@\s*(?:org\.junit\.jupiter\.api\.)?Disabled\b(?:\s*\((.*?)\))?', prefix, re.S)
     if found is None:
         return None
     return text[start + found.start(1):start + found.end(1)] if found.group(1) is not None else ''
@@ -274,7 +274,8 @@ def class_declarations(text, clean, package, lookup=None, source=None):
         _, prefix_start = annotation_prefix(text, clean, match.start())
         access = re.search(r'\b(public|protected|private)\b', clean[prefix_start:match.start()])
         classes.append(dict(start=start, end=end, name=name, offset=match.start(),
-                            kind='annotation' if match.start() and clean[match.start() - 1] == '@' else match.group(1),
+                            kind='annotation' if match.group(1) == 'interface' and
+                                clean[:match.start()].rstrip().endswith('@') else match.group(1),
                             access=access.group(1) if access else 'public' if parent and parent['kind'] in ('interface', 'annotation') else 'package',
                             header=clean[match.start():start], disabled_source=local_disabled
                             if local_disabled is not None else parent['disabled_source'] if parent else None))
@@ -291,6 +292,7 @@ class DisabledLookup:
         self.root, self.sources, self.contexts = root, sources, {}
         self.directories = [root / module / tree for module, _ in source_modules(root)
                             for tree in ('src/main/java', 'src/test/java')]
+        self.named_cache, self.packages = {}, {}
 
     def context(self, source):
         if source not in self.contexts:
@@ -304,6 +306,8 @@ class DisabledLookup:
         return self.contexts[source]
 
     def named(self, name):
+        if name in self.named_cache:
+            return self.named_cache[name]
         found = []
         parts = name.split('.')
         for directory in self.directories:
@@ -313,7 +317,19 @@ class DisabledLookup:
                     found.extend((candidate, node) for node in self.context(candidate)['classes']
                                  if node['name'].replace('$', '.') == name)
         require(len(found) <= 1, 'ambiguous annotation or interface source: ' + name)
-        return found[0] if found else None
+        self.named_cache[name] = found[0] if found else None
+        return self.named_cache[name]
+
+    def package_named(self, prefix, name):
+        if prefix not in self.packages:
+            found = {}
+            for directory in self.directories:
+                package = directory.joinpath(*prefix.rstrip('.').split('.'))
+                for candidate in package.glob('*.java'):
+                    for node in self.context(candidate)['classes']:
+                        found.setdefault(node['name'].replace('$', '.'), []).append((candidate, node))
+            self.packages[prefix] = found
+        return self.packages[prefix].get(name, [])
 
     def resolve(self, source, name, offset=0):
         context = self.context(source)
@@ -340,12 +356,7 @@ class DisabledLookup:
         found = self.named(qualified)
         if found is None:
             # Package-private annotation types need not have a matching filename.
-            candidates = []
-            for directory in self.directories:
-                package = directory.joinpath(*context['prefix'].rstrip('.').split('.'))
-                for candidate in package.glob('*.java'):
-                    candidates.extend((candidate, node) for node in self.context(candidate)['classes']
-                                      if node['name'].replace('$', '.') == qualified)
+            candidates = self.package_named(context['prefix'], qualified)
             require(len(candidates) <= 1, 'ambiguous annotation or interface source: ' + qualified)
             found = candidates[0] if candidates else None
         if found:
@@ -396,7 +407,7 @@ class DisabledLookup:
 
     def interfaces(self, source, node):
         keyword = 'extends' if node['kind'] == 'interface' else 'implements'
-        found = re.search(r'\b' + keyword + r'\s+(.+)', self.type_header(node))
+        found = re.search(r'\b' + keyword + r'\s+(.+)', self.type_header(node), re.S)
         return [self.resolve(source, name.strip(), node['offset'])[1]
                 for name in split_values(found.group(1), generic=True)] if found else []
 
@@ -418,7 +429,7 @@ class DisabledLookup:
 
     @staticmethod
     def type_header(node):
-        header = node['header']
+        header = re.sub(r'\s+permits\b[\s\S]*$', '', node['header'])
         while re.search(r'<[^<>]*>', header):
             header = re.sub(r'<[^<>]*>', '', header)
         require('<' not in header and '>' not in header, 'unsupported source type parameters')
@@ -464,13 +475,13 @@ def declarations(text, outer, package, lookup=None, source=None):
     clean = masked(text)
     classes = class_declarations(text, clean, package, lookup, source)
     result, consumed = [], -1
-    for found in re.finditer(r'@([\w.]+)\b', clean):
+    for found in re.finditer(r'@\s*([\w.]+)\b', clean):
         if found.start() < consumed or found.group(1).rsplit('.', 1)[-1] not in TEST_ANNOTATIONS:
             continue
         # Start at this test annotation and collect following declaration annotations.
         position, annotations = found.start(), {}
         while True:
-            annotation = re.match(r'\s*@([\w.]+)\b', clean[position:])
+            annotation = re.match(r'\s*@\s*([\w.]+)\b', clean[position:])
             if not annotation:
                 break
             name = annotation.group(1).rsplit('.', 1)[-1]
@@ -953,14 +964,17 @@ def csv_record(row, delimiter):
         position += 1
 
 
+JAVA_TEXT_WHITESPACE = ' \t\f\v\u001c\u001d\u001e\u001f\u1680' + ''.join(
+    chr(code) for code in (*range(0x2000, 0x2007), *range(0x2008, 0x200b), 0x2028, 0x2029, 0x205f, 0x3000))
+
+
 def text_block_content(value):
     """Normalize the supported Java text-block whitespace before escape decoding."""
     block = re.fullmatch(r'"""([\s\S]*?)"""', value)
     require(block is not None, 'unsupported Java text block')
     raw = block.group(1).replace('\r\n', '\n').replace('\r', '\n')
     # JDK 21 Character.isWhitespace differs from Python's Unicode whitespace.
-    whitespace = ' \t\f\v\u001c\u001d\u001e\u001f\u1680' + ''.join(
-        chr(code) for code in (*range(0x2000, 0x2007), *range(0x2008, 0x200b), 0x2028, 0x2029, 0x205f, 0x3000))
+    whitespace = JAVA_TEXT_WHITESPACE
     opening = re.match(r'^[ \t\f]*\n', raw)
     require(opening is not None, 'unsupported Java text block opening')
     lines = raw[opening.end():].split('\n')
@@ -974,8 +988,7 @@ def text_block_content(value):
 
 def csv_text_block(value):
     """Apply bounded Java whitespace normalization before default CSV comments."""
-    require('\\' not in value and all(not c.isspace() or c in ' \t\r\n' for c in value)
-            and all(ord(c) >= 32 or c in '\t\r\n' for c in value),
+    require('\\' not in value and all(ord(c) >= 32 or c in JAVA_TEXT_WHITESPACE + '\r\n' for c in value),
             'CSV text-block escapes or whitespace require independent enumeration')
     return [line for line in text_block_content(value).split('\n') if line.strip(' \t') and not line.startswith('#')]
 

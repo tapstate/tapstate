@@ -345,6 +345,124 @@ class SourceIdentityTests(unittest.TestCase):
                                  ['java.lang.String', 'a\n'])
 
 
+    def test_wrapped_and_sealed_interface_lists_preserve_disabled_identity(self):
+        cases = [('', 'implements Other,\n Marker', ''),
+                 ('sealed', 'implements Marker permits Child', 'final class Child extends IdentityTest {} '),
+                 ('sealed', 'implements Other,\n Marker permits Child', 'final class Child extends IdentityTest {} '),
+                 ('', 'implements Mid', 'interface Mid extends Other,\n Marker {} ')]
+        for modifiers, parent, extra in cases:
+            for declaration in ('@Test void disabled() {}',
+                    '@ParameterizedTest @ValueSource(strings={"a"}) void disabled(String value) {}'):
+                with self.subTest(parent=parent, declaration=declaration), tempfile.TemporaryDirectory() as temporary:
+                    inventory, inv = self.inventory(Path(temporary), declaration, modifiers, parent,
+                        '@Disabled interface Marker {} interface Other {} ' + extra)
+                    self.assertTrue(inv['complete'], inv['unresolved'])
+                    self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+                    name = 'disabled(String)' if 'String' in declaration else 'disabled'
+                    self.assertTrue(self.observe(Path(temporary), inventory, name)['complete'])
+
+    def test_annotation_name_token_separators_preserve_skip_contract(self):
+        for separator in (' ', '\n', '/* token separator */'):
+            for annotation in ('Disabled', 'Slow'):
+                with self.subTest(separator=separator, annotation=annotation), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    inventory, inv = self.inventory(root,
+                        '@' + separator + annotation + '("reason") @Test void disabled() {}',
+                        preamble='@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+                            '@Disabled @interface Slow { String value(); }')
+                    self.assertTrue(inv['complete'], inv['unresolved'])
+                    self.assertEqual(len(inv['methods']), 1)
+                    self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+                    self.assertTrue(self.observe(root, inventory, 'disabled')['complete'])
+
+    def test_test_annotation_name_accepts_token_separators(self):
+        for separator in (' ', '\n', '/* token separator */'):
+            text = 'package sample; class IdentityTest { @' + separator + 'Test void ordinary() {} }'
+            declarations = evidence.declarations(text, 'IdentityTest', 'sample.')
+            self.assertEqual([row['method'] for row in declarations], ['ordinary'])
+
+    def test_annotation_type_token_separators_preserve_runtime_composition(self):
+        for separator in (' ', '\n', '/* token separator */'):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as temporary:
+                _, inv = self.inventory(Path(temporary), '@Test void disabled() {}', '@Slow',
+                    preamble='@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+                        '@Disabled @' + separator + 'interface Slow {}')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+
+    def test_csv_text_block_uses_java_whitespace_without_losing_content(self):
+        for character in ('\u00a0', '\v', '\u2028'):
+            with self.subTest(character=repr(character)), tempfile.TemporaryDirectory() as temporary:
+                value = 'a' + character + 'b'
+                _, inv = self.inventory(Path(temporary), '@ParameterizedTest @CsvSource(textBlock="""\n'
+                    + '  ' + value + '\n  """) void csv(String value) {}')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['argument_digests'],
+                    [evidence.argument_digest([['java.lang.String', value]])])
+        with self.assertRaisesRegex(ValueError, 'escapes'):
+            evidence.csv_text_block('"""\n  a\\nb\n  """')
+
+    def test_named_hits_and_misses_stop_repeating_filesystem_probes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.inventory(root, '@Test void ordinary() {}')
+            definition = root / 'core/src/test/java/sample/Marker.java'
+            definition.write_text('package sample; interface Marker {}')
+            sources = {}
+            lookup = evidence.DisabledLookup(root, sources)
+            original = Path.is_file
+            with mock.patch.object(Path, 'is_file', autospec=True, side_effect=original) as probes:
+                for name in ('sample.Marker', 'missing.Annotation'):
+                    result = lookup.named(name)
+                    count = probes.call_count
+                    self.assertEqual(lookup.named(name), result)
+                    self.assertEqual(probes.call_count, count)
+            self.assertEqual(sources[definition.relative_to(root).as_posix()],
+                hashlib.sha256(definition.read_bytes()).hexdigest())
+
+    def test_package_fallback_scans_once_and_keeps_nonmatching_file_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.inventory(root, '@Test void ordinary() {}')
+            source = root / 'core/src/test/java/sample/IdentityTest.java'
+            definition = source.with_name('Other.java')
+            definition.write_text('package sample; @interface Hidden {}')
+            sources = {}
+            lookup = evidence.DisabledLookup(root, sources)
+            original = Path.glob
+            with mock.patch.object(Path, 'glob', autospec=True, side_effect=original) as scans:
+                self.assertIsNone(lookup.resolve(source, 'Unknown')[1])
+                count = scans.call_count
+                self.assertIsNone(lookup.resolve(source, 'DifferentUnknown')[1])
+                target = lookup.resolve(source, 'Hidden')[1]
+                self.assertIsNotNone(target)
+                self.assertEqual(scans.call_count, count)
+            self.assertEqual(target[0], definition)
+            self.assertEqual(sources[definition.relative_to(root).as_posix()],
+                hashlib.sha256(definition.read_bytes()).hexdigest())
+
+    def test_lookup_cache_is_scoped_to_one_inventory_and_preserves_ambiguity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.inventory(root, '@Test void ordinary() {}')
+            definition = root / 'core/src/test/java/sample/Marker.java'
+            first = evidence.DisabledLookup(root, {})
+            self.assertIsNone(first.named('sample.Marker'))
+            definition.write_text('package sample; interface Marker {}')
+            sources = {}
+            second = evidence.DisabledLookup(root, sources)
+            self.assertIsNotNone(second.named('sample.Marker'))
+            self.assertEqual(sources[definition.relative_to(root).as_posix()],
+                hashlib.sha256(definition.read_bytes()).hexdigest())
+            duplicate = root / 'core/src/main/java/sample/Marker.java'
+            duplicate.parent.mkdir(parents=True)
+            duplicate.write_text(definition.read_text())
+            third = evidence.DisabledLookup(root, {})
+            for _ in range(2):
+                with self.assertRaisesRegex(ValueError, 'ambiguous'):
+                    third.named('sample.Marker')
+
+
 class LiveReadbackTests(unittest.TestCase):
     def fixture(self, root):
         repo = HERE.parents[1]
