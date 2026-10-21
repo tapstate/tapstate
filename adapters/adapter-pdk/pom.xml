@@ -23,6 +23,11 @@
   <description>PDK runtime bridge: isolated per-connector class loading over the frozen PDK contract (capture + sink adapter)</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The frozen PDK contract surface (rule R3 locks it to this module). Compile scope: it is the
          shared API the per-connector class loaders expose to connectors, so it must sit on the host
          classpath as the one contract every connector binds to. -->

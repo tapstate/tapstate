@@ -333,6 +333,8 @@ transform.script-no-process
 transform.script-output-invalid
 transform.unwind-needs-a-complete-before-image
 transform.unwind-rows-share-a-key
+validation.codec-failed
+validation.codec-value-unavailable
 validation.illegal-transition
 validation.incompatible-key
 validation.invalid-contract

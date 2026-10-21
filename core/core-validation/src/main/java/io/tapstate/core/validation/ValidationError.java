@@ -17,7 +17,9 @@ public enum ValidationError implements TapstateErrorCode {
     OWNER_NOT_AUTHORIZED("validation.owner-not-authorized", Set.of("pipeline")),
     READ_FAILED("validation.read-failed", Set.of("table")),
     READ_PROTOCOL_VIOLATION("validation.read-protocol-violation", Set.of("table")),
-    READ_CANCELLED("validation.read-cancelled", Set.of("table"));
+    READ_CANCELLED("validation.read-cancelled", Set.of("table")),
+    CODEC_FAILED("validation.codec-failed", Set.of("connector", "field")),
+    CODEC_VALUE_UNAVAILABLE("validation.codec-value-unavailable", Set.of("connector", "field"));
 
     private final String code;
     private final Set<String> placeholders;

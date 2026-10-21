@@ -8,6 +8,12 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+validation.codec-failed:
+  message: "Connector {connector} failed to convert validation field {field}."
+  solution: "Inspect the codec failure; another codec cannot silently replace its result."
+validation.codec-value-unavailable:
+  message: "Connector {connector} did not provide a usable validation value for field {field}."
+  solution: "Check the codec and logical type support. A missing result or raw driver value cannot establish equality."
 validation.read-cancelled:
   message: "The independent validation read of {table} was cancelled."
   solution: "A cancelled read is incomplete; start a new validation when authorized."
