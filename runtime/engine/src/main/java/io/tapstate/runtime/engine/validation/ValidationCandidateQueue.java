@@ -89,6 +89,9 @@ public final class ValidationCandidateQueue implements AutoCloseable {
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
     }
 
+    public ValidationRunIdentity run() { return run; }
+    public Limits limits() { return limits; }
+
     /** The caller supplies a stable, admitted batch of complete root identities, including both sides of a move. */
     public Offer tryOffer(List<ValidationRoot> roots) {
         if (roots == null || roots.isEmpty() || roots.size() > limits.batch()) throw invalid("candidate.batch");
