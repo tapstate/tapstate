@@ -2,13 +2,16 @@
 """Discriminate source identities from Java escapes, injection and disabled templates."""
 import importlib.util
 import hashlib
+import io
 import json
+from contextlib import redirect_stdout
 from pathlib import Path
 import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
@@ -45,12 +48,13 @@ class SourceIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'invalid production class file'):
             evidence.crc64(b'invalid')
 
-    def inventory(self, root, declaration, class_annotations='', parent=''):
+    def inventory(self, root, declaration, class_annotations='', parent='', preamble=''):
         (root / 'core/src/test/java/sample').mkdir(parents=True, exist_ok=True)
         (root / 'pom.xml').write_text('<project><modules><module>core</module></modules></project>')
         (root / 'core/pom.xml').write_text('<project/>')
         source = root / 'core/src/test/java/sample/IdentityTest.java'
-        source.write_text('package sample; ' + class_annotations + ' class IdentityTest ' + parent + ' {\n' + declaration + '\n}')
+        source.write_text('package sample; import org.junit.jupiter.api.*; ' + preamble + ' '
+                          + class_annotations + ' class IdentityTest ' + parent + ' {\n' + declaration + '\n}')
         target = root / 'inventory.json'
         evidence.inventory(SimpleNamespace(root=str(root), lane='ci', kind=None, parameters=None,
             source_archive=None, source_receipt=None, published_connectors='unknown',
@@ -149,7 +153,7 @@ class SourceIdentityTests(unittest.TestCase):
             root = Path(temporary)
             folder = root / 'core/src/test/java/sample'
             folder.mkdir(parents=True)
-            (folder / 'Base.java').write_text('package sample; @Disabled class Base { '
+            (folder / 'Base.java').write_text('package sample; @org.junit.jupiter.api.Disabled class Base { '
                 '@ParameterizedTest @ValueSource(strings={"a"}) void inherited(String value) {} }')
             _, inv = self.inventory(root, '', parent='extends Base')
             self.assertTrue(inv['complete'], inv['unresolved'])
@@ -177,6 +181,116 @@ class SourceIdentityTests(unittest.TestCase):
                 '@DisplayName("@Disabled")')
             self.assertIsNone(inv['methods'][0]['disabled_source'])
             self.assertFalse(self.observe(root, inventory, 'enabled(String)')['complete'])
+
+    def test_interfaces_and_runtime_composed_annotations_disable_templates(self):
+        runtime = '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+        definitions = runtime + '@Disabled @interface Slow {} '
+        for preamble, annotation, parent in [('@Disabled interface Slow {}', '', 'implements Slow'),
+                ('@Disabled interface Parent {} interface Slow extends Parent {}', '', 'implements Slow'),
+                (definitions, '@Slow', ''),
+                (definitions + runtime + '@Slow @interface Slower {}', '@Slower', '')]:
+            with self.subTest(preamble=preamble), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                inventory, inv = self.inventory(root,
+                    '@ParameterizedTest @ValueSource(strings={"a"}) void disabled(String value) {}',
+                    annotation, parent, preamble)
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+                self.assertTrue(self.observe(root, inventory, 'disabled(String)')['complete'])
+
+    def test_composed_method_annotation_is_bound_to_its_definition_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'core/src/test/java/sample/Slow.java'
+            source.parent.mkdir(parents=True)
+            source.write_text('package sample; @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+                              '@org.junit.jupiter.api.Disabled @interface Slow {}')
+            inventory, inv = self.inventory(root,
+                '@Slow @ParameterizedTest @ValueSource(strings={"a"}) void disabled(String value) {}')
+            self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+            self.assertEqual(inv['sources']['core/src/test/java/sample/Slow.java'], hashlib.sha256(source.read_bytes()).hexdigest())
+            self.assertTrue(self.observe(root, inventory, 'disabled(String)')['complete'])
+
+    def test_inherited_composed_annotation_differs_from_direct_disabled(self):
+        runtime = '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+        for inherited in ('', '@java.lang.annotation.Inherited '):
+            with self.subTest(inherited=inherited), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / 'core/src/test/java/sample/Base.java'
+                source.parent.mkdir(parents=True)
+                source.write_text('package sample; ' + runtime + inherited + '@org.junit.jupiter.api.Disabled @interface Slow {} '
+                                  '@Slow class Base { @ParameterizedTest @ValueSource(strings={"a"}) void test(String value) {} }')
+                _, inv = self.inventory(root, '', parent='extends Base')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method' if inherited else 'argument-marker')
+
+    def test_non_runtime_or_same_name_annotations_cannot_authorize_skips(self):
+        for definitions, annotation in [('@interface Disabled {}', '@Disabled'),
+                ('@Disabled @interface Slow {}', '@Slow'),
+                ('@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @B @interface A {} '
+                 '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @A @interface B {}', '@A')]:
+            with self.subTest(annotation=annotation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                inventory, inv = self.inventory(root,
+                    '@ParameterizedTest @ValueSource(strings={"a"}) void enabled(String value) {}',
+                    annotation, preamble=definitions)
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertIsNone(inv['methods'][0]['disabled_source'])
+                self.assertFalse(self.observe(root, inventory, 'enabled(String)')['complete'])
+
+    def test_static_import_and_inherited_member_annotations_shadow_jupiter(self):
+        for preamble, parent, kind in [('import static sample.Tools.Disabled;', '', 'class'),
+                ('import static sample.Tools.*;', '', 'class'), ('', 'extends Tools', 'class'),
+                ('', 'implements Tools', 'interface'), ('', 'implements Mid', 'interface'),
+                ('@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+                 '@org.junit.jupiter.api.Disabled @interface Disabled {}', 'extends Tools', 'class')]:
+            with self.subTest(parent=parent), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / 'core/src/test/java/sample/Tools.java'
+                source.parent.mkdir(parents=True)
+                source.write_text('package sample; ' + kind + ' Tools { '
+                    '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @interface Disabled {} }'
+                    + (' interface Mid extends Tools {}' if kind == 'interface' else ''))
+                inventory, inv = self.inventory(root,
+                    '@Disabled @ParameterizedTest @ValueSource(strings={"a"}) void enabled(String value) {}',
+                    parent=parent, preamble=preamble)
+                if preamble == 'import static sample.Tools.*;':
+                    self.assertFalse(inv['complete'], 'two on-demand imports must not guess an annotation binding')
+                    self.assertTrue(any('ambiguous' in row['reason'] for row in inv['unresolved']))
+                    continue
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertIsNone(inv['methods'][0]['disabled_source'])
+                self.assertFalse(self.observe(root, inventory, 'enabled(String)')['complete'])
+
+    def test_generic_bounds_are_not_superclasses_or_parent_interfaces(self):
+        runtime = '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+        preamble = runtime + '@java.lang.annotation.Inherited @Disabled @interface Slow {} @Slow class Bound {} '
+        for definitions, parent, expected in [(preamble, '<T extends Bound>', 'argument-marker'),
+                ('@Disabled interface Marker {} interface Mid<T extends Runnable> extends Marker {}',
+                 'implements Mid<Runnable>', 'disabled-method')]:
+            with self.subTest(parent=parent), tempfile.TemporaryDirectory() as temporary:
+                _, inv = self.inventory(Path(temporary),
+                    '@ParameterizedTest @ValueSource(strings={"a"}) void test(String value) {}',
+                    parent=parent, preamble=definitions)
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['mapping'], expected)
+
+    def test_inherited_member_visibility_controls_annotation_binding(self):
+        runtime = '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+        for access, package, disabled in [('private', 'sample', False), ('', 'other', False),
+                                          ('', 'sample', True), ('protected', 'other', True), ('public', 'other', True)]:
+            with self.subTest(access=access, package=package), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / ('core/src/test/java/' + package + '/Base.java')
+                source.parent.mkdir(parents=True)
+                source.write_text('package ' + package + '; public class Base { ' + runtime
+                    + '@org.junit.jupiter.api.Disabled ' + access + ' @interface Slow {} }')
+                _, inv = self.inventory(root,
+                    '@Slow @ParameterizedTest @ValueSource(strings={"a"}) void test(String value) {}',
+                    parent='extends Base', preamble=('import other.Base; ' if package == 'other' else '')
+                    + runtime + '@interface Slow {}')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method' if disabled else 'argument-marker')
 
     def test_disabled_nested_container_preserves_raw_count_and_source_skip_identities(self):
         for annotation, expected in [('@Disabled', True), ('', False)]:
@@ -217,20 +331,139 @@ class SourceIdentityTests(unittest.TestCase):
                 self.assertEqual(evidence.canonical_expression(raw, None, None, {}, ''),
                                  ['java.lang.String', expected])
 
+    def test_text_block_whitespace_matches_java_instead_of_python(self):
+        for char in ('\u00a0', '\u0085', '\u2007', '\u202f'):
+            for content in ('a' + char + 'b', char + 'a' + char):
+                with self.subTest(content=repr(content)):
+                    self.assertEqual(evidence.canonical_expression('"""\n' + content + '\n"""', None, None, {}, ''),
+                                     ['java.lang.String', content + '\n'])
+        for char in ('\v', '\u001c', '\u1680', '\u2000', '\u2028', '\u2029', '\u205f', '\u3000'):
+            with self.subTest(char=repr(char)):
+                self.assertEqual(evidence.canonical_expression('"""\n' + char + 'a' + char + '\n"""', None, None, {}, ''),
+                                 ['java.lang.String', char + 'a\n'])
+                self.assertEqual(evidence.canonical_expression('"""\n' + char + 'a' + char + '\n' + char + '"""', None, None, {}, ''),
+                                 ['java.lang.String', 'a\n'])
 
-def junit_readback(reports):
+
+class LiveReadbackTests(unittest.TestCase):
+    def fixture(self, root):
+        repo = HERE.parents[1]
+        scripts = root / '.github/scripts'
+        stored = scripts / 'fixtures/ci-evidence-junit'
+        shutil.copytree(HERE / 'fixtures/ci-evidence-junit', stored)
+        manifest = stored / 'manifest.json'
+        value = json.loads(manifest.read_text())
+        moved = {}
+        for source, checksum in value['source_hashes'].items():
+            target = source.replace('test-support/', 'moved-controls/', 1)
+            (root / target).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(repo / source, root / target)
+            moved[target] = checksum
+        value['source_hashes'] = moved
+        manifest.write_text(json.dumps(value))
+        (root / 'bom').mkdir()
+        shutil.copyfile(repo / 'bom/pom.xml', root / 'bom/pom.xml')
+        shutil.copyfile(repo / 'pom.xml', root / 'pom.xml')
+        tests = [{'module': 'moved-controls', 'kind': 'unit', 'class': name[5:-4]}
+                 for name in value['reports']]
+        plan = {'schema': 1, 'expected': tests, 'shards': [{'id': 'owner', 'tests': tests}, {'id': 'other', 'tests': []}]}
+        path = root / 'plan.json'
+        path.write_text(json.dumps(plan))
+        reports = root / 'moved-controls/target/surefire-reports'
+        reports.mkdir(parents=True)
+        for name in value['reports']:
+            shutil.copyfile(stored / name, reports / name)
+        return scripts, path, plan, reports
+
+    def test_relocated_controls_are_read_from_the_planned_module(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            scripts, path, _, reports = self.fixture(Path(temporary))
+            calls = []
+            with mock.patch.dict(globals(), HERE=scripts, junit_readback=lambda rows, *args, **kwargs: calls.append(rows)):
+                shard_readback(path, 'owner')
+            self.assertEqual(len(calls), 1, 'selected controls must execute live readback')
+            self.assertEqual(set(calls[0]), set(reports.glob('*.xml')))
+
+    def test_relocated_reports_reconcile_with_their_manifest_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            scripts, path, _, _ = self.fixture(Path(temporary))
+            output = io.StringIO()
+            with mock.patch.dict(globals(), HERE=scripts), redirect_stdout(output):
+                shard_readback(path, 'owner')
+            self.assertIn('JUnit XML/source readback passed:', output.getvalue())
+
+    def test_relocated_owner_cannot_succeed_without_its_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            scripts, path, _, reports = self.fixture(Path(temporary))
+            next(reports.glob('*.xml')).unlink()
+            with mock.patch.dict(globals(), HERE=scripts), self.assertRaisesRegex((ValueError, AssertionError), 'report'):
+                shard_readback(path, 'owner')
+
+    def test_every_control_requires_exactly_one_plan_owner(self):
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate), tempfile.TemporaryDirectory() as temporary:
+                scripts, path, plan, _ = self.fixture(Path(temporary))
+                if duplicate:
+                    plan['shards'][1]['tests'].append(plan['shards'][0]['tests'][0])
+                else:
+                    plan['shards'][0]['tests'].pop()
+                path.write_text(json.dumps(plan))
+                with mock.patch.dict(globals(), HERE=scripts), self.assertRaisesRegex((ValueError, AssertionError), 'control'):
+                    shard_readback(path, 'other')
+
+    def test_non_owner_only_skips_after_global_control_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            scripts, path, _, reports = self.fixture(Path(temporary))
+            shutil.rmtree(reports)
+            with mock.patch.dict(globals(), HERE=scripts, junit_readback=mock.Mock()) as patched:
+                shard_readback(path, 'other')
+                patched['junit_readback'].assert_not_called()
+
+
+def fixture_layout(manifest, repo):
+    fixture = json.loads(manifest.read_text())
+    assert fixture['schema'] == 1 and fixture['reports'], 'JUnit fixture report set is empty'
+    sources, controls = {}, {}
+    for name, expected in fixture['source_hashes'].items():
+        path = repo / name
+        assert not Path(name).is_absolute() and '..' not in Path(name).parts, 'JUnit fixture source escapes repository'
+        assert path.resolve().is_relative_to(repo.resolve()), 'JUnit fixture source escapes repository'
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected, 'report fixture source differs: ' + name
+        module, separator, source = name.partition('/src/test/java/')
+        assert separator and module and source.endswith('.java'), 'JUnit fixture source is not a test Java file'
+        classname = source[:-5].replace('/', '.')
+        assert classname not in sources, 'duplicate JUnit fixture source class'
+        sources[classname] = dict(module=module, source=source, path=path)
+    for name in fixture['reports']:
+        assert name.startswith('TEST-') and name.endswith('.xml') and Path(name).name == name, 'invalid JUnit fixture report name'
+        classname = name[5:-4]
+        assert classname in sources, 'JUnit fixture report has no source: ' + classname
+        controls[classname] = sources[classname]
+        sources[classname]['control'] = True
+    namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
+    versions = dict(junit=ET.parse(repo / 'bom/pom.xml').findtext('m:properties/m:junit.version', namespaces=namespace),
+                    surefire=ET.parse(repo / 'pom.xml').findtext('m:properties/m:plugin.surefire.version', namespaces=namespace))
+    assert fixture['versions'] == versions, 'JUnit/Surefire changed; regenerate the real report fixture'
+    return fixture, sources, controls
+
+
+def junit_readback(reports, sources=None):
+    if sources is None:
+        _, sources, _ = fixture_layout(HERE / 'fixtures/ci-evidence-junit/manifest.json', HERE.parents[1])
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         (root / 'core/src/test/java/io/tapstate/testsupport').mkdir(parents=True)
         (root / 'pom.xml').write_text('<project><modules><module>core</module></modules></project>')
         (root / 'core/pom.xml').write_text('<project/>')
-        for report in reports:
-            classname = report.name.removeprefix('TEST-').removesuffix('.xml')
-            assert classname in ('io.tapstate.testsupport.CiInjectedEvidenceTest',
-                                 'io.tapstate.testsupport.CiDisabledContainerEvidenceTest'), classname
-            source = Path(classname.replace('.', '/') + '.java')
-            shutil.copyfile(HERE.parents[1] / 'test-support/src/test/java' / source,
-                            root / 'core/src/test/java' / source)
+        selected = {report.name.removeprefix('TEST-').removesuffix('.xml') for report in reports}
+        assert selected and selected <= set(sources), 'JUnit report source is missing'
+        for classname, definition in sources.items():
+            # Copy supporting annotation/interface sources, but not another control's tests.
+            if classname not in selected and definition.get('control', False):
+                continue
+            target = root / 'core/src/test/java' / definition['source']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(definition['path'], target)
         target = root / 'inventory.json'
         evidence.inventory(SimpleNamespace(root=str(root), lane='ci', kind=None, parameters=None,
             source_archive=None, source_receipt=None, published_connectors='unknown',
@@ -254,37 +487,35 @@ def junit_readback(reports):
 
 
 def fixture_readback(manifest):
-    fixture = json.loads(manifest.read_text())
-    classes = ('CiInjectedEvidenceTest', 'CiDisabledContainerEvidenceTest')
-    assert fixture['schema'] == 1 and set(fixture['reports']) == {
-        'TEST-io.tapstate.testsupport.' + name + '.xml' for name in classes}, 'JUnit fixture report set differs'
-    assert set(fixture['source_hashes']) == {
-        'test-support/src/test/java/io/tapstate/testsupport/' + name + '.java'
-        for name in (*classes, 'CiCaseEvidence')}, 'JUnit fixture source set differs'
-    repo = HERE.parents[1]
-    namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
-    versions = dict(junit=ET.parse(repo / 'bom/pom.xml').findtext('m:properties/m:junit.version', namespaces=namespace),
-                    surefire=ET.parse(repo / 'pom.xml').findtext('m:properties/m:plugin.surefire.version', namespaces=namespace))
-    assert fixture['versions'] == versions, 'JUnit/Surefire changed; regenerate the real report fixture'
-    for source, expected in fixture['source_hashes'].items():
-        assert hashlib.sha256((repo / source).read_bytes()).hexdigest() == expected, 'report fixture source differs: ' + source
+    fixture, sources, _ = fixture_layout(manifest, HERE.parents[1])
     reports = []
     for name, expected in fixture['reports'].items():
         report = manifest.parent / name
         assert report.resolve().is_relative_to(manifest.parent.resolve()), 'report fixture escapes its directory'
         assert hashlib.sha256(report.read_bytes()).hexdigest() == expected, 'JUnit report fixture bytes differ: ' + name
         reports.append(report)
-    junit_readback(reports)
+    junit_readback(reports, sources)
 
 
 def shard_readback(plan_path, shard_id):
     plan = json.loads(plan_path.read_text())
-    shard = next(row for row in plan['shards'] if row['id'] == shard_id)
-    classes = {'io.tapstate.testsupport.CiInjectedEvidenceTest', 'io.tapstate.testsupport.CiDisabledContainerEvidenceTest'}
-    reports = [HERE.parents[1] / 'test-support/target/surefire-reports' / ('TEST-' + test['class'] + '.xml')
-               for test in shard['tests'] if test['module'] == 'test-support' and test['kind'] == 'unit' and test['class'] in classes]
+    repo = HERE.parents[1]
+    _, sources, controls = fixture_layout(HERE / 'fixtures/ci-evidence-junit/manifest.json', repo)
+    assert plan['schema'] == 1 and len({row['id'] for row in plan['shards']}) == len(plan['shards']), 'invalid control shard plan'
+    owners = {name: [] for name in controls}
+    for row in plan['shards']:
+        for test in row['tests']:
+            name = test['class']
+            if name in controls:
+                assert test['module'] == controls[name]['module'] and test['kind'] == 'unit', 'control source and plan differ: ' + name
+                owners[name].append((row['id'], test))
+    assert all(len(rows) == 1 for rows in owners.values()), 'every JUnit control requires exactly one plan owner'
+    assert shard_id in {row['id'] for row in plan['shards']}, 'unknown control shard'
+    reports = [repo / test['module'] / 'target/surefire-reports' / ('TEST-' + name + '.xml')
+               for name, rows in owners.items() for owner, test in rows if owner == shard_id]
+    assert all(report.is_file() for report in reports), 'selected JUnit control report is missing'
     if reports:
-        junit_readback(reports)
+        junit_readback(reports, sources)
     else:
         print('JUnit observer controls are not selected by shard', shard_id)
 

@@ -11,7 +11,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class CiInjectedEvidenceTest {
+class CiInjectedEvidenceTest extends CiDisabledBase {
     @ParameterizedTest
     @ValueSource(strings = {"case"})
     void injectedInfo(String value, TestInfo info) {
@@ -68,5 +68,29 @@ class CiInjectedEvidenceTest {
     @ValueSource(strings = {"a", "b"})
     void disabledVarargs(String... values) {
         throw new AssertionError("disabled varargs must not invoke their provider");
+    }
+
+    @CiDisabled
+    @ParameterizedTest
+    @ValueSource(strings = {"a", "b"})
+    void composedMethodDisabled(String value) {
+        throw new AssertionError("a composed method annotation must prevent provider execution");
+    }
+
+    @CiSourceOnlyDisabled
+    @ParameterizedTest
+    @ValueSource(strings = {"a"})
+    void classRetainedAnnotationDoesNotDisable(String value) {
+        assertThat(value).isEqualTo("a");
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonBreakingStrings")
+    void nonBreakingSpaceRemainsContent(String value) {
+        assertThat(value).isEqualTo("a\u00a0b\n");
+    }
+
+    static Stream<String> nonBreakingStrings() {
+        return Stream.of("a\u00a0b\n");
     }
 }

@@ -217,7 +217,7 @@ def source_modules(root):
     return result
 
 
-def disabled_annotation(text, clean, position, floor=0):
+def annotation_prefix(text, clean, position, floor=0):
     # Walk past whole annotation arguments; array braces and strings are not
     # declaration boundaries and cannot supply a Disabled annotation.
     depth, start = 0, floor
@@ -230,6 +230,31 @@ def disabled_annotation(text, clean, position, floor=0):
         elif depth == 0 and char in '{};':
             start = index + 1
             break
+    result, consumed = [], start
+    for found in re.finditer(r'@([\w.]+)\b', clean[start:position]):
+        offset = start + found.start()
+        if offset < consumed:
+            continue
+        end = start + found.end()
+        while end < position and clean[end].isspace():
+            end += 1
+        argument = ''
+        if end < position and clean[end] == '(':
+            closing = close_at(clean, end)
+            argument = text[end + 1:closing]
+            consumed = closing + 1
+        result.append(dict(name=found.group(1), argument=argument, offset=offset))
+    return result, start
+
+
+def disabled_annotation(text, clean, position, floor=0, lookup=None, source=None):
+    annotations, start = annotation_prefix(text, clean, position, floor)
+    if lookup is not None:
+        for annotation in annotations:
+            found = lookup.annotation_disabled(source, annotation)
+            if found is not None:
+                return found
+        return None
     prefix = clean[start:position]
     found = re.search(r'@(?:org\.junit\.jupiter\.api\.)?Disabled\b(?:\s*\((.*?)\))?', prefix, re.S)
     if found is None:
@@ -237,22 +262,207 @@ def disabled_annotation(text, clean, position, floor=0):
     return text[start + found.start(1):start + found.end(1)] if found.group(1) is not None else ''
 
 
-def class_declarations(text, clean, package):
+def class_declarations(text, clean, package, lookup=None, source=None):
     classes = []
     for match in re.finditer(r'\b(class|interface|enum|record)\s+(\w+)\b[^;{]*\{', clean):
         start = match.end() - 1
         end = close_at(clean, start, '{', '}')
         parent = next((c for c in reversed(classes) if c['start'] < start < c['end']), None)
         name = parent['name'] + '$' + match.group(2) if parent else package + match.group(2)
-        local_disabled = disabled_annotation(text, clean, match.start(), parent['start'] + 1 if parent else 0)
-        classes.append(dict(start=start, end=end, name=name, disabled_source=local_disabled
+        local_disabled = (lookup.class_disabled(source, name) if lookup is not None else
+                          disabled_annotation(text, clean, match.start(), parent['start'] + 1 if parent else 0))
+        _, prefix_start = annotation_prefix(text, clean, match.start())
+        access = re.search(r'\b(public|protected|private)\b', clean[prefix_start:match.start()])
+        classes.append(dict(start=start, end=end, name=name, offset=match.start(),
+                            kind='annotation' if match.start() and clean[match.start() - 1] == '@' else match.group(1),
+                            access=access.group(1) if access else 'public' if parent and parent['kind'] in ('interface', 'annotation') else 'package',
+                            header=clean[match.start():start], disabled_source=local_disabled
                             if local_disabled is not None else parent['disabled_source'] if parent else None))
     return classes
 
 
-def declarations(text, outer, package):
+class DisabledLookup:
+    """Resolve source-defined runtime annotations using Jupiter's disabled lookup order."""
+    DISABLED = 'org.junit.jupiter.api.Disabled'
+    INHERITED = 'java.lang.annotation.Inherited'
+    RETENTION = 'java.lang.annotation.Retention'
+
+    def __init__(self, root, sources):
+        self.root, self.sources, self.contexts = root, sources, {}
+        self.directories = [root / module / tree for module, _ in source_modules(root)
+                            for tree in ('src/main/java', 'src/test/java')]
+
+    def context(self, source):
+        if source not in self.contexts:
+            text = source.read_text()
+            clean = masked(text)
+            package = re.search(r'\bpackage\s+([\w.]+)\s*;', clean)
+            prefix = package.group(1) + '.' if package else ''
+            self.contexts[source] = dict(text=text, clean=clean, prefix=prefix,
+                                        classes=class_declarations(text, clean, prefix))
+            self.sources[source.relative_to(self.root).as_posix()] = digest(source.read_bytes())
+        return self.contexts[source]
+
+    def named(self, name):
+        found = []
+        parts = name.split('.')
+        for directory in self.directories:
+            for length in range(len(parts), 0, -1):
+                candidate = directory.joinpath(*parts[:length]).with_suffix('.java')
+                if candidate.is_file():
+                    found.extend((candidate, node) for node in self.context(candidate)['classes']
+                                 if node['name'].replace('$', '.') == name)
+        require(len(found) <= 1, 'ambiguous annotation or interface source: ' + name)
+        return found[0] if found else None
+
+    def resolve(self, source, name, offset=0):
+        context = self.context(source)
+        lexical = [node for node in reversed(context['classes']) if node['start'] < offset < node['end']]
+        for owner in lexical:
+            members = self.members(source, owner, name)
+            require(len(members) <= 1, 'ambiguous inherited annotation source: ' + name)
+            if members:
+                path, node = members[0]
+                return node['name'].replace('$', '.'), (path, node)
+        local = [node for node in context['classes'] if node['name'].replace('$', '.') == context['prefix'] + name]
+        if local:
+            return local[0]['name'].replace('$', '.'), (source, local[0])
+        first = name.split('.')[0]
+        imported = re.search(r'\bimport\s+(?:static\s+)?([\w.]+\.' + re.escape(first) + r')\s*;', context['clean'])
+        if imported:
+            qualified = imported.group(1) + name[len(first):]
+            return qualified, self.named(qualified)
+        if '.' in name and name[0].islower():
+            return name, self.named(name)
+        qualified = context['prefix'] + name
+        if qualified in (self.DISABLED, self.INHERITED, self.RETENTION):
+            return qualified, None
+        found = self.named(qualified)
+        if found is None:
+            # Package-private annotation types need not have a matching filename.
+            candidates = []
+            for directory in self.directories:
+                package = directory.joinpath(*context['prefix'].rstrip('.').split('.'))
+                for candidate in package.glob('*.java'):
+                    candidates.extend((candidate, node) for node in self.context(candidate)['classes']
+                                      if node['name'].replace('$', '.') == qualified)
+            require(len(candidates) <= 1, 'ambiguous annotation or interface source: ' + qualified)
+            found = candidates[0] if candidates else None
+        if found:
+            return qualified, found
+        candidates = []
+        for imported in re.finditer(r'\bimport\s+(?:static\s+)?([\w.]+)\.\*\s*;', context['clean']):
+            qualified = imported.group(1) + '.' + name
+            target = self.named(qualified)
+            if target or qualified in (self.DISABLED, self.INHERITED, self.RETENTION):
+                candidates.append((qualified, target))
+        require(len(candidates) <= 1, 'ambiguous annotation or interface imports: ' + name)
+        if candidates:
+            return candidates[0]
+        return name, None
+
+    def annotations(self, source, node):
+        context = self.context(source)
+        return annotation_prefix(context['text'], context['clean'], node['offset'])[0]
+
+    def runtime(self, source, node):
+        for annotation in self.annotations(source, node):
+            name, _ = self.resolve(source, annotation['name'], annotation['offset'])
+            if name == self.RETENTION:
+                value = re.sub(r'\s+', '', annotation['argument']).removeprefix('value=')
+                require(re.fullmatch(r'(?:java\.lang\.annotation\.)?(?:RetentionPolicy\.)?(?:RUNTIME|CLASS|SOURCE)', value),
+                        'annotation retention requires an independent contract: ' + node['name'])
+                return value.rsplit('.', 1)[-1] == 'RUNTIME'
+        return False
+
+    def annotation_disabled(self, source, annotation, seen=frozenset()):
+        name, definition = self.resolve(source, annotation['name'], annotation['offset'])
+        if name == self.DISABLED:
+            return annotation['argument']
+        if definition is None or name in seen:
+            return None
+        path, node = definition
+        if node['kind'] != 'annotation' or not self.runtime(path, node):
+            return None
+        for meta in self.annotations(path, node):
+            disabled = self.annotation_disabled(path, meta, seen | {name})
+            if disabled is not None:
+                return disabled
+        return None
+
+    def parent(self, source, node):
+        match = re.search(r'\bextends\s+([\w.]+)', self.type_header(node)) if node['kind'] == 'class' else None
+        return self.resolve(source, match.group(1), node['offset'])[1] if match else None
+
+    def interfaces(self, source, node):
+        keyword = 'extends' if node['kind'] == 'interface' else 'implements'
+        found = re.search(r'\b' + keyword + r'\s+(.+)', self.type_header(node))
+        return [self.resolve(source, name.strip(), node['offset'])[1]
+                for name in split_values(found.group(1), generic=True)] if found else []
+
+    def members(self, source, node, name, seen=frozenset(), requester=None):
+        key = (source, node['name'])
+        if key in seen:
+            return []
+        direct = [(source, member) for member in self.context(source)['classes']
+                  if member['name'].replace('$', '.') == node['name'].replace('$', '.') + '.' + name]
+        inherited = {}
+        if not direct:
+            for parent in [self.parent(source, node), *self.interfaces(source, node)]:
+                if parent:
+                    for path, member in self.members(*parent, name, seen | {key}, self.context(source)['prefix']):
+                        inherited[(path, member['name'])] = (path, member)
+        result = direct or list(inherited.values())
+        return [(path, member) for path, member in result if requester is None or
+                member['access'] != 'private' and (member['access'] != 'package' or self.context(path)['prefix'] == requester)]
+
+    @staticmethod
+    def type_header(node):
+        header = node['header']
+        while re.search(r'<[^<>]*>', header):
+            header = re.sub(r'<[^<>]*>', '', header)
+        require('<' not in header and '>' not in header, 'unsupported source type parameters')
+        return header
+
+    def class_disabled(self, source, name, seen=frozenset()):
+        if name in seen:
+            return None
+        node = next(node for node in self.context(source)['classes'] if node['name'] == name)
+        annotations = self.annotations(source, node)
+        for annotation in annotations:
+            disabled = self.annotation_disabled(source, annotation)
+            if disabled is not None:
+                return disabled
+        for target in self.interfaces(source, node):
+            if target:
+                disabled = self.class_disabled(target[0], target[1]['name'], seen | {name})
+                if disabled is not None:
+                    return disabled
+        # Class.getAnnotations exposes inherited composed annotations, even
+        # though Disabled itself does not authorize superclass traversal.
+        blocked = {self.resolve(source, a['name'], a['offset'])[0] for a in annotations}
+        parent, visited = self.parent(source, node), set()
+        while parent and parent[1]['name'] not in visited:
+            path, base = parent
+            visited.add(base['name'])
+            for annotation in self.annotations(path, base):
+                qualified, definition = self.resolve(path, annotation['name'], annotation['offset'])
+                if qualified not in blocked and definition:
+                    declaring, annotation_type = definition
+                    inherited = any(self.resolve(declaring, meta['name'], meta['offset'])[0] == self.INHERITED
+                                    for meta in self.annotations(declaring, annotation_type))
+                    if inherited:
+                        disabled = self.annotation_disabled(path, annotation)
+                        if disabled is not None:
+                            return disabled
+                blocked.add(qualified)
+            parent = self.parent(path, base)
+        return None
+
+
+def declarations(text, outer, package, lookup=None, source=None):
     clean = masked(text)
-    classes = class_declarations(text, clean, package)
+    classes = class_declarations(text, clean, package, lookup, source)
     result, consumed = [], -1
     for found in re.finditer(r'@([\w.]+)\b', clean):
         if found.start() < consumed or found.group(1).rsplit('.', 1)[-1] not in TEST_ANNOTATIONS:
@@ -303,7 +513,8 @@ def declarations(text, outer, package):
         if owner is None or not (owner['name'] == package + outer or owner['name'].startswith(package + outer + '$')):
             continue
         # Include preceding Disabled annotations in the declaration's contract.
-        method_disabled = annotations.get('Disabled', disabled_annotation(text, clean, found.start(), owner['start'] + 1))
+        method_disabled = (disabled_annotation(text, clean, position, owner['start'] + 1, lookup, source) if lookup else
+                           annotations.get('Disabled', disabled_annotation(text, clean, found.start(), owner['start'] + 1)))
         disabled_source = method_disabled if method_disabled is not None else owner['disabled_source']
         result.append(dict(**{'class': owner['name']}, method=name, annotations=annotations,
                            disabled_source=disabled_source, method_disabled_source=method_disabled,
@@ -540,14 +751,15 @@ def with_injected(arguments, declaration, repetition=None):
     return result
 
 
-def inherited_declarations(root, source, sources, stack=None):
+def inherited_declarations(root, source, sources, stack=None, lookup=None):
     stack = set() if stack is None else stack
     require(source not in stack, 'cyclic test inheritance')
     stack = stack | {source}
     text, clean = source.read_text(), masked(source.read_text())
     package = re.search(r'\bpackage\s+([\w.]+)\s*;', clean)
     prefix = package.group(1) + '.' if package else ''
-    own = [(source, item) for item in declarations(text, source.stem, prefix)]
+    lookup = lookup or DisabledLookup(root, sources)
+    own = [(source, item) for item in declarations(text, source.stem, prefix, lookup, source)]
     parent = re.search(r'\bclass\s+' + re.escape(source.stem) + r'\s+extends\s+([\w.]+)', clean)
     if parent is None:
         return own
@@ -570,8 +782,8 @@ def inherited_declarations(root, source, sources, stack=None):
     overrides = {(item['class'].removeprefix(prefix + source.stem), item['method']) for _, item in own if 'method' in item}
     base_package = re.search(r'\bpackage\s+([\w.]+)\s*;', masked(base.read_text()))
     base_name = (base_package.group(1) + '.' if base_package else '') + base.stem
-    owners = {c['name']: c for c in class_declarations(text, clean, prefix)}
-    for declaring_source, item in inherited_declarations(root, base, sources, stack):
+    owners = {c['name']: c for c in class_declarations(text, clean, prefix, lookup, source)}
+    for declaring_source, item in inherited_declarations(root, base, sources, stack, lookup):
         if 'class' not in item:
             own.append((declaring_source, item))
             continue
@@ -746,10 +958,11 @@ def text_block_content(value):
     block = re.fullmatch(r'"""([\s\S]*?)"""', value)
     require(block is not None, 'unsupported Java text block')
     raw = block.group(1).replace('\r\n', '\n').replace('\r', '\n')
-    whitespace = ' \t\f'
+    # JDK 21 Character.isWhitespace differs from Python's Unicode whitespace.
+    whitespace = ' \t\f\v\u001c\u001d\u001e\u001f\u1680' + ''.join(
+        chr(code) for code in (*range(0x2000, 0x2007), *range(0x2008, 0x200b), 0x2028, 0x2029, 0x205f, 0x3000))
     opening = re.match(r'^[ \t\f]*\n', raw)
-    require(opening is not None and all(not c.isspace() or c in whitespace + '\n' for c in raw),
-            'unsupported Java text block opening or whitespace')
+    require(opening is not None, 'unsupported Java text block opening')
     lines = raw[opening.end():].split('\n')
     indentation = [len(line) - len(line.lstrip(whitespace)) for line in lines if line.strip(whitespace)]
     if not lines[-1].strip(whitespace):
@@ -911,6 +1124,7 @@ def inventory(args):
     require(bool(args.source_archive) == bool(args.source_receipt), 'source archive and receipt must be supplied together')
     authenticated_sha = archive_source_sha(root, args.source_archive, args.source_receipt) if args.source_archive else None
     methods, unresolved, sources, class_contracts = [], [], {}, []
+    disabled_lookup = DisabledLookup(root, sources)
     overrides = load(args.parameters) if args.parameters else {}
     used = set()
     for module, bound_it in source_modules(root):
@@ -935,7 +1149,7 @@ def inventory(args):
             sources[relative] = digest(source.read_bytes())
             class_contracts.extend(dict(lane=args.lane, module=module, kind=kind, **contract) for kind in kinds for contract in before_all_contracts(root, source, sources))
             try:
-                declared = inherited_declarations(root, source, sources)
+                declared = inherited_declarations(root, source, sources, lookup=disabled_lookup)
             except ValueError as error:
                 unresolved.append(dict(source=relative, reason=str(error)))
                 declared = [(source, d) for d in declarations(text, name, prefix)]
