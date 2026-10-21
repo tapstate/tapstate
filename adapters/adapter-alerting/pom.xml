@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>io.tapstate</groupId><artifactId>adapters</artifactId><version>${revision}</version></parent>
+  <artifactId>adapter-alerting</artifactId>
+  <name>Tapstate :: Adapters :: Alerting</name>
+  <description>Fixed notification rendering and bounded notification protocols</description>
+  <dependencies>
+    <dependency><groupId>io.tapstate</groupId><artifactId>spi-alerting</artifactId><version>${revision}</version></dependency>
+    <dependency><groupId>io.tapstate</groupId><artifactId>core-alerting</artifactId><version>${revision}</version></dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><scope>test</scope></dependency>
+    <dependency><groupId>org.assertj</groupId><artifactId>assertj-core</artifactId><scope>test</scope></dependency>
+  </dependencies>
+  <build><plugins><plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><configuration>
+    <argLine>@{argLine} -Djdk.http.maxHeaderSize=16384 -Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.enableAllMethodRetry=false</argLine>
+  </configuration></plugin></plugins></build>
+</project>

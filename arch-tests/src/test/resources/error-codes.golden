@@ -35,6 +35,9 @@ actuation.view-storage-tier-unsupported
 actuation.view-store-is-a-capture-source
 actuation.view-store-not-configured
 actuation.view-store-unreachable
+alert.channel-not-accepted
+alert.channel-result-unknown
+alert.channel-unavailable
 alert.invalid-configuration
 alert.stale-action
 artifact.in-use

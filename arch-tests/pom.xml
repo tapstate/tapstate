@@ -82,6 +82,8 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <dependency><groupId>io.tapstate</groupId><artifactId>spi-alerting</artifactId><version>${revision}</version><scope>test</scope></dependency>
+    <dependency><groupId>io.tapstate</groupId><artifactId>adapter-alerting</artifactId><version>${revision}</version><scope>test</scope></dependency>
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-event</artifactId>

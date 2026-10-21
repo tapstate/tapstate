@@ -1070,3 +1070,13 @@ alert.invalid-configuration:
 alert.stale-action:
   message: "The alert action `{action}` does not match the current episode or evaluation generation."
   solution: "Read the current alert and act on its exact identity."
+
+alert.channel-not-accepted:
+  message: "The notification channel `{channel}` did not accept the request at stage `{phase}`."
+  solution: "Review the bounded protocol status and the original delivery binding before retrying."
+alert.channel-result-unknown:
+  message: "The notification channel `{channel}` has an unknown result at stage `{phase}`."
+  solution: "The receiver may have accepted it. Preserve the delivery identity and inspect the existing result."
+alert.channel-unavailable:
+  message: "The notification channel `{channel}` is unavailable at stage `{phase}`."
+  solution: "Restore the required capability or bounded capacity without changing the original delivery identity."
