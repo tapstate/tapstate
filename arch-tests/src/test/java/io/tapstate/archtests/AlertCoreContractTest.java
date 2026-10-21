@@ -25,6 +25,12 @@ class AlertCoreContractTest {
                 + "metric-input-max-facts=" + ObservationMetricInput.MAX_FACTS + "\n"
                 + "metric-input-max-points=" + ObservationMetricInput.MAX_POINTS + "\n"
                 + "metric-input-status=" + names(ObservationMetricInput.Status.values()) + "\n"
+                + fields("delivery-capability-header", DeliveryCapabilityPolicy.Header.class)
+                + fields("delivery-capability-decision", DeliveryCapabilityPolicy.Decision.class)
+                + "delivery-capability-version=" + DeliveryCapabilityPolicy.CONTRACT_VERSION + "\n"
+                + "delivery-capability-max-channels=" + DeliveryCapabilityPolicy.MAX_CHANNELS + "\n"
+                + "delivery-capability-disposition=" + names(DeliveryCapabilityPolicy.Disposition.values()) + "\n"
+                + "delivery-capability-reason=" + names(DeliveryCapabilityPolicy.Reason.values()) + "\n"
                 + "group-max-members=" + FrozenGroupPolicy.MAX_MEMBERS + "\n"
                 + "severity=" + names(AlarmSeverity.values()) + "\n"
                 + "condition=" + names(AlertSnapshot.Status.values()) + "\n"
