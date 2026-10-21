@@ -10,7 +10,7 @@
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
 validation.rule-unsupported:
   message: "Validation cannot interpret {rule} for field {field} at node {node}."
-  solution: "Use a supported static rule; validation cannot execute production expressions as its reference."
+  solution: "Use a supported validation rule; validation cannot execute production expressions as its reference."
 validation.codec-failed:
   message: "Connector {connector} failed to convert validation field {field}."
   solution: "Inspect the codec failure; another codec cannot silently replace its result."
