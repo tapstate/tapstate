@@ -20,6 +20,7 @@ import io.tapstate.runtime.engine.validation.ValidationRelationReader;
 import io.tapstate.runtime.engine.validation.ValidationRootReader;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
 import io.tapstate.runtime.engine.validation.ValidationReadScope;
+import io.tapstate.runtime.engine.validation.ValidationLocalBudget;
 import java.time.Clock;
 import java.util.Optional;
 import io.tapstate.core.validation.ValidationError;
@@ -245,6 +246,7 @@ class ValidationJdbcMongoReadIT {
             Map<String, Object> sourceSettings, ConnectorRef targetRef, String uri, ValidationStaticMap projection) throws Exception {
         var targetSettings = Map.<String, Object>of("uri", uri, "database", DATABASE, "isUri", true);
         try (var queryIo = Executors.newSingleThreadExecutor(); var decodeIo = Executors.newSingleThreadExecutor()) {
+            verifyBorrowedReadBudget(kind, sourceRef, sourceSettings, queryIo, decodeIo);
             var actual = new ArrayList<String>();
             for (long id = 1; id <= 6; id++) {
                 var result = rootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings, "source_records", "target_records", id,
@@ -279,6 +281,38 @@ class ValidationJdbcMongoReadIT {
             }
             assertThat(actual).containsExactly("7:EQUAL", "8:{SOURCE_DUPLICATE=1}", "9:{SOURCE_FIELD_INVALID=1}",
                     "10:{TARGET_DUPLICATE=1}", "11:{TARGET_EXTRA=1}");
+        }
+    }
+
+    private static void verifyBorrowedReadBudget(String kind, ConnectorRef sourceRef, Map<String, Object> settings,
+            ExecutorService queryIo, ExecutorService decodeIo) throws Exception {
+        var logical = new ValidationKey(List.of(ValidationKey.Part.number(1)));
+        var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                "task", "native-borrowed-" + kind, ValidationMode.FULL, "fixed-projection", 1, "rules"),
+                new ValidationRoot("mapping", "output", logical, List.of()), 1);
+        // This reservation witnesses handle ownership; it does not certify opaque driver allocations.
+        var amount = new ValidationLocalBudget.Amount(1024 * 1024, 4, 1, 1);
+        try (var cleanup = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<>(1), new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+                var budget = new ValidationLocalBudget("cluster", "node", "boot", amount, 1, () -> {});
+                var run = budget.admit(observation.run(), amount, () -> {});
+                var scope = new ValidationReadScope(observation, cleanup, () -> {}, 1)) {
+            var reserved = run.reserve(amount);
+            scope.drained().whenComplete((ignored, error) -> reserved.close());
+            var handle = scope.open("source_records", guard -> rootLookup(kind, sourceRef, settings,
+                    "source_records", "source_key", logical, queryIo, decodeIo, guard));
+            try (var row = handle.next().orElseThrow()) {
+                assertThat(row.values().fields()).containsKey("source_key");
+                scope.close(); run.close();
+                handle.workersExited().handle((ignored, error) -> null).toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS);
+                assertThat(handle.rowsReleased().toCompletableFuture().isDone()).isFalse();
+                assertThat(scope.drained().toCompletableFuture().isDone()).isFalse();
+                assertThat(run.released().toCompletableFuture().isDone()).isFalse();
+                assertThat(budget.snapshot().reserved()).isEqualTo(amount);
+            }
+            scope.drained().handle((ignored, error) -> null).toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(run.released().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            assertThat(budget.snapshot().reserved()).isEqualTo(new ValidationLocalBudget.Amount(0, 0, 0, 0));
         }
     }
 
