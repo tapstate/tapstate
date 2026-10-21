@@ -48,12 +48,19 @@ import java.util.function.Function;
  * anything moving a whole row map along — preserve the carrier, as does an untouched script slot, or the
  * write side loses what it is owed.
  */
-public record ConvertedValue(Object value, String originType) implements Serializable {
+// Conversion descriptions are adapter-owned portable text; no plugin classes cross this boundary.
+public record ConvertedValue(Object value, String originType, String valueKind,
+        String typeDescription, String temporalDescription) implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
     public ConvertedValue {
         Objects.requireNonNull(value, "value");
+    }
+
+    /** Reads the original carrier shape, whose conversion metadata was not recorded. */
+    public ConvertedValue(Object value, String originType) {
+        this(value, originType, null, null, null);
     }
 
     /**

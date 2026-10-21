@@ -19,6 +19,22 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PreviewDocumentStorageTest {
 
     @Test
+    void preservesCompleteConversionMetadataAndNanoseconds() {
+        ConvertedValue stamp = new ConvertedValue(Instant.parse("2021-11-22T00:08:03.849711123Z"),
+                "timestamp(9)", "TapDateTimeValue", "{\"fraction\":9}", "{\"nano\":849711123}");
+        Map<String, Object> document = Map.of("stamp", stamp);
+        assertThat(PreviewDocumentStorage.decode(PreviewDocumentStorage.encode(document))).isEqualTo(document);
+    }
+
+    @Test
+    void preservesLeafCodecsInsideConvertedContainers() {
+        ConvertedValue key = new ConvertedValue("abcdef", "OBJECT_ID", "TapStringValue", "{\"type\":10}", null);
+        ConvertedValue array = new ConvertedValue(List.of(Map.of("key", key)), "ARRAY", "TapArrayValue", "{\"type\":2}", null);
+        Map<String, Object> document = Map.of("array", array);
+        assertThat(PreviewDocumentStorage.decode(PreviewDocumentStorage.encode(document))).isEqualTo(document);
+    }
+
+    @Test
     void preservesTypeCarriersAcrossNestedDocumentsAndArrays() {
         Map<String, Object> nested = new LinkedHashMap<>();
         nested.put("_id", new ConvertedValue("64f0c0de0011223344556677", "ObjectId"));

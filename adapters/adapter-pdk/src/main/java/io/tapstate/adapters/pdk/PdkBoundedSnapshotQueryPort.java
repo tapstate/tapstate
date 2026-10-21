@@ -343,7 +343,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                 try {
                     Map<String, Object> copy = stringKeyed(sourceRow);
                     TapEvent event = TapInsertRecordEvent.create().table(table.getId()).after(copy);
-                    Envelope envelope = TapEventCodec.decodeSnapshotRow(event, connector.codecs(), declaredTypes(table));
+                    Envelope envelope = TapEventCodec.decodeSnapshotRow(event, connector.codecs(), PdkRowSchema.of(table));
                     long remainingBytes = request.maxBytes() - bytesUsed[0];
                     // Byte accounting renders PDK temporal values without changing the typed row.
                     long rowBytes = PdkPreviewJsonValues.encodedSize(envelope.after(), remainingBytes);
@@ -394,17 +394,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         return DataMap.create(new LinkedHashMap<>(values));
     }
 
-    private static Map<String, String> declaredTypes(TapTable table) {
-        Map<String, String> declared = new LinkedHashMap<>();
-        if (table.getNameFieldMap() != null) {
-            table.getNameFieldMap().forEach((name, field) -> {
-                if (field != null && field.getDataType() != null) {
-                    declared.put(name, field.getDataType());
-                }
-            });
-        }
-        return declared;
-    }
+
 
     private static Map<String, Object> stringKeyed(Map<String, Object> row) {
         if (row == null) {

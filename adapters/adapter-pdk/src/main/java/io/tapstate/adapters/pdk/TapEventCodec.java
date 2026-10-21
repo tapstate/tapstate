@@ -96,10 +96,14 @@ public final class TapEventCodec {
      */
     public static Envelope decodeChange(
             TapEvent event, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
+        return decodeChange(event, codecs, PdkRowSchema.declared(columnTypes));
+    }
+
+    static Envelope decodeChange(TapEvent event, TapCodecsRegistry codecs, PdkRowSchema schema) {
         Objects.requireNonNull(codecs, "codecs");
-        Objects.requireNonNull(columnTypes, "columnTypes");
+        Objects.requireNonNull(schema, "schema");
         if (event instanceof TapInsertRecordEvent insert) {
-            return Envelope.insert(ts(insert), src(insert), row(insert.getAfter(), codecs, columnTypes), null);
+            return Envelope.insert(ts(insert), src(insert), row(insert.getAfter(), codecs, schema), null);
         }
         if (event instanceof TapUpdateRecordEvent update) {
             // One reading over both images, because they are two halves of one row. Taken per image, an
@@ -116,14 +120,14 @@ public final class TapEventCodec {
             // whatever arrived before it, which a resume from another position silently changes, and
             // refusing the write turns a value the target can hold into a dropped field or a failed row.
             SchemaNames names =
-                    SchemaNames.read(codecs, columnTypes, update.getBefore(), update.getAfter());
+                    SchemaNames.read(codecs, schema.declared(), update.getBefore(), update.getAfter());
             return Envelope.update(ts(update), src(update),
-                    walk(update.getBefore(), codecs, names, true),
-                    walk(update.getAfter(), codecs, names, true),
+                    PdkValueConversions.read(update.getBefore(), codecs, schema.fields(), names::of, TapEventCodec::portable),
+                    PdkValueConversions.read(update.getAfter(), codecs, schema.fields(), names::of, TapEventCodec::portable),
                     null);
         }
         if (event instanceof TapDeleteRecordEvent delete) {
-            return Envelope.delete(ts(delete), src(delete), row(delete.getBefore(), codecs, columnTypes), null);
+            return Envelope.delete(ts(delete), src(delete), row(delete.getBefore(), codecs, schema), null);
         }
         if (event instanceof TapDDLEvent ddl) {
             return Envelope.ddl(ts(ddl), src(ddl), ddlSchema(ddl));
@@ -138,10 +142,14 @@ public final class TapEventCodec {
      */
     public static Envelope decodeSnapshotRow(
             TapEvent event, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
+        return decodeSnapshotRow(event, codecs, PdkRowSchema.declared(columnTypes));
+    }
+
+    static Envelope decodeSnapshotRow(TapEvent event, TapCodecsRegistry codecs, PdkRowSchema schema) {
         Objects.requireNonNull(codecs, "codecs");
-        Objects.requireNonNull(columnTypes, "columnTypes");
+        Objects.requireNonNull(schema, "schema");
         if (event instanceof TapInsertRecordEvent read) {
-            return Envelope.read(ts(read), src(read), row(read.getAfter(), codecs, columnTypes), null);
+            return Envelope.read(ts(read), src(read), row(read.getAfter(), codecs, schema), null);
         }
         throw new IllegalArgumentException(
                 "snapshot rows are insert-shaped; got: " + event.getClass().getName());
@@ -150,33 +158,14 @@ public final class TapEventCodec {
     // ---- the value model a decoded row speaks --------------------------------------------
 
     /**
-     * One row's values carried into the tapstate value model, or {@code null} when the map is absent.
-     *
-     * <p>A row travels in two lanes, and which one a value takes is the connector's answer, not ours.
-     * A driver type the connector registered a conversion for takes that conversion and arrives as
-     * the portable value the connector chose; everything else — the ordinary Java boxes — arrives as
-     * a bare value, normalized. Two compatibility corrections cover MongoDB conversions with known
-     * loss: a Decimal128 narrowed to a double is replaced with the source's exact portable decimal,
-     * and a timestamp whose seconds were read as milliseconds is rebuilt from seconds. Only those
-     * exact results are replaced. A row is therefore mixed, which is the contract rather than a gap:
-     * the frozen conversion surface deliberately registers nothing for the ordinary boxes, so putting
-     * them through it would pay a wrapper for a conversion that does not exist.
-     *
-     * <p>On the bare lane: a driver hands over whatever box its own client uses — an int column may
-     * arrive in any integral box, a real one as a float — while the type namespace a column resolves
-     * into names one width per kind. Converting here is what makes the two agree: the boundary that
-     * resolves a column's type is the boundary that delivers a value of that type, so nothing
-     * downstream has to reconcile a column declared 64-bit with a value that is not.
-     *
-     * <p>Every conversion widens or re-wraps and none of them rounds, so no value changes on the way
-     * in. Only a value the target actually holds is converted: a wider integer is left as it came,
-     * where narrowing it would hand every reader downstream a different number and report it as a
-     * success. An exact fixed-point number stays exact in every case — routing it through any binary
-     * floating point type drops digits silently, which is the one loss nothing downstream could detect.
+     * Runs the source connector's PDK conversion flow with its discovered fields. The portable
+     * carrier retains the exact value kind and type description needed by the target's reverse
+     * conversion; integer widths are normalized without routing exact numbers through doubles.
      */
     private static Map<String, Object> row(
-            Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
-        return walk(row, codecs, SchemaNames.read(codecs, columnTypes, row, null), true);
+            Map<String, Object> row, TapCodecsRegistry codecs, PdkRowSchema schema) {
+        SchemaNames names = SchemaNames.read(codecs, schema.declared(), row, null);
+        return PdkValueConversions.read(row, codecs, schema.fields(), names::of, TapEventCodec::portable);
     }
 
     /**
@@ -576,8 +565,7 @@ public final class TapEventCodec {
      * every carried value put back the way the target wants it.
      */
     private static Map<String, Object> mutable(Map<String, Object> map, TapCodecsRegistry codecs) {
-        return map == null ? null
-                : new LinkedHashMap<>(ConvertedValue.unwrapRow(map, carrier -> restored(carrier, codecs)));
+        return PdkValueConversions.write(map, codecs, carrier -> restored(carrier, codecs));
     }
 
     /**
