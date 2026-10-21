@@ -25,13 +25,13 @@ public final class ValidationRootCheck {
     public enum TargetPresence { PRESENT, ABSENT, NOT_READ }
     public enum Side { SOURCE, TARGET }
     public enum Kind {
-        TARGET_MISSING, TARGET_EXTRA, TARGET_DUPLICATE, TARGET_STRUCTURE, TARGET_VALUE, TARGET_TYPE,
-        SOURCE_DUPLICATE, SOURCE_CARDINALITY, SOURCE_REFERENCE_MISSING, SOURCE_FIELD_MISSING,
+        TARGET_MISSING, TARGET_EXTRA, TARGET_DUPLICATE, TARGET_ROW_DUPLICATE, TARGET_IDENTITY, TARGET_STRUCTURE, TARGET_VALUE, TARGET_TYPE,
+        SOURCE_DUPLICATE, SOURCE_ROW_DUPLICATE, SOURCE_CARDINALITY, SOURCE_REFERENCE_MISSING, SOURCE_FIELD_MISSING,
         SOURCE_FIELD_CONFLICT, SOURCE_FIELD_INVALID;
 
         public boolean sourceProblem() {
             return switch (this) {
-                case SOURCE_DUPLICATE, SOURCE_CARDINALITY, SOURCE_REFERENCE_MISSING, SOURCE_FIELD_MISSING,
+                case SOURCE_DUPLICATE, SOURCE_ROW_DUPLICATE, SOURCE_CARDINALITY, SOURCE_REFERENCE_MISSING, SOURCE_FIELD_MISSING,
                         SOURCE_FIELD_CONFLICT, SOURCE_FIELD_INVALID -> true;
                 default -> false;
             };
@@ -77,8 +77,8 @@ public final class ValidationRootCheck {
             Objects.requireNonNull(kind, "kind");
             Objects.requireNonNull(location, "location");
             Objects.requireNonNull(multiplicity, "multiplicity");
-            boolean repeated = kind == Kind.SOURCE_DUPLICATE || kind == Kind.SOURCE_CARDINALITY
-                    || kind == Kind.TARGET_DUPLICATE;
+            boolean repeated = kind == Kind.SOURCE_DUPLICATE || kind == Kind.SOURCE_ROW_DUPLICATE || kind == Kind.SOURCE_CARDINALITY
+                    || kind == Kind.TARGET_DUPLICATE || kind == Kind.TARGET_ROW_DUPLICATE;
             if (repeated != multiplicity.isPresent()) throw ValidationError.invalid("rootCheck.findingMultiplicity");
         }
         public Finding(Kind kind, Location location) { this(kind, location, Optional.empty()); }
@@ -90,6 +90,19 @@ public final class ValidationRootCheck {
             Objects.requireNonNull(location, "location");
             Objects.requireNonNull(cause, "cause");
             if (!cause.kind().sourceProblem()) throw ValidationError.invalid("rootCheck.blockedCause");
+        }
+    }
+
+    /** A known target structural difference makes only its dependent checks inapplicable. */
+    public record Skipped(Check check, Location location, Finding cause) {
+        public Skipped {
+            Objects.requireNonNull(check, "check");
+            Objects.requireNonNull(location, "location");
+            Objects.requireNonNull(cause, "cause");
+            if (check != Check.STRUCTURE && check != Check.VALUES || cause.kind().sourceProblem()
+                    || cause.kind() == Kind.TARGET_VALUE || cause.kind() == Kind.TARGET_IDENTITY) {
+                throw ValidationError.invalid("rootCheck.skippedCause");
+            }
         }
     }
 
@@ -128,6 +141,7 @@ public final class ValidationRootCheck {
     private final Map<Finding, Long> findings;
     private final Map<Kind, Long> counts;
     private final List<Blocked> notCompared;
+    private final List<Skipped> notApplicableScopes;
     private final List<Read> reads;
     private final List<Sample> samples;
     private final boolean samplesTruncated;
@@ -142,6 +156,7 @@ public final class ValidationRootCheck {
         findings = Collections.unmodifiableMap(new LinkedHashMap<>(builder.findings));
         counts = Collections.unmodifiableMap(new EnumMap<>(builder.counts));
         notCompared = List.copyOf(builder.blocked);
+        notApplicableScopes = List.copyOf(builder.skipped);
         reads = List.copyOf(builder.reads.values());
         samples = List.copyOf(builder.samples);
         samplesTruncated = builder.samplesTruncated;
@@ -156,6 +171,7 @@ public final class ValidationRootCheck {
     public Map<Finding, Long> findings() { return findings; }
     public Map<Kind, Long> counts() { return counts; }
     public List<Blocked> notCompared() { return notCompared; }
+    public List<Skipped> notApplicableScopes() { return notApplicableScopes; }
     public List<Read> reads() { return reads; }
     public List<Sample> samples() { return samples; }
     public boolean samplesTruncated() { return samplesTruncated; }
@@ -178,6 +194,7 @@ public final class ValidationRootCheck {
         private final Map<Finding, Long> findings = new LinkedHashMap<>();
         private final EnumMap<Kind, Long> counts = new EnumMap<>(Kind.class);
         private final Set<Blocked> blocked = new LinkedHashSet<>();
+        private final Set<Skipped> skipped = new LinkedHashSet<>();
         private final Map<ReadKey, Read> reads = new LinkedHashMap<>();
         private final List<Sample> samples = new ArrayList<>();
         private final ValidationFailureLatch failure = new ValidationFailureLatch();
@@ -198,6 +215,11 @@ public final class ValidationRootCheck {
             charge(16 * 1024L + locationBytes(new Location(observation.root(), List.of())));
             if (method == ValidationMethod.UNIQUE_KEY) checks.put(Check.VALUES, Status.NOT_APPLICABLE);
         }
+
+        public ValidationObservation observation() { return observation; }
+        public ValidationMethod method() { return method; }
+        public Participation participation() { return participation; }
+        public TargetPresence targetPresence() { return targetPresence; }
 
         public Builder checked(Check check) {
             return mutate(() -> {
@@ -267,10 +289,25 @@ public final class ValidationRootCheck {
                     throw ValidationError.invalid("rootCheck.blockedCause");
                 }
                 if (blocked.contains(item)) return;
-                if (blocked.size() == limits.blockedScopes()) throw limit("blockedScopes");
+                if (blocked.size() + skipped.size() == limits.blockedScopes()) throw limit("blockedScopes");
                 charge(128L + locationBytes(location) + locationBytes(cause.location()));
                 blocked.add(item);
                 checks.put(check, Status.BLOCKED);
+            });
+        }
+
+        public Builder notApplicable(Check check, Location location, Finding cause) {
+            return mutate(() -> {
+                Skipped item = new Skipped(check, location, cause);
+                sameRoot(location);
+                sameRoot(cause.location());
+                if (!findings.containsKey(cause) || method == ValidationMethod.UNIQUE_KEY && check == Check.VALUES) {
+                    throw ValidationError.invalid("rootCheck.skippedCause");
+                }
+                if (skipped.contains(item)) return;
+                if (blocked.size() + skipped.size() == limits.blockedScopes()) throw limit("blockedScopes");
+                charge(128L + locationBytes(location) + locationBytes(cause.location()));
+                skipped.add(item);
             });
         }
 
@@ -362,7 +399,7 @@ public final class ValidationRootCheck {
         private void fail(Throwable cause) { failure.record(cause); close(); }
         @Override public void close() {
             closed = true;
-            checks.clear(); findings.clear(); counts.clear(); blocked.clear(); reads.clear(); samples.clear();
+            checks.clear(); findings.clear(); counts.clear(); blocked.clear(); skipped.clear(); reads.clear(); samples.clear();
         }
         private record ReadKey(Side side, String id) {}
     }
