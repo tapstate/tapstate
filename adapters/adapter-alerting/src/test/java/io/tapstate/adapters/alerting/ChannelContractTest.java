@@ -40,6 +40,25 @@ class ChannelContractTest {
             }
         }
     }
+    @Test void attemptPermitIdsAndTransportRequestIdsHaveTheSameContract() {
+        var scope = new AlarmKey.Scope("org", "cluster");
+        var destination = new Destination(scope, "webhook", "receiver", "target", "binding");
+        for (String invalid : new String[]{null, "", "delivery id", "a/b", "\ud800", new String(Character.toChars(0x1f680)), "x".repeat(257)}) {
+            for (int field = 0; field < 2; field++) {
+                String deliveryId = field == 0 ? invalid : "delivery";
+                String attemptId = field == 1 ? invalid : "attempt";
+                assertThatThrownBy(() -> DeliveryAttempt.grant(scope, deliveryId, attemptId, 1, 1, "owner",
+                        ChannelRetryPolicy.webhookDefaults(), T, T.plusSeconds(60), T)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                assertThatThrownBy(() -> new Request(destination, Purpose.BUSINESS, deliveryId, attemptId, T.plusSeconds(30),
+                        "application/json", new byte[]{123, 125})).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            }
+        }
+        String longest = "A0._-".repeat(51) + "x";
+        var permit = DeliveryAttempt.grant(scope, longest, longest, 1, 1, "owner", ChannelRetryPolicy.webhookDefaults(),
+                T, T.plusSeconds(60), T).orElseThrow().permit();
+        assertThatCode(() -> new Request(destination, Purpose.BUSINESS, permit.deliveryId(), permit.attemptId(), permit.deadline(),
+                "application/json", new byte[]{123, 125})).doesNotThrowAnyException();
+    }
     @Test void localNormalReturnIsAcceptedAndNoPublisherInvocationIsNotSuccess() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         try (var channel = new SdkPlaceholderChannel(AlertChannelPolicy.Deployment.CLOUD_MANAGED, new TargetBinding(new AlarmKey.Scope("org", "cluster"), "system", "cluster", "binding-1"), ignored -> calls.incrementAndGet(), Clock.fixed(T, ZoneOffset.UTC))) {

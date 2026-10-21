@@ -14,7 +14,7 @@ class AlertCoreContractTest {
         String actual = "contract-version=" + AlarmKey.CONTRACT_VERSION + "\n"
                 + fields("alarm-key", AlarmKey.class) + fields("scope", AlarmKey.Scope.class)
                 + fields("resource", AlarmKey.Resource.class) + fields("rule", AlertRule.class)
-                + fields("signal", AlertSignal.class)
+                + fields("signal", AlertSignal.class) + fields("permit", DeliveryAttempt.Permit.class)
                 + "severity=" + names(AlarmSeverity.values()) + "\n"
                 + "condition=" + names(AlertSnapshot.Status.values()) + "\n"
                 + "quality=" + names(AlertSnapshot.Quality.values()) + "\n"

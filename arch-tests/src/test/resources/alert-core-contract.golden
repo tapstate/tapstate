@@ -4,6 +4,7 @@ scope=authorityId,clusterId
 resource=kind,id,incarnation
 rule=key,revision,generation,producerIncarnation,triggerFor,resolveFor,maxAge,maxGap
 signal=key,revision,generation,producerIncarnation,sequence,observedAt,condition,severity
+permit=scope,deliveryId,attemptId,ordinal,ownerGeneration,ownerId,grantedAt,deadline
 severity=CRITICAL,MAJOR,MINOR,WARNING,INDETERMINATE
 condition=CLEAR,PENDING,FIRING,RESOLVED
 quality=VALID,UNKNOWN,STALE,CLOCK_INVALID,DISABLED

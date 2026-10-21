@@ -42,8 +42,8 @@ public interface NotificationChannel extends AutoCloseable {
         public Request {
             Objects.requireNonNull(destination, "destination"); Objects.requireNonNull(purpose, "purpose");
             Objects.requireNonNull(deadline, "deadline");
-            valid(deliveryId != null && deliveryId.matches("[A-Za-z0-9._-]{1,256}"), "deliveryId");
-            valid(attemptId != null && attemptId.matches("[A-Za-z0-9._-]{1,256}"), "attemptId");
+            deliveryId = io.tapstate.core.alerting.DeliveryAttempt.Permit.transportId(deliveryId, "deliveryId");
+            attemptId = io.tapstate.core.alerting.DeliveryAttempt.Permit.transportId(attemptId, "attemptId");
             valid(contentType != null && (contentType.equals("application/json") || contentType.equals("message/rfc822")), "contentType");
             valid(payload != null && payload.length > 0 && payload.length <= 256 * 1024, "payload");
             payload = payload.clone();
