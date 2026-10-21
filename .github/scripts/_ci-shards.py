@@ -219,8 +219,7 @@ def run_shard(args, root, plan):
         java_tmp = Path(runner_temp).resolve() / 'tapstate-java-tmp'
         java_tmp.mkdir(parents=True, exist_ok=True)
         java_option = '-Djava.io.tmpdir=' + str(java_tmp)
-        env['JAVA_TOOL_OPTIONS'] = ' '.join(value for value in
-                                           (env.get('JAVA_TOOL_OPTIONS', '').strip(), java_option) if value)
+        command.insert(command.index('-pl'), java_option)
     subprocess.run(command, cwd=root, check=True, env=env)
 
 

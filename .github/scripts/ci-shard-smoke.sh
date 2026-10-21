@@ -53,7 +53,8 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')],check=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH'],'RUNNER_TEMP':str(runner_temp),'JAVA_TOOL_OPTIONS':'-Dfile.encoding=UTF-8'})
     args=(root/'mvn-args').read_text().splitlines(); assert '-am' not in args and 'verify' in args and '-pl' in args
     assert '-Dapi.version=1.44' in args, 'Docker 29 requires a supported Testcontainers API version'
-    assert (root/'mvn-env').read_text()=='-Dfile.encoding=UTF-8 -Djava.io.tmpdir='+str(runner_temp.resolve()/'tapstate-java-tmp')
+    assert '-Djava.io.tmpdir='+str(runner_temp.resolve()/'tapstate-java-tmp') in args
+    assert (root/'mvn-env').read_text()=='-Dfile.encoding=UTF-8', 'do not inject JVM options into child Java processes'
     assert (runner_temp/'tapstate-java-tmp').is_dir(), 'runner-backed Java temporary directory must exist before Maven starts'
     assert any(a.startswith('-Dtest=') and all(name in a for name in ['FixedSleepGateTest','ErrorCodeGatesTest','NestStateSerialFormGatesTest']) for a in args)
     assert set(args[args.index('-pl')+1].split(','))=={'arch-tests', 'core', 'e2e'}, 'source-scanning gates must run in their owning modules'
