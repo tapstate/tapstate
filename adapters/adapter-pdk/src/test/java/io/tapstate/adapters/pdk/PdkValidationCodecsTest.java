@@ -3,6 +3,8 @@ package io.tapstate.adapters.pdk;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
 import io.tapdata.entity.schema.type.TapNumber;
+import io.tapdata.entity.schema.type.TapJson;
+import io.tapdata.entity.schema.value.TapJsonValue;
 import io.tapdata.entity.schema.type.TapString;
 import io.tapdata.entity.schema.type.TapType;
 import io.tapdata.entity.schema.value.TapNumberValue;
@@ -25,6 +27,63 @@ import static org.assertj.core.api.Assertions.*;
 
 class PdkValidationCodecsTest {
     private record DriverValue(String value) {}
+
+    @Test void declaredJsonParsesTheCustomResultOnceWithoutReplacingItsMeaning() {
+        var registry = new Registry();
+        AtomicInteger calls = new AtomicInteger();
+        registry.registerToTapValue(DriverValue.class, (value, model) -> {
+            calls.incrementAndGet();
+            assertThat(model).isInstanceOf(TapJson.class);
+            return new TapJsonValue("{\"n\":9007199254740993,\"child\":[1.2300,null]}");
+        });
+        var selector = codecs(registry);
+        var selected = selector.select("document", new DriverValue("not-json"), new TapJson());
+        var parsed = (Map<?, ?>) selector.jsonText("document", selected, new ValidationValues.Limits(8192, 100, 12));
+        assertThat(parsed.get("n")).isEqualTo(new BigInteger("9007199254740993"));
+        assertThat(((List<?>)parsed.get("child")).getFirst()).isEqualTo(new BigDecimal("1.2300"));
+        assertThat(calls).hasValue(1);
+        assertThat(registry.defaultCalls).hasValue(0);
+    }
+
+    @Test void jsonTextLaneKeepsOrdinaryTextSeparateAndPreservesValidNull() {
+        var selector = codecs(new Registry());
+        var limits = new ValidationValues.Limits(8192, 100, 12);
+        var text = selector.select("text", "{\"a\":1}", new TapString());
+        assertThat(text.value()).isEqualTo("{\"a\":1}");
+        for (Object value : List.of(new TapStringValue("{\"a\":1}"),
+                new ValidationValues.Typed("text", "varchar", "binding-v1", "{}"), Map.of("a", 1))) {
+            assertThatThrownBy(() -> selector.jsonText("json", selector.select("json", value, new TapJson()), limits))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ValidationError.CODEC_VALUE_UNAVAILABLE));
+        }
+        assertThat(selector.jsonText("json", selector.select("json", null, new TapJson()), limits)).isNull();
+        assertThat(selector.jsonText("json", selector.select("json", new TapJsonValue(null), new TapJson()), limits)).isNull();
+        assertThat(selector.jsonText("json", selector.select("json", new ConvertedValue("null", "jsonb"), new TapJson()), limits)).isNull();
+        assertThatThrownBy(() -> selector.jsonText("json",
+                new PdkValidationCodecs.Selected("{}", PdkValidationCodecs.Origin.BUILTIN, "stale"), limits))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ValidationError.CODEC_VALUE_UNAVAILABLE));
+    }
+
+    @Test void jsonWrapperFailuresKeepTheirCauseAndFatalErrorsEscape() {
+        var selector = codecs(new Registry());
+        var limits = new ValidationValues.Limits(8192, 100, 12);
+        var cause = new IllegalStateException("broken JSON value");
+        TapJsonValue broken = new TapJsonValue() {
+            @Override public String getValue() { throw cause; }
+        };
+        assertThatThrownBy(() -> selector.jsonText("json", selector.select("json", broken, new TapJson()), limits))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ValidationError.CODEC_FAILED);
+                    assertThat(failure.getCause()).isSameAs(cause);
+                });
+        var fatal = new AssertionError("fatal JSON value");
+        TapJsonValue fatalValue = new TapJsonValue() {
+            @Override public String getValue() { throw fatal; }
+        };
+        assertThatThrownBy(() -> selector.jsonText("json", selector.select("json", fatalValue, new TapJson()), limits))
+                .isSameAs(fatal);
+    }
 
     @Test void exactNumericLaneRefusesCollapsedCustomDoublesWithoutTryingAnotherCodec() {
         var registry = new Registry();

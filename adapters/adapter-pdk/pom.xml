@@ -112,6 +112,12 @@
       <artifactId>assertj-core</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Validation parses declared JSON text with bounded streaming tokens and exact numbers.
+         This does not replace the connector framework's own parser provider. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+    </dependency>
     <!-- Test-only JSON implementation for the frozen parser interface; production uses the PDK provider. -->
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>

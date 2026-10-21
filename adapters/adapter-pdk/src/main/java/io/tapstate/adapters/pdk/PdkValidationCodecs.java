@@ -4,6 +4,7 @@ import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
 import io.tapdata.entity.schema.type.TapType;
 import io.tapdata.entity.schema.type.TapNumber;
+import io.tapdata.entity.schema.type.TapJson;
 import io.tapdata.entity.schema.value.TapRawValue;
 import io.tapdata.entity.schema.value.TapValue;
 import io.tapstate.core.common.TapstateException;
@@ -106,6 +107,38 @@ final class PdkValidationCodecs {
             } else {
                 throw unavailable(field);
             }
+        }
+        throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "codecWrappers"), null);
+    }
+
+    /**
+     * Parses a selected textual JSON representation only when the caller's fixed rule declares JSON.
+     * A custom text wrapper is not JSON merely because its contents look like an object. Already
+     * structured portable values use their normal ownership path and must not enter this text lane.
+     */
+    Object jsonText(String field, Selected selected, ValidationValues.Limits limits) {
+        Objects.requireNonNull(field, "field");
+        Objects.requireNonNull(selected, "selected");
+        Objects.requireNonNull(limits, "limits");
+        if (!binding.equals(selected.codecBinding())) throw unavailable(field);
+        Object value = selected.value();
+        for (int wrappers = 0; wrappers < 64; wrappers++) {
+            if (value == null) return null;
+            if (value instanceof ValidationValues.Typed typed) {
+                if (!binding.equals(typed.codecBinding()) || !typed.logicalType().equals("json")) throw unavailable(field);
+                value = typed.value();
+            } else if (value instanceof ConvertedValue converted) {
+                value = converted.value();
+            } else if (value instanceof TapValue<?, ?> converted) {
+                Class<? extends TapType> kind;
+                try { kind = converted.tapTypeClass(); }
+                catch (RuntimeException failure) { throw failed(field, failure); }
+                if (kind != TapJson.class) throw unavailable(field);
+                try { value = converted.getValue(); }
+                catch (RuntimeException failure) { throw failed(field, failure); }
+            } else if (value instanceof String text) {
+                return PdkValidationJson.parse(text, connectorId, field, limits);
+            } else throw unavailable(field);
         }
         throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "codecWrappers"), null);
     }
