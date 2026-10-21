@@ -52,6 +52,18 @@ class ValidationArrayPredicateCompilerTest {
         }
     }
 
+    @Test void compiledPresenceAndArrayMacrosRespectUnresolvedSourceDependencies() {
+        var partial = row(Map.of("groups", List.of(Map.of("members", List.of(Map.of())))));
+        var predicate = compile("after.groups.exists(group, group.members.exists(member, has(member.keep)))");
+        var result = predicate.evaluate(partial, List.of(List.of("groups", 0, "members", 0, "keep")));
+        assertThat(result.matches()).isNull();
+        assertThat(result.problem()).isEqualTo(new ValidationPredicate.Problem(ValidationPredicate.ProblemKind.UNAVAILABLE_FIELD,
+                List.of("groups", 0, "members", 0, "keep")));
+        assertThat(compile("size(after.groups) == 1").evaluate(partial, List.of(List.of("groups", 0, "members", 0, "keep"))).matches()).isTrue();
+        assertThat(compile("!has(after.customer)").evaluate(row(Map.of()), List.of(List.of("customer"))).matches()).isNull();
+        assertThat(compile("!has(after.customer)").evaluate(row(Map.of())).matches()).isTrue();
+    }
+
     private static ValidationPredicate compile(String source) { return ValidationPredicateCompiler.compile("filter", source, LIMITS); }
     private static ValidationValues.Row row(Map<String, ?> input) { return ValidationValues.ownRow(input, ROW); }
 }

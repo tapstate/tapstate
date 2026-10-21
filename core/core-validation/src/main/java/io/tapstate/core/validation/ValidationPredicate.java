@@ -43,13 +43,13 @@ public final class ValidationPredicate {
         public Or { Objects.requireNonNull(left); Objects.requireNonNull(right); }
     }
     public record Not(Expr operand) implements Expr { public Not { Objects.requireNonNull(operand); } }
-    public enum ProblemKind { MISSING_FIELD, INVALID_PARENT, INCOMPATIBLE_TYPE, UNSUPPORTED_VALUE, NOT_BOOLEAN }
+    public enum ProblemKind { UNAVAILABLE_FIELD, MISSING_FIELD, INVALID_PARENT, INCOMPATIBLE_TYPE, UNSUPPORTED_VALUE, NOT_BOOLEAN }
     public record Problem(ProblemKind kind, List<Object> path) {
         public Problem {
             Objects.requireNonNull(kind);
             if (path == null || path.size() > 64) throw ValidationError.invalid("predicate.problemPath");
             for (Object segment : path) {
-                if (segment instanceof String field) ValidationError.identifier(field, "predicate.problemPath");
+                if (segment instanceof String field) ValidationError.fieldName(field, "predicate.problemPath");
                 else if (!(segment instanceof Integer ordinal) || ordinal < 0) throw ValidationError.invalid("predicate.problemPath");
             }
             path = List.copyOf(path);
@@ -126,11 +126,39 @@ public final class ValidationPredicate {
     public long retainedBytes() { return retainedBytes; }
 
     /** Resource/protocol/authorization errors are thrown, never represented as absorbable data problems. */
-    public Result evaluate(ValidationValues.Row row) {
+    public Result evaluate(ValidationValues.Row row) { return evaluate(row, List.of()); }
+
+    /**
+     * Evaluates a partial independently assembled view. Unavailable paths identify unresolved source
+     * subtrees, not absent fields or NULL values; their original source causes remain with the caller.
+     * Paths include original array ordinals. Known container presence/length and independent fields
+     * remain usable when only a descendant value is unavailable. Unknown membership blocks the whole
+     * array path. The caller must not insert guessed values or omit unresolved paths from this mask.
+     */
+    public Result evaluate(ValidationValues.Row row, List<List<Object>> unavailablePaths) {
         Objects.requireNonNull(row);
         if (row.accountedBytes() > limits.row().bytes() || row.nodes() > limits.row().nodes() || row.depth() > limits.row().depth())
             throw limit("filter.input");
         var budget = new Budget(limits.maxOperations());
+        if (unavailablePaths == null || unavailablePaths.size() > 256) throw ValidationError.invalid("predicate.unavailablePaths");
+        long bytes = row.accountedBytes();
+        var unavailable = new ArrayList<List<Object>>(unavailablePaths.size());
+        for (var path : unavailablePaths) {
+            budget.spend(1);
+            if (path == null || path.size() > 64) throw ValidationError.invalid("predicate.unavailablePath");
+            bytes += 64L + 8L * path.size();
+            for (Object segment : path) {
+                budget.spend(1);
+                if (segment instanceof String field) {
+                    ValidationError.fieldName(field, "predicate.unavailablePath");
+                    bytes += 48L + 2L * field.length();
+                } else if (segment instanceof Integer ordinal && ordinal >= 0) bytes += 24L;
+                else throw ValidationError.invalid("predicate.unavailablePath");
+            }
+            if (bytes > limits.row().bytes()) throw limit("filter.input");
+            unavailable.add(List.copyOf(path));
+        }
+        budget.unavailable = List.copyOf(unavailable);
         Value value = bool(evaluate(root, row.fields(), budget, null), budget);
         return value.problem() == null ? new Result((Boolean)value.value(), null) : new Result(null, value.problem());
     }
@@ -235,6 +263,9 @@ public final class ValidationPredicate {
             if (bound == null) throw new IllegalStateException("compiled predicate binding is absent");
             current = bound.value(); actualPath.addAll(bound.path());
         }
+        var requested = new ArrayList<Object>(actualPath); requested.addAll(path);
+        Problem unavailable = budget.unavailable(requested);
+        if (unavailable != null) return problem(unavailable);
         for (int i = 0; i < path.size(); i++) {
             budget.spend(1);
             while (current instanceof ValidationValues.Typed typed) {
@@ -357,7 +388,22 @@ public final class ValidationPredicate {
     }
     private static final class Budget {
         private long remaining;
+        private List<List<Object>> unavailable = List.of();
         Budget(long remaining) { this.remaining = remaining; }
+        Problem unavailable(List<Object> requested) {
+            for (var path : unavailable) {
+                spend(1);
+                if (path.size() > requested.size()) continue;
+                boolean matches = true;
+                for (int i = 0; i < path.size(); i++) {
+                    Object segment = path.get(i);
+                    spend(segment instanceof String text ? 1L + text.length() : 1L);
+                    if (!segment.equals(requested.get(i))) { matches = false; break; }
+                }
+                if (matches) return new Problem(ProblemKind.UNAVAILABLE_FIELD, path);
+            }
+            return null;
+        }
         void spend(long units) { if (units > remaining) throw limit("filter.operations"); remaining -= units; }
     }
 }
