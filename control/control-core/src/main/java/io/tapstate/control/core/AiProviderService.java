@@ -13,7 +13,8 @@ public final class AiProviderService {
             "https://api.openai.com/v1", "https://api.deepseek.com/v1", "https://api.deepseek.com",
             "https://api.groq.com/openai/v1", "https://api.mistral.ai/v1", "https://api.x.ai/v1",
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            "https://api.moonshot.ai/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1");
+            "https://api.moonshot.ai/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://api.super-nb.me", "https://api.super-nb.me/v1");
     private final AiProviderSettingsStore store;
     private final AuditGate audit;
     public AiProviderService(AiProviderSettingsStore store, AuditGate audit) {

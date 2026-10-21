@@ -12,6 +12,14 @@ import java.util.*;
 import static org.assertj.core.api.Assertions.*;
 
 class AiProviderServiceTest {
+    @Test void acceptsTheConfiguredOpenAiCompatibleEndpoint() {
+        for (String endpoint : List.of("https://api.super-nb.me", "https://api.super-nb.me/v1")) {
+            assertThat(AiProviderService.validated(
+                    new AiProviderSettings("openai-compatible", endpoint, "model", "sk-test")).baseUrl())
+                    .isEqualTo(endpoint);
+        }
+    }
+
     @Test void endpointAllowlistRejectsSsrfAndHeaderInjectionWithoutEchoingSecrets() {
         for (String endpoint : List.of("http://localhost/v1", "https://127.0.0.1/v1", "https://169.254.169.254/v1",
                 "https://api.openai.com.evil.example/v1", "https://api.openai.com@evil.example/v1", "https://api.openai.com/v1?secret=sk-test")) {
