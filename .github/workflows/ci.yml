@@ -105,6 +105,8 @@ jobs:
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
+          # The pinned client otherwise selects an API version current runners reject.
+          MAVEN_ARGS: -Dapi.version=1.44
         run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Preserve downloaded dependencies
         if: always()
