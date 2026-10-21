@@ -28,7 +28,9 @@ import java.util.function.Consumer;
  * construction, initialization, discovery and queries run on the query executor. Row delivery/codecs
  * run on a distinct admitted decoding executor, including joined off-thread callbacks, always under
  * the connector loader. Close can call blocking connector stop and therefore belongs on I/O too.
- * This adapter does not establish native ordering, read freshness or driver allocation guarantees.
+ * Each live read must own a query slot and a decode slot for its duration; backpressured reads must
+ * not queue their callbacks behind each other on an undersized executor. This adapter does not
+ * establish native ordering, read freshness or driver allocation guarantees.
  */
 final class PdkValidationSession {
     /** Runs after independent discovery and before any business query or row decoding. */

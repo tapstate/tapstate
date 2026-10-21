@@ -19,6 +19,11 @@
     never on an adapter.</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The resource model the DAG builder reads to compile a pipeline into a Jet job; core ring,
          zero third-party (rule R4: core + spi only). -->
     <dependency>
