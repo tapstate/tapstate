@@ -180,15 +180,21 @@ public final class ValidationRootCheck {
 
     public static Builder builder(ValidationObservation observation, ValidationMethod method,
                                   Participation participation, TargetPresence targetPresence, Limits limits) {
-        return new Builder(observation, method, participation, targetPresence, limits);
+        return new Builder(observation, method, participation, targetPresence, limits, false);
+    }
+
+    /** Source-only staging; the outcome is bound once after independent source participation settles. */
+    public static Builder pending(ValidationObservation observation, ValidationMethod method, Limits limits) {
+        return new Builder(observation, method, Participation.UNKNOWN, TargetPresence.NOT_READ, limits, true);
     }
 
     /** Thread-confined staging. Closing discards partial facts; any failure prevents subsequent finish. */
     public static final class Builder implements AutoCloseable {
         private final ValidationObservation observation;
         private final ValidationMethod method;
-        private final Participation participation;
-        private final TargetPresence targetPresence;
+        private Participation participation;
+        private TargetPresence targetPresence;
+        private boolean outcomePending;
         private final Limits limits;
         private final EnumMap<Check, Status> checks = new EnumMap<>(Check.class);
         private final Map<Finding, Long> findings = new LinkedHashMap<>();
@@ -203,12 +209,13 @@ public final class ValidationRootCheck {
         private boolean closed;
 
         private Builder(ValidationObservation observation, ValidationMethod method, Participation participation,
-                        TargetPresence targetPresence, Limits limits) {
+                        TargetPresence targetPresence, Limits limits, boolean outcomePending) {
             this.observation = Objects.requireNonNull(observation, "observation");
             this.method = Objects.requireNonNull(method, "method");
             this.participation = Objects.requireNonNull(participation, "participation");
             this.targetPresence = Objects.requireNonNull(targetPresence, "targetPresence");
             this.limits = Objects.requireNonNull(limits, "limits");
+            this.outcomePending = outcomePending;
             if (!observation.root().ancestors().isEmpty() || method == ValidationMethod.COUNT
                     || !method.supports(observation.run().mode())) throw ValidationError.invalid("rootCheck.scope");
             // Fixed identity strings are bounded independently; include them in the local retained charge.
@@ -221,9 +228,24 @@ public final class ValidationRootCheck {
         public Participation participation() { return participation; }
         public TargetPresence targetPresence() { return targetPresence; }
 
+        public Builder bindOutcome(Participation participation, TargetPresence targetPresence) {
+            return mutate(() -> {
+                Objects.requireNonNull(participation, "participation");
+                Objects.requireNonNull(targetPresence, "targetPresence");
+                if (!outcomePending || reads.values().stream().noneMatch(read -> read.side() == Side.SOURCE)
+                        || targetPresence == TargetPresence.NOT_READ && participation != Participation.UNKNOWN) {
+                    throw ValidationError.invalid("rootCheck.outcome");
+                }
+                this.participation = participation;
+                this.targetPresence = targetPresence;
+                outcomePending = false;
+            });
+        }
+
         public Builder checked(Check check) {
             return mutate(() -> {
                 Objects.requireNonNull(check, "check");
+                if (outcomePending) throw ValidationError.invalid("rootCheck.sourceOnly");
                 if (checks.get(check) == Status.NOT_APPLICABLE) throw ValidationError.invalid("rootCheck.check");
                 checks.putIfAbsent(check, Status.COMPLETE);
             });
@@ -231,6 +253,7 @@ public final class ValidationRootCheck {
 
         public Builder notApplicable(Check check) {
             return mutate(() -> {
+                if (outcomePending) throw ValidationError.invalid("rootCheck.sourceOnly");
                 if (check != Check.STRUCTURE && check != Check.VALUES || checks.containsKey(check)
                         && checks.get(check) != Status.NOT_APPLICABLE) throw ValidationError.invalid("rootCheck.notApplicable");
                 checks.put(check, Status.NOT_APPLICABLE);
@@ -240,6 +263,7 @@ public final class ValidationRootCheck {
         public Builder read(Side side, ValidationCheckEvent.ReadBoundary boundary) {
             return mutate(() -> {
                 Read read = new Read(side, boundary);
+                if (outcomePending && side != Side.SOURCE) throw ValidationError.invalid("rootCheck.sourceOnly");
                 ReadKey key = new ReadKey(side, boundary.readId());
                 Read old = reads.get(key);
                 if (old != null) {
@@ -258,6 +282,9 @@ public final class ValidationRootCheck {
                 Objects.requireNonNull(finding, "finding");
                 Objects.requireNonNull(source, "source");
                 Objects.requireNonNull(target, "target");
+                if (outcomePending && (!finding.kind().sourceProblem() || target.isPresent())) {
+                    throw ValidationError.invalid("rootCheck.sourceOnly");
+                }
                 sameRoot(finding.location());
                 source.ifPresent(side -> sampleRead(Side.SOURCE, side));
                 target.ifPresent(side -> sampleRead(Side.TARGET, side));
@@ -283,6 +310,7 @@ public final class ValidationRootCheck {
         public Builder notCompared(Check check, Location location, Finding cause) {
             return mutate(() -> {
                 Blocked item = new Blocked(check, location, cause);
+                if (outcomePending && check == Check.PARTICIPATION) throw ValidationError.invalid("rootCheck.sourceOnly");
                 sameRoot(location);
                 sameRoot(cause.location());
                 if (!findings.containsKey(cause) || checks.get(check) == Status.NOT_APPLICABLE) {
@@ -325,6 +353,7 @@ public final class ValidationRootCheck {
         }
 
         private void validateComplete() {
+            if (outcomePending) throw ValidationError.invalid("rootCheck.pendingOutcome");
             if (checks.size() != Check.values().length || reads.values().stream().noneMatch(r -> r.side() == Side.SOURCE)) {
                 throw ValidationError.invalid("rootCheck.incomplete");
             }
