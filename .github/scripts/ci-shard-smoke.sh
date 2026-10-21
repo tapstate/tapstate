@@ -54,6 +54,7 @@ with tempfile.TemporaryDirectory() as tmp:
     args=(root/'mvn-args').read_text().splitlines(); assert '-am' not in args and 'verify' in args and '-pl' in args
     assert '-Dapi.version=1.44' in args, 'Docker 29 requires a supported Testcontainers API version'
     assert '-Djava.io.tmpdir='+str(runner_temp.resolve()/'tapstate-java-tmp') in args
+    assert '-Dtapstate.it.jvmArgs=-Djava.io.tmpdir='+str(runner_temp.resolve()/'tapstate-java-tmp') in args, 'Failsafe forks must keep JUnit temp files on the runner temp filesystem'
     assert (root/'mvn-env').read_text()=='-Dfile.encoding=UTF-8', 'do not inject JVM options into child Java processes'
     assert (runner_temp/'tapstate-java-tmp').is_dir(), 'runner-backed Java temporary directory must exist before Maven starts'
     assert any(a.startswith('-Dtest=') and all(name in a for name in ['FixedSleepGateTest','ErrorCodeGatesTest','NestStateSerialFormGatesTest']) for a in args)

@@ -220,6 +220,7 @@ def run_shard(args, root, plan):
         java_tmp.mkdir(parents=True, exist_ok=True)
         java_option = '-Djava.io.tmpdir=' + str(java_tmp)
         command.insert(command.index('-pl'), java_option)
+        command.insert(command.index('-pl'), '-Dtapstate.it.jvmArgs=' + java_option)
     subprocess.run(command, cwd=root, check=True, env=env)
 
 
