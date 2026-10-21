@@ -11,24 +11,17 @@ import java.util.Optional;
  * surface {@link ConnectionTestReport}, or empty when the connection has never been tested. A read of derived
  * observation data, not the config truth layer, so it carries no audit gate.
  *
- * <p>The store is the truth layer; this only projects the storage-port result onto the control-ring report,
- * redacting values from the matching saved Source before projection so older stored diagnostics cannot expose
- * its current secrets. The faces render a control-ring type and never reach into the storage ports (the same
- * split the artifact read side keeps between {@link ArtifactQueryService} and {@link ApplyService}).
+ * <p>The store is the truth layer; this projects the storage-port result onto the control-ring report and hides
+ * diagnostic text from legacy rows without a safety marker. New results are redacted before they are stored.
+ * The faces render a control-ring type and never reach into the storage ports (the same split the artifact read
+ * side keeps between {@link ArtifactQueryService} and {@link ApplyService}).
  */
 public final class ConnectionTestResultQueryService {
 
     private final ConnectionTestResultStore store;
-    private final SourceConnectionResolver sourceConnections;
 
     public ConnectionTestResultQueryService(ConnectionTestResultStore store) {
-        this(store, null);
-    }
-
-    public ConnectionTestResultQueryService(
-            ConnectionTestResultStore store, SourceConnectionResolver sourceConnections) {
         this.store = Objects.requireNonNull(store, "store");
-        this.sourceConnections = sourceConnections;
     }
 
     /**
@@ -38,9 +31,7 @@ public final class ConnectionTestResultQueryService {
     public Optional<ConnectionTestReport> find(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
         return store.find(connectionId)
-                .map(result -> sourceConnections == null
-                        ? result
-                        : sourceConnections.redactStoredDiagnostics(result))
+                .map(ConnectionTestResultRedactor::hideUntrustedDiagnostics)
                 .map(ConnectionTestReport::from);
     }
 }

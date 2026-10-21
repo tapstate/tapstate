@@ -255,7 +255,7 @@ class ClusterServerAuthorizationApiTest {
                 state.probes.incrementAndGet();
                 return new ConnectionTestResult(config.id(), config.connectorId(), ConnectionTestResult.Outcome.PASSED,
                         List.of(), System.currentTimeMillis());
-            }, results, audit);
+            }, results, audit, null, io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
         @Bean ConnectionTestResultQueryService connectionResults(ConnectionTestResultStore results) {
             return new ConnectionTestResultQueryService(results);
@@ -268,7 +268,8 @@ class ClusterServerAuthorizationApiTest {
         }
         @Bean SchemaDiscoveryService schemaDiscovery(SchemaStore schemas, AuditGate audit) {
             return new SchemaDiscoveryService(config -> { throw new AssertionError("unexpected discovery"); },
-                    schemas, audit, Clock.systemUTC());
+                    schemas, audit, Clock.systemUTC(), null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
         @Bean SchemaQueryService schemaQuery(SchemaStore schemas) { return new SchemaQueryService(schemas); }
         @Bean TokenAdminService tokens(State state, AuditGate audit) {

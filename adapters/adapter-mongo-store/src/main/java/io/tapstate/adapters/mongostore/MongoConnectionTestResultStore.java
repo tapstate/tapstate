@@ -68,7 +68,8 @@ public final class MongoConnectionTestResultStore implements ConnectionTestResul
                 .append("connectorId", result.connectorId())
                 .append("outcome", result.outcome().name())
                 .append("items", items)
-                .append("testedAt", result.testedAt());
+                .append("testedAt", result.testedAt())
+                .append("diagnosticsRedacted", result.diagnosticsRedacted());
     }
 
     /** Reconstructs a result from its stored document, or fails coded when the shape is unreadable. */
@@ -84,7 +85,9 @@ public final class MongoConnectionTestResultStore implements ConnectionTestResul
         for (Document item : documentList(document.get("items"), id)) {
             items.add(toItem(item, id));
         }
-        return new ConnectionTestResult(id, connectorId, outcome, items, testedAt);
+        return new ConnectionTestResult(
+                id, connectorId, outcome, items, testedAt,
+                Boolean.TRUE.equals(document.get("diagnosticsRedacted")));
     }
 
     private static ConnectionTestItem toItem(Document item, String id) {

@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.ConfigType;
 import io.tapstate.core.catalog.EnumOption;
+import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.catalog.VisibleWhen;
 import org.junit.jupiter.api.Test;
 
@@ -101,6 +102,22 @@ class ConfigPrompterTest {
 
         assertThat(cfg).containsEntry("password", "s3cr3t");
         assertThat(p.secretQuestions).hasSize(1);
+    }
+
+    @Test
+    void shippedCredentialFileFieldsUseTheMaskedPrompt() {
+        ConfigField privateKey = TapstateCatalog.load().byId("snowflake").config().stream()
+                .filter(field -> field.name().equals("privateKey"))
+                .findFirst()
+                .orElseThrow();
+        ScriptedPrompter p = new ScriptedPrompter("pem-content");
+
+        Map<String, Object> config = new ConfigPrompter().collect(List.of(privateKey), p);
+
+        assertThat(privateKey.secret()).isTrue();
+        assertThat(config).containsEntry("privateKey", "pem-content");
+        assertThat(p.secretQuestions).containsExactly("Private Key");
+        assertThat(p.asked).isEmpty();
     }
 
     /**

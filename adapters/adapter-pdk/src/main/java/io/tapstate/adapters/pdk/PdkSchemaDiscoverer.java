@@ -128,16 +128,21 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
                         counted.put(table, count.count(connector.context(), table));
                     } catch (Throwable t) {
                         // Per table, so one source refusing to be counted does not cost the rest theirs.
-                        LOG.warn("connector {} could not count table {}: {}",
-                                connector.connectorId(), table.getId(), detail(t));
+                        LOG.warn("connector {} could not count table {} ({})",
+                                connector.connectorId(), table.getId(), failureType(t));
                     }
                 }
                 return null;
             });
         } catch (Throwable t) {
-            LOG.warn("connector {} could not be asked to count: {}", connector.connectorId(), detail(t));
+            LOG.warn("connector {} could not be asked to count ({})",
+                    connector.connectorId(), failureType(t));
         }
         return counted;
+    }
+
+    private static String failureType(Throwable failure) {
+        return failure.getClass().getSimpleName();
     }
 
     /**

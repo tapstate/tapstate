@@ -257,7 +257,8 @@ class CloudStateStoreSetupApiTest {
         @Bean Results results() { return new Results(); }
         @Bean Probe probe() { return new Probe(); }
         @Bean ConnectionTestService connections(Probe probe, Results results, AuditGate audit) {
-            return new ConnectionTestService(probe, results, audit);
+            return new ConnectionTestService(probe, results, audit, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
         @Bean TokenAdminService tokenAdministration() { return mock(TokenAdminService.class); }
         @Bean CloudAuthenticationService authentication(Clock clock) {

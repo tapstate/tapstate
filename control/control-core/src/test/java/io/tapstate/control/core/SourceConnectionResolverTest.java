@@ -90,7 +90,7 @@ class SourceConnectionResolverTest {
     }
 
     @Test
-    void honorsExplicitNullSecretMarkersWithoutRestoringSavedValues() {
+    void rejectsExplicitNullSecretsConsistentlyWithSourceUpdates() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(
                 "source-1", null, "mysql",
@@ -105,11 +105,11 @@ class SourceConnectionResolverTest {
         request.put("sslKey", null);
         request.put("__TAPDATA", sshSettings);
 
-        ConnectionConfig resolved = new SourceConnectionResolver(artifacts)
-                .resolve("source-1", "mysql", request);
-
-        assertThat(resolved.settings()).doesNotContainKey("sslKey")
-                .containsEntry("__TAPDATA", Map.of("sshHost", "bastion"));
+        assertThatThrownBy(() -> new SourceConnectionResolver(artifacts)
+                .resolve("source-1", "mysql", request))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.args().get("reason"))
+                                .isEqualTo("a supplied secret cannot be null: sslKey"));
     }
 
     @Test
@@ -128,6 +128,33 @@ class SourceConnectionResolverTest {
         assertThat(resolved.settings())
                 .containsEntry("sslKey", "replacement-key")
                 .containsEntry("__TAPDATA", Map.of("sshPassword", "replacement-ssh-password"));
+    }
+
+    @Test
+    void resolvesConfigAndSecretValuesFromOneCatalogSnapshot() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource(
+                "source-1", null, "mysql",
+                Map.of("password", "saved-db-password", "sslKey", "saved-private-key",
+                        "__TAPDATA", Map.of("sshPassword", "saved-ssh-password")),
+                null, null, null, null));
+        var catalog = io.tapstate.core.catalog.TapstateCatalog.load();
+        java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+        SourceConnectionResolver resolver = new SourceConnectionResolver(artifacts, () -> {
+            reads.incrementAndGet();
+            return catalog;
+        });
+
+        SourceConnectionResolver.ResolvedConnection resolved = resolver.resolveWithSecrets(
+                "source-1", "mysql", Map.of("host", "staging"));
+
+        assertThat(reads).hasValue(1);
+        assertThat(resolved.config().settings())
+                .containsEntry("password", "saved-db-password")
+                .containsEntry("sslKey", "saved-private-key")
+                .containsEntry("__TAPDATA", Map.of("sshPassword", "saved-ssh-password"));
+        assertThat(resolved.secretValues())
+                .contains("saved-db-password", "saved-private-key", "saved-ssh-password");
     }
 
     @Test

@@ -2,84 +2,94 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.logging.MongoUriUserInfo;
+import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 
+import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
-/** Removes submitted shared transport secrets from connector-controlled connection-test diagnostics. */
+/** Removes submitted credentials from connector-controlled connection diagnostics. */
 final class ConnectionTestResultRedactor {
 
     private ConnectionTestResultRedactor() {
     }
 
-    static List<String> sharedSecretValues(Map<String, Object> settings) {
-        if (settings == null) return List.of();
-        LinkedHashSet<String> values = new LinkedHashSet<>();
-        add(values, settings.get("sslKey"));
-        add(values, settings.get("sslKeyPassword"));
-        Object tapdata = settings.get("__TAPDATA");
-        if (tapdata instanceof Map<?, ?> nested) add(values, nested.get("sshPassword"));
-        Object uri = settings.get("uri");
-        if (uri instanceof String text) values.addAll(MongoUriUserInfo.secretValues(text));
-        return List.copyOf(values);
-    }
-
     static ConnectionTestResult redact(ConnectionTestResult result, List<String> secretValues) {
-        List<String> ordered = orderedSecrets(secretValues);
-        if (ordered.isEmpty()) return result;
         List<ConnectionTestItem> items = result.items().stream()
                 .map(item -> new ConnectionTestItem(
-                        redact(item.name(), ordered),
+                        redact(item.name(), secretValues),
                         item.status(),
-                        redact(item.message(), ordered),
-                        redact(item.reason(), ordered),
-                        redact(item.solution(), ordered),
-                        redact(item.connectorErrorCode(), ordered)))
+                        redact(item.message(), secretValues),
+                        redact(item.reason(), secretValues),
+                        redact(item.solution(), secretValues),
+                        redact(item.connectorErrorCode(), secretValues)))
                 .toList();
         return new ConnectionTestResult(
-                result.connectionId(), result.connectorId(), result.outcome(), items, result.testedAt());
+                result.connectionId(), result.connectorId(), result.outcome(), items,
+                result.testedAt(), true);
+    }
+
+    /** Hides legacy diagnostics whose original credential values are no longer available. */
+    static ConnectionTestResult hideUntrustedDiagnostics(ConnectionTestResult result) {
+        if (result.diagnosticsRedacted()) {
+            return result;
+        }
+        List<ConnectionTestItem> safeItems = new ArrayList<>(result.items().size());
+        for (int index = 0; index < result.items().size(); index++) {
+            ConnectionTestItem item = result.items().get(index);
+            safeItems.add(new ConnectionTestItem(
+                    "Check " + (index + 1), item.status(), null, null, null, null));
+        }
+        return new ConnectionTestResult(
+                result.connectionId(), result.connectorId(), result.outcome(), safeItems,
+                result.testedAt(), true);
     }
 
     static TapstateException redact(TapstateException failure, List<String> secretValues) {
-        List<String> ordered = orderedSecrets(secretValues);
-        if (ordered.isEmpty()) return failure;
         Map<String, Object> safeArgs = new LinkedHashMap<>();
-        boolean changed = false;
-        for (Map.Entry<String, Object> entry : failure.args().entrySet()) {
-            Object value = entry.getValue();
-            if (value instanceof String text) {
-                String safe = redact(text, ordered);
-                safeArgs.put(entry.getKey(), safe);
-                changed |= !safe.equals(text);
-            } else {
-                safeArgs.put(entry.getKey(), value);
-            }
+        failure.args().forEach((name, value) ->
+                safeArgs.put(redact(name, secretValues), redactValue(value, secretValues)));
+        if (failure.getCause() == null && safeArgs.equals(failure.args())) {
+            return failure;
         }
-        return changed ? new TapstateException(failure.code(), safeArgs, failure.getCause()) : failure;
+        return failure.withoutCause(safeArgs);
     }
 
-    private static List<String> orderedSecrets(List<String> secretValues) {
-        List<String> ordered = new ArrayList<>(new LinkedHashSet<>(secretValues));
-        ordered.removeIf(value -> value == null || value.isBlank());
-        ordered.sort((left, right) -> Integer.compare(right.length(), left.length()));
-        return ordered;
-    }
-
-    private static void add(LinkedHashSet<String> values, Object candidate) {
-        if (candidate instanceof String text && !text.isBlank()) values.add(text);
+    private static Object redactValue(Object value, List<String> secretValues) {
+        if (value == null || value instanceof Number || value instanceof Boolean || value instanceof Enum<?>) {
+            return value;
+        }
+        if (value instanceof CharSequence text) {
+            return redact(text.toString(), secretValues);
+        }
+        if (value instanceof Map<?, ?> map) {
+            Map<Object, Object> safe = new LinkedHashMap<>();
+            map.forEach((key, child) -> safe.put(redactValue(key, secretValues), redactValue(child, secretValues)));
+            return safe;
+        }
+        if (value instanceof Iterable<?> iterable) {
+            List<Object> safe = new ArrayList<>();
+            iterable.forEach(child -> safe.add(redactValue(child, secretValues)));
+            return safe;
+        }
+        if (value.getClass().isArray()) {
+            if (value.getClass().getComponentType().isPrimitive()) {
+                return MongoUriUserInfo.REDACTED;
+            }
+            List<Object> safe = new ArrayList<>(Array.getLength(value));
+            for (int index = 0; index < Array.getLength(value); index++) {
+                safe.add(redactValue(Array.get(value, index), secretValues));
+            }
+            return safe;
+        }
+        return MongoUriUserInfo.REDACTED;
     }
 
     private static String redact(String text, List<String> secretValues) {
-        if (text == null) return null;
-        String safe = text;
-        for (String value : secretValues) {
-            safe = safe.replace(value, MongoUriUserInfo.REDACTED);
-        }
-        return safe;
+        return SecretRedactor.redactValues(text, secretValues, MongoUriUserInfo.REDACTED);
     }
 }

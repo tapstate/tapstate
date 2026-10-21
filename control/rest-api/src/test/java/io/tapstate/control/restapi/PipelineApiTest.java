@@ -1457,7 +1457,8 @@ class PipelineApiTest {
                     return Optional.empty();
                 }
             };
-            return new ConnectionTestService(probe, resultStore, auditGate);
+            return new ConnectionTestService(probe, resultStore, auditGate, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
@@ -1488,7 +1489,8 @@ class PipelineApiTest {
                 public Optional<DiscoveredSourceModel> get(String connectionId) {
                     return Optional.empty();
                 }
-            }, auditGate, Clock.systemUTC());
+            }, auditGate, Clock.systemUTC(), null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean

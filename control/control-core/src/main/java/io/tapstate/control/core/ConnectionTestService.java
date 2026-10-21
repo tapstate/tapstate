@@ -31,24 +31,13 @@ public final class ConnectionTestService {
     private final SourceConnectionResolver sourceConnections;
 
     public ConnectionTestService(
-            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate) {
-        this(probe, resultStore, auditGate, null);
-    }
-
-    public ConnectionTestService(
-            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator) {
-        this(probe, resultStore, auditGate, configValidator, null);
-    }
-
-    public ConnectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
         this.probe = Objects.requireNonNull(probe, "probe");
         this.resultStore = Objects.requireNonNull(resultStore, "resultStore");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.configValidator = configValidator;
-        this.sourceConnections = sourceConnections;
+        this.sourceConnections = Objects.requireNonNull(sourceConnections, "sourceConnections");
     }
 
     /**
@@ -61,15 +50,13 @@ public final class ConnectionTestService {
      */
     public ConnectionTestReport test(
             String connectionId, String connectorId, Map<String, Object> settings, String principal) {
-        ConnectionConfig config = sourceConnections == null
-                ? new ConnectionConfig(connectionId, connectorId, settings)
-                : sourceConnections.resolve(connectionId, connectorId, settings);
-        List<String> secretValues = sourceConnections == null
-                ? ConnectionTestResultRedactor.sharedSecretValues(config.settings())
-                : sourceConnections.secretValuesForDiagnostics(config.connectorId(), config.settings());
+        SourceConnectionResolver.ResolvedConnection resolved =
+                sourceConnections.resolveWithSecrets(connectionId, connectorId, settings);
+        ConnectionConfig config = resolved.config();
+        List<String> secretValues = resolved.secretValues();
         try {
             if (configValidator != null) {
-                configValidator.validate(config.connectorId(), config.settings());
+                configValidator.validate(config.connectorId(), config.settings(), resolved.catalogSnapshot());
             }
             return auditGate.dispatch(
                     ControlOperations.CONNECTION_TEST,

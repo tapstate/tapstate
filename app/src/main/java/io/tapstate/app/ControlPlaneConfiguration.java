@@ -604,9 +604,8 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ConnectionTestResultQueryService connectionTestResultQueryService(
-            ConnectionTestResultStore resultStore, SourceConnectionResolver sourceConnections) {
-        return new ConnectionTestResultQueryService(resultStore, sourceConnections);
+    ConnectionTestResultQueryService connectionTestResultQueryService(ConnectionTestResultStore resultStore) {
+        return new ConnectionTestResultQueryService(resultStore);
     }
 
     // The schema-discovery half of the connection plane: the same provisioner feeds the PDK discoverer,

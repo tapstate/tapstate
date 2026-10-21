@@ -26,7 +26,7 @@ class ConnectionTestResultQueryServiceTest {
             "conn-orders", "mongodb", Outcome.FAILED,
             List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
                     "authentication failed", "SCRAM rejected", "check the password", "11000")),
-            1_700_000_000_000L);
+            1_700_000_000_000L, true);
 
     @Test
     void findReturnsTheLatestResultProjectedOntoTheSurfaceReport() {
@@ -58,6 +58,31 @@ class ConnectionTestResultQueryServiceTest {
         ConnectionTestResultQueryService query = new ConnectionTestResultQueryService(new MapResultStore());
 
         assertThat(query.find("never-tested")).isEmpty();
+    }
+
+    @Test
+    void hidesDiagnosticsFromLegacyResultsWithoutAStoredSafetyMarker() {
+        ConnectionTestResult legacy = new ConnectionTestResult(
+                "conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login private credential", ConnectionTestItem.Status.FAILED,
+                        "old password value", "old private key", "rotate the password", "secret-code")),
+                1_700_000_000_000L);
+        MapResultStore store = new MapResultStore();
+        store.save(legacy);
+
+        ConnectionTestReport report = new ConnectionTestResultQueryService(store)
+                .find("conn-orders").orElseThrow();
+
+        assertThat(report.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+        assertThat(report.testedAt()).isEqualTo(1_700_000_000_000L);
+        assertThat(report.checks()).singleElement().satisfies(check -> {
+            assertThat(check.name()).isEqualTo("Check 1");
+            assertThat(check.status()).isEqualTo(ConnectionTestReport.Check.Status.FAILED);
+            assertThat(check.message()).isNull();
+            assertThat(check.reason()).isNull();
+            assertThat(check.solution()).isNull();
+            assertThat(check.connectorErrorCode()).isNull();
+        });
     }
 
     @Test

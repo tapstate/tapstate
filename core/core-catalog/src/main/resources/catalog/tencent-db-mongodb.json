@@ -178,7 +178,7 @@
       },
       "required": true,
       "default": null,
-      "secret": false,
+      "secret": true,
       "options": [],
       "visibleWhen": {
         "controllingField": "ssl",

@@ -177,6 +177,30 @@ class SpecNormalizerTest {
     }
 
     @Test
+    void classifiesCredentialFileReadersAndInjectedTlsKeysAsSecrets() {
+        Map<String, Object> tree = Map.of(
+                "properties", Map.of("id", "file-credentials"),
+                "configOptions", Map.of("connection", Map.of("properties", Map.of(
+                        "privateKey", Map.of("type", "string", "x-component", "TextFileReader"),
+                        "walTdeKey", Map.of("type", "string", "x-component", "TextFileReader"),
+                        "krb5Keytab", Map.of("type", "string", "x-component", "TextFileReader"),
+                        "krb5Conf", Map.of("type", "string", "x-component", "TextFileReader"),
+                        "monkeyFile", Map.of("type", "string", "x-component", "TextFileReader"),
+                        "sslKey", Map.of("type", "string", "x-component", "Input"),
+                        "host", Map.of("type", "string", "x-component", "Input")))));
+
+        NormalizedSpec normalized = normalize(tree);
+
+        assertThat(field(normalized, "privateKey").secret()).isTrue();
+        assertThat(field(normalized, "walTdeKey").secret()).isTrue();
+        assertThat(field(normalized, "krb5Keytab").secret()).isTrue();
+        assertThat(field(normalized, "sslKey").secret()).isTrue();
+        assertThat(field(normalized, "krb5Conf").secret()).isFalse();
+        assertThat(field(normalized, "monkeyFile").secret()).isFalse();
+        assertThat(field(normalized, "host").secret()).isFalse();
+    }
+
+    @Test
     void keepsLiteralEnumLabelsUnderTheDefaultLocale() {
         ConfigField mechanism = field(normalize("kafka"), "kafkaSaslMechanism");
 
