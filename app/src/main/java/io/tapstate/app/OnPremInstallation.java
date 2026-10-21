@@ -17,7 +17,8 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     static final String DIRECTORY_PROPERTY = "tapstate.installation.directory";
     static final String CAPABILITY_HEADER = "X-Tapstate-Setup-Capability";
     static final String CONNECTOR_ATTRIBUTE = OnPremInstallation.class.getName() + ".connector";
-    private static final Set<String> STORAGE_PATHS = Set.of("/api/storage/status", "/api/storage/test", "/api/storage/setup/commit", "/api/storage/setup/status");
+    private static final Set<String> STORAGE_PATHS = Set.of("/api/storage/status", "/api/storage/test", "/api/storage/setup/commit", "/api/storage/setup/status",
+            "/api/storage/recovery/plan", "/api/storage/recovery/confirm", "/api/storage/recovery/status");
     private final Object connectorIdentity = new Object();
     private final StorageRoot root;
     private final InstallationFiles files;
@@ -31,6 +32,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     private Connector connector;
     private volatile boolean closed;
     private final boolean completedBeforeBoot;
+    private MongoConfigurationDomain.InitialOpRecovery recoveryInvocation;
 
     OnPremInstallation(StorageRoot root, InstallationFiles files, MongoProperties mongo, StorageSetupService.DefaultTarget target, Clock clock) {
         this.root = root; this.files = files; this.mongo = mongo; this.target = target; this.clock = clock;
@@ -89,7 +91,14 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         boolean probe = "GET".equals(request.getMethod()) && path.equals("/healthz");
         if (!write && !probe) throw InstallationFiles.refused();
     }
-    @Override public StorageControlAccess caller(HttpServletRequest request) { return StorageControlAccess.management(permission(request)); }
+    @Override public StorageControlAccess caller(HttpServletRequest request) {
+        var permission = permission(request);
+        if (permission.purpose() == StorageSetupStateStore.Purpose.SETUP && states.load().phase() == StorageSetupStateStore.Phase.STORAGE_BOUND) {
+            var scope = root.runtime().requireConfiguration().bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable).authScope();
+            return StorageControlAccess.initialInstallationRecovery(permission, scope);
+        }
+        return StorageControlAccess.management(permission);
+    }
 
     private synchronized SetupCapabilityService.Permission permission(HttpServletRequest request) {
         requireManagementRequest(request);
@@ -148,6 +157,15 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (status.phase() != StorageSetupStateStore.Phase.COMPLETE && !completedBeforeBoot) {
             files.locked(() -> { files.saveStage(files.stage().withScope(status.scope()).withHandoff(InstallationFiles.Handoff.CONFIGURED, stage.configurationHash())); return null; });
             var configuration = root.runtime().requireConfiguration();
+            var preparation = configuration.bindings().cachePreparation();
+            if (preparation.isPresent()) {
+                var pending = configuration.recoveryCommands().current(preparation.orElseThrow().authScope());
+                if (pending.isPresent()) {
+                    if (pending.orElseThrow().phase() != StorageRecoveryCommands.Phase.PLANNED)
+                        root.coordinateInstallation(() -> finishRecovery(pending.orElseThrow()));
+                    return;
+                }
+            }
             configuration.bindings().load().ifPresent(binding -> continueSetup(new StorageBindingCommit(binding,
                     configuration.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable), Optional.empty())));
         } else if (status.phase() != StorageSetupStateStore.Phase.COMPLETE) throw StorageRuntime.unavailable();
@@ -170,8 +188,85 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         var status = states.load();
         if (status.phase() != StorageSetupStateStore.Phase.COMPLETE || root.phase() != StorageRoot.Phase.BUSINESS_READY) throw StorageRuntime.unavailable();
         files.locked(() -> {
-            var stage = files.stage(); files.saveStage(stage.withScope(status.scope()).withHandoff(InstallationFiles.Handoff.RESTARTED, stage.configurationHash())); return null;
+            var stage = files.stage(); files.saveStage(stage.withScope(status.scope()).withHandoff(InstallationFiles.Handoff.RESTARTED, stage.configurationHash()));
+            if (files.capability().filter(value -> value.purpose() == StorageSetupStateStore.Purpose.SETUP).isPresent()) files.removeCapability();
+            return null;
         });
+    }
+
+    StorageRecoveryService recoveryService() {
+        var configuration = root.runtime().requireConfiguration();
+        return StorageRecoveryService.ownedPublication(configuration.recoveryCommands(), new StorageRecoveryService.Inspector() {
+            @Override public StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection) {
+                return root.coordinateInstallation(() -> recoveryManifest(scope, selection));
+            }
+            @Override public void requireCurrent(CacheAuthScope scope, StorageRecoveryCommands.Manifest original) {
+                root.coordinateInstallation(() -> {
+                    var actual = recoveryManifest(scope, original.selection());
+                    if (!actual.definitionHashes().equals(original.definitionHashes()) || !actual.dependencyHash().equals(original.dependencyHash())) throw StorageRuntime.unavailable();
+                    return null;
+                });
+            }
+        }, new AuditGate(configuration.audit(), clock), original -> root.coordinateInstallation(() -> finishRecovery(original)));
+    }
+
+    private StorageRecoveryCommands.Manifest recoveryManifest(CacheAuthScope scope, StorageRecoveryCommands.Selection selection) {
+        if (selection.extent() != StorageRecoveryCommands.Extent.CLUSTER || !selection.pipelineIds().isEmpty()
+                || root.originalSetupCreationAvailable()) throw StorageRuntime.unavailable();
+        var original = recoveryOwner(scope); var configuration = root.runtime().requireConfiguration();
+        var source = configuration.initialOpRecoverySource(scope, false);
+        original.cache().verifyEmptyInitialRecovery();
+        var identity = target.identity(master(source));
+        String dependency = recoveryDependency(original.binding(), scope, identity);
+        return new StorageRecoveryCommands.Manifest(selection, Set.of(), Map.of(source.id(), CanonicalHash.of(source)), dependency, configuration.configurationRevision());
+    }
+
+    private StorageRuntime.Bound recoveryOwner(CacheAuthScope scope) {
+        root.requireActive();
+        if (closed || root.runtime().cleanupRequired() || root.runtime().business().isPresent() || scope.mode() != StorageBinding.Mode.OP || scope.authGeneration() != 1)
+            throw StorageRuntime.unavailable();
+        var original = root.runtime().loadBound().orElseThrow(StorageRuntime::unavailable);
+        original.requireActive();
+        if (!original.preparation().authScope().equals(scope)) throw StorageRuntime.unavailable();
+        return original;
+    }
+
+    private StorageRecoveryCommands.Plan finishRecovery(StorageRecoveryCommands.Plan requested) {
+        var original = recoveryOwner(requested.originalScope());
+        var configuration = root.runtime().requireConfiguration(); var commands = configuration.recoveryCommands();
+        var current = commands.find(requested.originalScope(), requested.operationId()).orElseThrow(StorageRuntime::unavailable);
+        if (current.phase() == StorageRecoveryCommands.Phase.PLANNED) throw StorageRuntime.unavailable();
+        var source = configuration.initialOpRecoverySource(current.originalScope(), true); var master = master(source);
+        if (!current.manifest().definitionHashes().equals(Map.of(source.id(), CanonicalHash.of(source)))
+                || !current.manifest().dependencyHash().equals(recoveryDependency(original.binding(), current.originalScope(), target.identity(master))))
+            throw StorageRuntime.unavailable();
+        target.test(master, source, target.identity(master));
+        Runnable owner = () -> {
+            root.requireActive(); original.requireActive();
+            if (closed || root.runtime().cleanupRequired() || root.runtime().current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+        };
+        if (current.phase() == StorageRecoveryCommands.Phase.CONFIRMED) {
+            original.cache().verifyEmptyInitialRecovery(); original.cache().verifyInitialRecoveryPermissions(); owner.run();
+        }
+        if (recoveryInvocation == null || !recoveryInvocation.plan().operationId().equals(current.operationId())
+                || recoveryInvocation.plan().phase() != current.phase()) recoveryInvocation = configuration.startInitialOpRecovery(current, owner);
+        var running = recoveryInvocation.plan();
+        configuration.prepareInitialOpRecovery(original.cache(), recoveryInvocation, owner);
+        original.verifyAuthentication(); original.verifyBusiness(); target.test(master, source, target.identity(master)); owner.run();
+        var completed = running.phase() == StorageRecoveryCommands.Phase.COMPLETE ? running : commands.complete(running);
+        Runnable completedOwner = () -> {
+            owner.run();
+            if (commands.find(completed.originalScope(), completed.operationId()).filter(completed::equals).isEmpty()) throw StorageRuntime.unavailable();
+            configuration.initialOpRecoverySource(completed.originalScope(), true);
+        };
+        completedOwner.run();
+        configuration.bindings().guardedBy(completedOwner).complete(states.load().scope());
+        markRestartRequired(); return completed;
+    }
+    static String recoveryDependency(StorageBinding binding, CacheAuthScope scope, StorageSetupService.ConnectorIdentity identity) {
+        var setup = binding.setup();
+        return CanonicalHash.ofText(JsonWriter.write(List.of("initial-op-installation", setup.clusterId(), setup.installationId(), setup.operationId(),
+                scope.bindingVersion(), scope.cacheIncarnation(), scope.authGeneration(), identity.artifactHash(), identity.specHash())));
     }
     private void requireFirstAdministratorReady() {
         if (!completedBeforeBoot || files.stage().handoff() != InstallationFiles.Handoff.RESTARTED
@@ -190,6 +285,13 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
             var original = root.snapshot(caller, active);
             boolean complete = state.phase() == StorageSetupStateStore.Phase.COMPLETE;
             boolean restart = complete && !completedBeforeBoot;
+            if (caller.initialInstallationRecovery()) {
+                var current = root.runtime().requireConfiguration().recoveryCommands().guardedBy(active).current(caller.cache());
+                return new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), current.map(StorageRecoveryCommands.Plan::operationId).orElse(state.scope().operationId()),
+                        original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(), original.setupPhase(),
+                        StorageControlDispatcher.BusinessPhase.AWAITING_REBUILD_CONFIRMATION, original.health(),
+                        List.of("storage.status", "storage.setup.status", "storage.test", "storage.setup.commit", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status"), false);
+            }
             return new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), state.scope().operationId(),
                     original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(), original.setupPhase(),
                     restart ? StorageControlDispatcher.BusinessPhase.RESTART_REQUIRED : complete ? StorageControlDispatcher.BusinessPhase.FIRST_ADMIN_REQUIRED : original.businessPhase(),

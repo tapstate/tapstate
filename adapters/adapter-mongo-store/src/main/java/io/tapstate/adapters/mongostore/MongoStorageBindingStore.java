@@ -246,8 +246,20 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             }, requireCommit);
             if (checkAfterCommit) requireActive.run();
             return new io.tapstate.spi.store.StorageBindingCommit(result.binding(), result.preparation(), result.won()
-                    ? Optional.of(new Creation(result.preparation(), targetFingerprint(cache), requireActive)) : Optional.empty());
+                    ? Optional.of(new Creation(result.preparation(), targetFingerprint(cache),
+                            () -> { requireActive.run(); requireOriginalInitialPreparation(result.preparation()); })) : Optional.empty());
         });
+    }
+
+    /** Publishing a separate recovery intent retires the original initial-creation invocation. */
+    void requireOriginalInitialPreparation(CachePreparation expected) {
+        StoreIo.run(() -> transaction(session -> {
+            var current = load(session).orElseThrow(MongoStorageBindingStore::refused);
+            if (!current.cachePreparation().equals(expected)) throw refused();
+            var row = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", "cluster")).first();
+            if (row == null || MongoStorageRecoveryCommands.pending(row).isPresent()) throw refused();
+            return null;
+        }));
     }
 
     @Override public StorageBinding complete(StorageSetupScope expected) {

@@ -35,10 +35,10 @@ final class InstallationFiles {
     }
     private static final Set<java.nio.file.attribute.PosixFilePermission> DIRECTORY_MODE = PosixFilePermissions.fromString("rwx------");
     private static final Set<java.nio.file.attribute.PosixFilePermission> FILE_MODE = PosixFilePermissions.fromString("rw-------");
-    private static final ConcurrentHashMap<Path, ReentrantLock> LOCKS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Path, FileState> LOCKS = new ConcurrentHashMap<>();
     private static final int MAX_BYTES = 128 * 1024;
     private final Path directory;
-    private final ReentrantLock localLock;
+    private final FileState shared;
 
     InstallationFiles(Path directory) {
         Path requested = directory.toAbsolutePath().normalize();
@@ -46,7 +46,7 @@ final class InstallationFiles {
         try { this.directory = requested.toRealPath(); }
         catch (IOException invalid) { throw refused(); }
         check(this.directory, true);
-        this.localLock = LOCKS.computeIfAbsent(this.directory, ignored -> new ReentrantLock());
+        this.shared = LOCKS.computeIfAbsent(this.directory, FileState::new);
         check(path("owner.lock"), false);
     }
 
@@ -68,16 +68,109 @@ final class InstallationFiles {
     void requireOwner() { check(directory, true); check(path("owner.lock"), false); }
 
     <T> T locked(Supplier<T> action) {
-        localLock.lock();
+        shared.mutex.lock();
         try {
+            if (Thread.currentThread().isInterrupted()) throw refused();
             requireOwner();
-            if (localLock.getHoldCount() > 1) return action.get();
-            try (var channel = FileChannel.open(path("owner.lock"), StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
-                 var lock = channel.lock()) {
-                requireOwner();
-                return action.get();
+            if (shared.mutex.getHoldCount() > 1) return action.get();
+            try {
+                var channel = shared.open(); shared.mutation = true;
+                try (var lock = mutationLock(channel)) {
+                    requireOwner(); shared.requireIdentity(); return action.get();
+                }
+            } catch (IOException | java.nio.channels.OverlappingFileLockException invalid) { throw refused(); }
+            finally { shared.mutation = false; shared.closeIdle(); }
+        } finally { shared.mutex.unlock(); }
+    }
+
+    private static java.nio.channels.FileLock mutationLock(FileChannel channel) throws IOException {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(15);
+        while (true) {
+            if (Thread.currentThread().isInterrupted()) throw refused();
+            // Blocking FileChannel.lock is interruptible and closes this shared channel, dropping
+            // runtime ownership as well. Nonblocking attempts preserve it when a caller cancels.
+            var acquired = channel.tryLock(0, 1, false);
+            if (acquired != null) return acquired;
+            if (System.nanoTime() - deadline >= 0) throw refused();
+            java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10));
+        }
+    }
+
+    /** A separate lock region admits one service process without blocking owner CLI file updates. */
+    RuntimeOwner ownRuntime() {
+        shared.mutex.lock();
+        try {
+            if (Thread.currentThread().isInterrupted()) throw refused();
+            requireOwner();
+            if (shared.runtime != null) throw refused();
+            var lock = shared.open().tryLock(1, 1, false);
+            if (lock == null) throw refused();
+            shared.requireIdentity();
+            shared.runtime = new RuntimeOwner(shared, lock); return shared.runtime;
+        } catch (IOException | java.nio.channels.OverlappingFileLockException failure) { throw refused(); }
+        finally { try { shared.closeIdle(); } finally { shared.mutex.unlock(); } }
+    }
+    static final class RuntimeOwner implements AutoCloseable {
+        private final FileState shared;
+        private final java.nio.channels.FileLock lock;
+        private final FileChannel channel;
+        private final Object fileKey;
+        private RuntimeOwner(FileState shared, java.nio.channels.FileLock lock) {
+            this.shared = shared; this.lock = lock; this.channel = shared.channel; this.fileKey = shared.fileKey;
+        }
+        void requireActive() {
+            // Runtime/store monitors may call this while an installation writer holds the file
+            // mutex. Ownership validation must never acquire that mutex in the reverse order.
+            requireValid();
+            try {
+                Path path = shared.directory.resolve("owner.lock"); check(shared.directory, true); check(path, false);
+                if (!Objects.equals(fileKey, Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey())) throw refused();
             } catch (IOException invalid) { throw refused(); }
-        } finally { localLock.unlock(); }
+            requireValid();
+        }
+        private void requireValid() {
+            if (shared.runtime != this || shared.poisoned || !lock.isValid() || !channel.isOpen()) throw refused();
+        }
+        @Override public void close() {
+            shared.mutex.lock();
+            try {
+                if (shared.runtime != this) return;
+                lock.release(); shared.runtime = null; shared.closeIdle();
+            } catch (IOException failure) { shared.poisoned = true; throw refused(); }
+            finally { shared.mutex.unlock(); }
+        }
+    }
+
+    /** POSIX locks are process-owned: closing another descriptor can drop every lock on this inode. */
+    private static final class FileState {
+        final ReentrantLock mutex = new ReentrantLock();
+        final Path directory;
+        FileChannel channel;
+        Object fileKey;
+        volatile RuntimeOwner runtime;
+        boolean mutation;
+        volatile boolean poisoned;
+        FileState(Path directory) { this.directory = directory; }
+        FileChannel open() throws IOException {
+            if (poisoned) throw refused();
+            Path path = directory.resolve("owner.lock"); check(directory, true); check(path, false);
+            Object actual = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey();
+            if (actual == null) throw refused();
+            if (channel == null) {
+                channel = FileChannel.open(path, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS); fileKey = actual;
+            }
+            requireIdentity(); return channel;
+        }
+        void requireIdentity() throws IOException {
+            if (poisoned || channel == null || !channel.isOpen()) throw refused();
+            Path path = directory.resolve("owner.lock"); check(directory, true); check(path, false);
+            if (!Objects.equals(fileKey, Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey())) throw refused();
+        }
+        void closeIdle() {
+            if (runtime != null || mutation || channel == null) return;
+            try { channel.close(); channel = null; fileKey = null; }
+            catch (IOException failure) { poisoned = true; throw refused(); }
+        }
     }
 
     Stage stage() {

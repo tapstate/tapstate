@@ -26,6 +26,9 @@ class OnPremInstallationConfiguration {
         try { return new InstallationFiles(Path.of(environment.getRequiredProperty(OnPremInstallation.DIRECTORY_PROPERTY))); }
         catch (java.nio.file.InvalidPathException invalid) { throw InstallationFiles.refused(); }
     }
+    @Bean(destroyMethod = "close") InstallationFiles.RuntimeOwner installationRuntimeOwner(InstallationFiles files) {
+        return files.ownRuntime();
+    }
     @Bean(destroyMethod = "close") OnPremInstallation onPremInstallation(StorageRoot root, InstallationFiles files,
             MongoProperties mongo, ObjectProvider<StorageSetupService.DefaultTarget> targets, Clock clock) {
         return new OnPremInstallation(root, files, mongo, targets.getObject(), clock);

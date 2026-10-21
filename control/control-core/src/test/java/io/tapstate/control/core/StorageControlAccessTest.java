@@ -72,6 +72,21 @@ class StorageControlAccessTest {
         assertThatThrownBy(() -> StorageControlAccess.ordinary(StorageBinding.Mode.OP, SETUP,
                 new CacheAuthScope("other",1,StorageBinding.Mode.OP,"incarnation",1),op,null,() -> {})).isInstanceOf(IllegalArgumentException.class);
     }
+    @Test void initialInstallationRecoveryStillRequiresSetupPurposeAndNeverGrantsBusinessOrImportAccess() {
+        var states = new States(StorageSetupStateStore.Purpose.SETUP);
+        states.status = new StorageSetupStateStore.Status(SETUP, StorageSetupStateStore.Phase.STORAGE_BOUND, 1);
+        var permission = permission(states, StorageSetupStateStore.Purpose.SETUP);
+        var initial = StorageControlAccess.initialInstallationRecovery(permission, scope(StorageBinding.Mode.OP));
+        initial.require(ControlOperations.STORAGE_RECOVERY_PLAN); initial.require(ControlOperations.STORAGE_RECOVERY_CONFIRM);
+        initial.require(ControlOperations.STORAGE_RECOVERY_STATUS);
+        assertThat(initial.initialInstallationRecovery()).isTrue();
+        assertThatThrownBy(() -> initial.require(ControlOperations.CONFIGURATION_IMPORT_COMMIT)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> initial.require(ControlOperations.USER_CREATE)).isInstanceOf(TapstateException.class);
+        var administrator = permission(new States(StorageSetupStateStore.Purpose.FIRST_ADMIN), StorageSetupStateStore.Purpose.FIRST_ADMIN);
+        assertThatThrownBy(() -> StorageControlAccess.initialInstallationRecovery(administrator, scope(StorageBinding.Mode.OP))).isInstanceOf(TapstateException.class);
+        states.status = new StorageSetupStateStore.Status(states.status.scope(), StorageSetupStateStore.Phase.COMPLETE, 1);
+        assertThatThrownBy(() -> initial.require(ControlOperations.STORAGE_RECOVERY_CONFIRM)).isInstanceOf(TapstateException.class);
+    }
     @Test void aDependencyFailureRemainsUnavailableInsteadOfBecomingAnInvalidIdentity() {
         var access = StorageControlAccess.ordinary(StorageBinding.Mode.OP, SETUP, scope(StorageBinding.Mode.OP),
                 TapstatePrincipal.humanJwt(new VerifiedToken("admin", Scope.ADMIN)),null,

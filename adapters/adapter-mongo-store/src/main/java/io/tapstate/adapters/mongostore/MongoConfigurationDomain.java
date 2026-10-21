@@ -204,6 +204,78 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new MongoStorageRecoveryCommands(connection.client(), connection.database(), bindings, artifacts, this::requireOpen);
     }
 
+    public void requireOriginalInitialPreparation(io.tapstate.spi.store.CachePreparation original) {
+        requireOpen(); bindings.requireOriginalInitialPreparation(original);
+    }
+
+    public io.tapstate.core.model.SourceResource initialOpRecoverySource(io.tapstate.spi.store.CacheAuthScope scope, boolean allowCompleted) {
+        requireOpen();
+        return StoreIo.call(() -> {
+            try (var session = connection.client().startSession()) {
+                return session.withTransaction(() -> MongoInitialOpRecovery.require(connection.client(), session,
+                        connection.database(), bindings, artifacts, scope, allowCompleted));
+            }
+        });
+    }
+
+    /** An unforgeable committed winner, not a DTO that a caller can reconstruct from RUNNING. */
+    public static final class InitialOpRecovery {
+        private final MongoConfigurationDomain owner;
+        private final io.tapstate.spi.store.StorageRecoveryCommands.Plan plan;
+        private final boolean first;
+        private final java.util.concurrent.atomic.AtomicBoolean attempted = new java.util.concurrent.atomic.AtomicBoolean();
+        private InitialOpRecovery(MongoConfigurationDomain owner, io.tapstate.spi.store.StorageRecoveryCommands.Plan plan, boolean first) {
+            this.owner = owner; this.plan = plan; this.first = first;
+        }
+        public io.tapstate.spi.store.StorageRecoveryCommands.Plan plan() { return plan; }
+        boolean mayCreate() { return first && !attempted.get(); }
+        @Override public String toString() { return "InitialOpRecovery[owned]"; }
+    }
+
+    public InitialOpRecovery startInitialOpRecovery(io.tapstate.spi.store.StorageRecoveryCommands.Plan original, Runnable active) {
+        requireOpen(); active.run();
+        var commands = new MongoStorageRecoveryCommands(connection.client(), connection.database(), bindings, artifacts,
+                () -> { requireOpen(); active.run(); });
+        var result = commands.startInitialOp(original);
+        // A transaction retry carries its own result. Only the confirmed committed callback wins.
+        return new InitialOpRecovery(this, result.plan(), result.won());
+    }
+
+    public void prepareInitialOpRecovery(MongoCacheDomain cache, InitialOpRecovery invocation, Runnable active) {
+        requireOpen();
+        if (invocation == null || invocation.owner != this) throw MongoCachePipelineAccess.fenced();
+        var running = invocation.plan;
+        Runnable original = () -> requireInitialOpOperation(running, active);
+        original.run(); cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
+        var preparation = new io.tapstate.spi.store.CachePreparation(running.operationId(), running.originalScope());
+        if (running.phase() == io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING) {
+            if (invocation.first && invocation.attempted.compareAndSet(false, true)) cache.prepareAuth(preparation.authScope(), preparation.operationId(), original);
+            else cache.resumeInitialAuth(preparation, original);
+            cache.prepareConfirmedInitialBusiness(preparation, original);
+        } else if (running.phase() == io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE) {
+            cache.verifyInitialRecovery(preparation);
+        } else throw MongoCachePipelineAccess.fenced();
+        original.run();
+    }
+
+    private void requireInitialOpOperation(io.tapstate.spi.store.StorageRecoveryCommands.Plan original, Runnable active) {
+        requireOpen(); active.run();
+        if (original.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING
+                && original.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE) throw MongoCachePipelineAccess.fenced();
+        StoreIo.run(() -> {
+            try (var session = connection.client().startSession()) {
+                session.withTransaction(() -> {
+                    var row = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
+                    if (row == null || MongoStorageRecoveryCommands.pending(row).filter(original::equals).isEmpty()) throw MongoCachePipelineAccess.fenced();
+                    MongoInitialOpRecovery.requireManifest(connection.client(), session, connection.database(), bindings, artifacts,
+                            original.originalScope(), original.manifest(), true);
+                    return null;
+                });
+            }
+        });
+        requireOpen(); active.run();
+    }
+
     /** Reads the original initial-only closure without preparing or starting any CACHE work. */
     public io.tapstate.core.model.SourceResource initialCloudRecoverySource(io.tapstate.spi.store.CacheAuthScope scope) {
         requireOpen();

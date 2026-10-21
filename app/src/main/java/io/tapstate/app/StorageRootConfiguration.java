@@ -35,7 +35,9 @@ class StorageRootConfiguration {
     @Bean(destroyMethod = "close") StorageRoot storageRoot(MongoProperties mongo, CloudRuntimeSettings cloud,
             ObjectProvider<CloudSdkBridge> bridge, BootId boot, MetricsHistoryProperties history,
             TokenSecrets secrets, Clock clock, ControlPlaneConfiguration.SigningSecret signing,
-            ObjectProvider<InstallationFiles> installationFiles, Environment environment) {
+            ObjectProvider<InstallationFiles> installationFiles, Environment environment,
+            java.util.Optional<InstallationFiles.RuntimeOwner> installationOwner) {
+        installationOwner.ifPresent(InstallationFiles.RuntimeOwner::requireActive);
         var files = installationFiles.getIfAvailable();
         if (files != null) {
             if (cloud.cloud() || !mongo.isEnabled()) throw InstallationFiles.refused();
@@ -49,7 +51,8 @@ class StorageRootConfiguration {
             if (stage.configurationHash() != null && uri.isPresent()
                     && !stage.configurationHash().equals(OnPremInstallation.configurationHash(OnPremInstallation.connection(files)))) throw InstallationFiles.refused();
         }
-        return new StorageRoot(mongo, cloud, bridge.getIfAvailable(), boot, history, secrets, clock, signing.bytes());
+        return new StorageRoot(mongo, cloud, bridge.getIfAvailable(), boot, history, secrets, clock, signing.bytes(),
+                () -> installationOwner.ifPresent(InstallationFiles.RuntimeOwner::requireActive));
     }
     @Bean AuthenticationMode authenticationMode(CloudRuntimeSettings cloud) {
         return cloud.cloud() ? AuthenticationMode.CLOUD : AuthenticationMode.ON_PREM;
@@ -73,7 +76,7 @@ class StorageRootConfiguration {
     @Bean StorageControlDispatcher.Snapshots storageSnapshots(StorageRoot root, ObjectProvider<OnPremInstallation> installations) {
         return (caller, active) -> {
             var installation = installations.getIfAvailable();
-            return installation != null && caller.cacheScope().isEmpty() ? installation.snapshot(caller, active) : root.snapshot(caller, active);
+            return installation != null && (caller.cacheScope().isEmpty() || caller.initialInstallationRecovery()) ? installation.snapshot(caller, active) : root.snapshot(caller, active);
         };
     }
     @Bean @org.springframework.context.annotation.Lazy
@@ -94,7 +97,10 @@ class StorageRootConfiguration {
         };
     }
     @Bean @org.springframework.context.annotation.Lazy
-    StorageRecoveryService storageRecoveryService(StorageRoot root, Clock clock) { return root.recoveryService(clock); }
+    StorageRecoveryService storageRecoveryService(StorageRoot root, Clock clock, ObjectProvider<OnPremInstallation> installations) {
+        var installation = installations.getIfAvailable();
+        return installation == null ? root.recoveryService(clock) : installation.recoveryService();
+    }
     @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService storageSetupService(StorageRoot root, ObjectProvider<InstalledConnectorTests> connectors,
             MongoProperties mongo, Clock clock, ObjectProvider<StorageBusinessFactory> factories, ObjectProvider<OnPremInstallation> installations) {

@@ -26,10 +26,15 @@ final class StorageRuntime implements AutoCloseable {
     private AutoCloseable business;
     private volatile boolean closed;
     private boolean cleanupUnknown;
+    private final Runnable ownerActive;
 
     StorageRuntime(MongoConfigurationDomain configuration, Function<StorageBinding, MongoCacheDomain> connections) {
+        this(configuration, connections, () -> {});
+    }
+    StorageRuntime(MongoConfigurationDomain configuration, Function<StorageBinding, MongoCacheDomain> connections, Runnable ownerActive) {
         this.configuration = configuration;
         this.connections = Objects.requireNonNull(connections, "connections");
+        this.ownerActive = Objects.requireNonNull(ownerActive, "ownerActive");
     }
 
     synchronized Optional<MongoConfigurationDomain> configuration() {
@@ -180,7 +185,7 @@ final class StorageRuntime implements AutoCloseable {
         original.requireActive();
     }
 
-    private void requireOpen() { if (closed) throw unavailable(); }
+    private void requireOpen() { if (closed) throw unavailable(); ownerActive.run(); }
 
     final class Bound {
         private final StorageBinding binding;
@@ -199,7 +204,7 @@ final class StorageRuntime implements AutoCloseable {
         StorageBinding binding() { requireActive(); return binding; }
         CachePreparation preparation() { requireActive(); return preparation; }
         MongoCacheDomain cache() { requireActive(); return cache; }
-        void requireActive() { if (!active || closed) throw unavailable(); }
+        void requireActive() { requireOpen(); if (!active) throw unavailable(); }
         void verifyAuthentication() {
             requireActive();
             try { cache.loadAuthScope(preparation.authScope()); requireActive(); authReady = true; }

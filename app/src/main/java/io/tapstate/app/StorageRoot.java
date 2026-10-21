@@ -30,9 +30,15 @@ final class StorageRoot implements AutoCloseable {
     private java.util.concurrent.ExecutorService recoveryWorker;
     private volatile boolean recoveryQueued;
     private volatile boolean recoveryFailed;
+    private final Runnable installationActive;
 
     StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
             MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey) {
+        this(mongo, cloud, bridge, boot, history, secrets, clock, signingKey, () -> {});
+    }
+    StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
+            MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey, Runnable installationActive) {
+        this.installationActive = Objects.requireNonNull(installationActive);
         this.cloud = Objects.requireNonNull(cloud);
         String uri = cloud.metadataUri(mongo.getUri());
         StorageBinding.Connection selectedEndpoint = null;
@@ -65,7 +71,7 @@ final class StorageRoot implements AutoCloseable {
             var databases = new OperatorDatabaseBinding(preparation.businessScope(), binding.cache().database(),
                     original.databaseName(), MongoDatabaseNames.fromUri(masterUri));
             return MongoCacheDomain.connect(binding.cache(), mongo.getServerSelectionTimeout(), boot.value(), history.getRetention(), databases);
-        });
+        }, this::requireOpen);
         runtime = runtimes.apply(null); authentication = authentications.apply(null);
         loadConfiguration();
     }
@@ -100,6 +106,11 @@ final class StorageRoot implements AutoCloseable {
 
     synchronized StorageSetupService.Status coordinateSetup(java.util.function.Supplier<StorageSetupService.Status> action) {
         requireOpen(); return action.get();
+    }
+    synchronized <T> T coordinateInstallation(java.util.function.Supplier<T> action) { requireOpen(); return action.get(); }
+    synchronized boolean originalSetupCreationAvailable() {
+        return setupInvocation != null && setupInvocation.firstCreation().isPresent()
+                && attemptedCreation != setupInvocation.firstCreation().orElseThrow();
     }
 
     /** Transfers the original installer-owned CONFIG client; the installer retains no second runtime. */
@@ -141,6 +152,7 @@ final class StorageRoot implements AutoCloseable {
                     || !runtime.requireConfiguration().bindings().load().orElseThrow(StorageRuntime::unavailable).equals(committed.binding())
                     || !runtime.requireConfiguration().bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable).equals(committed.preparation()))
                 throw StorageRuntime.unavailable();
+            runtime.requireConfiguration().requireOriginalInitialPreparation(committed.preparation());
         };
         active.run();
         var configuration = runtime.requireConfiguration();
@@ -426,7 +438,7 @@ final class StorageRoot implements AutoCloseable {
                 actions, false);
     }
 
-    private void requireOpen() { if (closed) throw StorageRuntime.unavailable(); }
+    private void requireOpen() { if (closed) throw StorageRuntime.unavailable(); installationActive.run(); }
     private static String readCa(String path) {
         if (path == null || path.isBlank()) return null;
         try { return java.nio.file.Files.readString(java.nio.file.Path.of(path)); }

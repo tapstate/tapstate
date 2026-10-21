@@ -18,12 +18,20 @@ public final class StorageRecoveryService {
     private final StorageRecoveryCommands commands;
     private final Inspector inspector;
     private final AuditGate audit;
-    private final java.util.function.Consumer<StorageRecoveryCommands.Plan> published;
+    private final java.util.function.Function<StorageRecoveryCommands.Plan,StorageRecoveryCommands.Plan> published;
     public StorageRecoveryService(StorageRecoveryCommands commands, Inspector inspector, AuditGate audit) {
         this(commands, inspector, audit, ignored -> {});
     }
     public StorageRecoveryService(StorageRecoveryCommands commands, Inspector inspector, AuditGate audit,
             java.util.function.Consumer<StorageRecoveryCommands.Plan> published) {
+        this(commands, inspector, audit, (java.util.function.Function<StorageRecoveryCommands.Plan,StorageRecoveryCommands.Plan>) plan -> { published.accept(plan); return plan; });
+    }
+    public static StorageRecoveryService ownedPublication(StorageRecoveryCommands commands, Inspector inspector, AuditGate audit,
+            java.util.function.Function<StorageRecoveryCommands.Plan,StorageRecoveryCommands.Plan> published) {
+        return new StorageRecoveryService(commands, inspector, audit, published);
+    }
+    private StorageRecoveryService(StorageRecoveryCommands commands, Inspector inspector, AuditGate audit,
+            java.util.function.Function<StorageRecoveryCommands.Plan,StorageRecoveryCommands.Plan> published) {
         this.commands = Objects.requireNonNull(commands, "commands"); this.inspector = Objects.requireNonNull(inspector, "inspector");
         this.audit = Objects.requireNonNull(audit, "audit");
         this.published = Objects.requireNonNull(published, "published");
@@ -50,12 +58,21 @@ public final class StorageRecoveryService {
         if (!explicitlyConfirmed || !original.originalScope().equals(scope) || !original.planHash().equals(planHash)
                 || original.controlRevision() != controlRevision) throw conflict();
         if (original.phase() != StorageRecoveryCommands.Phase.PLANNED) {
-            published.accept(original); return original;
+            return publish(original);
         }
         Runnable current = () -> { active.run(); inspector.requireCurrent(scope, original.manifest()); };
         var result = audit.dispatch(ControlOperations.STORAGE_RECOVERY_CONFIRM, new AuditContext(subject, operationId),
                 () -> commands.guardedBy(current).confirm(original));
-        published.accept(result); return result;
+        return publish(result);
+    }
+    private StorageRecoveryCommands.Plan publish(StorageRecoveryCommands.Plan original) {
+        var result = Objects.requireNonNull(published.apply(original), "published recovery result");
+        if (!result.operationId().equals(original.operationId()) || !result.originalScope().equals(original.originalScope())
+                || !Objects.equals(result.previousOperationId(), original.previousOperationId())
+                || !result.manifest().equals(original.manifest()) || !result.planHash().equals(original.planHash())
+                || result.controlRevision() != original.controlRevision() || result.phase().ordinal() < original.phase().ordinal())
+            throw new IllegalStateException("recovery publication changed its original confirmation");
+        return result;
     }
     public Optional<StorageRecoveryCommands.Plan> status(CacheAuthScope scope, Runnable active, String originalId) {
         active.run();

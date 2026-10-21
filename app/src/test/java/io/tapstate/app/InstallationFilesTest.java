@@ -114,4 +114,79 @@ class InstallationFilesTest {
         Files.writeString(path, Files.readString(path).replace(issued.expiresAt().toString(), "not-an-instant"));
         assertThatThrownBy(files::capability).isInstanceOf(TapstateException.class);
     }
+
+    @Test void oneRuntimeOwnsTheInstallationWhileOwnerCliReissueRemainsAvailable() {
+        var files = InstallationFiles.initialize(temporary.resolve("runtime-owner"));
+        var other = new InstallationFiles(files.directory());
+        try (var runtime = files.ownRuntime()) {
+            runtime.requireActive();
+            assertThatThrownBy(other::ownRuntime).isInstanceOf(TapstateException.class);
+            var issued = InstallationCommand.authorize(other, new MongoProperties(), java.time.Clock.systemUTC());
+            assertThat(files.capability()).contains(issued);
+            runtime.requireActive();
+        }
+        try (var successor = other.ownRuntime()) { successor.requireActive(); }
+    }
+
+    @Test void ownerFileReadsCannotReleaseTheRuntimeLockToAnotherJvm() throws Exception {
+        var files = InstallationFiles.initialize(temporary.resolve("runtime-process"));
+        try (var owner = files.ownRuntime()) {
+            files.stage(); files.saveStage(files.stage());
+            owner.requireActive();
+            assertThat(runtimeProbe(files)).contains("REFUSED").doesNotContain("ACQUIRED");
+        }
+        assertThat(runtimeProbe(files)).contains("ACQUIRED");
+    }
+
+    @Test void interruptingAFileReaderCannotReleaseLiveRuntimeOwnership() throws Exception {
+        var files = InstallationFiles.initialize(temporary.resolve("interrupted-reader"));
+        var owner = files.ownRuntime();
+        try {
+            var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+            Thread reader = Thread.ofPlatform().start(() -> {
+                Thread.currentThread().interrupt();
+                failure.set(catchThrowable(files::stage));
+            });
+            reader.join(5000); assertThat(reader.isAlive()).isFalse();
+            assertThat(failure.get()).isInstanceOf(TapstateException.class);
+            assertThat(runtimeProbe(files)).contains("REFUSED").doesNotContain("ACQUIRED");
+            owner.requireActive();
+        } finally { try { owner.close(); } catch (TapstateException alreadyLost) { /* The acquisition assertion above discriminates the defect. */ } }
+    }
+
+    @Test void interruptingAWaitForAnotherProcessMutationKeepsRuntimeOwnership() throws Exception {
+        var files = InstallationFiles.initialize(temporary.resolve("interrupted-wait"));
+        try (var owner = files.ownRuntime()) {
+            var blocker = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx64m", "-cp",
+                    System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")), InstallationRuntimeProbe.class.getName(), files.directory().toString(), "mutation")
+                    .redirectErrorStream(true).start();
+            Thread reader = null;
+            try (var lines = new java.io.BufferedReader(new java.io.InputStreamReader(blocker.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+                assertThat(lines.readLine()).isEqualTo("MUTATION_HELD");
+                var entered = new CountDownLatch(1); var done = new CountDownLatch(1);
+                var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+                reader = Thread.ofPlatform().start(() -> { entered.countDown(); failure.set(catchThrowable(files::stage)); done.countDown(); });
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(done.await(100, TimeUnit.MILLISECONDS)).isFalse();
+                reader.interrupt(); assertThat(done.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(failure.get()).isInstanceOf(TapstateException.class);
+                assertThat(runtimeProbe(files)).contains("REFUSED").doesNotContain("ACQUIRED"); owner.requireActive();
+            } finally {
+                blocker.getOutputStream().close();
+                if (!blocker.waitFor(5, TimeUnit.SECONDS)) { blocker.destroy(); if (!blocker.waitFor(5, TimeUnit.SECONDS)) blocker.destroyForcibly(); }
+                if (reader != null && reader.isAlive()) { reader.interrupt(); reader.join(5000); }
+            }
+        }
+    }
+
+    private String runtimeProbe(InstallationFiles files) throws Exception {
+        var process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx64m", "-cp",
+                System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")), InstallationRuntimeProbe.class.getName(), files.directory().toString())
+                .redirectErrorStream(true).start();
+        try {
+            assertThat(process.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(process.exitValue()).isZero();
+            return new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        } finally { if (process.isAlive()) { process.destroy(); if (!process.waitFor(5, TimeUnit.SECONDS)) process.destroyForcibly(); } }
+    }
 }

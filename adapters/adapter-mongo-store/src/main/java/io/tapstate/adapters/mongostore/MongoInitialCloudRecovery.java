@@ -35,6 +35,11 @@ final class MongoInitialCloudRecovery {
             if (!"COMPLETE".equals(setup.get("phase")) || previous == null || !shape(previous.manifest()))
                 throw MongoCachePipelineAccess.fenced();
         }
+        return requirePristineSource(session, database, binding, artifacts, scope, false);
+    }
+
+    static SourceResource requirePristineSource(ClientSession session, MongoDatabase database, StorageBinding binding,
+            MongoConfigurationArtifactStore artifacts, CacheAuthScope scope, boolean pendingAdministrator) {
         var existing = new java.util.HashSet<>(database.listCollectionNames().into(new java.util.ArrayList<>()));
         for (var installed : new SystemCollections[]{SystemCollections.CAPTURE_PREPARATIONS, SystemCollections.PDK_NOTE_SCOPES,
                 SystemCollections.PDK_NOTE_ORIGINS, SystemCollections.PDK_NOTE_CARRIES, SystemCollections.CONFIG_PIPELINE_DRAFTS,
@@ -46,10 +51,10 @@ final class MongoInitialCloudRecovery {
                 SystemCollections.CONFIG_PIPELINE_DRAFTS, SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS,
                 SystemCollections.SERVE_DEFINITIONS, SystemCollections.PDK_NOTES,
                 SystemCollections.PDK_NOTE_ORIGINS, SystemCollections.PDK_NOTE_CARRIES, SystemCollections.PDK_NOTE_MIGRATIONS,
-                SystemCollections.CONFIG_NEST_DEAD_LETTERS, SystemCollections.CONFIG_CONNECTIONS, SystemCollections.CONFIGURATION_IMPORTS, SystemCollections.CONFIG_USERS,
-                SystemCollections.OP_BOOTSTRAP}) {
+                SystemCollections.CONFIG_NEST_DEAD_LETTERS, SystemCollections.CONFIG_CONNECTIONS, SystemCollections.CONFIGURATION_IMPORTS, SystemCollections.CONFIG_USERS}) {
             if (table.on(database).find(session).limit(1).first() != null) throw MongoCachePipelineAccess.fenced();
         }
+        if (!pendingAdministrator && SystemCollections.OP_BOOTSTRAP.on(database).find(session).limit(1).first() != null) throw MongoCachePipelineAccess.fenced();
         var scopes = SystemCollections.PDK_NOTE_SCOPES.on(database).find(session).limit(2).into(new java.util.ArrayList<>());
         var pristine = new Document("_id", new Document("bindingVersion", binding.bindingVersion()).append("namespace", "pdk.global-state"))
                 .append("ownerKind", "GLOBAL").append("ownerId", scope.clusterId()).append("generation", 1L).append("writeFence", 0L)
@@ -57,7 +62,8 @@ final class MongoInitialCloudRecovery {
         if (scopes.size() != 1 || !scopes.getFirst().equals(pristine)) throw MongoCachePipelineAccess.fenced();
         if (SystemCollections.SOURCES.on(database).countDocuments(session) != 1) throw MongoCachePipelineAccess.fenced();
         var resource = artifacts.getInTransaction(session, binding.defaultSourceId()).orElseThrow(MongoCachePipelineAccess::fenced);
-        if (!(resource instanceof SourceResource source) || !"mongodb-atlas".equals(source.connector())) throw MongoCachePipelineAccess.fenced();
+        if (!(resource instanceof SourceResource source) || (scope.mode() == StorageBinding.Mode.CLOUD
+                ? !"mongodb-atlas".equals(source.connector()) : !Set.of("mongodb", "mongodb-atlas").contains(source.connector()))) throw MongoCachePipelineAccess.fenced();
         return source;
     }
 

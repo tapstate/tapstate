@@ -34,6 +34,7 @@ class OnPremManagementChannelTest {
             try (var http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build()) {
                 assertThat(post(http, publicUrl + "/api/storage/status", issued, "{}").statusCode()).isIn(401, 403, 503);
                 assertThat(post(http, publicUrl + "/installation/first-admin", issued, "{\"username\":\"admin\",\"password\":\"password\"}").statusCode()).isIn(401, 403);
+                assertPublicReverseProxyCannotGrantManagement(http, publicUrl, issued);
                 var status = post(http, management + "/api/storage/status", issued, "{}");
                 assertThat(status.statusCode()).withFailMessage(status.body()).isEqualTo(200);
                 assertThat(((Map<?,?>)JsonReader.parse(status.body())).get("setupPhase")).isEqualTo("LOCAL_SETUP");
@@ -41,8 +42,21 @@ class OnPremManagementChannelTest {
                 assertThat(post(http, management + "/auth/bootstrap", issued, "{}").statusCode()).isEqualTo(403);
                 assertThat(post(http, management + "/api/sources", issued, "{}").statusCode()).isEqualTo(403);
                 assertThat(post(http, management + "/installation/first-admin", issued, "{\"username\":\"admin\",\"password\":\"password\"}").statusCode()).isEqualTo(403);
-                var forged = request(management + "/api/storage/status", issued, "{}").header("X-Forwarded-For", "127.0.0.1").build();
-                assertThat(http.send(forged, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
+                for (String header : java.util.List.of("Forwarded", "X-Forwarded-For", "X-Forwarded-Host")) {
+                    var forged = request(management + "/api/storage/status", issued, "{}").header(header, "127.0.0.1").build();
+                    assertThat(http.send(forged, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
+                }
+                var crossSite = request(management + "/api/storage/status", issued, "{}").header("Sec-Fetch-Site", "cross-site").build();
+                assertThat(http.send(crossSite, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
+                try (var socket = new java.net.Socket("127.0.0.1", URI.create(management).getPort())) {
+                    socket.setSoTimeout(15000);
+                    String payload = "POST /api/storage/status HTTP/1.1\r\nHost: unrelated.example\r\n"
+                            + OnPremInstallation.CAPABILITY_HEADER + ": " + issued.token()
+                            + "\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    socket.getOutputStream().write(payload.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                    var lines = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream(), java.nio.charset.StandardCharsets.US_ASCII));
+                    assertThat(lines.readLine()).contains(" 403 ");
+                }
                 var foreignOrigin = request(management + "/api/storage/status", issued, "{}").header("Origin", "https://unrelated.example").build();
                 assertThat(http.send(foreignOrigin, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
                 var noCredential = request(management + "/api/storage/status", null, "{}").build();
@@ -55,6 +69,36 @@ class OnPremManagementChannelTest {
                 assertThat(application.getBeanFactory().containsSingleton("installedConnectorTests")).isFalse();
             }
         }
+    }
+
+    private static void assertPublicReverseProxyCannotGrantManagement(HttpClient http, String upstream,
+            SetupCapabilityService.Issued issued) throws Exception {
+        var forwardedCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var proxy = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        proxy.createContext("/", exchange -> {
+            try (exchange) {
+                String body = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                var forwarded = request(upstream + exchange.getRequestURI().getPath(), issued, body);
+                String suppliedForwarding = exchange.getRequestHeaders().getFirst("X-Forwarded-For");
+                if (suppliedForwarding != null) forwarded.header("X-Forwarded-For", suppliedForwarding);
+                try {
+                    var response = http.send(forwarded.build(), HttpResponse.BodyHandlers.ofByteArray());
+                    forwardedCalls.incrementAndGet();
+                    exchange.sendResponseHeaders(response.statusCode(), response.body().length);
+                    exchange.getResponseBody().write(response.body());
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt(); throw new java.io.IOException(interrupted);
+                }
+            }
+        });
+        proxy.start();
+        try {
+            String base = "http://127.0.0.1:" + proxy.getAddress().getPort();
+            assertThat(post(http, base + "/api/storage/status", issued, "{}").statusCode()).isIn(401, 403, 503);
+            var spoofed = request(base + "/installation/first-admin", issued, "{}").header("X-Forwarded-For", "127.0.0.1").build();
+            assertThat(http.send(spoofed, HttpResponse.BodyHandlers.ofString()).statusCode()).isIn(401, 403);
+            assertThat(forwardedCalls.get()).isEqualTo(2);
+        } finally { proxy.stop(0); }
     }
 
     private static HttpRequest.Builder request(String url, SetupCapabilityService.Issued issued, String body) {

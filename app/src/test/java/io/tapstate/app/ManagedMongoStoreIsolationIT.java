@@ -294,6 +294,83 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void lostInitialOpCreationRequiresOwnerConfirmationAndAControlledRestart(boolean runningWithoutIdentity) throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String config = "recover_config_" + suffix, cache = "recover_cache_" + suffix, master = "recover_master_" + suffix, user = "recover_" + suffix;
+        var files = InstallationFiles.initialize(work.resolve("lost-installation"));
+        var setup = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+        Path seeds = Files.createDirectory(work.resolve("lost-seeds"));
+        Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"), seeds.resolve("mongodb-connector.jar"));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(config, cache, master)); seedOpBoundary(files, user, config, cache, master, "lost");
+            String predecessor = null;
+            if (runningWithoutIdentity) {
+                try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationDomain.openExisting(OnPremInstallation.settings(files, new MongoProperties()))) {
+                    var scope = configuration.bindings().cachePreparation().orElseThrow().authScope();
+                    var source = configuration.initialOpRecoverySource(scope, false);
+                    var properties = new ConnectorPluginProperties(); properties.setSeedDir(seeds); properties.setPluginsDir(work.resolve("retained-plan-plugins"));
+                    var target = new InstalledConnectorTests(properties, java.time.Clock.systemUTC()).target();
+                    var masterConnection = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, master), master, null);
+                    String dependency = OnPremInstallation.recoveryDependency(configuration.bindings().load().orElseThrow(), scope, target.identity(masterConnection));
+                    var manifest = new io.tapstate.spi.store.StorageRecoveryCommands.Manifest(new io.tapstate.spi.store.StorageRecoveryCommands.Selection(
+                            io.tapstate.spi.store.StorageRecoveryCommands.Extent.CLUSTER, java.util.Set.of()), java.util.Set.of(),
+                            Map.of(source.id(), io.tapstate.core.model.canonical.CanonicalHash.of(source)), dependency, configuration.configurationRevision());
+                    var commands = configuration.recoveryCommands(); var confirmed = commands.confirm(commands.plan(scope, manifest, null, null));
+                    predecessor = configuration.startInitialOpRecovery(confirmed, () -> {}).plan().operationId();
+                }
+            }
+            long firstPid;
+            try (var process = installationProcess(files, seeds, "lost")) {
+                firstPid = process.process.pid(); var management = process.management(files, setup.token());
+                assertThat(admin.getDatabase(cache).listCollectionNames().into(new ArrayList<>())).isEmpty();
+                var initial = management.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
+                assertThat(initial.get("businessPhase")).isEqualTo("AWAITING_REBUILD_CONFIRMATION");
+                assertThatThrownBy(() -> process.publicClient().post().uri("/api/storage/recovery/plan")
+                        .header(OnPremInstallation.CAPABILITY_HEADER, setup.token()).body(Map.of("scope", "CLUSTER", "pipelineIds", List.of()))
+                        .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                var input = new java.util.LinkedHashMap<String,Object>(); input.put("scope", "CLUSTER"); input.put("pipelineIds", List.of());
+                if (predecessor != null) input.put("previousOperationId", predecessor);
+                var planned = management.post().uri("/api/storage/recovery/plan").body(input).retrieve().body(Map.class);
+                assertThat(planned.get("phase")).isEqualTo("PLANNED");
+                assertThat(admin.getDatabase(cache).listCollectionNames().into(new ArrayList<>())).isEmpty();
+                assertThat(admin.getDatabase(config).getCollection("users").countDocuments()).isZero();
+                var confirm = new java.util.LinkedHashMap<String,Object>(); confirm.put("operationId", planned.get("operationId")); confirm.put("planHash", planned.get("planHash"));
+                confirm.put("controlRevision", planned.get("controlRevision")); confirm.put("confirmed", false);
+                assertThatThrownBy(() -> management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().toBodilessEntity())
+                        .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                assertThat(admin.getDatabase(cache).listCollectionNames().into(new ArrayList<>())).isEmpty();
+                confirm.put("confirmed", true);
+                var completed = management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().body(Map.class);
+                assertThat(completed.get("phase")).isEqualTo("COMPLETE");
+                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
+                assertThat(files.capability()).isEmpty();
+                var identity = admin.getDatabase(cache).getCollection("cache_identity").find().first();
+                assertThat(identity.getString("authPreparationId")).isEqualTo(planned.get("operationId"));
+                assertThat(identity.getString("businessPreparationId")).isEqualTo(planned.get("operationId"));
+                assertThat(identity.getLong("authGeneration")).isEqualTo(1L);
+                assertThat(admin.getDatabase(cache).getCollection("workload_claims").countDocuments()).isZero();
+                assertThat(admin.getDatabase(config).getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
+                assertThatThrownBy(() -> management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().toBodilessEntity())
+                        .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+            }
+            try (var process = installationProcess(files, seeds, "recovered")) {
+                assertThat(process.process.pid()).isNotEqualTo(firstPid);
+                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTARTED);
+                var firstAdmin = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+                process.management(files, firstAdmin.token()).post().uri("/installation/first-admin")
+                        .body(Map.of("username", "admin", "password", "recovered-admin-password")).retrieve().toBodilessEntity();
+                var login = process.publicClient().post().uri("/auth/login").body(Map.of("username", "admin", "password", "recovered-admin-password", "createSession", true))
+                        .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
+                assertThat(process.publicClient().get().uri("/api/sources").header("Authorization", "Bearer " + login.token()).retrieve().body(String.class)).contains("views");
+                assertThat(admin.getDatabase(config).getCollection("sources").countDocuments()).isOne();
+                assertThat(admin.getDatabase(config).getCollection("users").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cache).getCollection("op_sessions").countDocuments()).isOne();
+            }
+        }
+    }
+
     private static void seedOpBoundary(InstallationFiles files, String user, String config, String cache, String master, String boundary) {
         var endpoint = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, config), config, null);
         var scope = files.stage().scope(); String hash = OnPremInstallation.configurationHash(endpoint);
@@ -309,6 +386,7 @@ class ManagedMongoStoreIsolationIT {
             var connection = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, cache), cache, null);
             var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", uri(user, master)), null, null, null, null);
             var committed = configuration.bindings().commitWithFirstCache(scope, io.tapstate.spi.store.StorageBinding.Mode.OP, connection, target);
+            if (boundary.equals("lost")) return;
             try (var cached = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(connection, Duration.ofSeconds(5), "retained-op-boundary")) {
                 cached.prepareFirstAuth(committed.firstCreation().orElseThrow());
                 if (boundary.equals("birth")) return;

@@ -50,13 +50,21 @@ public final class StorageControlAccess {
         Objects.requireNonNull(verified, "verified"); verified.run();
         return new StorageControlAccess(StorageBinding.Mode.OP, verified.scope(), null, null, null, verified, verified);
     }
+    /** The installation owner supplies this allocated initial scope; it never grants a normal session. */
+    public static StorageControlAccess initialInstallationRecovery(SetupCapabilityService.Permission verified, CacheAuthScope original) {
+        Objects.requireNonNull(verified, "verified"); Objects.requireNonNull(original, "original"); verified.run();
+        if (verified.purpose() != StorageSetupStateStore.Purpose.SETUP || original.mode() != StorageBinding.Mode.OP || original.authGeneration() != 1)
+            throw new TapstateException(ControlError.BOOTSTRAP_FORBIDDEN, Map.of(), null);
+        return new StorageControlAccess(StorageBinding.Mode.OP, verified.scope(), original, null, null, verified, verified);
+    }
 
     public void require(Operation operation) {
         active.run();
         if (permission != null) {
             boolean status = operation.id().equals("storage.status") || operation.id().equals("storage.setup.status");
             boolean setupWrite = operation.id().equals("storage.test") || operation.id().equals("storage.setup.commit");
-            if (!status && !(setupWrite && permission.purpose() == StorageSetupStateStore.Purpose.SETUP)) throw forbidden(operation, Scope.ADMIN);
+            boolean initialRecovery = initialInstallationRecovery() && java.util.Set.of("storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status").contains(operation.id());
+            if (!status && !initialRecovery && !(setupWrite && permission.purpose() == StorageSetupStateStore.Purpose.SETUP)) throw forbidden(operation, Scope.ADMIN);
             return;
         }
         Scope required = mode == StorageBinding.Mode.OP ? Scope.ADMIN : operation.scope();
@@ -69,6 +77,7 @@ public final class StorageControlAccess {
     public StorageBinding.Mode mode() { return mode; }
     public StorageSetupScope setup() { return setup; }
     public java.util.Optional<CacheAuthScope> cacheScope() { return java.util.Optional.ofNullable(cache); }
+    public boolean initialInstallationRecovery() { return permission != null && cache != null && permission.purpose() == StorageSetupStateStore.Purpose.SETUP; }
     public CacheAuthScope cache() {
         if (cache == null) throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
         return cache;

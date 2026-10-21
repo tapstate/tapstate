@@ -81,6 +81,20 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         loadAuthScope(original.authScope()); pending.run();
     }
     void verifyRecoveryPermissions() { businessActive(); connection.verifyStoragePermissions(); }
+    /** Initial OP preflight has no formal session and must observe a genuinely empty target. */
+    public void verifyEmptyInitialRecovery() {
+        businessActive(); if (!emptyForAuthenticationRecovery()) throw MongoCacheIdentity.fenced();
+    }
+    public void verifyInitialRecoveryPermissions() { verifyRecoveryPermissions(); }
+
+    void verifyInitialRecovery(io.tapstate.spi.store.CachePreparation original) {
+        businessActive(); loadAuthScope(original.authScope()); loadBusinessScope(original.businessScope());
+        StoreIo.run(() -> {
+            var row = SystemCollections.CACHE_IDENTITY.on(database).find(new Document("_id", "cluster")).first();
+            if (row == null || !original.operationId().equals(row.get("authPreparationId"))
+                    || !original.operationId().equals(row.get("businessPreparationId")) || !"READY".equals(row.get("businessPhase"))) throw MongoCacheIdentity.fenced();
+        });
+    }
     /** A new preflight must observe exactly the current formal auth-only domain. */
     public void verifyAuthenticationOnly(CacheAuthScope expected) {
         businessActive(); loadAuthScope(expected); requireAuthOnlyRecovery(expected);
