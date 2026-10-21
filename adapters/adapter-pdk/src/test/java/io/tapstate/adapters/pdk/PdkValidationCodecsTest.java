@@ -26,6 +26,96 @@ import static org.assertj.core.api.Assertions.*;
 class PdkValidationCodecsTest {
     private record DriverValue(String value) {}
 
+    @Test void exactNumericLaneRefusesCollapsedCustomDoublesWithoutTryingAnotherCodec() {
+        var registry = new Registry();
+        registry.registerToTapValue(DriverValue.class, (value, model) ->
+                new TapNumberValue(new BigDecimal(((DriverValue)value).value()).doubleValue()));
+        var selector = codecs(registry);
+        var model = new TapNumber().fixed(true).precision(34).scale(9);
+        var first = selector.select("amount", new DriverValue("9007199254740992"), model);
+        var second = selector.select("amount", new DriverValue("9007199254740993"), model);
+        assertThat(((TapValue<?, ?>)first.value()).getValue()).isEqualTo(((TapValue<?, ?>)second.value()).getValue());
+        for (var selected : List.of(first, second)) {
+            assertThatThrownBy(() -> selector.exactNumber("amount", selected))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ValidationError.CODEC_VALUE_UNAVAILABLE));
+        }
+        assertThat(registry.defaultCalls).hasValue(0);
+    }
+
+    @Test void exactNumericLanePreservesLargePortableNumbersAndValidNull() {
+        var selector = codecs(new Registry());
+        var model = new TapNumber().fixed(true).precision(38);
+        for (Number value : List.of(1, 9007199254740993L, new BigInteger("18446744073709551616"),
+                new BigDecimal("123456789.123456789"))) {
+            assertThat(selector.exactNumber("amount", selector.select("amount", value, model))).isSameAs(value);
+        }
+        var decimal = new BigDecimal("1.00");
+        var converted = new ConvertedValue(decimal, "NUMERIC");
+        assertThat(selector.exactNumber("amount", selector.select("amount", converted, model))).isSameAs(decimal);
+        var typed = new ValidationValues.Typed("exact-number", "NUMERIC", "binding-v1", decimal);
+        assertThat(selector.exactNumber("amount", selector.select("amount", typed, model))).isSameAs(decimal);
+        assertThat(selector.exactNumber("amount", selector.select("amount", null, model))).isNull();
+        assertThat(selector.exactNumber("amount", selector.select("amount", new TapNumberValue(null), model))).isNull();
+    }
+
+    @Test void exactNumericLaneNeverGuessesTextBooleansOrFloatingRepresentations() {
+        var selector = codecs(new Registry());
+        for (Object value : List.of("1", true, 1.0d, 1.0f, Double.NaN, Double.POSITIVE_INFINITY,
+                new TapStringValue("123456789.123456789"))) {
+            var selected = selector.select("amount", value, new TapNumber().fixed(true));
+            assertThatThrownBy(() -> selector.exactNumber("amount", selected)).isInstanceOf(TapstateException.class);
+        }
+        // Floating data remains available to its own declared lane; this is not a global float ban.
+        assertThat(selector.select("ratio", 1.25d, new TapNumber().fixed(false)).value()).isEqualTo(1.25d);
+    }
+
+    @Test void exactCustomPayloadIsUsedAsReturnedAndWrapperFailureKeepsItsCause() {
+        var registry = new Registry();
+        BigDecimal output = new BigDecimal("123456789.123456789");
+        registry.registerToTapValue(DriverValue.class, (value, model) -> new ExactWrapper(output, null));
+        var selector = codecs(registry);
+        assertThat(selector.exactNumber("amount", selector.select("amount", new DriverValue("opaque"),
+                new TapNumber().fixed(true)))).isSameAs(output);
+        var cause = new IllegalStateException("fixture wrapper failed");
+        var broken = selector.select("amount", new ExactWrapper(output, cause), new TapNumber().fixed(true));
+        assertThatThrownBy(() -> selector.exactNumber("amount", broken))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ValidationError.CODEC_FAILED);
+                    assertThat(failure.getCause()).isSameAs(cause);
+                });
+        assertThat(registry.defaultCalls).hasValue(0);
+    }
+
+    @Test void cyclicNumericWrapperIsBoundedRatherThanUnwrappedForever() {
+        var wrapper = new TapValue<Object, TapNumber>() {
+            @Override public TapType createDefaultTapType() { return new TapNumber(); }
+            @Override public Class<? extends TapType> tapTypeClass() { return TapNumber.class; }
+        };
+        wrapper.setValue(wrapper);
+        var selector = codecs(new Registry());
+        assertThatThrownBy(() -> selector.exactNumber("amount", selector.select("amount", wrapper, null)))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ValidationError.VALUE_LIMIT_EXCEEDED));
+    }
+
+    private static final class ExactWrapper extends TapValue<BigDecimal, TapNumber> {
+        private final RuntimeException failure;
+        private ExactWrapper(BigDecimal value, RuntimeException failure) { this.value = value; this.failure = failure; }
+        @Override public BigDecimal getValue() { if (failure != null) throw failure; return value; }
+        @Override public TapType createDefaultTapType() { return new TapNumber(); }
+        @Override public Class<? extends TapType> tapTypeClass() { return TapNumber.class; }
+    }
+
+    @Test void exactNumericLaneRejectsOldBindingsAndContradictoryTypedDomains() {
+        var selector = codecs(new Registry());
+        var old = new PdkValidationCodecs.Selected(BigDecimal.ONE, PdkValidationCodecs.Origin.BUILTIN, "old-binding");
+        assertThatThrownBy(() -> selector.exactNumber("amount", old)).isInstanceOf(TapstateException.class);
+        var wrongDomain = new ValidationValues.Typed("text", "VARCHAR", "binding-v1", 1);
+        assertThatThrownBy(() -> selector.exactNumber("amount", selector.select("amount", wrongDomain, null)))
+                .isInstanceOf(TapstateException.class);
+    }
+
     @Test void customCodecWinsBeforeTheBuiltinLaneAndReceivesTheActualModel() {
         var registry = new Registry();
         AtomicReference<TapType> seenModel = new AtomicReference<>();

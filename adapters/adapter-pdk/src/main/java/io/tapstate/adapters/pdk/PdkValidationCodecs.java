@@ -3,6 +3,7 @@ package io.tapstate.adapters.pdk;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
 import io.tapdata.entity.schema.type.TapType;
+import io.tapdata.entity.schema.type.TapNumber;
 import io.tapdata.entity.schema.value.TapRawValue;
 import io.tapdata.entity.schema.value.TapValue;
 import io.tapstate.core.common.TapstateException;
@@ -69,6 +70,44 @@ final class PdkValidationCodecs {
         catch (RuntimeException failed) { throw failed(field, failed); }
         if (fallback == null) throw unavailable(field);
         return converted(field, value, modelType, fallback, Origin.DEFAULT);
+    }
+
+    /**
+     * Admits a selected value only when the caller requires an exact numeric representation. A floating
+     * payload is insufficient evidence even when this particular rounded value looks integral: the
+     * original may have been a neighboring integer or a higher-precision decimal. No second codec,
+     * origin-value recovery, string parsing or inferred rounding rule runs here. Model conformance is
+     * still a separate check. Null is a valid selected value and remains null.
+     */
+    Number exactNumber(String field, Selected selected) {
+        Objects.requireNonNull(field, "field");
+        Objects.requireNonNull(selected, "selected");
+        if (!binding.equals(selected.codecBinding())) throw unavailable(field);
+        Object value = selected.value();
+        for (int wrappers = 0; wrappers < 64; wrappers++) {
+            if (value == null) return null;
+            if (value instanceof ValidationValues.Typed typed) {
+                if (!binding.equals(typed.codecBinding()) || !typed.logicalType().equals("exact-number")) {
+                    throw unavailable(field);
+                }
+                value = typed.value();
+            } else if (value instanceof ConvertedValue converted) {
+                value = converted.value();
+            } else if (value instanceof TapValue<?, ?> converted) {
+                Class<? extends TapType> kind;
+                try { kind = converted.tapTypeClass(); }
+                catch (RuntimeException failure) { throw failed(field, failure); }
+                if (kind != TapNumber.class) throw unavailable(field);
+                try { value = converted.getValue(); }
+                catch (RuntimeException failure) { throw failed(field, failure); }
+            } else if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long
+                    || value.getClass() == BigInteger.class || value.getClass() == BigDecimal.class) {
+                return (Number) value;
+            } else {
+                throw unavailable(field);
+            }
+        }
+        throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "codecWrappers"), null);
     }
 
     private Selected converted(String field, Object value, TapType modelType,
