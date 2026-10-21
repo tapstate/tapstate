@@ -8,6 +8,8 @@ import java.util.Set;
 
 /** Diagnosable refusals at independent validation boundaries. */
 public enum ValidationError implements TapstateErrorCode {
+    EXECUTION_CANCELLED("validation.execution-cancelled", Set.of("node")),
+    SOURCE_FIELD_CONFLICT("validation.source-field-conflict", Set.of("node", "field")),
     RULE_UNSUPPORTED("validation.rule-unsupported", Set.of("node", "field", "rule")),
     INVALID_CONTRACT("validation.invalid-contract", Set.of("field")),
     KEY_LIMIT_EXCEEDED("validation.key-limit-exceeded", Set.of("limit")),

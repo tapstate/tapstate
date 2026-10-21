@@ -335,6 +335,7 @@ transform.unwind-needs-a-complete-before-image
 transform.unwind-rows-share-a-key
 validation.codec-failed
 validation.codec-value-unavailable
+validation.execution-cancelled
 validation.illegal-transition
 validation.incompatible-key
 validation.invalid-contract
@@ -344,5 +345,6 @@ validation.read-cancelled
 validation.read-failed
 validation.read-protocol-violation
 validation.rule-unsupported
+validation.source-field-conflict
 validation.value-limit-exceeded
 validation.value-type-unsupported

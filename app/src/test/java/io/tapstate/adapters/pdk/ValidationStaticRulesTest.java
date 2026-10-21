@@ -4,11 +4,14 @@ import io.tapstate.core.dsl.ValidationPredicateCompiler;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.validation.ValidationPredicate;
+import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationValueComparison;
 import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
+import io.tapstate.runtime.engine.validation.ValidationOrdinalExpansion;
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -75,6 +78,35 @@ class ValidationStaticRulesTest {
         // This is an ordinary array, so a root-level exists decision does not erase its ordering duty.
         assertThat(ValidationValueComparison.compare(working,
                 row(Map.of("id", 7L, "items", List.of(Map.of("amount", 11L), Map.of("amount", 9L)))))).isPresent();
+    }
+
+    @Test void filteringExpandedMembersKeepsTheOriginalOrdinalAndComparisonIdentity() {
+        var expansion = ValidationOrdinalExpansion.compile("expand", new TransformBody.Unwind("items", "position", false, null, null), ROW, 10);
+        var filter = ValidationPredicateCompiler.compile("keep", "after.items.keep", PREDICATE);
+        var rename = ValidationStaticMap.compile("rename", new TransformBody.MapProjection(Map.of("item", FieldRule.rename("items"))), ROW);
+        var parentKey = new ValidationKey(List.of(ValidationKey.Part.number(7)));
+        var source = row(Map.of("id", 7L, "items", List.of(Map.of("keep", false), Map.of("keep", true))));
+        var kept = new ArrayList<Long>();
+        try (var cursor = ((ValidationOrdinalExpansion.Ready)expansion.prepare(source, parentKey)).cursor()) {
+            while (true) {
+                var next = cursor.next();
+                if (next.isEmpty()) break;
+                try (var output = next.orElseThrow()) {
+                    var participation = filter.evaluate(output.values());
+                    assertThat(participation.problem()).isNull();
+                    if (participation.matches()) {
+                        kept.add(output.ordinal());
+                        assertThat(output.comparisonKey()).isEqualTo(new ValidationKey(List.of(
+                                ValidationKey.Part.number(7), ValidationKey.Part.number(1))));
+                        var expected = rename.apply(output.values());
+                        assertThat(ValidationValueComparison.compare(expected,
+                                row(Map.of("id", 7L, "position", 1L, "item", Map.of("keep", true))))).isEmpty();
+                    }
+                }
+            }
+        }
+        assertThat(kept).containsExactly(1L);
+        assertThat(source.fields()).doesNotContainKeys("position", "item");
     }
 
     private static ValidationValues.Row row(Map<String, ?> fields) { return ValidationValues.ownRow(fields, ROW); }
