@@ -2,12 +2,14 @@ package io.tapstate.e2e;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -70,7 +72,7 @@ final class ClusterProcessControlFixtures {
             RealProcessServer server = prepared.launch();
             try {
                 Await.until("the owned control child to acknowledge its PID", Duration.ofSeconds(5),
-                        () -> Files.isRegularFile(ready), server::tail);
+                        () -> acknowledgesPid(ready, server.pid()), server::tail);
                 if (!Files.readString(ready).equals(Long.toString(server.pid()))) {
                     throw new AssertionError("the child handshake names a different process");
                 }
@@ -80,6 +82,16 @@ final class ClusterProcessControlFixtures {
                 catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
                 throw failure;
             }
+        }
+    }
+
+    static boolean acknowledgesPid(Path ready, long pid) {
+        try {
+            return Files.isRegularFile(ready) && Files.readString(ready).equals(Long.toString(pid));
+        } catch (NoSuchFileException notPublishedYet) {
+            return false;
+        } catch (IOException failure) {
+            throw new UncheckedIOException("could not read the owned child PID acknowledgement", failure);
         }
     }
 

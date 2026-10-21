@@ -142,7 +142,7 @@ class NetworkedMongoProcessCleanupIT {
             RealProcessServer server = prepared.launch();
             try {
                 Await.until("the owned store control child to acknowledge its PID", Duration.ofSeconds(5),
-                        () -> Files.isRegularFile(ready), server::tail);
+                        () -> acknowledgesPid(ready, server.pid()), server::tail);
                 assertThat(Files.readString(ready)).isEqualTo(Long.toString(server.pid()));
                 return server;
             } catch (RuntimeException | Error | java.io.IOException failure) {

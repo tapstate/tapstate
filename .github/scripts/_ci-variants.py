@@ -478,8 +478,12 @@ def main():
         require(manifest.absolute().is_relative_to(refs.root), 'serial manifest must be under the evidence root')
         reference = {'path': manifest.absolute().relative_to(refs.root).as_posix(), 'sha256': groups.checksum(raw)}
         refs.blob(reference)
-        result = (serial.capture(refs, reference, groups.receipt.api) if args.command == 'verify-transition'
-                  else serial.readback(refs, value))
+        if args.command == 'readback-transition':
+            result = serial.readback(refs, value)
+        elif 'trigger_policy' in value:
+            result = serial.capture(refs, reference, groups.receipt.api)
+        else:
+            result = transition(refs, value, groups.receipt.api)
     elif args.command == 'switch': result = operation(refs, args.root, value, args.variant, args.journal, groups.receipt.api)
     elif args.command == 'restore-local':
         result = restore_local(refs, args.root, value, args.journal, groups.receipt.api)
@@ -487,7 +491,7 @@ def main():
     else: result = verify_source(refs, args.root, value, args.variant)
     require(groups.checksum(manifest.read_bytes()) == groups.checksum(raw), 'manifest changed during operation')
     if args.command not in ('switch', 'restore-local'):
-        if args.command == 'verify-transition':
+        if args.command == 'verify-transition' and 'trigger_policy' in value:
             groups.write_new_bytes(Path(args.output), serial.capture_bytes(result))
         else:
             result['input_files'] = refs.finish(); result['manifest_sha256'] = groups.checksum(raw)

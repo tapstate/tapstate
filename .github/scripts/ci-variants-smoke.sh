@@ -172,6 +172,26 @@ with tempfile.TemporaryDirectory(prefix='ci-variants-smoke-') as temporary:
    with redirect_stdout(output):m.main()
    return json.loads(output.getvalue())
   finally:sys.argv=old_arguments;m.groups.receipt.api=old_api
+ cli_transition,cli_transition_ref=transition_file()
+ transition_arguments=['verify-transition','--manifest',str(archive/cli_transition_ref['path']),
+                       '--evidence-root',str(archive),'--output',str(archive/'cli-transition-result.json')]
+ cli_transition_result=entry(transition_arguments)
+ check(cli_transition_result['type']=='serial-transition-readback' and cli_transition_result['archive_readback_verified']
+       and not cli_transition_result['first_complete_pr_sample_proven'] and not cli_transition_result['performance_accepted']
+       and cli_transition_result['manifest_sha256']==cli_transition_ref['sha256']
+       and json.loads((archive/'cli-transition-result.json').read_text())==cli_transition_result,
+       'actual CLI verifies and writes the documented transition without a trigger policy')
+ incomplete=copy.deepcopy(cli_transition);incomplete['archives'].pop()
+ incomplete_ref=save('cli-incomplete-transition.json',incomplete)
+ rejected(lambda:entry(['verify-transition','--manifest',str(archive/incomplete_ref['path']),
+                       '--evidence-root',str(archive),'--output',str(archive/'must-not-exist.json')]),
+          'archive set differs')
+ check(not (archive/'must-not-exist.json').exists(),'invalid CLI transition writes no result')
+ invalid_policy=dict(cli_transition,trigger_policy=None)
+ invalid_policy_ref=save('cli-invalid-policy.json',invalid_policy)
+ rejected(lambda:entry(['verify-transition','--manifest',str(archive/invalid_policy_ref['path']),
+                       '--evidence-root',str(archive),'--output',str(archive/'must-not-exist.json')]),
+          'invalid transition trigger policy reference')
  verify_manifest=save('cli-verify-request.json',{'recipe':recipe_ref})
  result=entry(['verify-source','--manifest',str(archive/verify_manifest['path']),'--evidence-root',str(archive),
                '--root',str(work),'--variant','C','--output',str(archive/'cli-verify-result.json')])

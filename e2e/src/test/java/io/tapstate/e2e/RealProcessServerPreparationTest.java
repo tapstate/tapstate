@@ -12,6 +12,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static io.tapstate.e2e.ClusterProcessControlFixtures.*;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -54,7 +57,7 @@ class RealProcessServerPreparationTest {
                 RealProcessServer child = children.get(member);
                 Path ready = scratch.resolve("member-" + member + ".ready");
                 Await.until("the prepared child to acknowledge its PID", Duration.ofSeconds(5),
-                        () -> Files.isRegularFile(ready), child::tail);
+                        () -> acknowledgesPid(ready, child.pid()), child::tail);
                 assertThat(Files.readString(ready)).isEqualTo(Long.toString(child.pid()));
                 prepared.get(member).close();
                 assertThat(child.isAlive()).isTrue();
@@ -68,6 +71,55 @@ class RealProcessServerPreparationTest {
             assertThat(launch.stagingDirectory()).doesNotExist();
             assertThat(launch.output()).isRegularFile();
             assertThat(launch.workingDirectory()).isDirectory();
+        }
+    }
+
+    @Test
+    void aReadyFileMustContainTheCompleteOwnedPidBeforeTheWaitCanFinish(@TempDir Path scratch) throws Exception {
+        Path childReady = scratch.resolve("child.ready");
+        try (RealProcessServer.PreparedLaunch prepared = prepare(jar(scratch), null,
+                ignored -> arguments(childReady, "quiet", null, null, null));
+             RealProcessServer child = prepared.launch()) {
+            Path controlled = scratch.resolve("controlled.ready");
+            String pid = Long.toString(child.pid());
+            String partial = pid.substring(0, pid.length() - 1);
+            assertThat(acknowledgesPid(controlled, child.pid())).isFalse();
+            Files.createFile(controlled);
+            assertThat(acknowledgesPid(controlled, child.pid())).as("creation is not acknowledgement").isFalse();
+            for (String incomplete : List.of(partial, pid + "0", pid + "\n")) {
+                Files.writeString(controlled, incomplete);
+                assertThat(acknowledgesPid(controlled, child.pid())).isFalse();
+            }
+            Files.writeString(controlled, "");
+            CountDownLatch emptyRead = new CountDownLatch(1);
+            CountDownLatch partialRead = new CountDownLatch(1);
+            try (var observer = Executors.newSingleThreadExecutor()) {
+                var waiting = observer.submit(() -> Await.until("a complete controlled child PID", Duration.ofSeconds(5), () -> {
+                    boolean ready = acknowledgesPid(controlled, child.pid());
+                    if (!ready) {
+                        try {
+                            String observed = Files.readString(controlled);
+                            if (observed.isEmpty()) emptyRead.countDown();
+                            if (observed.equals(partial)) partialRead.countDown();
+                        } catch (java.io.IOException failure) {
+                            throw new UncheckedIOException(failure);
+                        }
+                    }
+                    return ready;
+                }, child::tail));
+                try {
+                    assertThat(emptyRead.await(5, TimeUnit.SECONDS)).isTrue();
+                    assertThat(waiting.isDone()).isFalse();
+                    Files.writeString(controlled, partial);
+                    assertThat(partialRead.await(5, TimeUnit.SECONDS)).isTrue();
+                    assertThat(waiting.isDone()).isFalse();
+                    Files.writeString(controlled, pid);
+                    waiting.get(5, TimeUnit.SECONDS);
+                    assertThat(child.isAlive()).isTrue();
+                } finally {
+                    waiting.cancel(true);
+                }
+            }
         }
     }
 
