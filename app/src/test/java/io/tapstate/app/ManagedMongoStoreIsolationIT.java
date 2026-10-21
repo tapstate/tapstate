@@ -382,7 +382,136 @@ class ManagedMongoStoreIsolationIT {
     }
 
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"normal", "retry", "loss", "restart"})
+    void lostInitialCacheCreationNeedsFreshCloudLoginAndExplicitOriginalRecovery(String fault) throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "initial_config_" + suffix, cacheDb = "initial_cache_" + suffix, masterDb = "initial_master_" + suffix;
+        String configUser = "config_" + suffix, customerUser = "customer_" + suffix;
+        var scope = new StorageSetupScope("initial-" + suffix, "installation", "setup", 1);
+        var sdk = new RecoverySdk(scope.clusterId());
+        Path trace = work.resolve("initial-target-tests"), seeds = Files.createDirectory(work.resolve("initial-seeds"));
+        Files.copy(io.tapstate.adapters.pdk.SyntheticSinkJars.registeredStorageProbe(work.resolve("initial-probe-build"), trace,
+                "mongodb-atlas", "mongodb://"), seeds.resolve("mongodb-atlas.jar"));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, configUser, List.of(configDb)); createUser(admin, customerUser, List.of(cacheDb, masterDb));
+            var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
+                    uri(customerUser, cacheDb) + "&tls=true&authMechanism=SCRAM-SHA-256", cacheDb, TLS.ca());
+            var source = new SourceResource("atlas-store", null, "mongodb-atlas", Map.of("isUri", true,
+                    "uri", uri(customerUser, masterDb) + "&tls=true&authMechanism=SCRAM-SHA-256", "tlsCaPem", TLS.ca()), null, null, null, null);
+            try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                    new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(configUser, configDb), null, Duration.ofSeconds(5)),
+                    scope.clusterId(), scope.installationId(), scope.operationId(), 1)) {
+                configuration.bindings().commitWithFirstCache(scope, StorageBinding.Mode.CLOUD, cache, source);
+                // The first process lost its non-serializable creation invocation before any CACHE transaction.
+            }
+            var originalBinding = admin.getDatabase(configDb).getCollection("storage_binding").find().first();
+            try (var application = cloudRecoveryRoot(uri(configUser, configDb), sdk, CloudConnectorTestInputs.seedDirectory(), seeds)) {
+                var root = application.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                String cookie = exchangeCookie(application, "fresh");
+                assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(2);
+                assertThat(cloudPost(application, cookie, "/api/storage/status", Map.of()))
+                        .containsEntry("businessPhase", "AWAITING_REBUILD_CONFIRMATION");
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>()))
+                        .containsExactlyInAnyOrder("cache_identity", "schema_migrations", "cloud_sessions", "cloud_revocations");
+                var orphan = admin.getDatabase(configDb).getCollection("pdk_note_migrations");
+                orphan.insertOne(new Document("_id", "unknown-history"));
+                String initialCookie = cookie;
+                assertThatThrownBy(() -> cloudPost(application, initialCookie, "/api/storage/recovery/plan", Map.of("scope", "CLUSTER", "pipelineIds", List.of())))
+                        .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                orphan.deleteOne(new Document("_id", "unknown-history"));
+                var planned = cloudPost(application, cookie, "/api/storage/recovery/plan", Map.of("scope", "CLUSTER", "pipelineIds", List.of()));
+                assertThat(planned).containsEntry("phase", "PLANNED").containsEntry("affectedPipelineIds", List.of());
+                assertThat(((Map<?,?>)planned.get("definitionHashes")).containsKey("atlas-store")).isTrue();
+                assertThat(root.runtime().business()).isEmpty();
+                var recoverySnapshot = cloudPost(application, cookie, "/api/storage/status", Map.of());
+                assertThat(recoverySnapshot).containsEntry("operationId", planned.get("operationId"));
+                assertThat(((List<?>)recoverySnapshot.get("allowedActions")).contains("storage.recovery.confirm")).isTrue();
+                assertThat(((List<?>)recoverySnapshot.get("allowedActions")).contains("storage.setup.commit")).isFalse();
+                if (!fault.equals("normal")) failNextSetupCompletion(root.runtime().requireConfiguration());
+                var confirmation = Map.<String,Object>of("operationId", planned.get("operationId"), "planHash", planned.get("planHash"),
+                        "controlRevision", planned.get("controlRevision"), "confirmed", true);
+                assertThat(cloudPost(application, cookie, "/api/storage/recovery/confirm", confirmation)).containsEntry("phase", "CONFIRMED");
+                if (!fault.equals("normal")) {
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() ->
+                            Boolean.TRUE.equals(org.springframework.test.util.ReflectionTestUtils.getField(root, "recoveryFailed")));
+                    assertThat(root.runtime().requireConfiguration().setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+                    assertThat(root.runtime().business()).isEmpty();
+                    assertThat(cloudPost(application, cookie, "/api/storage/status", Map.of())).containsEntry("operationId", planned.get("operationId"));
+                    if (fault.equals("restart")) {
+                        root.close();
+                        try (var resumed = cloudRecoveryRoot(uri(configUser, configDb), new RecoverySdk(scope.clusterId()),
+                                CloudConnectorTestInputs.seedDirectory(), seeds)) {
+                            var resumedRoot = resumed.getBean(StorageRoot.class);
+                            String resumedCookie = exchangeCookie(resumed, "restarted"); var originalPlan = planned;
+                            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+                                assertThat(cloudPost(resumed, resumedCookie, "/api/storage/recovery/status", Map.of("operationId", originalPlan.get("operationId"))))
+                                        .containsEntry("phase", "COMPLETE");
+                                assertThat(resumedRoot.runtime().businessStarted()).isTrue();
+                            });
+                            assertThat(admin.getDatabase(configDb).getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
+                            assertThat(admin.getDatabase(cacheDb).getCollection("cache_identity").find().first().get("businessPreparationId"))
+                                    .isEqualTo(originalPlan.get("operationId"));
+                            assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                        }
+                        return;
+                    }
+                    if (fault.equals("loss")) {
+                        var oldPlan = planned; var oldConfirmation = confirmation; String oldCookie = cookie;
+                        admin.getDatabase(cacheDb).drop();
+                        cookie = exchangeCookie(application, "restarted");
+                        assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(3);
+                        assertCloudStatus(application, oldCookie, 401);
+                        String currentCookie = cookie;
+                        assertThat(cloudPost(application, cookie, "/api/storage/status", Map.of())).containsEntry("operationId", oldPlan.get("operationId"));
+                        assertThat(cloudPost(application, cookie, "/api/storage/recovery/status", Map.of("operationId", oldPlan.get("operationId"))))
+                                .containsEntry("phase", "RUNNING");
+                        assertThatThrownBy(() -> cloudPost(application, currentCookie, "/api/storage/recovery/confirm", oldConfirmation))
+                                .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                        planned = cloudPost(application, cookie, "/api/storage/recovery/plan", Map.of("scope", "CLUSTER", "pipelineIds", List.of(),
+                                "previousOperationId", oldPlan.get("operationId")));
+                        assertThat(planned).containsEntry("phase", "PLANNED");
+                        assertThat(planned.get("operationId")).isNotEqualTo(oldPlan.get("operationId"));
+                        assertThat(root.runtime().business()).isEmpty();
+                        confirmation = Map.of("operationId", planned.get("operationId"), "planHash", planned.get("planHash"),
+                                "controlRevision", planned.get("controlRevision"), "confirmed", true);
+                    }
+                    cloudPost(application, cookie, "/api/storage/recovery/confirm", confirmation);
+                }
+                String acceptedCookie = cookie; var acceptedPlan = planned;
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+                    assertThat(cloudPost(application, acceptedCookie, "/api/storage/recovery/status", Map.of("operationId", acceptedPlan.get("operationId"))))
+                            .containsEntry("phase", "COMPLETE");
+                    assertThat(root.runtime().businessStarted()).isTrue();
+                });
+                assertThat(root.runtime().requireConfiguration().setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+                assertThat(cloudPost(application, cookie, "/api/storage/recovery/confirm", confirmation)).containsEntry("phase", "COMPLETE");
+                assertThat(admin.getDatabase(configDb).getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
+                assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cacheDb).getCollection("cache_identity").find().first().get("businessPreparationId"))
+                        .isEqualTo(planned.get("operationId"));
+            }
+        }
+    }
+
+    private static void failNextSetupCompletion(io.tapstate.adapters.mongostore.MongoConfigurationDomain configuration) {
+        var original = configuration.bindings(); var bindings = org.mockito.Mockito.spy(original);
+        var fail = new java.util.concurrent.atomic.AtomicBoolean(true);
+        org.mockito.Mockito.doAnswer(call -> {
+            var guarded = org.mockito.Mockito.spy((io.tapstate.spi.store.StorageBindingStore)call.callRealMethod());
+            org.mockito.Mockito.doAnswer(completion -> {
+                var result = completion.callRealMethod();
+                if (fail.compareAndSet(true, false)) throw StorageRuntime.unavailable();
+                return result;
+            }).when(guarded).complete(org.mockito.ArgumentMatchers.any());
+            return guarded;
+        }).when(bindings).guardedBy(org.mockito.ArgumentMatchers.any());
+        org.springframework.test.util.ReflectionTestUtils.setField(configuration, "bindings", bindings);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true})
     void cloudFirstSetupContinuesInTheSameProcessAndReauthenticatesAfterCutover(boolean failAfterCompletion) throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String configDb = "setup_config_" + suffix, cacheDb = "setup_cache_" + suffix, masterDb = "setup_master_" + suffix;
@@ -401,6 +530,17 @@ class ManagedMongoStoreIsolationIT {
                 var cutoverFault = new java.util.concurrent.atomic.AtomicBoolean(failAfterCompletion);
                 var injected = new AtomicReference<Throwable>();
                 var bindings = org.mockito.Mockito.spy(configuration.bindings());
+                var committedBoundary = new java.util.concurrent.CountDownLatch(1);
+                var deliverGrant = new java.util.concurrent.CountDownLatch(1);
+                if (!failAfterCompletion) org.mockito.Mockito.doAnswer(call -> {
+                    var guarded = org.mockito.Mockito.spy((io.tapstate.spi.store.StorageBindingStore)call.callRealMethod());
+                    org.mockito.Mockito.doAnswer(commit -> {
+                        var value = commit.callRealMethod(); committedBoundary.countDown();
+                        assertThat(deliverGrant.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); return value;
+                    }).when(guarded).commitWithFirstCache(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+                    return guarded;
+                }).when(bindings).guardedBy(org.mockito.ArgumentMatchers.any());
                 org.mockito.Mockito.doAnswer(call -> {
                     Object result = call.callRealMethod();
                     if (configuration.setupStates().load().phase() == StorageSetupStateStore.Phase.COMPLETE && cutoverFault.compareAndSet(true, false)) {
@@ -429,7 +569,20 @@ class ManagedMongoStoreIsolationIT {
                         .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
                                 failure -> assertThat(failure.getStatusCode().value()).withFailMessage("%s; injected at %s",
                                         failure.getResponseBodyAsString(), injected.get() == null ? "never" : java.util.Arrays.toString(injected.get().getStackTrace())).isEqualTo(503));
-                else assertThat(cloudPost(application, temporary, "/api/storage/setup/commit", request)).containsEntry("setupPhase", "COMPLETE");
+                else try (var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+                    var commit = callers.submit(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request));
+                    try {
+                        assertThat(committedBoundary.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                        var loginEntered = new java.util.concurrent.CountDownLatch(1);
+                        var login = callers.submit(() -> { loginEntered.countDown(); return root.managedAuthentication(); });
+                        assertThat(loginEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                        assertThatThrownBy(() -> login.get(1, java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.TimeoutException.class);
+                        deliverGrant.countDown();
+                        assertThat(commit.get(60, java.util.concurrent.TimeUnit.SECONDS)).containsEntry("setupPhase", "COMPLETE");
+                        login.get(10, java.util.concurrent.TimeUnit.SECONDS).requireActive().run();
+                        assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
+                    } finally { deliverGrant.countDown(); }
+                }
                 assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
                 assertThat(admin.getDatabase(cacheDb).getCollection("cloud_sessions").countDocuments()).isZero();
                 assertCloudStatus(application, temporary, 401);
@@ -480,6 +633,10 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
             }
         }
+    }
+
+    @Test void setupCommitCannotLoseItsLiveCreationGrantToConcurrentLogin() throws Exception {
+        cloudFirstSetupContinuesInTheSameProcessAndReauthenticatesAfterCutover(false);
     }
 
     @SuppressWarnings("unchecked")

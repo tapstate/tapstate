@@ -81,6 +81,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         loadAuthScope(original.authScope()); pending.run();
     }
     void verifyRecoveryPermissions() { businessActive(); connection.verifyStoragePermissions(); }
+    /** A new preflight must observe exactly the current formal auth-only domain. */
+    public void verifyAuthenticationOnly(CacheAuthScope expected) {
+        businessActive(); loadAuthScope(expected); requireAuthOnlyRecovery(expected);
+    }
+
+    void prepareConfirmedInitialBusiness(io.tapstate.spi.store.CachePreparation original, Runnable active) {
+        active.run(); loadAuthScope(original.authScope());
+        facts(original.authScope()).beginConfirmedBusiness(original.operationId(), active, () -> requireAuthOnlyRecovery(original.authScope()));
+        prepareInitialBusiness(original, active);
+    }
     private void requireAuthOnlyRecovery(CacheAuthScope expected) {
         StoreIo.run(() -> {
             var allowed = new java.util.HashSet<String>();

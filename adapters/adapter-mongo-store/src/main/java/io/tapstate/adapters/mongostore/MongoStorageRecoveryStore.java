@@ -94,7 +94,8 @@ final class MongoStorageRecoveryStore {
                 if (!java.util.Set.of(AUTH_PREPARING, AUTH_READY).contains(row.get("phase")) || generation < 2 || revision < 1
                         || !UUID.fromString(operation).toString().equals(operation)) throw unreadable();
                 Document setup = SystemCollections.STORAGE_SETUP.on(database).find(session, new Document("_id", "cluster")).first();
-                if (setup == null || !"COMPLETE".equals(setup.get("phase"))) throw unreadable();
+                if (setup == null || !("COMPLETE".equals(setup.get("phase"))
+                        || binding.mode() == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(setup.get("phase")))) throw unreadable();
             }
             var scope = new CacheAuthScope(binding.setup().clusterId(), binding.bindingVersion(), binding.mode(), incarnation, generation);
             var pending = MongoStorageRecoveryCommands.pending(row);

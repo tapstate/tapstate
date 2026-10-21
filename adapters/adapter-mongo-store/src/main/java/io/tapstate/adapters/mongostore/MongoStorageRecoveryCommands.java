@@ -50,7 +50,13 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
         return transaction(session -> {
             Document root = root(session, current);
             Plan previous = pending(root).orElse(null);
+            boolean replaceStaleInitial = previous != null && !previous.originalScope().equals(current)
+                    && operationId == null && previous.operationId().equals(previousOperationId)
+                    && previous.originalScope().authGeneration() < current.authGeneration()
+                    && MongoInitialCloudRecovery.shape(previous.manifest()) && MongoInitialCloudRecovery.shape(verified);
+            if (replaceStaleInitial) MongoInitialCloudRecovery.requireManifest(session, database, bindings, artifacts, current, verified);
             if (previous != null && !previous.originalScope().equals(current)
+                    && !replaceStaleInitial
                     && (operationId != null || previous.phase() != Phase.COMPLETE || !previous.operationId().equals(previousOperationId))) throw refused();
             long revision = revision(session);
             if (operationId != null) {
@@ -63,9 +69,9 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
             } else if (previous != null) {
                 // A retried initial request returns its original operation, even after completion.
                 // A new operation explicitly names the completed predecessor; it cannot be inferred from a missing response.
-                if (Objects.equals(previous.previousOperationId(), previousOperationId)
+                if (previous.originalScope().equals(current) && Objects.equals(previous.previousOperationId(), previousOperationId)
                         && previous.manifest().selection().equals(verified.selection())) return previous;
-                if (previous.phase() != Phase.COMPLETE || !previous.operationId().equals(previousOperationId)) throw refused();
+                if (!replaceStaleInitial && (previous.phase() != Phase.COMPLETE || !previous.operationId().equals(previousOperationId))) throw refused();
             } else if (previousOperationId != null) throw refused();
             requireManifest(session, verified);
             if (verified.configurationRevision() != revision) throw refused();
@@ -109,7 +115,9 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
         var preparation = bindings.cachePreparationForTransaction(session).orElseThrow(MongoStorageRecoveryCommands::refused);
         if (!preparation.authScope().equals(expected)) throw refused();
         Document setup = SystemCollections.STORAGE_SETUP.on(database).find(session, new Document("_id", "cluster")).first();
-        if (setup == null || !"COMPLETE".equals(setup.get("phase"))) throw refused();
+        if (setup == null || !("COMPLETE".equals(setup.get("phase"))
+                || expected.mode() == io.tapstate.spi.store.StorageBinding.Mode.CLOUD && expected.authGeneration() > 1
+                && "STORAGE_BOUND".equals(setup.get("phase")))) throw refused();
         Document root = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", "cluster")).first();
         if (root == null) throw unreadable();
         return root;

@@ -18,9 +18,15 @@ public final class StorageRecoveryService {
     private final StorageRecoveryCommands commands;
     private final Inspector inspector;
     private final AuditGate audit;
+    private final java.util.function.Consumer<StorageRecoveryCommands.Plan> published;
     public StorageRecoveryService(StorageRecoveryCommands commands, Inspector inspector, AuditGate audit) {
+        this(commands, inspector, audit, ignored -> {});
+    }
+    public StorageRecoveryService(StorageRecoveryCommands commands, Inspector inspector, AuditGate audit,
+            java.util.function.Consumer<StorageRecoveryCommands.Plan> published) {
         this.commands = Objects.requireNonNull(commands, "commands"); this.inspector = Objects.requireNonNull(inspector, "inspector");
         this.audit = Objects.requireNonNull(audit, "audit");
+        this.published = Objects.requireNonNull(published, "published");
     }
     public StorageRecoveryCommands.Plan plan(String subject, CacheAuthScope scope, Runnable active,
             StorageRecoveryCommands.Selection selection, String operationId, String previousOperationId) {
@@ -41,11 +47,15 @@ public final class StorageRecoveryService {
             String operationId, String planHash, long controlRevision, boolean explicitlyConfirmed) {
         active.run();
         var original = commands.guardedBy(active).find(scope, operationId).orElseThrow(StorageRecoveryService::conflict);
-        if (!explicitlyConfirmed || !original.planHash().equals(planHash) || original.controlRevision() != controlRevision) throw conflict();
-        if (original.phase() != StorageRecoveryCommands.Phase.PLANNED) return original;
+        if (!explicitlyConfirmed || !original.originalScope().equals(scope) || !original.planHash().equals(planHash)
+                || original.controlRevision() != controlRevision) throw conflict();
+        if (original.phase() != StorageRecoveryCommands.Phase.PLANNED) {
+            published.accept(original); return original;
+        }
         Runnable current = () -> { active.run(); inspector.requireCurrent(scope, original.manifest()); };
-        return audit.dispatch(ControlOperations.STORAGE_RECOVERY_CONFIRM, new AuditContext(subject, operationId),
+        var result = audit.dispatch(ControlOperations.STORAGE_RECOVERY_CONFIRM, new AuditContext(subject, operationId),
                 () -> commands.guardedBy(current).confirm(original));
+        published.accept(result); return result;
     }
     public Optional<StorageRecoveryCommands.Plan> status(CacheAuthScope scope, Runnable active, String originalId) {
         active.run();

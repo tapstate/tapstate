@@ -113,6 +113,22 @@ class StorageRuntimeTest {
         }
     }
 
+    @Test void recheckingAuthenticationDoesNotTemporarilyRevokeTheOriginalValidatedOwner() throws Exception {
+        var config = configuration(); var cache = mock(MongoCacheDomain.class);
+        var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+        try (var root = new StorageRuntime(config, ignored -> cache); var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var original = root.loadBound().orElseThrow(); original.verifyAuthentication();
+            doAnswer(call -> { entered.countDown(); assertThat(release.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); return PREPARATION.authScope(); })
+                    .when(cache).loadAuthScope(PREPARATION.authScope());
+            var recheck = executor.submit(original::verifyAuthentication);
+            try {
+                assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThatCode(original::requireAuthentication).doesNotThrowAnyException();
+            } finally { release.countDown(); }
+            recheck.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
     private static MongoConfigurationDomain configuration() {
         var config = mock(MongoConfigurationDomain.class);
         var bindings = mock(StorageBindingStore.class); var setup = mock(StorageSetupStateStore.class);

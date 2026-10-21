@@ -159,7 +159,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     private StorageBinding requireAuthenticationRecoveryConfiguration(ClientSession session) {
         var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
         var stage = setup.find(session, new Document("_id", "cluster")).first();
-        if (stage == null || !"COMPLETE".equals(stage.get("phase"))) throw refused();
+        if (stage == null || !("COMPLETE".equals(stage.get("phase"))
+                || bound.mode() == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(stage.get("phase")))) throw refused();
         var account = new MongoFirstAdminStore(client, database, this).load(session);
         if (bound.mode() == StorageBinding.Mode.OP && (account.isEmpty()
                 || account.orElseThrow().phase() != io.tapstate.spi.store.FirstAdminStore.Phase.COMPLETE)) throw refused();

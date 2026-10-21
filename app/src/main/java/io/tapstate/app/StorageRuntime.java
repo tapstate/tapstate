@@ -120,10 +120,16 @@ final class StorageRuntime implements AutoCloseable {
 
     /** The caller passes the original owner, so a late callback cannot activate or close its successor. */
     synchronized void startBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
+        startRecoveredBusiness(original, assembly, null, () -> {});
+    }
+
+    synchronized void startRecoveredBusiness(Bound original, Function<Bound, ? extends Business> assembly,
+            io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Runnable beforePublication) {
         requireOriginal(original);
         if (business != null) return;
         if (cleanupUnknown) throw unavailable();
         verifyCompletedSetup(original);
+        verifyRecoveryPublication(original, running);
         original.requireAuthentication(); original.verifyBusiness();
         Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
         try {
@@ -131,11 +137,25 @@ final class StorageRuntime implements AutoCloseable {
             requireOriginal(original);
             verifyCompletedSetup(original);
             original.requireActive();
+            verifyRecoveryPublication(original, running);
+            if (running != null && !candidate.available()) throw unavailable();
+            beforePublication.run();
+            requireOriginal(original);
             business = candidate;
         } catch (RuntimeException | Error failure) {
             closeCandidate(candidate, failure);
             throw failure;
         }
+    }
+
+    private void verifyRecoveryPublication(Bound original, io.tapstate.spi.store.StorageRecoveryCommands.Plan running) {
+        if (original.preparation.authScope().authGeneration() < 2) return;
+        var pending = configuration.recoveryCommands().current(original.preparation.authScope());
+        if (running != null) {
+            if (running.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING
+                    || !running.originalScope().equals(original.preparation.authScope()) || pending.filter(running::equals).isEmpty()) throw unavailable();
+        } else if (pending.filter(plan -> plan.originalScope().equals(original.preparation.authScope())
+                && plan.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE).isPresent()) throw unavailable();
     }
 
     synchronized boolean businessStarted() { return !closed && business instanceof Business actual && actual.available(); }
@@ -181,10 +201,14 @@ final class StorageRuntime implements AutoCloseable {
         MongoCacheDomain cache() { requireActive(); return cache; }
         void requireActive() { if (!active || closed) throw unavailable(); }
         void verifyAuthentication() {
-            requireActive(); authReady = false; cache.loadAuthScope(preparation.authScope()); requireActive(); authReady = true;
+            requireActive();
+            try { cache.loadAuthScope(preparation.authScope()); requireActive(); authReady = true; }
+            catch (RuntimeException | Error unavailable) { authReady = false; throw unavailable; }
         }
         void verifyBusiness() {
-            requireActive(); businessReady = false; cache.loadBusinessScope(preparation.businessScope()); requireActive(); businessReady = true;
+            requireActive();
+            try { cache.loadBusinessScope(preparation.businessScope()); requireActive(); businessReady = true; }
+            catch (RuntimeException | Error unavailable) { businessReady = false; throw unavailable; }
         }
         void requireAuthentication() { requireActive(); if (!authReady) throw unavailable(); }
         void requireBusiness() { requireActive(); if (!businessReady) throw unavailable(); }

@@ -33,6 +33,7 @@ class StorageAuthenticationTest {
         var phase = new AtomicReference<>(StorageSetupStateStore.Phase.CONFIG_PREPARED);
         var configuration = mock(MongoConfigurationDomain.class); var states = mock(StorageSetupStateStore.class);
         when(configuration.setupStates()).thenReturn(states);
+        when(configuration.bindings()).thenReturn(mock(StorageBindingStore.class));
         when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(scope, phase.get(),
                 phase.get() == StorageSetupStateStore.Phase.CONFIG_PREPARED ? 0 : 1));
         try (var authentication = new StorageAuthentication(configuration, cloud, new CloudSdkBridge(cloud, sdk),

@@ -96,14 +96,15 @@ final class StorageAuthentication implements AutoCloseable {
                     new CloudSessionService(sessions, identity, secrets, clock, observer), observer);
         }
         boolean incomplete() {
-            try { return configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE; }
+            try { return configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE
+                    && configuration.bindings().cachePreparation().map(value -> value.authScope().authGeneration() == 1).orElse(true); }
             catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
         }
         void requireActive() {
             if (closed || current.get() != null) throw unauthenticated();
             var actual = configuration.setupStates().load();
             if (!actual.scope().equals(setup) || !cloud.clusterId().equals(setup.clusterId())
-                    || actual.phase() == StorageSetupStateStore.Phase.COMPLETE) throw unauthenticated();
+                    || !incomplete()) throw unauthenticated();
         }
         Optional<CredentialAuthentication> authenticate(String credential) {
             requireActive();

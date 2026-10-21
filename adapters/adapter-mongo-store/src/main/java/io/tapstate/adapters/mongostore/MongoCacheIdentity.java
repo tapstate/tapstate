@@ -179,6 +179,27 @@ final class MongoCacheIdentity {
         return client.getDatabase(identity.getNamespace().getDatabaseName());
     }
 
+    /** A verified CONFIG recovery intent competes on an existing formal authentication identity. */
+    void beginConfirmedBusiness(String operationId, Runnable active, Runnable requireOnlyAuth) {
+        transaction(session -> {
+            active.run(); fence(session);
+            Document row = requireIdentity(session);
+            if (PREPARING.equals(row.get("businessPhase")) || READY.equals(row.get("businessPhase"))) {
+                if (!operationId.equals(row.get("businessPreparationId"))) throw refused();
+            } else {
+                if (!"ABSENT".equals(row.get("businessPhase")) || row.containsKey("businessPreparationId")
+                        || row.containsKey("claimAdmissionFence") || row.containsKey("businessRetirementId")) throw refused();
+                requireOnlyAuth.run();
+                if (schemas.find(session, new Document("_id", "business")).first() != null) throw refused();
+                if (identity.updateOne(session, scopeFilter(expected).append("businessPhase", "ABSENT")
+                                .append("businessPreparationId", new Document("$exists", false)),
+                        new Document("$set", new Document("businessPhase", PREPARING).append("businessPreparationId", operationId)))
+                        .getMatchedCount() != 1) throw refused();
+            }
+            active.run(); return null;
+        });
+    }
+
     private Document requireIdentity(ClientSession session) {
         Document row = identity.find(session, new Document("_id", "cluster")).first();
         if (row == null || !matches(row, expected)) throw fenced();

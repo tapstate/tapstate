@@ -62,6 +62,21 @@ class StorageRootConfiguration {
         return new InstalledConnectorTests(properties, clock);
     }
     @Bean @org.springframework.context.annotation.Lazy
+    StorageSetupService.DefaultTarget storageDefaultTarget(ObjectProvider<InstalledConnectorTests> connectors) {
+        return new StorageSetupService.DefaultTarget() {
+            @Override public StorageSetupService.ConnectorIdentity identity(StorageBinding.Connection master) {
+                return connectors.getObject().target().identity(master);
+            }
+            @Override public io.tapstate.core.model.SourceResource definition(StorageBinding.Connection master, String id) {
+                return connectors.getObject().target().definition(master, id);
+            }
+            @Override public void test(StorageBinding.Connection master, io.tapstate.core.model.SourceResource source,
+                    StorageSetupService.ConnectorIdentity original) { connectors.getObject().target().test(master, source, original); }
+        };
+    }
+    @Bean @org.springframework.context.annotation.Lazy
+    StorageRecoveryService storageRecoveryService(StorageRoot root, Clock clock) { return root.recoveryService(clock); }
+    @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService storageSetupService(StorageRoot root, ObjectProvider<InstalledConnectorTests> connectors,
             MongoProperties mongo, Clock clock, ObjectProvider<StorageBusinessFactory> factories) {
         var configuration = root.runtime().requireConfiguration();
@@ -82,7 +97,7 @@ class StorageRootConfiguration {
                 committed -> {
                     if (root.mode() == StorageBinding.Mode.CLOUD)
                         root.continueCloudSetup(committed, target, original -> factories.getObject().create(original));
-                });
+                }, root::coordinateSetup);
     }
     @Bean StorageBusinessFactory storageBusinessFactory(StorageRoot root, org.springframework.context.ConfigurableApplicationContext context) {
         return original -> new NativeBusinessContext(root, original, context);
@@ -99,11 +114,12 @@ class StorageRootConfiguration {
             StorageControlDispatcher.Snapshots snapshots) {
         return StorageControlDispatcher.staged(operations, setups::getIfAvailable, recoveries::getIfAvailable, imports::getIfAvailable, snapshots);
     }
-    @Bean ApplicationRunner loadRetainedStorage(StorageRoot root, ObjectProvider<StorageBusinessFactory> factories) {
+    @Bean ApplicationRunner loadRetainedStorage(StorageRoot root, ObjectProvider<StorageBusinessFactory> factories,
+            ObjectProvider<StorageSetupService.DefaultTarget> targets) {
         return arguments -> root.loadExisting(original -> {
             var factory = factories.getIfAvailable();
             if (factory == null) throw StorageRuntime.unavailable();
             return factory.create(original);
-        });
+        }, targets::getObject);
     }
 }

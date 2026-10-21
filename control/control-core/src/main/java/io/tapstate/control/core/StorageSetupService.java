@@ -72,6 +72,7 @@ public final class StorageSetupService {
     // Bounded to the one original installation operation and three layer proofs. No credential is persisted here.
     private final EnumMap<Layer,Tested> tests = new EnumMap<>(Layer.class);
     private StorageBindingCommit pending;
+    private final java.util.function.Function<Supplier<Status>,Status> commitOwner;
 
     public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
             StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
@@ -83,12 +84,20 @@ public final class StorageSetupService {
             StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
             AuditGate audit, Clock clock, Runnable operationActive,
             java.util.function.Consumer<StorageBindingCommit> continuation) {
+        this(mode, bindings, states, probe, target, configuration, audit, clock, operationActive, continuation, Supplier::get);
+    }
+
+    public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
+            StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
+            AuditGate audit, Clock clock, Runnable operationActive,
+            java.util.function.Consumer<StorageBindingCommit> continuation, java.util.function.Function<Supplier<Status>,Status> commitOwner) {
         this.mode = Objects.requireNonNull(mode, "mode"); this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.states = Objects.requireNonNull(states, "states"); this.probe = Objects.requireNonNull(probe, "probe");
         this.target = Objects.requireNonNull(target, "target"); this.configuration = Objects.requireNonNull(configuration, "configuration");
         this.audit = Objects.requireNonNull(audit, "audit"); this.clock = Objects.requireNonNull(clock, "clock");
         this.operationActive = Objects.requireNonNull(operationActive, "operationActive");
         this.continuation = Objects.requireNonNull(continuation, "continuation");
+        this.commitOwner = Objects.requireNonNull(commitOwner, "commitOwner");
     }
 
     /** The caller guard is established by the server's existing Cloud identity or OP management capability. */
@@ -116,6 +125,10 @@ public final class StorageSetupService {
     /** Binding is durable before runtime activation. A lost HTTP response never discards its original first-cache invocation. */
     public synchronized Status commit(String subject, StorageSetupScope expected, Runnable active,
             Candidate candidate, Map<Layer,String> stamps) {
+        return commitOwner.apply(() -> commitOwned(subject, expected, active, candidate, stamps));
+    }
+
+    private Status commitOwned(String subject, StorageSetupScope expected, Runnable active, Candidate candidate, Map<Layer,String> stamps) {
         active.run();
         Prepared prepared = prepare(candidate);
         requireInstalledConfiguration(prepared.candidate().configuration());
@@ -140,7 +153,8 @@ public final class StorageSetupService {
         audit.dispatch(ControlOperations.STORAGE_SETUP_COMMIT, new AuditContext(subject, expected.operationId()), () -> {
             StorageBindingCommit result = bindings.guardedBy(operationActive).commitWithFirstCache(expected, mode,
                     prepared.candidate().cache(), prepared.target(), writeGuard);
-            if (pending == null || result.firstCreation().isPresent()) pending = result;
+            if (pending == null || result.firstCreation().isPresent() || !pending.binding().equals(result.binding())
+                    || !pending.preparation().equals(result.preparation())) pending = result;
             return result.binding();
         });
         // The committed operation owns continuation even if the HTTP request or its test stamps expire.

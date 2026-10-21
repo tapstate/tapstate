@@ -203,6 +203,42 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen();
         return new MongoStorageRecoveryCommands(connection.client(), connection.database(), bindings, artifacts, this::requireOpen);
     }
+
+    /** Reads the original initial-only closure without preparing or starting any CACHE work. */
+    public io.tapstate.core.model.SourceResource initialCloudRecoverySource(io.tapstate.spi.store.CacheAuthScope scope) {
+        requireOpen();
+        return StoreIo.call(() -> {
+            try (var session = connection.client().startSession()) {
+                return session.withTransaction(() -> {
+                    requireOpen();
+                    return MongoInitialCloudRecovery.require(session, connection.database(), bindings, artifacts, scope);
+                });
+            }
+        });
+    }
+
+    /** Only the exact current confirmed runtime operation can authorize an initial business birth. */
+    public void prepareInitialCloudRecovery(MongoCacheDomain cache, io.tapstate.spi.store.StorageRecoveryCommands.Plan running,
+            Runnable requireActive) {
+        Runnable original = () -> {
+            requireOpen(); requireActive.run();
+            StoreIo.run(() -> {
+                try (var session = connection.client().startSession()) {
+                    session.withTransaction(() -> {
+                        var root = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
+                        if (root == null || !MongoStorageRecoveryCommands.pending(root).filter(running::equals).isPresent()
+                                || running.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING) throw MongoCachePipelineAccess.fenced();
+                        MongoInitialCloudRecovery.requireManifest(session, connection.database(), bindings, artifacts,
+                                running.originalScope(), running.manifest());
+                        return null;
+                    });
+                }
+            });
+        };
+        original.run(); cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
+        cache.prepareConfirmedInitialBusiness(new io.tapstate.spi.store.CachePreparation(running.operationId(), running.originalScope()), original);
+        original.run();
+    }
     /** Inspects the exact original endpoint without disturbing a still-owned business runtime. */
     public boolean authenticationRecoveryRequired(MongoCacheDomain candidate, Runnable active) {
         requireOpen(); Objects.requireNonNull(candidate); Objects.requireNonNull(active); active.run();
