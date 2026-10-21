@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -35,6 +36,9 @@ final class PdkValidationCursor implements ValidationReadHandle {
     private final ValidationValues.Limits rowLimits;
     private final ArrayBlockingQueue<BorrowedRow> rows;
     private final Semaphore slots;
+    private final Object rowLock = new Object();
+    private final CompletableFuture<Void> rowsReleased = new CompletableFuture<>();
+    private int ownedRowSlots;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean callbackActive = new AtomicBoolean();
     private final Object invocationLock = new Object();
@@ -136,7 +140,7 @@ final class PdkValidationCursor implements ValidationReadHandle {
                     // close may have drained the queue before this offer. Reclaim this exact late item.
                     if (closed.get() && rows.remove(owned)) owned.close();
                 } finally {
-                    if (!handedOver) slots.release();
+                    if (!handedOver) releaseRowSlot();
                 }
             }
         } catch (RuntimeException | Error failed) {
@@ -151,7 +155,13 @@ final class PdkValidationCursor implements ValidationReadHandle {
         try {
             while (true) {
                 checkActive();
-                if (slots.tryAcquire(50, TimeUnit.MILLISECONDS)) return;
+                if (slots.tryAcquire(50, TimeUnit.MILLISECONDS)) {
+                    synchronized (rowLock) {
+                        if (closed.get()) { slots.release(); throw cancelled(); }
+                        ownedRowSlots++;
+                    }
+                    return;
+                }
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
@@ -224,6 +234,24 @@ final class PdkValidationCursor implements ValidationReadHandle {
     }
 
     @Override public CompletionStage<Void> workersExited() { return worker.exited(); }
+    @Override public CompletionStage<Void> rowsReleased() { return rowsReleased.minimalCompletionStage(); }
+
+    private void releaseRowSlot() {
+        boolean complete;
+        synchronized (rowLock) {
+            if (ownedRowSlots == 0) throw new IllegalStateException("validation row ownership was released twice");
+            ownedRowSlots--;
+            slots.release();
+            complete = closed.get() && ownedRowSlots == 0;
+        }
+        if (complete) rowsReleased.complete(null);
+    }
+
+    private void completeReleasedRows() {
+        boolean complete;
+        synchronized (rowLock) { complete = closed.get() && ownedRowSlots == 0; }
+        if (complete) rowsReleased.complete(null);
+    }
 
     int availableRowSlots() { return slots.availablePermits(); }
 
@@ -233,6 +261,7 @@ final class PdkValidationCursor implements ValidationReadHandle {
         if (worker != null) worker.cancel(true);
         BorrowedRow queued;
         while ((queued = rows.poll()) != null) queued.close();
+        completeReleasedRows();
         try { cancelQuery.run(); }
         catch (RuntimeException | Error cleanup) {
             failure.record(cleanup);
@@ -256,6 +285,6 @@ final class PdkValidationCursor implements ValidationReadHandle {
             if (released.get()) throw new IllegalStateException("validation row reservation has been released");
             return values;
         }
-        @Override public void close() { if (released.compareAndSet(false, true)) slots.release(); }
+        @Override public void close() { if (released.compareAndSet(false, true)) releaseRowSlot(); }
     }
 }

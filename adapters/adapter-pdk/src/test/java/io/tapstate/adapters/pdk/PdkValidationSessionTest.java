@@ -362,6 +362,7 @@ class PdkValidationSessionTest {
                     cursor.close();
                     io.submit(() -> {}).get(3, TimeUnit.SECONDS);
                     assertThat(cursor.workersExited().toCompletableFuture().isDone()).isFalse();
+                    assertThat(cursor.rowsReleased().toCompletableFuture().isDone()).isFalse();
                     assertThat(releasedReservations).hasValue(0);
                     var detached = cursor.workersExited().toCompletableFuture();
                     detached.complete(null);
@@ -374,6 +375,7 @@ class PdkValidationSessionTest {
                                         stopped -> assertThat(stopped.code()).isEqualTo(ValidationError.READ_CANCELLED));
                             });
                     assertThat(releasedReservations).hasValue(1);
+                    assertThat(cursor.rowsReleased().toCompletableFuture().get(3, TimeUnit.SECONDS)).isNull();
                     if (fatal) assertThatThrownBy(cursor::next).isSameAs(late);
                 } finally { release.countDown(); }
             }

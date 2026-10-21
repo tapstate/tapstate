@@ -395,6 +395,45 @@ class PdkValidationCursorTest {
         }
     }
 
+    @Test void workerExitAndCloseDoNotReleaseARowStillBorrowedByTheConsumer() throws Exception {
+        var rowReleases = new AtomicInteger();
+        try (var io = Executors.newSingleThreadExecutor();
+             var cursor = new PdkValidationCursor("table", consumer -> consumer.accept(result(Map.of("id", 7))),
+                     row -> ValidationValues.ownRow(row, LIMITS), () -> {}, () -> {}, io, 1, LIMITS)) {
+            var borrowed = cursor.next().orElseThrow();
+            try {
+                cursor.rowsReleased().whenComplete((ignored, error) -> rowReleases.incrementAndGet());
+                cursor.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS);
+                cursor.close();
+                assertThat(cursor.rowsReleased().toCompletableFuture().isDone()).isFalse();
+                assertThat(rowReleases).hasValue(0);
+                assertThat(borrowed.values().fields()).containsEntry("id", 7);
+                cursor.rowsReleased().toCompletableFuture().complete(null);
+                assertThat(cursor.rowsReleased().toCompletableFuture().isDone()).isFalse();
+            } finally { borrowed.close(); }
+            borrowed.close();
+            assertThat(cursor.rowsReleased().toCompletableFuture().get(3, TimeUnit.SECONDS)).isNull();
+            assertThat(rowReleases).hasValue(1);
+            assertThat(cursor.availableRowSlots()).isEqualTo(1);
+        }
+    }
+
+    @Test void queuedRowsAreReleasedByCloseAndOwnershipCannotRestartAfterwards() throws Exception {
+        var decoded = new CountDownLatch(1);
+        try (var io = Executors.newSingleThreadExecutor();
+             var cursor = new PdkValidationCursor("table", consumer -> consumer.accept(result(Map.of("id", 7))),
+                     row -> { decoded.countDown(); return ValidationValues.ownRow(row, LIMITS); }, () -> {}, () -> {}, io, 1, LIMITS)) {
+            assertThat(decoded.await(3, TimeUnit.SECONDS)).isTrue();
+            cursor.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS);
+            assertThat(cursor.availableRowSlots()).isZero();
+            cursor.close();
+            assertThat(cursor.rowsReleased().toCompletableFuture().get(3, TimeUnit.SECONDS)).isNull();
+            io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+            assertThat(cursor.availableRowSlots()).isEqualTo(1);
+            assertThatThrownBy(cursor::next).isInstanceOf(TapstateException.class);
+        }
+    }
+
     @SafeVarargs private static FilterResults result(Map<String, Object>... rows) {
         FilterResults result = new FilterResults();
         result.setResults(List.of(rows));

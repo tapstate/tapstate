@@ -181,6 +181,7 @@ final class PdkValidationSession {
             @Override public java.util.Optional<Row> next() { return cursor.next(); }
             @Override public void close() { cursor.close(); }
             @Override public CompletionStage<Void> workersExited() { return workersExited.minimalCompletionStage(); }
+            @Override public CompletionStage<Void> rowsReleased() { return cursor.rowsReleased(); }
         };
     }
 

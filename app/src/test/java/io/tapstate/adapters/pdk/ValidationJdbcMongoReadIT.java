@@ -19,6 +19,7 @@ import io.tapstate.core.validation.ValidationCheckEvent;
 import io.tapstate.runtime.engine.validation.ValidationRelationReader;
 import io.tapstate.runtime.engine.validation.ValidationRootReader;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
+import io.tapstate.runtime.engine.validation.ValidationScopedRead;
 import java.time.Clock;
 import java.util.Optional;
 import io.tapstate.core.validation.ValidationError;
@@ -293,11 +294,13 @@ class ValidationJdbcMongoReadIT {
         var handles = new ArrayList<ValidationReadHandle>();
         var checked = ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
                 new ValidationRootReader.Query("source", "native-root-v1", () -> {
-                    var handle = rootLookup(kind, sourceRef, sourceSettings, sourceTable, "source_key", logical, queryIo, decodeIo);
+                    var handle = new ValidationScopedRead(observation,
+                            rootLookup(kind, sourceRef, sourceSettings, sourceTable, "source_key", logical, queryIo, decodeIo));
                     handles.add(handle); return handle;
                 }),
                 new ValidationRootReader.Query("target", "native-root-v1", () -> {
-                    var handle = rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo);
+                    var handle = new ValidationScopedRead(observation,
+                            rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo));
                     handles.add(handle); return handle;
                 }),
                 new ValidationRelationRows.Limits(65536, LIMITS), new ValidationRootCheck.Limits(1024 * 1024, 100, 100, 20, 4),
@@ -318,7 +321,10 @@ class ValidationJdbcMongoReadIT {
                             new ValidationPhysicalIdentity(actual.sourceId(), DATABASE, null, targetTable, actual.keyFields(), actual.actualKey()));
                 }, (pair, root) -> ValidationFieldCheck.check(observation, List.of(), pair.source().working(), pair.target().working(),
                         pair.sourceSample(), pair.targetSample(), generated, String::equals, new ValidationValueComparison.TraversalLimits(LIMITS, 10000), root));
-        for (var handle : handles) assertThat(handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+        for (var handle : handles) {
+            assertThat(handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            assertThat(handle.rowsReleased().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+        }
         return checked;
     }
 

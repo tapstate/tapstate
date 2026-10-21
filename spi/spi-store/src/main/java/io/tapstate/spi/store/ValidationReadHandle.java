@@ -12,4 +12,11 @@ public interface ValidationReadHandle extends ValidationRowCursor {
      * ownership/admission rules. This stage is read-only; completion callbacks must not block workers.
      */
     CompletionStage<Void> workersExited();
+
+    /**
+     * Completes after close prevents further row ownership and every reserved, queued or borrowed
+     * decoded row has been released. Worker exit alone is insufficient. This says nothing about
+     * connector-native allocations or rows retained under the consumer's separate working budget.
+     */
+    CompletionStage<Void> rowsReleased();
 }
