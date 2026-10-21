@@ -18,6 +18,13 @@ class AlertCoreContractTest {
                 + fields("group-member", FrozenGroupPolicy.Member.class) + fields("frozen-group", FrozenGroupPolicy.Batch.class)
                 + fields("group-disposition-key", FrozenGroupPolicy.DispositionKey.class)
                 + fields("target-limit-domain", AlertTargetLimit.Domain.class) + fields("target-limit", AlertTargetLimit.class)
+                + fields("metric-input-budget", ObservationMetricInput.Budget.class)
+                + fields("metric-publication", ObservationMetricInput.Publication.class)
+                + fields("metric-reading", ObservationMetricInput.Reading.class)
+                + "metric-input-version=" + ObservationMetricInput.CONTRACT_VERSION + "\n"
+                + "metric-input-max-facts=" + ObservationMetricInput.MAX_FACTS + "\n"
+                + "metric-input-max-points=" + ObservationMetricInput.MAX_POINTS + "\n"
+                + "metric-input-status=" + names(ObservationMetricInput.Status.values()) + "\n"
                 + "group-max-members=" + FrozenGroupPolicy.MAX_MEMBERS + "\n"
                 + "severity=" + names(AlarmSeverity.values()) + "\n"
                 + "condition=" + names(AlertSnapshot.Status.values()) + "\n"
