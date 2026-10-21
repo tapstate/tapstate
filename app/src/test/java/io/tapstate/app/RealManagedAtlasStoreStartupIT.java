@@ -138,7 +138,7 @@ class RealManagedAtlasStoreStartupIT {
 
     private static ConfigurableApplicationContext start(String metadataUri, String cluster, Path plugins,
             Path seedDirectory, String retention, AtomicInteger ready) {
-        CloudStartupDerivationWitness witness = CloudStartupDerivationWitness.initializer();
+        CloudStartupDerivationWitness witness = CloudStartupDerivationWitness.realManagedStartupInitializer();
         try (var observation = witness.observeClientCreation()) {
             return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
                 .initializers(witness, CloudSeedOutcomeWitness.initializer())

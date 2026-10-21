@@ -46,7 +46,9 @@ import static org.mockito.Mockito.spy;
 final class CloudStartupDerivationWitness implements ApplicationContextInitializer<ConfigurableApplicationContext> {
     static final String REFUSAL_CLASSIFICATION_PROPERTY = "tapstate.test.mysql-seed-refusal-classification";
     static final String ARTIFACT_READ_FAILURE_PROPERTY = "tapstate.test.mysql-artifact-read-failure-classification";
+    static final String REGISTRY_INSERT_REFUSAL_PROPERTY = "tapstate.test.mysql-seed-registry-insert-refusal-classification";
     private final CloudArtifactReadFailureClassifier artifactReadFailureClassifier;
+    private final CloudRegistryInsertRefusalClassifier registryInsertRefusalClassifier;
     private final Consumer<Map<String, Object>> output;
     private final Consumer<Map<String, Object>> storeOutput;
     private final Path expectedSeed;
@@ -79,7 +81,17 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
     CloudStartupDerivationWitness(Consumer<Map<String, Object>> output,
             Consumer<Map<String, Object>> storeOutput, Path expectedSeed, boolean refusalClassificationEnabled,
             boolean artifactReadFailureClassificationEnabled) {
+        this(output, storeOutput, expectedSeed, refusalClassificationEnabled,
+                artifactReadFailureClassificationEnabled, false, null);
+    }
+
+    CloudStartupDerivationWitness(Consumer<Map<String, Object>> output,
+            Consumer<Map<String, Object>> storeOutput, Path expectedSeed, boolean refusalClassificationEnabled,
+            boolean artifactReadFailureClassificationEnabled, boolean registryInsertClassificationEnabled,
+            CloudRegistryInsertRefusalClassifier.Entry entry) {
         this.artifactReadFailureClassifier = new CloudArtifactReadFailureClassifier(artifactReadFailureClassificationEnabled);
+        this.registryInsertRefusalClassifier = new CloudRegistryInsertRefusalClassifier(
+                registryInsertClassificationEnabled, entry);
         this.output = output;
         this.storeOutput = storeOutput;
         this.expectedSeed = expectedSeed == null ? null : expectedSeed.toAbsolutePath().normalize();
@@ -87,6 +99,14 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
     }
 
     static CloudStartupDerivationWitness initializer() {
+        return initializer(null);
+    }
+
+    static CloudStartupDerivationWitness realManagedStartupInitializer() {
+        return initializer(CloudRegistryInsertRefusalClassifier.REAL_MANAGED_STARTUP);
+    }
+
+    private static CloudStartupDerivationWitness initializer(CloudRegistryInsertRefusalClassifier.Entry entry) {
         return new CloudStartupDerivationWitness(event ->
                 System.out.println("CLOUD_MYSQL_DERIVATION " + JsonWriter.write(event)), event -> {
                     String prefix = "factory".equals(event.get("kind"))
@@ -95,7 +115,8 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
                     System.out.println(prefix + JsonWriter.write(event));
                 }, CloudConnectorTestInputs.seedDirectory().resolve("mysql-connector.jar"),
                 Boolean.getBoolean(REFUSAL_CLASSIFICATION_PROPERTY),
-                Boolean.getBoolean(ARTIFACT_READ_FAILURE_PROPERTY));
+                Boolean.getBoolean(ARTIFACT_READ_FAILURE_PROPERTY),
+                Boolean.getBoolean(REGISTRY_INSERT_REFUSAL_PROPERTY), entry);
     }
 
     @Override
@@ -330,6 +351,13 @@ final class CloudStartupDerivationWitness implements ApplicationContextInitializ
             // Read only this field once; arbitrary text never enters an event or a diagnostic exception.
             event.put("refusal_category", CloudSpecPutRefusalClassifier.classify(
                     true, true, attempt.operation, command, mongo.getCode(), mongo::getErrorMessage).name());
+        }
+        if (failure.getClass() == MongoCommandException.class) {
+            MongoCommandException mongo = (MongoCommandException) failure;
+            registryInsertRefusalClassifier.classify(new CloudRegistryInsertRefusalClassifier.Scope(
+                    "mysql", attempt.seed, attempt.seed, attempt.operation, command,
+                    failure.getClass(), mongo.getCode()), mongo::getErrorMessage)
+                    .ifPresent(category -> event.put("registry_insert_refusal_category", category.name()));
         }
         emitStore(event);
     }

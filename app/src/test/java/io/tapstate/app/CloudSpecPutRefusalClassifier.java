@@ -18,6 +18,10 @@ final class CloudSpecPutRefusalClassifier {
         if (!explicitlyEnabled) return Category.NOT_ENABLED;
         if (!exactSeedScope || !"spec-put".equals(operation) || !"update".equals(command)
                 || driverCode != 8000) return Category.UNCLASSIFIED;
+        return classifyField(errorField);
+    }
+
+    static Category classifyField(Supplier<String> errorField) {
         try {
             String value = errorField.get();
             return value != null && value.length() <= 160 && SPACE_QUOTA.matcher(value).matches()

@@ -347,6 +347,111 @@ class CloudSeedStoreWitnessTest {
         verify(f.registry).findAll("mysql");
     }
 
+    @Test
+    void theApprovedRegistryInsertReadsOnceAndKeepsTheOriginalStoreFailure() throws IOException {
+        Fixture f = new Fixture(directory, false, true, CloudRegistryInsertRefusalClassifier.REAL_MANAGED_STARTUP);
+        CommandListener listener = listener(f);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenReturn("you are over your space quota, using 513 MB of 512 MB");
+        doAnswer(call -> {
+            listener.commandFailed(driverFailure("insert", driver));
+            listener.commandFailed(driverFailure("insert", driver));
+            throw f.failure;
+        }).when(f.registry).register(eq("mysql"), eq("api"), eq(RegistrationSource.SEED), any(byte[].class));
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        verify(f.registry).register(eq("mysql"), eq("api"), eq(RegistrationSource.SEED), eq(new byte[] {4, 7}));
+        verify(driver).getErrorMessage();
+        verify(driver, never()).getMessage();
+        verify(driver, never()).getCause();
+        verify(driver, never()).getResponse();
+        assertThat(f.events).filteredOn(e -> e.containsKey("registry_insert_refusal_category")).singleElement()
+                .satisfies(e -> assertThat(e).containsEntry("kind", "command-failed")
+                        .containsEntry("outcome", "driver-refusal").containsEntry("stage", "seed")
+                        .containsEntry("path_match", true).containsEntry("operation", "registry-register")
+                        .containsEntry("command", "insert").containsEntry("driver_code", 8000)
+                        .containsEntry("exception_type", MongoCommandException.class.getName())
+                        .containsEntry("registry_insert_refusal_category", "SPACE_QUOTA"));
+        assertThat(JsonWriter.write(f.events)).doesNotContain("space quota", "513", "512", SENTINEL,
+                directory.toString());
+    }
+
+    @Test
+    void oldConstructorsAndOtherEntriesCannotReadRegistryInsertFields() throws IOException {
+        List<Fixture> fixtures = List.of(new Fixture(Files.createDirectory(directory.resolve("old")), true),
+                new Fixture(Files.createDirectory(directory.resolve("missing")), false, true, null),
+                new Fixture(Files.createDirectory(directory.resolve("other")), false, true,
+                        new CloudRegistryInsertRefusalClassifier.Entry("ManagedAtlasCloudStoreIT",
+                                CloudRegistryInsertRefusalClassifier.REAL_MANAGED_STARTUP.testMethod())));
+        for (Fixture f : fixtures) {
+            CommandListener listener = listener(f);
+            MongoCommandException driver = commandFailure(8000);
+            doAnswer(call -> { listener.commandFailed(driverFailure("insert", driver)); throw f.failure; })
+                    .when(f.registry).register(eq("mysql"), eq("api"), eq(RegistrationSource.SEED), any(byte[].class));
+            assertThatThrownBy(f::seed).isSameAs(f.failure);
+            verify(driver, never()).getErrorMessage();
+            assertThat(f.events).allSatisfy(e -> assertThat(e).doesNotContainKey("registry_insert_refusal_category"));
+        }
+    }
+
+    @Test
+    void aDifferentPathOrRegistrationSourceCannotBorrowTheRegistryRead() throws IOException {
+        Fixture f = new Fixture(directory, false, true, CloudRegistryInsertRefusalClassifier.REAL_MANAGED_STARTUP);
+        CommandListener listener = listener(f);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenReturn(SENTINEL);
+        doAnswer(call -> { listener.commandFailed(driverFailure("insert", driver)); throw f.failure; })
+                .when(f.registry).register(eq("mysql"), eq("api"), any(RegistrationSource.class), any(byte[].class));
+        Path other = Files.createDirectory(directory.resolve("other")).resolve("mysql-connector.jar");
+        Files.write(other, new byte[] {4, 7});
+        assertThatThrownBy(() -> f.registrar.register(other, RegistrationSource.SEED)).isSameAs(f.failure);
+        assertThatThrownBy(() -> f.registrar.register(f.artifact, RegistrationSource.REGISTER)).isSameAs(f.failure);
+        verify(driver, never()).getErrorMessage();
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        verify(driver).getErrorMessage();
+        assertThat(f.events).filteredOn(e -> e.containsKey("registry_insert_refusal_category")).singleElement()
+                .satisfies(e -> assertThat(e).containsEntry("registry_insert_refusal_category", "UNCLASSIFIED"));
+        assertThat(JsonWriter.write(f.events)).doesNotContain(SENTINEL);
+    }
+
+    @Test
+    void otherOperationsCommandsAndCodesLeaveTheRegistryReadAvailable() throws IOException {
+        Fixture f = new Fixture(directory, true, true, CloudRegistryInsertRefusalClassifier.REAL_MANAGED_STARTUP);
+        CommandListener listener = listener(f);
+        MongoCommandException other = commandFailure(13);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenReturn(SENTINEL);
+        when(f.registry.findAll("mysql")).thenAnswer(call -> {
+            listener.commandFailed(driverFailure("insert", driver));
+            return List.of();
+        });
+        doAnswer(call -> {
+            listener.commandFailed(driverFailure("update", driver));
+            listener.commandFailed(driverFailure("insert", other));
+            listener.commandFailed(driverFailure("insert", driver));
+            throw f.failure;
+        }).when(f.registry).register(eq("mysql"), eq("api"), eq(RegistrationSource.SEED), any(byte[].class));
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        verify(other, never()).getErrorMessage();
+        verify(driver).getErrorMessage();
+        assertThat(f.events).filteredOn(e -> e.containsKey("registry_insert_refusal_category")).singleElement();
+        assertThat(f.events).allSatisfy(e -> assertThat(e).doesNotContainKey("refusal_category"));
+    }
+
+    @Test
+    void anUnreadableRegistryFieldCannotReplaceTheOriginalFailureOrPublishItsText() throws IOException {
+        Fixture f = new Fixture(directory, false, true, CloudRegistryInsertRefusalClassifier.REAL_MANAGED_STARTUP);
+        CommandListener listener = listener(f);
+        MongoCommandException driver = commandFailure(8000);
+        when(driver.getErrorMessage()).thenThrow(new IllegalArgumentException(SENTINEL));
+        doAnswer(call -> { listener.commandFailed(driverFailure("insert", driver)); throw f.failure; })
+                .when(f.registry).register(eq("mysql"), eq("api"), eq(RegistrationSource.SEED), any(byte[].class));
+        assertThatThrownBy(f::seed).isSameAs(f.failure);
+        verify(driver).getErrorMessage();
+        assertThat(f.events).filteredOn(e -> e.containsKey("registry_insert_refusal_category")).singleElement()
+                .satisfies(e -> assertThat(e).containsEntry("registry_insert_refusal_category", "UNCLASSIFIED"));
+        assertThat(JsonWriter.write(f.events)).doesNotContain(SENTINEL);
+    }
+
     private static CommandListener listener(Fixture f) {
         AtomicReference<CommandListener> captured = new AtomicReference<>();
         try (var scope = f.witness.observeClientCreation()) {
@@ -406,8 +511,14 @@ class CloudSeedStoreWitnessTest {
         }
 
         private Fixture(Path directory, boolean classify) throws IOException {
+            this(directory, classify, false, null);
+        }
+
+        private Fixture(Path directory, boolean classify, boolean classifyInsert,
+                CloudRegistryInsertRefusalClassifier.Entry entry) throws IOException {
             artifact = Files.write(directory.resolve("mysql-connector.jar"), new byte[] {4, 7});
-            witness = new CloudStartupDerivationWitness(event -> {}, events::add, artifact, classify);
+            witness = new CloudStartupDerivationWitness(event -> {}, events::add, artifact, classify,
+                    false, classifyInsert, entry);
             observedRegistry = witness.observe(registry);
             observedSpecs = witness.observe(specs);
             observedCatalog = witness.observe(catalog);
