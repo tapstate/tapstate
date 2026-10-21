@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 /**
  * Bounded unordered membership facts for one declared array under one exact parent observation.
@@ -204,6 +205,32 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         });
     }
 
+    record SourceGroup(ValidationRoot scope, long count, List<Member> samples, boolean conflict) {
+        SourceGroup { samples = List.copyOf(samples); }
+    }
+
+    ValidationCheckEvent.ReadBoundary requireSourceComplete() {
+        ensureOpen();
+        try {
+            var read = reads.get(Side.SOURCE);
+            if (read == null) throw ValidationError.invalid("nestMembers.sourceIncomplete");
+            return read;
+        } catch (RuntimeException | Error error) { fail(error); throw error; }
+    }
+
+    /** Independent source facts carry no inferred target count or target completion. */
+    void visitSourceGroups(Consumer<SourceGroup> visitor) {
+        mutate(() -> {
+            requireSourceComplete();
+            Objects.requireNonNull(visitor, "visitor");
+            for (var entry : buckets.entrySet()) {
+                Bucket bucket = entry.getValue();
+                if (bucket.sourceCount > 0) visitor.accept(new SourceGroup(scope(entry.getKey()), bucket.sourceCount,
+                        bucket.source, conflict(bucket.sourceCount, bucket.source, sourceRows)));
+            }
+        });
+    }
+
     public Result finish() {
         ensureOpen();
         try {
@@ -211,11 +238,7 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
             var groups = new ArrayList<Group>(buckets.size());
             for (var entry : buckets.entrySet()) {
                 Bucket bucket = entry.getValue();
-                var ancestors = new ArrayList<>(observation.root().ancestors());
-                ancestors.add(new ValidationRoot.Ancestor(path, entry.getKey()));
-                var scope = new ValidationRoot(observation.root().mappingId(), observation.root().outputId(),
-                        observation.root().rootKey(), ancestors);
-                groups.add(new Group(scope, bucket.sourceCount, bucket.targetCount, bucket.source, bucket.target,
+                groups.add(new Group(scope(entry.getKey()), bucket.sourceCount, bucket.targetCount, bucket.source, bucket.target,
                         conflict(bucket.sourceCount, bucket.source, sourceRows), conflict(bucket.targetCount, bucket.target, targetRows)));
             }
             Result result = new Result(observation, path, groups, reads, bytes);
@@ -225,6 +248,13 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
             fail(error);
             throw error;
         }
+    }
+
+    private ValidationRoot scope(ValidationKey elementKey) {
+        var ancestors = new ArrayList<>(observation.root().ancestors());
+        ancestors.add(new ValidationRoot.Ancestor(path, elementKey));
+        return new ValidationRoot(observation.root().mappingId(), observation.root().outputId(),
+                observation.root().rootKey(), ancestors);
     }
 
     private static boolean conflict(long count, List<Member> samples, Map<ValidationKey, Long> rows) {

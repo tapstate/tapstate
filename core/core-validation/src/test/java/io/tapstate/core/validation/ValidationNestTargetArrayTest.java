@@ -42,6 +42,7 @@ class ValidationNestTargetArrayTest {
         for (Object value : List.of(List.of(), new ValidationValues.Typed("json", null, "codec", List.of()))) {
             var doc = side(Map.of("items", value));
             try (var members = members(parent, List.of("items")); var root = builder()) {
+                members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
                 assertThat(read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
                         .isEqualTo(ValidationNestTargetArray.State.COMPLETE);
                 members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
@@ -52,6 +53,7 @@ class ValidationNestTargetArrayTest {
                 Map.<String, Object>of("items", new ValidationValues.Typed("text", null, "codec", List.of())))) {
             var doc = side(fields);
             try (var members = members(parent, List.of("items")); var root = builder()) {
+                members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
                 assertThat(read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
                         .isEqualTo(ValidationNestTargetArray.State.INVALID);
                 assertThatThrownBy(members::finish).isInstanceOf(IllegalStateException.class);
@@ -66,6 +68,7 @@ class ValidationNestTargetArrayTest {
         var doc = side(Map.of("items", List.of(Map.of("id", 11), Map.of("value", "missing-key"), nullable("id"), Map.of("id", 12))));
         try (var members = members(parent, List.of("items")); var root = builder()) {
             source(members, parent, 11, "A"); source(members, parent, 12, "B");
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             assertThat(read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
                     .isEqualTo(ValidationNestTargetArray.State.INVALID);
             assertThatThrownBy(members::finish).isInstanceOf(IllegalStateException.class);
@@ -82,6 +85,7 @@ class ValidationNestTargetArrayTest {
         var parent = observation(List.of(), 1);
         var doc = side(Map.of("items", List.of(Map.of("id", 11), "not-an-object")));
         try (var members = members(parent, List.of("items")); var root = builder()) {
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             assertThat(read(parent, List.of("items"), doc, doc.row(), Optional.empty(), LIMITS, members, root))
                     .isEqualTo(ValidationNestTargetArray.State.INVALID);
             root.read(Side.SOURCE, boundary("source"));
@@ -91,6 +95,7 @@ class ValidationNestTargetArrayTest {
         var hidden = side(Map.of("items", List.of(Map.of("id", 11))));
         try (var members = members(parent, List.of("items")); var root = builder()) {
             source(members, parent, 11, "A");
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             read(parent, List.of("items"), hidden, hidden.row(), Optional.empty(), LIMITS, members, root);
             members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             assertThat(members.finish().groups().getFirst().rowIdentityComparison()).isEqualTo(ValidationNestArrayMembers.RowIdentityComparison.NOT_OBSERVABLE);
@@ -102,6 +107,7 @@ class ValidationNestTargetArrayTest {
         var child = Map.<String, Object>of("id", 11, "allocations", List.of(Map.of("id", 501)));
         var doc = side(Map.of("id", 102, "items", List.of(child)));
         try (var members = members(parent, List.of("allocations")); var root = builder()) {
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             read(parent, List.of("allocations"), doc, ValidationValues.ownRow(child, ROW), Optional.of(KEY), LIMITS, members, root);
             members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             var group = members.finish().groups().getFirst();
@@ -119,6 +125,7 @@ class ValidationNestTargetArrayTest {
             var limits = scenario == 2 ? new ValidationNestTargetArray.Limits(ROW, 1, 2000)
                     : scenario == 3 ? new ValidationNestTargetArray.Limits(ROW, 100, 1) : LIMITS;
             try (var members = members(parent, scenario == 1 ? List.of("other") : List.of("items")); var root = builder()) {
+                members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
                 assertThatThrownBy(() -> read(actual, List.of("items"), doc, doc.row(), Optional.of(KEY), limits, members, root))
                         .isInstanceOf(TapstateException.class);
                 assertThatThrownBy(root::finish).isInstanceOf(IllegalStateException.class);
@@ -131,12 +138,14 @@ class ValidationNestTargetArrayTest {
         var parent = observation(List.of(), 1);
         var doc = side(Map.of("items", List.of()));
         try (var members = members(parent, List.of("other")); var root = builder()) {
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             assertThatThrownBy(() -> read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
                     .isInstanceOf(TapstateException.class);
             assertThatThrownBy(root::finish).isInstanceOf(IllegalStateException.class);
         }
         var nested = observation(List.of(new ValidationRoot.Ancestor(List.of("parents"), key(11))), 1);
         try (var members = members(nested, List.of("items")); var root = builder()) {
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, nested, boundary("source"));
             assertThatThrownBy(() -> read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
                     .isInstanceOf(TapstateException.class);
         }
@@ -146,6 +155,7 @@ class ValidationNestTargetArrayTest {
         var parent = observation(List.of(), 1);
         var doc = side(Map.of("items", List.of(Map.of("id", new ValidationValues.Typed("unadmitted", null, "codec", 11)))));
         try (var members = members(parent, List.of("items")); var root = builder()) {
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             assertThatThrownBy(() -> read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
                     .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED));
             assertThatThrownBy(root::finish).isInstanceOf(IllegalStateException.class);
@@ -153,8 +163,92 @@ class ValidationNestTargetArrayTest {
         var raw = side(Map.of("items", List.of()));
         var open = new ValidationCheckEvent.Side(raw.identity(), raw.row(), 1, ValidationCheckEvent.GroupStatus.OPEN, raw.boundary());
         try (var members = members(parent, List.of("items")); var root = builder()) {
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("source"));
             assertThatThrownBy(() -> read(parent, List.of("items"), open, open.row(), Optional.of(KEY), LIMITS, members, root))
                     .isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void malformedTargetCannotEraseACompleteIndependentSourceDuplicate() {
+        var parent = observation(List.of(), 1);
+        var doc = side(Map.of("items", List.of(Map.of("value", "missing-key"))));
+        try (var members = members(parent, List.of("items")); var root = builder()) {
+            source(members, parent, 11, "A"); source(members, parent, 11, "B");
+            members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("children"));
+            assertThat(read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
+                    .isEqualTo(ValidationNestTargetArray.State.INVALID);
+            root.read(Side.SOURCE, boundary("source"));
+            var result = finish(root);
+            assertThat(result.counts()).containsEntry(Kind.SOURCE_DUPLICATE, 1L).containsEntry(Kind.TARGET_KEY_INVALID, 1L);
+            assertThat(result.findings().keySet()).anySatisfy(finding -> {
+                assertThat(finding.kind()).isEqualTo(Kind.SOURCE_DUPLICATE);
+                assertThat(finding.multiplicity()).contains(new Multiplicity(2, true));
+                assertThat(finding.location().scope().ancestors()).containsExactly(new ValidationRoot.Ancestor(List.of("items"), key(11)));
+            });
+            assertThat(result.reads()).anySatisfy(read -> assertThat(read.boundary().readId()).isEqualTo("children"));
+            assertThat(result.checks()).containsEntry(Check.STRUCTURE, Status.BLOCKED).containsEntry(Check.VALUES, Status.BLOCKED);
+            assertThat(result.samples()).anySatisfy(sample -> assertThat(sample.source()).hasValueSatisfying(source -> assertThat(source.readId()).isEqualTo("children")));
+        }
+    }
+
+    @Test void missingOrScalarTargetRetainsCrossElementSourceRowConflictsWithoutInferringMissingTargets() {
+        var parent = observation(List.of(new ValidationRoot.Ancestor(List.of("parents"), key(5))), 1);
+        for (var fields : List.of(Map.<String, Object>of(), Map.<String, Object>of("items", "wrong"))) {
+            var doc = side(fields);
+            try (var members = members(parent, List.of("items")); var root = builder()) {
+                for (int element : List.of(21, 22)) members.add(ValidationNestArrayMembers.Side.SOURCE, parent,
+                        new ValidationNestArrayMembers.Member(key(11), key(element),
+                                new ValidationPhysicalIdentity("source", "db", null, "children", List.of(List.of("id")), key(11)),
+                                ValidationValues.ownRow(Map.of("id", 11, "element", element), ROW)));
+                members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("children"));
+                assertThat(read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
+                        .isEqualTo(ValidationNestTargetArray.State.INVALID);
+                var result = finish(root);
+                assertThat(result.counts()).containsExactlyInAnyOrderEntriesOf(Map.of(Kind.SOURCE_ROW_DUPLICATE, 2L, Kind.TARGET_STRUCTURE, 1L));
+                assertThat(result.notCompared()).hasSize(4).allSatisfy(blocked -> {
+                    assertThat(blocked.location().scope().ancestors()).hasSize(2);
+                    assertThat(blocked.location().scope().ancestors().getFirst()).isEqualTo(new ValidationRoot.Ancestor(List.of("parents"), key(5)));
+                });
+            }
+        }
+    }
+
+    @Test void anUnfinishedSourceCannotBeHiddenByAnEmptyOrMalformedTarget() {
+        var parent = observation(List.of(), 1);
+        for (var doc : List.of(side(Map.of("items", List.of())), side(Map.of()))) {
+            try (var members = members(parent, List.of("items")); var root = builder()) {
+                source(members, parent, 11, "A");
+                assertThatThrownBy(() -> read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
+                        .isInstanceOfSatisfying(TapstateException.class, error -> {
+                            assertThat(error.code()).isEqualTo(ValidationError.INVALID_CONTRACT);
+                            assertThat(error.args()).containsEntry("field", "nestMembers.sourceIncomplete");
+                        });
+                assertThatThrownBy(root::finish).isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(members::finish).isInstanceOf(TapstateException.class);
+            }
+        }
+    }
+
+    @Test void sourceProblemsSurviveSampleExhaustionAndHardFindingLimitsStillAbort() {
+        var parent = observation(List.of(), 1);
+        var doc = side(Map.of());
+        for (int findings : List.of(1, 2)) {
+            try (var members = members(parent, List.of("items")); var root = ValidationRootCheck.builder(parent, ValidationMethod.FULL_COLUMN,
+                    ValidationCheckEvent.Participation.SHOULD_EXIST, TargetPresence.PRESENT, new ValidationRootCheck.Limits(1024 * 1024, findings, 100, 20, 0))) {
+                source(members, parent, 11, "A"); source(members, parent, 11, "B");
+                members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, boundary("children"));
+                if (findings == 1) {
+                    assertThatThrownBy(() -> read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ValidationError.VALUE_LIMIT_EXCEEDED));
+                    assertThatThrownBy(root::finish).isInstanceOf(TapstateException.class);
+                } else {
+                    read(parent, List.of("items"), doc, doc.row(), Optional.of(KEY), LIMITS, members, root);
+                    var result = finish(root);
+                    assertThat(result.counts()).containsEntry(Kind.SOURCE_DUPLICATE, 1L).containsEntry(Kind.TARGET_STRUCTURE, 1L);
+                    assertThat(result.samples()).isEmpty();
+                    assertThat(result.samplesTruncated()).isTrue();
+                }
+            }
         }
     }
 

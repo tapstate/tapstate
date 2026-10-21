@@ -30,9 +30,7 @@ public final class ValidationNestArrayCheck {
                 Optional<SampledSide> source = sample(group.sourceSamples(), sourceRead.readId());
                 Optional<SampledSide> target = sample(group.targetSamples(), targetRead.readId());
                 if (group.sourceConflict()) {
-                    Finding cause = duplicate(group.sourceCount(), Kind.SOURCE_DUPLICATE, Kind.SOURCE_ROW_DUPLICATE, location);
-                    root.finding(cause, source, Optional.empty()).notCompared(Check.STRUCTURE, location, cause);
-                    if (root.method() == ValidationMethod.FULL_COLUMN) root.notCompared(Check.VALUES, location, cause);
+                    sourceProblem(group.sourceCount(), location, source, root);
                 }
                 if (group.targetConflict()) {
                     Finding cause = duplicate(group.targetCount(), Kind.TARGET_DUPLICATE, Kind.TARGET_ROW_DUPLICATE, location);
@@ -59,6 +57,21 @@ public final class ValidationNestArrayCheck {
             root.close();
             throw failure;
         }
+    }
+
+    /** Called before discarding a malformed target frame, without fabricating an empty target read. */
+    static void retainSourceProblems(ValidationNestArrayMembers members, Builder root) {
+        var read = members.requireSourceComplete();
+        root.read(Side.SOURCE, read);
+        members.visitSourceGroups(group -> {
+            if (group.conflict()) sourceProblem(group.count(), new Location(group.scope(), List.of()), sample(group.samples(), read.readId()), root);
+        });
+    }
+
+    private static void sourceProblem(long count, Location location, Optional<SampledSide> sample, Builder root) {
+        Finding cause = duplicate(count, Kind.SOURCE_DUPLICATE, Kind.SOURCE_ROW_DUPLICATE, location);
+        root.finding(cause, sample, Optional.empty()).notCompared(Check.STRUCTURE, location, cause);
+        if (root.method() == ValidationMethod.FULL_COLUMN) root.notCompared(Check.VALUES, location, cause);
     }
 
     private static void requireScope(ValidationNestArrayMembers.Result members, Builder root) {

@@ -15,7 +15,8 @@ import static io.tapstate.core.validation.ValidationRootCheck.*;
  * Reads one actual target array into a parent-scoped membership frame. Element diagnostics retain
  * the physical document read, not an invented table row identified by the logical element key.
  * Invalid structure or identity closes the frame: dropping an unkeyed element could falsely prove
- * another member missing or unique. The enclosing root and its independent branches may continue.
+ * another member missing or unique. Complete source membership is required before target extraction;
+ * its independently established problems survive a malformed target. Other root branches may continue.
  */
 public final class ValidationNestTargetArray {
     public enum State { COMPLETE, INVALID }
@@ -50,6 +51,7 @@ public final class ValidationNestTargetArray {
             containerTypes = Set.copyOf(containerTypes);
             requireScope(parent, root);
             members.requireRequest(parent, arrayPath);
+            members.requireSourceComplete();
             if (physicalParent.groupStatus() != ValidationCheckEvent.GroupStatus.COMPLETE || physicalParent.observedOccurrences() != 1) {
                 throw ValidationError.invalid("targetArray.parent");
             }
@@ -97,7 +99,7 @@ public final class ValidationNestTargetArray {
                         new ValidationNestArrayMembers.Member(declared == null ? Optional.empty() : Optional.of(((ValidationKeyBinding.Bound) declared).key()),
                                 ((ValidationKeyBinding.Bound) element).key(), physicalParent.identity(), physicalParent.row(), row));
             }
-            if (!valid) { members.close(); return State.INVALID; }
+            if (!valid) return discardInvalid(members, root);
             members.complete(ValidationNestArrayMembers.Side.TARGET, parent, physicalParent.boundary());
             return State.COMPLETE;
         } catch (RuntimeException | Error failure) {
@@ -119,6 +121,10 @@ public final class ValidationNestTargetArray {
     private static State invalid(Builder root, ValidationNestArrayMembers members, ValidationObservation parent,
             List<String> arrayPath, List<?> position, Kind kind, SampledSide sample) {
         finding(root, parent, arrayPath, position, kind, sample);
+        return discardInvalid(members, root);
+    }
+    private static State discardInvalid(ValidationNestArrayMembers members, Builder root) {
+        ValidationNestArrayCheck.retainSourceProblems(members, root);
         members.close();
         return State.INVALID;
     }
