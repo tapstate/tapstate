@@ -199,6 +199,11 @@ final class PdkValidationCodecs {
                 Map.of("limit", "binaryBytes"), null);
     }
 
+    Object temporal(String field, Selected selected, PdkValidationTemporal.Kind kind,
+            PdkValidationTemporal.LegacyEncoding legacyEncoding) {
+        return PdkValidationTemporal.decode(connectorId, binding, field, selected, kind, legacyEncoding);
+    }
+
     private Selected converted(String field, Object value, TapType modelType,
             ToTapValueCodec<?> codec, Origin origin) {
         TapValue<?, ?> converted;
