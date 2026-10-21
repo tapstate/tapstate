@@ -8,6 +8,15 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+validation.read-cancelled:
+  message: "The independent validation read of {table} was cancelled."
+  solution: "A cancelled read is incomplete; start a new validation when authorized."
+validation.read-failed:
+  message: "The independent validation read of {table} failed."
+  solution: "Inspect the reader error and connection before starting another validation."
+validation.read-protocol-violation:
+  message: "The validation reader for {table} violated its result-delivery contract."
+  solution: "Check the connector's query implementation; incomplete data cannot be treated as EOF."
 validation.owner-not-authorized:
   message: "The validation owner for Pipeline {pipeline} is no longer authorized."
   solution: "The old validation run must end. Start a new run after the owner has been safely retired."

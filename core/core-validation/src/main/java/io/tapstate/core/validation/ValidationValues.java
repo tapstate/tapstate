@@ -63,16 +63,19 @@ public final class ValidationValues {
         private final Map<String, Object> fields;
         private final long accountedBytes;
         private final int nodes;
+        private final int depth;
 
-        private Row(Map<String, Object> fields, long accountedBytes, int nodes) {
+        private Row(Map<String, Object> fields, long accountedBytes, int nodes, int depth) {
             this.fields = fields;
             this.accountedBytes = accountedBytes;
             this.nodes = nodes;
+            this.depth = depth;
         }
 
         public Map<String, Object> fields() { return fields; }
         public long accountedBytes() { return accountedBytes; }
         public int nodes() { return nodes; }
+        public int depth() { return depth; }
         @Override public String toString() { return "Row[fields=" + fields.size() + ", bytes=" + accountedBytes + "]"; }
     }
 
@@ -81,7 +84,7 @@ public final class ValidationValues {
         Meter meter = new Meter(Objects.requireNonNull(limits, "limits"));
         @SuppressWarnings("unchecked")
         Map<String, Object> copy = (Map<String, Object>) freeze(fields, 1, meter, new IdentityHashMap<>());
-        return new Row(copy, meter.bytes, meter.nodes);
+        return new Row(copy, meter.bytes, meter.nodes, meter.depth);
     }
 
     private static Object freeze(Object value, int depth, Meter meter, IdentityHashMap<Object, Boolean> active) {
@@ -155,10 +158,12 @@ public final class ValidationValues {
         private final Limits limits;
         private long bytes;
         private int nodes;
+        private int depth;
 
         private Meter(Limits limits) { this.limits = limits; }
         private void node(int depth) {
             if (depth > limits.depth()) throw limit("depth");
+            this.depth = Math.max(this.depth, depth);
             if (nodes == limits.nodes()) throw limit("nodes");
             nodes++;
             charge(16);

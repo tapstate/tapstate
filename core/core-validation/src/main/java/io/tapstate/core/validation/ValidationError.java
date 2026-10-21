@@ -14,7 +14,10 @@ public enum ValidationError implements TapstateErrorCode {
     ILLEGAL_TRANSITION("validation.illegal-transition", Set.of("from", "to", "mode")),
     VALUE_LIMIT_EXCEEDED("validation.value-limit-exceeded", Set.of("limit")),
     VALUE_TYPE_UNSUPPORTED("validation.value-type-unsupported", Set.of("type")),
-    OWNER_NOT_AUTHORIZED("validation.owner-not-authorized", Set.of("pipeline"));
+    OWNER_NOT_AUTHORIZED("validation.owner-not-authorized", Set.of("pipeline")),
+    READ_FAILED("validation.read-failed", Set.of("table")),
+    READ_PROTOCOL_VIOLATION("validation.read-protocol-violation", Set.of("table")),
+    READ_CANCELLED("validation.read-cancelled", Set.of("table"));
 
     private final String code;
     private final Set<String> placeholders;

@@ -338,5 +338,8 @@ validation.incompatible-key
 validation.invalid-contract
 validation.key-limit-exceeded
 validation.owner-not-authorized
+validation.read-cancelled
+validation.read-failed
+validation.read-protocol-violation
 validation.value-limit-exceeded
 validation.value-type-unsupported
