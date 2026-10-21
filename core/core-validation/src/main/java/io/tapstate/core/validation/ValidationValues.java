@@ -3,6 +3,7 @@ package io.tapstate.core.validation;
 import io.tapstate.core.common.TapstateException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -51,6 +52,19 @@ public final class ValidationValues {
             this.subtype = subtype;
             this.bytes = bytes.clone();
         }
+
+        private Binary(int subtype, ByteBuffer source) {
+            Objects.requireNonNull(source, "source");
+            if (subtype < -1 || subtype > 255) throw ValidationError.invalid("binary.subtype");
+            ByteBuffer view = source.asReadOnlyBuffer();
+            if (view.remaining() > 32 * 1024 * 1024) throw limit("bytes");
+            this.subtype = subtype;
+            this.bytes = new byte[view.remaining()];
+            view.get(this.bytes);
+        }
+
+        /** One owned payload allocation, without changing the caller's buffer position or limit. */
+        public static Binary fromBuffer(int subtype, ByteBuffer source) { return new Binary(subtype, source); }
 
         public int subtype() { return subtype; }
         public byte[] bytes() { return bytes.clone(); }
