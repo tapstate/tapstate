@@ -110,9 +110,13 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public Optional<Resource> get(String id) {
-        return delegate.get(id);
+    public synchronized Optional<Resource> get(String id) {
+        var current = delegate.get(id); current.ifPresent(this::track); return current;
     }
+    @Override public Optional<String> managedDefaultSourceId() { return delegate.managedDefaultSourceId(); }
+
+    /** Native publication supplies only identities; refresh current committed values under the same mutation lock. */
+    synchronized void refreshLoaded(java.util.Set<String> ids) { ids.forEach(this::get); }
 
     /** Registers a store-proven startup winner, never a candidate from a refused write. */
     synchronized void trackLoaded(Resource resource) {
@@ -120,8 +124,8 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public List<Resource> list() {
-        return delegate.list();
+    public synchronized List<Resource> list() {
+        var current = delegate.list(); current.forEach(this::track); return current;
     }
 
     @Override

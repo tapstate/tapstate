@@ -282,7 +282,7 @@ final class StoreBackedDagSource implements DagSource {
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         Map<String, String> connectors = new TreeMap<>();
         if (pipeline.view() instanceof ViewBlock.Inline view) {
-            artifacts().get(ViewTargetResolver.resolve(view).sourceId())
+            artifacts().get(ViewTargetResolver.resolve(view, viewStoreId()).sourceId())
                     .filter(SourceResource.class::isInstance)
                     .map(SourceResource.class::cast)
                     .ifPresent(store -> connectors.put(PipelineDagBuilder.viewVertex(view), store.connector()));
@@ -411,9 +411,9 @@ final class StoreBackedDagSource implements DagSource {
 
     static StoreBackedDagSource scopedRoot(StorePort store, NestSettings nests, StoreReachability reachability,
             SourcePlacement placement, boolean marked, Supplier<List<String>> members, ParallelismBudget budget,
-            io.tapstate.spi.store.RequiredNoteStore notes, io.tapstate.adapters.pdk.ConnectorProvisioner connectors) {
+            io.tapstate.spi.store.RequiredNoteStore notes, io.tapstate.adapters.pdk.ConnectorProvisioner connectors, ArtifactStore artifacts) {
         return new StoreBackedDagSource(store, new PdkSinkWriterBinder(notes, connectors), nests, reachability,
-                placement, store.artifacts(), marked, members, budget);
+                placement, artifacts, marked, members, budget);
     }
 
     /** Resolves the candidate's selected source tables without opening a connector or changing a store. */
@@ -985,6 +985,8 @@ final class StoreBackedDagSource implements DagSource {
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         List<String> copied = new ArrayList<>();
         for (String sourceId : pipeline.sourceIds()) {
+            if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
+                throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
             SourceModel discovered = modelInputs.apply(source);
             // Applying an undiscovered source records nothing, including when discovery is needed
@@ -1057,6 +1059,27 @@ final class StoreBackedDagSource implements DagSource {
         return byName;
     }
 
+    /** A verified binding wins over all author-controlled labels and display identifiers. */
+    private String viewStoreId() {
+        var managed = artifacts().managedDefaultSourceId();
+        if (managed.isPresent()) return managed.orElseThrow();
+        List<SourceResource> markedStores = artifacts().list().stream()
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.metadata() != null
+                        && "true".equals(source.metadata().labels().get("store")))
+                .toList();
+        if (markedStores.size() > 1) {
+            throw new IllegalStateException("Multiple marked state stores");
+        }
+        if (requireMarkedStore && markedStores.isEmpty()) {
+            throw new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
+                    Map.of("store", "atlas-store"), null);
+        }
+        return markedStores.isEmpty()
+                ? ViewTargetResolver.STATE_STORE_SOURCE_ID : markedStores.getFirst().id();
+    }
+
     /**
      * The source id to reach for each table the pipeline's sources read. A reference into a source names the
      * table, while the vertex reading it is keyed by the source id, so this is what carries one to the other.
@@ -1070,6 +1093,8 @@ final class StoreBackedDagSource implements DagSource {
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
+            if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
+                throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
             SourceModel discovered = modelInputs.apply(source);
             if (skipUndiscovered && discovered == null) {
@@ -2137,21 +2162,7 @@ final class StoreBackedDagSource implements DagSource {
         // Resolve first: it holds the simpler facts - a missing key among them - and a view without a
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
-        List<SourceResource> markedStores = artifacts().list().stream()
-                .filter(SourceResource.class::isInstance)
-                .map(SourceResource.class::cast)
-                .filter(source -> source.metadata() != null
-                        && "true".equals(source.metadata().labels().get("store")))
-                .toList();
-        if (markedStores.size() > 1) {
-            throw new IllegalStateException("Multiple marked state stores");
-        }
-        if (requireMarkedStore && markedStores.isEmpty()) {
-            throw new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
-                    Map.of("store", "atlas-store"), null);
-        }
-        String storeId = markedStores.isEmpty()
-                ? ViewTargetResolver.STATE_STORE_SOURCE_ID : markedStores.getFirst().id();
+        String storeId = viewStoreId();
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline, storeId);
         boolean alternateKey = requireKeyIsTheFeedIdentity(
                 pipeline, inline, targets, tablesBySourceId);
@@ -2162,9 +2173,7 @@ final class StoreBackedDagSource implements DagSource {
                 .map(SourceResource.class::cast)
                 .orElseThrow(() -> new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
                         Map.of("store", target.sourceId()), null));
-        // Resolved by id alone, so a source the author happened to give that id would satisfy the lookup
-        // - and be written into. Capture settings are what tells an authored source from the store; a
-        // plain connection under the id is indistinguishable today, which is a narrower, recorded gap.
+        // Managed deployments resolve the validated binding above; capture-shaped targets remain invalid.
         if (store.mode() != null || store.tables() != null) {
             throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE,
                     Map.of("store", target.sourceId()), null);

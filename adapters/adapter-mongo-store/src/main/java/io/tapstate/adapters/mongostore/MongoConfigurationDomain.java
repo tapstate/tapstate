@@ -373,6 +373,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new MongoPipelineStateRebuilds(connection.client(), connection.database(), clusterId, bindings, artifacts, this::requireOpen);
     }
 
+    public io.tapstate.spi.store.ConfigurationExportStore exports() {
+        requireOpen();
+        return new MongoConfigurationExportStore(connection.client(), connection.database(), clusterId, bindings, artifacts, this::requireOpen);
+    }
+
     public io.tapstate.spi.store.ConfigurationImportStore imports() {
         requireOpen();
         return new MongoConfigurationImportStore(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen);

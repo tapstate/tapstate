@@ -67,11 +67,13 @@ final class PdkConnector implements AutoCloseable {
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
     private volatile boolean stopped;
     private final Runnable closeNotes;
+    private final ConnectorTrustMaterial trust;
     private final Runnable driveGuard;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard) {
+                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard, ConnectorTrustMaterial trust) {
+        this.trust = trust;
         this.connectorId = connectorId;
         this.loader = loader;
         this.connector = connector;
@@ -199,7 +201,10 @@ final class PdkConnector implements AutoCloseable {
             throw loadFailed(connectorId, e);
         }
         boolean opened = false;
+        ConnectorTrustMaterial material = null;
         try {
+            material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
+            effectiveSettings = material.settings();
             driveGuard.run();
             Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loader, ref.className());
             ClassLoader restore = Thread.currentThread().getContextClassLoader();
@@ -260,7 +265,7 @@ final class PdkConnector implements AutoCloseable {
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
                     connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
-                    () -> notesActive.set(false), driveGuard);
+                    () -> notesActive.set(false), driveGuard, material);
             try {
                 result.requireActive();
             } catch (RuntimeException | Error failure) {
@@ -276,6 +281,7 @@ final class PdkConnector implements AutoCloseable {
             if (!opened) {
                 notesActive.set(false);
                 closeQuietly(loader);
+                if (material != null) material.close();
             }
         }
     }
@@ -531,6 +537,7 @@ final class PdkConnector implements AutoCloseable {
     public void close() {
         closeNotes.run();
         closeQuietly(loader);
+        trust.close();
     }
 
     private static void closeQuietly(ConnectorClassLoader loader) {

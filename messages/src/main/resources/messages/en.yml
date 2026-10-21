@@ -1186,3 +1186,10 @@ control.storage-unavailable:
 
 control.storage-databases-overlap:
   message: "Choose a different logical database name for each storage layer. Equal names cannot prove storage isolation."
+
+connector.tls-trust-invalid:
+  message: "Connector '{connector}' has invalid server TLS trust material or conflicting TLS settings."
+  solution: "Provide a valid CA certificate bundle with server verification enabled and no client private key."
+connector.tls-material-cleanup-failed:
+  message: "Connector '{connector}' could not remove its temporary TLS material."
+  solution: "Inspect the owning process file permissions before retrying cleanup."

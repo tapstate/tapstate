@@ -138,8 +138,23 @@ class StorageRootConfiguration {
     }
     @Bean StorageControlDispatcher storageControlDispatcher(OperationRegistry operations, ObjectProvider<StorageSetupService> setups,
             ObjectProvider<StorageRecoveryService> recoveries, ObjectProvider<ConfigurationImportService> imports,
-            StorageControlDispatcher.Snapshots snapshots) {
-        return StorageControlDispatcher.staged(operations, setups::getIfAvailable, recoveries::getIfAvailable, imports::getIfAvailable, snapshots);
+            StorageControlDispatcher.Snapshots snapshots, StorageRoot root, Clock clock) {
+        return StorageControlDispatcher.staged(operations, setups::getIfAvailable, recoveries::getIfAvailable, () -> {
+            var custom = imports.getIfAvailable(); if (custom != null) return custom;
+            var configuration = root.runtime().requireConfiguration();
+            return new ConfigurationImportService(configuration.imports(), new EncryptedConfigurationTransfer(), () -> {
+                var business = root.runtime().business().orElseThrow(StorageRuntime::unavailable);
+                if (!(business instanceof NativeBusinessContext nativeBusiness)) throw StorageRuntime.unavailable();
+                return nativeBusiness.importValidation();
+            }, new AuditGate(configuration.audit(), clock), configuration.artifacts()::get, ids -> {
+                var business = root.runtime().business();
+                if (business.isPresent() && business.orElseThrow() instanceof NativeBusinessContext nativeBusiness)
+                    nativeBusiness.refreshImportedSecrets(ids);
+            });
+        }, () -> {
+            var configuration = root.runtime().requireConfiguration();
+            return new ConfigurationExportService(configuration.exports(), new EncryptedConfigurationTransfer(), new AuditGate(configuration.audit(), clock));
+        }, snapshots);
     }
     @Bean ApplicationRunner loadRetainedStorage(StorageRoot root, ObjectProvider<StorageBusinessFactory> factories,
             ObjectProvider<StorageSetupService.DefaultTarget> targets, ObjectProvider<OnPremInstallation> installations) {

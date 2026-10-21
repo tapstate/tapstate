@@ -73,6 +73,133 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 class ManagedMongoStoreIsolationIT {
     enum Missing { OPERATOR, VIEWS }
 
+    @Test void encryptedConfigurationMovesBetweenIsolatedRootsAndRetainsItsOriginalResultAfterCacheLoss() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String sourceDb = "transfer_source_" + suffix;
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            var from = seedTransferRoot(admin, "from_" + suffix, sourceDb, "portable-admin", "portable-password");
+            var to = seedTransferRoot(admin, "to_" + suffix, sourceDb, "destination-admin", "destination-password");
+            admin.getDatabase(sourceDb).getCollection("orders").insertMany(List.of(new Document("_id", 1).append("name", "first").append("quantity", 7),
+                    new Document("_id", 2).append("name", "second").append("quantity", 19)));
+            admin.getDatabase(from.master()).getCollection("orders").insertOne(new Document("_id", 999).append("name", "source-only"));
+            var sourceConfig = admin.getDatabase(from.config()); var destinationConfig = admin.getDatabase(to.config());
+            String fromKey = sourceConfig.getCollection("cluster_keys").find().first().getString("keyId");
+            String toKey = destinationConfig.getCollection("cluster_keys").find().first().getString("keyId");
+            assertThat(toKey).isNotEqualTo(fromKey);
+            Document targetBinding = destinationConfig.getCollection("storage_binding").find().first();
+            Document targetBootstrap = destinationConfig.getCollection("op_bootstrap").find().first();
+            String key = Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
+            Map<?,?> exported;
+            Map<String,Object> sourceSettings = Map.of("isUri", true, "uri", uri(from.user(), sourceDb));
+            try (var application = transferRoot(from)) {
+                var client = transferClient(application, from.username(), from.password());
+                assertThat(client.get().uri("/api/sources").retrieve().body(String.class)).contains("\"store\":\"true\"");
+                application.getBean(StorageRoot.class).runtime().requireConfiguration().artifacts().save(new SourceResource("secret_only", null, "mysql",
+                        Map.of("host", "unused.invalid", "port", 3306, "database", "unused", "username", "unused", "password", "unique-import-catalog-secret"), null, null, null, null));
+                client.post().uri("/api/sources").body(Map.of("id", "portable_input", "connector", "mongodb", "config", sourceSettings,
+                        "mode", "snapshot", "tables", List.of(Map.of("type", "literal", "name", "orders")))).retrieve().toBodilessEntity();
+                client.post().uri("/api/connections:discover-schema").body(Map.of("id", "portable_input", "connectorId", "mongodb", "settings", sourceSettings)).retrieve().toBodilessEntity();
+                client.post().uri("/api/pipelines").body(Map.of("id", "portable_flow", "sources", List.of(Map.of("id", "portable_input", "srs", false)),
+                        "settings", Map.of("readMode", "snapshot_only"), "serve", Map.of("id", "output", "from", "/.*/",
+                                "sync", List.of(Map.of("id", "copy", "source", "views", "onFullLoad", "clear"))))).retrieve().toBodilessEntity();
+                exported = client.post().uri("/api/configuration/export").body(Map.of("resourceIds", List.of("portable_flow", "secret_only"),
+                        "usernames", List.of(from.username()), "transferKey", key)).retrieve().body(Map.class);
+                assertThat(exported.get("defaultSourceId")).isEqualTo("views");
+                assertThat(io.tapstate.core.common.JsonWriter.write(exported)).doesNotContain(PASSWORD, key, "portable-password");
+            }
+            String prepared; String importId; Map<?,?> receipt;
+            try (var application = transferRoot(to)) {
+                var client = transferClient(application, to.username(), to.password());
+                assertThatThrownBy(() -> client.post().uri("/api/configuration/import/preflight").body(Map.of("transfer", exported.get("transfer"),
+                        "transferKey", key, "defaultSourceMapping", Map.of())).retrieve().toBodilessEntity())
+                        .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                assertThat(destinationConfig.getCollection("configuration_imports").countDocuments()).isZero();
+                var preflight = client.post().uri("/api/configuration/import/preflight").body(Map.of("transfer", exported.get("transfer"),
+                        "transferKey", key, "defaultSourceMapping", Map.of("views", "views"))).retrieve().body(Map.class);
+                prepared = (String)preflight.get("preparedTransfer");
+                importId = (String)((Map<?,?>)((Map<?,?>)preflight.get("operation")).get("ticket")).get("id");
+                assertThat(destinationConfig.getCollection("pipelines").countDocuments()).isZero();
+                var confirmation = Map.of("importId", importId, "transfer", prepared, "transferKey", key, "defaultSourceMapping", Map.of("views", "views"));
+                receipt = client.post().uri("/api/configuration/import/commit").body(confirmation).retrieve().body(Map.class);
+                var business = application.getBean(StorageRoot.class).runtime().business().orElseThrow();
+                var child = (ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(business, "context");
+                assertThat(child.getBean(io.tapstate.core.logging.SecretRedactor.class).redact("unique-import-catalog-secret")).isEqualTo("********");
+                assertThat(destinationConfig.getCollection("storage_binding").find().first()).isEqualTo(targetBinding);
+                assertThat(destinationConfig.getCollection("op_bootstrap").find().first()).isEqualTo(targetBootstrap);
+                assertThat(destinationConfig.getCollection("cluster_keys").find().first().getString("keyId")).isEqualTo(toKey);
+                String originalCipher = sourceConfig.getCollection("sources").find(new Document("_id", "portable_input")).first().get("body", Document.class).getString("config");
+                String destinationCipher = destinationConfig.getCollection("sources").find(new Document("_id", "portable_input")).first().get("body", Document.class).getString("config");
+                assertThat(originalCipher).contains(fromKey).doesNotContain(PASSWORD);
+                assertThat(destinationCipher).contains(toKey).doesNotContain(fromKey, PASSWORD).isNotEqualTo(originalCipher);
+                assertThat(admin.getDatabase(to.master()).getCollection("orders").countDocuments()).isZero();
+                assertThat(destinationConfig.getCollection("pipeline_desired").countDocuments()).isZero();
+                var importedClient = transferClient(application, from.username(), from.password());
+                var tested = importedClient.post().uri("/api/connections:test").body(Map.of("id", "portable_input", "connectorId", "mongodb", "settings", sourceSettings)).retrieve().body(Map.class);
+                assertThat(tested.get("outcome")).isEqualTo("PASSED");
+                importedClient.post().uri("/api/connections:discover-schema").body(Map.of("id", "portable_input", "connectorId", "mongodb", "settings", sourceSettings)).retrieve().toBodilessEntity();
+                importedClient.post().uri("/api/pipelines/portable_flow:start").retrieve().toBodilessEntity();
+                var target = admin.getDatabase(to.master()).getCollection("orders");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(target.countDocuments()).isEqualTo(2);
+                    assertThat(target.find(new Document("_id", 1)).first().getString("name")).isEqualTo("first");
+                    assertThat(((Number)target.find(new Document("_id", 2)).first().get("quantity")).longValue()).isEqualTo(19);
+                });
+                assertThat(admin.getDatabase(from.master()).getCollection("orders").find(new Document("_id", 999)).first()).isNotNull();
+                var definitions = application.getBean(StorageRoot.class).runtime().requireConfiguration().artifacts();
+                var previous = (SourceResource)definitions.get("portable_input").orElseThrow();
+                var changed = new SourceResource(previous.id(), new Metadata(Map.of(), "edited-after-import"), previous.connector(), previous.config(),
+                        previous.mode(), previous.tables(), previous.srs(), previous.execution(), previous.experimental());
+                definitions.save(changed);
+                assertThat(client.post().uri("/api/configuration/import/commit").body(confirmation).retrieve().body(Map.class)).isEqualTo(receipt);
+                assertThat(((SourceResource)definitions.get("portable_input").orElseThrow()).metadata().description()).isEqualTo("edited-after-import");
+            }
+            admin.getDatabase(to.cache()).drop();
+            try (var restarted = transferRoot(to)) {
+                var client = transferClient(restarted, from.username(), from.password());
+                assertThat(restarted.getBean(StorageRoot.class).runtime().business()).isEmpty();
+                var status = client.post().uri("/api/configuration/import/status").body(Map.of("importId", importId)).retrieve().body(Map.class);
+                assertThat(status.get("phase")).isEqualTo("COMMITTED"); assertThat(status.get("receipt")).isEqualTo(receipt);
+                assertThat(client.post().uri("/api/configuration/import/commit").body(Map.of("importId", importId, "transfer", prepared,
+                        "transferKey", key, "defaultSourceMapping", Map.of("views", "views"))).retrieve().body(Map.class)).isEqualTo(receipt);
+                assertThat(restarted.getBean(StorageRoot.class).runtime().business()).isEmpty();
+                assertThat(admin.getDatabase(to.cache()).listCollectionNames().into(new ArrayList<>())).doesNotContain("node_sessions", "pipeline_checkpoints");
+            }
+        }
+    }
+
+    private record TransferDeployment(String config, String cache, String master, String user, String username, String password) {}
+    private TransferDeployment seedTransferRoot(MongoClient admin, String name, String sourceDb, String username, String password) {
+        var deployment = new TransferDeployment("tx_config_" + name, "tx_cache_" + name, "tx_master_" + name, "tx_user_" + name, username, password);
+        createUser(admin, deployment.user(), List.of(deployment.config(), deployment.cache(), deployment.master(), sourceDb));
+        var setup = new StorageSetupScope("tx_" + name, "installation", "setup", 1);
+        var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, uri(deployment.user(), deployment.cache()), deployment.cache(), null);
+        try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(deployment.user(), deployment.config()), null, Duration.ofSeconds(5)),
+                setup.clusterId(), setup.installationId(), setup.operationId(), 1)) {
+            var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", uri(deployment.user(), deployment.master())), null, null, null, null);
+            var initial = configuration.bindings().commitWithFirstCache(setup, StorageBinding.Mode.OP, cache, target);
+            try (var cached = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(cache, Duration.ofSeconds(5), "transfer-fixture")) {
+                cached.prepareFirstAuth(initial.firstCreation().orElseThrow()); cached.prepareInitialBusiness(initial.preparation(), () -> {});
+            }
+            configuration.bindings().complete(setup);
+            configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(), new User(username, new BCryptPasswordHasher().hash(password), "admin"));
+        }
+        return deployment;
+    }
+    private ConfigurableApplicationContext transferRoot(TransferDeployment deployment) {
+        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0", "--logging.level.root=ERROR",
+                "--tapstate.hz.jet.cooperative-thread-count=2", "--SDK_STATUS_SENDER_ENABLED=false",
+                "--tapstate.store.mongo.uri=" + uri(deployment.user(), deployment.config()), "--tapstate.control.auth.jwt-secret=transfer-fixture-signing-secret",
+                "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(), "--tapstate.connectors.plugins-dir=" + work.resolve(deployment.config()));
+    }
+    private static org.springframework.web.client.RestClient transferClient(ConfigurableApplicationContext application, String username, String password) {
+        var client = rootClient(application);
+        var login = client.post().uri("/auth/login").body(Map.of("username", username, "password", password, "createSession", true))
+                .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
+        return client.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
+    }
+
     @Test void opInstallationRestartsCreatesItsFirstAdministratorAndCopiesRealSourceValues() throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String configDb = "op_config_" + suffix, cacheDb = "op_cache_" + suffix, masterDb = "op_master_" + suffix, sourceDb = "op_source_" + suffix;

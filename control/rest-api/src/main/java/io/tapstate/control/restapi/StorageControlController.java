@@ -44,6 +44,9 @@ class StorageControlController {
     @Verb("storage.recovery.status")
     @PostMapping("/storage/recovery/status")
     ResponseEntity<Map<String,Object>> storage_recovery_status(HttpServletRequest request) throws IOException { return invoke("storage.recovery.status", request); }
+    @Verb("configuration.export")
+    @PostMapping("/configuration/export")
+    ResponseEntity<Map<String,Object>> configuration_export(HttpServletRequest request) throws IOException { return invoke("configuration.export", request); }
     @Verb("configuration.import.preflight")
     @PostMapping("/configuration/import/preflight")
     ResponseEntity<Map<String,Object>> configuration_import_preflight(HttpServletRequest request) throws IOException { return invoke("configuration.import.preflight", request); }

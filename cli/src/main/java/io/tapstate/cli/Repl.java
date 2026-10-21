@@ -987,7 +987,7 @@ final class Repl {
         };
     }
     private int storageUsage() {
-        printDiagnostic(commandLine.getErr(), CliError.STORAGE_USAGE, Map.of("reason", "use storage <status|test|setup ACTION|recovery ACTION> or configuration import <preflight|commit|status>; supply one readable bounded JSON object with --file"));
+        printDiagnostic(commandLine.getErr(), CliError.STORAGE_USAGE, Map.of("reason", "use storage <status|test|setup ACTION|recovery ACTION> or configuration <export|import preflight|import commit|import status>; supply one readable bounded JSON object with --file"));
         return Cli.EXIT_USAGE;
     }
 

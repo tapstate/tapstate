@@ -52,6 +52,8 @@ public final class ArtifactQueryService {
         return store.get(id).map(AssemblyIdentity::of);
     }
 
+    public Optional<String> managedDefaultSourceId() { return store.managedDefaultSourceId(); }
+
     /** Lists every stored artifact, retaining rows whose stored body is unreadable. */
     public List<ArtifactListEntry> list() {
         return store.listStored().stream().map(this::view).toList();

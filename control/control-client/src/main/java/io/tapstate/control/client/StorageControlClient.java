@@ -8,7 +8,7 @@ import java.util.Set;
 public final class StorageControlClient {
     private StorageControlClient() {}
     public static final Set<String> OPERATIONS = Set.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status",
-            "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status", "configuration.import.preflight",
+            "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status", "configuration.export", "configuration.import.preflight",
             "configuration.import.commit", "configuration.import.status");
     public static String path(String operation) {
         if (!OPERATIONS.contains(operation)) throw new IllegalArgumentException("not a storage operation");

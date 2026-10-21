@@ -13,11 +13,6 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.StorageBinding;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -59,25 +54,11 @@ final class RegisteredMongoDefaultTarget implements StorageSetupService.DefaultT
         ConnectorProvisioner pinned = requested -> {
             if (!requested.equals(id(master))) throw unavailable(); return ref;
         };
-        var settings = new LinkedHashMap<>(source.config()); settings.remove(CA_BUNDLE);
-        Path directory = null, ca = null;
-        try {
-            if (master.caPem() != null) {
-                directory = Files.createTempDirectory("tapstate-storage-probe-", PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
-                ca = directory.resolve("ca.pem");
-                Files.createFile(ca, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
-                Files.writeString(ca, master.caPem(), StandardCharsets.UTF_8);
-                settings.put("ssl", true); settings.put("sslValidate", true); settings.put("sslCA", ca.toString());
-            }
-            var result = testers.apply(pinned).test(new ConnectionConfig(source.id(), source.connector(), settings));
+        try (var material = io.tapstate.adapters.pdk.ConnectorTrustMaterial.open(source.connector(), source.config())) {
+            var result = testers.apply(pinned).test(new ConnectionConfig(source.id(), source.connector(), material.settings()));
             if (result.outcome() != ConnectionTestResult.Outcome.PASSED || result.items().isEmpty())
                 throw new TapstateException(ControlError.STORAGE_TEST_FAILED, Map.of("layer", "MASTER", "causeCode", io.tapstate.adapters.pdk.ConnectorError.TEST_FAILED.code()), null);
             if (!identity(master).equals(original)) throw unavailable();
-        } catch (IOException | UnsupportedOperationException failed) {
-            throw unavailable();
-        } finally {
-            try { if (ca != null) Files.deleteIfExists(ca); if (directory != null) Files.deleteIfExists(directory); }
-            catch (IOException unknownCleanup) { throw unavailable(); }
         }
     }
     private static String id(StorageBinding.Connection input) { return input.kind() == StorageBinding.Connection.Kind.ATLAS ? "mongodb-atlas" : "mongodb"; }

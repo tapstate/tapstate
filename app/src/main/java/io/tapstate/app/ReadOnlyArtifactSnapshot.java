@@ -11,10 +11,12 @@ import java.util.Optional;
 /** One immutable artifact-store reading used throughout a single pipeline start attempt. */
 final class ReadOnlyArtifactSnapshot implements ArtifactStore {
 
+    private final Optional<String> managedDefault;
     private final List<String> canonical;
     private final Map<String, String> byId;
 
-    private ReadOnlyArtifactSnapshot(List<Resource> resources) {
+    private ReadOnlyArtifactSnapshot(List<Resource> resources, Optional<String> managedDefault) {
+        this.managedDefault = managedDefault;
         var encoded = new java.util.ArrayList<String>();
         Map<String, String> indexed = new LinkedHashMap<>();
         var writer = new io.tapstate.core.model.canonical.CanonicalWriter();
@@ -31,7 +33,7 @@ final class ReadOnlyArtifactSnapshot implements ArtifactStore {
     }
 
     static ReadOnlyArtifactSnapshot capture(ArtifactStore source) {
-        return new ReadOnlyArtifactSnapshot(Objects.requireNonNull(source, "source").list());
+        return new ReadOnlyArtifactSnapshot(Objects.requireNonNull(source, "source").list(), source.managedDefaultSourceId());
     }
 
     /** Overlays one validated candidate closure without mutating the underlying artifact store. */
@@ -41,8 +43,10 @@ final class ReadOnlyArtifactSnapshot implements ArtifactStore {
         Map<String, Resource> merged = new LinkedHashMap<>();
         source.list().forEach(resource -> merged.put(resource.id(), resource));
         overrides.forEach(resource -> merged.put(resource.id(), resource));
-        return new ReadOnlyArtifactSnapshot(List.copyOf(merged.values()));
+        return new ReadOnlyArtifactSnapshot(List.copyOf(merged.values()), source.managedDefaultSourceId());
     }
+
+    @Override public Optional<String> managedDefaultSourceId() { return managedDefault; }
 
     @Override
     public void saveAll(List<Resource> artifacts) {

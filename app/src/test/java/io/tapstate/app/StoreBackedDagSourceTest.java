@@ -559,6 +559,21 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void aBoundDefaultTargetCannotBeRedirectedByAnAuthoredStoreLabel() {
+        for (String bound : List.of("views", "atlas-store")) {
+            FakeStorePort store = seededViewPipeline();
+            store.artifacts.managedDefault = bound;
+            store.artifacts().save(connectionSupplier(bound));
+            store.artifacts().save(new SourceResource("forged", new io.tapstate.core.model.Metadata(Map.of("store", "true"), null),
+                    "mongodb", Map.of("uri", "mongodb://forged/other"), null, null, null, null));
+            List<String> reached = new ArrayList<>();
+            var source = new StoreBackedDagSource(store, (id, connector, settings) -> reached.add(id));
+            source.dagFor("p");
+            assertThat(reached).containsExactly(bound);
+        }
+    }
+
+    @Test
     void a_declared_view_materializes_into_the_managed_state_store() {
         // No serve block anywhere: declaring the view is the whole instruction, and the store it lands
         // in is the deployment's own rather than anything the pipeline names.
@@ -1323,6 +1338,8 @@ class StoreBackedDagSourceTest {
 
     /** In-memory artifact store keyed by top-level id; the other sub-stores are not exercised. */
     private static final class FakeArtifactStore implements ArtifactStore {
+        private String managedDefault;
+        @Override public Optional<String> managedDefaultSourceId() { return Optional.ofNullable(managedDefault); }
 
         private final Map<String, Resource> byId = new LinkedHashMap<>();
 

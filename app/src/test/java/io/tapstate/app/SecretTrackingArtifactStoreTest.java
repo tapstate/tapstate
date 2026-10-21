@@ -16,6 +16,38 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class SecretTrackingArtifactStoreTest {
 
+    @Test void productionReadDecorationPreservesManagedTargetAuthority() {
+        var delegate = new RecordingStore(); delegate.managed = "views";
+        delegate.save(new SourceResource("views", null, "mongodb", Map.of("uri", "mongodb://host/master"), null, null, null, null));
+        var decorated = tracking(delegate, new SecretRedactor());
+        var query = new io.tapstate.control.core.ArtifactQueryService(decorated);
+        assertThat(query.managedDefaultSourceId()).contains("views");
+        var sources = new io.tapstate.control.core.SourceProjectionService(org.mockito.Mockito.mock(io.tapstate.control.core.ApplyService.class), query,
+                org.mockito.Mockito.mock(io.tapstate.control.core.ArtifactMutationService.class), new io.tapstate.control.core.SourceRepresentation(TapstateCatalog::load));
+        assertThat(sources.get("views").metadata().labels()).containsEntry("store", "true");
+        var apply = new io.tapstate.control.core.ApplyService(TapstateCatalog::load, decorated,
+                new io.tapstate.control.core.AuditGate(record -> {}, java.time.Clock.systemUTC()), org.mockito.Mockito.mock(io.tapstate.spi.store.SchemaStore.class),
+                io.tapstate.control.core.PlanAdvisories.none(), io.tapstate.control.core.SchemaDerivation.none());
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> apply.planPreviewWorkspace(List.of(new io.tapstate.control.core.ArtifactDraft(null,
+                "version: tapstate/v1\nkind: pipeline\nid: p\nsource: views\nview: {from: orders, primary_key: id}\n"))))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(io.tapstate.control.core.ControlError.MALFORMED_REQUEST));
+    }
+
+    @Test void readingANativelyPublishedSourceRegistersSecretsBeforePipelineLogging() {
+        var delegate = new RecordingStore(); var redactor = new SecretRedactor();
+        var decorated = tracking(delegate, redactor);
+        delegate.save(source("imported", "imported-catalog-secret"));
+        decorated.get("imported").orElseThrow();
+        var sink = new io.tapstate.core.logging.RingBufferLogSink(8, 8);
+        var event = org.mockito.Mockito.mock(ch.qos.logback.classic.spi.ILoggingEvent.class);
+        org.mockito.Mockito.when(event.getMDCPropertyMap()).thenReturn(Map.of("pipeline_id", "p"));
+        org.mockito.Mockito.when(event.getLevel()).thenReturn(ch.qos.logback.classic.Level.INFO);
+        org.mockito.Mockito.when(event.getFormattedMessage()).thenReturn("connector emitted imported-catalog-secret");
+        new PipelineLogAppender(sink, redactor).append(event);
+        assertThat(sink.tail("p")).extracting(io.tapstate.core.logging.LogLine::message).containsExactly("connector emitted ********");
+    }
+
     @Test void managedTrustBundleLinesAreTrackedForPlainAndStructuredLogs() {
         var redactor = new SecretRedactor(); var store = tracking(new RecordingStore(), redactor);
         String ca = "-----BEGIN CERTIFICATE-----\nsentinel-certificate-body\n-----END CERTIFICATE-----";
@@ -108,6 +140,8 @@ class SecretTrackingArtifactStoreTest {
     }
 
     private static final class RecordingStore implements ArtifactStore {
+        String managed;
+        @Override public Optional<String> managedDefaultSourceId() { return Optional.ofNullable(managed); }
 
         private final Map<String, Resource> resources = new LinkedHashMap<>();
 

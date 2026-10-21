@@ -84,6 +84,10 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         this.mappings = durable(SystemCollections.OPERATOR_GENERATIONS.on(database));
     }
 
+    @Override public Optional<String> managedDefaultSourceId() {
+        return bindings.load().map(io.tapstate.spi.store.StorageBinding::defaultSourceId);
+    }
+
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {
         return collection.withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));

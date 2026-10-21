@@ -22,7 +22,9 @@ class StorageCommandsTest {
             assertThat(exchange.getRequestMethod()).isEqualTo("POST");
             assertThat(exchange.getRequestHeaders().getFirst("Authorization")).isEqualTo("Bearer machine-sentinel");
             bodies.add(JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(),java.nio.charset.StandardCharsets.UTF_8)));
-            byte[] result = "{\"operationId\":\"original\",\"phase\":\"CONFIRMED\"}".getBytes();
+            byte[] result = (exchange.getRequestURI().getPath().equals("/api/configuration/export")
+                    ? "{\"transfer\":\"opaque-ciphertext\",\"defaultSourceId\":\"views\"}"
+                    : "{\"operationId\":\"original\",\"phase\":\"CONFIRMED\"}").getBytes();
             exchange.sendResponseHeaders(200,result.length); try(var out=exchange.getResponseBody()) { out.write(result); }
         }); server.start();
         try (var client = new HttpControlPlaneClient()) {
@@ -33,9 +35,14 @@ class StorageCommandsTest {
             repl.dispatch("configuration import commit --file request.json");
             assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_OK); assertThat(paths).containsExactly("/api/configuration/import/commit");
             assertThat(output.toString()).doesNotContain("sentinel-secret","machine-sentinel"); assertThat(bodies).hasSize(1);
+            String transferKey = "A".repeat(43);
+            Files.writeString(work.resolve("export.json"), io.tapstate.core.common.JsonWriter.write(Map.of("resourceIds", List.of("flow"), "usernames", List.of(), "transferKey", transferKey)));
+            repl.dispatch("configuration export --file export.json");
+            assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_OK); assertThat(paths.getLast()).isEqualTo("/api/configuration/export");
+            assertThat(output.toString()).contains("opaque-ciphertext").doesNotContain(transferKey);
             repl.dispatch("storage status"); assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_OK);
             repl.dispatch("storage test mongodb://sentinel-secret"); assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
-            assertThat(calls).hasValue(2); assertThat(output.toString()).contains("cli.storage-usage").doesNotContain("sentinel-secret");
+            assertThat(calls).hasValue(3); assertThat(output.toString()).contains("cli.storage-usage").doesNotContain("sentinel-secret");
         } finally { server.stop(0); }
     }
     @Test void anUnknownWriteResultIsNotRetriedAgainstTheSameOrAnotherMember(@TempDir Path work) throws Exception {

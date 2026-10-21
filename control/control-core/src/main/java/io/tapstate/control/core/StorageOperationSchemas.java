@@ -12,6 +12,7 @@ final class StorageOperationSchemas {
             Map.entry("storage.setup.commit", "StorageSetupCommit"), Map.entry("storage.setup.status", "StorageSetupStatus"),
             Map.entry("storage.recovery.plan", "StorageRecoveryPlan"), Map.entry("storage.recovery.confirm", "StorageRecoveryConfirm"),
             Map.entry("storage.recovery.status", "StorageRecoveryStatus"),
+            Map.entry("configuration.export", "ConfigurationExport"),
             Map.entry("configuration.import.preflight", "ConfigurationImportPreflight"),
             Map.entry("configuration.import.commit", "ConfigurationImportCommit"), Map.entry("configuration.import.status", "ConfigurationImportStatus"));
     static Map<String,Object> definitions() {
@@ -23,6 +24,8 @@ final class StorageOperationSchemas {
         var stamps = object(List.of("CONFIG", "CACHE", "MASTER"), Map.of("CONFIG", text(), "CACHE", text(), "MASTER", text()));
         var transfer = Map.<String,Object>of("type", "string", "minLength", 1,
                 "description", "Opaque versioned encrypted transfer package; plaintext definitions are not accepted.");
+        var transferKey = Map.<String,Object>of("type", "string", "minLength", 43, "maxLength", 43, "pattern", "^[A-Za-z0-9_-]{43}$",
+                "description", "Caller-supplied unpadded base64url encoding of an independent 32-byte key; never stored or returned.");
         defs.put("StorageStatusRequest", object(List.of(), Map.of()));
         defs.put("StorageTestRequest", object(List.of("operationId", "generation", "candidate", "layer"), Map.of(
                 "operationId", text(), "generation", positive(), "candidate", candidate, "layer", choice("CONFIG", "CACHE", "MASTER"))));
@@ -35,10 +38,15 @@ final class StorageOperationSchemas {
                 "operationId", text(), "planHash", text(), "controlRevision", positive(),
                 "confirmed", Map.of("type", "boolean", "const", true))));
         defs.put("StorageRecoveryStatusRequest", operation());
+        defs.put("ConfigurationExportRequest", object(List.of("resourceIds", "usernames", "transferKey"), Map.of(
+                "resourceIds", Map.of("type", "array", "items", text(), "maxItems", 64),
+                "usernames", Map.of("type", "array", "items", text(), "maxItems", 64), "transferKey", transferKey)));
+        defs.put("ConfigurationExportResult", object(List.of("transfer", "defaultSourceId"), Map.of(
+                "transfer", transfer, "defaultSourceId", Map.of("anyOf", List.of(text(), Map.of("type", "null"))))));
         defs.put("ConfigurationImportPreflightRequest", object(List.of("transfer", "transferKey", "defaultSourceMapping"), Map.of(
-                "transfer", transfer, "transferKey", text(), "defaultSourceMapping", stringMap())));
+                "transfer", transfer, "transferKey", transferKey, "defaultSourceMapping", stringMap())));
         defs.put("ConfigurationImportCommitRequest", object(List.of("importId", "transfer", "transferKey", "defaultSourceMapping"), Map.of(
-                "importId", text(), "transfer", transfer, "transferKey", text(), "defaultSourceMapping", stringMap())));
+                "importId", text(), "transfer", transfer, "transferKey", transferKey, "defaultSourceMapping", stringMap())));
         defs.put("ConfigurationImportStatusRequest", object(List.of("importId"), Map.of("importId", text())));
         var setupStatus = object(List.of("mode", "clusterId", "operationId", "generation", "setupPhase", "bindingVersion"), Map.of(
                 "mode", choice("CLOUD", "OP"), "clusterId", text(), "operationId", text(), "generation", positive(),

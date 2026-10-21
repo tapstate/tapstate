@@ -114,6 +114,7 @@ public final class ControlOperations {
     public static final Operation STORAGE_RECOVERY_PLAN = storage("storage.recovery.plan", Scope.WRITE, true);
     public static final Operation STORAGE_RECOVERY_CONFIRM = storage("storage.recovery.confirm", Scope.WRITE, true);
     public static final Operation STORAGE_RECOVERY_STATUS = storage("storage.recovery.status", Scope.READ, false);
+    public static final Operation CONFIGURATION_EXPORT = storage("configuration.export", Scope.WRITE, true);
     public static final Operation CONFIGURATION_IMPORT_PREFLIGHT = storage("configuration.import.preflight", Scope.WRITE, true);
     public static final Operation CONFIGURATION_IMPORT_COMMIT = storage("configuration.import.commit", Scope.WRITE, true);
     public static final Operation CONFIGURATION_IMPORT_STATUS = storage("configuration.import.status", Scope.READ, false);
@@ -375,7 +376,7 @@ public final class ControlOperations {
             STATE_STORE_CONNECT,
             STORAGE_STATUS, STORAGE_TEST, STORAGE_SETUP_COMMIT, STORAGE_SETUP_STATUS,
             STORAGE_RECOVERY_PLAN, STORAGE_RECOVERY_CONFIRM, STORAGE_RECOVERY_STATUS,
-            CONFIGURATION_IMPORT_PREFLIGHT, CONFIGURATION_IMPORT_COMMIT, CONFIGURATION_IMPORT_STATUS,
+            CONFIGURATION_EXPORT, CONFIGURATION_IMPORT_PREFLIGHT, CONFIGURATION_IMPORT_COMMIT, CONFIGURATION_IMPORT_STATUS,
             CONNECTION_TEST,
             CONNECTION_TEST_RESULT,
             CONNECTION_DISCOVER_SCHEMA,

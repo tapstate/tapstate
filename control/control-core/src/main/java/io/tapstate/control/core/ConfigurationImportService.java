@@ -36,13 +36,32 @@ public final class ConfigurationImportService {
 
     private final ConfigurationImportStore imports;
     private final TransferCodec transfer;
-    private final ApplyService validation;
+    private final java.util.function.Supplier<ApplyService> validation;
     private final AuditGate audit;
+    private final java.util.function.Consumer<java.util.Set<String>> published;
+    private final java.util.function.Function<String, java.util.Optional<Resource>> destination;
     private final CanonicalWriter writer = new CanonicalWriter();
     private final DslParser parser = new DslParser();
 
     public ConfigurationImportService(ConfigurationImportStore imports, TransferCodec transfer,
             ApplyService validation, AuditGate audit) {
+        this(imports, transfer, validation, audit, id -> java.util.Optional.empty());
+    }
+    public ConfigurationImportService(ConfigurationImportStore imports, TransferCodec transfer,
+            ApplyService validation, AuditGate audit, java.util.function.Function<String, java.util.Optional<Resource>> destination) {
+        this(imports, transfer, () -> validation, audit, destination);
+    }
+    public ConfigurationImportService(ConfigurationImportStore imports, TransferCodec transfer,
+            java.util.function.Supplier<ApplyService> validation, AuditGate audit,
+            java.util.function.Function<String, java.util.Optional<Resource>> destination) {
+        this(imports, transfer, validation, audit, destination, ids -> {});
+    }
+    public ConfigurationImportService(ConfigurationImportStore imports, TransferCodec transfer,
+            java.util.function.Supplier<ApplyService> validation, AuditGate audit,
+            java.util.function.Function<String, java.util.Optional<Resource>> destination,
+            java.util.function.Consumer<java.util.Set<String>> published) {
+        this.published = Objects.requireNonNull(published, "published");
+        this.destination = Objects.requireNonNull(destination, "destination");
         this.imports = Objects.requireNonNull(imports, "imports"); this.transfer = Objects.requireNonNull(transfer, "transfer");
         this.validation = Objects.requireNonNull(validation, "validation"); this.audit = Objects.requireNonNull(audit, "audit");
     }
@@ -55,7 +74,7 @@ public final class ConfigurationImportService {
         var attributed = decoded.resources().stream().map(resource -> attribution.attribute(subject, resource, null)).toList();
         var validationPlan = validate(attributed);
         var prepared = new Payload(validationPlan.artifacts().stream().map(PreparedArtifact::resource).toList(),
-                decoded.users(), decoded.layouts(), validationPlan.workspacePreconditions(), decoded.defaultSourceMapping());
+                decoded.users(), decoded.layouts(), references(validationPlan, decoded.defaultSourceMapping()), decoded.defaultSourceMapping());
         // Seal before admission so a codec failure never leaves a preflight the caller cannot confirm.
         String confirmation = transfer.seal(prepared, submission.transferKey());
         active.run();
@@ -76,10 +95,13 @@ public final class ConfigurationImportService {
             return guarded.commit(original.ticket(), prepared);
         if (original.phase() == ConfigurationImportStore.Phase.PENDING) {
             var current = validate(prepared.resources());
-            if (!current.workspacePreconditions().equals(prepared.referenceHashes())) throw refused("destination-changed");
+            if (!references(current, prepared.defaultSourceMapping()).equals(prepared.referenceHashes())) throw refused("destination-changed");
         }
-        return audit.dispatch(ControlOperations.CONFIGURATION_IMPORT_COMMIT,
+        var receipt = audit.dispatch(ControlOperations.CONFIGURATION_IMPORT_COMMIT,
                 new AuditContext(subject, originalId), () -> guarded.commit(original.ticket(), prepared));
+        // This observes confirmed publication only. Original committed-result retries above stay CONFIG-only.
+        published.accept(receipt.resourceHashes().keySet());
+        return receipt;
     }
 
     /** An unknown or expired original id is a result view, never an invitation to register another import. */
@@ -112,10 +134,22 @@ public final class ConfigurationImportService {
         return new Payload(resources, decoded.users(), decoded.layouts(), decoded.referenceHashes(), decoded.defaultSourceMapping());
     }
 
+    private Map<String,String> references(ApplyPlan plan, Map<String,String> mapping) {
+        var result = new java.util.TreeMap<>(plan.workspacePreconditions());
+        for (String target : mapping.values()) {
+            var resource = destination.apply(target).orElseThrow(() -> refused("default-target-unavailable"));
+            if (!(resource instanceof io.tapstate.core.model.SourceResource)) throw refused("default-target-unavailable");
+            String hash = io.tapstate.core.model.canonical.CanonicalHash.of(resource);
+            String prior = result.putIfAbsent(target, hash);
+            if (prior != null && !prior.equals(hash)) throw refused("destination-changed");
+        }
+        return result;
+    }
+
     private ApplyPlan validate(List<Resource> resources) {
         if (resources.isEmpty()) return new ApplyPlan(List.of());
         try {
-            return validation.planPreviewWorkspace(resources.stream()
+            return validation.get().planPreviewWorkspace(resources.stream()
                     .map(resource -> new ArtifactDraft(null, writer.write(resource))).toList()).plan();
         } catch (io.tapstate.core.dsl.DslException invalid) {
             // Validation may name a supplied config value. Neither decrypted values nor nested causes

@@ -96,7 +96,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
 
     private void preparePipeline(PipelineIntentScope scope) {
         original.requireBusiness();
-        var snapshot = ReadOnlyArtifactSnapshot.capture(configuration.artifacts());
+        var snapshot = ReadOnlyArtifactSnapshot.capture(context.getBean(ArtifactStore.class));
         var authored = StoredArtifacts.requirePipeline(snapshot, scope.pipelineId());
         var expanded = PipelineInlining.inline(authored, snapshot);
         var sources = new LinkedHashMap<String,SourceResource>();
@@ -140,6 +140,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     @Override public boolean available() {
         return active.get() && memberStorage != null && memberStorage.nodeActive()
                 && context.getBean(ClusterMembershipGate.class).businessEligible();
+    }
+    void refreshImportedSecrets(Set<String> ids) {
+        if (!active.get()) return;
+        var artifacts = context.getBean(ArtifactStore.class);
+        if (!(artifacts instanceof SecretTrackingArtifactStore tracked)) throw new IllegalStateException("native artifact tracking is not installed");
+        tracked.refreshLoaded(ids);
+    }
+    ApplyService importValidation() {
+        if (!available()) throw StorageRuntime.unavailable();
+        return context.getBean(ApplyService.class);
     }
     StorePort statusStore() { if (!available()) throw StorageRuntime.unavailable(); return port; }
     @Override public HandlerExecutionChain handlerFor(HttpServletRequest request) throws Exception {
@@ -256,10 +266,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     environment.getProperty("tapstate.execution.max-blocking-processors-per-member", Integer.class, 128));
         }
         @Bean DagSource dagSource(NativeBusinessContext owner, NestSettings nests, ConnectionTester tester, HazelcastInstance member,
-                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors) {
+                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts) {
             return StoreBackedDagSource.scopedRoot(owner.port, nests, StoreReachability.probing(tester, Duration.ofSeconds(10)),
                     SourcePlacement.on(member.getCluster().getLocalMember().getAddress()), cloud.cloud(),
-                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors);
+                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts);
         }
         @Bean(destroyMethod = "close") BoundedPipelinePreviewExecutor boundedPipelinePreviewExecutor(StorePort store, ConnectorProvisioner connectors,
                 HazelcastInstance member, NestSettings nests, Clock clock) {

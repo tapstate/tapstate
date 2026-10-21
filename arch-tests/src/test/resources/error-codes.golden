@@ -170,6 +170,8 @@ connector.spec-not-found
 connector.state-unreadable
 connector.state-value-unsupported
 connector.test-failed
+connector.tls-material-cleanup-failed
+connector.tls-trust-invalid
 connector.write-failed
 control.audit-blocked
 control.auth-failed

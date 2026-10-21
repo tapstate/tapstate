@@ -41,18 +41,25 @@ public final class StorageControlDispatcher {
     private final java.util.function.Supplier<StorageRecoveryService> recoveries;
     private final java.util.function.Supplier<ConfigurationImportService> importers;
     private final Snapshots snapshots;
+    private final java.util.function.Supplier<ConfigurationExportService> exporters;
     public StorageControlDispatcher(OperationRegistry operations, StorageSetupService setup, StorageRecoveryService recovery,
             ConfigurationImportService imports, Snapshots snapshots) {
-        this(operations, constant(setup), constant(recovery), constant(imports), snapshots);
+        this(operations, constant(setup), constant(recovery), constant(imports), () -> null, snapshots);
     }
     public static StorageControlDispatcher staged(OperationRegistry operations, java.util.function.Supplier<StorageSetupService> setups,
             java.util.function.Supplier<StorageRecoveryService> recoveries,
             java.util.function.Supplier<ConfigurationImportService> importers, Snapshots snapshots) {
-        return new StorageControlDispatcher(operations, setups, recoveries, importers, snapshots);
+        return new StorageControlDispatcher(operations, setups, recoveries, importers, () -> null, snapshots);
+    }
+    public static StorageControlDispatcher staged(OperationRegistry operations, java.util.function.Supplier<StorageSetupService> setups,
+            java.util.function.Supplier<StorageRecoveryService> recoveries, java.util.function.Supplier<ConfigurationImportService> importers,
+            java.util.function.Supplier<ConfigurationExportService> exporters, Snapshots snapshots) {
+        return new StorageControlDispatcher(operations, setups, recoveries, importers, exporters, snapshots);
     }
     private StorageControlDispatcher(OperationRegistry operations, java.util.function.Supplier<StorageSetupService> setups,
             java.util.function.Supplier<StorageRecoveryService> recoveries,
-            java.util.function.Supplier<ConfigurationImportService> importers, Snapshots snapshots) {
+            java.util.function.Supplier<ConfigurationImportService> importers, java.util.function.Supplier<ConfigurationExportService> exporters, Snapshots snapshots) {
+        this.exporters = Objects.requireNonNull(exporters, "exporters");
         this.operations = Objects.requireNonNull(operations, "operations"); this.setups = Objects.requireNonNull(setups, "setups");
         this.recoveries = Objects.requireNonNull(recoveries, "recoveries"); this.importers = Objects.requireNonNull(importers, "importers");
         this.snapshots = Objects.requireNonNull(snapshots, "snapshots");
@@ -113,6 +120,14 @@ public final class StorageControlDispatcher {
                 input.only("operationId"); String id = input.uuid("operationId");
                 yield available(recoveries).status(caller.cache(), active, id).map(StorageControlDispatcher::recovery)
                         .orElseGet(() -> Map.of("operationId", id, "phase", "UNKNOWN"));
+            }
+            case "configuration.export" -> {
+                input.only("resourceIds", "usernames", "transferKey");
+                var ids = input.ids("resourceIds"); var usernames = input.ids("usernames");
+                if (ids.size() + usernames.size() < 1 || ids.size() + usernames.size() > ConfigurationImportStore.MAX_OBJECTS) throw malformed();
+                var exported = available(exporters).export(caller.subject(), caller.importScope(), active,
+                        new io.tapstate.spi.store.ConfigurationExportStore.Selection(ids, usernames), input.text("transferKey", 4096));
+                var out = new LinkedHashMap<String,Object>(); out.put("transfer", exported.transfer()); out.put("defaultSourceId", exported.defaultSourceId()); yield out;
             }
             case "configuration.import.preflight" -> {
                 input.only("transfer", "transferKey", "defaultSourceMapping");
