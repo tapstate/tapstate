@@ -201,7 +201,7 @@ def run_shard(args, root, plan):
             shutil.rmtree(target / directory, ignore_errors=True)
         for filename in ['jacoco.exec', 'jacoco-it.exec']:
             (target / filename).unlink(missing_ok=True)
-    command = ['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
+    command = ['mvn', '-B', '-Dapi.version=1.44', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
     for kind, flag in [('unit', 'test'), ('it', 'it.test')]:
         names = sorted({t['class'] for t in shard['tests'] if t['kind'] == kind})
         command.append('-D' + flag + '=' + (','.join(names) if names else '__ci_shard_no_tests__'))

@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (root/'bin/mvn').chmod(0o755)
     subprocess.run([os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')],check=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']})
     args=(root/'mvn-args').read_text().splitlines(); assert '-am' not in args and 'verify' in args and '-pl' in args
+    assert '-Dapi.version=1.44' in args, 'Docker 29 requires a supported Testcontainers API version'
     assert any(a.startswith('-Dtest=') and all(name in a for name in ['FixedSleepGateTest','ErrorCodeGatesTest','NestStateSerialFormGatesTest']) for a in args)
     assert set(args[args.index('-pl')+1].split(','))=={'arch-tests', 'core', 'e2e'}, 'source-scanning gates must run in their owning modules'
     # A custom Maven selector must not disappear from both sides of admission.
