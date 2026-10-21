@@ -31,6 +31,9 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.context.support.GenericApplicationContext;
 
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -39,6 +42,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -49,6 +54,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -452,6 +458,88 @@ class CloudSeedStoreWitnessTest {
         assertThat(JsonWriter.write(f.events)).doesNotContain(SENTINEL);
     }
 
+    @Test
+    void everyActualLegacyConstructorRemainsIneligibleWhenTheNewFlagIsOn() throws IOException {
+        String previous = System.getProperty(CloudStartupDerivationWitness.REGISTRY_INSERT_REFUSAL_PROPERTY);
+        System.setProperty(CloudStartupDerivationWitness.REGISTRY_INSERT_REFUSAL_PROPERTY, "true");
+        try {
+            List<BiFunction<Path, Consumer<Map<String, Object>>, CloudStartupDerivationWitness>> constructors = List.of(
+                    (path, out) -> new CloudStartupDerivationWitness(event -> {}),
+                    (path, out) -> new CloudStartupDerivationWitness(event -> {}, out),
+                    (path, out) -> new CloudStartupDerivationWitness(event -> {}, out, path),
+                    (path, out) -> new CloudStartupDerivationWitness(event -> {}, out, path, true),
+                    (path, out) -> new CloudStartupDerivationWitness(event -> {}, out, path, true, true));
+            for (int i = 0; i < constructors.size(); i++) {
+                Fixture f = new Fixture(Files.createDirectory(directory.resolve("legacy" + i)), constructors.get(i));
+                CommandListener listener = listener(f);
+                MongoCommandException driver = commandFailure(8000);
+                doAnswer(call -> { listener.commandFailed(driverFailure("insert", driver)); throw f.failure; })
+                        .when(f.registry).register(eq("mysql"), eq("api"), eq(RegistrationSource.SEED), any(byte[].class));
+                assertThatThrownBy(f::seed).isSameAs(f.failure);
+                verify(driver, never()).getErrorMessage();
+                assertThat(f.events).allSatisfy(e -> assertThat(e).doesNotContainKey("registry_insert_refusal_category"));
+            }
+        } finally {
+            restoreProperty(CloudStartupDerivationWitness.REGISTRY_INSERT_REFUSAL_PROPERTY, previous);
+        }
+    }
+
+    @Test
+    void theRealInitializerRequiresBothTheApprovedEntryAndAnExplicitTrueProperty() throws IOException {
+        String property = CloudStartupDerivationWitness.REGISTRY_INSERT_REFUSAL_PROPERTY;
+        String previous = System.getProperty(property);
+        PrintStream original = System.out;
+        try (var inputs = mockStatic(CloudConnectorTestInputs.class)) {
+            int scenario = 0;
+            for (boolean approvedEntry : new boolean[] {false, true}) {
+                for (String enabled : new String[] {null, "false", "true"}) {
+                    restoreProperty(property, enabled);
+                    Path folder = Files.createDirectory(directory.resolve("entry" + scenario++));
+                    inputs.when(CloudConnectorTestInputs::seedDirectory).thenReturn(folder);
+                    ByteArrayOutputStream captured = new ByteArrayOutputStream();
+                    try (PrintStream output = new PrintStream(captured, true, StandardCharsets.UTF_8)) {
+                        System.setOut(output);
+                        Fixture f = new Fixture(folder, (path, out) -> approvedEntry
+                                ? CloudStartupDerivationWitness.realManagedStartupInitializer()
+                                : CloudStartupDerivationWitness.initializer());
+                        CommandListener listener = listener(f);
+                        MongoCommandException driver = commandFailure(8000);
+                        when(driver.getErrorMessage()).thenReturn(SENTINEL);
+                        doAnswer(call -> {
+                            listener.commandFailed(driverFailure("insert", driver));
+                            listener.commandFailed(driverFailure("insert", driver));
+                            throw f.failure;
+                        }).when(f.registry).register(eq("mysql"), eq("api"), eq(RegistrationSource.SEED), any(byte[].class));
+                        assertThatThrownBy(f::seed).isSameAs(f.failure);
+                        if (approvedEntry && "true".equals(enabled)) {
+                            verify(driver).getErrorMessage();
+                            assertThat(captured.toString(StandardCharsets.UTF_8)).contains(
+                                    "registry_insert_refusal_category", "UNCLASSIFIED");
+                        } else {
+                            verify(driver, never()).getErrorMessage();
+                            assertThat(captured.toString(StandardCharsets.UTF_8))
+                                    .doesNotContain("registry_insert_refusal_category");
+                        }
+                        verify(driver, never()).getMessage();
+                        verify(driver, never()).getCause();
+                        verify(driver, never()).getResponse();
+                        assertThat(captured.toString(StandardCharsets.UTF_8)).doesNotContain(SENTINEL, folder.toString());
+                    } finally {
+                        System.setOut(original);
+                    }
+                }
+            }
+        } finally {
+            System.setOut(original);
+            restoreProperty(property, previous);
+        }
+    }
+
+    private static void restoreProperty(String key, String value) {
+        if (value == null) System.clearProperty(key);
+        else System.setProperty(key, value);
+    }
+
     private static CommandListener listener(Fixture f) {
         AtomicReference<CommandListener> captured = new AtomicReference<>();
         try (var scope = f.witness.observeClientCreation()) {
@@ -511,14 +599,19 @@ class CloudSeedStoreWitnessTest {
         }
 
         private Fixture(Path directory, boolean classify) throws IOException {
-            this(directory, classify, false, null);
+            this(directory, (path, out) -> new CloudStartupDerivationWitness(event -> {}, out, path, classify));
         }
 
         private Fixture(Path directory, boolean classify, boolean classifyInsert,
                 CloudRegistryInsertRefusalClassifier.Entry entry) throws IOException {
+            this(directory, (path, out) -> new CloudStartupDerivationWitness(event -> {}, out, path, classify,
+                    false, classifyInsert, entry));
+        }
+
+        private Fixture(Path directory,
+                BiFunction<Path, Consumer<Map<String, Object>>, CloudStartupDerivationWitness> factory) throws IOException {
             artifact = Files.write(directory.resolve("mysql-connector.jar"), new byte[] {4, 7});
-            witness = new CloudStartupDerivationWitness(event -> {}, events::add, artifact, classify,
-                    false, classifyInsert, entry);
+            witness = factory.apply(artifact, events::add);
             observedRegistry = witness.observe(registry);
             observedSpecs = witness.observe(specs);
             observedCatalog = witness.observe(catalog);
