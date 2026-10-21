@@ -38,6 +38,9 @@ actuation.view-store-unreachable
 alert.channel-not-accepted
 alert.channel-result-unknown
 alert.channel-unavailable
+alert.command-conflict
+alert.command-expired
+alert.command-not-yet-valid
 alert.invalid-configuration
 alert.stale-action
 artifact.in-use

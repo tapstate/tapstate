@@ -1080,3 +1080,13 @@ alert.channel-result-unknown:
 alert.channel-unavailable:
   message: "The notification channel `{channel}` is unavailable at stage `{phase}`."
   solution: "Restore the required capability or bounded capacity without changing the original delivery identity."
+
+alert.command-conflict:
+  message: "The notification test command was already accepted with different parameters."
+  solution: "Query the original command. Use a new command only for another explicit test."
+alert.command-expired:
+  message: "The notification test command's first-admission window has expired."
+  solution: "Query the original result if it exists. Create a new command only for another explicit test."
+alert.command-not-yet-valid:
+  message: "The notification test command was created too far in the future."
+  solution: "Correct the client clock before explicitly starting a new test."

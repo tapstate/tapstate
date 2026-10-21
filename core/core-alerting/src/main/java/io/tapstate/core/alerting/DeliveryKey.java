@@ -46,7 +46,7 @@ public record DeliveryKey(NotificationRound notification, String channelType,
         receiverIncarnation = AlertValidation.text(receiverIncarnation, "receiverIncarnation", 256);
         targetId = AlertValidation.text(targetId, "targetId", 256);
     }
-    private static String fingerprint(List<String> fields) {
+    static String fingerprint(List<String> fields) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             for (String field : fields) {
