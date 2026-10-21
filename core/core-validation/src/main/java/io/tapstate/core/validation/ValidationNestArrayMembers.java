@@ -102,6 +102,27 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         public long accountedBytes() { return accountedBytes; }
     }
 
+    /** A complete source query whose omitted indeterminate participants leave membership unknown. */
+    public static final class UncertainSource {
+        private final ValidationObservation observation;
+        private final List<String> arrayPath;
+        private final ValidationCheckEvent.ReadBoundary read;
+        private final List<SourceGroup> groups;
+        private final List<ValidationRootCheck.Finding> causes;
+        private final long accountedBytes;
+        private UncertainSource(ValidationObservation observation, List<String> arrayPath, ValidationCheckEvent.ReadBoundary read,
+                List<SourceGroup> groups, List<ValidationRootCheck.Finding> causes, long accountedBytes) {
+            this.observation = observation; this.arrayPath = arrayPath; this.read = read;
+            this.groups = List.copyOf(groups); this.causes = List.copyOf(causes); this.accountedBytes = accountedBytes;
+        }
+        public ValidationObservation observation() { return observation; }
+        public List<String> arrayPath() { return arrayPath; }
+        public ValidationCheckEvent.ReadBoundary read() { return read; }
+        public List<ValidationRootCheck.Finding> causes() { return causes; }
+        public long accountedBytes() { return accountedBytes; }
+        List<SourceGroup> groups() { return groups; }
+    }
+
     private final ValidationObservation observation;
     private final List<String> path;
     private final Limits limits;
@@ -229,6 +250,42 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
                         bucket.source, conflict(bucket.sourceCount, bucket.source, sourceRows)));
             }
         });
+    }
+
+    /**
+     * Normal source EOF is still mandatory. Known included members are lower bounds only; this
+     * terminal path never publishes target membership or permits the ordinary two-sided finish.
+     * Causes concern parent fields or this array's descendants, never a sibling array. They are
+     * retained source problems, not query, budget, codec or authorization failures.
+     */
+    public UncertainSource finishUncertainSource(List<ValidationRootCheck.Finding> causes) {
+        ensureOpen();
+        try {
+            var read = requireSourceComplete();
+            if (causes == null || causes.isEmpty() || causes.size() > 256
+                    || reads.containsKey(Side.TARGET) || targetRowIdentityVisible != null) {
+                throw ValidationError.invalid("nestMembers.uncertainSource");
+            }
+            for (var cause : causes) {
+                Objects.requireNonNull(cause, "source cause");
+                var actual = cause.location().scope(); var parent = observation.root();
+                if (!cause.kind().sourceProblem() || !parent.mappingId().equals(actual.mappingId())
+                        || !parent.outputId().equals(actual.outputId()) || !parent.rootKey().equals(actual.rootKey())
+                        || actual.ancestors().size() < parent.ancestors().size()
+                        || !actual.ancestors().subList(0, parent.ancestors().size()).equals(parent.ancestors())
+                        || actual.ancestors().size() > parent.ancestors().size()
+                            && !actual.ancestors().get(parent.ancestors().size()).fieldPath().equals(path)) {
+                    throw ValidationError.invalid("nestMembers.uncertaintyCause");
+                }
+                charge(128L + rootBytes(actual));
+                for (Object segment : cause.location().fieldPath()) charge(segment instanceof String text ? textBytes(text) : 16L);
+            }
+            var groups = new ArrayList<SourceGroup>();
+            visitSourceGroups(group -> { charge(64L + 8L * group.samples().size()); groups.add(group); });
+            var result = new UncertainSource(observation, path, read, groups, causes, bytes);
+            close();
+            return result;
+        } catch (RuntimeException | Error error) { fail(error); throw error; }
     }
 
     public Result finish() {

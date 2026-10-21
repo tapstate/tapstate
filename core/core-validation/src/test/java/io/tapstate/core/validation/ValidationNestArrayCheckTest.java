@@ -168,6 +168,120 @@ class ValidationNestArrayCheckTest {
         assertThatThrownBy(narrow::finish).isInstanceOf(TapstateException.class);
     }
 
+    @Test void uncertainSourceMembershipBlocksTheWholeArrayWithoutInventingTargetDifferences() {
+        var observation = observation(102, 1);
+        var cause = new Finding(Kind.SOURCE_FIELD_MISSING, new Location(observation.root(), List.of("eligible")));
+        for (boolean hasKnownMember : List.of(false, true)) {
+            try (var staged = sourceFrame(observation)) {
+                if (hasKnownMember) staged.add(ValidationNestArrayMembers.Side.SOURCE, observation, member(11, 1, "known"));
+                staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+                var uncertain = staged.finishUncertainSource(List.of(cause));
+                assertThatThrownBy(staged::finish).isInstanceOf(IllegalStateException.class);
+                var root = builder(observation, ValidationMethod.FULL_COLUMN).read(Side.TARGET, read("target-root"));
+                ValidationNestArrayCheck.checkUncertainSource(uncertain, root);
+                var result = finish(root);
+                assertThat(result.counts()).containsOnly(entry(Kind.SOURCE_FIELD_MISSING, 1L));
+                assertThat(result.notCompared()).hasSize(2).allSatisfy(blocked ->
+                        assertThat(blocked.location()).isEqualTo(new Location(observation.root(), List.of("items"))));
+                assertThat(result.observedAgreement()).isFalse();
+                assertThat(result.reads()).noneMatch(boundary -> boundary.boundary().readId().equals("target-array"));
+            }
+        }
+    }
+
+    @Test void unknownArrayParticipationCannotMakeAParentEmptyArrayPredicateTrue() {
+        var observation = observation(102, 1);
+        var empty = ValidationPredicate.compile("empty", new ValidationPredicate.Compare(ValidationPredicate.Operator.EQ,
+                new ValidationPredicate.ArraySize(new ValidationPredicate.Field(List.of("items"))), new ValidationPredicate.Constant(0)),
+                new ValidationPredicate.Limits(ROW, 1000, false));
+        try (var staged = sourceFrame(observation)) {
+            staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+            var uncertain = staged.finishUncertainSource(List.of(new Finding(Kind.SOURCE_FIELD_MISSING,
+                    new Location(observation.root(), List.of("eligible")))));
+            var working = ValidationValues.ownRow(Map.of("id", 102), ROW);
+            var evaluated = empty.evaluate(working, List.of(new ArrayList<Object>(uncertain.arrayPath())));
+            assertThat(evaluated.matches()).isNull();
+            assertThat(evaluated.problem().kind()).isEqualTo(ValidationPredicate.ProblemKind.UNAVAILABLE_FIELD);
+            assertThat(empty.evaluate(ValidationValues.ownRow(Map.of("items", List.of()), ROW)).matches()).isTrue();
+        }
+    }
+
+    @Test void alreadyProvenSourceDuplicatesSurviveUnknownMembershipAsLowerBounds() {
+        var observation = observation(102, 1);
+        var cause = new Finding(Kind.SOURCE_FIELD_INVALID, new Location(observation.root(), List.of("eligible")));
+        try (var staged = sourceFrame(observation)) {
+            staged.add(ValidationNestArrayMembers.Side.SOURCE, observation, member(11, 1, "raw-A"));
+            staged.add(ValidationNestArrayMembers.Side.SOURCE, observation, member(12, 1, "raw-B"));
+            staged.add(ValidationNestArrayMembers.Side.SOURCE, observation, member(13, 2, "uncontested"));
+            staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+            var root = builder(observation, ValidationMethod.FULL_COLUMN).read(Side.TARGET, read("target-root"));
+            ValidationNestArrayCheck.checkUncertainSource(staged.finishUncertainSource(List.of(cause)), root);
+            var result = finish(root);
+            assertThat(result.counts()).containsOnly(entry(Kind.SOURCE_FIELD_INVALID, 1L), entry(Kind.SOURCE_DUPLICATE, 1L));
+            assertThat(result.findings().keySet()).filteredOn(finding -> finding.kind() == Kind.SOURCE_DUPLICATE)
+                    .singleElement().satisfies(finding -> assertThat(finding.multiplicity()).contains(new Multiplicity(2, false)));
+            assertThat(result.samples()).singleElement().satisfies(sample ->
+                    assertThat(sample.source().orElseThrow().row().fields()).containsEntry("value", "raw-A"));
+        }
+    }
+
+    @Test void uncertainSourceRequiresNormalEofASourceCauseAndNoInventedTargetFacts() {
+        var observation = observation(102, 1);
+        var cause = new Finding(Kind.SOURCE_FIELD_MISSING, new Location(observation.root(), List.of("eligible")));
+        try (var staged = sourceFrame(observation)) {
+            assertThatThrownBy(() -> staged.finishUncertainSource(List.of(cause))).isInstanceOf(TapstateException.class);
+        }
+        for (var causes : List.of(List.<Finding>of(), List.of(new Finding(Kind.TARGET_VALUE, cause.location())),
+                List.of(new Finding(Kind.SOURCE_FIELD_MISSING, new Location(observation(999, 1).root(), List.of("eligible")))))) {
+            try (var staged = sourceFrame(observation)) {
+                staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+                assertThatThrownBy(() -> staged.finishUncertainSource(causes)).isInstanceOf(TapstateException.class);
+            }
+        }
+        try (var staged = sourceFrame(observation)) {
+            staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+            staged.complete(ValidationNestArrayMembers.Side.TARGET, observation, read("target-array"));
+            assertThatThrownBy(() -> staged.finishUncertainSource(List.of(cause))).isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void uncertainSourceFactsKeepTheOriginalObservationFence() {
+        var observation = observation(102, 1);
+        try (var staged = sourceFrame(observation)) {
+            staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+            var uncertain = staged.finishUncertainSource(List.of(new Finding(Kind.SOURCE_FIELD_INVALID,
+                    new Location(observation.root(), List.of("eligible")))));
+            var newer = builder(observation(102, 2), ValidationMethod.FULL_COLUMN);
+            assertThatThrownBy(() -> ValidationNestArrayCheck.checkUncertainSource(uncertain, newer)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(newer::finish).isInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    @Test void uncertainMembershipCannotBorrowProblemsFromASiblingArray() {
+        var observation = observation(102, 1);
+        var sibling = new ValidationRoot("mapping", "output", observation.root().rootKey(),
+                List.of(new ValidationRoot.Ancestor(List.of("refunds"), key(9))));
+        try (var staged = sourceFrame(observation)) {
+            staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+            assertThatThrownBy(() -> staged.finishUncertainSource(List.of(new Finding(Kind.SOURCE_FIELD_INVALID,
+                    new Location(sibling, List.of("eligible")))))).isInstanceOf(TapstateException.class);
+        }
+        var descendant = new ValidationRoot("mapping", "output", observation.root().rootKey(), List.of(
+                new ValidationRoot.Ancestor(List.of("items"), key(7)), new ValidationRoot.Ancestor(List.of("details"), key(2))));
+        try (var staged = sourceFrame(observation)) {
+            staged.complete(ValidationNestArrayMembers.Side.SOURCE, observation, read("source"));
+            var cause = new Finding(Kind.SOURCE_FIELD_INVALID, new Location(descendant, List.of("eligible")));
+            assertThat(staged.finishUncertainSource(List.of(cause)).causes()).containsExactly(cause);
+        }
+    }
+
+    private static ValidationNestArrayMembers sourceFrame(ValidationObservation observation) {
+        return new ValidationNestArrayMembers(observation, List.of("items"), new ValidationNestArrayMembers.Limits(1024 * 1024, 100, 100, ROW));
+    }
+    private static ValidationCheckEvent.ReadBoundary read(String id) {
+        return new ValidationCheckEvent.ReadBoundary(id, "complete", Instant.EPOCH, Instant.EPOCH);
+    }
+
     private static void values(ValidationNestArrayMembers.Result facts, ValidationNestArrayMembers.Group group, Builder builder) {
         ValidationValueComparison.visitDifferences(group.sourceSamples().getFirst().values(), group.targetSamples().getFirst().values(),
                 String::equals, new ValidationValueComparison.TraversalLimits(ROW, 10000), difference -> {

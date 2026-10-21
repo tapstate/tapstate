@@ -59,6 +59,29 @@ public final class ValidationNestArrayCheck {
         }
     }
 
+    /** Reports source facts only; the entire array remains unavailable to parent participation rules. */
+    public static void checkUncertainSource(ValidationNestArrayMembers.UncertainSource source, Builder root) {
+        Objects.requireNonNull(root, "root");
+        try {
+            Objects.requireNonNull(source, "source");
+            var actual = source.observation(); var expected = root.observation();
+            if (!expected.run().equals(actual.run()) || expected.revision() != actual.revision()
+                    || !expected.root().mappingId().equals(actual.root().mappingId())
+                    || !expected.root().outputId().equals(actual.root().outputId())
+                    || !expected.root().rootKey().equals(actual.root().rootKey())) throw ValidationError.invalid("nestCheck.sourceScope");
+            root.read(Side.SOURCE, source.read());
+            var array = new Location(actual.root(), new java.util.ArrayList<>(source.arrayPath()));
+            for (var cause : source.causes()) {
+                root.finding(cause).notCompared(Check.STRUCTURE, array, cause);
+                if (root.method() == ValidationMethod.FULL_COLUMN) root.notCompared(Check.VALUES, array, cause);
+            }
+            for (var group : source.groups()) {
+                if (group.conflict()) sourceProblem(group.count(), new Location(group.scope(), List.of()),
+                        sample(group.samples(), source.read().readId()), root, false);
+            }
+        } catch (RuntimeException | Error failure) { root.close(); throw failure; }
+    }
+
     /** Called before discarding a malformed target frame, without fabricating an empty target read. */
     static void retainSourceProblems(ValidationNestArrayMembers members, Builder root) {
         var read = members.requireSourceComplete();
@@ -69,7 +92,12 @@ public final class ValidationNestArrayCheck {
     }
 
     private static void sourceProblem(long count, Location location, Optional<SampledSide> sample, Builder root) {
-        Finding cause = duplicate(count, Kind.SOURCE_DUPLICATE, Kind.SOURCE_ROW_DUPLICATE, location);
+        sourceProblem(count, location, sample, root, true);
+    }
+
+    private static void sourceProblem(long count, Location location, Optional<SampledSide> sample, Builder root, boolean exact) {
+        Finding cause = count > 1 ? new Finding(Kind.SOURCE_DUPLICATE, location, Optional.of(new Multiplicity(count, exact)))
+                : new Finding(Kind.SOURCE_ROW_DUPLICATE, location, Optional.of(new Multiplicity(2, false)));
         root.finding(cause, sample, Optional.empty()).notCompared(Check.STRUCTURE, location, cause);
         if (root.method() == ValidationMethod.FULL_COLUMN) root.notCompared(Check.VALUES, location, cause);
     }
