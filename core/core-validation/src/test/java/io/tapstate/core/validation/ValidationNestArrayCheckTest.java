@@ -13,6 +13,29 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Complete local fact composition, not native read completeness, a Jet job or strict confirmation. */
 class ValidationNestArrayCheckTest {
+    @Test void transformedMembersKeepWorkingValuesForComparisonAndRawRowsForDiagnostics() {
+        var observation = observation(102, 1);
+        var original = member(11, 1, "raw");
+        var working = ValidationValues.ownRow(Map.of("renamed", "checked"), ROW);
+        var source = new ValidationNestArrayMembers.Member(original.rowKey(), original.elementKey(), original.physical(), original.values(), working);
+        var missing = members(observation, List.of(source), List.of());
+        var builder = builder(observation, ValidationMethod.FULL_COLUMN);
+        ValidationNestArrayCheck.check(missing, builder, ignored -> { throw new AssertionError("No target exists"); });
+        assertThat(finish(builder).samples()).singleElement().satisfies(sample -> {
+            assertThat(sample.source().orElseThrow().row()).isSameAs(original.values());
+            assertThat(sample.source().orElseThrow().identity()).isEqualTo(original.physical());
+            assertThat(sample.source().orElseThrow().row().fields()).containsEntry("value", "raw").doesNotContainKey("renamed");
+        });
+        var target = new ValidationNestArrayMembers.Member(original.rowKey(), original.elementKey(), original.physical(), working);
+        var complete = members(observation, List.of(source), List.of(target));
+        var matched = builder(observation, ValidationMethod.FULL_COLUMN);
+        ValidationNestArrayCheck.check(complete, matched, group -> {
+            assertThat(group.sourceSamples().getFirst().values()).isSameAs(working);
+            assertThat(ValidationValueComparison.compare(group.sourceSamples().getFirst().values(), group.targetSamples().getFirst().values())).isEmpty();
+        });
+        assertThat(finish(matched).observedAgreement()).isTrue();
+    }
+
     private static final ValidationValues.Limits ROW = new ValidationValues.Limits(8192, 100, 16);
     private static final Limits ROOT = new Limits(1024 * 1024, 100, 100, 30, 1);
 

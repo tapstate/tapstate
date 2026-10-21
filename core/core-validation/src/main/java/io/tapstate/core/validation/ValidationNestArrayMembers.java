@@ -26,17 +26,21 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         }
     }
 
-    /** Declared row identity, local array identity and actual physical read identity are distinct. */
+    /** Declared and physical identities, raw diagnostics and independently transformed values stay distinct. */
     public record Member(Optional<ValidationKey> rowKey, ValidationKey elementKey, ValidationPhysicalIdentity physical,
-                         ValidationValues.Row values) {
+                         ValidationValues.Row original, ValidationValues.Row values) {
         public Member {
             Objects.requireNonNull(rowKey, "rowKey");
             Objects.requireNonNull(elementKey, "elementKey");
             Objects.requireNonNull(physical, "physical");
+            Objects.requireNonNull(original, "original");
             Objects.requireNonNull(values, "values");
         }
+        public Member(Optional<ValidationKey> rowKey, ValidationKey elementKey, ValidationPhysicalIdentity physical, ValidationValues.Row values) {
+            this(rowKey, elementKey, physical, values, values);
+        }
         public Member(ValidationKey rowKey, ValidationKey elementKey, ValidationPhysicalIdentity physical, ValidationValues.Row values) {
-            this(Optional.of(rowKey), elementKey, physical, values);
+            this(Optional.of(rowKey), elementKey, physical, values, values);
         }
     }
 
@@ -131,8 +135,8 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
             Objects.requireNonNull(side, "side");
             Objects.requireNonNull(member, "member");
             if (reads.containsKey(side)) throw ValidationError.invalid("nestMembers.readAlreadyComplete");
-            if (member.values().accountedBytes() > limits.row().bytes() || member.values().nodes() > limits.row().nodes()
-                    || member.values().depth() > limits.row().depth()) throw limit("row");
+            bounded(member.original());
+            bounded(member.values());
             // Compare only to validate domains. Nothing is sorted or coerced to repair native reads.
             if (elementDomain != null) member.elementKey().compareTo(elementDomain);
             else elementDomain = member.elementKey();
@@ -168,7 +172,8 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
             ArrayList<Member> samples = side == Side.SOURCE ? bucket.source : bucket.target;
             if (samples.size() < 2) {
                 charge(128L + member.rowKey().map(ValidationKey::retainedBytes).orElse(0L) + member.elementKey().retainedBytes()
-                        + member.physical().retainedBytes() + member.values().accountedBytes());
+                        + member.physical().retainedBytes() + member.original().accountedBytes()
+                        + (member.original() == member.values() ? 0 : member.values().accountedBytes()));
                 samples.add(member);
             }
             if (side == Side.SOURCE) bucket.sourceCount = increment(bucket.sourceCount);
@@ -217,6 +222,10 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
 
     private static boolean conflict(long count, List<Member> samples, Map<ValidationKey, Long> rows) {
         return count > 1 || samples.stream().anyMatch(sample -> sample.rowKey().map(key -> rows.get(key) > 1).orElse(false));
+    }
+    private void bounded(ValidationValues.Row row) {
+        if (row.accountedBytes() > limits.row().bytes() || row.nodes() > limits.row().nodes()
+                || row.depth() > limits.row().depth()) throw limit("row");
     }
     private void sameObservation(ValidationObservation request) {
         if (!observation.equals(request)) throw ValidationError.invalid("nestMembers.observation");

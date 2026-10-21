@@ -177,6 +177,26 @@ class ValidationNestArrayMembersTest {
         assertThatThrownBy(() -> mixed.add(Side.TARGET, parent, source)).isInstanceOf(TapstateException.class);
     }
 
+    @Test void rawAndWorkingRowsAreBothBoundedAndRetainedChargesIncludeBoth() {
+        var parent = observation(List.of(), 1);
+        var raw = member(11, 1, "A");
+        var working = ValidationValues.ownRow(Map.of("renamed", "A"), ROW);
+        var transformed = new Member(raw.rowKey(), raw.elementKey(), raw.physical(), raw.values(), working);
+        var originalResult = members(parent, List.of("items"), List.of(raw), List.of());
+        var transformedResult = members(parent, List.of("items"), List.of(transformed), List.of());
+        assertThat(transformedResult.accountedBytes() - originalResult.accountedBytes()).isEqualTo(working.accountedBytes());
+        for (boolean rawIsOversized : List.of(true, false)) {
+            var small = ValidationValues.ownRow(Map.of(), ROW);
+            var limited = new ValidationNestArrayMembers(parent, List.of("items"), new Limits(1024 * 1024, 10, 10,
+                    new ValidationValues.Limits(small.accountedBytes(), 100, 16)));
+            var invalid = new Member(raw.rowKey(), raw.elementKey(), raw.physical(), rawIsOversized ? raw.values() : small,
+                    rawIsOversized ? small : raw.values());
+            assertThatThrownBy(() -> limited.add(Side.SOURCE, parent, invalid)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(ValidationError.VALUE_LIMIT_EXCEEDED));
+            assertThatThrownBy(limited::finish).isInstanceOf(TapstateException.class);
+        }
+    }
+
     private static Group group(Result result, int elementKey) {
         return result.groups().stream().filter(group -> group.scope().ancestors().getLast().key().equals(key(elementKey)))
                 .findFirst().orElseThrow();

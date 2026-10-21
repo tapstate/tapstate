@@ -86,6 +86,6 @@ public final class ValidationNestArrayCheck {
     }
 
     private static Optional<SampledSide> sample(List<ValidationNestArrayMembers.Member> samples, String readId) {
-        return samples.isEmpty() ? Optional.empty() : Optional.of(new SampledSide(samples.getFirst().physical(), samples.getFirst().values(), readId));
+        return samples.isEmpty() ? Optional.empty() : Optional.of(new SampledSide(samples.getFirst().physical(), samples.getFirst().original(), readId));
     }
 }
