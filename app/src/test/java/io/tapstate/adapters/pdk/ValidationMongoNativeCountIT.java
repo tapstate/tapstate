@@ -2,6 +2,7 @@ package io.tapstate.adapters.pdk;
 
 import com.mongodb.client.MongoClients;
 import io.tapdata.pdk.apis.entity.TapExecuteCommand;
+import io.tapstate.testsupport.RequiresDocker;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -15,6 +16,7 @@ import static org.assertj.core.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Real native count dispatch and scalar delivery; not a validation lifecycle or stable-window proof. */
+@RequiresDocker
 class ValidationMongoNativeCountIT {
     private static final String DATABASE = "validation_native_count";
     private static final String COLLECTION = "records";
