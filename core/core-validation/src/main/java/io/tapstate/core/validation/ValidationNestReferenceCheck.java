@@ -18,12 +18,20 @@ public final class ValidationNestReferenceCheck {
     public static ValidationReferenceFields.Result check(ValidationObservation parent, List<String> outputPath,
             Shape shape, ValidationReferenceFields fields, ValidationCheckEvent.Side source,
             Optional<ValidationCheckEvent.Side> target, Builder root) {
+        return check(parent, outputPath, shape, fields, source, source == null ? null : source.row(), target, root);
+    }
+
+    /** Prior independent rules may change working fields; physical identity and diagnostics stay raw. */
+    public static ValidationReferenceFields.Result check(ValidationObservation parent, List<String> outputPath,
+            Shape shape, ValidationReferenceFields fields, ValidationCheckEvent.Side source, ValidationValues.Row working,
+            Optional<ValidationCheckEvent.Side> target, Builder root) {
         Objects.requireNonNull(root, "root");
         try {
             Objects.requireNonNull(parent, "parent");
             Objects.requireNonNull(shape, "shape");
             Objects.requireNonNull(fields, "fields");
             Objects.requireNonNull(source, "source");
+            Objects.requireNonNull(working, "working");
             Objects.requireNonNull(target, "target");
             if (outputPath == null || outputPath.isEmpty() || outputPath.size() > 32) {
                 throw ValidationError.invalid("referenceCheck.outputPath");
@@ -37,7 +45,7 @@ public final class ValidationNestReferenceCheck {
                 requireUniqueParent(side);
                 root.read(Side.TARGET, side.boundary());
             });
-            var reference = fields.read(source.row());
+            var reference = fields.read(working);
             Location output = new Location(parent.root(), List.copyOf(outputPath));
             SampledSide sourceSample = sample(source);
             if (reference instanceof ValidationReferenceFields.Missing missing) {

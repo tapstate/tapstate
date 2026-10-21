@@ -7,6 +7,19 @@ import io.tapstate.core.validation.ValidationPredicate;
 import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationValueComparison;
 import io.tapstate.core.validation.ValidationValues;
+import io.tapstate.core.validation.ValidationCheckEvent;
+import io.tapstate.core.validation.ValidationMethod;
+import io.tapstate.core.validation.ValidationNestReferenceCheck;
+import io.tapstate.core.validation.ValidationObservation;
+import io.tapstate.core.validation.ValidationOwner;
+import io.tapstate.core.validation.ValidationPhysicalIdentity;
+import io.tapstate.core.validation.ValidationReferenceFields;
+import io.tapstate.core.validation.ValidationRoot;
+import io.tapstate.core.validation.ValidationRootCheck;
+import io.tapstate.core.validation.ValidationRunIdentity;
+import io.tapstate.core.validation.ValidationMode;
+import java.time.Instant;
+import java.util.Optional;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
 import io.tapstate.runtime.engine.validation.ValidationOrdinalExpansion;
 import java.math.BigDecimal;
@@ -107,6 +120,53 @@ class ValidationStaticRulesTest {
         }
         assertThat(kept).containsExactly(1L);
         assertThat(source.fields()).doesNotContainKeys("position", "item");
+    }
+
+    @Test void nestReferenceUsesTheRenamedWorkingFieldAndKeepsTheOriginalReadFacts() {
+        var projection = ValidationStaticMap.compile("rename-reference", new TransformBody.MapProjection(
+                Map.of("customer_id", FieldRule.rename("raw_customer"))), ROW);
+        var fields = new ValidationReferenceFields(List.of("customer_id"), ROW);
+        for (Object reference : List.of(0, 19, "")) {
+            var source = source(row(Map.of("id", 7, "raw_customer", reference)));
+            var working = projection.apply(source.row());
+            try (var builder = nestBuilder()) {
+                var result = ValidationNestReferenceCheck.check(nestObservation(), List.of("customer"),
+                        ValidationNestReferenceCheck.Shape.OBJECT, fields, source, working, Optional.empty(), builder);
+                assertThat(((ValidationReferenceFields.Complete) result).components()).containsExactly(reference);
+                assertThat(source.row().fields()).containsEntry("raw_customer", reference).doesNotContainKey("customer_id");
+                assertThat(working.fields()).containsEntry("customer_id", reference).doesNotContainKey("raw_customer");
+                // An actual relation query and the remaining root checks are still required.
+                assertThatThrownBy(builder::finish).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            }
+        }
+    }
+
+    @Test void droppingAReferenceIsMissingEvenIfTheRawRowStillContainsItsOldValue() {
+        var projection = ValidationStaticMap.compile("drop-reference", new TransformBody.MapProjection(
+                Map.of("customer_id", FieldRule.drop())), ROW);
+        var source = source(row(Map.of("id", 7, "customer_id", 19)));
+        var fields = new ValidationReferenceFields(List.of("customer_id"), ROW);
+        try (var builder = nestBuilder()) {
+            var result = ValidationNestReferenceCheck.check(nestObservation(), List.of("customer"),
+                    ValidationNestReferenceCheck.Shape.OBJECT, fields, source, projection.apply(source.row()), Optional.empty(), builder);
+            assertThat(result).isEqualTo(new ValidationReferenceFields.Missing(List.of("customer_id")));
+            assertThat(source.row().fields()).containsEntry("customer_id", 19);
+        }
+    }
+
+    private static ValidationObservation nestObservation() {
+        var key = new ValidationKey(List.of(ValidationKey.Part.number(7)));
+        return new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                "task", "run", ValidationMode.FULL, "spec", 1, "rules"), new ValidationRoot("mapping", "output", key, List.of()), 1);
+    }
+    private static ValidationCheckEvent.Side source(ValidationValues.Row row) {
+        return new ValidationCheckEvent.Side(new ValidationPhysicalIdentity("source", "database", null, "table", List.of(List.of("id")),
+                nestObservation().root().rootKey()), row, 1, ValidationCheckEvent.GroupStatus.COMPLETE,
+                new ValidationCheckEvent.ReadBoundary("source", "complete", Instant.EPOCH, Instant.EPOCH));
+    }
+    private static ValidationRootCheck.Builder nestBuilder() {
+        return ValidationRootCheck.builder(nestObservation(), ValidationMethod.FULL_COLUMN, ValidationCheckEvent.Participation.SHOULD_EXIST,
+                ValidationRootCheck.TargetPresence.PRESENT, new ValidationRootCheck.Limits(1024 * 1024, 100, 100, 20, 4));
     }
 
     private static ValidationValues.Row row(Map<String, ?> fields) { return ValidationValues.ownRow(fields, ROW); }

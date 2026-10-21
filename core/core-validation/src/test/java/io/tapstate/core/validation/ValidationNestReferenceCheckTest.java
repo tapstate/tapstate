@@ -130,6 +130,25 @@ class ValidationNestReferenceCheckTest {
         assertThatThrownBy(bounded::finish).isInstanceOf(IllegalStateException.class);
     }
 
+    @Test void workingReferenceFieldsDoNotReplaceRawDiagnosticRowsOrPhysicalIdentity() {
+        var observation = observation(List.of(), 1);
+        var source = side("source", Map.of("raw_customer", 19));
+        var builder = builder(observation, TargetPresence.PRESENT);
+        var complete = ValidationNestReferenceCheck.check(observation, List.of("customer"), OBJECT, FIELDS,
+                source, ValidationValues.ownRow(Map.of("customer_id", 19), ROW), Optional.empty(), builder);
+        assertThat(((ValidationReferenceFields.Complete) complete).components()).containsExactly(19);
+        builder.close();
+
+        var missing = builder(observation, TargetPresence.PRESENT);
+        ValidationNestReferenceCheck.check(observation, List.of("customer"), OBJECT, FIELDS, source,
+                ValidationValues.ownRow(Map.of("dropped", 19), ROW), Optional.of(side("target", Map.of())), missing);
+        assertThat(finish(missing).samples()).singleElement().satisfies(sample -> {
+            assertThat(sample.source().orElseThrow().row()).isSameAs(source.row());
+            assertThat(sample.source().orElseThrow().identity()).isEqualTo(source.identity());
+            assertThat(sample.source().orElseThrow().row().fields()).containsEntry("raw_customer", 19).doesNotContainKey("dropped");
+        });
+    }
+
     private static ValidationRootCheck run(ValidationNestReferenceCheck.Shape shape, Map<String, ?> source, Map<String, ?> target) {
         var root = observation(List.of(), 1);
         var builder = builder(root, TargetPresence.PRESENT);
