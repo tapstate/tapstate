@@ -194,7 +194,13 @@ class ValidationJdbcMongoReadIT {
                                 root.read(ValidationRootCheck.Side.TARGET, new ValidationCheckEvent.ReadBoundary("target", "native-group-v1", readStarted, observed));
                                 // This fixture inserted without _id, confirmed native ObjectId values,
                                 // maps no source _id and uses only source_key/target_key as identity.
-                                var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
+                                var sourceIdentity = new ValidationKeyBinding("source-root", List.of(new ValidationKeyBinding.Component(List.of("source_key"),
+                ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);
+        var projectedIdentity = new ValidationKeyBinding("projected-root", List.of(new ValidationKeyBinding.Component(List.of("target_key"),
+                ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);
+        var identity = new ValidationLinearRules.Identity(observation.run(), observation.root().mappingId(), observation.root().outputId(),
+                sourceIdentity, projectedIdentity);
+        var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
                                         id -> id instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
                                 ValidationFieldCheck.check(observation, List.of(), projection.apply(sourceGroup.sampleValues()), targetGroup.sampleValues(),
                                         Optional.of(new ValidationRootCheck.SampledSide(sourceGroup.key().physical(), sourceGroup.sampleValues(), "source")),
@@ -264,6 +270,19 @@ class ValidationJdbcMongoReadIT {
             }
             assertThat(actual).containsExactly("1:EQUAL", "2:{TARGET_VALUE=1}", "3:{TARGET_MISSING=1}",
                     "4:{TARGET_EXTRA=1}", "5:{TARGET_VALUE=1}", "6:{TARGET_EXTRA=1}");
+            for (FieldRule keyRule : List.of(FieldRule.literal(99), FieldRule.drop())) {
+                var invalid = linearRules(kind, "source_records", new TransformBody.MapProjection(Map.of("target_key", keyRule)), Optional.empty());
+                var targetOpens = new java.util.concurrent.atomic.AtomicInteger();
+                assertThatThrownBy(() -> rootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings,
+                        "source_records", "target_records", 1, invalid, queryIo, decodeIo, targetOpens))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED);
+                            assertThat(failure.args()).containsEntry("field", List.of("target_key"))
+                                    .containsEntry("rule", keyRule instanceof FieldRule.Drop
+                                            ? "identity.projected-key-unavailable" : "identity.projected-key-changed");
+                        });
+                assertThat(targetOpens).hasValue(0);
+            }
         }
         sql(jdbc, mysql, "CREATE TABLE root_check_records (source_key BIGINT NOT NULL, amount DECIMAL(30,0));"
                 + "INSERT INTO root_check_records VALUES (7," + (EXACT - 1) + "),(7," + EXACT + "),"
@@ -344,10 +363,24 @@ class ValidationJdbcMongoReadIT {
     private static ValidationRootCheck rootRead(String kind, ConnectorRef sourceRef, Map<String, Object> sourceSettings,
             ConnectorRef targetRef, Map<String, Object> targetSettings, String sourceTable, String targetTable, long id,
             ValidationLinearRules rules, ExecutorService queryIo, ExecutorService decodeIo) throws Exception {
+        return rootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings, sourceTable, targetTable, id, rules,
+                queryIo, decodeIo, new java.util.concurrent.atomic.AtomicInteger());
+    }
+
+    private static ValidationRootCheck rootRead(String kind, ConnectorRef sourceRef, Map<String, Object> sourceSettings,
+            ConnectorRef targetRef, Map<String, Object> targetSettings, String sourceTable, String targetTable, long id,
+            ValidationLinearRules rules, ExecutorService queryIo, ExecutorService decodeIo,
+            java.util.concurrent.atomic.AtomicInteger targetOpens) throws Exception {
         var logical = new ValidationKey(List.of(ValidationKey.Part.number(id)));
         var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
                 "task", "native-roots-" + kind, ValidationMode.FULL, "fixed-projection", 1, "rules"),
                 new ValidationRoot("mapping", "output", logical, List.of()), 1);
+        var sourceIdentity = new ValidationKeyBinding("source-root", List.of(new ValidationKeyBinding.Component(List.of("source_key"),
+                ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);
+        var projectedIdentity = new ValidationKeyBinding("projected-root", List.of(new ValidationKeyBinding.Component(List.of("target_key"),
+                ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);
+        var identity = new ValidationLinearRules.Identity(observation.run(), observation.root().mappingId(), observation.root().outputId(),
+                sourceIdentity, projectedIdentity);
         var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
                 value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
         var handles = new ArrayList<ValidationReadHandle>();
@@ -361,6 +394,7 @@ class ValidationJdbcMongoReadIT {
                     handles.add(handle); return handle;
                 }),
                 new ValidationRootReader.Query("target", "native-root-v1", () -> {
+                    targetOpens.incrementAndGet();
                     var handle = scope.open(targetTable, guard ->
                             rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo, guard));
                     handles.add(handle); return handle;
@@ -369,7 +403,7 @@ class ValidationJdbcMongoReadIT {
                 Clock.systemUTC(), scope::requireActive, original -> {
                     var actual = key(original, "source_key", kind).physical();
                     var physical = new ValidationPhysicalIdentity(actual.sourceId(), DATABASE, actual.schema(), sourceTable, actual.keyFields(), actual.actualKey());
-                    return rules.classify(original, physical, observation, scope::requireActive);
+                    return rules.classify(original, physical, observation, identity, scope::requireActive);
                 }, original -> {
                     var actual = key(original, "target_key", "mongodb").physical();
                     return new ValidationRootReader.Target(original,

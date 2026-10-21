@@ -7,6 +7,9 @@ import io.tapstate.core.dsl.ValidationStaticRestrictions;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationKey;
+import io.tapstate.core.validation.ValidationKeyBinding;
+import io.tapstate.core.validation.ValidationRunIdentity;
 import io.tapstate.core.validation.ValidationPredicate;
 import io.tapstate.core.validation.ValidationObservation;
 import io.tapstate.core.validation.ValidationPhysicalIdentity;
@@ -55,6 +58,20 @@ public final class ValidationLinearRules {
         }
     }
 
+    /** Explicit endpoint bindings evaluated on source facts; no intermediate field correspondence is inferred. */
+    public record Identity(ValidationRunIdentity run, String mappingId, String outputId,
+                           ValidationKeyBinding source, ValidationKeyBinding projected) {
+        public Identity {
+            Objects.requireNonNull(run, "run"); Objects.requireNonNull(source, "source"); Objects.requireNonNull(projected, "projected");
+            if (mappingId == null || mappingId.isBlank() || outputId == null || outputId.isBlank()) throw invalid("linear.identityScope");
+            ValidationError.fieldName(mappingId, "linear.identityScope"); ValidationError.fieldName(outputId, "linear.identityScope");
+            if (source.components().size() != projected.components().size()) throw invalid("linear.identityArity");
+            for (int i = 0; i < source.components().size(); i++) {
+                if (source.components().get(i).domain() != projected.components().get(i).domain()) throw invalid("linear.identityDomains");
+            }
+        }
+    }
+
     private sealed interface Operation {
         record Projection(ValidationStaticMap map) implements Operation {}
         record Predicate(String node, ValidationPredicate predicate) implements Operation {}
@@ -62,9 +79,10 @@ public final class ValidationLinearRules {
     private final List<Operation> operations;
     private final Limits limits;
     private final long retainedBytes;
+    private final String output;
 
-    private ValidationLinearRules(List<Operation> operations, Limits limits, long retainedBytes) {
-        this.operations = List.copyOf(operations); this.limits = limits; this.retainedBytes = retainedBytes;
+    private ValidationLinearRules(List<Operation> operations, Limits limits, long retainedBytes, String output) {
+        this.operations = List.copyOf(operations); this.limits = limits; this.retainedBytes = retainedBytes; this.output = output;
     }
 
     /** Every selected step is compiled before any row can be evaluated, including unreachable data branches. */
@@ -86,7 +104,7 @@ public final class ValidationLinearRules {
                 throw unsupported(reason.node(), reason.fieldPath().getLast(), rule);
             }
         }
-        long bytes = 256L;
+        long bytes = 256L + 2L * declarations.output().id().length();
         if (bytes > limits.programBytes()) throw limit("programBytes");
         var operations = new ArrayList<Operation>();
         for (Step.Inline step : steps) {
@@ -109,7 +127,7 @@ public final class ValidationLinearRules {
             bytes += operationBytes;
             operations.add(operation);
         }
-        return new ValidationLinearRules(operations, limits, bytes);
+        return new ValidationLinearRules(operations, limits, bytes, declarations.output().id());
     }
 
     public long retainedBytes() { return retainedBytes; }
@@ -118,6 +136,12 @@ public final class ValidationLinearRules {
     public long executionReservationBytes(ValidationValues.Row source) {
         checkInput(source);
         return retainedBytes + source.accountedBytes() + 4L * limits.row().bytes();
+    }
+
+    /** Adds both logical-key constructions and bounded intermediate key/diagnostic metadata. Bindings are separately admitted configuration. */
+    public long executionReservationBytes(ValidationValues.Row source, Identity identity) {
+        Objects.requireNonNull(identity, "identity");
+        return executionReservationBytes(source) + 4L * ValidationKey.MAX_KEY_BYTES + 1024L * ValidationKey.MAX_COMPONENTS;
     }
 
     /** An indeterminate source predicate remains a source problem; it is never treated as an excluded row. */
@@ -152,7 +176,50 @@ public final class ValidationLinearRules {
     public ValidationRootReader.Source classify(ValidationValues.Row source, ValidationPhysicalIdentity physical,
             ValidationObservation observation, Runnable requireAuthorized) {
         Objects.requireNonNull(physical, "physical"); Objects.requireNonNull(observation, "observation");
+        return sourceOf(evaluate(source, requireAuthorized), physical, observation);
+    }
+
+    /**
+     * Checks actual endpoint key facts before a participating source can be paired with the target.
+     * Losing or changing the configured root identity cannot safely advance the ordered comparison;
+     * it is a coded execution failure, not a fabricated target missing/extra or a repairable finding.
+     * This does not replace configuration-time identity checks or prove business equivalence of a user mapping.
+     */
+    public ValidationRootReader.Source classify(ValidationValues.Row source, ValidationPhysicalIdentity physical,
+            ValidationObservation observation, Identity identity, Runnable requireAuthorized) {
+        Objects.requireNonNull(source, "source"); Objects.requireNonNull(physical, "physical");
+        Objects.requireNonNull(observation, "observation"); Objects.requireNonNull(identity, "identity");
+        Objects.requireNonNull(requireAuthorized, "requireAuthorized");
+        if (!identity.run().equals(observation.run()) || !identity.mappingId().equals(observation.root().mappingId())
+                || !identity.outputId().equals(observation.root().outputId()) || !output.equals(identity.outputId())
+                || !observation.root().ancestors().isEmpty()) throw invalid("linear.identityRunScope");
+        requireAuthorized.run();
+        checkInput(source);
+        ValidationKey original = bound(identity.source(), source, "identity.source-key-unavailable");
+        if (!original.equals(observation.root().rootKey())) throw invalid("linear.sourceKeyScope");
+        requireAuthorized.run();
         Evaluation result = evaluate(source, requireAuthorized);
+        if (result.disposition() == ValidationRelationRows.Disposition.INCLUDED) {
+            requireAuthorized.run();
+            ValidationKey projected = bound(identity.projected(), result.working(), "identity.projected-key-unavailable");
+            for (int i = 0; i < original.parts().size(); i++) {
+                if (!original.parts().get(i).equals(projected.parts().get(i)))
+                    throw identityFailure(identity.projected().components().get(i).path(), "identity.projected-key-changed");
+            }
+        }
+        requireAuthorized.run();
+        return sourceOf(result, physical, observation);
+    }
+
+    private ValidationKey bound(ValidationKeyBinding binding, ValidationValues.Row values, String rule) {
+        var result = binding.read(values);
+        if (result instanceof ValidationKeyBinding.Bound bound) return bound.key();
+        throw identityFailure(((ValidationKeyBinding.Invalid)result).problems().getFirst().path(), rule);
+    }
+    private TapstateException identityFailure(List<String> path, String rule) {
+        return new TapstateException(ValidationError.RULE_UNSUPPORTED, Map.of("node", output, "field", path, "rule", rule), null);
+    }
+    private static ValidationRootReader.Source sourceOf(Evaluation result, ValidationPhysicalIdentity physical, ValidationObservation observation) {
         var row = new ValidationRelationReader.Evaluation(result.disposition(), result.working(), Optional.of(physical));
         if (result.problem() == null) return new ValidationRootReader.Source(row, List.of());
         var problem = result.problem().predicate();
