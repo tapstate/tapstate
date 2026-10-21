@@ -6,6 +6,7 @@ import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.exc.StreamConstraintsException;
+import com.fasterxml.jackson.core.util.JsonRecyclerPools;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationValues;
@@ -36,6 +37,9 @@ final class PdkValidationJson {
         if (2L * text.length() > limits.bytes()) throw limit("jsonInputBytes");
         int tokenCharacters = (int) Math.max(1, Math.min(limits.bytes() / 2, Integer.MAX_VALUE));
         JsonFactory factory = JsonFactory.builder()
+                // A previous large row must not leave buffers retained on a shared decoding worker
+                // after its run's work reservation has been released.
+                .recyclerPool(JsonRecyclerPools.nonRecyclingPool())
                 .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
                 .disable(StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION)
                 .disable(JsonFactory.Feature.INTERN_FIELD_NAMES)

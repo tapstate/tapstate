@@ -226,12 +226,14 @@ final class PdkValidationCodecs {
                 || value instanceof List<?>;
     }
 
-    private TapstateException unavailable(String field) {
+    String binding() { return binding; }
+
+    TapstateException unavailable(String field) {
         return new TapstateException(ValidationError.CODEC_VALUE_UNAVAILABLE,
                 Map.of("connector", connectorId, "field", field), null);
     }
 
-    private TapstateException failed(String field, RuntimeException cause) {
+    TapstateException failed(String field, RuntimeException cause) {
         return new TapstateException(ValidationError.CODEC_FAILED,
                 Map.of("connector", connectorId, "field", field), cause);
     }

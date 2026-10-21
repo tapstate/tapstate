@@ -88,12 +88,12 @@ class ValidationReaderMergeTest {
                      "fixed-artifact", new PdkValidationSession.Scan("orders", List.of("source_id"), 2),
                      (model, codecs) -> {
                          assertThat(model.getNameFieldMap().get("source_id").getTapType()).isInstanceOf(TapNumber.class);
-                         return row -> ValidationValues.ownRow(row, limits);
+                         return new PdkValidationRows(model, codecs, pathRule -> PdkValidationRows.Rule.AUTO, limits);
                      }, () -> { }, queryIo, decodeIo, 1, limits);
              var target = PdkValidationSession.scan("fixture", artifact,
                      Map.of("key", "target_id", "ids", List.of(2L, 3L, 5L, 6L, 8L), "stops", targetStops),
                      "fixed-artifact", new PdkValidationSession.Scan("orders_v2", List.of("target_id"), 2),
-                     (model, codecs) -> row -> ValidationValues.ownRow(row, limits), () -> { },
+                     (model, codecs) -> new PdkValidationRows(model, codecs, pathRule -> PdkValidationRows.Rule.AUTO, limits), () -> { },
                      queryIo, decodeIo, 1, limits);
              var merge = new ValidationOrderedMerge(
                      new ValidationOrderedGroups("source", source, row -> key(row, "source_id", "orders"), limits.bytes()),
@@ -115,7 +115,7 @@ class ValidationReaderMergeTest {
                         var compared = ValidationValueComparison.compare(
                                 ValidationValues.ownRow(Map.of("amount", left.get("amount")), limits),
                                 ValidationValues.ownRow(Map.of("amount", right.get("amount")), limits));
-                        valueChecks.add(left.get("source_id") + ":" + compared.map(diff -> diff.kind().toString()).orElse("EQUAL"));
+                        valueChecks.add(((ValidationValues.Typed)left.get("source_id")).value() + ":" + compared.map(diff -> diff.kind().toString()).orElse("EQUAL"));
                         compared.ifPresent(diff -> assertThat(diff.path()).containsExactly("amount"));
                     }
                 }
@@ -129,7 +129,7 @@ class ValidationReaderMergeTest {
     }
 
     private static ValidationOrderedGroups.Key key(ValidationValues.Row row, String field, String table) {
-        var key = new ValidationKey(List.of(ValidationKey.Part.number((Long)row.fields().get(field))));
+        var key = new ValidationKey(List.of(ValidationKey.Part.number((Long)((ValidationValues.Typed)row.fields().get(field)).value())));
         return new ValidationOrderedGroups.Key(key, new ValidationPhysicalIdentity(field + "-connection",
                 "database", null, table, List.of(List.of(field)), key));
     }

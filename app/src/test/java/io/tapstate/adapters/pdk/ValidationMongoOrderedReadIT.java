@@ -100,18 +100,18 @@ class ValidationMongoOrderedReadIT {
                 "fixture-artifact", new PdkValidationSession.Scan(table, List.of(key), List.of(key), 2),
                 (model, codecs) -> {
                     assertThat(model.getNameFieldMap()).containsOnlyKeys(key);
+                    var reader = new PdkValidationRows(model, codecs,
+                            path -> PdkValidationRows.Rule.of(PdkValidationRows.Shape.EXACT_NUMBER), LIMITS);
                     return row -> {
                         decoded.incrementAndGet();
                         assertThat(row).containsOnlyKeys(key);
-                        Number actual = codecs.exactNumber(key, codecs.select(key, row.get(key),
-                                model.getNameFieldMap().get(key).getTapType()));
-                        return ValidationValues.ownRow(Map.of(key, actual), LIMITS);
+                        return reader.decode(row);
                     };
                 }, () -> { }, queryIo, decodeIo, 1, LIMITS);
     }
 
     private static ValidationOrderedGroups.Key key(ValidationValues.Row row, String table, String field) {
-        var actual = (Number) row.fields().get(field);
+        var actual = (Number) ((ValidationValues.Typed)row.fields().get(field)).value();
         assertThat(actual).isInstanceOf(Long.class);
         var key = new ValidationKey(List.of(ValidationKey.Part.number((Long)actual)));
         return new ValidationOrderedGroups.Key(key, new ValidationPhysicalIdentity(table + "-connection",

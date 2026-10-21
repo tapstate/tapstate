@@ -32,11 +32,15 @@ public final class ValidationValues {
     }
 
     /** Codec and logical type provenance is retained even within arrays. */
-    public record Typed(String logicalType, String nativeType, String codecBinding, Object value) {
+    public record Typed(String logicalType, String nativeType, String codecBinding, String conversionOrigin, Object value) {
+        public Typed(String logicalType, String nativeType, String codecBinding, Object value) {
+            this(logicalType, nativeType, codecBinding, "unspecified", value);
+        }
         public Typed {
             logicalType = ValidationError.identifier(logicalType, "logicalType");
             if (nativeType != null) nativeType = ValidationError.identifier(nativeType, "nativeType");
             codecBinding = ValidationError.identifier(codecBinding, "codecBinding");
+            conversionOrigin = ValidationError.identifier(conversionOrigin, "conversionOrigin");
         }
     }
 
@@ -140,8 +144,8 @@ public final class ValidationValues {
         try {
             if (value instanceof Typed typed) {
                 meter.charge(64L + 2L * typed.logicalType().length() + 2L * typed.codecBinding().length()
-                        + (typed.nativeType() == null ? 0 : 2L * typed.nativeType().length()));
-                return new Typed(typed.logicalType(), typed.nativeType(), typed.codecBinding(),
+                        + 2L * typed.conversionOrigin().length() + (typed.nativeType() == null ? 0 : 2L * typed.nativeType().length()));
+                return new Typed(typed.logicalType(), typed.nativeType(), typed.codecBinding(), typed.conversionOrigin(),
                         freeze(typed.value(), depth + 1, meter, active));
             }
             if (value instanceof Map<?, ?> map) {
