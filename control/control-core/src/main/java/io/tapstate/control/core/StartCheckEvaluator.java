@@ -17,6 +17,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -104,28 +105,35 @@ public final class StartCheckEvaluator {
         } catch (TapstateException coded) {
             planUnavailable = coded;
         }
-        StartCheckContext context = new StartCheckContext(pipelineId, intent, definition, contentHash, plan,
-                planUnavailable, probe, executor, clock, started.plus(budget), perTarget, this::describe);
-
+        ExecutorService probes = Executors.newVirtualThreadPerTaskExecutor();
         Map<StartCheck, Future<List<StartFinding>>> running = new LinkedHashMap<>();
-        for (StartCheck check : checks) {
-            running.put(check, executor.submit(() -> check.evaluate(context)));
-        }
-        List<StartFinding> findings = new ArrayList<>();
-        Set<String> keys = new HashSet<>();
-        for (Map.Entry<StartCheck, Future<List<StartFinding>>> each : running.entrySet()) {
-            for (StartFinding finding : await(each.getKey(), each.getValue(), context)) {
-                if (!finding.check().equals(each.getKey().id())) {
-                    throw new IllegalStateException(
-                            "start check " + each.getKey().id() + " made a finding for " + finding.check());
-                }
-                if (!keys.add(finding.key())) {
-                    throw new IllegalStateException("two start check findings share the key " + finding.key());
-                }
-                findings.add(finding);
+        try {
+            StartCheckContext context = new StartCheckContext(pipelineId, intent, definition, contentHash, plan,
+                    planUnavailable, probe, probes, clock, started.plus(budget), perTarget, this::describe);
+
+            for (StartCheck check : checks) {
+                running.put(check, executor.submit(() -> check.evaluate(context)));
             }
+            List<StartFinding> findings = new ArrayList<>();
+            Set<String> keys = new HashSet<>();
+            for (Map.Entry<StartCheck, Future<List<StartFinding>>> each : running.entrySet()) {
+                for (StartFinding finding : await(each.getKey(), each.getValue(), context)) {
+                    if (!finding.check().equals(each.getKey().id())) {
+                        throw new IllegalStateException(
+                                "start check " + each.getKey().id() + " made a finding for " + finding.check());
+                    }
+                    if (!keys.add(finding.key())) {
+                        throw new IllegalStateException("two start check findings share the key " + finding.key());
+                    }
+                    findings.add(finding);
+                }
+            }
+            return new StartEvaluation(pipelineId, intent, contentHash, started, plan, findings);
+        } finally {
+            running.values().forEach(future -> future.cancel(true));
+            // Do not wait for a connector that ignores interruption past the start's deadline.
+            probes.shutdownNow();
         }
-        return new StartEvaluation(pipelineId, intent, contentHash, started, plan, findings);
     }
 
     private List<StartFinding> await(StartCheck check, Future<List<StartFinding>> future, StartCheckContext context) {
@@ -135,22 +143,14 @@ public final class StartCheckEvaluator {
         } catch (TimeoutException late) {
             future.cancel(true);
             return List.of(unavailable(check, context,
-                    "it did not answer within " + budget.toMillis() + " ms", null));
+                    "it did not answer during the remaining " + wait + " ms wait", null));
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             future.cancel(true);
             return List.of(unavailable(check, context, "the start was interrupted while it was being checked", null));
         } catch (ExecutionException failed) {
-            if (failed.getCause() instanceof TapstateException coded) {
-                return List.of(unavailable(check, context, describe(coded), coded.code().code()));
-            }
-            if (failed.getCause() instanceof RuntimeException defect) {
-                throw defect;
-            }
-            if (failed.getCause() instanceof Error fatal) {
-                throw fatal;
-            }
-            throw new IllegalStateException(failed.getCause());
+            TapstateException coded = StartCheckFailures.coded(failed);
+            return List.of(unavailable(check, context, describe(coded), coded.code().code()));
         }
     }
 

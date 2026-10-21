@@ -309,9 +309,11 @@ pipeline-draft.not-found
 pipeline-draft.precondition-required
 pipeline-draft.revision-conflict
 pipeline.already-exists
+pipeline.definition-change-unavailable
 pipeline.id-mismatch
 pipeline.not-found
 pipeline.precondition-required
+pipeline.start-change-not-applied
 pipeline.version-conflict
 position.chain-not-read
 position.field-not-editable

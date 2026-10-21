@@ -26,7 +26,7 @@ finding that never passes: by default a warning, marked as not evaluated.
 
 | Check | Asks when | Answers |
 |---|---|---|
-| `target-not-empty` | A new full load is about to go into a target that already holds rows and will not clear them first (`on_full_load: append`). A new full load cannot see rows the source deleted in the meantime, so they would stay. A target set to `fail` refuses the start instead. | `clear` - clear the target first, and record `on_full_load: clear` on the element that writes it. `keep` - keep the rows. |
+| `target-not-empty` | A new full load is about to go into a target that already holds rows and will not clear them first (`on_full_load: append`). A new full load cannot see rows the source deleted in the meantime, so they would stay. A non-empty target the server can read, set to `fail`, refuses the start instead. Unreadable targets warn and allow the start. | `clear` - clear the target first, and record `on_full_load: clear` on the element that writes it. `keep` - keep the rows. |
 
 [Existing rows in the target](../quickstart-online.md#existing-rows-in-the-target) is the walkthrough.
 

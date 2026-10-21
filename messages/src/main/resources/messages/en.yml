@@ -512,8 +512,8 @@ lifecycle.start-blocked:
   message: "Pipeline {pipeline} was not started: {count} start check(s) refuse this start whatever is answered. First: {check} on {subject}."
   solution: "Read the start checks for what each refusal needs changed, change it, then start again."
 lifecycle.invalid-start-decision:
-  message: "Pipeline {pipeline} was not started: the answer {action} to start check {finding} cannot be taken, because that question does not offer it or was answered more than once."
-  solution: "Answer each question once, with one of the actions its start check lists."
+  message: "Pipeline {pipeline} was not started: the answer {action} to start check {finding} cannot be taken, because it is not offered, is repeated, or conflicts with another answer."
+  solution: "Answer each question once, with one of its offered actions. Targets sharing a write element must agree: do not mix clear and keep for that element."
 role.unsupported:
   message: "Unsupported --role value '{role}'."
   solution: "L1 runs the whole platform in one process; use --role=all (the default)."
@@ -874,6 +874,12 @@ pipeline.precondition-required:
 pipeline.version-conflict:
   message: "Pipeline '{id}' changed after it was read."
   solution: "Read the current Pipeline and retry the operation with its new ETag."
+pipeline.start-change-not-applied:
+  message: "The selected start change did not change Pipeline '{id}'. Nothing was started."
+  solution: "Check the offered action and the Pipeline definition, then retry with a change that can be applied."
+pipeline.definition-change-unavailable:
+  message: "Pipeline '{id}' cannot be changed together with its draft by this store. Nothing was started."
+  solution: "Use a store that supports atomic definition and draft updates, or edit and publish the draft before starting."
 pipeline-draft.not-found:
   message: "No Pipeline draft with id '{id}' exists."
   solution: "Create the draft or list Pipeline drafts to find an existing id."

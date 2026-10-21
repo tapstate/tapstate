@@ -144,6 +144,7 @@ class ApiExceptionHandler {
             case "pipeline.id-mismatch" -> HttpStatus.BAD_REQUEST;
             case "pipeline.precondition-required" -> HttpStatus.PRECONDITION_REQUIRED;
             case "pipeline.version-conflict" -> HttpStatus.PRECONDITION_FAILED;
+            case "pipeline.definition-change-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
             case "pipeline-draft.not-found" -> HttpStatus.NOT_FOUND;
             case "pipeline-draft.already-exists", "pipeline-draft.mode-conflict",
                  "pipeline-draft.artifact-conflict" -> HttpStatus.CONFLICT;

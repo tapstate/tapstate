@@ -219,7 +219,11 @@ stops and asks, naming the target and how many rows it holds:
   next new full load asks again.
 - **`keep`** keeps the rows and starts anyway.
 
-A target set to `fail` refuses the start outright, before anything is written. A target
+When one write element owns several targets, `clear` changes the policy for all of them;
+its preview names every affected target. Their answers must agree: mixing `clear` and
+`keep` for the same element is refused before the definition or start intent is written.
+
+A non-empty target the server can read, set to `fail`, refuses the start outright before anything is written. A target
 set to `clear`, or an empty one, is not asked about. A target whose rows the server
 cannot read gets a warning and does not stop the start. An element that comes from a
 shared `kind: serve` or `kind: view` definition is only offered `keep`; change the

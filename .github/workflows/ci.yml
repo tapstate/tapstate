@@ -105,7 +105,9 @@ jobs:
       - name: Record storage before the test shard
         run: |
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
-          docker system df
+          if ! docker system df; then
+            echo '::warning::Docker storage could not be observed before the test shard.'
+          fi
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}

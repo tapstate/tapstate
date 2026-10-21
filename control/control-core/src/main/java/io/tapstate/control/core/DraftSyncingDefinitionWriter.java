@@ -48,10 +48,20 @@ public final class DraftSyncingDefinitionWriter implements StartDefinitionWriter
                 draft -> PipelineDraftEdits.carry(draft, changes, expectedContentHash, prepared.contentHash(),
                         clock.instant(), principal));
         PipelineDraftMutation outcome = auditGate.dispatch(ControlOperations.PIPELINE_UPDATE,
-                new AuditContext(principal, changed.id(), expectedContentHash), () -> drafts.changeDefinition(change));
+                new AuditContext(principal, changed.id(), expectedContentHash), () -> changeDefinition(change));
         if (outcome != PipelineDraftMutation.REPLACED) {
             throw new TapstateException(PipelineError.VERSION_CONFLICT, Map.of("id", changed.id()), null);
         }
         return prepared.contentHash();
+    }
+
+    private PipelineDraftMutation changeDefinition(PipelineDraft.DefinitionChange change) {
+        try {
+            return drafts.changeDefinition(change);
+        } catch (UnsupportedOperationException unsupported) {
+            // A definition-only fallback would let the next draft publication silently undo the answer.
+            throw new TapstateException(PipelineError.DEFINITION_CHANGE_UNAVAILABLE,
+                    Map.of("id", change.pipelineId()), unsupported);
+        }
     }
 }

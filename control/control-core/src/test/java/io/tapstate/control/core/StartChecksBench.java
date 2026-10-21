@@ -80,6 +80,7 @@ final class StartChecksBench {
     final Map<String, Function<String, TargetProbe.TargetRows>> targets = new HashMap<>();
     final List<StartCheck> checks = new ArrayList<>(List.of(new TargetNotEmptyCheck()));
     final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    List<String> servedTables = List.of("orders");
     Duration budget = StartCheckEvaluator.BUDGET;
     Duration perTarget = StartCheckEvaluator.PER_TARGET;
 
@@ -123,12 +124,16 @@ final class StartChecksBench {
     }
 
     StartCheckEvaluator evaluator() {
+        return evaluator(executor, CLOCK);
+    }
+
+    StartCheckEvaluator evaluator(ExecutorService checkExecutor, Clock checkClock) {
         return new StartCheckEvaluator(checks, new StartPlanner(pipelineId -> List.of(), noChainRecords(),
                 this::writeTargets), (connection, table) -> {
                     Function<String, TargetProbe.TargetRows> answer = targets.get(connection + "/" + table);
                     return answer == null ? TargetProbe.TargetRows.EMPTY : answer.apply(table);
                 },
-                (code, params) -> code.code() + " " + new java.util.TreeMap<>(params), executor, CLOCK,
+                (code, params) -> code.code() + " " + new java.util.TreeMap<>(params), checkExecutor, checkClock,
                 budget, perTarget);
     }
 
@@ -157,9 +162,11 @@ final class StartChecksBench {
         }
         if (sync != null) {
             for (SyncElement element : sync) {
-                written.add(new PipelineWriteTargets.WriteTarget(element.id(),
-                        PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), "orders",
-                        element.onFullLoad() == null ? OnFullLoad.APPEND : element.onFullLoad(), definedIn));
+                for (String table : servedTables) {
+                    written.add(new PipelineWriteTargets.WriteTarget(element.id(),
+                            PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table,
+                            element.onFullLoad() == null ? OnFullLoad.APPEND : element.onFullLoad(), definedIn));
+                }
             }
         }
         if (definition.view() instanceof ViewBlock.Inline view) {

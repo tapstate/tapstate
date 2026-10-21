@@ -89,6 +89,23 @@ class StartDraftSyncTest {
                 .isEqualTo(OnFullLoad.CLEAR);
     }
 
+    @Test
+    void anUnsupportedAtomicDefinitionChangeIsCodedAndLeavesTheDraftAndArtifactTogether() {
+        String before = publish(draft(1));
+        PipelineDraft unchanged = drafts.get("pl").orElseThrow();
+        drafts.supportsChange = false;
+        bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 5L, true));
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> service().start("alice", "pl",
+                List.of(new StartDecision(KEY, "clear")), before))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        failure -> assertThat(failure.code().code()).isEqualTo("pipeline.definition-change-unavailable"));
+
+        assertThat(bench.hash("pl")).isEqualTo(before);
+        assertThat(drafts.get("pl")).contains(unchanged);
+        assertThat(bench.desiredById).isEmpty();
+    }
+
     private PipelineStartService service() {
         return new PipelineStartService(bench.lifecycle, bench.evaluator(),
                 new DraftSyncingDefinitionWriter(bench.apply, drafts, bench.auditGate, StartChecksBench.CLOCK));
@@ -124,6 +141,7 @@ class StartDraftSyncTest {
 
     /** Drafts beside the bench's definitions, publishing and changing both together the way the store does. */
     private static final class Drafts implements PipelineDraftStore {
+        boolean supportsChange = true;
         final Map<String, PipelineDraft> byId = new LinkedHashMap<>();
         private final StartChecksBench.Artifacts artifacts;
 
@@ -185,6 +203,9 @@ class StartDraftSyncTest {
 
         @Override
         public PipelineDraftMutation changeDefinition(PipelineDraft.DefinitionChange change) {
+            if (!supportsChange) {
+                return PipelineDraftStore.super.changeDefinition(change);
+            }
             Resource stored = artifacts.get(change.pipelineId()).orElse(null);
             if (stored == null || !CanonicalHash.of(stored).equals(change.expectedArtifactHash())) {
                 return PipelineDraftMutation.ARTIFACT_CONFLICT;

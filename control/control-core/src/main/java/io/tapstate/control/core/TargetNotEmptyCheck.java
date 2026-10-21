@@ -58,11 +58,12 @@ public final class TargetNotEmptyCheck implements StartCheck {
         Map<String, StartCheckContext.Probed> probed =
                 context.probe(byTarget.values().stream().map(List::getFirst).toList());
         List<StartFinding> findings = new ArrayList<>();
-        byTarget.forEach((coordinate, writers) -> findings.add(finding(writers, probed.get(coordinate))));
+        byTarget.forEach((coordinate, writers) -> findings.add(finding(writers, probed.get(coordinate), fullLoads)));
         return findings;
     }
 
-    private StartFinding finding(List<StartPlan.Entry> writers, StartCheckContext.Probed probed) {
+    private StartFinding finding(List<StartPlan.Entry> writers, StartCheckContext.Probed probed,
+            List<StartPlan.Entry> fullLoads) {
         StartPlan.Entry first = writers.getFirst();
         PipelineWriteTargets.WriteTarget target = first.target();
         StartFinding.Subject subject = new StartFinding.Subject(
@@ -95,12 +96,13 @@ public final class TargetNotEmptyCheck implements StartCheck {
                     params, List.of());
             case FAIL -> complete(subject, StartFinding.Behavior.BLOCK, StartCheckCode.TARGET_NOT_EMPTY_REFUSED,
                     params, List.of());
-            case APPEND -> confirm(subject, writers, params);
+            case APPEND -> confirm(subject, writers, params, fullLoads);
         };
     }
 
     private StartFinding confirm(
-            StartFinding.Subject subject, List<StartPlan.Entry> writers, Map<String, Object> params) {
+            StartFinding.Subject subject, List<StartPlan.Entry> writers, Map<String, Object> params,
+            List<StartPlan.Entry> fullLoads) {
         StartAction keep = StartAction.acknowledge(KEEP, StartCheckCode.KEEP_EXISTING_ROWS,
                 Map.of("target", params.get("target")));
         String shared = writers.stream().map(entry -> entry.target().definedIn())
@@ -115,8 +117,11 @@ public final class TargetNotEmptyCheck implements StartCheck {
                 .map(element -> new StartAction.Change(element, "on_full_load",
                         OnFullLoad.APPEND.yaml(), OnFullLoad.CLEAR.yaml()))
                 .toList();
+        String affectedTargets = String.join(", ", fullLoads.stream()
+                .filter(entry -> elements.contains(entry.target().element()))
+                .map(entry -> entry.target().table()).distinct().sorted().toList());
         StartAction clear = StartAction.changeDefinition(CLEAR, true, StartCheckCode.CLEAR_BEFORE_FULL_LOAD,
-                Map.of("target", params.get("target"), "element", String.join(", ", elements)),
+                Map.of("target", affectedTargets, "element", String.join(", ", elements)),
                 changes, definition -> clearedFirst(definition, elements));
         return complete(subject, StartFinding.Behavior.CONFIRM, StartCheckCode.TARGET_NOT_EMPTY,
                 params, List.of(clear, keep));

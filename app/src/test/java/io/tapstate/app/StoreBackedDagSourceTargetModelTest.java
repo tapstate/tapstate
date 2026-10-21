@@ -503,6 +503,10 @@ class StoreBackedDagSourceTargetModelTest {
             assertThat(bound).containsOnlyKeys("left.orders", "right.orders");
             assertThat(bound.get("left.orders").name()).isEqualTo("left_orders");
             assertThat(bound.get("right.orders").name()).isEqualTo("right_orders");
+            PipelineResource pipeline = (PipelineResource) store.artifacts().get("p").orElseThrow();
+            assertThat(new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                    .extracting(io.tapstate.control.core.PipelineWriteTargets.WriteTarget::table)
+                    .containsExactlyInAnyOrder("left_orders", "right_orders");
         }
     }
 

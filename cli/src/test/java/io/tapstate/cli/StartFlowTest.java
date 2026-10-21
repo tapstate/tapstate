@@ -555,6 +555,49 @@ class StartFlowTest {
         assertThat(err.toString()).contains("cli.start-checks-unsupported");
     }
 
+    @ParameterizedTest
+    @EnumSource(value = OutputFormat.class, names = {"JSON", "YAML"})
+    void aRefusalAfterApplyingChangesIsOneStructuredDocument(OutputFormat format) {
+        server.checks = new StartChecksOutcome.Found(StartChecks.parse(report("NEEDS_CONFIRMATION", notEmpty("orders"))));
+        server.starts.add(new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"),
+                "pl1 changed", List.of(applied("orders"))));
+
+        StartFlow.Result result = flow(false, new ScriptedPrompter()).start("pl1",
+                new StartFlow.Answering(false, List.of("target-not-empty=clear"), format));
+
+        assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        Map<?, ?> document = structured(format);
+        assertThat(document.get("code")).isEqualTo("pipeline.version-conflict");
+        assertThat(document.get("decisionsApplied")).isInstanceOf(List.class);
+        assertThat(out.toString()).doesNotContain("Updated pl1:", "still says");
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = OutputFormat.class, names = {"JSON", "YAML"})
+    void aPartiallyAnsweredPrereadStillPrintsTheStoppedReport(OutputFormat format) {
+        server.checks = new StartChecksOutcome.Found(StartChecks.parse(
+                report("NEEDS_CONFIRMATION", notEmpty("orders"), notEmpty("customers"))));
+
+        StartFlow.Result result = flow(false, new ScriptedPrompter()).start("pl1",
+                new StartFlow.Answering(false, List.of("target-not-empty/warehouse/orders=keep"), format));
+
+        assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        Map<?, ?> document = structured(format);
+        assertThat(document.get("code")).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(document.get("params")).isInstanceOfSatisfying(Map.class,
+                params -> assertThat(params.get("subject")).isEqualTo("warehouse/customers"));
+        assertThat(document.get("message")).isInstanceOf(String.class);
+        assertThat(document.get("startChecks")).isInstanceOf(Map.class);
+        assertThat(server.startsSent()).isEmpty();
+    }
+
+    private Map<?, ?> structured(OutputFormat format) {
+        Object parsed = format == OutputFormat.JSON ? JsonReader.parse(out.toString())
+                : new org.yaml.snakeyaml.Yaml().load(out.toString());
+        assertThat(parsed).isInstanceOf(Map.class);
+        return (Map<?, ?>) parsed;
+    }
+
     // ---- harness --------------------------------------------------------------------------------------
 
     private StartFlow flow(boolean terminal, Prompter prompter) {

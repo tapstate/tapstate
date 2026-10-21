@@ -251,6 +251,102 @@ class PipelineStartServiceTest {
         assertThat(plain.code().code()).isEqualTo("lifecycle.illegal-transition");
     }
 
+    @Test
+    void keepingOneTargetCannotBeOverriddenByClearingAnotherFromTheSameElement() {
+        bench.artifacts.put(StartChecksBench.SOURCE.replace("[ orders ]", "[ orders, customers ]"));
+        bench.artifacts.put(StartChecksBench.pipeline(null).replace("from: orders", "from: [orders, customers]"));
+        bench.servedTables = List.of("orders", "customers");
+        bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 5L, true));
+        bench.holding("warehouse/customers", new TargetProbe.TargetRows(false, 7L, true));
+        String before = bench.hash("pl");
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class, () -> bench.service().start(
+                "alice", "pl", List.of(new StartDecision(KEY, "clear"),
+                        new StartDecision("target-not-empty/warehouse/customers", "keep")), before));
+
+        assertThat(refused).isNotNull();
+        assertThat(refused.code().code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(bench.hash("pl")).isEqualTo(before);
+        assertThat(bench.desiredById).isEmpty();
+        assertThat(bench.audit).isEmpty();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"clear", "keep"})
+    void consistentAnswersForAllTargetsOfOneElementStillStart(String action) {
+        bench.artifacts.put(StartChecksBench.SOURCE.replace("[ orders ]", "[ orders, customers ]"));
+        bench.artifacts.put(StartChecksBench.pipeline(null).replace("from: orders", "from: [orders, customers]"));
+        bench.servedTables = List.of("orders", "customers");
+        bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 5L, true));
+        bench.holding("warehouse/customers", new TargetProbe.TargetRows(false, 7L, true));
+        String before = bench.hash("pl");
+        StartCheckReport report = bench.service().checks("pl", StartIntent.START);
+        assertThat(report.findings()).hasSize(2).allSatisfy(finding ->
+                assertThat(finding.actions()).filteredOn(offered -> offered.id().equals("clear"))
+                        .singleElement().satisfies(offered ->
+                                assertThat(offered.message()).contains("target=customers, orders")));
+
+        StartOutcome outcome = bench.service().start("alice", "pl", List.of(new StartDecision(KEY, action),
+                new StartDecision("target-not-empty/warehouse/customers", action)), before);
+
+        assertThat(outcome.desired().targetState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(outcome.decisionsApplied()).hasSize(2);
+        assertThat(((ServeBlock.Inline) bench.stored("pl").serve()).sync().getFirst().onFullLoad())
+                .isEqualTo(action.equals("clear") ? OnFullLoad.CLEAR : null);
+        assertThat(outcome.desired().revision()).isEqualTo(bench.hash("pl"));
+    }
+
+    @Test
+    void aWriterThatReturnsTheUnchangedHashCannotStartOrClaimTheChangeApplied() {
+        bench.artifacts.put(StartChecksBench.pipeline(null));
+        bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 5L, true));
+        String before = bench.hash("pl");
+        PipelineStartService service = new PipelineStartService(bench.lifecycle, bench.evaluator(),
+                (principal, changed, expected, changes) -> before);
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl", List.of(new StartDecision(KEY, "clear")), before));
+
+        assertThat(refused).isNotNull();
+        assertThat(refused.code()).isEqualTo(PipelineError.START_CHANGE_NOT_APPLIED);
+        assertThat(bench.desiredById).isEmpty();
+        assertThat(bench.audit).isEmpty();
+    }
+
+    @Test
+    void aNoOpDefinitionChangeCannotBeReportedAsAppliedOrStartThePipeline() {
+        bench.artifacts.put(StartChecksBench.pipeline(null));
+        bench.checks.clear();
+        bench.checks.add(new StartCheck() {
+            @Override
+            public String id() { return "no-op"; }
+
+            @Override
+            public List<StartFinding> evaluate(StartCheckContext context) {
+                return List.of(new StartFinding(id(),
+                        new StartFinding.Subject(StartFinding.Subject.PIPELINE, "pl", null, "pipeline pl"),
+                        StartFinding.Behavior.CONFIRM, StartFinding.Evaluation.COMPLETE, StartCheckCode.UNAVAILABLE,
+                        Map.of("check", id(), "reason", "must change"), List.of(
+                                StartAction.changeDefinition("clear", true, StartCheckCode.CLEAR_BEFORE_FULL_LOAD,
+                                        Map.of("target", "orders", "element", "missing"),
+                                        List.of(new StartAction.Change("missing", "on_full_load", "append", "clear")),
+                                        definition -> definition),
+                                StartAction.acknowledge("keep", StartCheckCode.KEEP_EXISTING_ROWS,
+                                        Map.of("target", "orders")))));
+            }
+        });
+        String before = bench.hash("pl");
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class, () -> bench.service().start(
+                "alice", "pl", List.of(new StartDecision("no-op/pl", "clear")), before));
+
+        assertThat(refused).isNotNull();
+        assertThat(refused.code()).isEqualTo(PipelineError.START_CHANGE_NOT_APPLIED);
+        assertThat(bench.hash("pl")).isEqualTo(before);
+        assertThat(bench.desiredById).isEmpty();
+        assertThat(bench.audit).isEmpty();
+    }
+
     private static AuditRecord only(List<AuditRecord> records, String operation) {
         List<AuditRecord> matching = records.stream().filter(record -> record.operationId().equals(operation)).toList();
         assertThat(matching).hasSize(1);

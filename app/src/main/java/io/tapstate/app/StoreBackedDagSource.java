@@ -602,40 +602,18 @@ final class StoreBackedDagSource implements DagSource {
         // back to a bare name carrying neither.
         Map<String, TargetTable> assembled =
                 assembledTargets(pipeline, bySourceTable, sourceVertices, compiledJoins);
-        Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
-        targets.putAll(assembled);
-        Map<String, TargetTable> viewTargets = new LinkedHashMap<>(targets);
-        Set<String> serveStreams = pipeline.serve() instanceof ServeBlock.Inline serve
-                && serve.sync() != null && !serve.sync().isEmpty()
-                ? streamsReaching(pipeline, serve.from(), sourceKeyByTable, sourceKeysById,
-                        sourceVertices, stepIds)
-                : Set.of();
-        Set<String> viewStreams = pipeline.view() instanceof ViewBlock.Inline view
-                ? streamsReaching(pipeline, view.from(), sourceKeyByTable, sourceKeysById,
-                        sourceVertices, stepIds)
-                : Set.of();
-        // Each stream a sink receives, narrowed to what the pipeline actually publishes on it rather
-        // than to what its source table holds. The two terminals keep independent maps because the
-        // same stream can reach them through different transform paths.
-        if (pipeline.serve() instanceof ServeBlock.Inline serving && !serveStreams.isEmpty()) {
-            targets.putAll(publishedTargets(pipelineId, pipeline, serving.from(), serveStreams,
-                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
-        }
-        // A view validates and binds against the rows at its own input, not against the source model
-        // those rows started from.
-        if (pipeline.view() instanceof ViewBlock.Inline viewing && !viewStreams.isEmpty()) {
-            viewTargets.putAll(publishedTargets(pipelineId, pipeline,
-                    FromClause.list(viewing.from()), viewStreams,
-                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
-        }
-        requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
-        // A nest with nothing to assemble passes its root's rows on under their own streams, not under the nest's,
-        // so each stream they arrive on is landed where the nest's documents land: in its target, matched on its
-        // root's key, and routed among a sink's writers by those.
-        Map<String, Set<String>> passedOn =
-                passedOnStreams(pipeline, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
-        Set<String> serveLanding = landing(pipelineId, serveStreams, targets, passedOn);
-        Set<String> viewLanding = landing(pipelineId, viewStreams, viewTargets, passedOn);
+        TerminalTargets serving = terminalTargets(pipelineId, pipeline,
+                pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()
+                        ? serve.from() : null,
+                bySourceTable, assembled, sourceVertices, vertex -> copiedColumns(pipelineId, vertex));
+        TerminalTargets viewing = terminalTargets(pipelineId, pipeline,
+                pipeline.view() instanceof ViewBlock.Inline view ? FromClause.list(view.from()) : null,
+                bySourceTable, assembled, sourceVertices, vertex -> copiedColumns(pipelineId, vertex));
+        requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serving.streams());
+        Map<String, TargetTable> targets = serving.targets();
+        Map<String, TargetTable> viewTargets = viewing.targets();
+        Set<String> serveLanding = serving.landing();
+        Set<String> viewLanding = viewing.landing();
         FrontierBinding frontier = frontierBinding(sourceVertices);
         PipelineResource builtPipeline = new PipelineResource(
                 pipeline.id(), pipeline.metadata(),
@@ -3188,6 +3166,28 @@ final class StoreBackedDagSource implements DagSource {
         return StartLoad.of(readMode, pipeline.id(), records) == StartLoad.FULL_LOAD;
     }
 
+    /** The same published models and arriving streams for a run and its read-only start inspection. */
+    private TerminalTargets terminalTargets(String pipelineId, PipelineResource pipeline, FromClause from,
+            Map<String, TargetTable> bySourceTable, Map<String, TargetTable> assembled,
+            Map<String, SourceVertex> vertices, Function<SourceVertex, NodeColumns> sourceColumns) {
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
+        Set<String> steps = stepIds(pipeline);
+        Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
+        targets.putAll(assembled);
+        Set<String> streams = from == null ? Set.of() : streamsReaching(pipeline, from, sourceKeyByTable,
+                sourceKeysById, vertices, steps);
+        if (!streams.isEmpty()) {
+            targets.putAll(publishedTargets(pipelineId, pipeline, from, streams, bySourceTable,
+                    vertices, sourceKeyByTable, sourceKeysById, steps, sourceColumns));
+        }
+        Set<String> landed = landing(pipelineId, streams, targets,
+                passedOnStreams(pipeline, sourceKeyByTable, sourceKeysById, vertices, steps));
+        return new TerminalTargets(targets, streams, landed);
+    }
+
+    private record TerminalTargets(Map<String, TargetTable> targets, Set<String> streams, Set<String> landing) { }
+
     /**
      * Where each write element of {@code definition} lands: every sync element's tables under the names its
      * sink binds them by, then the view's collection in the managed store.
@@ -3212,21 +3212,23 @@ final class StoreBackedDagSource implements DagSource {
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()) {
             Map<String, SourceVertex> vertices = sourceVertices(pipeline);
             Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
-            Map<String, TargetTable> bySourceTable = targetModelResolver.resolveAll(pipeline);
-            Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
-            targets.putAll(assembledTargets(
-                    pipeline, bySourceTable, vertices, compiledJoins(pipeline, vertices)));
-            Set<String> serveStreams = streamsReaching(pipeline, serve.from(), sourceKeyByTable(vertices),
-                    sourceKeysById(vertices), vertices, stepIds(pipeline));
+            Map<String, TargetTable> bySourceTable = sourceTargets(vertices);
+            Map<String, TargetTable> assembled = assembledTargets(
+                    pipeline, bySourceTable, vertices, compiledJoins(pipeline, sourceTablesByName(vertices)));
+            TerminalTargets terminal = terminalTargets(pipeline.id(), pipeline, serve.from(), bySourceTable,
+                    assembled, vertices, this::discoveredColumns);
             String definedIn = definition.serve() instanceof ServeBlock.Use use ? use.use() : null;
             for (SyncElement element : serve.sync()) {
                 io.tapstate.core.model.OnFullLoad policy = element.onFullLoad() == null
                         ? io.tapstate.core.model.OnFullLoad.APPEND : element.onFullLoad();
+                Set<String> tables = new LinkedHashSet<>();
                 for (TargetTable table : TargetModelResolver.renameAll(
-                        targets, serveStreams, element.rename(), sourceIdByTable).values()) {
-                    written.add(new PipelineWriteTargets.WriteTarget(syncNodeId(element),
-                            PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
-                            policy, definedIn));
+                        terminal.targets(), terminal.landing(), element.rename(), sourceIdByTable).values()) {
+                    if (tables.add(table.name())) {
+                        written.add(new PipelineWriteTargets.WriteTarget(syncNodeId(element),
+                                PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
+                                policy, definedIn));
+                    }
                 }
             }
         }

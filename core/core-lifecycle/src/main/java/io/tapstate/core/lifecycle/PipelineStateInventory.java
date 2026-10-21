@@ -45,13 +45,13 @@ public final class PipelineStateInventory {
      * does not think of. The rows in targets and views stay, and the new full load that follows copies only
      * what the source still holds: a row deleted from the source in the meantime is in neither, and stays in
      * the target. The clearing answer alone says it -- after a stop that keeps the state the run carries on
-     * and replays those deletes -- and it says the start will ask, which is what makes it a fact to act on
-     * rather than a warning to remember.
+     * and replays those deletes. The question is limited to targets the server can read; an unreadable
+     * target must not be described as protected by a question.
      */
     public static final String KEPT_ROWS_OUTLIVE_THEIR_SOURCE =
             "Rows already written to targets and views stay. The next run loads afresh and does not see rows "
-                    + "deleted from the source in the meantime, so starting it checks those targets and asks "
-                    + "first.";
+                    + "deleted from the source in the meantime. Starting it asks before keeping rows in targets "
+                    + "the server can read; unreadable targets produce a warning and the start goes ahead.";
 
     /**
      * What the pipeline's operators had built up: what a nest assembled, the shape it assembled under

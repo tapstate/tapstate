@@ -168,6 +168,7 @@ final class StartFlow {
             }
             Integer stopped = answerTheRest(id, checks, decided, answering, startCommand(id));
             if (stopped != null) {
+                printUnanswered(id, checks, decided, answering);
                 return new Result(stopped, null, checks);
             }
             ifMatch = checks.contentHash();
@@ -337,6 +338,7 @@ final class StartFlow {
         }
         Integer stopped = answerTheRest(id, checks, decided, answering, "tapstate restart " + id + " --rerun");
         if (stopped != null) {
+            printUnanswered(id, checks, decided, answering);
             return new RerunPlan.Stop(stopped);
         }
         return new RerunPlan.Ready(decided, checks);
@@ -646,7 +648,6 @@ final class StartFlow {
     }
 
     private int rejected(String id, StartAttempt.Rejected rejected, OutputFormat format) {
-        tellAppliedChanges(id, rejected.decisionsApplied());
         if (format != OutputFormat.TEXT) {
             Map<String, Object> document = new LinkedHashMap<>();
             document.put("code", rejected.code());
@@ -658,7 +659,29 @@ final class StartFlow {
             printStructured(document, format);
             return Cli.EXIT_DIAGNOSTIC;
         }
+        tellAppliedChanges(id, rejected.decisionsApplied());
         return reporting.rejection(rejected.code(), rejected.message(), rejected.params());
+    }
+
+    private void printUnanswered(String id, StartChecks checks, List<StartDecision> decided, Answering answering) {
+        if (answering.format() == OutputFormat.TEXT || answering.embedded()) {
+            return;
+        }
+        Set<String> answered = new LinkedHashSet<>();
+        decided.forEach(decision -> answered.add(decision.finding()));
+        List<StartChecks.Finding> open = checks.questions().stream()
+                .filter(finding -> !answered.contains(finding.key())).toList();
+        if (open.isEmpty()) {
+            return;
+        }
+        StartChecks.Finding first = open.getFirst();
+        String prefix = first.check() + "/";
+        String subject = first.key().startsWith(prefix) ? first.key().substring(prefix.length()) : first.subject();
+        Map<String, Object> document = Diagnostics.map(io.tapstate.core.lifecycle.LifecycleError.START_NEEDS_CONFIRMATION,
+                Map.of("pipeline", id, "count", open.size(), "check", first.check(), "subject", subject),
+                null, 0, 0);
+        document.put("startChecks", checks.raw());
+        printStructured(document, answering.format());
     }
 
     private static Map<String, Object> stopDocument(StartAttempt.Stopped stopped) {

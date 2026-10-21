@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -79,6 +80,7 @@ public final class PipelineStartService {
 
         StartEvaluation first = evaluate(pipelineId, startable, startable.pipeline(), StartIntent.START);
         Reconciled taken = reconcile(pipelineId, first, answers);
+        refuseConflictingAnswers(pipelineId, taken);
         refuseUnlessReady(pipelineId, first, taken.answered());
 
         PipelineResource definition = startable.pipeline();
@@ -88,10 +90,19 @@ public final class PipelineStartService {
             for (Chosen chosen : taken.changes()) {
                 definition = chosen.action().change().apply(definition);
             }
+            if (CanonicalHash.of(definition).equals(storedHash)) {
+                throw changeNotApplied(pipelineId);
+            }
             started = evaluate(pipelineId, startable, definition, StartIntent.START);
-            refuseUnlessReady(pipelineId, started, taken.answered());
+            // A changing answer is fulfilled by the changed definition, not by its original question's key.
+            Set<String> acknowledged = new LinkedHashSet<>();
+            taken.acknowledged().forEach(chosen -> acknowledged.add(chosen.finding().key()));
+            refuseUnlessReady(pipelineId, started, acknowledged);
             String changedHash = definitions.write(principal, definition, storedHash,
                     taken.changes().stream().flatMap(chosen -> chosen.action().changes().stream()).toList());
+            if (storedHash.equals(changedHash)) {
+                throw changeNotApplied(pipelineId);
+            }
             for (Chosen chosen : taken.changes()) {
                 applied.add(new StartOutcome.Applied(chosen.finding().key(), chosen.action().id(),
                         chosen.action().kind(), chosen.action().changes(), changedHash));
@@ -155,6 +166,35 @@ public final class PipelineStartService {
             (action.change() == null ? acknowledged : changes).add(new Chosen(finding, action));
         }
         return new Reconciled(answered, changes, acknowledged, stale);
+    }
+
+    /** Answers to different targets must agree when they configure the same write element. */
+    private static void refuseConflictingAnswers(String pipelineId, Reconciled taken) {
+        List<StartAction.Change> changed = new ArrayList<>();
+        for (Chosen chosen : taken.changes()) {
+            for (StartAction.Change change : chosen.action().changes()) {
+                if (changed.stream().anyMatch(prior -> sameField(prior, change) && !prior.to().equals(change.to()))) {
+                    throw invalid(pipelineId, new StartDecision(chosen.finding().key(), chosen.action().id()));
+                }
+                changed.add(change);
+            }
+        }
+        for (Chosen kept : taken.acknowledged()) {
+            boolean overwritten = kept.finding().actions().stream()
+                    .flatMap(action -> action.changes().stream())
+                    .anyMatch(unchosen -> changed.stream().anyMatch(change -> sameField(unchosen, change)));
+            if (overwritten) {
+                throw invalid(pipelineId, new StartDecision(kept.finding().key(), kept.action().id()));
+            }
+        }
+    }
+
+    private static boolean sameField(StartAction.Change one, StartAction.Change other) {
+        return one.element().equals(other.element()) && one.field().equals(other.field());
+    }
+
+    private static TapstateException changeNotApplied(String pipelineId) {
+        return new TapstateException(PipelineError.START_CHANGE_NOT_APPLIED, Map.of("id", pipelineId), null);
     }
 
     private void refuseUnlessReady(String pipelineId, StartEvaluation evaluation, Set<String> answered) {

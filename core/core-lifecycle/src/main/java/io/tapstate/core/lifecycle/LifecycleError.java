@@ -60,7 +60,8 @@ public enum LifecycleError implements TapstateErrorCode {
 
     /**
      * A {@code start} carrying a decision the start checks cannot take: {@code finding} names a question
-     * that does not offer {@code action}, or the same question was answered twice.
+     * that does not offer {@code action}, the same question was answered twice, or the answer conflicts
+     * with another answer changing the same element.
      */
     INVALID_START_DECISION("lifecycle.invalid-start-decision", Set.of("pipeline", "finding", "action"));
 

@@ -119,27 +119,20 @@ public final class StartCheckContext {
 
     private Probed await(Future<TargetProbe.TargetRows> future, List<Future<?>> abandoned) {
         Duration untilDeadline = Duration.between(clock.instant(), deadline);
-        Duration wait = untilDeadline.compareTo(perTarget) < 0 ? untilDeadline : perTarget;
+        Duration remaining = untilDeadline.compareTo(perTarget) < 0 ? untilDeadline : perTarget;
+        long wait = Math.max(0L, remaining.toMillis());
         try {
-            return new Probed.Rows(future.get(Math.max(0L, wait.toMillis()), TimeUnit.MILLISECONDS));
+            return new Probed.Rows(future.get(wait, TimeUnit.MILLISECONDS));
         } catch (TimeoutException late) {
             abandoned.add(future);
-            return new Probed.Unknown("it did not answer within " + perTarget.toMillis() + " ms", null);
+            return new Probed.Unknown("it did not answer during the remaining " + wait + " ms wait", null);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             abandoned.add(future);
             return new Probed.Unknown("the start was interrupted while it was being asked", null);
         } catch (ExecutionException failed) {
-            if (failed.getCause() instanceof TapstateException coded) {
-                return new Probed.Unknown(describe.apply(coded), coded.code().code());
-            }
-            if (failed.getCause() instanceof RuntimeException defect) {
-                throw defect;
-            }
-            if (failed.getCause() instanceof Error fatal) {
-                throw fatal;
-            }
-            throw new IllegalStateException(failed.getCause());
+            TapstateException coded = StartCheckFailures.coded(failed);
+            return new Probed.Unknown(describe.apply(coded), coded.code().code());
         }
     }
 
