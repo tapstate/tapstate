@@ -11,7 +11,9 @@ public enum ValidationError implements TapstateErrorCode {
     INVALID_CONTRACT("validation.invalid-contract", Set.of("field")),
     KEY_LIMIT_EXCEEDED("validation.key-limit-exceeded", Set.of("limit")),
     INCOMPATIBLE_KEY("validation.incompatible-key", Set.of("component")),
-    ILLEGAL_TRANSITION("validation.illegal-transition", Set.of("from", "to", "mode"));
+    ILLEGAL_TRANSITION("validation.illegal-transition", Set.of("from", "to", "mode")),
+    VALUE_LIMIT_EXCEEDED("validation.value-limit-exceeded", Set.of("limit")),
+    VALUE_TYPE_UNSUPPORTED("validation.value-type-unsupported", Set.of("type"));
 
     private final String code;
     private final Set<String> placeholders;

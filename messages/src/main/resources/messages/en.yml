@@ -8,6 +8,12 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+validation.value-limit-exceeded:
+  message: "Validation read facts exceed their {limit} budget."
+  solution: "Inspect the affected value or root size; validation cannot truncate facts to continue."
+validation.value-type-unsupported:
+  message: "Validation cannot safely carry a value of type {type}."
+  solution: "Use a connector codec that preserves this value in a supported portable form."
 validation.illegal-transition:
   message: "Validation cannot move from {from} to {to} in {mode} mode."
   solution: "Read the original run state before retrying the operation."
