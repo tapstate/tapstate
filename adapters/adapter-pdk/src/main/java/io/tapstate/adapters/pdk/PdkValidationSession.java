@@ -2,6 +2,7 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.entity.FilterResults;
+import io.tapdata.pdk.apis.entity.Projection;
 import io.tapdata.pdk.apis.entity.SortOn;
 import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
 import io.tapstate.core.common.TapstateException;
@@ -39,14 +40,24 @@ final class PdkValidationSession {
         PdkValidationCursor.Decoder prepare(TapTable model, PdkValidationCodecs codecs);
     }
 
-    record Scan(String table, List<String> ascendingKeys, int batchSize) {
+    /** Empty projection reads the complete row; a nonempty projection lists literal physical fields. */
+    record Scan(String table, List<String> ascendingKeys, List<String> projection, int batchSize) {
+        Scan(String table, List<String> ascendingKeys, int batchSize) {
+            this(table, ascendingKeys, List.of(), batchSize);
+        }
+
         Scan {
             Objects.requireNonNull(table, "table");
             ascendingKeys = List.copyOf(ascendingKeys);
+            projection = List.copyOf(projection);
             if (table.isBlank() || table.length() > 512 || ascendingKeys.isEmpty()
                     || ascendingKeys.size() > 32 || batchSize < 1 || batchSize > 64
                     || ascendingKeys.stream().anyMatch(key -> key.isBlank() || key.length() > 512)
-                    || ascendingKeys.stream().distinct().count() != ascendingKeys.size()) {
+                    || ascendingKeys.stream().distinct().count() != ascendingKeys.size()
+                    || projection.size() > 4096
+                    || projection.stream().anyMatch(field -> field.isBlank() || field.length() > 512)
+                    || projection.stream().distinct().count() != projection.size()
+                    || (!projection.isEmpty() && !projection.containsAll(ascendingKeys))) {
                 throw new IllegalArgumentException("invalid independent scan shape");
             }
         }
@@ -89,7 +100,7 @@ final class PdkValidationSession {
         if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
         var session = new PdkValidationSession(connectorId, artifact, settings, codecBinding, scan,
                 admission, requireAuthorized, decodeIo);
-        return new PdkValidationCursor(scan.table(), session::read, row -> session.decoder.decode(row),
+        return new PdkValidationCursor(scan.table(), session::read, row -> session.decoder.decode(session.project(row)),
                 session::checkActive, session::cancel, io, maxInFlightRows, rowLimits);
     }
 
@@ -114,6 +125,11 @@ final class PdkValidationSession {
                 checkAlive(opened);
                 TapAdvanceFilter filter = TapAdvanceFilter.create().batchSize(scan.batchSize());
                 for (String key : scan.ascendingKeys()) filter.sort(SortOn.ascending(key));
+                if (!scan.projection().isEmpty()) {
+                    Projection projection = Projection.create();
+                    scan.projection().forEach(projection::include);
+                    filter.projection(projection);
+                }
                 // One complete invocation; callback size is a hint, never an overall row limit or offset.
                 synchronized (callbackLock) { queryOpen = true; }
                 try {
@@ -209,9 +225,28 @@ final class PdkValidationSession {
         } finally { discovery.seal(); }
         TapTable model = discovery.result();
         if (model.getNameFieldMap() == null || model.getNameFieldMap().size() > 4096) throw protocol();
-        if (!model.getNameFieldMap().keySet().containsAll(scan.ascendingKeys())) throw protocol();
+        if (!model.getNameFieldMap().keySet().containsAll(scan.ascendingKeys())
+                || !model.getNameFieldMap().keySet().containsAll(scan.projection())) throw protocol();
+        if (!scan.projection().isEmpty()) {
+            var required = new LinkedHashMap<String, io.tapdata.entity.schema.TapField>();
+            for (String field : scan.projection()) required.put(field, model.getNameFieldMap().get(field));
+            // Unused fields must not participate in type/codec admission for a key-only read.
+            model.setNameFieldMap(required);
+        }
         invoke(() -> { opened.fillFieldTypes(model); return null; });
         return model;
+    }
+
+    private Map<String, Object> project(Map<String, Object> row) {
+        if (scan.projection().isEmpty()) return row;
+        Map<String, Object> selected = new LinkedHashMap<>();
+        for (String field : scan.projection()) {
+            if (row.containsKey(field)) selected.put(field, row.get(field));
+        }
+        // Some connectors return extra fields even with an inclusion projection. Their allocation
+        // still requires separate admission, but their values must not invoke codecs for this read.
+        // Preserve absent versus explicit null: never fill a missing physical key from the request.
+        return Collections.unmodifiableMap(selected);
     }
 
     private final class Discovery {

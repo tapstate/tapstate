@@ -83,8 +83,19 @@ class PdkValidationSessionTest {
                                     || filter.getSortOnList().get(0).getSort() != SortOn.ASCENDING)
                                 throw new IllegalStateException("wrong scan request");
                             if (mode(c).equals("query-failure")) throw new Exception("query failed first");
+                            if (mode(c).equals("projection")) {
+                                if (filter.getProjection() == null
+                                        || !new java.util.HashSet<>(filter.getProjection().getIncludeFields())
+                                            .equals(java.util.Set.of("id", "nullable", "absent")))
+                                    throw new IllegalStateException("missing necessary-field projection");
+                            } else if (filter.getProjection() != null)
+                                throw new IllegalStateException("unexpected full-row projection");
                             FilterResults result = new FilterResults();
-                            result.setResults(List.of(Map.of("id", 7)));
+                            Map<String, Object> row = new java.util.LinkedHashMap<>();
+                            row.put("id", 7);
+                            row.put("nullable", null);
+                            row.put("opaque", new Object());
+                            result.setResults(List.of(row));
                             if (mode(c).equals("callback-thread")) {
                                 java.util.concurrent.CompletableFuture.runAsync(() -> consumer.accept(result)).get();
                             } else if ((mode(c).equals("swallow-callback") || mode(c).equals("swallow-then-throw") || mode(c).equals("swallow-then-fatal"))) {
@@ -121,6 +132,9 @@ class PdkValidationSessionTest {
                         ((AtomicReference<Consumer<List<TapTable>>>)c.getConnectionConfig().get("discovery")).set(consumer);
                         TapTable table = new TapTable("records");
                         table.add(new TapField("id", "integer").tapType(new TapNumber()));
+                        table.add(new TapField("nullable", "unknown"));
+                        table.add(new TapField("absent", "unknown"));
+                        table.add(new TapField("opaque", "unavailable-driver-type"));
                         consumer.accept(List.of(table));
                         if (mode(c).equals("duplicate-model")) {
                             try { consumer.accept(List.of(table)); } catch (RuntimeException ignored) {}
@@ -133,6 +147,68 @@ class PdkValidationSessionTest {
                 }
                 """);
         artifact = new ConnectorRef(List.of(jar), "synthetic.ValidationQuery", "2.0.8", null);
+    }
+
+    @Test void necessaryFieldProjectionSkipsUnusedModelsAndPayloadsWithoutInventingMissingValues() {
+        var probe = new Probe("project", "projection");
+        var requested = new java.util.ArrayList<>(List.of("id", "nullable", "absent"));
+        var scan = new PdkValidationSession.Scan("records", List.of("id"), requested, 2);
+        requested.clear();
+        try (var io = Executors.newSingleThreadExecutor();
+             var cursor = PdkValidationSession.scan("fixture", artifact, probe.settings(), "binding", scan,
+                     (model, codecs) -> {
+                         assertThat(model.getNameFieldMap()).containsOnlyKeys("id", "nullable", "absent");
+                         return row -> {
+                             assertThat(row).containsOnlyKeys("id", "nullable").containsEntry("nullable", null);
+                             assertThat(row).doesNotContainKey("absent");
+                             assertThatThrownBy(() -> row.put("id", 8)).isInstanceOf(UnsupportedOperationException.class);
+                             return ValidationValues.ownRow(row, LIMITS);
+                         };
+                     }, () -> { }, io, decodeIo, 1, LIMITS)) {
+            try (var row = cursor.next().orElseThrow()) {
+                assertThat(row.values().fields()).containsOnlyKeys("id", "nullable");
+                assertThat(row.values().fields().get("id")).isEqualTo(7);
+            }
+            assertThat(cursor.next()).isEmpty();
+        }
+        assertThat(probe.queries).hasValue(1);
+    }
+
+    @Test void fullRowReadKeepsExtraFieldsVisibleToAdmissionAndDecoder() {
+        var probe = new Probe("full", "normal");
+        try (var io = Executors.newSingleThreadExecutor();
+             var cursor = scan(probe, io, (model, codecs) -> {
+                 assertThat(model.getNameFieldMap()).containsKey("opaque");
+                 return row -> {
+                     assertThat(row).containsKeys("id", "opaque", "nullable");
+                     return ValidationValues.ownRow(row, LIMITS);
+                 };
+             }, () -> { })) {
+            assertCode(cursor, ValidationError.VALUE_TYPE_UNSUPPORTED);
+        }
+    }
+
+    @Test void missingProjectedModelFieldFailsBeforeAdmissionOrQuery() {
+        var probe = new Probe("missing", "normal");
+        AtomicInteger admissions = new AtomicInteger();
+        try (var io = Executors.newSingleThreadExecutor();
+             var cursor = PdkValidationSession.scan("fixture", artifact, probe.settings(), "binding",
+                     new PdkValidationSession.Scan("records", List.of("id"), List.of("id", "unknown"), 2),
+                     (model, codecs) -> { admissions.incrementAndGet(); return decoder(model, codecs); },
+                     () -> { }, io, decodeIo, 1, LIMITS)) {
+            assertCode(cursor, ValidationError.READ_PROTOCOL_VIOLATION);
+        }
+        assertThat(admissions).hasValue(0);
+        assertThat(probe.queries).hasValue(0);
+    }
+
+    @Test void invalidProjectionCannotDropPhysicalSortKeysOrAdmitDuplicateUnboundedFields() {
+        for (List<String> projection : List.of(List.of("nullable"), List.of("id", "id"),
+                List.of("id", " "), List.of("id", "x".repeat(513)),
+                java.util.stream.IntStream.range(0, 4097).mapToObj(i -> "column" + i).toList())) {
+            assertThatThrownBy(() -> new PdkValidationSession.Scan("records", List.of("id"), projection, 2))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
     }
 
     @Test void independentSessionsOwnTheirNotesCodecsModelsAndOnlyTheirCancellation() throws Exception {
