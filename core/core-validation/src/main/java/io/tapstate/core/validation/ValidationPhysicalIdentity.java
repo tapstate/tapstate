@@ -26,4 +26,16 @@ public record ValidationPhysicalIdentity(String sourceId, String database, Strin
             throw ValidationError.invalid("physicalKey.duplicateField");
         }
     }
+
+    /** Conservative retained charge, including explicit path segments and the owned physical key. */
+    public long retainedBytes() {
+        long bytes = 128L + textBytes(sourceId) + textBytes(database) + textBytes(schema) + textBytes(table) + actualKey.retainedBytes();
+        for (List<String> field : keyFields) {
+            bytes += 32;
+            for (String segment : field) bytes += 8L + textBytes(segment);
+        }
+        return bytes;
+    }
+
+    private static long textBytes(String text) { return text == null ? 0 : 32L + 2L * text.length(); }
 }

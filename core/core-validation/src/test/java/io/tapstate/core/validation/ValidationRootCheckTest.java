@@ -58,7 +58,7 @@ class ValidationRootCheckTest {
         var mutable = new java.util.HashMap<String, Object>();
         mutable.put("nullable", null);
         var sample = ValidationValues.ownRow(mutable, new ValidationValues.Limits(1024, 20, 4));
-        for (int i = 0; i < 10; i++) builder.finding(problem, Optional.of(sample), Optional.empty());
+        for (int i = 0; i < 10; i++) builder.finding(problem, Optional.of(sampled(sample, "s")), Optional.empty());
         builder.notCompared(Check.VALUES, location(childScope(11), "customer"), problem).checked(Check.VALUES);
         mutable.put("nullable", 19);
         var result = builder.finish();
@@ -66,7 +66,7 @@ class ValidationRootCheckTest {
         assertThat(result.counts()).containsEntry(Kind.SOURCE_FIELD_MISSING, 10L);
         assertThat(result.samples()).hasSize(2);
         assertThat(result.samplesTruncated()).isTrue();
-        assertThat(result.samples().getFirst().source().orElseThrow().fields()).containsEntry("nullable", null);
+        assertThat(result.samples().getFirst().source().orElseThrow().row().fields()).containsEntry("nullable", null);
         assertThat(result.checks()).containsEntry(Check.VALUES, Status.BLOCKED);
         assertThat(result.notCompared()).containsExactly(new Blocked(Check.VALUES, location(childScope(11), "customer"), problem));
         assertThat(result.observedAgreement()).isFalse();
@@ -188,7 +188,7 @@ class ValidationRootCheckTest {
                 SHOULD_EXIST, TargetPresence.PRESENT, new Limits(1024 * 1024, 1, 1, 2, 0));
         complete(builder);
         var sample = ValidationValues.ownRow(Map.of("v", 1), new ValidationValues.Limits(1024, 10, 4));
-        builder.finding(new Finding(Kind.TARGET_VALUE, location(root(), "a")), Optional.of(sample), Optional.empty());
+        builder.finding(new Finding(Kind.TARGET_VALUE, location(root(), "a")), Optional.of(sampled(sample, "s")), Optional.empty());
         var result = builder.finish();
         assertThat(result.samples()).isEmpty();
         assertThat(result.samplesTruncated()).isTrue();
@@ -217,6 +217,30 @@ class ValidationRootCheckTest {
         assertThatThrownBy(() -> new Multiplicity(1, true)).isInstanceOf(TapstateException.class);
     }
 
+    @Test void retainedSamplesKeepPhysicalKeysAndAreBoundToActualReadIds() {
+        var builder = basic(SHOULD_EXIST, TargetPresence.PRESENT);
+        complete(builder);
+        var row = ValidationValues.ownRow(Map.of("business_id", 102), new ValidationValues.Limits(1024, 10, 4));
+        var sample = sampled(row, "s");
+        builder.finding(new Finding(Kind.TARGET_VALUE, location(root(), "value")), Optional.of(sample), Optional.empty());
+        var result = builder.finish();
+        assertThat(result.samples().getFirst().source()).contains(sample);
+        assertThat(sample.identity().actualKey()).isEqualTo(key(999));
+        assertThat(sample.identity().actualKey()).isNotEqualTo(result.observation().root().rootKey());
+        var absent = basic(SHOULD_EXIST, TargetPresence.PRESENT);
+        complete(absent);
+        assertThatThrownBy(() -> absent.finding(new Finding(Kind.TARGET_VALUE, location(root(), "value")),
+                Optional.of(sampled(row, "not-read")), Optional.empty())).isInstanceOf(TapstateException.class);
+        var wrongSide = basic(SHOULD_EXIST, TargetPresence.PRESENT);
+        complete(wrongSide);
+        assertThatThrownBy(() -> wrongSide.finding(new Finding(Kind.TARGET_VALUE, location(root(), "value")),
+                Optional.empty(), Optional.of(sample))).isInstanceOf(TapstateException.class);
+    }
+
+    private static SampledSide sampled(ValidationValues.Row row, String readId) {
+        return new SampledSide(new ValidationPhysicalIdentity("connection", "database", null, "table",
+                List.of(List.of("physical_id")), key(999)), row, readId);
+    }
     private static Builder basic(ValidationCheckEvent.Participation participation, TargetPresence presence) {
         return builder(observation(ValidationMode.FULL, 1), ValidationMethod.FULL_COLUMN, participation, presence, LIMITS);
     }

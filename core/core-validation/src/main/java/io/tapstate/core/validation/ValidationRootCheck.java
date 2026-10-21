@@ -93,8 +93,18 @@ public final class ValidationRootCheck {
         }
     }
 
+    /** Actual read identity is not reconstructed from the logical root or a transformed sample field. */
+    public record SampledSide(ValidationPhysicalIdentity identity, ValidationValues.Row row, String readId) {
+        public SampledSide {
+            Objects.requireNonNull(identity, "identity");
+            Objects.requireNonNull(row, "row");
+            readId = ValidationError.identifier(readId, "rootCheck.sampleReadId");
+        }
+        public long accountedBytes() { return 128L + identity.retainedBytes() + row.accountedBytes() + textBytes(readId); }
+    }
+
     /** Empty means a sample was not retained, never that a row or a field is NULL or absent. */
-    public record Sample(Finding finding, Optional<ValidationValues.Row> source, Optional<ValidationValues.Row> target) {
+    public record Sample(Finding finding, Optional<SampledSide> source, Optional<SampledSide> target) {
         public Sample {
             Objects.requireNonNull(finding, "finding");
             Objects.requireNonNull(source, "source");
@@ -221,12 +231,14 @@ public final class ValidationRootCheck {
         }
 
         /** Each call records one observed finding, not one confirmed root or one duplicate row. */
-        public Builder finding(Finding finding, Optional<ValidationValues.Row> source, Optional<ValidationValues.Row> target) {
+        public Builder finding(Finding finding, Optional<SampledSide> source, Optional<SampledSide> target) {
             return mutate(() -> {
                 Objects.requireNonNull(finding, "finding");
                 Objects.requireNonNull(source, "source");
                 Objects.requireNonNull(target, "target");
                 sameRoot(finding.location());
+                source.ifPresent(side -> sampleRead(Side.SOURCE, side));
+                target.ifPresent(side -> sampleRead(Side.TARGET, side));
                 if (method == ValidationMethod.UNIQUE_KEY && finding.kind().valueCheck()) {
                     throw ValidationError.invalid("rootCheck.method");
                 }
@@ -238,8 +250,8 @@ public final class ValidationRootCheck {
                 counts.put(finding.kind(), increment(counts.getOrDefault(finding.kind(), 0L)));
                 if (source.isEmpty() && target.isEmpty()) return;
                 if (samples.size() == limits.samples()) { samplesTruncated = true; return; }
-                charge(128L + source.map(ValidationValues.Row::accountedBytes).orElse(0L)
-                        + target.map(ValidationValues.Row::accountedBytes).orElse(0L));
+                charge(128L + source.map(SampledSide::accountedBytes).orElse(0L)
+                        + target.map(SampledSide::accountedBytes).orElse(0L));
                 samples.add(new Sample(finding, source, target));
             });
         }
@@ -312,6 +324,10 @@ public final class ValidationRootCheck {
                     || extra != (participation == Participation.SHOULD_NOT_EXIST && targetPresence == TargetPresence.PRESENT)) {
                 throw ValidationError.invalid("rootCheck.presenceFinding");
             }
+        }
+
+        private void sampleRead(Side side, SampledSide sample) {
+            if (!reads.containsKey(new ReadKey(side, sample.readId()))) throw ValidationError.invalid("rootCheck.sampleRead");
         }
 
         private boolean wholeRootFinding(Kind kind) {

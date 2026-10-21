@@ -168,7 +168,7 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
             ArrayList<Member> samples = side == Side.SOURCE ? bucket.source : bucket.target;
             if (samples.size() < 2) {
                 charge(128L + member.rowKey().map(ValidationKey::retainedBytes).orElse(0L) + member.elementKey().retainedBytes()
-                        + physicalBytes(member.physical()) + member.values().accountedBytes());
+                        + member.physical().retainedBytes() + member.values().accountedBytes());
                 samples.add(member);
             }
             if (side == Side.SOURCE) bucket.sourceCount = increment(bucket.sourceCount);
@@ -251,15 +251,6 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         for (ValidationRoot.Ancestor ancestor : root.ancestors()) {
             bytes += 64L + ancestor.key().retainedBytes();
             for (String segment : ancestor.fieldPath()) bytes += textBytes(segment) + 8;
-        }
-        return bytes;
-    }
-    private static long physicalBytes(ValidationPhysicalIdentity physical) {
-        long bytes = 128L + textBytes(physical.sourceId()) + textBytes(physical.database())
-                + textBytes(physical.schema()) + textBytes(physical.table()) + physical.actualKey().retainedBytes();
-        for (List<String> field : physical.keyFields()) {
-            bytes += 32;
-            for (String segment : field) bytes += textBytes(segment) + 8;
         }
         return bytes;
     }
