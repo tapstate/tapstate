@@ -8,6 +8,7 @@ import io.tapstate.core.validation.ValidationValues;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -111,6 +112,90 @@ public final class ValidationStaticMap {
                 put(output, field.getKey(), field.getValue());
         }
         return ValidationValues.ownRow(output, limits);
+    }
+
+    /** A partial working view; unresolved source causes and physical identities remain with the caller. */
+    public static final class Projection {
+        private final ValidationValues.Row row;
+        private final List<List<Object>> unavailablePaths;
+        private final long accountedBytes;
+        private Projection(ValidationValues.Row row, List<List<Object>> paths, long accountedBytes) {
+            this.row = row;
+            this.unavailablePaths = List.copyOf(paths);
+            this.accountedBytes = accountedBytes;
+        }
+        public ValidationValues.Row row() { return row; }
+        public List<List<Object>> unavailablePaths() { return unavailablePaths; }
+        public long accountedBytes() { return accountedBytes; }
+    }
+
+    /**
+     * Carries unresolved paths through these explicit forward rules. A literal replaces uncertainty;
+     * a rename reads the original view, including its unavailable descendants, and a drop removes its
+     * field contribution. This does not infer physical keys, trace key lineage or resolve source issues.
+     * A whole unknown view remains conservatively unknown because its unknown fields cannot be listed.
+     * Reserve input and output masks in addition to the ordinary projection's working copies.
+     */
+    public Projection apply(ValidationValues.Row input, List<List<Object>> unavailablePaths) {
+        checkInput(input);
+        var inputPaths = new PathSet(input.accountedBytes());
+        if (unavailablePaths == null || unavailablePaths.size() > 256) throw invalid("map.unavailablePaths");
+        for (var path : unavailablePaths) inputPaths.add(path);
+        var projected = apply(input);
+        var outputPaths = new PathSet(projected.accountedBytes());
+        if (inputPaths.paths.contains(List.of())) {
+            outputPaths.add(List.of());
+            return new Projection(projected, new ArrayList<>(outputPaths.paths), outputPaths.bytes);
+        }
+        var byField = new LinkedHashMap<String, List<List<Object>>>();
+        for (var path : inputPaths.paths) byField.computeIfAbsent((String)path.getFirst(), ignored -> new ArrayList<>()).add(path);
+        var assigned = new HashSet<String>();
+        for (Assignment assignment : assignments) {
+            switch (assignment) {
+                case Assignment.Literal literal -> assigned.add(literal.output());
+                case Assignment.Rename rename -> {
+                    var paths = byField.getOrDefault(rename.source(), List.of());
+                    if (input.fields().containsKey(rename.source()) || !paths.isEmpty()) assigned.add(rename.output());
+                    for (var path : paths) {
+                        var renamed = new ArrayList<Object>(path); renamed.set(0, rename.output());
+                        outputPaths.add(renamed);
+                    }
+                }
+            }
+        }
+        for (var path : inputPaths.paths) {
+            String field = (String)path.getFirst();
+            if (!consumed.contains(field) && !assigned.contains(field)) outputPaths.add(path);
+        }
+        return new Projection(projected, new ArrayList<>(outputPaths.paths), outputPaths.bytes);
+    }
+
+    private final class PathSet {
+        private final Set<List<Object>> paths = new LinkedHashSet<>();
+        private long bytes;
+        private PathSet(long rowBytes) { bytes = rowBytes; }
+        private void add(List<Object> path) {
+            if (path == null || path.size() > 64 || !path.isEmpty() && !(path.getFirst() instanceof String))
+                throw invalid("map.unavailablePath");
+            long amount = 64L + 8L * path.size();
+            for (Object segment : path) {
+                if (segment instanceof String field) {
+                    ValidationError.fieldName(field, "map.unavailablePath");
+                    amount += 48L + 2L * field.length();
+                } else if (segment instanceof Integer ordinal && ordinal >= 0) amount += 24L;
+                else throw invalid("map.unavailablePath");
+            }
+            var owned = List.copyOf(path);
+            if (paths.contains(owned)) return;
+            if (paths.size() == 256) throw limit("map.unavailablePaths");
+            if (amount > limits.bytes() - bytes) throw limit("map.unavailableBytes");
+            bytes += amount;
+            paths.add(owned);
+        }
+    }
+
+    private static TapstateException invalid(String field) {
+        return new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", field), null);
     }
 
     private void checkInput(ValidationValues.Row input) {

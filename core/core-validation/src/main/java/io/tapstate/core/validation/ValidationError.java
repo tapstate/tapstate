@@ -45,7 +45,8 @@ public enum ValidationError implements TapstateErrorCode {
         return fieldName(value, field);
     }
 
-    static String fieldName(String value, String field) {
+    /** Validates a literal data field name, including empty and whitespace-only JSON members. */
+    public static String fieldName(String value, String field) {
         if (value == null || value.length() > 512) throw invalid(field);
         for (int i = 0; i < value.length(); i++) {
             char c = value.charAt(i);
